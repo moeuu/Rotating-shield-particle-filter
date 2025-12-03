@@ -11,9 +11,9 @@ def test_spectral_decomposition_recovers_sources():
     decomposer = SpectralDecomposer()
     env = EnvironmentConfig()
     sources = [
-        PointSource("Cs-137", position=(2.0, 2.0, 2.0), strength=5.0),
-        PointSource("Co-60", position=(8.0, 5.0, 2.0), strength=3.0),
-        PointSource("Eu-155", position=(1.0, 10.0, 1.0), strength=7.0),
+        PointSource("Cs-137", position=(2.0, 2.0, 2.0), intensity_cps_1m=5.0),
+        PointSource("Co-60", position=(8.0, 5.0, 2.0), intensity_cps_1m=3.0),
+        PointSource("Eu-155", position=(1.0, 10.0, 1.0), intensity_cps_1m=7.0),
     ]
     spectrum, effective = decomposer.simulate_spectrum(sources, environment=env, acquisition_time=2.0, rng=None)
     estimates = decomposer.decompose(spectrum)

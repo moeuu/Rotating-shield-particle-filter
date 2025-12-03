@@ -7,15 +7,16 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import nnls
 
 from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
 from spectrum.library import Nuclide, default_library
-from spectrum.response_matrix import (
-    build_response_matrix,
-    constant_efficiency,
-    default_resolution,
-)
+from spectrum.response_matrix import build_response_matrix, constant_efficiency, default_resolution
+from spectrum.smoothing import gaussian_smooth
+from spectrum.baseline import asymmetric_least_squares
+from spectrum.dead_time import non_paralyzable_correction
+from spectrum.activity_estimation import estimate_activities
+from spectrum.decomposition import Peak, strip_overlaps
+from spectrum.peak_detection import detect_peaks
 
 
 @dataclass
@@ -52,6 +53,7 @@ class SpectralDecomposer:
             self.library,
             resolution_fn=self.resolution_fn,
             efficiency_fn=self.efficiency_fn,
+            bin_width_keV=self.config.bin_width_keV,
         )
         self.isotope_names = list(self.library.keys())
 
@@ -61,6 +63,7 @@ class SpectralDecomposer:
         environment: EnvironmentConfig | None = None,
         acquisition_time: float = 1.0,
         rng: np.random.Generator | None = None,
+        dead_time_s: float = 0.0,
     ) -> Tuple[NDArray[np.float64], Dict[str, float]]:
         """
         点源と環境設定に基づき合成スペクトルを生成する。
@@ -75,23 +78,47 @@ class SpectralDecomposer:
             if source.isotope not in self.library:
                 continue
             geom = inverse_square_scale(detector, source)
-            effective_strength = source.strength * geom
+            effective_strength = source.intensity_cps_1m * geom
             col_idx = self.isotope_names.index(source.isotope)
             contribution = acquisition_time * effective_strength
             spectrum += contribution * self.response_matrix[:, col_idx]
             effective_strengths[source.isotope] += contribution
 
-        if rng is not None:
-            spectrum = rng.poisson(spectrum)
-        return spectrum, effective_strengths
+        noisy = rng.poisson(spectrum) if rng is not None else spectrum
+        corrected = non_paralyzable_correction(noisy, dead_time_s=dead_time_s)
+        return corrected, effective_strengths
+
+    def preprocess(self, spectrum: NDArray[np.float64]) -> NDArray[np.float64]:
+        """平滑化とベースライン補正を適用してピーク検出を安定化させる。"""
+        smoothed = gaussian_smooth(spectrum, sigma_bins=1.0)
+        baseline = asymmetric_least_squares(smoothed, lam=1e4, p=0.01, niter=10)
+        corrected = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
+        return corrected
 
     def decompose(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """観測スペクトルを非負値最小二乗で分解し、核種ごとの強度を返す。"""
-        # 非負制約付き最小二乗で活動度を推定
-        activities, _ = nnls(self.response_matrix, spectrum)
-        return {name: act for name, act in zip(self.isotope_names, activities)}
+        return estimate_activities(self.response_matrix, spectrum, self.isotope_names)
 
     def isotope_counts(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """分解結果を使ってPFに渡しやすい同位体別カウントを返す。"""
-        activities = self.decompose(spectrum)
-        return activities
+        return self.decompose(spectrum)
+
+    def identify_by_peaks(
+        self,
+        spectrum: NDArray[np.float64],
+        tolerance_keV: float = 5.0,
+    ) -> Dict[str, float]:
+        """
+        ピーク検出とストリッピングに基づき核種ごとの参照ピーク面積を推定する。
+
+        低カウント環境でピークベース同定を行いたい場合に使用する。
+        """
+        corrected = self.preprocess(spectrum)
+        peak_indices = detect_peaks(corrected, prominence=0.05, distance=5)
+        peaks: list[Peak] = []
+        for idx in peak_indices:
+            energy = self.energy_axis[idx]
+            area = corrected[idx]
+            peaks.append(Peak(energy_keV=float(energy), area=float(area)))
+        ref_areas, _ = strip_overlaps(peaks, self.library, tolerance_keV=tolerance_keV)
+        return ref_areas

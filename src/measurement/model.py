@@ -30,11 +30,16 @@ class PointSource:
 
     isotope: str
     position: Tuple[float, float, float]
-    strength: float
+    intensity_cps_1m: float
 
     def position_array(self) -> np.ndarray:
         """位置をnumpy配列として返す。"""
         return np.array(self.position, dtype=float)
+
+    @property
+    def strength(self) -> float:
+        """後方互換のための強度アクセサ（1 mでのcps）。"""
+        return self.intensity_cps_1m
 
 
 def inverse_square_scale(detector: np.ndarray, source: PointSource) -> float:
