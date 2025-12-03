@@ -10,7 +10,11 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
 from spectrum.library import Nuclide, default_library
-from spectrum.response_matrix import build_response_matrix, constant_efficiency, default_resolution
+from spectrum.response_matrix import (
+    build_response_matrix,
+    default_background_shape,
+    default_resolution,
+)
 from spectrum.smoothing import gaussian_smooth
 from spectrum.baseline import asymmetric_least_squares
 from spectrum.dead_time import non_paralyzable_correction
@@ -18,6 +22,8 @@ from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
 from spectrum.peak_detection import detect_peaks
 
+# バックグラウンド強度（counts/s）
+BACKGROUND_COUNTS_PER_SECOND = 50.0
 
 @dataclass
 class SpectrumConfig:
@@ -47,7 +53,11 @@ class SpectralDecomposer:
         self.library = library or default_library()
         self.energy_axis = self.config.energy_axis()
         self.resolution_fn = default_resolution(a=self.config.resolution_a, b=self.config.resolution_b)
-        self.efficiency_fn = constant_efficiency()
+        # エネルギー依存効率に切り替え
+        from spectrum.response_matrix import energy_dependent_efficiency
+
+        self.efficiency_fn = energy_dependent_efficiency
+        self._background_shape = default_background_shape(self.energy_axis)
         self.response_matrix = build_response_matrix(
             self.energy_axis,
             self.library,
@@ -72,7 +82,7 @@ class SpectralDecomposer:
         """
         env = environment or EnvironmentConfig()
         detector = env.detector()
-        spectrum = np.zeros_like(self.energy_axis, dtype=float)
+        expected = np.zeros_like(self.energy_axis, dtype=float)
         effective_strengths: Dict[str, float] = {name: 0.0 for name in self.isotope_names}
         for source in sources:
             if source.isotope not in self.library:
@@ -81,10 +91,15 @@ class SpectralDecomposer:
             effective_strength = source.intensity_cps_1m * geom
             col_idx = self.isotope_names.index(source.isotope)
             contribution = acquisition_time * effective_strength
-            spectrum += contribution * self.response_matrix[:, col_idx]
+            expected += contribution * self.response_matrix[:, col_idx]
             effective_strengths[source.isotope] += contribution
 
-        noisy = rng.poisson(spectrum) if rng is not None else spectrum
+        # バックグラウンドを加算
+        if BACKGROUND_COUNTS_PER_SECOND > 0.0:
+            total_bg_counts = BACKGROUND_COUNTS_PER_SECOND * acquisition_time
+            expected += self._background_shape * total_bg_counts
+
+        noisy = rng.poisson(expected) if rng is not None else expected
         corrected = non_paralyzable_correction(noisy, dead_time_s=dead_time_s)
         return corrected, effective_strengths
 

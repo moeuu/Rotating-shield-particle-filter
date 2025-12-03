@@ -3,11 +3,15 @@
 import numpy as np
 
 from measurement.model import EnvironmentConfig, PointSource
+from spectrum import pipeline
 from spectrum.pipeline import SpectralDecomposer
 
 
 def test_spectral_decomposition_recovers_sources():
     """Cs-137, Co-60, Eu-155の合成スペクトルを分解して強度を近似的に復元する。"""
+    # バックグラウンドの影響を避けるため一時的にオフにする
+    original_bg = pipeline.BACKGROUND_COUNTS_PER_SECOND
+    pipeline.BACKGROUND_COUNTS_PER_SECOND = 0.0
     decomposer = SpectralDecomposer()
     env = EnvironmentConfig()
     sources = [
@@ -17,6 +21,7 @@ def test_spectral_decomposition_recovers_sources():
     ]
     spectrum, effective = decomposer.simulate_spectrum(sources, environment=env, acquisition_time=2.0, rng=None)
     estimates = decomposer.decompose(spectrum)
+    pipeline.BACKGROUND_COUNTS_PER_SECOND = original_bg
 
     for iso in ["Cs-137", "Co-60", "Eu-155"]:
         assert iso in estimates
