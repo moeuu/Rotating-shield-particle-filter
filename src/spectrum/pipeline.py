@@ -22,8 +22,10 @@ from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
 from spectrum.peak_detection import detect_peaks
 
-# バックグラウンド強度（counts/s）
-BACKGROUND_COUNTS_PER_SECOND = 50.0
+# バックグラウンド強度（counts/s） - tuned default
+BACKGROUND_RATE_CPS = 5.0
+# 互換性のための別名
+BACKGROUND_COUNTS_PER_SECOND = BACKGROUND_RATE_CPS
 
 @dataclass
 class SpectrumConfig:
@@ -95,8 +97,12 @@ class SpectralDecomposer:
             effective_strengths[source.isotope] += contribution
 
         # バックグラウンドを加算
-        if BACKGROUND_COUNTS_PER_SECOND > 0.0:
-            total_bg_counts = BACKGROUND_COUNTS_PER_SECOND * acquisition_time
+        # エイリアスのどちらを更新しても反映されるように値を解決
+        background_rate = BACKGROUND_RATE_CPS
+        if BACKGROUND_COUNTS_PER_SECOND != BACKGROUND_RATE_CPS:
+            background_rate = BACKGROUND_COUNTS_PER_SECOND
+        if background_rate > 0.0:
+            total_bg_counts = background_rate * acquisition_time
             expected += self._background_shape * total_bg_counts
 
         noisy = rng.poisson(expected) if rng is not None else expected

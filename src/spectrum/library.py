@@ -24,7 +24,7 @@ class Nuclide:
 
 
 def default_library() -> Dict[str, Nuclide]:
-    """Cs-137, Co-60, Eu-155の代表ピークを含むライブラリを返す。"""
+    """Cs-137, Co-60, Eu-154の代表ピークを含むライブラリを返す。"""
     return {
         "Cs-137": Nuclide(
             name="Cs-137",
@@ -39,9 +39,16 @@ def default_library() -> Dict[str, Nuclide]:
             ],
             representative_energy_keV=1250.0,
         ),
-        "Eu-155": Nuclide(
-            name="Eu-155",
-            lines=[NuclideLine(energy_keV=86.5, intensity=1.0)],
-            representative_energy_keV=86.5,
+        "Eu-154": Nuclide(
+            name="Eu-154",
+            lines=[
+                NuclideLine(energy_keV=723.3, intensity=0.25),
+                NuclideLine(energy_keV=873.2, intensity=0.14),
+                NuclideLine(energy_keV=996.3, intensity=0.14),
+                NuclideLine(energy_keV=1274.5, intensity=0.45),
+                NuclideLine(energy_keV=1494.0, intensity=0.01),
+                NuclideLine(energy_keV=1596.5, intensity=0.02),
+            ],
+            representative_energy_keV=1274.5,
         ),
     }

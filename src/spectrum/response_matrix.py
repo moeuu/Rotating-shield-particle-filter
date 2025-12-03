@@ -11,8 +11,10 @@ from spectrum.library import Nuclide, NuclideLine
 
 # 電子静止エネルギー
 ME_C2_KEV = 511.0  # keV
-# バックスキャターピークの強度比
-BACKSCATTER_FRACTION = 0.15
+# コンプトン連続対ピーク比（単一ラインあたり） - tuned default
+COMPTON_CONTINUUM_TO_PEAK = 0.4
+# バックスキャターピークの強度比 - tuned default
+BACKSCATTER_FRACTION = 0.03
 
 
 def gaussian_peak(energy_axis: NDArray[np.float64], center: float, sigma: float) -> NDArray[np.float64]:
@@ -44,7 +46,7 @@ def compton_continuum(
     e_gamma_keV: float,
     bin_width_keV: float,
     peak_area: float,
-    continuum_to_peak: float = 3.0,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
     shape_power: float = 2.0,
 ) -> NDArray[np.float64]:
     """
@@ -172,7 +174,7 @@ def _nuclide_response(
             e_gamma_keV=line.energy_keV,
             bin_width_keV=bin_width_keV,
             peak_area=peak_area,
-            continuum_to_peak=3.0,
+            continuum_to_peak=COMPTON_CONTINUUM_TO_PEAK,
         )
         eff = efficiency_fn(line.energy_keV)
         peak *= eff
