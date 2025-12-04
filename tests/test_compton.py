@@ -43,9 +43,9 @@ def test_continuum_dominates_low_energy_mean():
     dec = SpectralDecomposer()
     env = EnvironmentConfig()
     sources = [
-        PointSource("Cs-137", position=(5.0, 10.0, 5.0), intensity_cps_1m=20.0),
-        PointSource("Co-60", position=(5.0, 11.0, 5.0), intensity_cps_1m=20.0),
-        PointSource("Eu-154", position=(5.0, 9.0, 5.0), intensity_cps_1m=20.0),
+        PointSource("Cs-137", position=(5.0, 10.0, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Co-60", position=(5.0, 11.0, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Eu-154", position=(5.0, 9.0, 5.0), intensity_cps_1m=20000.0),
     ]
     spectrum, _ = dec.simulate_spectrum(sources, environment=env, acquisition_time=10.0, rng=None, dead_time_s=0.0)
     energy_axis = dec.energy_axis

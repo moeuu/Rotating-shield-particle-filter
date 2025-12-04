@@ -22,8 +22,8 @@ from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
 from spectrum.peak_detection import detect_peaks
 
-# バックグラウンド強度（counts/s） - tuned default (lower to highlight peaks)
-BACKGROUND_RATE_CPS = 2.0
+# バックグラウンド強度（counts/s）
+BACKGROUND_RATE_CPS = 3.0
 # 互換性のための別名
 BACKGROUND_COUNTS_PER_SECOND = BACKGROUND_RATE_CPS
 
@@ -33,7 +33,7 @@ class SpectrumConfig:
 
     energy_min_keV: float = 0.0
     energy_max_keV: float = 1500.0
-    bin_width_keV: float = 1.0
+    bin_width_keV: float = 2.0
     resolution_a: float = 0.8
     resolution_b: float = 1.5
 
@@ -55,10 +55,10 @@ class SpectralDecomposer:
         self.library = library or default_library()
         self.energy_axis = self.config.energy_axis()
         self.resolution_fn = default_resolution()
-        # エネルギー依存効率に切り替え
-        from spectrum.response_matrix import energy_dependent_efficiency
+        # エネルギー依存効率（CeBr3想定）
+        from spectrum.response_matrix import cebr3_efficiency
 
-        self.efficiency_fn = energy_dependent_efficiency
+        self.efficiency_fn = cebr3_efficiency
         self._background_shape = default_background_shape(self.energy_axis)
         self.response_matrix = build_response_matrix(
             self.energy_axis,
@@ -111,8 +111,8 @@ class SpectralDecomposer:
 
     def preprocess(self, spectrum: NDArray[np.float64]) -> NDArray[np.float64]:
         """平滑化とベースライン補正を適用してピーク検出を安定化させる。"""
-        smoothed = gaussian_smooth(spectrum, sigma_bins=1.0)
-        baseline = asymmetric_least_squares(smoothed, lam=1e4, p=0.01, niter=10)
+        smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
+        baseline = asymmetric_least_squares(smoothed, lam=1e6, p=0.005, niter=10)
         corrected = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
         return corrected
 
@@ -123,6 +123,29 @@ class SpectralDecomposer:
     def isotope_counts(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """分解結果を使ってPFに渡しやすい同位体別カウントを返す。"""
         return self.decompose(spectrum)
+
+    @staticmethod
+    def debug_baseline(
+        energy_axis: NDArray[np.float64],
+        raw: NDArray[np.float64],
+        smoothed: NDArray[np.float64],
+        baseline: NDArray[np.float64],
+        corrected: NDArray[np.float64],
+        title: str = "Baseline Debug",
+    ) -> None:
+        """基線推定の挙動を可視化するためのデバッグ用プロット。"""
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(energy_axis, raw, label="Raw")
+        plt.plot(energy_axis, smoothed, label="Smoothed")
+        plt.plot(energy_axis, baseline, label="Baseline")
+        plt.plot(energy_axis, corrected, label="Corrected")
+        plt.xlabel("Energy (keV)")
+        plt.ylabel("Counts")
+        plt.title(title)
+        plt.legend()
+        plt.show()
 
     def identify_by_peaks(
         self,

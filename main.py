@@ -28,6 +28,8 @@ from measurement.model import EnvironmentConfig, PointSource
 from spectrum.pipeline import SpectralDecomposer
 from spectrum.library import default_library
 from spectrum.tuning import evaluate_spectrum_quality
+from spectrum.smoothing import gaussian_smooth
+from spectrum.baseline import asymmetric_least_squares
 from counts.isotope_sequence import build_isotope_count_sequence
 import matplotlib.pyplot as plt
 
@@ -63,22 +65,25 @@ def fill_peak_area(
 
 def main() -> None:
     """Simulate a spectrum and print decomposition results."""
-    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
-    acquisition_time = 1.0
-    loops = 120
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 1.0))
+    acquisition_time = 3.0
+    loops = 40
+    dead_time_s = 2e-8
+    detector_pos = env.detector()
     sources = [
-        PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20.0),
-        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=30.0),
-        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=30.0),
+        PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=20000.0),
     ]
     decomposer = SpectralDecomposer()
+    energy_axis = decomposer.energy_axis
     rng = np.random.default_rng(42)
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
     spectra_series: list[np.ndarray] = []
     effective_loop = None
     for _ in range(loops):
         loop_spectrum, loop_effective = decomposer.simulate_spectrum(
-            sources, environment=env, acquisition_time=acquisition_time, rng=rng, dead_time_s=0.0
+            sources, environment=env, acquisition_time=acquisition_time, rng=rng, dead_time_s=dead_time_s
         )
         spectrum += loop_spectrum
         spectra_series.append(loop_spectrum)
@@ -89,21 +94,11 @@ def main() -> None:
 
     print("=== Simulation configuration ===")
     print(f"Environment (m): {env.size_x} x {env.size_y} x {env.size_z}")
+    print(f"Detector position: {detector_pos.tolist()}")
     for src in sources:
-        print(f"  {src.isotope} @ {src.position} -> 20 cps at 1 m")
+        print(f"  {src.isotope} @ {src.position} -> {src.intensity_cps_1m:.0f} cps at 1 m")
     print(f"Acquisition: {loops} loops x {acquisition_time:.1f} s = {loops*acquisition_time:.1f} s")
-    print("\n=== Effective counts (geometry + acquisition time) ===")
-    for iso, val in effective.items():
-        print(f"  {iso}: {val:.3f} counts")
-
-    print("\n=== Decomposition (estimated activities, arbitrary units) ===")
-    for iso, val in estimates.items():
-        print(f"  {iso}: {val:.3f}")
-
-    print("\n=== Peak-based identification (reference peak areas) ===")
-    peak_based = decomposer.identify_by_peaks(spectrum)
-    for iso, val in peak_based.items():
-        print(f"  {iso}: {val:.3f}")
+    print(f"Dead time (non-paralyzable): {dead_time_s:.1e} s")
 
     # Isotope-wise counts per 2.5.7
     iso_names, iso_counts = build_isotope_count_sequence(
@@ -121,25 +116,26 @@ def main() -> None:
     for name, total in zip(iso_names, total_counts_per_iso):
         print(f"  {name}: {total:.3f}")
 
-    print("\n=== Spectrum quality metrics ===")
-    print(f"  Passes: {quality.passes}")
-    print(f"  mean_L: {quality.mean_L:.2f}, mean_M: {quality.mean_M:.2f}, mean_H: {quality.mean_H:.2f}")
-    print(f"  global_max_energy_keV: {quality.global_max_energy_keV:.1f}")
-    for key, val in quality.peak_prominence.items():
-        print(f"  peak {key}: {val:.3f}")
-
-    print("\n=== Sample spectrum (first 20 bins) ===")
-    print(np.array2string(spectrum[:20], precision=3, separator=", "))
+    # 収集スペクトルの統計量を簡易確認
+    total_counts = float(spectrum.sum())
+    cs_window = (energy_axis >= 652.0) & (energy_axis <= 672.0)
+    cs_counts = float(spectrum[cs_window].sum())
+    print(f"\nTotal counts (raw): {total_counts:.1f}")
+    print(f"Counts in Cs-137 peak window (652–672 keV, raw): {cs_counts:.1f}")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    energy_axis = decomposer.energy_axis
-    output = np.column_stack([energy_axis, spectrum])
+    # Apply smoothing and baseline correction for plotting/CSV
+    smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
+    baseline = asymmetric_least_squares(smoothed, lam=1e6, p=0.005, niter=10)
+    processed = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
+
+    output = np.column_stack([energy_axis, processed])
     out_path = RESULTS_DIR / "spectrum.csv"
     np.savetxt(out_path, output, delimiter=",", header="energy_keV,counts", comments="")
     print(f"\nSpectrum saved to: {out_path}")
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(energy_axis, spectrum, label="Simulated spectrum")
+    ax.plot(energy_axis, processed, label="Simulated spectrum (processed)")
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
     ax.set_title("Simulated gamma spectrum")
@@ -158,13 +154,42 @@ def main() -> None:
     for e, label in peak_definitions:
         ax.axvline(e, linestyle="--", alpha=0.5)
         ax.text(e, ymax * 0.95, label, rotation=90, va="top", ha="center", fontsize=8)
-        fill_peak_area(ax, energy_axis, spectrum, peak_energy_keV=e, window_keV=40.0, alpha=0.3)
+        fill_peak_area(ax, energy_axis, processed, peak_energy_keV=e, window_keV=40.0, alpha=0.3)
     ax.legend()
     img_path = RESULTS_DIR / "spectrum.png"
     fig.tight_layout()
     fig.savefig(img_path, dpi=150)
     plt.close(fig)
     print(f"Spectrum image saved to: {img_path}")
+
+    # 基線確認用のデバッグ図を保存
+    fig_dbg, ax_dbg = plt.subplots(figsize=(10, 5))
+    ax_dbg.plot(energy_axis, spectrum, label="Raw")
+    ax_dbg.plot(energy_axis, smoothed, label="Smoothed")
+    ax_dbg.plot(energy_axis, baseline, label="Baseline")
+    ax_dbg.plot(energy_axis, processed, label="Corrected")
+    ax_dbg.set_xlabel("Energy (keV)")
+    ax_dbg.set_ylabel("Counts")
+    ax_dbg.set_title("Baseline debug")
+    ax_dbg.legend()
+    debug_path = RESULTS_DIR / "spectrum_debug.png"
+    fig_dbg.tight_layout()
+    fig_dbg.savefig(debug_path, dpi=150)
+    plt.close(fig_dbg)
+    print(f"Spectrum debug image saved to: {debug_path}")
+
+    # Raw spectrum plot
+    fig_raw, ax_raw = plt.subplots(figsize=(10, 5))
+    ax_raw.plot(energy_axis, spectrum, label="Simulated spectrum (raw)")
+    ax_raw.set_xlabel("Energy (keV)")
+    ax_raw.set_ylabel("Counts")
+    ax_raw.set_title("Simulated gamma spectrum (raw)")
+    ax_raw.legend()
+    img_path_raw = RESULTS_DIR / "spectrum_raw.png"
+    fig_raw.tight_layout()
+    fig_raw.savefig(img_path_raw, dpi=150)
+    plt.close(fig_raw)
+    print(f"Spectrum raw image saved to: {img_path_raw}")
 
 
 if __name__ == "__main__":

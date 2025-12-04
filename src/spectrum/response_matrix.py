@@ -11,8 +11,8 @@ from spectrum.library import Nuclide, NuclideLine
 
 # 電子静止エネルギー
 ME_C2_KEV = 511.0  # keV
-# コンプトン連続対ピーク比（単一ラインあたり） - tuned default (peaks a bit clearer)
-COMPTON_CONTINUUM_TO_PEAK = 0.25
+# コンプトン連続対ピーク比（単一ラインあたり）
+COMPTON_CONTINUUM_TO_PEAK = 0.35
 # バックスキャターピークの強度比 - tuned default
 BACKSCATTER_FRACTION = 0.03
 
@@ -73,23 +73,20 @@ def compton_continuum(
 
 def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np.float64]:
     """
-    エネルギー依存の簡易バックグラウンド形状を返す（最大値で正規化）。
+    CeBr3を想定した簡易バックグラウンド形状を返す（最大値で正規化）。
 
-    - 低エネルギー閾値未満は0
-    - 100 keV付近で膨らみを持ち、高エネルギーに向けて減衰
+    - 100 keV付近に緩やかな膨らみ
+    - それ以降は指数的に減衰
     """
     E = np.asarray(energy_axis_keV, dtype=float)
-    E_thr = 40.0
-    E_scale = 350.0
-    bump_center = 110.0
-    bump_sigma = 40.0
-
-    base = np.exp(-E / E_scale)
-    bump = np.exp(-0.5 * ((E - bump_center) / bump_sigma) ** 2)
-    bg = base + 0.8 * bump
-    bg[E < E_thr] = 0.0
-    if bg.max() > 0:
-        bg = bg / bg.max()
+    bump = np.exp(-0.5 * ((E - 100.0) / 50.0) ** 2)
+    decay = np.exp(-E / 400.0)
+    bg = 0.4 * bump + decay
+    bg[E < 30.0] = 0.0
+    # 総和が1になるよう正規化（bin幅は呼び出し側で扱う）
+    total = bg.sum()
+    if total > 0:
+        bg = bg / total
     return bg
 
 
@@ -97,22 +94,12 @@ def default_resolution() -> Callable[[float], float]:
     """
     CeBr3（2\"×2\"想定）のエネルギー分解能σ(E)を返す関数を生成する。
 
-    FWHM(E) = sqrt(a^2 * E + b^2), sigma = FWHM / 2.355。
-    59.5 keVで約8.7 keV、662 keVで約27 keV、1332 keVで約38 keVとなるように
-    最小二乗で(a^2, b^2)をフィットしたパラメータを用いる。
+    Scionixアプリケーションノートに合わせ、122 keVで約8%、662 keVで約4%、1332 keVで約3%の
+    FWHMとなるように sigma(E) = max(0.5 * sqrt(E) - 1.5, 0.1) を採用する（FWHM=2.355*sigma）。
     """
-    energies = np.array([59.5, 661.7, 1332.5], dtype=float)
-    fwhm_targets = np.array([8.7, 27.0, 38.0], dtype=float)
-    # FWHM^2 = a2 * E + b2 を最小二乗でフィット
-    A = np.vstack([energies, np.ones_like(energies)]).T
-    y = fwhm_targets**2
-    a2, b2 = np.linalg.lstsq(A, y, rcond=None)[0]
-    a_fwhm = np.sqrt(a2)
-    b_fwhm = np.sqrt(b2)
 
     def sigma(energy_keV: float) -> float:
-        fwhm = np.sqrt((a_fwhm**2) * energy_keV + b_fwhm**2)
-        return fwhm / 2.355
+        return max(0.5 * np.sqrt(energy_keV) - 1.5, 0.1)
 
     return sigma
 
@@ -126,33 +113,28 @@ def constant_efficiency(value: float = 1.0) -> Callable[[float], float]:
     return eff
 
 
-def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
+def cebr3_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
     """
-    CeBr3を模した簡易エネルギー依存効率。
+    CeBr3の検出効率を模した簡易モデル。
 
-    - 低エネルギー閾値（~30 keV未満）で0
-    - 80–150 keV付近で最大
-    - 高エネルギーで緩やかに減衰
+    - 30 keV未満は0
+    - 30〜150 keVは高効率（ほぼ1）
+    - 150 keV以降は緩やかにパワー則で減衰
     """
     e = np.asarray(e_keV, dtype=float)
     eff = np.zeros_like(e, dtype=float)
-    # 低エネルギー部（30〜120 keV）を高効率に
-    plateau = (e >= 30.0) & (e <= 120.0)
+    plateau = (e >= 30.0) & (e <= 150.0)
     eff[plateau] = 1.0
-    # 緩やかなロールオフ（>120 keV）をパワーで表現
-    high = e > 120.0
-    x = np.maximum(e[high], 1.0) / 180.0
-    eff[high] = x ** (-0.8)
-    # 低エネルギー閾値未満は0
-    eff[e < 30.0] = 0.0
-    # 最大を1に正規化し、僅かに高エネルギー側を抑制
-    if eff.max() > 0:
-        eff = eff / eff.max()
-    # 高エネルギーに単調減少するよう補正（低エネ優位を強める）
-    eff = np.where(e > 120.0, eff * (100.0 / (e + 1e-9)) ** 0.6, eff)
+    high = e > 150.0
+    eff[high] = (150.0 / np.maximum(e[high], 1e-9)) ** 0.6
     if eff.shape == ():
         return float(eff)
     return eff
+
+
+def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
+    """後方互換のための別名。"""
+    return cebr3_efficiency(e_keV)
 
 
 def build_response_matrix(
@@ -215,6 +197,6 @@ def _nuclide_response(
             if back_norm > 0:
                 area_back = BACKSCATTER_FRACTION * peak_area
                 back *= area_back / back_norm
-                back *= energy_dependent_efficiency(e_back)
+                back *= efficiency_fn(e_back)
                 response += line.intensity * back
     return response

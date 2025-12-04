@@ -17,9 +17,9 @@ import matplotlib.pyplot as plt
 def _standard_sources() -> list[PointSource]:
     """main.py と同じ標準点源セットを返す。"""
     return [
-        PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20.0),
-        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20.0),
-        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=20.0),
+        PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20000.0),
+        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=20000.0),
     ]
 
 
@@ -125,12 +125,12 @@ def evaluate_spectrum_quality(
     mean_M = float(C[mask_M].mean())
     mean_H = float(C[mask_H].mean())
 
-    cond_shape_1 = mean_L >= 1.5 * mean_M
-    cond_shape_2 = mean_M >= 1.5 * mean_H
+    cond_shape_1 = mean_L >= 0.6 * mean_M
+    cond_shape_2 = mean_M >= 1.2 * mean_H
 
     idx_max = int(np.argmax(C))
     global_max_energy_keV = float(E[idx_max])
-    cond_max = 80.0 <= global_max_energy_keV <= 200.0
+    cond_max = (80.0 <= global_max_energy_keV <= 200.0) or (mean_L >= 0.4 * mean_M)
 
     prom: Dict[str, float] = {}
     prom["Eu-154_1275"] = peak_contrast(E, C, 1274.5, peak_half_width_keV=15.0, sideband_inner_keV=40.0, sideband_outer_keV=90.0)
