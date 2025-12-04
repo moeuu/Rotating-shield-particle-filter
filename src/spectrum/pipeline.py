@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
+from measurement.shielding import OctantShield, octant_index_from_normal
 from spectrum.library import Nuclide, default_library
 from spectrum.response_matrix import (
     build_response_matrix,
@@ -26,6 +27,10 @@ from spectrum.peak_detection import detect_peaks
 BACKGROUND_RATE_CPS = 3.0
 # 互換性のための別名
 BACKGROUND_COUNTS_PER_SECOND = BACKGROUND_RATE_CPS
+# ALS基線推定のデフォルトパラメータ
+BASELINE_LAM = 1e5
+BASELINE_P = 0.01
+BASELINE_NITER = 10
 
 @dataclass
 class SpectrumConfig:
@@ -76,11 +81,17 @@ class SpectralDecomposer:
         acquisition_time: float = 1.0,
         rng: np.random.Generator | None = None,
         dead_time_s: float = 0.0,
+        shield_orientation: NDArray[np.float64] | None = None,
+        octant_shield: OctantShield | None = None,
     ) -> Tuple[NDArray[np.float64], Dict[str, float]]:
         """
         点源と環境設定に基づき合成スペクトルを生成する。
 
         戻り値はスペクトル配列と、幾何減衰込みの実効強度辞書。
+
+        Shielding (Sec. 3.4–3.5): if shield_orientation/octant_shield are provided,
+        the line-of-sight is tested via blocks_ray and a 0.1 attenuation factor is
+        applied to the source contribution to reflect attenuated photopeaks.
         """
         env = environment or EnvironmentConfig()
         detector = env.detector()
@@ -91,10 +102,15 @@ class SpectralDecomposer:
                 continue
             geom = inverse_square_scale(detector, source)
             effective_strength = source.intensity_cps_1m * geom
+            atten = 1.0
+            if octant_shield is not None and shield_orientation is not None:
+                oct_idx = octant_index_from_normal(shield_orientation)
+                if octant_shield.blocks_ray(source.position_array(), detector, octant_index=oct_idx):
+                    atten = 0.1
             col_idx = self.isotope_names.index(source.isotope)
             contribution = acquisition_time * effective_strength
-            expected += contribution * self.response_matrix[:, col_idx]
-            effective_strengths[source.isotope] += contribution
+            expected += atten * contribution * self.response_matrix[:, col_idx]
+            effective_strengths[source.isotope] += atten * contribution
 
         # バックグラウンドを加算
         # エイリアスのどちらを更新しても反映されるように値を解決
@@ -112,7 +128,12 @@ class SpectralDecomposer:
     def preprocess(self, spectrum: NDArray[np.float64]) -> NDArray[np.float64]:
         """平滑化とベースライン補正を適用してピーク検出を安定化させる。"""
         smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
-        baseline = asymmetric_least_squares(smoothed, lam=1e6, p=0.005, niter=10)
+        baseline = asymmetric_least_squares(
+            smoothed,
+            lam=BASELINE_LAM,
+            p=BASELINE_P,
+            niter=BASELINE_NITER,
+        )
         corrected = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
         return corrected
 

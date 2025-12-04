@@ -8,6 +8,8 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
+from measurement.shielding import OctantShield, octant_index_from_normal
+
 
 @dataclass(frozen=True)
 class ShieldParams:
@@ -17,25 +19,6 @@ class ShieldParams:
     mu_fe: float = 0.5  # 1/cm at representative energies
     thickness_pb_cm: float = 2.0
     thickness_fe_cm: float = 2.0
-
-
-def _attenuation_factor(
-    unit_vec: NDArray[np.float64],
-    shield_normal: NDArray[np.float64],
-    params: ShieldParams,
-    mu_energy_scale: float,
-) -> float:
-    """
-    シールド法線と入射方向の内積に比例した透過厚みを仮定した簡易減衰係数。
-
-    unit_vec: 源→検出器方向の単位ベクトル
-    shield_normal: シールド面の法線（遮蔽方向）
-    mu_energy_scale: エネルギー依存μをあらかじめ組み込んだスカラー
-    """
-    # シールドに向かう成分のみ遮蔽すると仮定
-    cos_theta = np.clip(np.dot(unit_vec, shield_normal), 0.0, 1.0)
-    path_length = (params.thickness_pb_cm + params.thickness_fe_cm) * cos_theta
-    return float(np.exp(-mu_energy_scale * path_length))
 
 
 class KernelPrecomputer:
@@ -68,6 +51,7 @@ class KernelPrecomputer:
         self.num_sources = candidate_sources.shape[0]
         self.num_poses = poses.shape[0]
         self.num_orient = orientations.shape[0]
+        self.octant_shield = OctantShield()
 
     def geometric_term(self, pose: NDArray[np.float64], source: NDArray[np.float64]) -> float:
         """逆二乗の幾何項 1/(4πd^2)"""
@@ -85,12 +69,13 @@ class KernelPrecomputer:
         """
         単位強度源に対する期待計数カーネル (J,) を返す。
 
-        Includes geometric term and orientation-dependent attenuation.
+        Includes geometric term and simple orientation-dependent attenuation:
+        if the ray falls into the current octant shield, apply factor 0.1 (−90%),
+        otherwise factor 1.0.
         """
-        mu = self.mu_by_isotope.get(isotope, 0.0)
         pose = self.poses[pose_idx]
-        shield_normal = self.orientations[orient_idx]
         kernels = np.zeros(self.num_sources, dtype=float)
+        oct_idx = octant_index_from_normal(self.orientations[orient_idx])
         for j, src in enumerate(self.sources):
             vec = pose - src
             dist = np.linalg.norm(vec)
@@ -98,7 +83,10 @@ class KernelPrecomputer:
                 dist = 1e-6
             unit_vec = vec / dist
             geom = 1.0 / (4.0 * np.pi * dist**2)
-            att = _attenuation_factor(unit_vec, shield_normal, self.shield_params, mu_energy_scale=mu)
+            # Lead/iron扱いを簡略化：blocks_rayがTrueなら0.1、それ以外は1.0
+            blocked_lead = self.octant_shield.blocks_ray(src, pose, octant_index=oct_idx)
+            blocked_iron = self.octant_shield.blocks_ray(src, pose, octant_index=oct_idx)
+            att = 0.1 if (blocked_lead or blocked_iron) else 1.0
             kernels[j] = geom * att
         return kernels
 
@@ -111,6 +99,11 @@ class KernelPrecomputer:
         background: float = 0.0,
         live_time_s: float = 1.0,
     ) -> float:
-        """源強度ベクトルから期待計数を計算する。"""
+        """
+        源強度ベクトルから期待計数を計算する（スペクトル生成用の内部ヘルパ）。
+
+        PF観測は常にスペクトル展開後の同位体別カウントであり、本関数は直接PF入力を
+        生成しないことに注意（コメント目的のみ）。
+        """
         kvec = self.kernel(isotope, pose_idx, orient_idx)
         return float(live_time_s * (np.dot(kvec, source_strengths) + background))

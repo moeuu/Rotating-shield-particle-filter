@@ -12,7 +12,7 @@ from spectrum.library import Nuclide, NuclideLine
 # 電子静止エネルギー
 ME_C2_KEV = 511.0  # keV
 # コンプトン連続対ピーク比（単一ラインあたり）
-COMPTON_CONTINUUM_TO_PEAK = 0.35
+COMPTON_CONTINUUM_TO_PEAK = 2.0  # チューニング開始値
 # バックスキャターピークの強度比 - tuned default
 BACKSCATTER_FRACTION = 0.03
 
@@ -30,6 +30,45 @@ def compton_edge(e_gamma_keV: float) -> float:
     E_edge = E_gamma * (1 - 1 / (1 + 2 * E_gamma / 511 keV))
     """
     return float(e_gamma_keV * (1.0 - 1.0 / (1.0 + 2.0 * e_gamma_keV / ME_C2_KEV)))
+
+
+def compton_edge_energy(e_gamma_keV: float) -> float:
+    """
+    インシデントガンマ線のコンプトン端エネルギー（keV）を返す。
+
+    m_e c^2 = 511 keV を用いた標準式。
+    """
+    return compton_edge(e_gamma_keV)
+
+
+def compton_continuum_shape(
+    energy_bins_keV: NDArray[np.float64],
+    E_gamma_keV: float,
+    shape: str = "exponential",
+) -> NDArray[np.float64]:
+    """
+    単一ガンマ線のコンプトン連続成分を近似し、総和1に正規化した形状を返す。
+
+    - サポートは [0, Compton edge]
+    - shape="exponential"（デフォルト）は低エネルギー優位、"triangular" も選択可
+    """
+    E = energy_bins_keV
+    Ec = compton_edge_energy(E_gamma_keV)
+    mask = (E >= 0.0) & (E <= Ec)
+    continuum = np.zeros_like(E, dtype=float)
+    if not np.any(mask):
+        return continuum
+    if shape == "triangular":
+        continuum[mask] = E[mask] / Ec
+    elif shape == "exponential":
+        tau = Ec / 3.0 if Ec > 0 else 1.0
+        continuum[mask] = np.exp(-E[mask] / tau)
+    else:
+        raise ValueError(f"Unknown Compton shape: {shape}")
+    total = continuum.sum()
+    if total > 0:
+        continuum /= total
+    return continuum
 
 
 def backscatter_energy(e_gamma_keV: float) -> float:
@@ -56,19 +95,14 @@ def compton_continuum(
     - 高エネルギー側へ単調減少
     - 総面積が continuum_to_peak * peak_area となるよう正規化
     """
-    edge = compton_edge(e_gamma_keV)
-    cont = np.zeros_like(energy_axis, dtype=float)
-    mask = (energy_axis > 0.0) & (energy_axis < edge)
-    if not np.any(mask) or peak_area <= 0.0:
-        return cont
-    x = energy_axis[mask] / edge
-    base = (1.0 - x) ** shape_power
+    if peak_area <= 0.0:
+        return np.zeros_like(energy_axis, dtype=float)
+    base = compton_continuum_shape(energy_axis, e_gamma_keV, shape="exponential")
     norm = base.sum() * bin_width_keV
     if norm <= 0:
-        return cont
+        return np.zeros_like(energy_axis, dtype=float)
     scale = (continuum_to_peak * peak_area) / norm
-    cont[mask] = base * scale
-    return cont
+    return base * scale
 
 
 def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -176,13 +210,11 @@ def _nuclide_response(
         sigma = resolution_fn(line.energy_keV)
         peak = gaussian_peak(energy_axis, center=line.energy_keV, sigma=sigma)
         peak_area = peak.sum() * bin_width_keV
-        cont = compton_continuum(
-            energy_axis,
-            e_gamma_keV=line.energy_keV,
-            bin_width_keV=bin_width_keV,
-            peak_area=peak_area,
-            continuum_to_peak=COMPTON_CONTINUUM_TO_PEAK,
-        )
+        # フルエネルギーピークと同じ面積基準でコンプトン連続を付加
+        cont_shape = compton_continuum_shape(energy_axis, line.energy_keV, shape="exponential")
+        if cont_shape.sum() > 0:
+            cont_shape = cont_shape / cont_shape.sum()
+        cont = COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape
         eff = efficiency_fn(line.energy_keV)
         peak *= eff
         cont *= eff

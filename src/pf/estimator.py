@@ -47,7 +47,7 @@ class RotatingShieldPFEstimator:
         self,
         isotopes: Sequence[str],
         candidate_sources: NDArray[np.float64],
-        shield_normals: NDArray[np.float64],
+        shield_normals: NDArray[np.float64] | None,
         mu_by_isotope: Dict[str, float],
         pf_config: RotatingShieldPFConfig | None = None,
         shield_params: ShieldParams | None = None,
@@ -57,7 +57,12 @@ class RotatingShieldPFEstimator:
         self.shield_params = shield_params or ShieldParams()
         # 測定姿勢は逐次追加するので空で初期化
         self.poses: List[NDArray[np.float64]] = []
-        self.normals = shield_normals
+        if shield_normals is None:
+            from measurement.shielding import generate_octant_orientations
+
+            self.normals = generate_octant_orientations()
+        else:
+            self.normals = shield_normals
         self.mu_by_isotope = mu_by_isotope
         self.kernel_cache: KernelPrecomputer | None = None
         self.filters: Dict[str, IsotopeParticleFilter] = {}
@@ -140,7 +145,14 @@ class RotatingShieldPFEstimator:
         """簡易情報利得：予測強度の分散を用いた指標（Sec. 3.5.2簡略版）。"""
         score = 0.0
         for iso, f in self.filters.items():
-            lam = f.expected_counts(pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s)
+            # Expected counts approximation using current strengths; used only for IG heuristic.
+            lam = np.zeros(f.N, dtype=float)
+            for i, st in enumerate(f.states):
+                contrib = 0.0
+                for idx_src, strength in zip(st.source_indices, st.strengths):
+                    kvec = f.kernel.kernel(iso, pose_idx, orient_idx)
+                    contrib += kvec[idx_src] * strength
+                lam[i] = live_time_s * (contrib + st.background)
             w = np.exp(f.log_weights)
             mean = float(np.sum(w * lam))
             var = float(np.sum(w * (lam - mean) ** 2))
@@ -151,7 +163,13 @@ class RotatingShieldPFEstimator:
         """全同位体の予測強度分散を足し上げた簡易不確実性指標。"""
         total = 0.0
         for iso, f in self.filters.items():
-            lam = f.expected_counts(pose_idx=pose_idx, orient_idx=0, live_time_s=live_time_s)
+            lam = np.zeros(f.N, dtype=float)
+            for i, st in enumerate(f.states):
+                contrib = 0.0
+                for idx_src, strength in zip(st.source_indices, st.strengths):
+                    kvec = f.kernel.kernel(iso, pose_idx, 0)
+                    contrib += kvec[idx_src] * strength
+                lam[i] = live_time_s * (contrib + st.background)
             w = np.exp(f.log_weights)
             mean = float(np.sum(w * lam))
             var = float(np.sum(w * (lam - mean) ** 2))

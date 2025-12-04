@@ -5,6 +5,8 @@ import numpy as np
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.state import ParticleState
+from measurement.model import EnvironmentConfig, PointSource
+from spectrum.pipeline import SpectralDecomposer
 
 
 def test_prune_spurious_source_best_case_measurement() -> None:
@@ -26,14 +28,17 @@ def test_prune_spurious_source_best_case_measurement() -> None:
     estimator._ensure_kernel_cache()
 
     true_strength = 200.0
-    observed_z = estimator.kernel_cache.expected_counts(
-        "Cs-137",
-        pose_idx=0,
-        orient_idx=0,
-        source_strengths=np.array([true_strength, 0.0]),
-        background=0.0,
-        live_time_s=1.0,
+    decomposer = SpectralDecomposer()
+    env = EnvironmentConfig(detector_position=(1.0, 0.0, 0.0))
+    sources = [
+        PointSource("Cs-137", position=tuple(candidate_sources[0]), intensity_cps_1m=true_strength),
+        PointSource("Cs-137", position=tuple(candidate_sources[1]), intensity_cps_1m=5.0),
+    ]
+    spectrum, _ = decomposer.simulate_spectrum(
+        sources=sources, environment=env, acquisition_time=1.0, rng=np.random.default_rng(0)
     )
+    observed_counts = decomposer.isotope_counts(spectrum)
+    observed_z = observed_counts["Cs-137"]
     estimator.update(z_k={"Cs-137": observed_z}, pose_idx=0, orient_idx=0, live_time_s=1.0)
 
     states = [

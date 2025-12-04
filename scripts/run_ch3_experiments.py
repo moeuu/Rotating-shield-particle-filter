@@ -20,8 +20,11 @@ from typing import Dict, Iterable, List
 
 import numpy as np
 
+from measurement.model import EnvironmentConfig, PointSource
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
+from measurement.shielding import OctantShield
+from spectrum.pipeline import SpectralDecomposer
 
 
 @dataclass(frozen=True)
@@ -78,30 +81,30 @@ def _simulate_measurements(
     """
     Simulate isotope-wise counts z_k using the same kernel and poses as the PF.
 
-    Uses Λ_{k,h} from Sec. 3.4.3 with Poisson sampling.
+    Uses spectral simulation + unfolding (Sec. 2.5.7 + Sec. 3.4.3) so PF observes
+    isotope-wise counts derived from spectra, not direct kernel means.
     """
-    kernel: KernelPrecomputer = est.kernel_cache  # type: ignore[assignment]
-    source_strengths: Dict[str, np.ndarray] = {}
-    for iso in est.isotopes:
-        vec = np.zeros(scn.candidate_sources.shape[0], dtype=float)
-        for ts in scn.true_sources:
-            if ts.isotope == iso:
-                vec[ts.candidate_index] += ts.strength
-        source_strengths[iso] = vec
+    oct_shield = OctantShield()
+    decomposer = SpectralDecomposer()
 
     for k, pose in enumerate(scn.poses):
         orient_idx = k % scn.normals.shape[0]
         z_k: Dict[str, float] = {}
-        for iso in est.isotopes:
-            lam = kernel.expected_counts(
-                isotope=iso,
-                pose_idx=k,
-                orient_idx=orient_idx,
-                source_strengths=source_strengths[iso],
-                background=scn.background.get(iso, 0.0),
-                live_time_s=scn.live_time_s,
-            )
-            z_k[iso] = float(rng.poisson(lam=lam))
+        env = EnvironmentConfig(detector_position=tuple(pose.tolist()))
+        orientation = scn.normals[orient_idx]
+        sources = [
+            PointSource(ts.isotope, position=tuple(scn.candidate_sources[ts.candidate_index].tolist()), intensity_cps_1m=ts.strength)
+            for ts in scn.true_sources
+        ]
+        spectrum, _ = decomposer.simulate_spectrum(
+            sources=sources,
+            environment=env,
+            acquisition_time=scn.live_time_s,
+            rng=rng,
+            shield_orientation=orientation,
+            octant_shield=oct_shield,
+        )
+        z_k = decomposer.isotope_counts(spectrum)
         yield z_k
 
 

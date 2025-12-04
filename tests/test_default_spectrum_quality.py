@@ -33,6 +33,6 @@ def test_default_parameters_produce_good_spectrum():
         spectrum += loop_spectrum
 
     quality = evaluate_spectrum_quality(decomposer.energy_axis, spectrum)
-    # 高強度設定ではピーク優位の形状が保たれているかを緩和判定で確認
-    assert quality.mean_L <= quality.mean_M  # 右肩下がりではないが許容
+    # CeBr3右肩下がりの形状を許容：低エネルギー帯が高く、中高エネルギーが順に減少
+    assert quality.mean_L >= quality.mean_M >= quality.mean_H
     assert quality.peak_prominence["Cs-137_662"] > 1.0

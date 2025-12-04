@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import argparse
 
 import numpy as np
 
@@ -25,6 +26,7 @@ if str(SRC) not in sys.path:
 RESULTS_DIR = ROOT / "results" / "spectrum"
 
 from measurement.model import EnvironmentConfig, PointSource
+from measurement.shielding import OctantShield, generate_octant_orientations
 from spectrum.pipeline import SpectralDecomposer
 from spectrum.library import default_library
 from spectrum.tuning import evaluate_spectrum_quality
@@ -65,27 +67,62 @@ def fill_peak_area(
 
 def main() -> None:
     """Simulate a spectrum and print decomposition results."""
-    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 1.0))
+    parser = argparse.ArgumentParser(description="Simulate gamma spectrum demo.")
+    parser.add_argument("--compton-continuum-to-peak", type=float, default=None, help="Continuum-to-peak area ratio")
+    parser.add_argument("--als-lambda", type=float, default=None, help="ALS baseline lambda")
+    parser.add_argument("--als-p", type=float, default=None, help="ALS baseline asymmetry p")
+    parser.add_argument("--als-iters", type=int, default=None, help="ALS baseline iterations")
+    args = parser.parse_args()
+
+    from spectrum import response_matrix
+    from spectrum import pipeline as pipeline_mod
+
+    if args.compton_continuum_to_peak is not None:
+        response_matrix.COMPTON_CONTINUUM_TO_PEAK = args.compton_continuum_to_peak
+    if args.als_lambda is not None:
+        pipeline_mod.BASELINE_LAM = args.als_lambda
+    if args.als_p is not None:
+        pipeline_mod.BASELINE_P = args.als_p
+    if args.als_iters is not None:
+        pipeline_mod.BASELINE_NITER = args.als_iters
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(5.0, 10.0, 5.0))
     acquisition_time = 3.0
     loops = 40
     dead_time_s = 2e-8
     detector_pos = env.detector()
     sources = [
-        PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20000.0),
-        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20000.0),
-        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=20000.0),
+        PointSource("Cs-137", position=(8.0, 12.0, 8.0), intensity_cps_1m=20000.0),
+        # Place Co-60 so the (-,-,-) octant also blocks it
+        PointSource("Co-60", position=(7.0, 13.0, 6.0), intensity_cps_1m=20000.0),
+        # Place Eu-154 so it is also blocked (all components negative toward detector)
+        PointSource("Eu-154", position=(7.0, 12.5, 7.0), intensity_cps_1m=20000.0),
     ]
     decomposer = SpectralDecomposer()
     energy_axis = decomposer.energy_axis
     rng = np.random.default_rng(42)
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    spectrum_blocked = np.zeros_like(decomposer.energy_axis, dtype=float)
     spectra_series: list[np.ndarray] = []
     effective_loop = None
+    octant_shield = OctantShield()
+    orientations = generate_octant_orientations()
+    # Block Cs-137 only: vector from Cs (8,12,8) to detector (5,10,5) is negative in all axes
+    blocking_orient = orientations[7]
     for _ in range(loops):
         loop_spectrum, loop_effective = decomposer.simulate_spectrum(
             sources, environment=env, acquisition_time=acquisition_time, rng=rng, dead_time_s=dead_time_s
         )
+        loop_spectrum_blocked, _ = decomposer.simulate_spectrum(
+            sources,
+            environment=env,
+            acquisition_time=acquisition_time,
+            rng=rng,
+            dead_time_s=dead_time_s,
+            shield_orientation=blocking_orient,
+            octant_shield=octant_shield,
+        )
         spectrum += loop_spectrum
+        spectrum_blocked += loop_spectrum_blocked
         spectra_series.append(loop_spectrum)
         effective_loop = loop_effective
     effective = {k: v * loops for k, v in (effective_loop or {}).items()}
@@ -97,6 +134,10 @@ def main() -> None:
     print(f"Detector position: {detector_pos.tolist()}")
     for src in sources:
         print(f"  {src.isotope} @ {src.position} -> {src.intensity_cps_1m:.0f} cps at 1 m")
+    print(f"Shield orientation (blocking): {blocking_orient.tolist()}")
+    for src in sources:
+        blocked = octant_shield.blocks_ray(np.array(src.position), detector_pos, octant_index=7)
+        print(f"  Shield blocks {src.isotope}: {blocked}")
     print(f"Acquisition: {loops} loops x {acquisition_time:.1f} s = {loops*acquisition_time:.1f} s")
     print(f"Dead time (non-paralyzable): {dead_time_s:.1e} s")
 
@@ -126,8 +167,21 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     # Apply smoothing and baseline correction for plotting/CSV
     smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
-    baseline = asymmetric_least_squares(smoothed, lam=1e6, p=0.005, niter=10)
+    smoothed_blocked = gaussian_smooth(spectrum_blocked, sigma_bins=2.0)
+    baseline = asymmetric_least_squares(
+        smoothed,
+        lam=pipeline_mod.BASELINE_LAM,
+        p=pipeline_mod.BASELINE_P,
+        niter=pipeline_mod.BASELINE_NITER,
+    )
+    baseline_blocked = asymmetric_least_squares(
+        smoothed_blocked,
+        lam=pipeline_mod.BASELINE_LAM,
+        p=pipeline_mod.BASELINE_P,
+        niter=pipeline_mod.BASELINE_NITER,
+    )
     processed = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
+    processed_blocked = np.clip(smoothed_blocked - baseline_blocked, a_min=0.0, a_max=None)
 
     output = np.column_stack([energy_axis, processed])
     out_path = RESULTS_DIR / "spectrum.csv"
@@ -135,10 +189,11 @@ def main() -> None:
     print(f"\nSpectrum saved to: {out_path}")
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(energy_axis, processed, label="Simulated spectrum (processed)")
+    ax.plot(energy_axis, processed, label="Unshielded (processed)")
+    ax.plot(energy_axis, processed_blocked, label="Shielded (Cs-137 blocked)", alpha=0.8)
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
-    ax.set_title("Simulated gamma spectrum")
+    ax.set_title("Simulated gamma spectrum (with shielding comparison)")
     # Mark key photopeaks for readability
     peak_definitions = [
         (662.0, "Cs-137"),
@@ -154,7 +209,8 @@ def main() -> None:
     for e, label in peak_definitions:
         ax.axvline(e, linestyle="--", alpha=0.5)
         ax.text(e, ymax * 0.95, label, rotation=90, va="top", ha="center", fontsize=8)
-        fill_peak_area(ax, energy_axis, processed, peak_energy_keV=e, window_keV=40.0, alpha=0.3)
+        fill_peak_area(ax, energy_axis, processed, peak_energy_keV=e, window_keV=40.0, alpha=0.15)
+        fill_peak_area(ax, energy_axis, processed_blocked, peak_energy_keV=e, window_keV=40.0, alpha=0.15)
     ax.legend()
     img_path = RESULTS_DIR / "spectrum.png"
     fig.tight_layout()
@@ -165,9 +221,13 @@ def main() -> None:
     # 基線確認用のデバッグ図を保存
     fig_dbg, ax_dbg = plt.subplots(figsize=(10, 5))
     ax_dbg.plot(energy_axis, spectrum, label="Raw")
+    ax_dbg.plot(energy_axis, spectrum_blocked, label="Raw shielded")
     ax_dbg.plot(energy_axis, smoothed, label="Smoothed")
+    ax_dbg.plot(energy_axis, smoothed_blocked, label="Smoothed shielded")
     ax_dbg.plot(energy_axis, baseline, label="Baseline")
+    ax_dbg.plot(energy_axis, baseline_blocked, label="Baseline shielded")
     ax_dbg.plot(energy_axis, processed, label="Corrected")
+    ax_dbg.plot(energy_axis, processed_blocked, label="Corrected shielded")
     ax_dbg.set_xlabel("Energy (keV)")
     ax_dbg.set_ylabel("Counts")
     ax_dbg.set_title("Baseline debug")
@@ -178,18 +238,32 @@ def main() -> None:
     plt.close(fig_dbg)
     print(f"Spectrum debug image saved to: {debug_path}")
 
-    # Raw spectrum plot
+    # Raw spectra plots: unshielded and shielded positions
     fig_raw, ax_raw = plt.subplots(figsize=(10, 5))
-    ax_raw.plot(energy_axis, spectrum, label="Simulated spectrum (raw)")
+    ax_raw.plot(energy_axis, spectrum, label="Unshielded spectrum (raw)")
+    ax_raw.plot(energy_axis, spectrum_blocked, label="Shielded spectrum (raw, Cs-137 attenuated)")
     ax_raw.set_xlabel("Energy (keV)")
     ax_raw.set_ylabel("Counts")
-    ax_raw.set_title("Simulated gamma spectrum (raw)")
+    ax_raw.set_title("Gamma spectra (raw)")
     ax_raw.legend()
     img_path_raw = RESULTS_DIR / "spectrum_raw.png"
     fig_raw.tight_layout()
     fig_raw.savefig(img_path_raw, dpi=150)
     plt.close(fig_raw)
-    print(f"Spectrum raw image saved to: {img_path_raw}")
+    print(f"Raw spectra image saved to: {img_path_raw}")
+
+    # Shielded-only raw for quick inspection
+    fig_atten, ax_atten = plt.subplots(figsize=(10, 5))
+    ax_atten.plot(energy_axis, spectrum_blocked, label="Shielded spectrum (raw)")
+    ax_atten.set_xlabel("Energy (keV)")
+    ax_atten.set_ylabel("Counts")
+    ax_atten.set_title("Shielded gamma spectrum (raw, Cs-137 attenuated)")
+    ax_atten.legend()
+    img_path_atten = RESULTS_DIR / "spectrum_atten.png"
+    fig_atten.tight_layout()
+    fig_atten.savefig(img_path_atten, dpi=150)
+    plt.close(fig_atten)
+    print(f"Shielded spectrum image saved to: {img_path_atten}")
 
 
 if __name__ == "__main__":

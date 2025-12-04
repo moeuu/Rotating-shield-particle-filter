@@ -69,8 +69,15 @@ class IsotopeParticleFilter:
             max_sources=self.config.max_sources,
         )
 
-    def expected_counts(self, pose_idx: int, orient_idx: int, live_time_s: float) -> NDArray[np.float64]:
-        """各粒子の期待計数を返す。"""
+    def update(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
+        """
+        ポアソン重み更新。
+
+        Note: z_obs はスペクトル展開（Sec. 2.5.7）から得た同位体別カウントを想定。
+        ここでの期待値推定はあくまで内部モデルであり、直接観測を生成しない。
+        """
+        # PF now consumes isotope-wise counts from spectrum unfolding; expected rate
+        # is approximated using current strengths and geometric kernels.
         lam = np.zeros(self.N, dtype=float)
         for i, st in enumerate(self.states):
             contrib = 0.0
@@ -78,11 +85,6 @@ class IsotopeParticleFilter:
                 kvec = self.kernel.kernel(self.isotope, pose_idx, orient_idx)
                 contrib += kvec[idx_src] * strength
             lam[i] = live_time_s * (contrib + st.background)
-        return lam
-
-    def update(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
-        """ポアソン重み更新。"""
-        lam = self.expected_counts(pose_idx, orient_idx, live_time_s)
         self.log_weights = log_weight_update_poisson(self.log_weights, z_obs=z_obs, lambda_exp=lam)
         self._maybe_resample()
 
