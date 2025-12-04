@@ -11,8 +11,8 @@ from spectrum.library import Nuclide, NuclideLine
 
 # 電子静止エネルギー
 ME_C2_KEV = 511.0  # keV
-# コンプトン連続対ピーク比（単一ラインあたり） - tuned default
-COMPTON_CONTINUUM_TO_PEAK = 0.4
+# コンプトン連続対ピーク比（単一ラインあたり） - tuned default (peaks a bit clearer)
+COMPTON_CONTINUUM_TO_PEAK = 0.25
 # バックスキャターピークの強度比 - tuned default
 BACKSCATTER_FRACTION = 0.03
 
@@ -93,11 +93,26 @@ def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np
     return bg
 
 
-def default_resolution(a: float = 0.8, b: float = 1.5) -> Callable[[float], float]:
-    """エネルギー分解能σ(E)=a*sqrt(E)+bを返す関数を生成する。"""
+def default_resolution() -> Callable[[float], float]:
+    """
+    CeBr3（2\"×2\"想定）のエネルギー分解能σ(E)を返す関数を生成する。
+
+    FWHM(E) = sqrt(a^2 * E + b^2), sigma = FWHM / 2.355。
+    59.5 keVで約8.7 keV、662 keVで約27 keV、1332 keVで約38 keVとなるように
+    最小二乗で(a^2, b^2)をフィットしたパラメータを用いる。
+    """
+    energies = np.array([59.5, 661.7, 1332.5], dtype=float)
+    fwhm_targets = np.array([8.7, 27.0, 38.0], dtype=float)
+    # FWHM^2 = a2 * E + b2 を最小二乗でフィット
+    A = np.vstack([energies, np.ones_like(energies)]).T
+    y = fwhm_targets**2
+    a2, b2 = np.linalg.lstsq(A, y, rcond=None)[0]
+    a_fwhm = np.sqrt(a2)
+    b_fwhm = np.sqrt(b2)
 
     def sigma(energy_keV: float) -> float:
-        return a * np.sqrt(energy_keV) + b
+        fwhm = np.sqrt((a_fwhm**2) * energy_keV + b_fwhm**2)
+        return fwhm / 2.355
 
     return sigma
 
@@ -113,18 +128,28 @@ def constant_efficiency(value: float = 1.0) -> Callable[[float], float]:
 
 def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
     """
-    NaI(Tl)/CeBr3を模した簡易エネルギー依存効率。
+    CeBr3を模した簡易エネルギー依存効率。
 
-    - 低エネルギー閾値（40 keV未満）でほぼ0
-    - 80–200 keV付近が高効率
-    - 数MeVに向けて徐々に低下
+    - 低エネルギー閾値（~30 keV未満）で0
+    - 80–150 keV付近で最大
+    - 高エネルギーで緩やかに減衰
     """
     e = np.asarray(e_keV, dtype=float)
-    x = np.maximum(e, 40.0) / 300.0
-    eff = x ** (-0.4)
-    eff = np.clip(eff, 0.1, 1.0)
-    eff = np.where(e < 40.0, 0.0, eff)
-    # スカラー入力時はスカラーで返す
+    eff = np.zeros_like(e, dtype=float)
+    # 低エネルギー部（30〜120 keV）を高効率に
+    plateau = (e >= 30.0) & (e <= 120.0)
+    eff[plateau] = 1.0
+    # 緩やかなロールオフ（>120 keV）をパワーで表現
+    high = e > 120.0
+    x = np.maximum(e[high], 1.0) / 180.0
+    eff[high] = x ** (-0.8)
+    # 低エネルギー閾値未満は0
+    eff[e < 30.0] = 0.0
+    # 最大を1に正規化し、僅かに高エネルギー側を抑制
+    if eff.max() > 0:
+        eff = eff / eff.max()
+    # 高エネルギーに単調減少するよう補正（低エネ優位を強める）
+    eff = np.where(e > 120.0, eff * (100.0 / (e + 1e-9)) ** 0.6, eff)
     if eff.shape == ():
         return float(eff)
     return eff

@@ -24,6 +24,8 @@ class PFConfig:
     resample_threshold: float = 0.5  # relative to N
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
+    min_strength: float = 0.01
+    p_birth: float = 0.05
 
 
 class IsotopeParticleFilter:
@@ -48,15 +50,23 @@ class IsotopeParticleFilter:
         self.states = []
         J = self.kernel.num_sources
         for _ in range(self.N):
-            idx = np.random.choice(J, size=self.config.max_sources, replace=True)
-            strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=self.config.max_sources))
+            r = np.random.randint(1, self.config.max_sources + 1)
+            replace = r > J
+            idx = np.random.choice(J, size=r, replace=replace)
+            strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=r))
             self.states.append(ParticleState(source_indices=idx.astype(np.int32), strengths=strengths, background=0.1))
         self.log_weights = np.log(np.ones(self.N) / self.N)
 
     def predict(self) -> None:
         """位置は固定グリッドなので予測ステップは強度と背景の拡散に限定。"""
         self.states = regularize_states(
-            self.states, strength_sigma=self.config.strength_sigma, background_sigma=self.config.background_sigma
+            self.states,
+            kernel=self.kernel,
+            strength_sigma=self.config.strength_sigma,
+            background_sigma=self.config.background_sigma,
+            min_strength=self.config.min_strength,
+            p_birth=self.config.p_birth,
+            max_sources=self.config.max_sources,
         )
 
     def expected_counts(self, pose_idx: int, orient_idx: int, live_time_s: float) -> NDArray[np.float64]:
@@ -86,12 +96,22 @@ class IsotopeParticleFilter:
             self.predict()
 
     def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """源位置と強度の単純加重平均推定を返す。"""
+        """
+        源位置と強度の単純加重平均推定を返す。
+
+        可変源数に対応するため、候補グリッドごとに加重平均強度を集計し、
+        上位max_sourcesを出力する。
+        """
         w = np.exp(self.log_weights)
-        pos_accum = np.zeros((len(self.states[0].source_indices), 3))
-        strength_accum = np.zeros(len(self.states[0].source_indices))
+        strength_accum = np.zeros(self.kernel.num_sources, dtype=float)
         for st, wi in zip(self.states, w):
-            for j, idx_src in enumerate(st.source_indices):
-                pos_accum[j] += wi * self.kernel.sources[idx_src]
-                strength_accum[j] += wi * st.strengths[j]
-        return pos_accum, strength_accum
+            for idx_src, strength in zip(st.source_indices, st.strengths):
+                strength_accum[idx_src] += wi * strength
+        positive = np.nonzero(strength_accum > 0.0)[0]
+        if positive.size == 0:
+            return np.zeros((0, 3)), np.zeros(0)
+        order = np.argsort(strength_accum[positive])[::-1]
+        selected = positive[order][: self.config.max_sources]
+        positions = self.kernel.sources[selected]
+        strengths = strength_accum[selected]
+        return positions, strengths

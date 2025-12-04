@@ -11,6 +11,7 @@ from measurement.model import EnvironmentConfig, PointSource
 from spectrum.pipeline import SpectralDecomposer
 import spectrum.response_matrix as response_matrix
 import spectrum.pipeline as pipeline
+import matplotlib.pyplot as plt
 
 
 def _standard_sources() -> list[PointSource]:
@@ -111,31 +112,31 @@ def evaluate_spectrum_quality(
     spectrum: NDArray[np.float64],
 ) -> SpectrumQuality:
     """
-    右肩下がり形状と主ピーク顕著度にもとづきスペクトル品質を評価する。
+    CeBr3想定の右肩下がり形状と主ピーク顕著度にもとづきスペクトル品質を評価する。
     """
     E = energy_keV
     C = spectrum
 
     mask_L = (E >= 80.0) & (E <= 200.0)
     mask_M = (E >= 400.0) & (E <= 800.0)
-    mask_H = (E >= 800.0) & (E <= 1500.0)
+    mask_H = (E >= 1200.0) & (E <= 1600.0)
 
     mean_L = float(C[mask_L].mean())
     mean_M = float(C[mask_M].mean())
     mean_H = float(C[mask_H].mean())
 
     cond_shape_1 = mean_L >= 1.5 * mean_M
-    cond_shape_2 = mean_M >= 1.3 * mean_H
+    cond_shape_2 = mean_M >= 1.5 * mean_H
 
     idx_max = int(np.argmax(C))
     global_max_energy_keV = float(E[idx_max])
     cond_max = 80.0 <= global_max_energy_keV <= 200.0
 
     prom: Dict[str, float] = {}
-    prom["Eu-154_1275"] = peak_contrast(E, C, 1274.5, peak_half_width_keV=15.0)
-    prom["Cs-137_662"] = peak_contrast(E, C, 662.0)
-    prom["Co-60_1173"] = peak_contrast(E, C, 1173.0)
-    prom["Co-60_1332"] = peak_contrast(E, C, 1332.0)
+    prom["Eu-154_1275"] = peak_contrast(E, C, 1274.5, peak_half_width_keV=15.0, sideband_inner_keV=40.0, sideband_outer_keV=90.0)
+    prom["Cs-137_662"] = peak_contrast(E, C, 662.0, peak_half_width_keV=12.0, sideband_inner_keV=40.0, sideband_outer_keV=90.0)
+    prom["Co-60_1173"] = peak_contrast(E, C, 1173.0, peak_half_width_keV=15.0, sideband_inner_keV=50.0, sideband_outer_keV=100.0)
+    prom["Co-60_1332"] = peak_contrast(E, C, 1332.0, peak_half_width_keV=15.0, sideband_inner_keV=50.0, sideband_outer_keV=100.0)
 
     cond_peak_eu = prom["Eu-154_1275"] >= 1.2
     cond_peak_cs137 = prom["Cs-137_662"] >= 1.5
@@ -232,6 +233,36 @@ def print_grid_search_result() -> None:
 def get_best_parameters() -> tuple[float, float, float, SpectrumQuality]:
     """デフォルトグリッドとrng_seed=0でグリッドサーチを実行しベストを返す。"""
     return grid_search_parameters(rng_seed=0)
+
+
+def plot_cebr3_reference_spectrum() -> None:
+    """
+    チューニング済みデフォルトでの参照スペクトルを描画・保存する。
+
+    - 662, 1332 keV付近にラベルを付与
+    - results/spectrum/cebr3_reference.png に保存
+    """
+    c, b, bg, _ = get_best_parameters()
+    E, spec = simulate_reference_spectrum(
+        continuum_to_peak=c, backscatter_fraction=b, background_rate_cps=bg, rng_seed=0
+    )
+    from pathlib import Path
+    results_dir = Path(__file__).resolve().parents[2] / "results" / "spectrum"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(E, spec, label="CeBr3-like reference")
+    for energy, label in [(662.0, "Cs-137"), (1332.0, "Co-60"), (1173.0, "Co-60")]:
+        ax.axvline(energy, color="r", linestyle="--", alpha=0.5)
+        ax.text(energy + 5, max(spec) * 0.05, label, rotation=90, va="bottom", fontsize=8)
+    ax.set_xlabel("Energy (keV)")
+    ax.set_ylabel("Counts")
+    ax.set_title("CeBr3-like reference spectrum")
+    ax.legend()
+    fig.tight_layout()
+    out_path = results_dir / "cebr3_reference.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved CeBr3 reference spectrum to {out_path}")
 
 
 if __name__ == "__main__":

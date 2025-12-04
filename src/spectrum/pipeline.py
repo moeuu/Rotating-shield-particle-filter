@@ -22,8 +22,8 @@ from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
 from spectrum.peak_detection import detect_peaks
 
-# バックグラウンド強度（counts/s） - tuned default
-BACKGROUND_RATE_CPS = 5.0
+# バックグラウンド強度（counts/s） - tuned default (lower to highlight peaks)
+BACKGROUND_RATE_CPS = 2.0
 # 互換性のための別名
 BACKGROUND_COUNTS_PER_SECOND = BACKGROUND_RATE_CPS
 
@@ -54,7 +54,7 @@ class SpectralDecomposer:
         self.config = spectrum_config or SpectrumConfig()
         self.library = library or default_library()
         self.energy_axis = self.config.energy_axis()
-        self.resolution_fn = default_resolution(a=self.config.resolution_a, b=self.config.resolution_b)
+        self.resolution_fn = default_resolution()
         # エネルギー依存効率に切り替え
         from spectrum.response_matrix import energy_dependent_efficiency
 

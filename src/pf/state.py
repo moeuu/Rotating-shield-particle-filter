@@ -27,14 +27,13 @@ class ParticleState:
 
 def jitter_state(
     state: ParticleState,
-    grid_size: int,
     strength_sigma: float = 0.1,
     background_sigma: float = 0.1,
 ) -> ParticleState:
     """リサンプリング後のわずかな揺らぎを加える。"""
     new_state = state.copy()
-    noise = np.random.normal(scale=strength_sigma, size=new_state.strengths.shape)
-    new_state.strengths = np.clip(new_state.strengths + noise, a_min=0.0, a_max=None)
+    if new_state.strengths.size:
+        noise = np.random.normal(scale=strength_sigma, size=new_state.strengths.shape)
+        new_state.strengths = np.clip(new_state.strengths + noise, a_min=0.0, a_max=None)
     new_state.background = max(0.0, new_state.background + np.random.normal(scale=background_sigma))
-    # 位置はグリッドインデックスのままにする
     return new_state

@@ -1,4 +1,8 @@
-"""Demo script to simulate and decompose a gamma spectrum from three point sources."""
+"""Demo script to simulate and decompose a gamma spectrum from three point sources.
+
+Detector assumptions: 2"x2" CeBr3 scintillator with CeBr3-like energy resolution and
+right-shoulder-down continuum; includes weak intrinsic/background continuum.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +32,35 @@ from counts.isotope_sequence import build_isotope_count_sequence
 import matplotlib.pyplot as plt
 
 
+def fill_peak_area(
+    ax: plt.Axes,
+    energy_axis: np.ndarray,
+    spectrum: np.ndarray,
+    peak_energy_keV: float,
+    window_keV: float = 40.0,
+    alpha: float = 0.3,
+) -> None:
+    """
+    Visually highlight the net peak area around a known photopeak.
+
+    - Select a symmetric energy window [E0 - window_keV, E0 + window_keV].
+    - Within that window, define a simple linear baseline between the two
+      end points of the spectrum.
+    - Shade the area between this baseline and the spectrum curve.
+    - Do not modify the data; this is visualization only.
+    """
+    mask = (energy_axis >= peak_energy_keV - window_keV) & (energy_axis <= peak_energy_keV + window_keV)
+    if not np.any(mask):
+        return
+    x = energy_axis[mask]
+    y = spectrum[mask]
+    x0, x1 = x[0], x[-1]
+    y0, y1 = y[0], y[-1]
+    baseline = y0 + (y1 - y0) * (x - x0) / (x1 - x0 + 1e-9)
+    upper = np.maximum(y, baseline)
+    ax.fill_between(x, baseline, upper, alpha=alpha)
+
+
 def main() -> None:
     """Simulate a spectrum and print decomposition results."""
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
@@ -35,8 +68,8 @@ def main() -> None:
     loops = 120
     sources = [
         PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20.0),
-        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20.0),
-        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=20.0),
+        PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=30.0),
+        PointSource("Eu-154", position=(5.0, 9.4, 4.6), intensity_cps_1m=30.0),
     ]
     decomposer = SpectralDecomposer()
     rng = np.random.default_rng(42)
@@ -110,6 +143,22 @@ def main() -> None:
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
     ax.set_title("Simulated gamma spectrum")
+    # Mark key photopeaks for readability
+    peak_definitions = [
+        (662.0, "Cs-137"),
+        (1173.0, "Co-60"),
+        (1332.0, "Co-60"),
+        (723.0, "Eu-154"),
+        (873.0, "Eu-154"),
+        (996.0, "Eu-154"),
+        (1275.0, "Eu-154"),
+        (1408.0, "Eu-154"),
+    ]
+    ymin, ymax = ax.get_ylim()
+    for e, label in peak_definitions:
+        ax.axvline(e, linestyle="--", alpha=0.5)
+        ax.text(e, ymax * 0.95, label, rotation=90, va="top", ha="center", fontsize=8)
+        fill_peak_area(ax, energy_axis, spectrum, peak_energy_keV=e, window_keV=40.0, alpha=0.3)
     ax.legend()
     img_path = RESULTS_DIR / "spectrum.png"
     fig.tight_layout()

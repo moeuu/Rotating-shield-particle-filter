@@ -7,7 +7,7 @@ from spectrum.response_matrix import energy_dependent_efficiency
 
 def test_efficiency_low_energy_threshold():
     """40 keV未満ではほぼ0となることを確認する。"""
-    val = energy_dependent_efficiency(10.0)
+    val = energy_dependent_efficiency(20.0)
     assert val == 0.0
 
 
@@ -25,3 +25,15 @@ def test_efficiency_array_input():
     assert eff.shape == energies.shape
     assert eff[0] == 0.0
     assert eff[1] > 0.0
+
+
+def test_efficiency_ratios_and_order():
+    """CeBr3らしい比率と単調性を確認する。"""
+    e1 = energy_dependent_efficiency(59.5)
+    e2 = energy_dependent_efficiency(662.0)
+    e3 = energy_dependent_efficiency(1332.0)
+    assert e1 > e2 > e3
+    ratio = e1 / e3
+    assert 3.5 < ratio < 6.0
+    # 高エネルギーで減少が続くこと
+    assert energy_dependent_efficiency(500.0) > energy_dependent_efficiency(1332.0) > energy_dependent_efficiency(2000.0)
