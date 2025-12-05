@@ -1,4 +1,9 @@
-"""Define per-isotope particle state vectors (source count, positions, intensities, background)."""
+"""Define per-isotope particle state vectors (source count, positions, intensities, background).
+
+Two representations exist while transitioning to the Chapter 3.3 formulation:
+- `IsotopeState`: continuous 3D positions (s_{h,m}), strengths (q_{h,m}), background b_h.
+- `ParticleState`: legacy grid-index representation (kept temporarily for compatibility).
+"""
 
 from __future__ import annotations
 
@@ -10,8 +15,29 @@ from numpy.typing import NDArray
 
 
 @dataclass
+class IsotopeState:
+    """
+    Continuous PF state for a single isotope (Sec. 3.3.2):
+        θ_h = (r_h, {s_{h,m}}, {q_{h,m}}, b_h)
+    """
+
+    num_sources: int
+    positions: NDArray[np.float64]  # shape (r_h,3)
+    strengths: NDArray[np.float64]  # shape (r_h,)
+    background: float
+
+    def copy(self) -> "IsotopeState":
+        return IsotopeState(
+            num_sources=int(self.num_sources),
+            positions=self.positions.copy(),
+            strengths=self.strengths.copy(),
+            background=float(self.background),
+        )
+
+
+@dataclass
 class ParticleState:
-    """単一同位体の粒子状態（Sec. 3.4）。"""
+    """Legacy grid-index particle state (Sec. 3.4, discrete candidate_sources)."""
 
     source_indices: NDArray[np.int32]  # shape (r_h,)
     strengths: NDArray[np.float64]  # shape (r_h,)

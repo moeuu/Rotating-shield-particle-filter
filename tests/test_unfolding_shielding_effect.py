@@ -32,8 +32,8 @@ def test_shielding_reduces_unfolded_counts() -> None:
     log_path = Path("results") / "shielding_unfolding_cases.log"
     try:
         for src_pos in source_positions:
-            for orient_idx, orient in enumerate(orientations):
-                blocked = shield.blocks_ray(src_pos, detector, octant_index=orient_idx)
+                for orient_idx, orient in enumerate(orientations):
+                    blocked = shield.blocks_ray(detector_position=detector, source_position=src_pos, octant_index=orient_idx)
                 src = PointSource("Cs-137", position=tuple(src_pos.tolist()), intensity_cps_1m=500.0)
                 spectrum_unshielded, _ = decomposer.simulate_spectrum(
                     sources=[src],

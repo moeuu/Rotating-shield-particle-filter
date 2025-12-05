@@ -1,4 +1,8 @@
-"""幾何減衰と遮蔽減衰を組み合わせたカーネル計算を提供するモジュール（Chapter 3, Sec. 3.2/3.4）。"""
+"""Legacy grid-based kernel calculations (Chapter 3, Sec. 3.2/3.4).
+
+Note: This module uses discrete candidate_sources indices. New continuous PF code
+uses measurement.continuous_kernels instead.
+"""
 
 from __future__ import annotations
 
@@ -84,8 +88,8 @@ class KernelPrecomputer:
             unit_vec = vec / dist
             geom = 1.0 / (4.0 * np.pi * dist**2)
             # Lead/iron扱いを簡略化：blocks_rayがTrueなら0.1、それ以外は1.0
-            blocked_lead = self.octant_shield.blocks_ray(src, pose, octant_index=oct_idx)
-            blocked_iron = self.octant_shield.blocks_ray(src, pose, octant_index=oct_idx)
+            blocked_lead = self.octant_shield.blocks_ray(detector_position=pose, source_position=src, octant_index=oct_idx)
+            blocked_iron = self.octant_shield.blocks_ray(detector_position=pose, source_position=src, octant_index=oct_idx)
             att = 0.1 if (blocked_lead or blocked_iron) else 1.0
             kernels[j] = geom * att
         return kernels
@@ -100,10 +104,10 @@ class KernelPrecomputer:
         live_time_s: float = 1.0,
     ) -> float:
         """
-        源強度ベクトルから期待計数を計算する（スペクトル生成用の内部ヘルパ）。
+        源強度ベクトルから期待計数を計算する（スペクトル生成やテスト専用のヘルパ）。
 
-        PF観測は常にスペクトル展開後の同位体別カウントであり、本関数は直接PF入力を
-        生成しないことに注意（コメント目的のみ）。
+        PFの観測値は常にスペクトル展開後の同位体別カウント（Sec. 2.5.7）であり、
+        本関数はPF重み更新に直接使われないことに注意。
         """
         kvec = self.kernel(isotope, pose_idx, orient_idx)
         return float(live_time_s * (np.dot(kvec, source_strengths) + background))

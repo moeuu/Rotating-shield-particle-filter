@@ -110,7 +110,12 @@ class RotatingShieldPFEstimator:
         orient_idx: int,
         live_time_s: float,
     ) -> None:
-        """同位体別カウントz_kを用いてPF群を更新。"""
+        """
+        同位体別カウントz_kを用いてPF群を更新。
+
+        z_k must come from the spectrum unfolding pipeline (Sec. 2.5.7); this method
+        never fabricates observations from geometric kernels or ground truth.
+        """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
         for iso, val in z_k.items():

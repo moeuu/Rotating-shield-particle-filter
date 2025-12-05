@@ -151,7 +151,14 @@ class OctantShield:
     - φ: 方位角 [0, 2π)（x軸からxy平面への角度）
     """
 
-    def __init__(self, octant_normals: NDArray[np.float64] | None = None) -> None:
+    def __init__(
+        self,
+        material: str | None = None,
+        orientation_index: int = 0,
+        octant_normals: NDArray[np.float64] | None = None,
+    ) -> None:
+        self.material = material or "generic"
+        self.orientation_index = orientation_index
         self.octant_normals = octant_normals if octant_normals is not None else OCTANT_NORMALS
         # θ, φ 範囲をオクタントごとに定義
         self.theta_phi_ranges = [
@@ -165,21 +172,27 @@ class OctantShield:
             ((np.pi / 2.0, np.pi), (np.pi, 3.0 * np.pi / 2.0)),  # - - -
         ]
 
-    def blocks_ray(self, source_position: NDArray[np.float64], detector_position: NDArray[np.float64], octant_index: int) -> bool:
+    def blocks_ray(
+        self,
+        detector_position: NDArray[np.float64],
+        source_position: NDArray[np.float64],
+        octant_index: int | None = None,
+    ) -> bool:
         """
         源→検出器のレイが指定オクタントシールドを通過するかを判定する。
 
         - v = detector - source
         - (θ, φ) を計算し、octant_indexの角度範囲に入れば遮蔽される。
-        方向の符号一致判定（shield_blocks_radiation相当）と整合するように定義。
+        orientation_indexを指定しない場合はインスタンス保持のorientation_indexを使用。
         """
-        if octant_index < 0 or octant_index >= len(self.theta_phi_ranges):
+        idx = self.orientation_index if octant_index is None else octant_index
+        if idx < 0 or idx >= len(self.theta_phi_ranges):
             raise ValueError("octant_index must be in [0, 7]")
         v = np.asarray(detector_position, dtype=float) - np.asarray(source_position, dtype=float)
         r, theta, phi = cartesian_to_spherical(v)
         if r == 0.0:
             return False
-        (theta_low, theta_high), (phi_low, phi_high) = self.theta_phi_ranges[octant_index]
+        (theta_low, theta_high), (phi_low, phi_high) = self.theta_phi_ranges[idx]
         in_theta = _angle_in_range(theta, theta_low, theta_high)
         in_phi = _angle_in_range(phi, phi_low, phi_high)
         return bool(in_theta and in_phi)

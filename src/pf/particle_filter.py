@@ -9,7 +9,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.kernels import KernelPrecomputer
-from pf.state import ParticleState
+from measurement.continuous_kernels import ContinuousKernel
+from pf.state import ParticleState, IsotopeState
 from pf.weights import effective_sample_size, log_weight_update_poisson
 from pf.resampling import systematic_resample
 from pf.regularization import regularize_states
@@ -26,10 +27,22 @@ class PFConfig:
     background_sigma: float = 0.1
     min_strength: float = 0.01
     p_birth: float = 0.05
+    # Continuous PF priors (Sec. 3.3.2)
+    position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
+    init_num_sources: Tuple[int, int] = (0, 3)  # inclusive range
+
+
+@dataclass
+class IsotopeParticle:
+    """Continuous-state particle (Sec. 3.3.2)."""
+
+    state: IsotopeState
+    log_weight: float
 
 
 class IsotopeParticleFilter:
-    """同位体ごとの粒子フィルタを実装。"""
+    """同位体ごとの粒子フィルタを実装。Discrete path is legacy; continuous path is WIP."""
 
     def __init__(
         self,
@@ -44,6 +57,143 @@ class IsotopeParticleFilter:
         self.states: List[ParticleState] = []
         self.log_weights: NDArray[np.float64] = np.zeros(self.N)
         self._init_particles()
+        # Continuous PF scaffold (unused until full transition)
+        self.continuous_kernel = ContinuousKernel()
+        self.continuous_particles: List[IsotopeParticle] = []
+        self._init_continuous_particles()
+
+    def _init_continuous_particles(self) -> None:
+        """Sample continuous positions/strengths/background from broad priors (Sec. 3.3.2)."""
+        self.continuous_particles = []
+        lo = np.array(self.config.position_min, dtype=float)
+        hi = np.array(self.config.position_max, dtype=float)
+        min_r, max_r = self.config.init_num_sources
+        for _ in range(self.N):
+            r_h = int(np.random.randint(min_r, max_r + 1))
+            if r_h > 0:
+                positions = lo + np.random.rand(r_h, 3) * (hi - lo)
+                strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=r_h))
+            else:
+                positions = np.zeros((0, 3), dtype=float)
+                strengths = np.zeros(0, dtype=float)
+            b_h = float(max(0.0, np.random.normal(loc=0.1, scale=0.05)))
+            st = IsotopeState(num_sources=r_h, positions=positions, strengths=strengths, background=b_h)
+            self.continuous_particles.append(IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N))))
+
+    def _continuous_expected_counts(self, pose_idx: int, orient_idx: int, live_time_s: float) -> NDArray[np.float64]:
+        """Compute Λ_{k,h}^{(n)} for each continuous particle using ContinuousKernel."""
+        lam = np.zeros(len(self.continuous_particles), dtype=float)
+        detector_pos = self.kernel.poses[pose_idx]
+        orient_vec = self.kernel.orientations[orient_idx]
+        for i, p in enumerate(self.continuous_particles):
+            st = p.state
+            lam[i] = self.continuous_kernel.expected_counts(
+                isotope=self.isotope,
+                detector_pos=detector_pos,
+                sources=st.positions,
+                strengths=st.strengths,
+                orient_idx=self.continuous_kernel.orient_index_from_vector(orient_vec),
+                live_time_s=live_time_s,
+                background=st.background,
+            )
+        return lam
+
+    def update_continuous(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
+        """
+        Poisson log-weight update for continuous particles (Sec. 3.3.3).
+
+        z_obs should come from spectrum unfolding (Chapter 2.5.7). Expected Λ is
+        computed via continuous kernel; no shortcut counts are used.
+        """
+        lam = self._continuous_expected_counts(pose_idx, orient_idx, live_time_s)
+        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
+        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
+        log_unnorm -= np.max(log_unnorm)
+        w = np.exp(log_unnorm)
+        w /= np.sum(w)
+        for p, wi in zip(self.continuous_particles, w):
+            p.log_weight = float(np.log(wi + 1e-20))
+        self._maybe_resample_continuous()
+
+    @property
+    def continuous_weights(self) -> NDArray[np.float64]:
+        """Return normalized weights for continuous particles."""
+        w = np.exp([p.log_weight for p in self.continuous_particles])
+        s = np.sum(w)
+        if s <= 0:
+            return np.ones(len(self.continuous_particles)) / len(self.continuous_particles)
+        return w / s
+
+    def _maybe_resample_continuous(self) -> None:
+        """ESS check and systematic resampling for continuous particles (Sec. 3.3.4, Eq. 3.29)."""
+        w = self.continuous_weights
+        ess = 1.0 / np.sum(w**2)
+        if ess < self.config.resample_threshold * self.N:
+            idx = systematic_resample(np.log(w))
+            self.continuous_particles = [self.continuous_particles[i].state.copy() for i in idx]
+            # reset weights to uniform
+            self.continuous_particles = [
+                IsotopeParticle(state=st, log_weight=float(-np.log(self.N))) for st in self.continuous_particles
+            ]
+            self.regularize_continuous(
+                sigma_pos=self.config.strength_sigma,
+                sigma_int=self.config.strength_sigma,
+                p_birth=self.config.p_birth,
+                p_kill=0.1,
+                intensity_threshold=self.config.min_strength,
+            )
+
+    def adapt_num_particles(self) -> None:
+        """
+        Optional: adapt N based on variance/entropy of weights (Chapter 3.3.4).
+
+        TODO: Not implemented in this task.
+        """
+        return
+
+    def best_particle(self) -> IsotopeParticle:
+        """Return the particle with maximum log_weight."""
+        return max(self.continuous_particles, key=lambda p: p.log_weight)
+
+    def regularize_continuous(
+        self,
+        sigma_pos: float = 0.05,
+        sigma_int: float = 0.05,
+        p_birth: float = 0.05,
+        p_kill: float = 0.1,
+        intensity_threshold: float = 0.05,
+    ) -> None:
+        """
+        Apply small Gaussian jitter to positions/strengths and simple birth/death moves (Sec. 3.3.4).
+
+        - positions: s <- s + N(0, sigma_pos^2 I)
+        - strengths: q <- max(q + N(0, sigma_int^2), 0)
+        - delete sources with q < intensity_threshold with prob p_kill
+        - with prob p_birth, add a new source uniformly in workspace with small initial strength
+        """
+        lo = np.array(self.config.position_min, dtype=float)
+        hi = np.array(self.config.position_max, dtype=float)
+        for p in self.continuous_particles:
+            st = p.state
+            if st.positions.size:
+                st.positions = st.positions + np.random.normal(scale=sigma_pos, size=st.positions.shape)
+                st.positions = np.clip(st.positions, lo, hi)
+                st.strengths = np.maximum(st.strengths + np.random.normal(scale=sigma_int, size=st.strengths.shape), 0.0)
+                # kill weak sources
+                mask = np.ones(st.num_sources, dtype=bool)
+                for i, q in enumerate(st.strengths):
+                    if q < intensity_threshold and np.random.rand() < p_kill:
+                        mask[i] = False
+                st.positions = st.positions[mask]
+                st.strengths = st.strengths[mask]
+                st.num_sources = st.positions.shape[0]
+            # birth
+            if np.random.rand() < p_birth:
+                new_pos = lo + np.random.rand(3) * (hi - lo)
+                new_strength = float(np.abs(np.random.normal(loc=0.1, scale=0.05)))
+                st.positions = np.vstack([st.positions, new_pos])
+                st.strengths = np.append(st.strengths, new_strength)
+                st.num_sources = st.positions.shape[0]
 
     def _init_particles(self) -> None:
         """源位置と強度を乱択して初期化。"""
@@ -73,8 +223,9 @@ class IsotopeParticleFilter:
         """
         ポアソン重み更新。
 
-        Note: z_obs はスペクトル展開（Sec. 2.5.7）から得た同位体別カウントを想定。
-        ここでの期待値推定はあくまで内部モデルであり、直接観測を生成しない。
+        Note: z_obs はスペクトル展開（Sec. 2.5.7）から得た同位体別カウントを必須とする。
+        このメソッド自身が幾何モデルから観測を合成することはなく、期待値計算は
+        観測との対比のための内部モデルに限定される。
         """
         # PF now consumes isotope-wise counts from spectrum unfolding; expected rate
         # is approximated using current strengths and geometric kernels.

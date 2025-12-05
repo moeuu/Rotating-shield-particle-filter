@@ -104,8 +104,8 @@ class SpectralDecomposer:
             effective_strength = source.intensity_cps_1m * geom
             atten = 1.0
             if octant_shield is not None and shield_orientation is not None:
-                oct_idx = octant_index_from_normal(shield_orientation)
-                if octant_shield.blocks_ray(source.position_array(), detector, octant_index=oct_idx):
+                oct_idx = octant_index_from_normal(np.asarray(shield_orientation))
+                if octant_shield.blocks_ray(detector_position=detector, source_position=source.position_array(), octant_index=oct_idx):
                     atten = 0.1
             col_idx = self.isotope_names.index(source.isotope)
             contribution = acquisition_time * effective_strength

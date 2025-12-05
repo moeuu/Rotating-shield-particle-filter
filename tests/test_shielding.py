@@ -50,10 +50,10 @@ def test_octant_shield_blocks_ray_by_angles() -> None:
     src = np.array([0.0, 0.0, 0.0])
     det_ppp = np.array([1.0, 1.0, 1.0])
     det_mmp = np.array([-1.0, -1.0, 1.0])
-    assert shield.blocks_ray(src, det_ppp, octant_index=0)
-    assert not shield.blocks_ray(src, det_ppp, octant_index=7)
-    assert shield.blocks_ray(src, det_mmp, octant_index=6)
-    assert not shield.blocks_ray(src, det_mmp, octant_index=1)
+    assert shield.blocks_ray(detector_position=det_ppp, source_position=src, octant_index=0)
+    assert not shield.blocks_ray(detector_position=det_ppp, source_position=src, octant_index=7)
+    assert shield.blocks_ray(detector_position=det_mmp, source_position=src, octant_index=6)
+    assert not shield.blocks_ray(detector_position=det_mmp, source_position=src, octant_index=1)
 
 
 def test_kernel_attenuation_factor_applies_tenth_when_blocked() -> None:

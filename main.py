@@ -90,12 +90,11 @@ def main() -> None:
     loops = 40
     dead_time_s = 2e-8
     detector_pos = env.detector()
+    # Place sources so all are blocked by (-,-,-) orientation relative to detector (5,10,5)
     sources = [
-        PointSource("Cs-137", position=(8.0, 12.0, 8.0), intensity_cps_1m=20000.0),
-        # Place Co-60 so the (-,-,-) octant also blocks it
-        PointSource("Co-60", position=(7.0, 13.0, 6.0), intensity_cps_1m=20000.0),
-        # Place Eu-154 so it is also blocked (all components negative toward detector)
-        PointSource("Eu-154", position=(7.0, 12.5, 7.0), intensity_cps_1m=20000.0),
+        PointSource("Cs-137", position=(8.0, 12.0, 8.0), intensity_cps_1m=20000.0),  # blocked (-,-,-)
+        PointSource("Co-60", position=(9.0, 15.0, 9.0), intensity_cps_1m=20000.0),  # blocked (-,-,-)
+        PointSource("Eu-154", position=(8.5, 17.0, 8.5), intensity_cps_1m=50000.0),  # blocked (-,-,-)
     ]
     decomposer = SpectralDecomposer()
     energy_axis = decomposer.energy_axis
@@ -106,7 +105,7 @@ def main() -> None:
     effective_loop = None
     octant_shield = OctantShield()
     orientations = generate_octant_orientations()
-    # Block Cs-137 only: vector from Cs (8,12,8) to detector (5,10,5) is negative in all axes
+    # (-,-,-) orientation selected; with current source placement all sources are blocked
     blocking_orient = orientations[7]
     for _ in range(loops):
         loop_spectrum, loop_effective = decomposer.simulate_spectrum(
@@ -134,9 +133,9 @@ def main() -> None:
     print(f"Detector position: {detector_pos.tolist()}")
     for src in sources:
         print(f"  {src.isotope} @ {src.position} -> {src.intensity_cps_1m:.0f} cps at 1 m")
-    print(f"Shield orientation (blocking): {blocking_orient.tolist()}")
+    print(f"Shield orientation (blocking): {blocking_orient.tolist()} (all sources blocked)")
     for src in sources:
-        blocked = octant_shield.blocks_ray(np.array(src.position), detector_pos, octant_index=7)
+        blocked = octant_shield.blocks_ray(detector_pos, np.array(src.position), octant_index=7)
         print(f"  Shield blocks {src.isotope}: {blocked}")
     print(f"Acquisition: {loops} loops x {acquisition_time:.1f} s = {loops*acquisition_time:.1f} s")
     print(f"Dead time (non-paralyzable): {dead_time_s:.1e} s")
@@ -189,11 +188,12 @@ def main() -> None:
     print(f"\nSpectrum saved to: {out_path}")
 
     fig, ax = plt.subplots(figsize=(10, 5))
+    blocked_label = "Shielded (-,-,-) orientation (all sources blocked)"
     ax.plot(energy_axis, processed, label="Unshielded (processed)")
-    ax.plot(energy_axis, processed_blocked, label="Shielded (Cs-137 blocked)", alpha=0.8)
+    ax.plot(energy_axis, processed_blocked, label=blocked_label, alpha=0.8)
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
-    ax.set_title("Simulated gamma spectrum (with shielding comparison)")
+    ax.set_title("Simulated gamma spectrum (all sources blocked by shield)")
     # Mark key photopeaks for readability
     peak_definitions = [
         (662.0, "Cs-137"),
@@ -241,10 +241,10 @@ def main() -> None:
     # Raw spectra plots: unshielded and shielded positions
     fig_raw, ax_raw = plt.subplots(figsize=(10, 5))
     ax_raw.plot(energy_axis, spectrum, label="Unshielded spectrum (raw)")
-    ax_raw.plot(energy_axis, spectrum_blocked, label="Shielded spectrum (raw, Cs-137 attenuated)")
+    ax_raw.plot(energy_axis, spectrum_blocked, label="Shielded spectrum (raw, all sources blocked)")
     ax_raw.set_xlabel("Energy (keV)")
     ax_raw.set_ylabel("Counts")
-    ax_raw.set_title("Gamma spectra (raw)")
+    ax_raw.set_title("Gamma spectra (raw; all sources blocked)")
     ax_raw.legend()
     img_path_raw = RESULTS_DIR / "spectrum_raw.png"
     fig_raw.tight_layout()
@@ -254,10 +254,10 @@ def main() -> None:
 
     # Shielded-only raw for quick inspection
     fig_atten, ax_atten = plt.subplots(figsize=(10, 5))
-    ax_atten.plot(energy_axis, spectrum_blocked, label="Shielded spectrum (raw)")
+    ax_atten.plot(energy_axis, spectrum_blocked, label=blocked_label)
     ax_atten.set_xlabel("Energy (keV)")
     ax_atten.set_ylabel("Counts")
-    ax_atten.set_title("Shielded gamma spectrum (raw, Cs-137 attenuated)")
+    ax_atten.set_title("Shielded gamma spectrum (raw, all sources blocked)")
     ax_atten.legend()
     img_path_atten = RESULTS_DIR / "spectrum_atten.png"
     fig_atten.tight_layout()
