@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
+from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
@@ -57,12 +58,24 @@ class RealTimePFVisualizer:
     - save_final(path) saves the current figure.
     """
 
-    def __init__(self, isotopes: List[str], world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None) -> None:
+    def __init__(
+        self,
+        isotopes: List[str],
+        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
+        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
+        show_counts: bool = True,
+    ) -> None:
         self.isotopes = isotopes
         self.world_bounds = world_bounds or (0, 10, 0, 10, 0, 3)
+        self.true_sources = true_sources or {}
+        self.show_counts = show_counts
         self.fig = plt.figure(figsize=(10, 6))
-        self.ax3d = self.fig.add_subplot(121, projection="3d")
-        self.ax_counts = self.fig.add_subplot(122)
+        if self.show_counts:
+            self.ax3d = self.fig.add_subplot(121, projection="3d")
+            self.ax_counts = self.fig.add_subplot(122)
+        else:
+            self.ax3d = self.fig.add_subplot(111, projection="3d")
+            self.ax_counts = None
         cmap = plt.get_cmap("tab10")
         self.colors = {}
         for i, iso in enumerate(isotopes):
@@ -76,25 +89,33 @@ class RealTimePFVisualizer:
         self._est_artists: Dict[str, any] = {}
         self._robot_artist = None
         self._traj_line = None
-        self._shield_arrows: list = []
+        self._shield_arrows: Dict[str, any] = {}
         self._counts_bars = None
         # Pre-create bar containers with zeros
-        if self.isotopes:
+        if self.ax_counts is not None and self.isotopes:
             zeros = [0.0 for _ in self.isotopes]
             self._counts_bars = self.ax_counts.bar(self.isotopes, zeros, color=[self.colors.get(n, "gray") for n in self.isotopes])
         self._traj_history: list[NDArray[np.float64]] = []
         self._last_frame: PFFrame | None = None
+        self._true_artists: list = []
+        # Plot true sources once if provided
+        for iso, pos in self.true_sources.items():
+            if pos.size:
+                art = self.ax3d.scatter(pos[:, 0], pos[:, 1], pos[:, 2], marker="*", s=100, color=self.colors.get(iso, "black"), label=f"True {iso}")
+                self._true_artists.append(art)
 
     def _init_axes(self) -> None:
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
         self.ax3d.set_xlim(xmin, xmax)
         self.ax3d.set_ylim(ymin, ymax)
         self.ax3d.set_zlim(zmin, zmax)
+        self.ax3d.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
         self.ax3d.set_xlabel("x [m]")
         self.ax3d.set_ylabel("y [m]")
         self.ax3d.set_zlabel("z [m]")
-        self.ax_counts.set_ylabel("Counts")
-        self.ax_counts.set_title("Isotope-wise counts")
+        if self.ax_counts is not None:
+            self.ax_counts.set_ylabel("Counts")
+            self.ax_counts.set_title("Isotope-wise counts")
         # Draw wireframe cube for bounds
         xs = [xmin, xmax]
         ys = [ymin, ymax]
@@ -135,11 +156,15 @@ class RealTimePFVisualizer:
                 np.array([frame.robot_position[2]]),
             )
         # Shields as arrows
-        for arr in self._shield_arrows:
+        for arr in self._shield_arrows.values():
             arr.remove()
-        self._shield_arrows = []
+        self._shield_arrows = {}
         origin = frame.robot_position
-        for normal, color in [(frame.RFe[:, 2], "magenta"), (frame.RPb[:, 2], "green")]:
+        arrow_specs = {
+            "Fe": (frame.RFe[:, 2], "magenta"),
+            "Pb": (frame.RPb[:, 2], "green"),
+        }
+        for name, (normal, color) in arrow_specs.items():
             arr = self.ax3d.quiver(
                 origin[0],
                 origin[1],
@@ -150,8 +175,9 @@ class RealTimePFVisualizer:
                 length=1.0,
                 color=color,
                 normalize=True,
+                label=f"{name} shield",
             )
-            self._shield_arrows.append(arr)
+            self._shield_arrows[name] = arr
         # Estimated sources and particles
         for iso in self.isotopes:
             pts = frame.particle_positions.get(iso, np.zeros((0, 3)))
@@ -179,7 +205,7 @@ class RealTimePFVisualizer:
                     art._offsets3d = ([], [], [])
         self.ax3d.set_title(f"Step {frame.step_index} t={frame.time:.2f}s")
         # Counts bar (reuse)
-        if frame.counts_by_isotope:
+        if self.ax_counts is not None and frame.counts_by_isotope:
             names = list(frame.counts_by_isotope.keys())
             vals = [frame.counts_by_isotope[n] for n in names]
             # Update pre-created bars in the same order as isotopes; fallback if new isotope appears
@@ -230,7 +256,10 @@ def build_frame_from_pf(
         step_index: integer step
         time_sec: cumulative time in seconds
     """
-    est = pf.estimate_all()
+    if hasattr(pf, "estimate_all"):
+        est = pf.estimate_all()
+    else:
+        est = pf.estimates()  # type: ignore[attr-defined]
     particle_positions: Dict[str, NDArray[np.float64]] = {}
     particle_weights: Dict[str, NDArray[np.float64]] = {}
     estimated_sources: Dict[str, NDArray[np.float64]] = {}
@@ -241,8 +270,16 @@ def build_frame_from_pf(
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
         particle_weights[iso] = getattr(filt, "continuous_weights", np.zeros(0))
         if iso in est:
-            estimated_sources[iso] = est[iso].positions
-            estimated_strengths[iso] = est[iso].strengths
+            val = est[iso]
+            if hasattr(val, "positions"):
+                estimated_sources[iso] = val.positions
+                estimated_strengths[iso] = val.strengths
+            elif isinstance(val, tuple) and len(val) == 2:
+                estimated_sources[iso] = val[0]
+                estimated_strengths[iso] = val[1]
+            else:
+                estimated_sources[iso] = np.zeros((0, 3))
+                estimated_strengths[iso] = np.zeros(0)
         else:
             estimated_sources[iso] = np.zeros((0, 3))
             estimated_strengths[iso] = np.zeros(0)

@@ -43,6 +43,8 @@ class RotatingShieldPFConfig:
     alpha_weights: Dict[str, float] | None = None  # EIGの同位体重み α_h
     beta_weights: Dict[str, float] | None = None  # Fisher基準の同位体重み β_h
     credible_volume_threshold: float = 1e-3  # 95%位置信用領域体積の閾値（収束判定用）
+    position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,8 @@ class RotatingShieldPFEstimator:
             background_sigma=self.pf_config.background_sigma,
             min_strength=self.pf_config.min_strength,
             p_birth=self.pf_config.p_birth,
+            position_min=self.pf_config.position_min,
+            position_max=self.pf_config.position_max,
         )
         for iso in self.isotopes:
             self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
@@ -222,6 +226,10 @@ class RotatingShieldPFEstimator:
     def estimates(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """同位体ごとの位置・強度推定を返す。"""
         return {iso: f.estimate() for iso, f in self.filters.items()}
+
+    def estimate_all(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+        """Alias for estimates() to align with visualization helpers."""
+        return self.estimates()
 
     @property
     def num_orientations(self) -> int:

@@ -19,6 +19,7 @@ def select_best_orientation(
     RPb_candidates=None,
     alpha_by_isotope=None,
     beta_by_isotope=None,
+    allowed_indices=None,
 ) -> Tuple[int, float]:
     """
     Choose the shield orientation that maximises EIG/JA/JD or variance-based score (Eqs. 3.40–3.48).
@@ -38,15 +39,20 @@ def select_best_orientation(
     elif criterion in {"eig", "ja", "jd"}:
         if RFe_candidates is None or RPb_candidates is None:
             from measurement.shielding import generate_octant_rotation_matrices
-
             RFe_candidates = generate_octant_rotation_matrices()
             RPb_candidates = generate_octant_rotation_matrices()
-        for oid, (RFe, RPb) in enumerate(zip(RFe_candidates, RPb_candidates)):
-            if criterion == "eig":
-                score = estimator.orientation_expected_information_gain(
-                    pose_idx=pose_idx,
-                    RFe=RFe,
-                    RPb=RPb,
+        # Build full Cartesian product so Fe/Pb can point independently (8x8=64 combos by default).
+        allowed = set(allowed_indices) if allowed_indices is not None else None
+        for fe_idx, RFe in enumerate(RFe_candidates):
+            for pb_idx, RPb in enumerate(RPb_candidates):
+                oid = fe_idx * len(RPb_candidates) + pb_idx
+                if allowed is not None and oid not in allowed:
+                    continue
+                if criterion == "eig":
+                    score = estimator.orientation_expected_information_gain(
+                        pose_idx=pose_idx,
+                        RFe=RFe,
+                        RPb=RPb,
                     live_time_s=live_time_s,
                     alpha_by_isotope=alpha_by_isotope,
                 )
