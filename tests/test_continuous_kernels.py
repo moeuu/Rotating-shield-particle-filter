@@ -104,3 +104,40 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
     )
     assert np.isclose(fe_only, 0.1 * base, rtol=1e-6)
     assert np.isclose(both, 0.01 * base, rtol=1e-6)
+
+
+def test_expected_counts_pair_matches_single_helper() -> None:
+    """expected_counts_pair should match expected_counts_single_isotope with corresponding RFe/RPb."""
+    kernel = ContinuousKernel()
+    det = np.array([1.0, 1.0, 1.0])
+    sources = np.array([[0.0, 0.0, 0.0]])
+    strengths = np.array([1.0])
+    fe_idx = 0  # (+,+,+) blocks
+    pb_idx = 7  # (-,-,-) free
+    pair_counts = kernel.expected_counts_pair(
+        isotope="Cs-137",
+        detector_pos=det,
+        sources=sources,
+        strengths=strengths,
+        fe_index=fe_idx,
+        pb_index=pb_idx,
+        live_time_s=1.0,
+        background=0.0,
+    )
+    from measurement.shielding import generate_octant_rotation_matrices
+
+    mats = generate_octant_rotation_matrices()
+    single = expected_counts_single_isotope(
+        detector_position=det,
+        RFe=mats[fe_idx],
+        RPb=mats[pb_idx],
+        sources=sources,
+        strengths=strengths,
+        background=0.0,
+        duration=1.0,
+        isotope_id="Cs-137",
+        kernel=kernel,
+    )
+    import pytest
+
+    assert pair_counts == pytest.approx(single, rel=1e-12)

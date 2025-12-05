@@ -13,15 +13,25 @@ def select_next_pose(
     candidate_pose_indices: NDArray[np.int64],
     current_pose_idx: int,
     live_time_s: float = 1.0,
-    lambda_cost: float = 1.0,
+    lambda_cost: float | None = None,
+    ig_weight: float = 1.0,
 ) -> int:
     """
-    次姿勢を情報量と移動コストのトレードオフで選択する。
+    次姿勢を情報量と移動コストのトレードオフで選択する（Sec. 3.4.4, Eq. 3.49–3.51簡略版）。
+
+    Score_k = U_k - ig_weight * max_phi IG_k(phi) + lambda_cost * C_move
     """
     current_pos = estimator.poses[current_pose_idx]
+    lam_cost = estimator.pf_config.lambda_cost if lambda_cost is None else lambda_cost
     scores = []
     for idx in candidate_pose_indices:
-        uncertainty = estimator.expected_uncertainty(pose_idx=int(idx), live_time_s=live_time_s)
-        motion_cost = np.linalg.norm(estimator.poses[int(idx)] - current_pos)
-        scores.append(uncertainty + lambda_cost * motion_cost)
+        idx_int = int(idx)
+        # Fallback to legacy expected_uncertainty if MC surrogate is unavailable (e.g., dummy estimator in tests)
+        if hasattr(estimator, "expected_uncertainty_after_pose"):
+            uncertainty = estimator.expected_uncertainty_after_pose(pose_idx=idx_int, orient_idx=0, live_time_s=live_time_s)
+        else:
+            uncertainty = estimator.expected_uncertainty(pose_idx=idx_int, live_time_s=live_time_s)
+        ig = estimator.max_orientation_information_gain(pose_idx=idx_int, live_time_s=live_time_s)
+        motion_cost = float(np.linalg.norm(estimator.poses[idx_int] - current_pos))
+        scores.append(uncertainty - ig_weight * ig + lam_cost * motion_cost)
     return int(candidate_pose_indices[int(np.argmin(scores))])

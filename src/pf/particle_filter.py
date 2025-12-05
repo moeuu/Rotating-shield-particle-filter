@@ -98,6 +98,26 @@ class IsotopeParticleFilter:
             )
         return lam
 
+    def _continuous_expected_counts_pair(
+        self, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float
+    ) -> NDArray[np.float64]:
+        """Compute Λ_{k,h}^{(n)} using Fe/Pb octant indices (Eq. 3.41)."""
+        lam = np.zeros(len(self.continuous_particles), dtype=float)
+        detector_pos = self.kernel.poses[pose_idx]
+        for i, p in enumerate(self.continuous_particles):
+            st = p.state
+            lam[i] = self.continuous_kernel.expected_counts_pair(
+                isotope=self.isotope,
+                detector_pos=detector_pos,
+                sources=st.positions,
+                strengths=st.strengths,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                background=st.background,
+            )
+        return lam
+
     def update_continuous(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
         """
         Poisson log-weight update for continuous particles (Sec. 3.3.3).
@@ -106,6 +126,22 @@ class IsotopeParticleFilter:
         computed via continuous kernel; no shortcut counts are used.
         """
         lam = self._continuous_expected_counts(pose_idx, orient_idx, live_time_s)
+        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
+        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
+        log_unnorm -= np.max(log_unnorm)
+        w = np.exp(log_unnorm)
+        w /= np.sum(w)
+        for p, wi in zip(self.continuous_particles, w):
+            p.log_weight = float(np.log(wi + 1e-20))
+        self._maybe_resample_continuous()
+
+    def update_continuous_pair(self, z_obs: float, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float) -> None:
+        """
+        Poisson log-weight update using Fe/Pb orientation indices (Eq. 3.41–3.44).
+
+        z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
+        """
+        lam = self._continuous_expected_counts_pair(pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s)
         log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
         log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
         log_unnorm -= np.max(log_unnorm)

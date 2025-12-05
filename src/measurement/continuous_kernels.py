@@ -77,6 +77,40 @@ class ContinuousKernel:
             total += self.kernel_value(isotope, detector_pos, src_pos, orient_idx) * float(q)
         return float(total)
 
+    def expected_rate_pair(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        background: float = 0.0,
+    ) -> float:
+        """
+        Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
+
+        Attenuation model:
+            Fe blocks -> 0.1, Pb blocks -> 0.1, both -> 0.01, none -> 1.0.
+        """
+        total = background
+        for src_pos, q in zip(sources, strengths):
+            geom = geometric_term(detector_pos, src_pos)
+            fe_block = self.octant_shield.blocks_ray(
+                detector_position=detector_pos, source_position=src_pos, octant_index=fe_index
+            )
+            pb_block = self.octant_shield.blocks_ray(
+                detector_position=detector_pos, source_position=src_pos, octant_index=pb_index
+            )
+            if fe_block and pb_block:
+                att = 0.01
+            elif fe_block or pb_block:
+                att = 0.1
+            else:
+                att = 1.0
+            total += geom * att * float(q)
+        return float(total)
+
     def expected_counts(
         self,
         isotope: str,
@@ -91,6 +125,31 @@ class ContinuousKernel:
         Compute Λ_{k,h} = T_k λ_{k,h} (Eq. 3.13).
         """
         rate = self.expected_rate(isotope, detector_pos, sources, strengths, orient_idx, background=background)
+        return float(live_time_s * rate)
+
+    def expected_counts_pair(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float = 1.0,
+        background: float = 0.0,
+    ) -> float:
+        """
+        Compute Λ_{k,h}(R_Fe, R_Pb) per Eq. (3.41) using octant indices for Fe/Pb.
+        """
+        rate = self.expected_rate_pair(
+            isotope=isotope,
+            detector_pos=detector_pos,
+            sources=sources,
+            strengths=strengths,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            background=background,
+        )
         return float(live_time_s * rate)
 
     def orient_index_from_vector(self, orientation: NDArray[np.float64]) -> int:
@@ -131,16 +190,13 @@ def expected_counts_single_isotope(
     idx_fe = k.orient_index_from_vector(n_fe)
     idx_pb = k.orient_index_from_vector(n_pb)
 
-    lam = background
-    for src_pos, q in zip(sources, strengths):
-        geom = geometric_term(detector_position, src_pos)
-        fe_block = k.octant_shield.blocks_ray(detector_position=detector_position, source_position=src_pos, octant_index=idx_fe)
-        pb_block = k.octant_shield.blocks_ray(detector_position=detector_position, source_position=src_pos, octant_index=idx_pb)
-        if fe_block and pb_block:
-            att = 0.01
-        elif fe_block or pb_block:
-            att = 0.1
-        else:
-            att = 1.0
-        lam += geom * att * float(q)
-    return float(duration * lam)
+    return k.expected_counts_pair(
+        isotope=isotope_id or "generic",
+        detector_pos=detector_position,
+        sources=sources,
+        strengths=strengths,
+        fe_index=idx_fe,
+        pb_index=idx_pb,
+        live_time_s=duration,
+        background=background,
+    )

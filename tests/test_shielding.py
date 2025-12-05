@@ -7,6 +7,8 @@ from measurement.shielding import (
     OCTANT_NORMALS,
     OctantShield,
     generate_octant_orientations,
+    generate_octant_rotation_matrices,
+    generate_fe_pb_orientation_pairs,
     octant_index_from_normal,
     cartesian_to_spherical,
     iron_shield,
@@ -81,6 +83,19 @@ def test_generate_octant_orientations_and_index() -> None:
     for i, n in enumerate(normals):
         idx = octant_index_from_normal(n)
         assert idx == i
+
+
+def test_generate_rotation_matrices_and_pairs() -> None:
+    """Rotation matrices should be diagonal sign matrices and pair enumeration size should match 8x8."""
+    mats = generate_octant_rotation_matrices()
+    assert mats.shape == (8, 3, 3)
+    for n, m in zip(generate_octant_orientations(), mats):
+        expected = np.diag(np.where(np.sign(n) == 0.0, 1.0, np.sign(n)))
+        assert np.allclose(m, expected)
+    pairs = generate_fe_pb_orientation_pairs()
+    assert len(pairs) == 64
+    assert pairs[0]["id"] == 0
+    assert pairs[-1]["id"] == 63
 
 
 def test_rotation_changes_counts_by_tenth_when_blocked() -> None:

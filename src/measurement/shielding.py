@@ -127,6 +127,66 @@ def generate_octant_orientations() -> NDArray[np.float64]:
     return OCTANT_NORMALS.copy()
 
 
+def rotation_matrix_from_normal(normal: NDArray[np.float64]) -> NDArray[np.float64]:
+    """
+    Generate a simple rotation matrix for an octant defined by a normal.
+
+    For the 1/8-shell, we only need the sign pattern: construct a diagonal matrix
+    whose entries are the signs of the normal components (Sec. 3.4.1).
+    """
+    n = np.asarray(normal, dtype=float)
+    sign = np.sign(n)
+    sign[sign == 0.0] = 1.0
+    return np.diag(sign)
+
+
+def octant_index_from_rotation(R: NDArray[np.float64]) -> int:
+    """
+    Map a rotation matrix (diagonal sign matrix) back to its octant index.
+
+    Uses the third column as the normal, consistent with expected_counts_single_isotope.
+    """
+    n = R[:, 2] if R.shape == (3, 3) else np.asarray(R, dtype=float)
+    return octant_index_from_normal(n)
+
+
+def generate_octant_rotation_matrices() -> NDArray[np.float64]:
+    """Return 8 diagonal rotation matrices corresponding to the octant normals."""
+    normals = generate_octant_orientations()
+    mats = [rotation_matrix_from_normal(n) for n in normals]
+    return np.stack(mats, axis=0)
+
+
+def generate_fe_pb_orientation_pairs() -> list[dict]:
+    """
+    Generate candidate orientation pairs (RFe, RPb) per Sec. 3.4.1.
+
+    Returns a list of dictionaries with keys:
+        - id: integer orientation ID
+        - fe_index, pb_index: octant indices for Fe/Pb
+        - RFe, RPb: 3x3 rotation matrices (diagonal sign matrices)
+    """
+    fe_normals = generate_octant_orientations()
+    pb_normals = generate_octant_orientations()
+    fe_mats = generate_octant_rotation_matrices()
+    pb_mats = generate_octant_rotation_matrices()
+    pairs = []
+    oid = 0
+    for i in range(len(fe_normals)):
+        for j in range(len(pb_normals)):
+            pairs.append(
+                {
+                    "id": oid,
+                    "fe_index": i,
+                    "pb_index": j,
+                    "RFe": fe_mats[i],
+                    "RPb": pb_mats[j],
+                }
+            )
+            oid += 1
+    return pairs
+
+
 def octant_index_from_normal(normal: NDArray[np.float64], tol: float = 1e-6) -> int:
     """
     法線ベクトルから最も近いオクタントインデックスを取得する。

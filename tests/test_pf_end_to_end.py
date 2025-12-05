@@ -29,7 +29,7 @@ def test_pf_estimator_runs_one_step():
     sources = [PointSource("Cs-137", position=(0.0, 0.0, 0.0), intensity_cps_1m=20.0)]
     spectrum, _ = decomposer.simulate_spectrum(sources=sources, environment=env, acquisition_time=1.0, rng=np.random.default_rng(0))
     z_k = decomposer.isotope_counts(spectrum)
-    est.update(z_k=z_k, pose_idx=0, orient_idx=0, live_time_s=1.0)
+    est.update_pair(z_k=z_k, pose_idx=0, fe_index=0, pb_index=0, live_time_s=1.0)
     estimates = est.estimates()
     assert "Cs-137" in estimates
     positions, strengths = estimates["Cs-137"]
