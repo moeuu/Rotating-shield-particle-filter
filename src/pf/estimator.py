@@ -18,7 +18,16 @@ from pf.particle_filter import IsotopeParticleFilter, PFConfig
 
 @dataclass
 class RotatingShieldPFConfig:
-    """設定パラメータ（Sec. 3.4–3.5）。"""
+    """
+    設定パラメータ（Sec. 3.4–3.5）。
+
+    Users can tune convergence thresholds:
+        - ig_threshold: max IG below which rotation stops (Eq. 3.49)
+        - max_dwell_time_s: per-pose dwell cap
+        - credible_volume_threshold: max ellipsoid volume for positional credible regions
+        - lambda_cost: motion-cost weight in Eq. 3.51
+        - alpha_weights / beta_weights: isotope weights for IG / Fisher criteria
+    """
 
     num_particles: int = 200
     max_sources: int = 1
@@ -470,47 +479,6 @@ class RotatingShieldPFEstimator:
             total_U += U_accum / max(num_samples, 1)
         return float(total_U)
 
-    def expected_uncertainty(self, pose_idx: int, live_time_s: float = 1.0) -> float:
-        """全同位体の予測強度分散を足し上げた簡易不確実性指標。"""
-        total = 0.0
-        for iso, f in self.filters.items():
-            lam = np.zeros(f.N, dtype=float)
-            for i, st in enumerate(f.states):
-                contrib = 0.0
-                for idx_src, strength in zip(st.source_indices, st.strengths):
-                    kvec = f.kernel.kernel(iso, pose_idx, 0)
-                    contrib += kvec[idx_src] * strength
-                lam[i] = live_time_s * (contrib + st.background)
-            w = np.exp(f.log_weights)
-            mean = float(np.sum(w * lam))
-            var = float(np.sum(w * (lam - mean) ** 2))
-            total += var
-        return total
-
-    def converged(self, ig_threshold: float = 1e-3, change_tol: float = 1e-2, window: int = 3) -> bool:
-        """情報利得と推定変化に基づく簡易収束判定（Sec. 3.6簡略版）。"""
-        if len(self.history_estimates) < window + 1:
-            return False
-        recent = self.history_estimates[-window:]
-        # 位置・強度変化のノルムを確認
-        diffs = []
-        for i in range(1, len(recent)):
-            prev = recent[i - 1]
-            curr = recent[i]
-            for iso in self.isotopes:
-                prev_pos, prev_str = prev.get(iso, (None, None))
-                curr_pos, curr_str = curr.get(iso, (None, None))
-                if prev_pos is None or curr_pos is None:
-                    continue
-                diffs.append(np.linalg.norm(prev_pos - curr_pos) + np.linalg.norm(prev_str - curr_str))
-        if diffs and max(diffs) > change_tol:
-            return False
-        # 情報利得評価
-        scores = []
-        for orient_idx in range(self.num_orientations):
-            scores.append(self.orientation_information_gain(pose_idx=len(self.poses) - 1, orient_idx=orient_idx))
-        return max(scores) < ig_threshold
-
     def estimate_change_norm(self) -> float:
         """
         直近2回の推定差分ノルム ||Δs|| + ||Δq|| を返す（Sec. 3.6の収束判定の一部）。
@@ -537,17 +505,77 @@ class RotatingShieldPFEstimator:
         """
         total = 0.0
         for iso, filt in self.filters.items():
-            weights = np.exp(filt.log_weights)
-            weights = weights / max(np.sum(weights), 1e-12)
-            mean = np.zeros(self.candidate_sources.shape[0], dtype=float)
-            second = np.zeros_like(mean)
-            for st, wi in zip(filt.states, weights):
-                for idx_src, strength in zip(st.source_indices, st.strengths):
-                    mean[idx_src] += wi * strength
-                    second[idx_src] += wi * (strength**2)
-            var = np.clip(second - mean**2, a_min=0.0, a_max=None)
-            total += float(np.sum(var))
+            # Prefer continuous PF if available; otherwise fallback to legacy grid
+            if filt.continuous_particles:
+                w = filt.continuous_weights
+                max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
+                if max_r == 0:
+                    continue
+                strengths = np.zeros((len(filt.continuous_particles), max_r), dtype=float)
+                for i, p in enumerate(filt.continuous_particles):
+                    r = p.state.num_sources
+                    if r > 0:
+                        strengths[i, :r] = p.state.strengths
+                mean = np.sum(w[:, None] * strengths, axis=0)
+                var = np.sum(w[:, None] * (strengths - mean) ** 2, axis=0)
+                total += float(np.sum(var))
+            else:
+                weights = np.exp(filt.log_weights)
+                weights = weights / max(np.sum(weights), 1e-12)
+                mean = np.zeros(self.candidate_sources.shape[0], dtype=float)
+                second = np.zeros_like(mean)
+                for st, wi in zip(filt.states, weights):
+                    for idx_src, strength in zip(st.source_indices, st.strengths):
+                        mean[idx_src] += wi * strength
+                        second[idx_src] += wi * (strength**2)
+                var = np.clip(second - mean**2, a_min=0.0, a_max=None)
+                total += float(np.sum(var))
         return total
+
+    def credible_region_volumes(
+        self, confidence: float = 0.95
+    ) -> Dict[str, List[float]]:
+        """
+        Compute 3D positional credible region volumes for each isotope/source (Sec. 3.5).
+
+        For each source index m (up to max_r across particles), compute weighted mean/cov
+        of positions and return ellipsoid volume using chi-square threshold. Used by
+        should_stop_shield_rotation/should_stop_exploration to enforce small positional
+        uncertainty before declaring convergence.
+        """
+        volumes: Dict[str, List[float]] = {}
+        chi2_thresh = float(chi2.ppf(confidence, df=3))
+        for iso, filt in self.filters.items():
+            vols: List[float] = []
+            if not filt.continuous_particles:
+                volumes[iso] = vols
+                continue
+            w = filt.continuous_weights
+            max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
+            for j in range(max_r):
+                positions = []
+                weights = []
+                for wi, p in zip(w, filt.continuous_particles):
+                    if p.state.num_sources > j:
+                        positions.append(p.state.positions[j])
+                        weights.append(wi)
+                if not positions:
+                    continue
+                pos_arr = np.vstack(positions)
+                weights_arr = np.asarray(weights)
+                weights_arr = weights_arr / max(np.sum(weights_arr), 1e-12)
+                mean = np.sum(weights_arr[:, None] * pos_arr, axis=0)
+                centered = pos_arr - mean
+                cov = centered.T @ (centered * weights_arr[:, None])
+                # Ellipsoid volume = 4/3 π sqrt(det(cov * chi2_thresh))
+                det_val = np.linalg.det(cov * chi2_thresh)
+                if det_val < 0:
+                    vol = 0.0
+                else:
+                    vol = float((4.0 / 3.0) * np.pi * np.sqrt(det_val + 1e-12))
+                vols.append(vol)
+            volumes[iso] = vols
+        return volumes
 
     def should_stop_shield_rotation(
         self,
@@ -578,11 +606,18 @@ class RotatingShieldPFEstimator:
         max_ig = max(ig_scores) if ig_scores else 0.0
         max_fisher = max(fisher_scores) if fisher_scores else 0.0
         dwell_time = sum(rec.live_time_s for rec in self.measurements if rec.pose_idx == pose_idx)
+        # Credible region volumes check (Sec. 3.5)
+        volumes = self.credible_region_volumes()
+        max_volume = 0.0
+        for vols in volumes.values():
+            if vols:
+                max_volume = max(max_volume, max(vols))
         return (
             (max_ig < ig_threshold)
             and (max_fisher < fisher_threshold)
             and (self.estimate_change_norm() < change_tol)
             and (self.global_uncertainty() < uncertainty_tol)
+            and (max_volume < self.pf_config.credible_volume_threshold)
             or (dwell_time >= self.pf_config.max_dwell_time_s)
         )
 

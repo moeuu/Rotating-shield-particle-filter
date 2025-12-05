@@ -41,16 +41,28 @@ def prune_spurious_sources(
                 if filt.kernel is None:
                     continue
                 det_pos = filt.kernel.poses[meas.pose_idx]
-                orient_vec = filt.kernel.orientations[meas.orient_idx]
-                k_val = kernel_helper.expected_counts(
-                    isotope=iso,
-                    detector_pos=det_pos,
-                    sources=np.array([best.positions[m]]),
-                    strengths=np.array([best.strengths[m]]),
-                    orient_idx=kernel_helper.orient_index_from_vector(orient_vec),
-                    live_time_s=meas.live_time_s,
-                    background=0.0,
-                )
+                if meas.fe_index is not None and meas.pb_index is not None:
+                    k_val = kernel_helper.expected_counts_pair(
+                        isotope=iso,
+                        detector_pos=det_pos,
+                        sources=np.array([best.positions[m]]),
+                        strengths=np.array([best.strengths[m]]),
+                        fe_index=meas.fe_index,
+                        pb_index=meas.pb_index,
+                        live_time_s=meas.live_time_s,
+                        background=0.0,
+                    )
+                else:
+                    orient_vec = filt.kernel.orientations[meas.orient_idx]
+                    k_val = kernel_helper.expected_counts(
+                        isotope=iso,
+                        detector_pos=det_pos,
+                        sources=np.array([best.positions[m]]),
+                        strengths=np.array([best.strengths[m]]),
+                        orient_idx=kernel_helper.orient_index_from_vector(orient_vec),
+                        live_time_s=meas.live_time_s,
+                        background=0.0,
+                    )
                 ratio = k_val / (z_obs + epsilon)
                 if ratio > best_ratio:
                     best_ratio = ratio

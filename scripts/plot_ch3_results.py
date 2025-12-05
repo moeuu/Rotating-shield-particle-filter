@@ -66,12 +66,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Plot Chapter 3 experiment results.")
     parser.add_argument("--logdir", type=Path, default=Path("results/ch3_experiments"), help="Directory with JSONL logs.")
     parser.add_argument("--output", type=Path, default=Path("results/ch3_experiments"), help="Directory for plots.")
+    parser.add_argument(
+        "--ig-threshold", type=float, default=1e-3, help="Information gain threshold used during convergence."
+    )
+    parser.add_argument(
+        "--credible-volume-threshold",
+        type=float,
+        default=1e-3,
+        help="Credible region volume threshold used during convergence.",
+    )
     args = parser.parse_args()
     logs = _load_logs(args.logdir)
     if not logs:
         raise SystemExit(f"No logs found under {args.logdir}")
     summary = _aggregate(logs)
     plot_summary(summary, args.output)
+    print(
+        f"Convergence thresholds: IG<{args.ig_threshold}, credible_volume<{args.credible_volume_threshold} "
+        "(configure in RotatingShieldPFConfig for runs)."
+    )
 
 
 if __name__ == "__main__":

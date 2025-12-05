@@ -56,7 +56,8 @@ class IsotopeParticleFilter:
         self.N = self.config.num_particles
         self.states: List[ParticleState] = []
         self.log_weights: NDArray[np.float64] = np.zeros(self.N)
-        self._init_particles()
+        if self.kernel is not None:
+            self._init_particles()
         # Continuous PF scaffold (unused until full transition)
         self.continuous_kernel = ContinuousKernel()
         self.continuous_particles: List[IsotopeParticle] = []

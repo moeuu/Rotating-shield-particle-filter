@@ -29,6 +29,8 @@ def _build_stable_estimator(strength: float = 10.0) -> RotatingShieldPFEstimator
         for _ in range(filt.N)
     ]
     filt.log_weights = np.log(np.ones(filt.N) / filt.N)
+    # Remove continuous particles to keep uncertainty zeroed for this grid-based convergence check
+    filt.continuous_particles = []
     # populate history with identical estimates to simulate stabilization
     est.history_estimates = [est.estimates(), est.estimates()]
     return est
