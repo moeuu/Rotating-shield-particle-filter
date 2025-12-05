@@ -63,11 +63,13 @@ class RealTimePFVisualizer:
         isotopes: List[str],
         world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
         true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
+        true_strengths: Optional[Dict[str, float]] = None,
         show_counts: bool = True,
     ) -> None:
         self.isotopes = isotopes
         self.world_bounds = world_bounds or (0, 10, 0, 10, 0, 3)
         self.true_sources = true_sources or {}
+        self.true_strengths = true_strengths or {}
         self.show_counts = show_counts
         self.fig = plt.figure(figsize=(10, 6))
         if self.show_counts:
@@ -98,10 +100,14 @@ class RealTimePFVisualizer:
         self._traj_history: list[NDArray[np.float64]] = []
         self._last_frame: PFFrame | None = None
         self._true_artists: list = []
-        # Plot true sources once if provided
+        # Plot true sources once if provided (as legend entries)
         for iso, pos in self.true_sources.items():
             if pos.size:
-                art = self.ax3d.scatter(pos[:, 0], pos[:, 1], pos[:, 2], marker="*", s=100, color=self.colors.get(iso, "black"), label=f"True {iso}")
+                strength = self.true_strengths.get(iso, None)
+                label = f"True {iso}"
+                if strength is not None:
+                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                art = self.ax3d.scatter(pos[:, 0], pos[:, 1], pos[:, 2], marker="*", s=100, color=self.colors.get(iso, "black"), label=label)
                 self._true_artists.append(art)
 
     def _init_axes(self) -> None:
@@ -231,13 +237,25 @@ class RealTimePFVisualizer:
         # If we have a last frame, ensure markers are up to date
         if self._last_frame is not None:
             self.update(self._last_frame)
-        # Annotate estimated sources with isotope/strength
+        # Annotate only the strongest estimated source per isotope
         if self._last_frame is not None:
-            for iso in self.isotopes:
-                est_pos = self._last_frame.estimated_sources.get(iso, np.zeros((0, 3)))
-                est_str = self._last_frame.estimated_strengths.get(iso, np.zeros(0))
-                for pos, s in zip(est_pos, est_str):
-                    self.ax3d.text(pos[0], pos[1], pos[2], f"{iso} {s:.1f}", color=self.colors.get(iso, "black"), fontsize=8)
+            strongest: Dict[str, Tuple[NDArray[np.float64], float]] = {}
+            for iso, pos_arr in self._last_frame.estimated_sources.items():
+                strengths = self._last_frame.estimated_strengths.get(iso, np.zeros(0))
+                if strengths.size:
+                    idx = int(np.argmax(strengths))
+                    strongest[iso] = (pos_arr[idx], float(strengths[idx]))
+            # Place strongest estimates as text inside the 3D plot
+            for iso, (pos, s) in strongest.items():
+                self.ax3d.text(
+                    pos[0],
+                    pos[1],
+                    pos[2],
+                    f"{iso}\nEst pos={pos.round(2).tolist()}\nEst q={s:.1f} cps@1m",
+                    color=self.colors.get(iso, "black"),
+                    fontsize=8,
+                )
+            # True sources are already included via legend labels from __init__
         self.fig.savefig(out, dpi=200)
 
 

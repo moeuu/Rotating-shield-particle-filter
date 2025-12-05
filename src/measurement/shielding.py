@@ -131,13 +131,22 @@ def rotation_matrix_from_normal(normal: NDArray[np.float64]) -> NDArray[np.float
     """
     Generate a simple rotation matrix for an octant defined by a normal.
 
-    For the 1/8-shell, we only need the sign pattern: construct a diagonal matrix
-    whose entries are the signs of the normal components (Sec. 3.4.1).
+    The third column is aligned with the (normalized) octant normal. The first two
+    columns are any orthonormal basis spanning the plane perpendicular to the normal.
     """
     n = np.asarray(normal, dtype=float)
-    sign = np.sign(n)
-    sign[sign == 0.0] = 1.0
-    return np.diag(sign)
+    n_norm = np.linalg.norm(n)
+    if n_norm == 0:
+        raise ValueError("normal must be non-zero")
+    n_unit = n / n_norm
+    # choose a helper vector that is not collinear
+    helper = np.array([1.0, 0.0, 0.0]) if abs(n_unit[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_axis = np.cross(helper, n_unit)
+    x_axis /= (np.linalg.norm(x_axis) + 1e-12)
+    y_axis = np.cross(n_unit, x_axis)
+    y_axis /= (np.linalg.norm(y_axis) + 1e-12)
+    R = np.stack([x_axis, y_axis, n_unit], axis=1)
+    return R
 
 
 def octant_index_from_rotation(R: NDArray[np.float64]) -> int:

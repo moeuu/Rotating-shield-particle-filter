@@ -86,12 +86,15 @@ def test_generate_octant_orientations_and_index() -> None:
 
 
 def test_generate_rotation_matrices_and_pairs() -> None:
-    """Rotation matrices should be diagonal sign matrices and pair enumeration size should match 8x8."""
+    """Rotation matrices should be orthonormal with third column aligned to the octant normal; pair count = 8x8."""
     mats = generate_octant_rotation_matrices()
     assert mats.shape == (8, 3, 3)
     for n, m in zip(generate_octant_orientations(), mats):
-        expected = np.diag(np.where(np.sign(n) == 0.0, 1.0, np.sign(n)))
-        assert np.allclose(m, expected)
+        # third column = normalized normal
+        n_unit = n / np.linalg.norm(n)
+        assert np.allclose(m[:, 2], n_unit)
+        # columns should be orthonormal
+        assert np.allclose(m.T @ m, np.eye(3), atol=1e-6)
     pairs = generate_fe_pb_orientation_pairs()
     assert len(pairs) == 64
     assert pairs[0]["id"] == 0

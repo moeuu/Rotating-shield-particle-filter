@@ -31,6 +31,10 @@ class PFConfig:
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (0, 3)  # inclusive range
+    # Strength prior (cps@1m scale). Defaults cover ~1e3–1e5 cps via log-normal.
+    init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
+    init_strength_log_sigma: float = 1.0
+    use_discrete: bool = True  # set False to skip legacy discrete initialisation
 
 
 @dataclass
@@ -56,7 +60,7 @@ class IsotopeParticleFilter:
         self.N = self.config.num_particles
         self.states: List[ParticleState] = []
         self.log_weights: NDArray[np.float64] = np.zeros(self.N)
-        if self.kernel is not None:
+        if self.kernel is not None and self.config.use_discrete:
             self._init_particles()
         # Continuous PF scaffold (unused until full transition)
         self.continuous_kernel = ContinuousKernel()
@@ -73,7 +77,9 @@ class IsotopeParticleFilter:
             r_h = int(np.random.randint(min_r, max_r + 1))
             if r_h > 0:
                 positions = lo + np.random.rand(r_h, 3) * (hi - lo)
-                strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=r_h))
+                strengths = np.random.lognormal(
+                    mean=self.config.init_strength_log_mean, sigma=self.config.init_strength_log_sigma, size=r_h
+                )
             else:
                 positions = np.zeros((0, 3), dtype=float)
                 strengths = np.zeros(0, dtype=float)
@@ -287,21 +293,37 @@ class IsotopeParticleFilter:
 
     def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
         """
-        源位置と強度の単純加重平均推定を返す。
-
-        可変源数に対応するため、候補グリッドごとに加重平均強度を集計し、
-        上位max_sourcesを出力する。
+        Continuous MMSE estimate over positions/strengths using continuous_particles.
         """
-        w = np.exp(self.log_weights)
-        strength_accum = np.zeros(self.kernel.num_sources, dtype=float)
-        for st, wi in zip(self.states, w):
-            for idx_src, strength in zip(st.source_indices, st.strengths):
-                strength_accum[idx_src] += wi * strength
-        positive = np.nonzero(strength_accum > 0.0)[0]
-        if positive.size == 0:
+        if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
-        order = np.argsort(strength_accum[positive])[::-1]
-        selected = positive[order][: self.config.max_sources]
-        positions = self.kernel.sources[selected]
-        strengths = strength_accum[selected]
+        w = self.continuous_weights
+        max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
+        positions = np.zeros((max_r, 3), dtype=float)
+        strengths = np.zeros(max_r, dtype=float)
+        for j in range(max_r):
+            pos_stack = []
+            str_stack = []
+            w_stack = []
+            for wi, p in zip(w, self.continuous_particles):
+                if p.state.num_sources > j:
+                    pos_stack.append(p.state.positions[j])
+                    str_stack.append(p.state.strengths[j])
+                    w_stack.append(wi)
+            if not w_stack:
+                continue
+            wj = np.array(w_stack, dtype=float)
+            wj = wj / max(np.sum(wj), 1e-12)
+            pos_arr = np.vstack(pos_stack)
+            str_arr = np.array(str_stack, dtype=float)
+            positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+            strengths[j] = float(np.sum(wj * str_arr))
+        # Trim zeros beyond max_sources
+        mask = strengths > 0
+        positions = positions[mask]
+        strengths = strengths[mask]
+        if positions.shape[0] > self.config.max_sources:
+            order = np.argsort(strengths)[::-1][: self.config.max_sources]
+            positions = positions[order]
+            strengths = strengths[order]
         return positions, strengths
