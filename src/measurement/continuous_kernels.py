@@ -7,12 +7,19 @@ consistent with Sec. 3.2–3.3 of the thesis (inverse-square law plus attenuatio
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable
+from typing import Dict
 
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.shielding import OctantShield, generate_octant_orientations, octant_index_from_normal
+from measurement.kernels import ShieldParams
+from measurement.shielding import (
+    OctantShield,
+    generate_octant_orientations,
+    octant_index_from_normal,
+    path_length_cm,
+    resolve_mu_values,
+)
 
 
 def geometric_term(detector: NDArray[np.float64], source: NDArray[np.float64]) -> float:
@@ -28,23 +35,74 @@ class ContinuousKernel:
     """
     Continuous-coordinate kernel for Poisson expected counts (Sec. 3.3).
 
-    Shield attenuation is applied using an octant-based model: if the line-of-sight
-    falls inside the selected octant, an attenuation factor of 0.1 is applied.
+    Shield attenuation is applied using an octant-based model with exponential
+    attenuation exp(-mu * L) for Fe/Pb shells.
     """
 
-    mu_by_isotope: Dict[str, float] | None = None  # kept for future use; not used in 0.1 model
+    mu_by_isotope: Dict[str, object] | None = None
+    shield_params: ShieldParams = field(default_factory=ShieldParams)
     octant_shield: OctantShield = OctantShield()
     orientations: NDArray[np.float64] = field(default_factory=generate_octant_orientations)
 
+    def _mu_values(self, isotope: str) -> tuple[float, float]:
+        """Return (mu_fe, mu_pb) for the given isotope with fallbacks."""
+        return resolve_mu_values(
+            self.mu_by_isotope,
+            isotope,
+            default_fe=self.shield_params.mu_fe,
+            default_pb=self.shield_params.mu_pb,
+        )
+
     def attenuation_factor(
         self,
+        isotope: str,
         source_pos: NDArray[np.float64],
         detector_pos: NDArray[np.float64],
         orient_idx: int,
     ) -> float:
-        """Return attenuation factor A^{sh} (Sec. 3.2) using a simple 0.1/1.0 model."""
-        blocked = self.octant_shield.blocks_ray(detector_position=detector_pos, source_position=source_pos, octant_index=orient_idx)
-        return 0.1 if blocked else 1.0
+        """
+        Return attenuation factor A^{sh} (Sec. 3.2) for a single orientation.
+
+        This treats Fe and Pb shells as sharing the same orientation index.
+        """
+        normal = self.orientations[orient_idx]
+        blocked = self.octant_shield.blocks_ray(
+            detector_position=detector_pos,
+            source_position=source_pos,
+            octant_index=orient_idx,
+        )
+        direction = detector_pos - source_pos
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        L_fe = path_length_cm(direction, normal, self.shield_params.thickness_fe_cm, blocked=blocked)
+        L_pb = path_length_cm(direction, normal, self.shield_params.thickness_pb_cm, blocked=blocked)
+        return float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
+
+    def attenuation_factor_pair(
+        self,
+        isotope: str,
+        source_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+    ) -> float:
+        """Return combined Fe/Pb attenuation factor A^{sh} (Sec. 3.2)."""
+        direction = detector_pos - source_pos
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        normal_fe = self.orientations[fe_index]
+        normal_pb = self.orientations[pb_index]
+        blocked_fe = self.octant_shield.blocks_ray(
+            detector_position=detector_pos,
+            source_position=source_pos,
+            octant_index=fe_index,
+        )
+        blocked_pb = self.octant_shield.blocks_ray(
+            detector_position=detector_pos,
+            source_position=source_pos,
+            octant_index=pb_index,
+        )
+        L_fe = path_length_cm(direction, normal_fe, self.shield_params.thickness_fe_cm, blocked=blocked_fe)
+        L_pb = path_length_cm(direction, normal_pb, self.shield_params.thickness_pb_cm, blocked=blocked_pb)
+        return float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
 
     def kernel_value(
         self,
@@ -57,7 +115,20 @@ class ContinuousKernel:
         Evaluate K_{k,j,h} = G_{k,j} * A^{sh}_{k,j,h} (Eq. 3.11).
         """
         geom = geometric_term(detector_pos, source_pos)
-        att = self.attenuation_factor(source_pos, detector_pos, orient_idx)
+        att = self.attenuation_factor(isotope, source_pos, detector_pos, orient_idx)
+        return geom * att
+
+    def kernel_value_pair(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        source_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+    ) -> float:
+        """Evaluate K_{k,j,h}(R_Fe, R_Pb) for a Fe/Pb orientation pair."""
+        geom = geometric_term(detector_pos, source_pos)
+        att = self.attenuation_factor_pair(isotope, source_pos, detector_pos, fe_index, pb_index)
         return geom * att
 
     def expected_rate(
@@ -89,26 +160,10 @@ class ContinuousKernel:
     ) -> float:
         """
         Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
-
-        Attenuation model:
-            Fe blocks -> 0.1, Pb blocks -> 0.1, both -> 0.01, none -> 1.0.
         """
         total = background
         for src_pos, q in zip(sources, strengths):
-            geom = geometric_term(detector_pos, src_pos)
-            fe_block = self.octant_shield.blocks_ray(
-                detector_position=detector_pos, source_position=src_pos, octant_index=fe_index
-            )
-            pb_block = self.octant_shield.blocks_ray(
-                detector_position=detector_pos, source_position=src_pos, octant_index=pb_index
-            )
-            if fe_block and pb_block:
-                att = 0.01
-            elif fe_block or pb_block:
-                att = 0.1
-            else:
-                att = 1.0
-            total += geom * att * float(q)
+            total += self.kernel_value_pair(isotope, detector_pos, src_pos, fe_index, pb_index) * float(q)
         return float(total)
 
     def expected_counts(
@@ -167,16 +222,20 @@ def expected_counts_single_isotope(
     duration: float,
     isotope_id: str | None = None,
     kernel: ContinuousKernel | None = None,
+    mu_by_isotope: Dict[str, object] | None = None,
+    shield_params: ShieldParams | None = None,
 ) -> float:
     """
     Continuous expected counts Λ_{k,h} for a single isotope and time step (Sec. 3.2–3.3).
 
-    Attenuation model:
-        Fe blocks -> 0.1, Pb blocks -> 0.1, both -> 0.01, none -> 1.0.
     RFe / RPb are interpreted as orientation matrices; the third column is used as the
     shield normal. If a 3-vector is passed, it is used directly.
+    mu_by_isotope and shield_params are used only when a kernel is not provided.
     """
-    k = kernel or ContinuousKernel()
+    if kernel is None:
+        k = ContinuousKernel(mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams())
+    else:
+        k = kernel
 
     def _normal_from_R(R: NDArray[np.float64]) -> NDArray[np.float64]:
         if R.ndim == 1:

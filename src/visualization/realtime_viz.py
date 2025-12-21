@@ -46,6 +46,7 @@ class PFFrame:
 DEFAULT_ISOTOPE_COLORS = {
     "Cs-137": "tab:red",
     "Co-60": "tab:blue",
+    "Eu-154": "tab:green",
     "Eu-155": "tab:green",
 }
 
@@ -54,7 +55,7 @@ class RealTimePFVisualizer:
     """
     Simple matplotlib-based 3D visualizer for the PF state.
 
-    - update(frame) redraws particles, estimates, and counts for the given PFFrame.
+    - update(frame) redraws particles, estimates, counts, and label panel.
     - save_final(path) saves the current figure.
     """
 
@@ -71,13 +72,17 @@ class RealTimePFVisualizer:
         self.true_sources = true_sources or {}
         self.true_strengths = true_strengths or {}
         self.show_counts = show_counts
-        self.fig = plt.figure(figsize=(10, 6))
+        self.fig = plt.figure(figsize=(12, 6))
         if self.show_counts:
-            self.ax3d = self.fig.add_subplot(121, projection="3d")
-            self.ax_counts = self.fig.add_subplot(122)
+            layout = self.fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1])
+            self.ax3d = self.fig.add_subplot(layout[:, 0], projection="3d")
+            self.ax_counts = self.fig.add_subplot(layout[0, 1])
+            self.ax_labels = self.fig.add_subplot(layout[1, 1])
         else:
-            self.ax3d = self.fig.add_subplot(111, projection="3d")
+            layout = self.fig.add_gridspec(1, 2, width_ratios=[3, 1])
+            self.ax3d = self.fig.add_subplot(layout[0, 0], projection="3d")
             self.ax_counts = None
+            self.ax_labels = self.fig.add_subplot(layout[0, 1])
         cmap = plt.get_cmap("tab10")
         self.colors = {}
         for i, iso in enumerate(isotopes):
@@ -86,6 +91,7 @@ class RealTimePFVisualizer:
             else:
                 self.colors[iso] = cmap(i % 10)
         self._init_axes()
+        self._init_label_axis()
         plt.tight_layout()
         self._particle_artists: Dict[str, any] = {}
         self._est_artists: Dict[str, any] = {}
@@ -138,6 +144,133 @@ class RealTimePFVisualizer:
             Y, Z = np.meshgrid([y], zs)
             X = np.array([[xmin, xmin], [xmax, xmax]])
             self.ax3d.plot_wireframe(X, Y, Z, color="gray", alpha=0.2)
+
+    def _init_label_axis(self) -> None:
+        """Initialize the label panel axis."""
+        if self.ax_labels is None:
+            return
+        self.ax_labels.set_title("Legend / Estimates")
+        self.ax_labels.axis("off")
+
+    def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
+        """Build legend-style label lines with matching colors and markers."""
+        lines: List[Tuple[str, str, str, str]] = []
+        for iso, pos in self.true_sources.items():
+            if pos.size:
+                strength = self.true_strengths.get(iso, None)
+                label = f"True {iso}"
+                if strength is not None:
+                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                lines.append((label, self.colors.get(iso, "black"), "*", "None"))
+        lines.append(("trajectory", "cyan", "o", "-"))
+        lines.append(("robot", "cyan", "o", "None"))
+        for iso in self.isotopes:
+            color = self.colors.get(iso, "black")
+            lines.append((f"{iso} particles", color, ".", "None"))
+            lines.append((f"{iso} est", color, "x", "None"))
+        lines.append(("Fe shield", "magenta", ">", "None"))
+        lines.append(("Pb shield", "green", "<", "None"))
+        return lines
+
+    def _estimate_lines(self, frame: PFFrame) -> List[Tuple[str, str]]:
+        """Build estimate text lines for the strongest source per isotope."""
+        lines: List[Tuple[str, str]] = []
+        for iso in self.isotopes:
+            est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
+            strengths = frame.estimated_strengths.get(iso, np.zeros(0))
+            if strengths.size and est_pos.size:
+                idx = int(np.argmax(strengths))
+                pos = est_pos[idx]
+                strength = float(strengths[idx])
+                text = f"{iso}: pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+            else:
+                text = f"{iso}: no estimate"
+            lines.append((text, self.colors.get(iso, "black")))
+        return lines
+
+    def _update_labels(self, frame: PFFrame) -> None:
+        """Update the label panel with legend entries and estimates."""
+        if self.ax_labels is None:
+            return
+        self.ax_labels.cla()
+        self.ax_labels.set_title("Legend / Estimates")
+        self.ax_labels.axis("off")
+        legend_lines = self._legend_lines()
+        estimate_lines = self._estimate_lines(frame)
+        gap_lines = 1
+        total_lines = len(legend_lines) + len(estimate_lines) + 2 + gap_lines
+        line_height = 0.95 / max(total_lines, 1)
+        y = 0.98
+        self.ax_labels.text(
+            0.0,
+            y,
+            "Legend",
+            transform=self.ax_labels.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+        )
+        y -= line_height
+        for text, color, marker, linestyle in legend_lines:
+            self.ax_labels.text(
+                0.1,
+                y,
+                text,
+                transform=self.ax_labels.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                color=color,
+            )
+            if linestyle != "None":
+                self.ax_labels.plot(
+                    [0.02, 0.06],
+                    [y - 0.005, y - 0.005],
+                    transform=self.ax_labels.transAxes,
+                    color=color,
+                    linestyle=linestyle,
+                    marker=marker,
+                    markersize=6,
+                    linewidth=1.0,
+                )
+            else:
+                self.ax_labels.plot(
+                    [0.03],
+                    [y - 0.005],
+                    transform=self.ax_labels.transAxes,
+                    color=color,
+                    linestyle="None",
+                    marker=marker,
+                    markersize=6,
+                )
+            y -= line_height
+        y -= line_height
+        self.ax_labels.text(
+            0.0,
+            y,
+            "Estimates",
+            transform=self.ax_labels.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            fontweight="bold",
+            color="black",
+        )
+        y -= line_height
+        for text, color in estimate_lines:
+            self.ax_labels.text(
+                0.0,
+                y,
+                text,
+                transform=self.ax_labels.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8,
+                color=color,
+            )
+            y -= line_height
 
     def update(self, frame: PFFrame) -> None:
         """Redraw the scene for the given PFFrame."""
@@ -227,7 +360,7 @@ class RealTimePFVisualizer:
                     self._counts_bars.append(new_bar)
             self.ax_counts.set_ylabel("Counts")
             self.ax_counts.set_title("Unfolded counts z_{k,h}")
-        self.ax3d.legend(loc="upper right", fontsize=8)
+        self._update_labels(frame)
         self.fig.canvas.draw_idle()
 
     def save_final(self, path: str = "result.png") -> None:
@@ -237,26 +370,8 @@ class RealTimePFVisualizer:
         # If we have a last frame, ensure markers are up to date
         if self._last_frame is not None:
             self.update(self._last_frame)
-        # Annotate only the strongest estimated source per isotope
-        if self._last_frame is not None:
-            strongest: Dict[str, Tuple[NDArray[np.float64], float]] = {}
-            for iso, pos_arr in self._last_frame.estimated_sources.items():
-                strengths = self._last_frame.estimated_strengths.get(iso, np.zeros(0))
-                if strengths.size:
-                    idx = int(np.argmax(strengths))
-                    strongest[iso] = (pos_arr[idx], float(strengths[idx]))
-            # Place strongest estimates as text inside the 3D plot
-            for iso, (pos, s) in strongest.items():
-                self.ax3d.text(
-                    pos[0],
-                    pos[1],
-                    pos[2],
-                    f"{iso}\nEst pos={pos.round(2).tolist()}\nEst q={s:.1f} cps@1m",
-                    color=self.colors.get(iso, "black"),
-                    fontsize=8,
-                )
-            # True sources are already included via legend labels from __init__
         self.fig.savefig(out, dpi=200)
+        self.fig.canvas.draw_idle()
 
 
 def build_frame_from_pf(

@@ -56,6 +56,65 @@ def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArr
     return bool(np.all(sign_dir == sign_shield))
 
 
+def resolve_mu_values(
+    mu_by_isotope: dict[str, object] | None,
+    isotope: str,
+    default_fe: float,
+    default_pb: float,
+) -> Tuple[float, float]:
+    """
+    Resolve per-isotope attenuation coefficients for Fe/Pb.
+
+    Accepts one of:
+        - float: use the same mu for Fe and Pb
+        - (mu_fe, mu_pb) tuple/list
+        - dict with "fe"/"pb" keys
+    Falls back to defaults if isotope is missing or value is None.
+    """
+    if mu_by_isotope is None:
+        return float(default_fe), float(default_pb)
+    mu_val = mu_by_isotope.get(isotope)
+    if mu_val is None:
+        return float(default_fe), float(default_pb)
+    if isinstance(mu_val, dict):
+        mu_fe = float(mu_val.get("fe", default_fe))
+        mu_pb = float(mu_val.get("pb", default_pb))
+        return mu_fe, mu_pb
+    if isinstance(mu_val, (tuple, list, np.ndarray)) and len(mu_val) == 2:
+        return float(mu_val[0]), float(mu_val[1])
+    if isinstance(mu_val, (int, float)):
+        mu = float(mu_val)
+        return mu, mu
+    raise ValueError(f"Unsupported mu_by_isotope entry for {isotope}: {mu_val!r}")
+
+
+def path_length_cm(
+    direction: NDArray[np.float64],
+    shield_normal: NDArray[np.float64],
+    thickness_cm: float,
+    blocked: bool | None = None,
+    tol: float = 1e-9,
+) -> float:
+    """
+    Compute path length through the octant shell for a given direction and normal.
+
+    When blocked is None, a sign-based octant check is used. Otherwise the caller can
+    pass a precomputed blocked flag (e.g., OctantShield.blocks_ray).
+    """
+    if blocked is None:
+        blocked = shield_blocks_radiation(direction, shield_normal)
+    if not blocked:
+        return 0.0
+    norm = float(np.linalg.norm(direction))
+    if norm <= tol:
+        return 0.0
+    dir_unit = direction / norm
+    cos_theta = float(np.clip(np.dot(dir_unit, shield_normal), 0.0, 1.0))
+    if cos_theta <= tol:
+        return 0.0
+    return float(thickness_cm / cos_theta)
+
+
 @dataclass(frozen=True)
 class SphericalOctantShield:
     """1/8球殻シールドの単純モデル。"""

@@ -4,12 +4,13 @@ import numpy as np
 
 from measurement.model import EnvironmentConfig, PointSource
 from measurement.shielding import OctantShield, generate_octant_orientations
+from measurement.kernels import ShieldParams
 from spectrum.pipeline import SpectralDecomposer
 
 
 def test_spectrum_attenuates_when_shield_blocks() -> None:
     """
-    When the shield blocks the line-of-sight, the full spectrum is attenuated (~0.1×).
+    When the shield blocks the line-of-sight, the full spectrum is attenuated by exp(-mu*L).
 
     This ensures photopeaks (and unfolded isotope counts) decrease, consistent with
     the physical model (Sec. 3.4–3.5 shielding effect).
@@ -44,4 +45,8 @@ def test_spectrum_attenuates_when_shield_blocks() -> None:
     )
     ratio = spectrum_blocked.sum() / spectrum_free.sum()
     pl.BACKGROUND_RATE_CPS, pl.BACKGROUND_COUNTS_PER_SECOND = bg_backup
-    assert np.isclose(ratio, 0.1, rtol=1e-1)
+    shield_params = ShieldParams()
+    expected_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+    )
+    assert np.isclose(ratio, expected_ratio, rtol=1e-2)

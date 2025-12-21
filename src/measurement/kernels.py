@@ -7,12 +7,12 @@ uses measurement.continuous_kernels instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.shielding import OctantShield, octant_index_from_normal
+from measurement.shielding import OctantShield, octant_index_from_normal, path_length_cm, resolve_mu_values
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class ShieldParams:
 class KernelPrecomputer:
     """
     測定姿勢・遮蔽方位・候補源位置に対する幾何+遮蔽カーネルを事前計算する。
-    Sec. 3.2, 3.4に基づく簡易モデル。
+    Sec. 3.2, 3.4に基づくモデル。
     """
 
     def __init__(
@@ -37,7 +37,7 @@ class KernelPrecomputer:
         poses: NDArray[np.float64],
         orientations: NDArray[np.float64],
         shield_params: ShieldParams,
-        mu_by_isotope: Dict[str, float],
+        mu_by_isotope: Dict[str, object],
     ) -> None:
         """
         Args:
@@ -45,7 +45,7 @@ class KernelPrecomputer:
             poses: (K,3) 配列の検出器姿勢。
             orientations: (R,3) 配列のシールド法線ベクトル。
             shield_params: ShieldParams。
-            mu_by_isotope: 核種ごとの線減弱係数（1/cm）代表値。
+            mu_by_isotope: 核種ごとの線減弱係数（1/cm）。float, (fe, pb), or {"fe","pb"}.
         """
         self.sources = candidate_sources
         self.poses = poses
@@ -73,24 +73,28 @@ class KernelPrecomputer:
         """
         単位強度源に対する期待計数カーネル (J,) を返す。
 
-        Includes geometric term and simple orientation-dependent attenuation:
-        if the ray falls into the current octant shield, apply factor 0.1 (−90%),
-        otherwise factor 1.0.
+        Includes geometric term and exponential attenuation based on shield thickness
+        and per-isotope linear attenuation coefficients.
         """
         pose = self.poses[pose_idx]
         kernels = np.zeros(self.num_sources, dtype=float)
         oct_idx = octant_index_from_normal(self.orientations[orient_idx])
+        mu_fe, mu_pb = resolve_mu_values(
+            self.mu_by_isotope, isotope, default_fe=self.shield_params.mu_fe, default_pb=self.shield_params.mu_pb
+        )
+        normal = self.orientations[orient_idx]
         for j, src in enumerate(self.sources):
             vec = pose - src
             dist = np.linalg.norm(vec)
             if dist == 0:
                 dist = 1e-6
-            unit_vec = vec / dist
             geom = 1.0 / (4.0 * np.pi * dist**2)
-            # Lead/iron扱いを簡略化：blocks_rayがTrueなら0.1、それ以外は1.0
-            blocked_lead = self.octant_shield.blocks_ray(detector_position=pose, source_position=src, octant_index=oct_idx)
-            blocked_iron = self.octant_shield.blocks_ray(detector_position=pose, source_position=src, octant_index=oct_idx)
-            att = 0.1 if (blocked_lead or blocked_iron) else 1.0
+            blocked = self.octant_shield.blocks_ray(
+                detector_position=pose, source_position=src, octant_index=oct_idx
+            )
+            L_fe = path_length_cm(vec, normal, self.shield_params.thickness_fe_cm, blocked=blocked)
+            L_pb = path_length_cm(vec, normal, self.shield_params.thickness_pb_cm, blocked=blocked)
+            att = float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
             kernels[j] = geom * att
         return kernels
 

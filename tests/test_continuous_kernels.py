@@ -3,6 +3,7 @@
 import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel, geometric_term
+from measurement.kernels import ShieldParams
 from measurement.shielding import generate_octant_orientations
 from measurement.continuous_kernels import expected_counts_single_isotope
 
@@ -18,8 +19,9 @@ def test_geometric_term_inverse_square() -> None:
 
 
 def test_attenuation_applies_blocking_factor() -> None:
-    """Blocked orientation should reduce expected counts by ~0.1."""
-    kernel = ContinuousKernel()
+    """Blocked orientation should reduce expected counts by exp(-mu*L)."""
+    shield_params = ShieldParams()
+    kernel = ContinuousKernel(shield_params=shield_params)
     orientations = generate_octant_orientations()
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([1.0, 1.0, 1.0])
@@ -44,7 +46,10 @@ def test_attenuation_applies_blocking_factor() -> None:
         live_time_s=1.0,
         background=0.0,
     )
-    assert np.isclose(blocked_counts, 0.1 * free_counts, rtol=1e-6)
+    expected_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+    )
+    assert np.isclose(blocked_counts, expected_ratio * free_counts, rtol=1e-6)
 
 
 def test_background_added_to_expected_counts() -> None:
@@ -65,7 +70,7 @@ def test_background_added_to_expected_counts() -> None:
 
 
 def test_expected_counts_single_isotope_attenuation_levels() -> None:
-    """Fe/Pb blocking factors (0.1, 0.01) should scale expected counts accordingly."""
+    """Fe/Pb blocking should scale expected counts via exp(-mu*L)."""
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([[1.0, 1.0, 1.0]])
     strengths = np.array([10.0])
@@ -81,6 +86,11 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
         background=0.0,
         duration=1.0,
         isotope_id="Cs-137",
+    )
+    shield_params = ShieldParams()
+    expected_fe_ratio = np.exp(-(shield_params.mu_fe * shield_params.thickness_fe_cm))
+    expected_both_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
     )
     fe_only = expected_counts_single_isotope(
         detector_position=det,
@@ -102,8 +112,8 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
         duration=1.0,
         isotope_id="Cs-137",
     )
-    assert np.isclose(fe_only, 0.1 * base, rtol=1e-6)
-    assert np.isclose(both, 0.01 * base, rtol=1e-6)
+    assert np.isclose(fe_only, expected_fe_ratio * base, rtol=1e-6)
+    assert np.isclose(both, expected_both_ratio * base, rtol=1e-6)
 
 
 def test_expected_counts_pair_matches_single_helper() -> None:

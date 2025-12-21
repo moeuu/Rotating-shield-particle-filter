@@ -152,7 +152,8 @@ def rotation_policy_step(
     """
     One step of the shield-rotation policy (Sec. 3.4.3, Eqs. 3.47–3.48).
 
-    - Compute expected IG/Fisher for all orientations at the current pose.
+    - Compute expected IG/Fisher for all orientations at the current pose using
+      the discrete particle states when available.
     - If max metrics are below thresholds, stop rotating.
     - Otherwise select the best orientation (short acquisition suggested by live_time_s).
 
@@ -163,7 +164,12 @@ def rotation_policy_step(
     fishers: List[float] = []
     scores: List[float] = []
     for oid in range(estimator.num_orientations):
-        ig, fi = estimator.orientation_information_metrics(pose_idx=pose_idx, orient_idx=oid, live_time_s=live_time_s)
+        ig, fi = estimator.orientation_information_metrics(
+            pose_idx=pose_idx,
+            orient_idx=oid,
+            live_time_s=live_time_s,
+            prefer_continuous=False,
+        )
         igs.append(ig)
         fishers.append(fi)
         scores.append(ig + fisher_weight * fi)

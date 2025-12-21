@@ -37,7 +37,7 @@ def test_geometric_scaling_inverse_square() -> None:
 
 
 def test_shield_attenuation_factor_both_materials() -> None:
-    """When both Fe and Pb block, expected counts should be ~0.01 of free."""
+    """When both Fe and Pb block, expected counts should follow exp(-mu*L)."""
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([[1.0, 1.0, 1.0]])
     strength = np.array([5.0])
@@ -61,7 +61,13 @@ def test_shield_attenuation_factor_both_materials() -> None:
         duration=1.0,
         isotope_id="Cs-137",
     )
-    assert np.isclose(lam_blocked, 0.01 * lam_free, rtol=1e-6)
+    from measurement.kernels import ShieldParams
+
+    shield_params = ShieldParams()
+    expected_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+    )
+    assert np.isclose(lam_blocked, expected_ratio * lam_free, rtol=1e-6)
 
 
 def test_poisson_weight_update_prefers_higher_lambda() -> None:

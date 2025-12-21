@@ -8,7 +8,8 @@ Notes:
 - PF observations are always the isotope-wise counts from spectrum unfolding (no direct
   geometric shortcuts).
 - The PF algorithm itself is unchanged; this script focuses on live visualization and
-  playback. A final snapshot is saved to results/result.png.
+  playback. Final snapshots are saved to results/result_pf.png (PF) and
+  results/result_spectrum.png (final spectrum).
 """
 
 from __future__ import annotations
@@ -35,13 +36,16 @@ if str(SRC) not in sys.path:
 RESULTS_DIR = ROOT / "results"
 
 from measurement.model import EnvironmentConfig, PointSource
-from measurement.shielding import OctantShield, generate_octant_orientations, generate_octant_rotation_matrices
+from measurement.shielding import generate_octant_orientations, generate_octant_rotation_matrices
+from measurement.kernels import ShieldParams
+from spectrum.library import Nuclide
+from spectrum.peak_detection import detect_peaks
 from spectrum.pipeline import SpectralDecomposer
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
 from planning.shield_rotation import select_best_orientation, select_top_k_orientations
 from planning.pose_selection import select_next_pose
-from visualization.realtime_viz import build_frame_from_pf, RealTimePFVisualizer
+from visualization.realtime_viz import DEFAULT_ISOTOPE_COLORS, RealTimePFVisualizer, build_frame_from_pf
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -53,7 +57,101 @@ def _build_demo_sources() -> list[PointSource]:
     ]
 
 
-def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.png", all_orientations: bool = False) -> None:
+def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
+    """Return a consistent color mapping for isotope-specific plots."""
+    cmap = plt.get_cmap("tab10")
+    colors: dict[str, str] = {}
+    for i, iso in enumerate(isotopes):
+        if iso in DEFAULT_ISOTOPE_COLORS:
+            colors[iso] = DEFAULT_ISOTOPE_COLORS[iso]
+        else:
+            colors[iso] = cmap(i % 10)
+    return colors
+
+
+def _assign_peak_indices(
+    energy_axis: np.ndarray,
+    peak_indices: np.ndarray,
+    library: dict[str, Nuclide],
+    tolerance_keV: float,
+) -> tuple[dict[str, list[int]], list[int]]:
+    """Assign detected peak indices to isotopes based on closest library lines."""
+    peaks_by_iso: dict[str, list[int]] = {iso: [] for iso in library}
+    unassigned: list[int] = []
+    line_energies = {
+        iso: np.array([line.energy_keV for line in nuclide.lines], dtype=float)
+        for iso, nuclide in library.items()
+    }
+    for idx in peak_indices:
+        energy = float(energy_axis[int(idx)])
+        best_iso = None
+        best_diff = float("inf")
+        for iso, energies in line_energies.items():
+            if energies.size == 0:
+                continue
+            diff = float(np.min(np.abs(energies - energy)))
+            if diff < best_diff:
+                best_diff = diff
+                best_iso = iso
+        if best_iso is not None and best_diff <= tolerance_keV:
+            peaks_by_iso[best_iso].append(int(idx))
+        else:
+            unassigned.append(int(idx))
+    return peaks_by_iso, unassigned
+
+
+def _save_spectrum_plot(
+    decomposer: SpectralDecomposer,
+    spectrum: np.ndarray,
+    output_path: Path,
+    peak_tolerance_keV: float = 10.0,
+) -> None:
+    """Save the final measurement spectrum with nuclide lines and colored peaks."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    energy_axis = decomposer.energy_axis
+    library = decomposer.library
+    colors = _build_isotope_colors(list(library.keys()))
+    corrected = decomposer.preprocess(spectrum)
+    peak_indices = detect_peaks(corrected, prominence=0.05, distance=5)
+    peaks_by_iso, unassigned = _assign_peak_indices(
+        energy_axis,
+        peak_indices,
+        library,
+        tolerance_keV=peak_tolerance_keV,
+    )
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(energy_axis, spectrum, color="black", linewidth=1.0, label="Spectrum")
+    for iso, nuclide in library.items():
+        color = colors.get(iso, "gray")
+        labeled = False
+        for line in nuclide.lines:
+            label = iso if not labeled else None
+            ax.axvline(
+                line.energy_keV,
+                color=color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.6,
+                label=label,
+            )
+            labeled = True
+    for iso, idxs in peaks_by_iso.items():
+        if idxs:
+            ax.scatter(energy_axis[idxs], spectrum[idxs], color=colors.get(iso, "gray"), s=28, zorder=3)
+    if unassigned:
+        ax.scatter(energy_axis[unassigned], spectrum[unassigned], color="gray", s=20, zorder=3, alpha=0.6)
+    ax.set_xlabel("Energy (keV)")
+    ax.set_ylabel("Counts")
+    ax.set_title("Final measurement spectrum")
+    ax.grid(True, alpha=0.3)
+    if library:
+        ax.legend(loc="upper right", fontsize=8, title="Nuclide lines")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def run_live_pf(live: bool = True, steps: int = 24, all_orientations: bool = False) -> None:
     """Run a simple PF loop with live visualization (active pose/orientation selection)."""
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = [
@@ -62,7 +160,6 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
         PointSource("Eu-154", position=(7.0, 5.0, 3.0), intensity_cps_1m=30000.0),
     ]
     decomposer = SpectralDecomposer()
-    octant_shield = OctantShield()
     normals = generate_octant_orientations()
     rot_mats = generate_octant_rotation_matrices()
     num_orients = len(rot_mats)
@@ -82,6 +179,10 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
     max_sources = 2
     # Use a moderate particle count for the demo (previous default was 200)
     num_particles = 2000
+    shield_params = ShieldParams()
+    mu_by_isotope = {
+        iso: {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb} for iso in isotopes
+    }
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
         max_sources=max_sources,
@@ -96,7 +197,7 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
         isotopes=isotopes,
         candidate_sources=grid,
         shield_normals=normals,
-        mu_by_isotope={iso: 0.5 for iso in isotopes},
+        mu_by_isotope=mu_by_isotope,
         pf_config=pf_conf,
     )
     # Register all candidate poses
@@ -136,6 +237,7 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
     min_unique_poses = 21  # require >20 unique measurement locations
     target_steps = max(steps, min_steps)
     visited_poses: set[int] = set()
+    last_spectrum: np.ndarray | None = None
     while (step_counter < target_steps) or (len(visited_poses) < min_unique_poses):
         pose = poses_arr[current_pose_idx]
         available_orients = list(range(total_pairs))
@@ -164,9 +266,12 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
                 environment=env_step,
                 acquisition_time=live_time,
                 rng=np.random.default_rng(123 + step_counter),
-                shield_orientation=normals[fe_idx],  # reuse Fe normal for spectral sim
-                octant_shield=octant_shield,
+                fe_shield_orientation=normals[fe_idx],
+                pb_shield_orientation=normals[pb_idx],
+                mu_by_isotope=mu_by_isotope,
+                shield_params=shield_params,
             )
+            last_spectrum = spectrum.copy()
             z_k = decomposer.isotope_counts(spectrum)
             meas = Measurement(
                 counts_by_isotope=z_k,
@@ -185,10 +290,10 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
             viz.update(frame)
             rfe_dir = RFe_sel[:, 2].tolist()
             rpb_dir = RPb_sel[:, 2].tolist()
-            # Log only measurement point, shield orientations, and counts
+            # Log only measurement point and shield orientations
             print(
                 f"[step {step_counter}] pose={pose.tolist()} orient_pair={best_pair_idx} "
-                f"fe_idx={fe_idx} pb_idx={pb_idx} RFe_dir={rfe_dir} RPb_dir={rpb_dir} counts={z_k}"
+                f"fe_idx={fe_idx} pb_idx={pb_idx} RFe_dir={rfe_dir} RPb_dir={rpb_dir}"
             )
             if live:
                 plt.pause(0.05)
@@ -229,12 +334,17 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
         )
         recent_poses.append(current_pose_idx)
 
-    # Save final snapshot
-    out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    viz.save_final(out_path.as_posix())
+    # Save final snapshots
+    pf_out_path = RESULTS_DIR / "result_pf.png"
+    spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
+    pf_out_path.parent.mkdir(parents=True, exist_ok=True)
+    viz.save_final(pf_out_path.as_posix())
+    if last_spectrum is not None:
+        _save_spectrum_plot(decomposer, last_spectrum, spectrum_out_path)
     total_meas_time = step_counter * live_time
-    print(f"Final visualization saved to: {out_path}")
+    print(f"Final PF visualization saved to: {pf_out_path}")
+    if last_spectrum is not None:
+        print(f"Final spectrum saved to: {spectrum_out_path}")
     print(f"Total measurements: {step_counter}, total live time (simulated): {total_meas_time:.1f} s")
     if live:
         plt.ioff()
@@ -242,28 +352,25 @@ def run_live_pf(live: bool = True, steps: int = 24, output_path: str = "result.p
     plt.close("all")
 
 
-def run_realtime_pf(scenario_path: str | None = None, output_path: str = "result.png") -> None:
-    """
-    Entry point for real-time PF + visualization.
-
-    For now, scenario loading is simplified: if scenario_path is provided, it can be parsed
-    in the future; currently the built-in demo trajectory/sources are used.
-    """
-    run_live_pf(live=True, steps=10, output_path=output_path)
+def run_realtime_pf() -> None:
+    """Entry point for real-time PF + visualization with built-in demo settings."""
+    run_live_pf(live=True, steps=10)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time rotating-shield PF visualization demo.")
     parser.add_argument("--steps", type=int, default=24, help="Number of measurement steps to simulate.")
-    parser.add_argument("--no-live", action="store_true", help="Disable interactive updating (still saves result.png).")
-    parser.add_argument("--output", type=str, default="result.png", help="Path to save final snapshot.")
-    parser.add_argument("--scenario", type=str, default=None, help="(Optional) scenario config path (JSON/YAML).")
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Disable interactive updating (still saves results/result_pf.png and results/result_spectrum.png).",
+    )
     parser.add_argument(
         "--all-orientations", action="store_true", help="Measure all 64 Fe/Pb orientation pairs at each pose."
     )
     args = parser.parse_args()
     # For now scenario loading is a placeholder; default to built-in demo
-    run_live_pf(live=not args.no_live, steps=args.steps, output_path=args.output, all_orientations=args.all_orientations)
+    run_live_pf(live=not args.no_live, steps=args.steps, all_orientations=args.all_orientations)
 
 
 if __name__ == "__main__":

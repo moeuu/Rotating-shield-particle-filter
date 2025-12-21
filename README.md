@@ -7,7 +7,7 @@ Demo simulations assume strong sources (≈20,000 cps at 1 m) for Cs-137, Co-60,
 To run the real-time particle filter visualization demo:
 
 ```
-python main.py --scenario configs/example_scenario.yaml --output result.png
+python main.py
 ```
 
-The scenario argument is optional in the current demo (built-in synthetic path/sources are used if omitted). The run shows robot trajectory, shield orientations, particle clouds, and estimated sources; `result.png` is written at the end.
+The run shows robot trajectory, shield orientations, particle clouds, and estimated sources; `results/result_pf.png` is written at the end, alongside the final spectrum as `results/result_spectrum.png`.

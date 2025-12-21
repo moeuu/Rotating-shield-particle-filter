@@ -58,22 +58,26 @@ def test_octant_shield_blocks_ray_by_angles() -> None:
     assert not shield.blocks_ray(detector_position=det_mmp, source_position=src, octant_index=1)
 
 
-def test_kernel_attenuation_factor_applies_tenth_when_blocked() -> None:
-    """KernelPrecomputer should scale to 0.1 when octant blocks the ray."""
+def test_kernel_attenuation_factor_applies_exponential_when_blocked() -> None:
+    """KernelPrecomputer should attenuate according to exp(-mu*L) when blocked."""
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     poses = np.array([[1.0, 1.0, 1.0]], dtype=float)
     orientations = OCTANT_NORMALS
-    mu = {"Cs-137": 0.5}
+    shield_params = ShieldParams()
+    mu = {"Cs-137": {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb}}
     kernel = KernelPrecomputer(
         candidate_sources=candidate_sources,
         poses=poses,
         orientations=orientations,
-        shield_params=ShieldParams(),
+        shield_params=shield_params,
         mu_by_isotope=mu,
     )
     k_block = kernel.kernel("Cs-137", pose_idx=0, orient_idx=0)[0]
     k_free = kernel.kernel("Cs-137", pose_idx=0, orient_idx=7)[0]
-    assert np.isclose(k_block, 0.1 * k_free, rtol=1e-6)
+    expected_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+    )
+    assert np.isclose(k_block, expected_ratio * k_free, rtol=1e-6)
 
 
 def test_generate_octant_orientations_and_index() -> None:
@@ -101,9 +105,9 @@ def test_generate_rotation_matrices_and_pairs() -> None:
     assert pairs[-1]["id"] == 63
 
 
-def test_rotation_changes_counts_by_tenth_when_blocked() -> None:
+def test_rotation_changes_counts_by_exponential_when_blocked() -> None:
     """
-    Rotating from an unblocked to a blocked octant should reduce counts to ~1/10.
+    Rotating from an unblocked to a blocked octant should attenuate counts via exp(-mu*L).
 
     This reproduces the qualitative behavior in IAS-19 Fig. 1: orientation
     modulates count rate and provides directional information.
@@ -111,15 +115,19 @@ def test_rotation_changes_counts_by_tenth_when_blocked() -> None:
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     poses = np.array([[1.0, 1.0, 1.0]], dtype=float)
     orientations = generate_octant_orientations()
-    mu = {"Cs-137": 0.5}
+    shield_params = ShieldParams()
+    mu = {"Cs-137": {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb}}
     kernel = KernelPrecomputer(
         candidate_sources=candidate_sources,
         poses=poses,
         orientations=orientations,
-        shield_params=ShieldParams(),
+        shield_params=shield_params,
         mu_by_isotope=mu,
     )
     strength = np.array([10.0])
     unblocked = kernel.expected_counts("Cs-137", pose_idx=0, orient_idx=7, source_strengths=strength, background=0.0)
     blocked = kernel.expected_counts("Cs-137", pose_idx=0, orient_idx=0, source_strengths=strength, background=0.0)
-    assert blocked == pytest.approx(0.1 * unblocked, rel=1e-6)
+    expected_ratio = np.exp(
+        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+    )
+    assert blocked == pytest.approx(expected_ratio * unblocked, rel=1e-6)

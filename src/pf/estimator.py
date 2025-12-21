@@ -73,7 +73,7 @@ class RotatingShieldPFEstimator:
         isotopes: Sequence[str],
         candidate_sources: NDArray[np.float64],
         shield_normals: NDArray[np.float64] | None,
-        mu_by_isotope: Dict[str, float],
+        mu_by_isotope: Dict[str, object],
         pf_config: RotatingShieldPFConfig | None = None,
         shield_params: ShieldParams | None = None,
     ) -> None:
@@ -149,7 +149,13 @@ class RotatingShieldPFEstimator:
         for iso, val in z_k.items():
             if iso not in self.filters:
                 continue
-            self.filters[iso].update(z_obs=val, pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s)
+            filt = self.filters[iso]
+            if filt.continuous_particles:
+                filt.update_continuous(
+                    z_obs=val, pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+                )
+            else:
+                filt.update(z_obs=val, pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s)
         self.history_estimates.append(self.estimates())
         self.measurements.append(
             MeasurementRecord(
@@ -246,13 +252,19 @@ class RotatingShieldPFEstimator:
         return ig
 
     def orientation_information_metrics(
-        self, pose_idx: int, orient_idx: int, live_time_s: float = 1.0
+        self,
+        pose_idx: int,
+        orient_idx: int,
+        live_time_s: float = 1.0,
+        prefer_continuous: bool = True,
     ) -> Tuple[float, float]:
         """
         Compute (IG, Fisher) surrogates for a given orientation (Sec. 3.4.2, Eqs. 3.40–3.43).
 
         IG ≈ 0.5 log(1 + Var[Λ]/E[Λ]) and Fisher surrogate ≈ Var[Λ]/(E[Λ]^2+ε),
         where Λ are the per-particle expected counts under the current PF posterior.
+        If prefer_continuous is False and discrete particles are available, use the
+        discrete states; otherwise fall back to continuous particles.
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
@@ -260,15 +272,26 @@ class RotatingShieldPFEstimator:
         fisher_total = 0.0
         eps = 1e-9
         for iso, filt in self.filters.items():
-            lam = np.zeros(filt.N, dtype=float)
-            kvec = self.kernel_cache.kernel(iso, pose_idx, orient_idx)
-            for i, st in enumerate(filt.states):
-                contrib = 0.0
-                for idx_src, strength in zip(st.source_indices, st.strengths):
-                    contrib += kvec[idx_src] * strength
-                lam[i] = live_time_s * (contrib + st.background)
-            w = np.exp(filt.log_weights)
-            w = w / max(np.sum(w), eps)
+            use_continuous = bool(filt.continuous_particles)
+            use_discrete = bool(filt.states)
+            if use_continuous and (prefer_continuous or not use_discrete):
+                lam = filt._continuous_expected_counts(
+                    pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+                )
+                w = filt.continuous_weights
+            elif use_discrete:
+                lam = np.zeros(filt.N, dtype=float)
+                kvec = self.kernel_cache.kernel(iso, pose_idx, orient_idx)
+                for i, st in enumerate(filt.states):
+                    contrib = 0.0
+                    for idx_src, strength in zip(st.source_indices, st.strengths):
+                        contrib += kvec[idx_src] * strength
+                    lam[i] = live_time_s * (contrib + st.background)
+                w = np.exp(filt.log_weights)
+                w = w / max(np.sum(w), eps)
+            else:
+                lam = np.zeros(0, dtype=float)
+                w = np.zeros(0, dtype=float)
             mean = float(np.sum(w * lam))
             var = float(np.sum(w * (lam - mean) ** 2))
             ig_total += 0.5 * float(np.log1p(var / max(mean, eps)))
@@ -306,7 +329,7 @@ class RotatingShieldPFEstimator:
         eps = 1e-12
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
-        kernel = ContinuousKernel()
+        kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
         detector_pos = self.kernel_cache.poses[pose_idx]
         alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
         # normalize alphas
@@ -375,7 +398,7 @@ class RotatingShieldPFEstimator:
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
         detector_pos = self.kernel_cache.poses[pose_idx]
-        kernel = ContinuousKernel()
+        kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
         JA_total = 0.0
         JD_total = 0.0
         for iso, filt in self.filters.items():
@@ -400,20 +423,13 @@ class RotatingShieldPFEstimator:
                 lam = max(lam, ridge)
                 g = np.zeros(dim, dtype=float)
                 for j in range(st.num_sources):
-                    geom = 1.0 / (4.0 * np.pi * max(np.linalg.norm(detector_pos - st.positions[j]), 1e-6) ** 2)
-                    fe_block = kernel.octant_shield.blocks_ray(
-                        detector_position=detector_pos, source_position=st.positions[j], octant_index=fe_idx
+                    g[j] = live_time_s * kernel.kernel_value_pair(
+                        isotope=iso,
+                        detector_pos=detector_pos,
+                        source_pos=st.positions[j],
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
                     )
-                    pb_block = kernel.octant_shield.blocks_ray(
-                        detector_position=detector_pos, source_position=st.positions[j], octant_index=pb_idx
-                    )
-                    if fe_block and pb_block:
-                        att = 0.01
-                    elif fe_block or pb_block:
-                        att = 0.1
-                    else:
-                        att = 1.0
-                    g[j] = live_time_s * geom * att
                 g[-1] = live_time_s  # derivative w.r.t. background
                 I += w * (1.0 / lam) * np.outer(g, g)
             I += ridge * np.eye(dim)
@@ -661,13 +677,30 @@ class RotatingShieldPFEstimator:
         """
         Apply the best-case measurement test (Sec. 3.4.5) and zero out spurious sources.
 
-        For each isotope h and each candidate grid point j with non-zero expected strength,
-        find the measurement index k* that maximises the ratio \\hat{Λ}_{k,h,j}/(z_{k,h}+ε)
-        (Eq. k* definition in Sec. 3.4.5), where \\hat{Λ}_{k,h,j} is the expected contribution
-        of that source alone. If the best-case ratio \\hat{Λ}_{k*,h,j}/z_{k*,h} falls below τ_mix,
-        the source is marked spurious and removed from every particle. Returns a boolean mask
-        (length = num candidate grid points) of kept sources per isotope.
+        For each isotope h and each candidate source, find the measurement index k* that
+        maximises the ratio \\hat{Λ}_{k,h}/(z_{k,h}+ε) (Sec. 3.4.5). If the best-case ratio
+        falls below τ_mix, the source is marked spurious and removed.
         """
+        if any(filt.continuous_particles for filt in self.filters.values()):
+            from pf.mixing import prune_spurious_sources_continuous
+
+            keep_masks = prune_spurious_sources_continuous(self, tau_mix=tau_mix, epsilon=epsilon)
+            for iso, filt in self.filters.items():
+                if not filt.continuous_particles:
+                    continue
+                keep = keep_masks.get(iso)
+                if keep is None or keep.size == 0:
+                    continue
+                for p in filt.continuous_particles:
+                    r = p.state.num_sources
+                    if r == 0:
+                        continue
+                    keep_idx = keep[:r] if keep.size >= r else np.pad(keep, (0, r - keep.size), constant_values=True)
+                    p.state.positions = p.state.positions[keep_idx]
+                    p.state.strengths = p.state.strengths[keep_idx]
+                    p.state.num_sources = p.state.positions.shape[0]
+            return keep_masks
+
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
         if not self.measurements:

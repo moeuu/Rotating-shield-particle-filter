@@ -58,7 +58,7 @@ class ParallelIsotopePF:
     """
     Hold one PF per isotope and provide update/estimate helpers (Sec. 3.3.5).
 
-    Currently uses the continuous PF scaffold via IsotopeParticleFilter.update_continuous.
+    Uses the continuous PF path via IsotopeParticleFilter.update_continuous.
     Use `estimate_all()` after convergence to retrieve per-isotope means and 4x4 covariances
     over (x, y, z, q) for downstream visualization/reporting.
     """
@@ -74,7 +74,7 @@ class ParallelIsotopePF:
     def attach_kernel(self, isotope: str, kernel) -> None:
         """Assign a measurement kernel to a specific isotope PF."""
         if isotope in self.filters:
-            self.filters[isotope].kernel = kernel
+            self.filters[isotope].set_kernel(kernel)
 
     def update_all(self, measurement: Measurement) -> None:
         """Update all isotope PFs with isotope-wise counts z_{k,h}."""

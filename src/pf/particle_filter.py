@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.kernels import KernelPrecomputer
+from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
 from pf.state import ParticleState, IsotopeState
 from pf.weights import effective_sample_size, log_weight_update_poisson
@@ -21,12 +21,16 @@ class PFConfig:
     """粒子フィルタ設定（Sec. 3.4）。"""
 
     num_particles: int = 200
+    min_particles: int | None = None
+    max_particles: int | None = None
     max_sources: int = 1
     resample_threshold: float = 0.5  # relative to N
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     min_strength: float = 0.01
     p_birth: float = 0.05
+    ess_low: float = 0.5
+    ess_high: float = 0.9
     # Continuous PF priors (Sec. 3.3.2)
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
@@ -46,12 +50,12 @@ class IsotopeParticle:
 
 
 class IsotopeParticleFilter:
-    """同位体ごとの粒子フィルタを実装。Discrete path is legacy; continuous path is WIP."""
+    """同位体ごとの粒子フィルタを実装（連続状態のPFを主体に運用）。"""
 
     def __init__(
         self,
         isotope: str,
-        kernel: KernelPrecomputer,
+        kernel: KernelPrecomputer | None,
         config: PFConfig | None = None,
     ) -> None:
         self.isotope = isotope
@@ -62,10 +66,22 @@ class IsotopeParticleFilter:
         self.log_weights: NDArray[np.float64] = np.zeros(self.N)
         if self.kernel is not None and self.config.use_discrete:
             self._init_particles()
-        # Continuous PF scaffold (unused until full transition)
-        self.continuous_kernel = ContinuousKernel()
+        mu_by_isotope = getattr(kernel, "mu_by_isotope", None) if kernel is not None else None
+        shield_params = getattr(kernel, "shield_params", ShieldParams()) if kernel is not None else ShieldParams()
+        self.continuous_kernel = ContinuousKernel(
+            mu_by_isotope=mu_by_isotope,
+            shield_params=shield_params,
+        )
         self.continuous_particles: List[IsotopeParticle] = []
         self._init_continuous_particles()
+
+    def set_kernel(self, kernel: KernelPrecomputer) -> None:
+        """Attach a kernel and refresh the continuous-kernel configuration."""
+        self.kernel = kernel
+        self.continuous_kernel = ContinuousKernel(
+            mu_by_isotope=getattr(kernel, "mu_by_isotope", None),
+            shield_params=getattr(kernel, "shield_params", ShieldParams()),
+        )
 
     def _init_continuous_particles(self) -> None:
         """Sample continuous positions/strengths/background from broad priors (Sec. 3.3.2)."""
@@ -75,6 +91,8 @@ class IsotopeParticleFilter:
         min_r, max_r = self.config.init_num_sources
         for _ in range(self.N):
             r_h = int(np.random.randint(min_r, max_r + 1))
+            if self.config.max_sources > 0:
+                r_h = min(r_h, self.config.max_sources)
             if r_h > 0:
                 positions = lo + np.random.rand(r_h, 3) * (hi - lo)
                 strengths = np.random.lognormal(
@@ -148,7 +166,12 @@ class IsotopeParticleFilter:
 
         z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
         """
-        lam = self._continuous_expected_counts_pair(pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s)
+        lam = self._continuous_expected_counts_pair(
+            pose_idx=pose_idx,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+        )
         log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
         log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
         log_unnorm -= np.max(log_unnorm)
@@ -189,10 +212,48 @@ class IsotopeParticleFilter:
     def adapt_num_particles(self) -> None:
         """
         Optional: adapt N based on variance/entropy of weights (Chapter 3.3.4).
-
-        TODO: Not implemented in this task.
         """
-        return
+        if not self.continuous_particles:
+            return
+        min_particles = (
+            max(1, int(self.config.min_particles))
+            if self.config.min_particles is not None
+            else max(1, int(self.config.num_particles))
+        )
+        max_particles = (
+            max(1, int(self.config.max_particles))
+            if self.config.max_particles is not None
+            else max(1, int(self.config.num_particles))
+        )
+        w = self.continuous_weights
+        ess = 1.0 / np.sum(w**2)
+        ess_ratio = ess / max(len(w), 1)
+        if ess_ratio < self.config.ess_low and len(w) < max_particles:
+            target = min(max_particles, max(len(w) + 1, int(len(w) * 1.25)))
+            self._resample_continuous_to(target, jitter=True)
+        elif ess_ratio > self.config.ess_high and len(w) > min_particles:
+            target = max(min_particles, int(len(w) * 0.8))
+            self._resample_continuous_to(target, jitter=False)
+
+    def _resample_continuous_to(self, target_n: int, jitter: bool = False) -> None:
+        """Resample the continuous particles to a new population size."""
+        target_n = max(1, int(target_n))
+        w = self.continuous_weights
+        idx = np.random.choice(len(self.continuous_particles), size=target_n, p=w)
+        states = [self.continuous_particles[i].state.copy() for i in idx]
+        self.continuous_particles = [
+            IsotopeParticle(state=st, log_weight=float(-np.log(target_n))) for st in states
+        ]
+        self.N = target_n
+        self.config.num_particles = target_n
+        if jitter:
+            self.regularize_continuous(
+                sigma_pos=self.config.strength_sigma,
+                sigma_int=self.config.strength_sigma,
+                p_birth=self.config.p_birth,
+                p_kill=0.1,
+                intensity_threshold=self.config.min_strength,
+            )
 
     def best_particle(self) -> IsotopeParticle:
         """Return the particle with maximum log_weight."""

@@ -10,6 +10,8 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
 from measurement.shielding import OctantShield, octant_index_from_normal
+from measurement.kernels import ShieldParams
+from measurement.continuous_kernels import ContinuousKernel
 from spectrum.library import Nuclide, default_library
 from spectrum.response_matrix import (
     build_response_matrix,
@@ -83,18 +85,23 @@ class SpectralDecomposer:
         dead_time_s: float = 0.0,
         shield_orientation: NDArray[np.float64] | None = None,
         octant_shield: OctantShield | None = None,
+        fe_shield_orientation: NDArray[np.float64] | None = None,
+        pb_shield_orientation: NDArray[np.float64] | None = None,
+        mu_by_isotope: Dict[str, object] | None = None,
+        shield_params: ShieldParams | None = None,
     ) -> Tuple[NDArray[np.float64], Dict[str, float]]:
         """
         点源と環境設定に基づき合成スペクトルを生成する。
 
         戻り値はスペクトル配列と、幾何減衰込みの実効強度辞書。
 
-        Shielding (Sec. 3.4–3.5): if shield_orientation/octant_shield are provided,
-        the line-of-sight is tested via blocks_ray and a 0.1 attenuation factor is
-        applied to the source contribution to reflect attenuated photopeaks.
+        Shielding (Sec. 3.4–3.5): if shield orientations are provided, the line-of-sight
+        is tested and an exponential attenuation factor exp(-mu * L) is applied to each
+        source contribution to reflect attenuated photopeaks.
         """
         env = environment or EnvironmentConfig()
         detector = env.detector()
+        kernel = ContinuousKernel(mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams())
         expected = np.zeros_like(self.energy_axis, dtype=float)
         effective_strengths: Dict[str, float] = {name: 0.0 for name in self.isotope_names}
         for source in sources:
@@ -103,10 +110,38 @@ class SpectralDecomposer:
             geom = inverse_square_scale(detector, source)
             effective_strength = source.intensity_cps_1m * geom
             atten = 1.0
-            if octant_shield is not None and shield_orientation is not None:
+            if fe_shield_orientation is not None or pb_shield_orientation is not None:
+                fe_idx = octant_index_from_normal(np.asarray(fe_shield_orientation)) if fe_shield_orientation is not None else None
+                pb_idx = octant_index_from_normal(np.asarray(pb_shield_orientation)) if pb_shield_orientation is not None else None
+                if fe_idx is not None and pb_idx is not None:
+                    atten = kernel.attenuation_factor_pair(
+                        isotope=source.isotope,
+                        source_pos=source.position_array(),
+                        detector_pos=detector,
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                    )
+                else:
+                    orient_idx = fe_idx if fe_idx is not None else pb_idx
+                    atten = kernel.attenuation_factor(
+                        isotope=source.isotope,
+                        source_pos=source.position_array(),
+                        detector_pos=detector,
+                        orient_idx=int(orient_idx),
+                    )
+            elif octant_shield is not None and shield_orientation is not None:
                 oct_idx = octant_index_from_normal(np.asarray(shield_orientation))
-                if octant_shield.blocks_ray(detector_position=detector, source_position=source.position_array(), octant_index=oct_idx):
-                    atten = 0.1
+                if octant_shield.blocks_ray(
+                    detector_position=detector,
+                    source_position=source.position_array(),
+                    octant_index=oct_idx,
+                ):
+                    atten = kernel.attenuation_factor(
+                        isotope=source.isotope,
+                        source_pos=source.position_array(),
+                        detector_pos=detector,
+                        orient_idx=oct_idx,
+                    )
             col_idx = self.isotope_names.index(source.isotope)
             contribution = acquisition_time * effective_strength
             expected += atten * contribution * self.response_matrix[:, col_idx]

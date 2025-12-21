@@ -10,8 +10,9 @@ import numpy as np
 from matplotlib.colors import ListedColormap
 from numpy.typing import NDArray
 
-from measurement.continuous_kernels import geometric_term
-from measurement.shielding import OctantShield, octant_index_from_normal
+from measurement.continuous_kernels import ContinuousKernel, geometric_term
+from measurement.kernels import ShieldParams
+from measurement.shielding import octant_index_from_normal
 
 
 def _make_grid(
@@ -29,18 +30,16 @@ def _expected_intensity_at_points(
     grid_points: NDArray[np.float64],
     estimates: Dict[str, Dict[str, NDArray[np.float64]]],
     shield_normal: Optional[NDArray[np.float64]] = None,
-    attenuation_block: float = 0.1,
+    mu_by_isotope: Optional[Dict[str, object]] = None,
+    shield_params: Optional[ShieldParams] = None,
 ) -> NDArray[np.float64]:
     """
     Compute expected intensity (sum over isotopes) at given grid_points (N,2).
 
     estimates: dict[iso] -> {"positions": (M,3), "strengths": (M,)}
     """
-    octant = OctantShield()
-    if shield_normal is not None:
-        orient_idx = octant_index_from_normal(shield_normal)
-    else:
-        orient_idx = None
+    kernel = ContinuousKernel(mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams())
+    orient_idx = octant_index_from_normal(shield_normal) if shield_normal is not None else None
     intensities = np.zeros(grid_points.shape[0], dtype=float)
     detector_z = 0.0  # assume ground plane rendering
     for iso, est in estimates.items():
@@ -53,8 +52,12 @@ def _expected_intensity_at_points(
                 geom = geometric_term(detector, src)
                 att = 1.0
                 if orient_idx is not None:
-                    if octant.blocks_ray(detector_position=detector, source_position=src, octant_index=orient_idx):
-                        att = attenuation_block
+                    att = kernel.attenuation_factor(
+                        isotope=iso,
+                        source_pos=src,
+                        detector_pos=detector,
+                        orient_idx=orient_idx,
+                    )
                 intensities[i] += geom * att * float(q)
     return intensities
 
@@ -68,6 +71,8 @@ def render_heatmap(
     obstacles: Optional[Iterable[Tuple[float, float]]] = None,
     cmap: str = "inferno",
     output_path: Optional[Path] = None,
+    mu_by_isotope: Optional[Dict[str, object]] = None,
+    shield_params: Optional[ShieldParams] = None,
 ) -> plt.Figure:
     """
     Render a 2D heatmap of expected radiation intensity over the environment.
@@ -81,10 +86,18 @@ def render_heatmap(
         obstacles: iterable of (x,y) points to mark obstacles
         cmap: matplotlib colormap name
         output_path: if provided, save the figure to this path
+        mu_by_isotope: optional per-isotope attenuation coefficients for Fe/Pb
+        shield_params: optional shield thickness/attenuation parameters
     """
     X, Y = _make_grid(env_bounds, resolution)
     points = np.column_stack([X.ravel(), Y.ravel()])
-    intensities = _expected_intensity_at_points(points, estimates, shield_normal=shield_normal)
+    intensities = _expected_intensity_at_points(
+        points,
+        estimates,
+        shield_normal=shield_normal,
+        mu_by_isotope=mu_by_isotope,
+        shield_params=shield_params,
+    )
     Z = intensities.reshape(X.shape)
 
     fig, ax = plt.subplots(figsize=(8, 6))

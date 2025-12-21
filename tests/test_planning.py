@@ -102,7 +102,7 @@ def test_rotation_policy_stops_when_information_low() -> None:
 
 
 def test_select_next_pose_balances_information_and_cost() -> None:
-    """Pose selection should trade off uncertainty, information gain, and motion cost (Eq. 3.49)."""
+    """Pose selection should trade off uncertainty and motion cost (Eq. 3.51)."""
 
     class DummyEstimator:
         def __init__(self) -> None:
@@ -121,7 +121,6 @@ def test_select_next_pose_balances_information_and_cost() -> None:
         current_pose_idx=0,
         live_time_s=1.0,
         lambda_cost=0.1,
-        ig_weight=1.0,
     )
     assert next_idx == 1
 
