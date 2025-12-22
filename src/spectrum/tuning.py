@@ -1,4 +1,4 @@
-"""パラメータチューニング用の参照スペクトル生成ヘルパー。"""
+"""Helpers for tuning spectrum parameters via reference spectra."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 
 def _standard_sources() -> list[PointSource]:
-    """main.py と同じ標準点源セットを返す。"""
+    """Return the standard point-source set used in main.py."""
     return [
         PointSource("Cs-137", position=(5.3, 10.0, 5.0), intensity_cps_1m=20000.0),
         PointSource("Co-60", position=(4.7, 10.6, 5.0), intensity_cps_1m=20000.0),
@@ -30,19 +30,19 @@ def simulate_reference_spectrum(
     rng_seed: int = 0,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
-    標準シナリオでスペクトルを生成し、(energy_axis, spectrum)を返す。
+    Simulate a spectrum in the standard scenario and return (energy_axis, spectrum).
 
-    - Cs-137 / Co-60 / Eu-154 (各20 cps@1m)
-    - 環境: 10 x 20 x 10 m で中心付近の検出器
-    - 120秒相当の計測（acquisition_time=120）
+    - Cs-137 / Co-60 / Eu-154 (20 kcps at 1 m each)
+    - Environment: 10 x 20 x 10 m, detector near the center
+    - 120 s acquisition time
     """
-    # 現在値を保存
+    # Save current values.
     prev_cont = response_matrix.COMPTON_CONTINUUM_TO_PEAK
     prev_back = response_matrix.BACKSCATTER_FRACTION
     prev_bg_rate = pipeline.BACKGROUND_RATE_CPS
     prev_bg_rate_alias = pipeline.BACKGROUND_COUNTS_PER_SECOND
     try:
-        # パラメータを上書き
+        # Override parameters for the simulation run.
         response_matrix.COMPTON_CONTINUUM_TO_PEAK = continuum_to_peak
         response_matrix.BACKSCATTER_FRACTION = backscatter_fraction
         pipeline.BACKGROUND_RATE_CPS = background_rate_cps
@@ -60,7 +60,7 @@ def simulate_reference_spectrum(
         )
         return decomposer.energy_axis, spectrum
     finally:
-        # パラメータを元に戻す
+        # Restore parameters.
         response_matrix.COMPTON_CONTINUUM_TO_PEAK = prev_cont
         response_matrix.BACKSCATTER_FRACTION = prev_back
         pipeline.BACKGROUND_RATE_CPS = prev_bg_rate
@@ -69,7 +69,7 @@ def simulate_reference_spectrum(
 
 @dataclass
 class SpectrumQuality:
-    """スペクトル品質の簡易指標。"""
+    """Simple spectrum quality metrics for tuning."""
 
     passes: bool
     mean_L: float
@@ -88,7 +88,7 @@ def peak_contrast(
     sideband_outer_keV: float = 60.0,
 ) -> float:
     """
-    指定エネルギー周辺のピーク顕著度を算出する。
+    Compute peak contrast around a target energy.
     contrast = peak_max / sideband_mean
     """
     E = energy_keV
@@ -112,7 +112,7 @@ def evaluate_spectrum_quality(
     spectrum: NDArray[np.float64],
 ) -> SpectrumQuality:
     """
-    CeBr3想定の右肩下がり形状と主ピーク顕著度にもとづきスペクトル品質を評価する。
+    Evaluate spectrum quality using a CeBr3-like shape and peak prominence.
     """
     E = energy_keV
     C = spectrum
@@ -165,7 +165,7 @@ def evaluate_spectrum_quality(
 
 def grid_search_parameters(rng_seed: int = 0) -> tuple[float, float, float, SpectrumQuality]:
     """
-    簡易グリッドサーチでパラメータを探索し、ベストな組み合わせを返す。
+    Run a coarse grid search and return the best parameter set.
     """
     continuum_grid = [0.4, 0.7, 1.0, 1.5]
     backscatter_grid = [0.03, 0.05, 0.08, 0.10]
@@ -186,7 +186,7 @@ def grid_search_parameters(rng_seed: int = 0) -> tuple[float, float, float, Spec
                 quality = evaluate_spectrum_quality(E, spectrum)
                 if quality.passes:
                     return c, b, bg, quality
-                # スコアリングでベストを記録
+                # Keep the best-scoring parameters as a fallback.
                 shape_score = (quality.mean_L / max(quality.mean_M, 1e-6)) + (
                     quality.mean_M / max(quality.mean_H, 1e-6)
                 )
@@ -202,7 +202,7 @@ def grid_search_parameters(rng_seed: int = 0) -> tuple[float, float, float, Spec
                         best_params = (c, b, bg, score)
 
     if best_quality is None or best_params is None:
-        # フォールバック（あり得ないはずだが念のため）
+        # Fallback (should not happen, but keep a safe default).
         return continuum_grid[0], backscatter_grid[0], background_grid[0], evaluate_spectrum_quality(
             *simulate_reference_spectrum(
                 continuum_to_peak=continuum_grid[0],
@@ -216,7 +216,7 @@ def grid_search_parameters(rng_seed: int = 0) -> tuple[float, float, float, Spec
 
 
 def print_grid_search_result() -> None:
-    """グリッドサーチ結果を人が読みやすく出力する。"""
+    """Print grid-search results in a readable format."""
     c, b, bg, q = grid_search_parameters()
     print("Best parameters:")
     print(f"  continuum_to_peak:   {c}")
@@ -231,16 +231,16 @@ def print_grid_search_result() -> None:
 
 
 def get_best_parameters() -> tuple[float, float, float, SpectrumQuality]:
-    """デフォルトグリッドとrng_seed=0でグリッドサーチを実行しベストを返す。"""
+    """Run the grid search with defaults and return the best parameters."""
     return grid_search_parameters(rng_seed=0)
 
 
 def plot_cebr3_reference_spectrum() -> None:
     """
-    チューニング済みデフォルトでの参照スペクトルを描画・保存する。
+    Plot and save a tuned CeBr3-like reference spectrum.
 
-    - 662, 1332 keV付近にラベルを付与
-    - results/spectrum/cebr3_reference.png に保存
+    - Label peaks near 662 and 1332 keV
+    - Save to results/spectrum/cebr3_reference.png
     """
     c, b, bg, _ = get_best_parameters()
     E, spec = simulate_reference_spectrum(

@@ -1,4 +1,4 @@
-"""1/8球殻状の鉛・鉄シールド形状と遮蔽判定・減衰計算を扱うモジュール。"""
+"""Model octant-shaped Pb/Fe shields and their attenuation/blocking logic."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Tuple
 import numpy as np
 from numpy.typing import NDArray
 
-# 8オクタントを表す符号付き単位ベクトル（(+,+,+), (+,+,-), ...）
+# Signed unit normals for the eight octants ((+,+,+), (+,+,-), ...).
 OCTANT_NORMALS: NDArray[np.float64] = np.array(
     [
         [1.0, 1.0, 1.0],
@@ -27,9 +27,10 @@ OCTANT_NORMALS /= np.linalg.norm(OCTANT_NORMALS, axis=1, keepdims=True)
 
 def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, float]:
     """
-    デカルト座標ベクトルを球座標 (r, theta, phi) に変換する。
+    Convert a Cartesian vector to spherical coordinates (r, theta, phi).
 
-    theta: z軸からの極角 [0, π]、phi: x軸からxy平面への方位角 [0, 2π)。
+    theta: polar angle from the z-axis [0, pi]
+    phi: azimuth from the x-axis in the xy-plane [0, 2pi)
     """
     x, y, z = vec
     r = float(np.linalg.norm(vec))
@@ -42,15 +43,15 @@ def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, floa
 
 def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArray[np.float64], tol: float = 1e-6) -> bool:
     """
-    方向ベクトルが指定オクタントのシールドに向いているか簡易判定する。
+    Check whether a direction points into the selected octant shield.
 
-    direction: 源→検出器（または検出器→源）方向のベクトル
-    shield_normal: オクタント法線（OCTANT_NORMALSの1本）
+    direction: source-to-detector (or detector-to-source) direction vector
+    shield_normal: octant normal (one of OCTANT_NORMALS)
     """
     if np.linalg.norm(direction) == 0:
         return False
     dir_unit = direction / np.linalg.norm(direction)
-    # 符号が一致する方向のみを遮蔽する（1/8球殻）
+    # Only block when direction signs match the octant (1/8 shell model).
     sign_dir = np.sign(np.where(np.abs(dir_unit) < tol, 0.0, dir_unit))
     sign_shield = np.sign(shield_normal)
     return bool(np.all(sign_dir == sign_shield))
@@ -117,21 +118,21 @@ def path_length_cm(
 
 @dataclass(frozen=True)
 class SphericalOctantShield:
-    """1/8球殻シールドの単純モデル。"""
+    """Simple 1/8 spherical shell shield model."""
 
-    mu_cm_inv: float  # 材質ごとの線減弱係数（代表値、1/cm）
-    thickness_cm: float = 2.0  # 殻の厚み
-    inner_radius_cm: float = 5.0  # シールド内側半径（検出器中心）
+    mu_cm_inv: float  # Material attenuation coefficient (1/cm).
+    thickness_cm: float = 2.0  # Shell thickness.
+    inner_radius_cm: float = 5.0  # Inner radius (detector center).
 
     def orientations(self) -> NDArray[np.float64]:
-        """8オクタントの法線ベクトルを返す。"""
+        """Return the octant normals."""
         return OCTANT_NORMALS.copy()
 
     def path_length_cm(self, direction: NDArray[np.float64], shield_normal: NDArray[np.float64]) -> float:
         """
-        指定方向でシールドを貫通する有効経路長を返す。
+        Return the path length through the shield for the given direction.
 
-        1/8球殻に向かう場合のみ cos成分で厚みを割った距離を返す。
+        Only directions into the octant return a thickness scaled by cos(theta).
         """
         if not shield_blocks_radiation(direction, shield_normal):
             return 0.0
@@ -143,10 +144,10 @@ class SphericalOctantShield:
 
     def attenuation_factor(self, direction: NDArray[np.float64], shield_normal: NDArray[np.float64]) -> float:
         """
-        exp(-μ·L) による単純な減衰係数を返す。
+        Return the attenuation factor exp(-mu * L).
 
-        direction: 源→検出器方向ベクトル
-        shield_normal: 選択したオクタント法線
+        direction: source-to-detector direction vector
+        shield_normal: selected octant normal
         """
         path = self.path_length_cm(direction, shield_normal)
         if path <= 0.0:
@@ -156,32 +157,32 @@ class SphericalOctantShield:
 
 def lead_shield(thickness_cm: float = 2.0, inner_radius_cm: float = 5.0) -> SphericalOctantShield:
     """
-    鉛シールドを生成する。
+    Construct a lead shield.
 
-    mu_cm_inv は代表値 0.7 1/cm を使用。
+    Uses a representative mu_cm_inv of 0.7 1/cm.
     """
     return SphericalOctantShield(mu_cm_inv=0.7, thickness_cm=thickness_cm, inner_radius_cm=inner_radius_cm)
 
 
 def iron_shield(thickness_cm: float = 2.0, inner_radius_cm: float = 5.0) -> SphericalOctantShield:
     """
-    鉄シールドを生成する。
+    Construct an iron shield.
 
-    mu_cm_inv は代表値 0.5 1/cm を使用。
+    Uses a representative mu_cm_inv of 0.5 1/cm.
     """
     return SphericalOctantShield(mu_cm_inv=0.5, thickness_cm=thickness_cm, inner_radius_cm=inner_radius_cm)
 
 
 def _angle_in_range(angle: float, low: float, high: float, tol: float = 1e-6) -> bool:
-    """角度が指定範囲[low, high)にあるか（wrap-aroundなし）。"""
+    """Return True if angle is within [low, high) without wrap-around."""
     return (angle + tol) >= low and (angle - tol) < high
 
 
 def generate_octant_orientations() -> NDArray[np.float64]:
     """
-    8オクタントのシールド方位を返すヘルパ（鉛・鉄で共通使用）。
+    Return the eight octant normals (shared by Pb and Fe).
 
-    KernelPrecomputerなどで orientation 行列として渡すことを想定。
+    This is typically passed as the orientation matrix to KernelPrecomputer.
     """
     return OCTANT_NORMALS.copy()
 
@@ -257,9 +258,9 @@ def generate_fe_pb_orientation_pairs() -> list[dict]:
 
 def octant_index_from_normal(normal: NDArray[np.float64], tol: float = 1e-6) -> int:
     """
-    法線ベクトルから最も近いオクタントインデックスを取得する。
+    Return the nearest octant index for a given normal.
 
-    符号が不明瞭な軸ベクトル ([1,0,0] など) も扱えるよう、ドット積最大のオクタントを選択する。
+    For axis-aligned vectors (e.g., [1, 0, 0]) choose the octant with maximum dot.
     """
     n = np.asarray(normal, dtype=float)
     if np.linalg.norm(n) == 0:
@@ -271,12 +272,12 @@ def octant_index_from_normal(normal: NDArray[np.float64], tol: float = 1e-6) -> 
 
 class OctantShield:
     """
-    1/8球殻シールドの幾何判定を担当するクラス。
+    Geometric blocking test for a 1/8 spherical shell shield.
 
-    detector_positionとsource_positionからベクトル v を計算し、球座標 (θ, φ) を用いて
-    指定オクタント（octant_index 0..7）に含まれるかを判定する。
-    - θ: 極角 [0, π]（z軸からの角度）
-    - φ: 方位角 [0, 2π)（x軸からxy平面への角度）
+    Computes vector v = detector - source and uses spherical coordinates (theta, phi)
+    to determine whether the ray intersects a given octant (0..7).
+    - theta: polar angle [0, pi] from the z-axis
+    - phi: azimuth [0, 2pi) from the x-axis in the xy-plane
     """
 
     def __init__(
@@ -288,7 +289,7 @@ class OctantShield:
         self.material = material or "generic"
         self.orientation_index = orientation_index
         self.octant_normals = octant_normals if octant_normals is not None else OCTANT_NORMALS
-        # θ, φ 範囲をオクタントごとに定義
+        # Define (theta, phi) ranges for each octant.
         self.theta_phi_ranges = [
             ((0.0, np.pi / 2.0), (0.0, np.pi / 2.0)),  # + + +
             ((np.pi / 2.0, np.pi), (0.0, np.pi / 2.0)),  # + + -
@@ -307,11 +308,11 @@ class OctantShield:
         octant_index: int | None = None,
     ) -> bool:
         """
-        源→検出器のレイが指定オクタントシールドを通過するかを判定する。
+        Determine if the ray from source to detector passes through the octant.
 
         - v = detector - source
-        - (θ, φ) を計算し、octant_indexの角度範囲に入れば遮蔽される。
-        orientation_indexを指定しない場合はインスタンス保持のorientation_indexを使用。
+        - compute (theta, phi) and check whether it falls in the octant range
+        If octant_index is None, use the instance's orientation_index.
         """
         idx = self.orientation_index if octant_index is None else octant_index
         if idx < 0 or idx >= len(self.theta_phi_ranges):

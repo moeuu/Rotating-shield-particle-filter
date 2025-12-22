@@ -1,4 +1,4 @@
-"""ピーク重畳を考慮した簡易ストリッピングと強度推定を行うモジュール。"""
+"""Peak stripping and intensity estimation with overlap handling."""
 
 from __future__ import annotations
 
@@ -13,22 +13,22 @@ from spectrum.library import Nuclide
 
 @dataclass(frozen=True)
 class Peak:
-    """検出されたピークのエネルギーと面積を保持する。"""
+    """Hold a detected peak's energy and area."""
 
     energy_keV: float
     area: float
 
 
 def reference_line(nuclide: Nuclide) -> float:
-    """最強度のラインエネルギーを参照線として返す。"""
+    """Return the most intense line energy as the reference line."""
     if not nuclide.lines:
-        raise ValueError("ライン情報が存在しません")
+        raise ValueError("Nuclide has no line information.")
     return max(nuclide.lines, key=lambda l: l.intensity).energy_keV
 
 
 def intensity_ratios(nuclide: Nuclide) -> Dict[float, float]:
     """
-    参照線に対する各ラインの強度比を計算する。
+    Compute line intensity ratios relative to the reference line.
 
     Returns:
         {line_energy_keV: ratio}
@@ -43,12 +43,12 @@ def intensity_ratios(nuclide: Nuclide) -> Dict[float, float]:
 
 def match_peaks_to_library(peaks: Iterable[Peak], library: Dict[str, Nuclide], tolerance_keV: float = 5.0) -> Dict[str, Peak]:
     """
-    検出ピークをライブラリの参照線にマッチングする。
+    Match detected peaks to library reference lines.
 
     Args:
-        peaks: 検出ピーク群。
-        library: 核種ライブラリ。
-        tolerance_keV: エネルギー差許容幅。
+        peaks: Detected peaks.
+        library: Nuclide library.
+        tolerance_keV: Allowed energy mismatch.
 
     Returns:
         {isotope: matched_peak}
@@ -74,15 +74,15 @@ def strip_overlaps(
     tolerance_keV: float = 5.0,
 ) -> Tuple[Dict[str, float], List[Peak]]:
     """
-    ライブラリの強度比を用いて重畳ピークをストリップし、核種ごとの参照線面積を推定する。
+    Strip overlapping peaks using library ratios and estimate reference areas.
 
     Args:
-        peaks: 検出ピーク群。
-        library: 核種ライブラリ。
-        tolerance_keV: マッチング許容幅。
+        peaks: Detected peaks.
+        library: Nuclide library.
+        tolerance_keV: Matching tolerance.
 
     Returns:
-        (核種ごとの参照線面積, ストリップ後ピーク)
+        (reference area per isotope, stripped peaks)
     """
     peak_list = list(peaks)
     matches = match_peaks_to_library(peak_list, library, tolerance_keV=tolerance_keV)
@@ -95,7 +95,7 @@ def strip_overlaps(
         for energy, ratio in ratios.items():
             if energy == reference_line(library[iso]):
                 continue
-            # 該当ピークを探索し、予測寄与を差し引く
+            # Find the target peak and subtract expected contribution.
             target = _find_peak(stripped_peaks, energy, tolerance_keV)
             if target is None:
                 continue
@@ -106,7 +106,7 @@ def strip_overlaps(
 
 
 def _find_peak(peaks: List[Peak], energy: float, tolerance_keV: float) -> Peak | None:
-    """エネルギー近傍のピークを検索する。"""
+    """Find the closest peak within the given energy tolerance."""
     closest: Peak | None = None
     min_diff = tolerance_keV
     for pk in peaks:
@@ -118,7 +118,7 @@ def _find_peak(peaks: List[Peak], energy: float, tolerance_keV: float) -> Peak |
 
 
 def _replace_peak(peaks: List[Peak], target: Peak, new_area: float) -> List[Peak]:
-    """ピークリスト中の対象ピークの面積を更新する。"""
+    """Replace a peak's area in the list and return the updated list."""
     updated: List[Peak] = []
     for pk in peaks:
         if pk is target:

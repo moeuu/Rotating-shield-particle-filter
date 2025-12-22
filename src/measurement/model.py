@@ -1,4 +1,4 @@
-"""非指向性検出器による計測モデルと環境設定を表現するモジュール。"""
+"""Represent the measurement environment for a non-directional detector."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    """計測環境のサイズと検出器位置を保持する設定クラス。"""
+    """Hold environment dimensions and detector position."""
 
     size_x: float = 10.0
     size_y: float = 20.0
@@ -18,7 +18,7 @@ class EnvironmentConfig:
     detector_position: Tuple[float, float, float] | None = None
 
     def detector(self) -> np.ndarray:
-        """検出器位置を返す。未指定の場合は環境中央を返す。"""
+        """Return the detector position (defaults to the environment center)."""
         if self.detector_position is None:
             return np.array([self.size_x / 2.0, self.size_y / 2.0, self.size_z / 2.0])
         return np.array(self.detector_position, dtype=float)
@@ -26,30 +26,30 @@ class EnvironmentConfig:
 
 @dataclass(frozen=True)
 class PointSource:
-    """点放射線源を表すデータ構造。"""
+    """Represent a point radiation source."""
 
     isotope: str
     position: Tuple[float, float, float]
     intensity_cps_1m: float
 
     def position_array(self) -> np.ndarray:
-        """位置をnumpy配列として返す。"""
+        """Return the position as a NumPy array."""
         return np.array(self.position, dtype=float)
 
     @property
     def strength(self) -> float:
-        """後方互換のための強度アクセサ（1 mでのcps）。"""
+        """Backward-compatible strength accessor (cps at 1 m)."""
         return self.intensity_cps_1m
 
 
 def inverse_square_scale(detector: np.ndarray, source: PointSource) -> float:
     """
-    逆二乗則による単一点源の幾何スケール係数を返す。
+    Return the inverse-square geometric scale for a point source.
 
-    検出器までの距離に基づき1/(4πd^2)を計算する。
+    Computes 1/(4πd^2) based on the detector distance.
     """
     distance = np.linalg.norm(detector - source.position_array())
     if distance == 0:
-        # 同位置は非現実的なので小さな距離でクリップする
+        # Clip zero distance to avoid unrealistic singularity.
         distance = 1e-6
     return 1.0 / (4.0 * np.pi * distance**2)

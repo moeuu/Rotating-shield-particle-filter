@@ -119,8 +119,9 @@ def test_select_next_pose_balances_information_and_cost() -> None:
         estimator=est,
         candidate_pose_indices=np.array([0, 1], dtype=np.int64),
         current_pose_idx=0,
-        live_time_s=1.0,
+        criterion="uncertainty",
         lambda_cost=0.1,
+        t_short_s=1.0,
     )
     assert next_idx == 1
 
@@ -165,6 +166,42 @@ def test_orientation_expected_information_gain_positive_when_strengths_differ() 
         pose_idx=0, RFe=RFe, RPb=RPb, live_time_s=1.0, num_samples=20
     )
     assert ig > 0.0
+
+
+def test_expected_uncertainty_after_rotation_stops_with_zero_time() -> None:
+    """No rotation time should return the current uncertainty."""
+    est = _build_simple_estimator()
+    u0 = est.global_uncertainty()
+    u_after = est.expected_uncertainty_after_rotation(
+        pose_idx=0, tau_ig=1e-3, t_max_s=0.0, t_short_s=1.0, rng_seed=0
+    )
+    assert u_after == pytest.approx(u0)
+
+
+def test_expected_uncertainty_after_rotation_stops_with_large_tau() -> None:
+    """Large tau_ig should stop immediately and return current uncertainty."""
+    est = _build_simple_estimator()
+    u0 = est.global_uncertainty()
+    u_after = est.expected_uncertainty_after_rotation(
+        pose_idx=0, tau_ig=1e9, t_max_s=1.0, t_short_s=1.0, rng_seed=0
+    )
+    assert u_after == pytest.approx(u0)
+
+
+def test_expected_uncertainty_after_rotation_one_step() -> None:
+    """When t_max_s == t_short_s and tau_ig == 0, exactly one rotation is simulated."""
+    est = _build_simple_estimator()
+    est.pf_config.eig_num_samples = 100
+    u_after, debug = est.expected_uncertainty_after_rotation(
+        pose_idx=0,
+        tau_ig=0.0,
+        t_max_s=1.0,
+        t_short_s=1.0,
+        rng_seed=0,
+        return_debug=True,
+    )
+    assert isinstance(u_after, float)
+    assert debug["num_rotations"] == 1
 
 
 def test_orientation_fisher_criteria_positive() -> None:

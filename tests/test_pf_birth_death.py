@@ -4,8 +4,8 @@ import numpy as np
 
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
-from pf.particle_filter import IsotopeParticleFilter, PFConfig
-from pf.state import ParticleState
+from pf.particle_filter import IsotopeParticleFilter, PFConfig, IsotopeParticle
+from pf.state import ParticleState, IsotopeState
 
 
 def _build_filter(p_birth: float, min_strength: float, max_sources: int, num_particles: int = 10) -> IsotopeParticleFilter:
@@ -66,11 +66,30 @@ def test_death_removes_weak_sources() -> None:
     assert all(st.source_indices.size == 0 for st in filt.states)
 
 
-def test_estimate_respects_max_sources() -> None:
-    """Estimator output should cap the number of sources at max_sources even with births."""
+def test_estimate_returns_all_sources() -> None:
+    """Estimator output should return all estimated sources without capping."""
     np.random.seed(2)
     filt = _build_filter(p_birth=1.0, min_strength=0.01, max_sources=1, num_particles=5)
-    filt.predict()  # allow births to occur
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=2,
+                positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+                strengths=np.array([5.0, 2.0]),
+                background=0.1,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=2,
+                positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+                strengths=np.array([5.0, 2.0]),
+                background=0.1,
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
     positions, strengths = filt.estimate()
-    assert positions.shape[0] <= 1
+    assert positions.shape[0] == 2
     assert strengths.shape[0] == positions.shape[0]

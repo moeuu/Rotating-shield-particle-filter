@@ -14,9 +14,9 @@ def _sample_birth_index(
     existing: NDArray[np.int32],
 ) -> int | None:
     """
-    候補点の中から新規源位置を選択する単純な事前分布。
+    Choose a new source index from candidate locations.
 
-    現在の粒子が未使用のグリッドを優先し、それでも存在しない場合は一様にサンプルする。
+    Prefer unused grid locations; if none remain, fall back to uniform sampling.
     """
     candidates = np.setdiff1d(np.arange(kernel.num_sources, dtype=np.int32), existing, assume_unique=True)
     if candidates.size == 0:
@@ -31,13 +31,14 @@ def regularize_states(
     background_sigma: float = 0.1,
     min_strength: float = 0.01,
     p_birth: float = 0.05,
-    max_sources: int = 5,
+    max_sources: int | None = None,
 ) -> list[ParticleState]:
     """
-    リサンプリング後に小さな摂動を与え、弱い源の死亡と低確率の出生を適用する。
+    Apply post-resampling jitter plus birth/death moves.
 
-    Death: 強度がmin_strength未満の源を削除する（Sec. 3.4.2の可変源数モデルに沿う簡易版）。
-    Birth: 確率p_birthで未使用グリッドから新規源を追加し、log-normal初期強度を与える。
+    Death: remove sources with strength below min_strength.
+    Birth: with probability p_birth, add a new source at an unused grid location
+    and draw its initial strength from a log-normal prior.
     """
     regularized: list[ParticleState] = []
     for st in states:
@@ -47,7 +48,8 @@ def regularize_states(
             st.source_indices = st.source_indices[keep]
             st.strengths = st.strengths[keep]
         # Birth move
-        if st.source_indices.size < max_sources and np.random.rand() < p_birth:
+        can_birth = max_sources is None or st.source_indices.size < max_sources
+        if can_birth and np.random.rand() < p_birth:
             candidate_idx = _sample_birth_index(kernel, st.source_indices)
             if candidate_idx is not None:
                 birth_strength = float(np.random.lognormal(mean=-2.0, sigma=0.5))

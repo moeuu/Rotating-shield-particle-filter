@@ -1,4 +1,4 @@
-"""検出器応答行列の生成と背景スペクトルモデルを扱うモジュール。"""
+"""Build detector response matrices and background spectrum models."""
 
 from __future__ import annotations
 
@@ -9,23 +9,23 @@ from numpy.typing import NDArray
 
 from spectrum.library import Nuclide, NuclideLine
 
-# 電子静止エネルギー
+# Electron rest energy.
 ME_C2_KEV = 511.0  # keV
-# コンプトン連続対ピーク比（単一ラインあたり）
-COMPTON_CONTINUUM_TO_PEAK = 2.0  # チューニング開始値
-# バックスキャターピークの強度比 - tuned default
+# Compton continuum-to-peak ratio (per line).
+COMPTON_CONTINUUM_TO_PEAK = 2.0  # Tuned starting value.
+# Backscatter peak fraction (tuned default).
 BACKSCATTER_FRACTION = 0.03
 
 
 def gaussian_peak(energy_axis: NDArray[np.float64], center: float, sigma: float) -> NDArray[np.float64]:
-    """与えられた中心と分散で正規分布形状のピークを返す。"""
+    """Return a Gaussian peak with the given center and sigma."""
     norm = 1.0 / (np.sqrt(2.0 * np.pi) * sigma)
     return norm * np.exp(-0.5 * ((energy_axis - center) / sigma) ** 2)
 
 
 def compton_edge(e_gamma_keV: float) -> float:
     """
-    単一コンプトン散乱における最大エネルギー付与量（コンプトン端）を返す。
+    Return the Compton edge energy for a single scatter.
 
     E_edge = E_gamma * (1 - 1 / (1 + 2 * E_gamma / 511 keV))
     """
@@ -34,9 +34,9 @@ def compton_edge(e_gamma_keV: float) -> float:
 
 def compton_edge_energy(e_gamma_keV: float) -> float:
     """
-    インシデントガンマ線のコンプトン端エネルギー（keV）を返す。
+    Return the Compton edge energy (keV) of an incident gamma.
 
-    m_e c^2 = 511 keV を用いた標準式。
+    Standard formula using m_e c^2 = 511 keV.
     """
     return compton_edge(e_gamma_keV)
 
@@ -47,10 +47,10 @@ def compton_continuum_shape(
     shape: str = "exponential",
 ) -> NDArray[np.float64]:
     """
-    単一ガンマ線のコンプトン連続成分を近似し、総和1に正規化した形状を返す。
+    Approximate the Compton continuum shape for a single gamma line.
 
-    - サポートは [0, Compton edge]
-    - shape="exponential"（デフォルト）は低エネルギー優位、"triangular" も選択可
+    - Support is [0, Compton edge]
+    - shape="exponential" (default) biases low energies; "triangular" is also supported
     """
     E = energy_bins_keV
     Ec = compton_edge_energy(E_gamma_keV)
@@ -73,7 +73,7 @@ def compton_continuum_shape(
 
 def backscatter_energy(e_gamma_keV: float) -> float:
     """
-    180度バックスキャター後のガンマ線エネルギーを返す。
+    Return the energy after 180-degree backscatter.
 
     E_back = E_gamma / (1 + 2 E_gamma / 511 keV)
     """
@@ -89,11 +89,11 @@ def compton_continuum(
     shape_power: float = 2.0,
 ) -> NDArray[np.float64]:
     """
-    単一ガンマ線に対する簡易コンプトン連続成分を生成する。
+    Generate a Compton continuum contribution for a single gamma line.
 
-    - 0 < E < Compton端のみ非ゼロ
-    - 高エネルギー側へ単調減少
-    - 総面積が continuum_to_peak * peak_area となるよう正規化
+    - Non-zero only for 0 < E < Compton edge
+    - Monotonically decreasing toward higher energy
+    - Normalised so total area equals continuum_to_peak * peak_area
     """
     if peak_area <= 0.0:
         return np.zeros_like(energy_axis, dtype=float)
@@ -107,17 +107,17 @@ def compton_continuum(
 
 def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np.float64]:
     """
-    CeBr3を想定した簡易バックグラウンド形状を返す（最大値で正規化）。
+    Return a CeBr3-like background shape (normalised).
 
-    - 100 keV付近に緩やかな膨らみ
-    - それ以降は指数的に減衰
+    - Gentle bump around 100 keV
+    - Exponential decay thereafter
     """
     E = np.asarray(energy_axis_keV, dtype=float)
     bump = np.exp(-0.5 * ((E - 100.0) / 50.0) ** 2)
     decay = np.exp(-E / 400.0)
     bg = 0.4 * bump + decay
     bg[E < 30.0] = 0.0
-    # 総和が1になるよう正規化（bin幅は呼び出し側で扱う）
+    # Normalise to unit sum; bin width is handled by the caller.
     total = bg.sum()
     if total > 0:
         bg = bg / total
@@ -126,10 +126,10 @@ def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np
 
 def default_resolution() -> Callable[[float], float]:
     """
-    CeBr3（2\"×2\"想定）のエネルギー分解能σ(E)を返す関数を生成する。
+    Return a CeBr3-like energy resolution sigma(E) function.
 
-    Scionixアプリケーションノートに合わせ、122 keVで約8%、662 keVで約4%、1332 keVで約3%の
-    FWHMとなるように sigma(E) = max(0.5 * sqrt(E) - 1.5, 0.1) を採用する（FWHM=2.355*sigma）。
+    Based on a Scionix application note: ~8% at 122 keV, ~4% at 662 keV, and ~3% at
+    1332 keV. We use sigma(E) = max(0.5 * sqrt(E) - 1.5, 0.1) (FWHM = 2.355*sigma).
     """
 
     def sigma(energy_keV: float) -> float:
@@ -139,7 +139,7 @@ def default_resolution() -> Callable[[float], float]:
 
 
 def constant_efficiency(value: float = 1.0) -> Callable[[float], float]:
-    """エネルギーによらず一定の検出効率を返す関数を生成する。"""
+    """Return a constant detection efficiency function."""
 
     def eff(_: float) -> float:
         return value
@@ -149,11 +149,11 @@ def constant_efficiency(value: float = 1.0) -> Callable[[float], float]:
 
 def cebr3_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
     """
-    CeBr3の検出効率を模した簡易モデル。
+    CeBr3-like detection efficiency model.
 
-    - 30 keV未満は0
-    - 30〜150 keVは高効率（ほぼ1）
-    - 150 keV以降は緩やかにパワー則で減衰
+    - 0 below 30 keV
+    - near 1.0 for 30-150 keV
+    - decays with a power law above 150 keV
     """
     e = np.asarray(e_keV, dtype=float)
     eff = np.zeros_like(e, dtype=float)
@@ -167,7 +167,7 @@ def cebr3_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
 
 
 def energy_dependent_efficiency(e_keV: np.ndarray | float) -> np.ndarray:
-    """後方互換のための別名。"""
+    """Backward-compatible alias."""
     return cebr3_efficiency(e_keV)
 
 
@@ -179,9 +179,10 @@ def build_response_matrix(
     bin_width_keV: float | None = None,
 ) -> NDArray[np.float64]:
     """
-    核種ライブラリに基づいて応答行列を構築する。
+    Build a response matrix from the nuclide library.
 
-    行はエネルギービン、列は核種を表し、各核種の単位強度に対する期待カウントを格納する。
+    Rows are energy bins, columns are nuclides, and entries represent expected counts
+    per unit activity.
     """
     if bin_width_keV is None:
         if energy_axis.size < 2:
@@ -204,13 +205,13 @@ def _nuclide_response(
     efficiency_fn: Callable[[float], float],
     bin_width_keV: float,
 ) -> NDArray[np.float64]:
-    """単一核種のピークを重ねた応答を計算する。"""
+    """Compute the response for a single nuclide by summing its lines."""
     response = np.zeros_like(energy_axis, dtype=float)
     for line in lines:
         sigma = resolution_fn(line.energy_keV)
         peak = gaussian_peak(energy_axis, center=line.energy_keV, sigma=sigma)
         peak_area = peak.sum() * bin_width_keV
-        # フルエネルギーピークと同じ面積基準でコンプトン連続を付加
+        # Add Compton continuum with the same area basis as the full-energy peak.
         cont_shape = compton_continuum_shape(energy_axis, line.energy_keV, shape="exponential")
         if cont_shape.sum() > 0:
             cont_shape = cont_shape / cont_shape.sum()
@@ -220,7 +221,7 @@ def _nuclide_response(
         cont *= eff
         response += line.intensity * peak * bin_width_keV
         response += line.intensity * cont
-        # バックスキャターピーク（高エネルギーラインのみ）
+        # Add a backscatter peak for higher-energy lines.
         if line.energy_keV > 200.0:
             e_back = backscatter_energy(line.energy_keV)
             sigma_back = resolution_fn(e_back)

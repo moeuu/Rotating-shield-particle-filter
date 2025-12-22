@@ -10,19 +10,25 @@ from measurement.shielding import generate_octant_orientations
 
 def generate_ring_normals(num: int = 4, axis: str = "z") -> NDArray[np.float64]:
     """
-    円環状に等間隔でシールド法線を生成する。
+    Generate evenly spaced shield normals on a ring perpendicular to the given axis.
 
     Args:
-        num: 生成する方位数。
-        axis: 回転軸（"z"のみサポート）。
+        num: Number of orientations to generate on the ring.
+        axis: Axis the ring is perpendicular to ("x", "y", or "z").
 
     Returns:
-        (num, 3) 配列の単位ベクトル。
+        (num, 3) unit-normal vectors.
     """
-    if axis != "z":
-        raise NotImplementedError("Only z-axis ring supported.")
+    axis = axis.lower()
     angles = np.linspace(0, 2 * np.pi, num, endpoint=False)
-    normals = np.stack([np.cos(angles), np.sin(angles), np.zeros_like(angles)], axis=1)
+    if axis == "z":
+        normals = np.stack([np.cos(angles), np.sin(angles), np.zeros_like(angles)], axis=1)
+    elif axis == "x":
+        normals = np.stack([np.zeros_like(angles), np.cos(angles), np.sin(angles)], axis=1)
+    elif axis == "y":
+        normals = np.stack([np.cos(angles), np.zeros_like(angles), np.sin(angles)], axis=1)
+    else:
+        raise ValueError(f"Unknown axis: {axis}")
     return normals
 
 

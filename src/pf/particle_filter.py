@@ -18,12 +18,12 @@ from pf.regularization import regularize_states
 
 @dataclass
 class PFConfig:
-    """粒子フィルタ設定（Sec. 3.4）。"""
+    """Particle filter configuration (Sec. 3.4)."""
 
     num_particles: int = 200
     min_particles: int | None = None
     max_particles: int | None = None
-    max_sources: int = 1
+    max_sources: int | None = None
     resample_threshold: float = 0.5  # relative to N
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
@@ -50,7 +50,7 @@ class IsotopeParticle:
 
 
 class IsotopeParticleFilter:
-    """同位体ごとの粒子フィルタを実装（連続状態のPFを主体に運用）。"""
+    """Per-isotope particle filter (continuous state is the primary mode)."""
 
     def __init__(
         self,
@@ -91,7 +91,7 @@ class IsotopeParticleFilter:
         min_r, max_r = self.config.init_num_sources
         for _ in range(self.N):
             r_h = int(np.random.randint(min_r, max_r + 1))
-            if self.config.max_sources > 0:
+            if self.config.max_sources is not None and self.config.max_sources > 0:
                 r_h = min(r_h, self.config.max_sources)
             if r_h > 0:
                 positions = lo + np.random.rand(r_h, 3) * (hi - lo)
@@ -300,11 +300,16 @@ class IsotopeParticleFilter:
                 st.num_sources = st.positions.shape[0]
 
     def _init_particles(self) -> None:
-        """源位置と強度を乱択して初期化。"""
+        """Randomly initialise discrete particles over source indices and strengths."""
         self.states = []
         J = self.kernel.num_sources
+        min_r = max(1, int(self.config.init_num_sources[0]))
+        if self.config.max_sources is None:
+            max_r = max(min_r, int(self.config.init_num_sources[1]))
+        else:
+            max_r = max(min_r, int(self.config.max_sources))
         for _ in range(self.N):
-            r = np.random.randint(1, self.config.max_sources + 1)
+            r = np.random.randint(min_r, max_r + 1)
             replace = r > J
             idx = np.random.choice(J, size=r, replace=replace)
             strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=r))
@@ -312,7 +317,7 @@ class IsotopeParticleFilter:
         self.log_weights = np.log(np.ones(self.N) / self.N)
 
     def predict(self) -> None:
-        """位置は固定グリッドなので予測ステップは強度と背景の拡散に限定。"""
+        """Predict step for the discrete PF (diffuse strengths and background only)."""
         self.states = regularize_states(
             self.states,
             kernel=self.kernel,
@@ -325,11 +330,11 @@ class IsotopeParticleFilter:
 
     def update(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
         """
-        ポアソン重み更新。
+        Poisson log-weight update for the discrete PF.
 
-        Note: z_obs はスペクトル展開（Sec. 2.5.7）から得た同位体別カウントを必須とする。
-        このメソッド自身が幾何モデルから観測を合成することはなく、期待値計算は
-        観測との対比のための内部モデルに限定される。
+        z_obs must come from spectrum unfolding (Sec. 2.5.7). This method never
+        synthesises observations from geometry; expected counts are computed only
+        for comparison with the observed isotope-wise counts.
         """
         # PF now consumes isotope-wise counts from spectrum unfolding; expected rate
         # is approximated using current strengths and geometric kernels.
@@ -344,7 +349,7 @@ class IsotopeParticleFilter:
         self._maybe_resample()
 
     def _maybe_resample(self) -> None:
-        """有効サンプル数が閾値以下ならリサンプリング。"""
+        """Resample when effective sample size falls below the threshold."""
         ess = effective_sample_size(self.log_weights)
         if ess < self.config.resample_threshold * self.N:
             idx = systematic_resample(self.log_weights)
@@ -379,12 +384,8 @@ class IsotopeParticleFilter:
             str_arr = np.array(str_stack, dtype=float)
             positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
             strengths[j] = float(np.sum(wj * str_arr))
-        # Trim zeros beyond max_sources
+        # Trim zero-strength slots.
         mask = strengths > 0
         positions = positions[mask]
         strengths = strengths[mask]
-        if positions.shape[0] > self.config.max_sources:
-            order = np.argsort(strengths)[::-1][: self.config.max_sources]
-            positions = positions[order]
-            strengths = strengths[order]
         return positions, strengths

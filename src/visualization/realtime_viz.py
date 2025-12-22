@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
 from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 
 @dataclass
@@ -23,8 +24,8 @@ class PFFrame:
     - RFe, RPb: rotation matrices for iron/lead shields (3x3)
     - duration: acquisition time T_k
     - counts_by_isotope: z_{k,h} from spectrum unfolding (Sec. 2.5.7)
-    - particle_positions: isotope -> (N_particles, 3)
-    - particle_weights: isotope -> (N_particles,)
+    - particle_positions: isotope -> (N_points, 3)
+    - particle_weights: isotope -> (N_points,)
     - estimated_sources: isotope -> (N_est, 3)
     - estimated_strengths: isotope -> (N_est,)
     """
@@ -57,6 +58,7 @@ class RealTimePFVisualizer:
 
     - update(frame) redraws particles, estimates, counts, and label panel.
     - save_final(path) saves the current figure.
+    - save_estimates_only(path) saves a view with only estimate markers visible.
     """
 
     def __init__(
@@ -93,11 +95,11 @@ class RealTimePFVisualizer:
         self._init_axes()
         self._init_label_axis()
         plt.tight_layout()
-        self._particle_artists: Dict[str, any] = {}
-        self._est_artists: Dict[str, any] = {}
+        self._particle_artists: Dict[str, Any] = {}
+        self._est_artists: Dict[str, Any] = {}
         self._robot_artist = None
         self._traj_line = None
-        self._shield_arrows: Dict[str, any] = {}
+        self._shield_arrows: Dict[str, Any] = {}
         self._counts_bars = None
         # Pre-create bar containers with zeros
         if self.ax_counts is not None and self.isotopes:
@@ -106,6 +108,13 @@ class RealTimePFVisualizer:
         self._traj_history: list[NDArray[np.float64]] = []
         self._last_frame: PFFrame | None = None
         self._true_artists: list = []
+        self._projection_artists: list = []
+        self._true_projection_artists: list = []
+        self._particle_size_range = (0.6, 18.0)
+        self._particle_alpha_range = (0.05, 0.95)
+        self._particle_weight_exponent = 1.0
+        self._projection_linewidth = 1.8
+        self.estimate_colors = {}
         # Plot true sources once if provided (as legend entries)
         for iso, pos in self.true_sources.items():
             if pos.size:
@@ -113,8 +122,19 @@ class RealTimePFVisualizer:
                 label = f"True {iso}"
                 if strength is not None:
                     label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
-                art = self.ax3d.scatter(pos[:, 0], pos[:, 1], pos[:, 2], marker="*", s=100, color=self.colors.get(iso, "black"), label=label)
+                art = self.ax3d.scatter(
+                    pos[:, 0],
+                    pos[:, 1],
+                    pos[:, 2],
+                    marker="*",
+                    s=100,
+                    color=self.colors.get(iso, "black"),
+                    label=label,
+                )
                 self._true_artists.append(art)
+                self._true_projection_artists.extend(self._axis_projection_lines(pos, self.colors.get(iso, "black")))
+        for iso in self.isotopes:
+            self.estimate_colors[iso] = self._estimate_color(self.colors.get(iso, "black"))
 
     def _init_axes(self) -> None:
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
@@ -167,9 +187,26 @@ class RealTimePFVisualizer:
         for iso in self.isotopes:
             color = self.colors.get(iso, "black")
             lines.append((f"{iso} particles", color, ".", "None"))
-            lines.append((f"{iso} est", color, "x", "None"))
+            lines.append((f"{iso} est", self.estimate_colors.get(iso, color), "x", "None"))
         lines.append(("Fe shield", "magenta", ">", "None"))
         lines.append(("Pb shield", "green", "<", "None"))
+        return lines
+
+    def _legend_lines_estimates_only(self) -> List[Tuple[str, str, str, str]]:
+        """Build legend lines for the estimates-only view."""
+        lines: List[Tuple[str, str, str, str]] = []
+        for iso, pos in self.true_sources.items():
+            if pos.size:
+                strength = self.true_strengths.get(iso, None)
+                label = f"True {iso}"
+                if strength is not None:
+                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                lines.append((label, self.colors.get(iso, "black"), "*", "None"))
+        lines.append(("trajectory", "cyan", "o", "-"))
+        lines.append(("robot", "cyan", "o", "None"))
+        for iso in self.isotopes:
+            color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
+            lines.append((f"{iso} est", color, "x", "None"))
         return lines
 
     def _estimate_lines(self, frame: PFFrame) -> List[Tuple[str, str]]:
@@ -185,18 +222,94 @@ class RealTimePFVisualizer:
                 text = f"{iso}: pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
             else:
                 text = f"{iso}: no estimate"
-            lines.append((text, self.colors.get(iso, "black")))
+            lines.append((text, self.estimate_colors.get(iso, self.colors.get(iso, "black"))))
         return lines
 
-    def _update_labels(self, frame: PFFrame) -> None:
+    def _estimate_lines_all(self, frame: PFFrame) -> List[Tuple[str, str]]:
+        """Build estimate text lines for all sources per isotope."""
+        lines: List[Tuple[str, str]] = []
+        for iso in self.isotopes:
+            est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
+            strengths = frame.estimated_strengths.get(iso, np.zeros(0))
+            color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
+            if strengths.size and est_pos.size:
+                for idx, (pos, strength) in enumerate(zip(est_pos, strengths)):
+                    text = f"{iso}[{idx}]: pos={pos.round(2).tolist()} q={float(strength):.1f} cps@1m"
+                    lines.append((text, color))
+            else:
+                lines.append((f"{iso}: no estimate", color))
+        return lines
+
+    def _estimate_color(self, base_color: str) -> Tuple[float, float, float]:
+        """Return a lighter variant of the base color for estimate markers."""
+        rgb = np.array(mcolors.to_rgb(base_color))
+        hsv = mcolors.rgb_to_hsv(rgb)
+        hsv[0] = (hsv[0] + 0.12) % 1.0
+        hsv[1] = min(1.0, hsv[1] * 0.7 + 0.3)
+        hsv[2] = min(1.0, hsv[2] * 0.8 + 0.2)
+        return tuple(mcolors.hsv_to_rgb(hsv))
+
+    def _axis_projection_lines(
+        self,
+        points: NDArray[np.float64],
+        color: str,
+        alpha: float = 0.35,
+    ) -> list:
+        """Draw thin dotted projection lines from points to each axis."""
+        if points.size == 0:
+            return []
+        xmin, _, ymin, _, zmin, _ = self.world_bounds
+        artists: list = []
+        for x, y, z in points:
+            artists.append(
+                self.ax3d.plot(
+                    [x, x],
+                    [y, ymin],
+                    [z, zmin],
+                    linestyle=":",
+                    linewidth=self._projection_linewidth,
+                    color=color,
+                    alpha=alpha,
+                )[0]
+            )
+            artists.append(
+                self.ax3d.plot(
+                    [x, xmin],
+                    [y, y],
+                    [z, zmin],
+                    linestyle=":",
+                    linewidth=self._projection_linewidth,
+                    color=color,
+                    alpha=alpha,
+                )[0]
+            )
+            artists.append(
+                self.ax3d.plot(
+                    [x, xmin],
+                    [y, ymin],
+                    [z, z],
+                    linestyle=":",
+                    linewidth=self._projection_linewidth,
+                    color=color,
+                    alpha=alpha,
+                )[0]
+            )
+        return artists
+
+    def _update_labels(
+        self,
+        frame: PFFrame,
+        legend_lines: List[Tuple[str, str, str, str]] | None = None,
+        estimate_lines: List[Tuple[str, str]] | None = None,
+    ) -> None:
         """Update the label panel with legend entries and estimates."""
         if self.ax_labels is None:
             return
         self.ax_labels.cla()
         self.ax_labels.set_title("Legend / Estimates")
         self.ax_labels.axis("off")
-        legend_lines = self._legend_lines()
-        estimate_lines = self._estimate_lines(frame)
+        legend_lines = self._legend_lines() if legend_lines is None else legend_lines
+        estimate_lines = self._estimate_lines(frame) if estimate_lines is None else estimate_lines
         gap_lines = 1
         total_lines = len(legend_lines) + len(estimate_lines) + 2 + gap_lines
         line_height = 0.95 / max(total_lines, 1)
@@ -272,6 +385,28 @@ class RealTimePFVisualizer:
             )
             y -= line_height
 
+    def _particle_style(self, weights: NDArray[np.float64], base_color: str) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Map particle weights to marker sizes and RGBA colors."""
+        if weights.size == 0:
+            return np.zeros(0), np.zeros((0, 4))
+        w = np.asarray(weights, dtype=float)
+        w_min = float(np.min(w))
+        w_max = float(np.max(w))
+        denom = w_max - w_min
+        if denom <= 1e-12:
+            w = np.ones_like(w)
+        else:
+            w = (w - w_min) / denom
+        w = np.clip(w, 0.0, 1.0) ** self._particle_weight_exponent
+        min_size, max_size = self._particle_size_range
+        min_alpha, max_alpha = self._particle_alpha_range
+        sizes = min_size + (max_size - min_size) * w
+        alphas = min_alpha + (max_alpha - min_alpha) * w
+        base_rgba = mcolors.to_rgba(base_color)
+        colors = np.tile(base_rgba, (len(w), 1))
+        colors[:, 3] = alphas
+        return sizes, colors
+
     def update(self, frame: PFFrame) -> None:
         """Redraw the scene for the given PFFrame."""
         self._last_frame = frame
@@ -320,28 +455,63 @@ class RealTimePFVisualizer:
         # Estimated sources and particles
         for iso in self.isotopes:
             pts = frame.particle_positions.get(iso, np.zeros((0, 3)))
+            weights = frame.particle_weights.get(iso, np.zeros(0))
             color = self.colors.get(iso, None)
+            sizes, colors = self._particle_style(weights, color)
             if iso not in self._particle_artists:
                 if pts.size:
-                    self._particle_artists[iso] = self.ax3d.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=5, alpha=0.15, color=color, label=f"{iso} particles")
+                    self._particle_artists[iso] = self.ax3d.scatter(
+                        pts[:, 0],
+                        pts[:, 1],
+                        pts[:, 2],
+                        s=sizes if sizes.size else 5,
+                        c=colors if colors.size else color,
+                        label=f"{iso} particles",
+                        depthshade=False,
+                        zorder=1,
+                    )
             else:
                 art = self._particle_artists[iso]
                 if pts.size:
                     art._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
+                    if sizes.size:
+                        art.set_sizes(sizes)
+                    if colors.size:
+                        art.set_facecolors(colors)
+                        art.set_edgecolors(colors)
                 else:
                     art._offsets3d = ([], [], [])
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
+            est_color = self.estimate_colors.get(iso, color)
             if iso not in self._est_artists:
                 if est_pos.size:
                     self._est_artists[iso] = self.ax3d.scatter(
-                        est_pos[:, 0], est_pos[:, 1], est_pos[:, 2], marker="x", s=80, color=color, label=f"{iso} est"
+                        est_pos[:, 0],
+                        est_pos[:, 1],
+                        est_pos[:, 2],
+                        marker="x",
+                        s=180,
+                        color=est_color,
+                        linewidths=2.5,
+                        label=f"{iso} est",
+                        depthshade=False,
+                        zorder=10,
                     )
             else:
                 art = self._est_artists[iso]
                 if est_pos.size:
                     art._offsets3d = (est_pos[:, 0], est_pos[:, 1], est_pos[:, 2])
+                    art.set_color(est_color)
+                    art.set_zorder(10)
                 else:
                     art._offsets3d = ([], [], [])
+        for art in self._projection_artists:
+            art.remove()
+        self._projection_artists = []
+        for iso in self.isotopes:
+            est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
+            est_color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
+            self._projection_artists.extend(self._axis_projection_lines(est_pos, est_color))
         self.ax3d.set_title(f"Step {frame.step_index} t={frame.time:.2f}s")
         # Counts bar (reuse)
         if self.ax_counts is not None and frame.counts_by_isotope:
@@ -373,6 +543,44 @@ class RealTimePFVisualizer:
         self.fig.savefig(out, dpi=200)
         self.fig.canvas.draw_idle()
 
+    def save_estimates_only(self, path: str = "result_estimates.png") -> None:
+        """Save a figure with only estimate markers visible on the 3D axis."""
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if self._last_frame is not None:
+            self.update(self._last_frame)
+
+        hidden: list[tuple[Any, bool]] = []
+
+        def _hide(artist: Any) -> None:
+            if artist is None:
+                return
+            if hasattr(artist, "get_visible") and hasattr(artist, "set_visible"):
+                hidden.append((artist, artist.get_visible()))
+                artist.set_visible(False)
+
+        for art in self._particle_artists.values():
+            _hide(art)
+        for art in self._shield_arrows.values():
+            _hide(art)
+
+        for art in self._est_artists.values():
+            if hasattr(art, "set_visible"):
+                art.set_visible(True)
+
+        if self._last_frame is not None:
+            self._update_labels(
+                self._last_frame,
+                legend_lines=self._legend_lines_estimates_only(),
+                estimate_lines=self._estimate_lines_all(self._last_frame),
+            )
+        self.fig.savefig(out, dpi=200)
+        for art, vis in hidden:
+            art.set_visible(vis)
+        if self._last_frame is not None:
+            self._update_labels(self._last_frame)
+        self.fig.canvas.draw_idle()
+
 
 def build_frame_from_pf(
     pf,
@@ -399,9 +607,19 @@ def build_frame_from_pf(
     estimated_strengths: Dict[str, NDArray[np.float64]] = {}
 
     for iso, filt in pf.filters.items():
-        positions = [p.state.positions for p in getattr(filt, "continuous_particles", []) if p.state.positions.size]
+        positions: list[NDArray[np.float64]] = []
+        weights: list[float] = []
+        cont_particles = getattr(filt, "continuous_particles", [])
+        cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
+        if cont_particles and len(cont_weights) == len(cont_particles):
+            for p, w in zip(cont_particles, cont_weights):
+                if p.state.positions.size == 0:
+                    continue
+                for pos in p.state.positions:
+                    positions.append(pos)
+                    weights.append(float(w))
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
-        particle_weights[iso] = getattr(filt, "continuous_weights", np.zeros(0))
+        particle_weights[iso] = np.asarray(weights, dtype=float)
         if iso in est:
             val = est[iso]
             if hasattr(val, "positions"):

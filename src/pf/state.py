@@ -58,7 +58,7 @@ def jitter_state(
     strength_sigma: float = 0.1,
     background_sigma: float = 0.1,
 ) -> ParticleState:
-    """リサンプリング後のわずかな揺らぎを加える。"""
+    """Add small post-resampling jitter to strengths and background."""
     new_state = state.copy()
     if new_state.strengths.size:
         noise = np.random.normal(scale=strength_sigma, size=new_state.strengths.shape)

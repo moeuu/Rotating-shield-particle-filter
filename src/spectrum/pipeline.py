@@ -1,4 +1,4 @@
-"""スペクトル生成と分解の簡易パイプラインを提供するモジュール。"""
+"""Provide the spectrum simulation and unfolding pipeline used in Chapter 2."""
 
 from __future__ import annotations
 
@@ -25,18 +25,18 @@ from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
 from spectrum.peak_detection import detect_peaks
 
-# バックグラウンド強度（counts/s）
+# Background intensity (counts/s).
 BACKGROUND_RATE_CPS = 3.0
-# 互換性のための別名
+# Backward-compatible alias.
 BACKGROUND_COUNTS_PER_SECOND = BACKGROUND_RATE_CPS
-# ALS基線推定のデフォルトパラメータ
+# Default ALS baseline parameters.
 BASELINE_LAM = 1e5
 BASELINE_P = 0.01
 BASELINE_NITER = 10
 
 @dataclass
 class SpectrumConfig:
-    """スペクトル生成と分解に用いる基本設定。"""
+    """Configuration for spectrum simulation and unfolding."""
 
     energy_min_keV: float = 0.0
     energy_max_keV: float = 1500.0
@@ -45,24 +45,24 @@ class SpectrumConfig:
     resolution_b: float = 1.5
 
     def energy_axis(self) -> NDArray[np.float64]:
-        """エネルギー軸を返す。"""
+        """Return the energy axis in keV."""
         return np.arange(self.energy_min_keV, self.energy_max_keV + self.bin_width_keV, self.bin_width_keV)
 
 
 class SpectralDecomposer:
-    """Chapter 2のピークベース手法を簡略化したスペクトル分解器。"""
+    """Peak-based spectrum decomposer following the Chapter 2 pipeline."""
 
     def __init__(
         self,
         spectrum_config: SpectrumConfig | None = None,
         library: Dict[str, Nuclide] | None = None,
     ) -> None:
-        """分解に必要な応答行列と設定を初期化する。"""
+        """Initialize the response matrix and pipeline configuration."""
         self.config = spectrum_config or SpectrumConfig()
         self.library = library or default_library()
         self.energy_axis = self.config.energy_axis()
         self.resolution_fn = default_resolution()
-        # エネルギー依存効率（CeBr3想定）
+        # Energy-dependent efficiency model (CeBr3 assumption).
         from spectrum.response_matrix import cebr3_efficiency
 
         self.efficiency_fn = cebr3_efficiency
@@ -91,9 +91,10 @@ class SpectralDecomposer:
         shield_params: ShieldParams | None = None,
     ) -> Tuple[NDArray[np.float64], Dict[str, float]]:
         """
-        点源と環境設定に基づき合成スペクトルを生成する。
+        Simulate a spectrum from point sources and the environment.
 
-        戻り値はスペクトル配列と、幾何減衰込みの実効強度辞書。
+        Returns the spectrum array and the effective source strengths after
+        geometric attenuation.
 
         Shielding (Sec. 3.4–3.5): if shield orientations are provided, the line-of-sight
         is tested and an exponential attenuation factor exp(-mu * L) is applied to each
@@ -147,8 +148,7 @@ class SpectralDecomposer:
             expected += atten * contribution * self.response_matrix[:, col_idx]
             effective_strengths[source.isotope] += atten * contribution
 
-        # バックグラウンドを加算
-        # エイリアスのどちらを更新しても反映されるように値を解決
+        # Add background, resolving the alias consistently.
         background_rate = BACKGROUND_RATE_CPS
         if BACKGROUND_COUNTS_PER_SECOND != BACKGROUND_RATE_CPS:
             background_rate = BACKGROUND_COUNTS_PER_SECOND
@@ -161,7 +161,7 @@ class SpectralDecomposer:
         return corrected, effective_strengths
 
     def preprocess(self, spectrum: NDArray[np.float64]) -> NDArray[np.float64]:
-        """平滑化とベースライン補正を適用してピーク検出を安定化させる。"""
+        """Apply smoothing and baseline correction to stabilise peak detection."""
         smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
         baseline = asymmetric_least_squares(
             smoothed,
@@ -173,11 +173,11 @@ class SpectralDecomposer:
         return corrected
 
     def decompose(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
-        """観測スペクトルを非負値最小二乗で分解し、核種ごとの強度を返す。"""
+        """Decompose a spectrum by NNLS and return isotope-wise activities."""
         return estimate_activities(self.response_matrix, spectrum, self.isotope_names)
 
     def isotope_counts(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
-        """分解結果を使ってPFに渡しやすい同位体別カウントを返す。"""
+        """Return isotope-wise counts suitable for PF updates."""
         return self.decompose(spectrum)
 
     @staticmethod
@@ -189,7 +189,7 @@ class SpectralDecomposer:
         corrected: NDArray[np.float64],
         title: str = "Baseline Debug",
     ) -> None:
-        """基線推定の挙動を可視化するためのデバッグ用プロット。"""
+        """Plot baseline estimation diagnostics."""
         import matplotlib.pyplot as plt
 
         plt.figure(figsize=(10, 5))
@@ -209,9 +209,9 @@ class SpectralDecomposer:
         tolerance_keV: float = 5.0,
     ) -> Dict[str, float]:
         """
-        ピーク検出とストリッピングに基づき核種ごとの参照ピーク面積を推定する。
+        Estimate isotope-wise reference peak areas via detection and stripping.
 
-        低カウント環境でピークベース同定を行いたい場合に使用する。
+        Use this in low-count scenarios where peak-based identification is preferred.
         """
         corrected = self.preprocess(spectrum)
         peak_indices = detect_peaks(corrected, prominence=0.05, distance=5)

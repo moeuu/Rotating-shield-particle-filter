@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 
 
 def systematic_resample(log_weights: NDArray[np.float64]) -> NDArray[np.float64]:
-    """システマティックリサンプリング。"""
+    """Perform systematic resampling given log-weights."""
     weights = np.exp(log_weights)
     N = len(weights)
     positions = (np.arange(N) + np.random.uniform()) / N

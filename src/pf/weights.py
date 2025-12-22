@@ -11,7 +11,7 @@ def log_weight_update_poisson(
     z_obs: float,
     lambda_exp: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """ポアソン観測に対する対数重み更新（Sec. 3.4.3）。"""
+    """Log-weight update for Poisson observations (Sec. 3.4.3)."""
     # log-likelihood up to additive constant
     ll = z_obs * np.log(lambda_exp + 1e-12) - lambda_exp
     log_w = log_w_prev + ll
@@ -23,6 +23,6 @@ def log_weight_update_poisson(
 
 
 def effective_sample_size(log_w: NDArray[np.float64]) -> float:
-    """有効サンプル数を返す。"""
+    """Return the effective sample size."""
     w = np.exp(log_w)
     return float(1.0 / np.sum(w**2))

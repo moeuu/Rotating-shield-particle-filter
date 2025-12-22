@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Any
+import copy
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,37 +15,63 @@ from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
 from pf.particle_filter import IsotopeParticleFilter, PFConfig
+from pf.state import IsotopeState
 
 
 @dataclass
 class RotatingShieldPFConfig:
     """
-    設定パラメータ（Sec. 3.4–3.5）。
+    Configuration parameters for the rotating-shield PF (Sec. 3.4–3.5).
 
-    Users can tune convergence thresholds:
+    Users can tune convergence thresholds and planning settings:
+        - max_sources: optional cap on the number of sources per isotope (None = no cap)
         - ig_threshold: max IG below which rotation stops (Eq. 3.49)
         - max_dwell_time_s: per-pose dwell cap
         - credible_volume_threshold: max ellipsoid volume for positional credible regions
         - lambda_cost: motion-cost weight in Eq. 3.51
         - alpha_weights / beta_weights: isotope weights for IG / Fisher criteria
+        - orientation_k: number of orientations to execute per pose
+        - orientation_selection_mode: "eig", "fisher", or "hybrid"
+        - planning_particles: particle count used for orientation scoring (None = all)
+        - planning_method: how to select planning particles (top_weight/resample)
+        - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
+        - fisher_screening_metric: "ja" or "jd" for Fisher screening
+        - fisher_screening_k: number of top candidates kept after Fisher screening
+        - hybrid_eig_samples: small-sample count for EIG refinement
+        - hybrid_entropy_threshold: switch to Fisher-only when entropy ratio is below this
+        - preselect_*: optional surrogate stage settings for candidate reduction
     """
 
     num_particles: int = 200
-    max_sources: int = 1
+    max_sources: int | None = None
     resample_threshold: float = 0.5
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     min_strength: float = 0.01
     p_birth: float = 0.05
-    short_time_s: float = 0.5  # 推奨短時間計測時間（Sec. 3.4.3）
-    ig_threshold: float = 1e-3  # ΔIG停止閾値（Sec. 3.4.4）
-    max_dwell_time_s: float = 5.0  # 1ポーズあたりの最大滞留時間
-    lambda_cost: float = 1.0  # 移動コスト重み（Eq. 3.51）
-    alpha_weights: Dict[str, float] | None = None  # EIGの同位体重み α_h
-    beta_weights: Dict[str, float] | None = None  # Fisher基準の同位体重み β_h
-    credible_volume_threshold: float = 1e-3  # 95%位置信用領域体積の閾値（収束判定用）
+    short_time_s: float = 0.5  # Recommended short-time measurement (Sec. 3.4.3).
+    ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
+    max_dwell_time_s: float = 5.0  # Max dwell time per pose.
+    lambda_cost: float = 1.0  # Motion-cost weight (Eq. 3.51).
+    alpha_weights: Dict[str, float] | None = None  # EIG isotope weights alpha_h.
+    beta_weights: Dict[str, float] | None = None  # Fisher weights beta_h.
+    credible_volume_threshold: float = 1e-3  # Max 95% credible volume for convergence.
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
+    orientation_k: int = 16
+    orientation_selection_mode: str = "eig"
+    planning_particles: int | None = None
+    planning_method: str = "top_weight"
+    eig_num_samples: int = 50
+    fisher_screening_metric: str = "ja"
+    fisher_screening_k: int = 12
+    hybrid_eig_samples: int = 20
+    hybrid_entropy_threshold: float = 0.4
+    preselect_orientations: bool = False
+    preselect_metric: str = "var_log_lambda"
+    preselect_delta: float = 0.05
+    preselect_k_min: int = 8
+    preselect_k_max: int = 16
 
 
 @dataclass(frozen=True)
@@ -62,10 +89,10 @@ class MeasurementRecord:
 
 class RotatingShieldPFEstimator:
     """
-    シールド回転を伴う並列PFによるオンライン源推定器（Sec. 3.4, 3.5, 3.6）。
+    Online source estimator using parallel PFs with shield rotation (Sec. 3.4–3.6).
 
-    - 同位体ごとに独立PFを保持
-    - 各更新で姿勢・遮蔽方位を受け取りPoisson重み更新
+    - Maintains one PF per isotope.
+    - Updates each PF with pose/orientation and Poisson weight updates.
     """
 
     def __init__(
@@ -80,7 +107,7 @@ class RotatingShieldPFEstimator:
         self.isotopes = list(isotopes)
         self.pf_config = pf_config or RotatingShieldPFConfig()
         self.shield_params = shield_params or ShieldParams()
-        # 測定姿勢は逐次追加するので空で初期化
+        # Measurement poses are appended incrementally.
         self.poses: List[NDArray[np.float64]] = []
         if shield_normals is None:
             from measurement.shielding import generate_octant_orientations
@@ -124,10 +151,87 @@ class RotatingShieldPFEstimator:
         for iso in self.isotopes:
             self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
 
+    def planning_particles(
+        self,
+        max_particles: int | None = None,
+        method: str | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]:
+        """
+        Select per-isotope particle subsets for orientation evaluation.
+
+        Args:
+            max_particles: cap on particles per isotope; None uses config default.
+            method: "top_weight" or "resample"; None uses config default.
+            rng: optional RNG for resampling.
+        """
+        if max_particles is None:
+            max_particles = self.pf_config.planning_particles
+        method = method or self.pf_config.planning_method
+        rng = rng or np.random.default_rng()
+        subsets: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] = {}
+        for iso, filt in self.filters.items():
+            if not filt.continuous_particles:
+                continue
+            weights = filt.continuous_weights
+            total = float(np.sum(weights))
+            if total <= 0.0:
+                continue
+            weights = weights / total
+            n_particles = len(weights)
+            if max_particles is None or max_particles <= 0 or max_particles >= n_particles:
+                states = [p.state for p in filt.continuous_particles]
+                subsets[iso] = (states, weights)
+                continue
+            if method == "top_weight":
+                idx = np.argsort(weights)[::-1][:max_particles]
+                sel_weights = weights[idx]
+                sel_weights = sel_weights / max(np.sum(sel_weights), 1e-12)
+            elif method == "resample":
+                idx = rng.choice(n_particles, size=max_particles, p=weights)
+                sel_weights = np.ones(max_particles, dtype=float) / max_particles
+            else:
+                raise ValueError(f"Unknown planning particle selection method: {method}")
+            states = [filt.continuous_particles[i].state for i in idx]
+            subsets[iso] = (states, sel_weights)
+        return subsets
+
+    def weight_entropy_ratio(
+        self,
+        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None = None,
+    ) -> float:
+        """
+        Return the mean normalized weight entropy across isotopes.
+
+        The entropy ratio is H(w)/log(N) in [0, 1]. Lower values indicate a more
+        concentrated posterior (less multi-modality).
+        """
+        entropies: List[float] = []
+        eps = 1e-12
+        for iso, filt in self.filters.items():
+            if particles_by_isotope is not None and iso in particles_by_isotope:
+                _, weights = particles_by_isotope[iso]
+            else:
+                if not filt.continuous_particles:
+                    continue
+                weights = filt.continuous_weights
+            weights = np.asarray(weights, dtype=float)
+            if weights.size == 0:
+                continue
+            weights = weights / max(float(np.sum(weights)), eps)
+            if weights.size == 1:
+                entropies.append(0.0)
+                continue
+            entropy = float(-np.sum(weights * np.log(weights + eps)))
+            entropies.append(entropy / max(np.log(weights.size), eps))
+        if not entropies:
+            return 0.0
+        return float(np.mean(entropies))
+
     def add_measurement_pose(self, pose: NDArray[np.float64]) -> None:
-        """新しい測定姿勢を登録。最初の登録後にカーネルを構築。"""
+        """Register a new measurement pose (kernel built lazily on demand)."""
         self.poses.append(np.asarray(pose, dtype=float))
-        # 再構築は次回必要時に実施
+        # Rebuild lazily on the next access.
         self.kernel_cache = None
         self.filters = {}
 
@@ -139,7 +243,7 @@ class RotatingShieldPFEstimator:
         live_time_s: float,
     ) -> None:
         """
-        同位体別カウントz_kを用いてPF群を更新。
+        Update per-isotope PFs using isotope-wise counts z_k.
 
         z_k must come from the spectrum unfolding pipeline (Sec. 2.5.7); this method
         never fabricates observations from geometric kernels or ground truth.
@@ -170,7 +274,7 @@ class RotatingShieldPFEstimator:
         # reset cache if new pose added later
 
     def predict(self) -> None:
-        """全PFで予測ステップを行う。"""
+        """Run the prediction step for all PFs."""
         for f in self.filters.values():
             f.predict()
 
@@ -183,12 +287,11 @@ class RotatingShieldPFEstimator:
         live_time_s: float | None = None,
     ) -> None:
         """
-        短時間計測 (Sec. 3.4.3) を PF に反映するヘルパ。
+        Apply a short-time measurement update (Sec. 3.4.3).
 
-        - シールド方位 (RFe, RPb) を設定し、短時間 T_k で取得した z_k（同位体別カウント）を使用。
-        - T_k は pf_config.short_time_s（デフォルト0.5s）を既定値とする。
-        - z_k は必ずスペクトル処理パイプライン (Sec. 2.5.7) の展開結果であり、幾何カーネルから
-          直接計算したカウントを渡さないこと。
+        - Use shield orientations (RFe, RPb) and isotope-wise counts z_k.
+        - T_k defaults to pf_config.short_time_s unless specified.
+        - z_k must come from the spectrum pipeline (Sec. 2.5.7), not from geometry.
         """
         duration = live_time_s if live_time_s is not None else self.pf_config.short_time_s
         fe_index = octant_index_from_rotation(RFe)
@@ -231,7 +334,7 @@ class RotatingShieldPFEstimator:
         )
 
     def estimates(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """同位体ごとの位置・強度推定を返す（連続粒子のMMSE）。"""
+        """Return per-isotope position/strength estimates (MMSE over continuous particles)."""
         return {iso: f.estimate() for iso, f in self.filters.items()}
 
     def estimate_all(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
@@ -312,8 +415,9 @@ class RotatingShieldPFEstimator:
         RFe: NDArray[np.float64],
         RPb: NDArray[np.float64],
         live_time_s: float = 1.0,
-        num_samples: int = 50,
+        num_samples: int | None = None,
         alpha_by_isotope: Dict[str, float] | None = None,
+        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None = None,
         rng: np.random.Generator | None = None,
     ) -> float:
         """
@@ -326,6 +430,7 @@ class RotatingShieldPFEstimator:
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
         rng = rng or np.random.default_rng()
+        num_samples = self.pf_config.eig_num_samples if num_samples is None else num_samples
         eps = 1e-12
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
@@ -342,12 +447,19 @@ class RotatingShieldPFEstimator:
 
         total_ig = 0.0
         for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
+            if particles_by_isotope is not None and iso in particles_by_isotope:
+                states, weights = particles_by_isotope[iso]
+            else:
+                if not filt.continuous_particles:
+                    continue
+                states = [p.state for p in filt.continuous_particles]
+                weights = filt.continuous_weights
+            if not states:
                 continue
-            weights = filt.continuous_weights
-            lam = np.zeros(len(filt.continuous_particles), dtype=float)
-            for i, p in enumerate(filt.continuous_particles):
-                st = p.state
+            weights = np.asarray(weights, dtype=float)
+            weights = weights / max(np.sum(weights), eps)
+            lam = np.zeros(len(states), dtype=float)
+            for i, st in enumerate(states):
                 lam[i] = kernel.expected_counts_pair(
                     isotope=iso,
                     detector_pos=detector_pos,
@@ -381,6 +493,7 @@ class RotatingShieldPFEstimator:
         RPb: NDArray[np.float64],
         live_time_s: float = 1.0,
         beta_by_isotope: Dict[str, float] | None = None,
+        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None = None,
         ridge: float = 1e-6,
     ) -> Tuple[float, float]:
         """
@@ -402,14 +515,21 @@ class RotatingShieldPFEstimator:
         JA_total = 0.0
         JD_total = 0.0
         for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
+            if particles_by_isotope is not None and iso in particles_by_isotope:
+                states, weights = particles_by_isotope[iso]
+            else:
+                if not filt.continuous_particles:
+                    continue
+                states = [p.state for p in filt.continuous_particles]
+                weights = filt.continuous_weights
+            if not states:
                 continue
-            weights = filt.continuous_weights
-            max_r = max(p.state.num_sources for p in filt.continuous_particles)
+            weights = np.asarray(weights, dtype=float)
+            weights = weights / max(np.sum(weights), 1e-12)
+            max_r = max(st.num_sources for st in states)
             dim = max_r + 1  # strengths + background
             I = np.zeros((dim, dim), dtype=float)
-            for w, p in zip(weights, filt.continuous_particles):
-                st = p.state
+            for w, st in zip(weights, states):
                 lam = kernel.expected_counts_pair(
                     isotope=iso,
                     detector_pos=detector_pos,
@@ -504,9 +624,142 @@ class RotatingShieldPFEstimator:
             total_U += U_accum / max(num_samples, 1)
         return float(total_U)
 
+    def expected_uncertainty_after_rotation(
+        self,
+        pose_idx: int,
+        *,
+        tau_ig: float,
+        t_max_s: float,
+        t_short_s: float,
+        num_rollouts: int = 0,
+        use_mean_measurement: bool = True,
+        rng_seed: int | None = 0,
+        return_debug: bool = False,
+    ) -> float | Tuple[float, Dict[str, Any]]:
+        """
+        Estimate E[U_after-rotation | pose] for the full rotating-shield procedure.
+
+        The rotation loop follows:
+          - select the orientation with max IG (Eq. 3.48)
+          - stop if ΔIG < tau_ig (Eq. 3.49)
+          - simulate a short-time measurement and update the PF
+          - stop if accumulated time >= t_max_s (Eq. 3.50)
+
+        If num_rollouts == 0, uses a deterministic approximation that treats the
+        mixture mean Λ̄ as the observation when use_mean_measurement is True.
+        Otherwise, Monte Carlo rollouts are performed using mixture-Poisson sampling.
+        """
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        rng = np.random.default_rng(rng_seed) if rng_seed is not None else np.random.default_rng()
+        from measurement.shielding import generate_octant_rotation_matrices
+
+        RFe_candidates = generate_octant_rotation_matrices()
+        RPb_candidates = generate_octant_rotation_matrices()
+        num_fe = len(RFe_candidates)
+        num_pb = len(RPb_candidates)
+        alphas = self.pf_config.alpha_weights
+
+        def _select_best_orientation(estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator) -> Tuple[int, int, float]:
+            best_ig = -np.inf
+            best_fe = 0
+            best_pb = 0
+            for fe_idx in range(num_fe):
+                for pb_idx in range(num_pb):
+                    ig_val = estimator.orientation_expected_information_gain(
+                        pose_idx=pose_idx,
+                        RFe=RFe_candidates[fe_idx],
+                        RPb=RPb_candidates[pb_idx],
+                        live_time_s=t_short_s,
+                        alpha_by_isotope=alphas,
+                        rng=rng_local,
+                    )
+                    if ig_val > best_ig:
+                        best_ig = ig_val
+                        best_fe = fe_idx
+                        best_pb = pb_idx
+            return best_fe, best_pb, float(best_ig)
+
+        def _simulate_measurement(
+            estimator: "RotatingShieldPFEstimator",
+            fe_idx: int,
+            pb_idx: int,
+            rng_local: np.random.Generator,
+        ) -> Dict[str, float]:
+            z_k: Dict[str, float] = {}
+            for iso, filt in estimator.filters.items():
+                if not filt.continuous_particles:
+                    z_k[iso] = 0.0
+                    continue
+                lam = filt._continuous_expected_counts_pair(
+                    pose_idx=pose_idx,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                    live_time_s=t_short_s,
+                )
+                if lam.size == 0:
+                    z_k[iso] = 0.0
+                    continue
+                weights = filt.continuous_weights
+                if num_rollouts == 0 and use_mean_measurement:
+                    z_k[iso] = float(np.sum(weights * lam))
+                else:
+                    idx = int(rng_local.choice(len(lam), p=weights))
+                    z_k[iso] = float(rng_local.poisson(lam[idx]))
+            return z_k
+
+        def _run_once(estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator) -> Tuple[float, Dict[str, Any]]:
+            elapsed = 0.0
+            rotations = 0
+            iterations: List[Dict[str, Any]] = []
+            while elapsed < t_max_s:
+                fe_idx, pb_idx, ig_val = _select_best_orientation(estimator, rng_local)
+                iterations.append(
+                    {
+                        "fe_idx": fe_idx,
+                        "pb_idx": pb_idx,
+                        "ig": ig_val,
+                        "elapsed": elapsed,
+                    }
+                )
+                if ig_val < tau_ig:
+                    break
+                z_k = _simulate_measurement(estimator, fe_idx, pb_idx, rng_local)
+                estimator.update_pair(
+                    z_k=z_k,
+                    pose_idx=pose_idx,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                    live_time_s=t_short_s,
+                )
+                elapsed += t_short_s
+                rotations += 1
+            return estimator.global_uncertainty(), {
+                "iterations": iterations,
+                "elapsed": elapsed,
+                "num_rotations": rotations,
+            }
+
+        if num_rollouts <= 0:
+            estimator_copy = copy.deepcopy(self)
+            u_val, debug = _run_once(estimator_copy, rng)
+            return (u_val, debug) if return_debug else u_val
+
+        u_vals: List[float] = []
+        debug_rollouts: List[Dict[str, Any]] = []
+        for _ in range(num_rollouts):
+            estimator_copy = copy.deepcopy(self)
+            u_val, debug = _run_once(estimator_copy, rng)
+            u_vals.append(u_val)
+            debug_rollouts.append(debug)
+        mean_u = float(np.mean(u_vals)) if u_vals else 0.0
+        if return_debug:
+            return mean_u, {"rollouts": debug_rollouts, "u_vals": u_vals}
+        return mean_u
+
     def estimate_change_norm(self) -> float:
         """
-        直近2回の推定差分ノルム ||Δs|| + ||Δq|| を返す（Sec. 3.6の収束判定の一部）。
+        Return ||Δs|| + ||Δq|| between the last two estimates (Sec. 3.6 convergence check).
         """
         if len(self.history_estimates) < 2:
             return float("inf")
@@ -526,7 +779,7 @@ class RotatingShieldPFEstimator:
 
     def global_uncertainty(self) -> float:
         """
-        粒子群から強度分散を集計した不確実性 U = Σ_h Σ_j Var(q_{h,j}) を返す（Sec. 3.6のU）。
+        Return global uncertainty U = Σ_h Σ_j Var(q_{h,j}) (Sec. 3.6).
         """
         total = 0.0
         for iso, filt in self.filters.items():
@@ -612,11 +865,11 @@ class RotatingShieldPFEstimator:
         live_time_s: float = 1.0,
     ) -> bool:
         """
-        シールド回転を終了する条件（Sec. 3.5, Eq. for IG + Sec. 3.6の収束条件）。
+        Stop shield rotation when convergence criteria are met (Sec. 3.5–3.6).
 
-        - 最大情報利得 max_φ IG_k(φ) が閾値未満
-        - 直近推定差分 ||Δs|| + ||Δq|| < change_tol
-        - グローバル不確実性 U が閾値未満
+        - max IG_k(φ) below threshold
+        - estimate change ||Δs|| + ||Δq|| < change_tol
+        - global uncertainty U below threshold
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
@@ -655,11 +908,11 @@ class RotatingShieldPFEstimator:
         live_time_s: float = 1.0,
     ) -> bool:
         """
-        探索全体を終了する条件（Sec. 3.6, Uと情報利得の収束に基づく）。
+        Stop the overall exploration (Sec. 3.6) based on IG and uncertainty convergence.
 
-        - 最終ポーズでの最大IGが小さい（これ以上ポーズを変えても情報が増えない）
-        - 推定変化が小さい
-        - グローバル不確実性 U が十分小さい
+        - Max IG at the last pose is small
+        - Estimate change is small
+        - Global uncertainty U is small
         """
         if not self.poses:
             return False

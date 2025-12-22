@@ -14,7 +14,7 @@ from spectrum.smoothing import gaussian_smooth
 
 
 def _dead_time_scale(total_counts: float, live_time_s: float, dead_time_s: float) -> float:
-    """非パラライザブルモデルに基づく全体スケール係数を返す。"""
+    """Return a global scale factor using a non-paralyzable dead-time model."""
     if dead_time_s <= 0.0 or live_time_s <= 0.0:
         return 1.0
     m_rate = total_counts / live_time_s
@@ -28,7 +28,7 @@ def _apply_preprocess(
     smooth_sigma_bins: float | None,
     subtract_baseline: bool,
 ) -> NDArray[np.float64]:
-    """死時間補正・平滑化・ベースライン補正を順に適用する。"""
+    """Apply dead-time correction, smoothing, and baseline subtraction."""
     corrected = spectrum.astype(float)
     scale = _dead_time_scale(corrected.sum(), live_time_s, dead_time_s)
     corrected *= scale
@@ -51,17 +51,17 @@ def build_isotope_count_sequence(
     subtract_baseline: bool = True,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
-    短時間スペクトル系列から同位体別カウント系列z_kを生成する。
+    Build isotope-wise count sequences z_k from short-time spectra.
 
     Args:
-        spectra: 時系列スペクトル（チャネルカウント配列の反復）。
-        energy_axis_keV: 各チャネルのエネルギー軸（keV）。
-        library: 核種ライブラリ。
-        live_time_s: 測定ライブタイム（単一値またはスペクトルごとの列）。
-        dead_time_s: 死時間（秒）。
-        window_keV: 各ピークの積分窓幅（±window_keV）。
-        smooth_sigma_bins: 平滑化に用いるσ（bin単位）。Noneまたは0で無効。
-        subtract_baseline: ベースラインを引くかどうか。
+        spectra: Time-series spectra (iterable of channel-count arrays).
+        energy_axis_keV: Energy axis per channel (keV).
+        library: Nuclide library.
+        live_time_s: Live time (single value or per-spectrum list).
+        dead_time_s: Dead time in seconds.
+        window_keV: Integration window (±window_keV) around each line.
+        smooth_sigma_bins: Smoothing sigma in bins (None or 0 disables).
+        subtract_baseline: Whether to subtract the baseline.
 
     Returns:
         (isotope_names, counts_matrix) where counts_matrix shape = (T, H)
@@ -78,7 +78,7 @@ def build_isotope_count_sequence(
         raise ValueError("Number of spectra and live_time_s entries must match")
 
     counts_matrix = np.zeros((len(spectra_list), len(iso_names)), dtype=float)
-    # 事前に強度合計を計算
+    # Pre-compute total line intensities.
     total_intensity: Dict[str, float] = {
         name: sum(line.intensity for line in nuclide.lines) for name, nuclide in library.items()
     }

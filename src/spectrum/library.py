@@ -1,4 +1,4 @@
-"""核種ライブラリの定義と取得を扱うモジュール。"""
+"""Define and expose a small nuclide library used by the spectrum pipeline."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Dict, List
 
 @dataclass(frozen=True)
 class NuclideLine:
-    """単一ガンマ線のエネルギーと強度を表す。"""
+    """Represent a single gamma line energy and relative intensity."""
 
     energy_keV: float
     intensity: float
@@ -16,7 +16,7 @@ class NuclideLine:
 
 @dataclass(frozen=True)
 class Nuclide:
-    """核種とその代表ピーク群を保持する。"""
+    """Hold nuclide metadata and its representative gamma lines."""
 
     name: str
     lines: List[NuclideLine]
@@ -24,7 +24,7 @@ class Nuclide:
 
 
 def default_library() -> Dict[str, Nuclide]:
-    """Cs-137, Co-60, Eu-154の代表ピークを含むライブラリを返す。"""
+    """Return a default library with Cs-137, Co-60, and Eu-154 lines."""
     return {
         "Cs-137": Nuclide(
             name="Cs-137",

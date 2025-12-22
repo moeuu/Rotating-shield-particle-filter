@@ -176,7 +176,6 @@ def run_live_pf(live: bool = True, steps: int = 24, all_orientations: bool = Fal
     poses_arr = np.array([[x, y, 0.5] for x in xs_pose for y in ys_pose], dtype=float)
 
     isotopes = ["Cs-137", "Co-60", "Eu-154"]
-    max_sources = 2
     # Use a moderate particle count for the demo (previous default was 200)
     num_particles = 2000
     shield_params = ShieldParams()
@@ -185,7 +184,6 @@ def run_live_pf(live: bool = True, steps: int = 24, all_orientations: bool = Fal
     }
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
-        max_sources=max_sources,
         resample_threshold=0.5,
         min_strength=0.01,
         p_birth=0.05,
@@ -248,7 +246,6 @@ def run_live_pf(live: bool = True, steps: int = 24, all_orientations: bool = Fal
             top_pairs = select_top_k_orientations(
                 estimator,
                 pose_idx=current_pose_idx,
-                k=4,
                 live_time_s=live_time,
                 allowed_indices=available_orients,
             )
@@ -330,19 +327,21 @@ def run_live_pf(live: bool = True, steps: int = 24, all_orientations: bool = Fal
             estimator=estimator,
             candidate_pose_indices=cand_idx,
             current_pose_idx=current_pose_idx,
-            live_time_s=live_time,
         )
         recent_poses.append(current_pose_idx)
 
     # Save final snapshots
     pf_out_path = RESULTS_DIR / "result_pf.png"
     spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
+    estimates_out_path = RESULTS_DIR / "result_estimates.png"
     pf_out_path.parent.mkdir(parents=True, exist_ok=True)
     viz.save_final(pf_out_path.as_posix())
+    viz.save_estimates_only(estimates_out_path.as_posix())
     if last_spectrum is not None:
         _save_spectrum_plot(decomposer, last_spectrum, spectrum_out_path)
     total_meas_time = step_counter * live_time
     print(f"Final PF visualization saved to: {pf_out_path}")
+    print(f"Final estimates-only visualization saved to: {estimates_out_path}")
     if last_spectrum is not None:
         print(f"Final spectrum saved to: {spectrum_out_path}")
     print(f"Total measurements: {step_counter}, total live time (simulated): {total_meas_time:.1f} s")

@@ -1,4 +1,4 @@
-"""エネルギー校正多項式の推定と適用を行うモジュール。"""
+"""Estimate and apply polynomial energy calibration."""
 
 from __future__ import annotations
 
@@ -11,19 +11,18 @@ from numpy.typing import NDArray
 
 @dataclass(frozen=True)
 class CalibrationModel:
-    """校正式係数を保持し、チャネルとエネルギーを相互変換するモデル。"""
+    """Store calibration coefficients and map between channel and energy."""
 
     coefficients: Sequence[float]
 
     def channel_to_energy(self, channels: NDArray[np.float64]) -> NDArray[np.float64]:
-        """チャネル配列をエネルギー軸（keV）に変換する。"""
+        """Convert channel indices to energy (keV)."""
         poly = np.poly1d(self.coefficients)
         return poly(channels)
 
     def energy_to_channel(self, energies: NDArray[np.float64]) -> NDArray[np.float64]:
-        """エネルギー配列をチャネルに変換する。"""
-        # 逆変換は一意ではないため、近似的にルートを探す
-        # 低次多項式想定なので簡易ニュートン法を用いる
+        """Convert energy values to channel indices."""
+        # Inversion is not unique; use a simple Newton iteration for low-order polynomials.
         energies = np.asarray(energies, dtype=float)
         channels = np.zeros_like(energies, dtype=float)
         for _ in range(10):
@@ -39,18 +38,18 @@ def fit_polynomial_calibration(
     order: int = 2,
 ) -> CalibrationModel:
     """
-    既知ピークのチャネルとエネルギーを用いて校正式をフィットする。
+    Fit a polynomial calibration from reference channel/energy pairs.
 
     Args:
-        reference_peaks: (channel, energy_keV) の反復可能オブジェクト。
-        order: 多項式の次数。
+        reference_peaks: Iterable of (channel, energy_keV) pairs.
+        order: Polynomial order.
 
     Returns:
-        CalibrationModel: 校正式モデル。
+        CalibrationModel: Fitted calibration model.
     """
     refs = np.asarray(reference_peaks, dtype=float)
     if refs.shape[0] < order + 1:
-        raise ValueError("十分な基準ピークがありません")
+        raise ValueError("Not enough reference peaks for the requested order.")
     channels = refs[:, 0]
     energies = refs[:, 1]
     coeffs = np.polyfit(channels, energies, order)
@@ -59,14 +58,14 @@ def fit_polynomial_calibration(
 
 def apply_calibration(model: CalibrationModel, num_channels: int) -> NDArray[np.float64]:
     """
-    校正式を用いてエネルギー軸を生成する。
+    Generate an energy axis using the calibration model.
 
     Args:
-        model: CalibrationModel。
-        num_channels: チャネル数。
+        model: CalibrationModel instance.
+        num_channels: Number of channels.
 
     Returns:
-        keV単位のエネルギー軸配列。
+        Energy axis in keV.
     """
     channels = np.arange(num_channels, dtype=float)
     return model.channel_to_energy(channels)
