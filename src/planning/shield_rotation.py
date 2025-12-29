@@ -6,7 +6,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
 
 
@@ -38,7 +37,6 @@ def _surrogate_scores(
     """
     if not particles_by_isotope:
         return {}
-    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
     alphas = alpha_by_isotope or {iso: 1.0 for iso in particles_by_isotope}
     alpha_sum = sum(alphas.values()) or 1.0
     alphas = {k: v / alpha_sum for k, v in alphas.items()}
@@ -52,18 +50,14 @@ def _surrogate_scores(
             score = 0.0
             for iso, (states, weights) in particles_by_isotope.items():
                 weights = _normalize_weights(np.asarray(weights, dtype=float))
-                lam = np.zeros(len(states), dtype=float)
-                for i, st in enumerate(states):
-                    lam[i] = kernel.expected_counts_pair(
-                        isotope=iso,
-                        detector_pos=estimator.poses[pose_idx],
-                        sources=st.positions,
-                        strengths=st.strengths,
-                        fe_index=fe_idx,
-                        pb_index=pb_idx,
-                        live_time_s=live_time_s,
-                        background=st.background,
-                    )
+                lam = estimator.expected_counts_pair_for_states(
+                    isotope=iso,
+                    pose_idx=pose_idx,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                    live_time_s=live_time_s,
+                    states=states,
+                )
                 if metric == "var_log_lambda":
                     vals = np.log(lam + eps)
                 elif metric == "var_lambda":

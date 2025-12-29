@@ -12,17 +12,30 @@ from typing import Dict, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.shielding import OctantShield, octant_index_from_normal, path_length_cm, resolve_mu_values
+from measurement.shielding import (
+    CS137_TVL_FE_MM,
+    CS137_TVL_PB_MM,
+    OctantShield,
+    mu_from_tvl_mm,
+    octant_index_from_normal,
+    path_length_cm,
+    resolve_mu_values,
+)
+
+CS137_TVL_PB_CM = CS137_TVL_PB_MM / 10.0
+CS137_TVL_FE_CM = CS137_TVL_FE_MM / 10.0
+CS137_MU_PB_CM_INV = mu_from_tvl_mm(CS137_TVL_PB_MM)
+CS137_MU_FE_CM_INV = mu_from_tvl_mm(CS137_TVL_FE_MM)
 
 
 @dataclass(frozen=True)
 class ShieldParams:
     """Lightweight shield material and thickness parameters."""
 
-    mu_pb: float = 0.7  # 1/cm at representative energies
-    mu_fe: float = 0.5  # 1/cm at representative energies
-    thickness_pb_cm: float = 2.0
-    thickness_fe_cm: float = 2.0
+    mu_pb: float = CS137_MU_PB_CM_INV  # 1/cm based on Cs-137 TVL.
+    mu_fe: float = CS137_MU_FE_CM_INV  # 1/cm based on Cs-137 TVL.
+    thickness_pb_cm: float = CS137_TVL_PB_CM
+    thickness_fe_cm: float = CS137_TVL_FE_CM
 
 
 class KernelPrecomputer:

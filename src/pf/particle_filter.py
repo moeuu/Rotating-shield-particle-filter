@@ -39,6 +39,9 @@ class PFConfig:
     init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
     init_strength_log_sigma: float = 1.0
     use_discrete: bool = True  # set False to skip legacy discrete initialisation
+    use_gpu: bool = False
+    gpu_device: str = "cuda"
+    gpu_dtype: str = "float32"
 
 
 @dataclass
@@ -105,8 +108,115 @@ class IsotopeParticleFilter:
             st = IsotopeState(num_sources=r_h, positions=positions, strengths=strengths, background=b_h)
             self.continuous_particles.append(IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N))))
 
+    def _gpu_enabled(self) -> bool:
+        """Return True if GPU computation is enabled and available."""
+        if not self.config.use_gpu:
+            return False
+        try:
+            from pf import gpu_utils
+        except ImportError:
+            return False
+        if self.config.gpu_device.startswith("cpu"):
+            return gpu_utils.torch_installed()
+        return gpu_utils.torch_available()
+
+    def _continuous_expected_counts_torch(
+        self, pose_idx: int, orient_idx: int, live_time_s: float
+    ) -> "torch.Tensor":
+        """Compute Λ_{k,h}^{(n)} using torch for a single orientation index."""
+        if self.kernel is None:
+            from pf import gpu_utils
+
+            device = gpu_utils.resolve_device(self.config.gpu_device)
+            dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+            import torch
+
+            return torch.zeros(0, device=device, dtype=dtype)
+        orient_vec = self.kernel.orientations[orient_idx]
+        octant_idx = self.continuous_kernel.orient_index_from_vector(orient_vec)
+        return self._continuous_expected_counts_pair_torch(
+            pose_idx=pose_idx,
+            fe_index=octant_idx,
+            pb_index=octant_idx,
+            live_time_s=live_time_s,
+        )
+
+    def _continuous_expected_counts_pair_torch(
+        self, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float
+    ) -> "torch.Tensor":
+        """Compute Λ_{k,h}^{(n)} using torch for Fe/Pb orientation indices."""
+        from pf import gpu_utils
+        import torch
+
+        device = gpu_utils.resolve_device(self.config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+        if not self.continuous_particles or self.kernel is None:
+            return torch.zeros(0, device=device, dtype=dtype)
+        states = [p.state for p in self.continuous_particles]
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
+        mu_fe, mu_pb = self.continuous_kernel._mu_values(isotope=self.isotope)
+        shield_params = self.continuous_kernel.shield_params
+        detector_pos = np.asarray(self.kernel.poses[pose_idx], dtype=float)
+        return gpu_utils.expected_counts_pair_torch(
+            detector_pos=detector_pos,
+            positions=positions,
+            strengths=strengths,
+            backgrounds=backgrounds,
+            mask=mask,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            mu_fe=mu_fe,
+            mu_pb=mu_pb,
+            thickness_fe_cm=shield_params.thickness_fe_cm,
+            thickness_pb_cm=shield_params.thickness_pb_cm,
+            live_time_s=live_time_s,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _update_continuous_weights_gpu(self, lam_t: "torch.Tensor", z_obs: float) -> None:
+        """Update continuous log-weights using torch on the configured device."""
+        if lam_t.numel() == 0:
+            return
+        import torch
+
+        logw = torch.as_tensor(
+            [p.log_weight for p in self.continuous_particles],
+            device=lam_t.device,
+            dtype=lam_t.dtype,
+        )
+        logw = logw + z_obs * torch.log(lam_t + 1e-12) - lam_t
+        logw = logw - torch.max(logw)
+        w = torch.exp(logw)
+        w = w / torch.sum(w)
+        w_cpu = w.detach().cpu().numpy()
+        for p, wi in zip(self.continuous_particles, w_cpu):
+            p.log_weight = float(np.log(wi + 1e-20))
+
+    def _continuous_expected_counts_gpu(
+        self, pose_idx: int, orient_idx: int, live_time_s: float
+    ) -> NDArray[np.float64]:
+        """Compute Λ_{k,h}^{(n)} using torch for a single orientation index."""
+        lam_t = self._continuous_expected_counts_torch(
+            pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+        )
+        return lam_t.detach().cpu().numpy()
+
+    def _continuous_expected_counts_pair_gpu(
+        self, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float
+    ) -> NDArray[np.float64]:
+        """Compute Λ_{k,h}^{(n)} using torch for Fe/Pb orientation indices."""
+        lam_t = self._continuous_expected_counts_pair_torch(
+            pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s
+        )
+        return lam_t.detach().cpu().numpy()
+
     def _continuous_expected_counts(self, pose_idx: int, orient_idx: int, live_time_s: float) -> NDArray[np.float64]:
         """Compute Λ_{k,h}^{(n)} for each continuous particle using ContinuousKernel."""
+        if self._gpu_enabled():
+            return self._continuous_expected_counts_gpu(
+                pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+            )
         lam = np.zeros(len(self.continuous_particles), dtype=float)
         detector_pos = self.kernel.poses[pose_idx]
         orient_vec = self.kernel.orientations[orient_idx]
@@ -127,6 +237,10 @@ class IsotopeParticleFilter:
         self, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float
     ) -> NDArray[np.float64]:
         """Compute Λ_{k,h}^{(n)} using Fe/Pb octant indices (Eq. 3.41)."""
+        if self._gpu_enabled():
+            return self._continuous_expected_counts_pair_gpu(
+                pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s
+            )
         lam = np.zeros(len(self.continuous_particles), dtype=float)
         detector_pos = self.kernel.poses[pose_idx]
         for i, p in enumerate(self.continuous_particles):
@@ -143,6 +257,77 @@ class IsotopeParticleFilter:
             )
         return lam
 
+    def _continuous_expected_counts_pair_at_pose_torch(
+        self,
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+    ) -> "torch.Tensor":
+        """Compute Λ_{k,h}^{(n)} using torch for explicit detector position."""
+        from pf import gpu_utils
+        import torch
+
+        device = gpu_utils.resolve_device(self.config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+        if not self.continuous_particles:
+            return torch.zeros(0, device=device, dtype=dtype)
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
+            [p.state for p in self.continuous_particles],
+            device=device,
+            dtype=dtype,
+        )
+        mu_fe, mu_pb = self.continuous_kernel._mu_values(isotope=self.isotope)
+        shield_params = self.continuous_kernel.shield_params
+        det_pos = np.asarray(detector_pos, dtype=float)
+        return gpu_utils.expected_counts_pair_torch(
+            detector_pos=det_pos,
+            positions=positions,
+            strengths=strengths,
+            backgrounds=backgrounds,
+            mask=mask,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            mu_fe=mu_fe,
+            mu_pb=mu_pb,
+            thickness_fe_cm=shield_params.thickness_fe_cm,
+            thickness_pb_cm=shield_params.thickness_pb_cm,
+            live_time_s=live_time_s,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _continuous_expected_counts_pair_at_pose(
+        self,
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+    ) -> NDArray[np.float64]:
+        """Compute Λ_{k,h}^{(n)} for explicit detector position."""
+        if self._gpu_enabled():
+            lam_t = self._continuous_expected_counts_pair_at_pose_torch(
+                detector_pos=detector_pos,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+            )
+            return lam_t.detach().cpu().numpy()
+        lam = np.zeros(len(self.continuous_particles), dtype=float)
+        for i, p in enumerate(self.continuous_particles):
+            st = p.state
+            lam[i] = self.continuous_kernel.expected_counts_pair(
+                isotope=self.isotope,
+                detector_pos=np.asarray(detector_pos, dtype=float),
+                sources=st.positions,
+                strengths=st.strengths,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                background=st.background,
+            )
+        return lam
+
     def update_continuous(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
         """
         Poisson log-weight update for continuous particles (Sec. 3.3.3).
@@ -150,6 +335,13 @@ class IsotopeParticleFilter:
         z_obs should come from spectrum unfolding (Chapter 2.5.7). Expected Λ is
         computed via continuous kernel; no shortcut counts are used.
         """
+        if self._gpu_enabled():
+            lam_t = self._continuous_expected_counts_torch(
+                pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+            )
+            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
+            self._maybe_resample_continuous()
+            return
         lam = self._continuous_expected_counts(pose_idx, orient_idx, live_time_s)
         log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
         log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
@@ -166,8 +358,56 @@ class IsotopeParticleFilter:
 
         z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
         """
+        if self._gpu_enabled():
+            lam_t = self._continuous_expected_counts_pair_torch(
+                pose_idx=pose_idx,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+            )
+            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
+            self._maybe_resample_continuous()
+            return
         lam = self._continuous_expected_counts_pair(
             pose_idx=pose_idx,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+        )
+        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
+        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
+        log_unnorm -= np.max(log_unnorm)
+        w = np.exp(log_unnorm)
+        w /= np.sum(w)
+        for p, wi in zip(self.continuous_particles, w):
+            p.log_weight = float(np.log(wi + 1e-20))
+        self._maybe_resample_continuous()
+
+    def update_continuous_pair_at_pose(
+        self,
+        z_obs: float,
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+    ) -> None:
+        """
+        Poisson log-weight update using explicit detector position.
+
+        This avoids reliance on pose indices for planning-time evaluations.
+        """
+        if self._gpu_enabled():
+            lam_t = self._continuous_expected_counts_pair_at_pose_torch(
+                detector_pos=detector_pos,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+            )
+            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
+            self._maybe_resample_continuous()
+            return
+        lam = self._continuous_expected_counts_pair_at_pose(
+            detector_pos=detector_pos,
             fe_index=fe_index,
             pb_index=pb_index,
             live_time_s=live_time_s,
@@ -277,6 +517,7 @@ class IsotopeParticleFilter:
         """
         lo = np.array(self.config.position_min, dtype=float)
         hi = np.array(self.config.position_max, dtype=float)
+        max_sources = self.config.max_sources
         for p in self.continuous_particles:
             st = p.state
             if st.positions.size:
@@ -293,6 +534,8 @@ class IsotopeParticleFilter:
                 st.num_sources = st.positions.shape[0]
             # birth
             if np.random.rand() < p_birth:
+                if max_sources is not None and st.num_sources >= max_sources:
+                    continue
                 new_pos = lo + np.random.rand(3) * (hi - lo)
                 new_strength = float(np.abs(np.random.normal(loc=0.1, scale=0.05)))
                 st.positions = np.vstack([st.positions, new_pos])

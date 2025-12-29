@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from measurement.shielding import (
+    HVL_TVL_TABLE_MM,
     OCTANT_NORMALS,
     OctantShield,
     generate_octant_orientations,
@@ -13,6 +14,8 @@ from measurement.shielding import (
     cartesian_to_spherical,
     iron_shield,
     lead_shield,
+    mu_by_isotope_from_tvl_mm,
+    mu_from_tvl_mm,
     shield_blocks_radiation,
 )
 from measurement.kernels import KernelPrecomputer, ShieldParams
@@ -131,3 +134,29 @@ def test_rotation_changes_counts_by_exponential_when_blocked() -> None:
         -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
     )
     assert blocked == pytest.approx(expected_ratio * unblocked, rel=1e-6)
+
+
+def test_tvl_table_mu_and_attenuation_factors() -> None:
+    """TVL-derived mu values should reproduce attenuation at Cs-137 TVL thickness."""
+    mu_by_isotope = mu_by_isotope_from_tvl_mm(
+        HVL_TVL_TABLE_MM, isotopes=["Cs-137", "Co-60", "Eu-154"]
+    )
+    cs_pb_tvl = HVL_TVL_TABLE_MM["Cs-137"]["pb"]["tvl"]
+    cs_fe_tvl = HVL_TVL_TABLE_MM["Cs-137"]["fe"]["tvl"]
+    co_pb_tvl = HVL_TVL_TABLE_MM["Co-60"]["pb"]["tvl"]
+    co_fe_tvl = HVL_TVL_TABLE_MM["Co-60"]["fe"]["tvl"]
+    eu_pb_tvl = HVL_TVL_TABLE_MM["Eu-154"]["pb"]["tvl"]
+    eu_fe_tvl = HVL_TVL_TABLE_MM["Eu-154"]["fe"]["tvl"]
+
+    assert mu_by_isotope["Cs-137"]["pb"] == pytest.approx(mu_from_tvl_mm(cs_pb_tvl))
+    assert mu_by_isotope["Cs-137"]["fe"] == pytest.approx(mu_from_tvl_mm(cs_fe_tvl))
+
+    co_pb_factor = np.exp(-mu_by_isotope["Co-60"]["pb"] * (cs_pb_tvl / 10.0))
+    eu_pb_factor = np.exp(-mu_by_isotope["Eu-154"]["pb"] * (cs_pb_tvl / 10.0))
+    co_fe_factor = np.exp(-mu_by_isotope["Co-60"]["fe"] * (cs_fe_tvl / 10.0))
+    eu_fe_factor = np.exp(-mu_by_isotope["Eu-154"]["fe"] * (cs_fe_tvl / 10.0))
+
+    assert co_pb_factor == pytest.approx(10 ** (-(cs_pb_tvl / co_pb_tvl)))
+    assert eu_pb_factor == pytest.approx(10 ** (-(cs_pb_tvl / eu_pb_tvl)))
+    assert co_fe_factor == pytest.approx(10 ** (-(cs_fe_tvl / co_fe_tvl)))
+    assert eu_fe_factor == pytest.approx(10 ** (-(cs_fe_tvl / eu_fe_tvl)))

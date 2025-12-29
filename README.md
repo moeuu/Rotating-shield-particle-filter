@@ -22,6 +22,17 @@ To run tests:
 uv run pytest
 ```
 
+## GPU acceleration (optional)
+
+To enable CUDA acceleration for EIG, rotation rollouts, and PF updates, install torch:
+
+```
+uv add torch
+```
+
+The demo automatically enables GPU when CUDA is available. Set `use_gpu=False` in
+`RotatingShieldPFConfig` to force CPU mode.
+
 ## Real-time visualization
 
 To run the real-time particle filter visualization demo:

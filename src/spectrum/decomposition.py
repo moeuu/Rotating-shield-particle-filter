@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -19,29 +19,44 @@ class Peak:
     area: float
 
 
-def reference_line(nuclide: Nuclide) -> float:
+def reference_line(nuclide: Nuclide, efficiency_fn: Callable[[float], float] | None = None) -> float:
     """Return the most intense line energy as the reference line."""
     if not nuclide.lines:
         raise ValueError("Nuclide has no line information.")
-    return max(nuclide.lines, key=lambda l: l.intensity).energy_keV
+    if efficiency_fn is None:
+        return max(nuclide.lines, key=lambda l: l.intensity).energy_keV
+    return max(nuclide.lines, key=lambda l: l.intensity * float(efficiency_fn(l.energy_keV))).energy_keV
 
 
-def intensity_ratios(nuclide: Nuclide) -> Dict[float, float]:
+def intensity_ratios(
+    nuclide: Nuclide, efficiency_fn: Callable[[float], float] | None = None
+) -> Dict[float, float]:
     """
     Compute line intensity ratios relative to the reference line.
 
     Returns:
         {line_energy_keV: ratio}
     """
-    ref_energy = reference_line(nuclide)
-    ref_intensity = max(l.intensity for l in nuclide.lines)
+    ref_energy = reference_line(nuclide, efficiency_fn=efficiency_fn)
+    if efficiency_fn is None:
+        ref_intensity = max(l.intensity for l in nuclide.lines)
+    else:
+        ref_intensity = max(l.intensity * float(efficiency_fn(l.energy_keV)) for l in nuclide.lines)
     ratios: Dict[float, float] = {}
     for line in nuclide.lines:
-        ratios[line.energy_keV] = line.intensity / ref_intensity if ref_intensity > 0 else 0.0
+        weight = line.intensity
+        if efficiency_fn is not None:
+            weight *= float(efficiency_fn(line.energy_keV))
+        ratios[line.energy_keV] = weight / ref_intensity if ref_intensity > 0 else 0.0
     return ratios
 
 
-def match_peaks_to_library(peaks: Iterable[Peak], library: Dict[str, Nuclide], tolerance_keV: float = 5.0) -> Dict[str, Peak]:
+def match_peaks_to_library(
+    peaks: Iterable[Peak],
+    library: Dict[str, Nuclide],
+    tolerance_keV: float = 5.0,
+    efficiency_fn: Callable[[float], float] | None = None,
+) -> Dict[str, Peak]:
     """
     Match detected peaks to library reference lines.
 
@@ -55,7 +70,7 @@ def match_peaks_to_library(peaks: Iterable[Peak], library: Dict[str, Nuclide], t
     """
     matches: Dict[str, Peak] = {}
     for iso, nuclide in library.items():
-        ref_energy = reference_line(nuclide)
+        ref_energy = reference_line(nuclide, efficiency_fn=efficiency_fn)
         closest: Peak | None = None
         min_diff = tolerance_keV
         for pk in peaks:
@@ -72,6 +87,7 @@ def strip_overlaps(
     peaks: Iterable[Peak],
     library: Dict[str, Nuclide],
     tolerance_keV: float = 5.0,
+    efficiency_fn: Callable[[float], float] | None = None,
 ) -> Tuple[Dict[str, float], List[Peak]]:
     """
     Strip overlapping peaks using library ratios and estimate reference areas.
@@ -85,15 +101,17 @@ def strip_overlaps(
         (reference area per isotope, stripped peaks)
     """
     peak_list = list(peaks)
-    matches = match_peaks_to_library(peak_list, library, tolerance_keV=tolerance_keV)
+    matches = match_peaks_to_library(
+        peak_list, library, tolerance_keV=tolerance_keV, efficiency_fn=efficiency_fn
+    )
     stripped_peaks: List[Peak] = peak_list.copy()
     ref_areas: Dict[str, float] = {}
 
     for iso, ref_peak in matches.items():
         ref_areas[iso] = ref_peak.area
-        ratios = intensity_ratios(library[iso])
+        ratios = intensity_ratios(library[iso], efficiency_fn=efficiency_fn)
         for energy, ratio in ratios.items():
-            if energy == reference_line(library[iso]):
+            if energy == reference_line(library[iso], efficiency_fn=efficiency_fn):
                 continue
             # Find the target peak and subtract expected contribution.
             target = _find_peak(stripped_peaks, energy, tolerance_keV)

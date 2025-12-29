@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -174,11 +174,270 @@ class SpectralDecomposer:
 
     def decompose(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """Decompose a spectrum by NNLS and return isotope-wise activities."""
-        return estimate_activities(self.response_matrix, spectrum, self.isotope_names)
+        return self.decompose_subset(spectrum, isotopes=None)
+
+    def decompose_subset(
+        self,
+        spectrum: NDArray[np.float64],
+        isotopes: Sequence[str] | None = None,
+    ) -> Dict[str, float]:
+        """
+        Decompose a spectrum by NNLS for a subset of isotopes.
+
+        Args:
+            spectrum: Observed spectrum.
+            isotopes: Optional subset of isotopes to fit; None fits all.
+        """
+        if isotopes is None:
+            return estimate_activities(self.response_matrix, spectrum, self.isotope_names)
+        indices = [self.isotope_names.index(iso) for iso in isotopes if iso in self.isotope_names]
+        if not indices:
+            return {iso: 0.0 for iso in isotopes}
+        design = self.response_matrix[:, indices]
+        iso_names = [self.isotope_names[i] for i in indices]
+        return estimate_activities(design, spectrum, iso_names)
 
     def isotope_counts(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """Return isotope-wise counts suitable for PF updates."""
-        return self.decompose(spectrum)
+        counts, _ = self.isotope_counts_with_detection(spectrum)
+        return counts
+
+    def isotope_counts_with_detection(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        detect_isotopes: bool = True,
+        detect_threshold_abs: float = 0.1,
+        detect_threshold_rel: float = 0.2,
+        peak_prominence: float = 0.05,
+        peak_distance: int = 5,
+        peak_tolerance_keV: float = 10.0,
+        min_peaks_multi: int = 2,
+    ) -> Tuple[Dict[str, float], set[str]]:
+        """
+        Return isotope-wise counts plus detected isotopes.
+
+        Detection uses peak matching and minimum peak counts before fitting NNLS
+        on the subset of candidate isotopes.
+        """
+        if not detect_isotopes:
+            return self.decompose(spectrum), set(self.isotope_names)
+        detected, _ = self.detect_isotopes(
+            spectrum,
+            detect_threshold_abs=detect_threshold_abs,
+            detect_threshold_rel=detect_threshold_rel,
+            peak_prominence=peak_prominence,
+            peak_distance=peak_distance,
+            peak_tolerance_keV=peak_tolerance_keV,
+            min_peaks_multi=min_peaks_multi,
+        )
+        counts_partial = self.decompose_subset(spectrum, isotopes=sorted(detected)) if detected else {}
+        counts_full = {iso: float(counts_partial.get(iso, 0.0)) for iso in self.isotope_names}
+        if detected:
+            peak_counts = self.peak_window_counts(
+                spectrum,
+                isotopes=sorted(detected),
+                window_keV=None,
+                window_sigma=3.0,
+                apply_stripping=True,
+                peak_tolerance_keV=peak_tolerance_keV,
+                peak_prominence=peak_prominence,
+                peak_distance=peak_distance,
+            )
+            for iso in detected:
+                counts_full[iso] = max(counts_full.get(iso, 0.0), peak_counts.get(iso, 0.0))
+        return counts_full, detected
+
+    def detect_isotopes(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        detect_threshold_abs: float = 0.1,
+        detect_threshold_rel: float = 0.2,
+        peak_prominence: float = 0.05,
+        peak_distance: int = 5,
+        peak_tolerance_keV: float = 10.0,
+        min_peaks_multi: int = 2,
+    ) -> Tuple[set[str], Dict[str, list[int]]]:
+        """
+        Detect isotopes using peak assignments and area thresholds.
+
+        Returns:
+            (detected_isotopes, peaks_by_iso)
+        """
+        corrected = self.preprocess(spectrum)
+        work = corrected
+        if float(np.max(work)) <= 0.0:
+            work = gaussian_smooth(np.asarray(spectrum, dtype=float), sigma_bins=2.0)
+        peak_indices = detect_peaks(work, prominence=peak_prominence, distance=peak_distance)
+        peaks_by_iso, _ = self._assign_peak_indices(
+            self.energy_axis,
+            peak_indices,
+            self.library,
+            tolerance_keV=peak_tolerance_keV,
+        )
+        min_peaks = self._min_peak_count_by_isotope(self.library, min_peaks_multi=min_peaks_multi)
+        line_counts = self.peak_line_counts(
+            spectrum,
+            isotopes=list(self.isotope_names),
+            window_keV=None,
+            window_sigma=3.0,
+            smooth_sigma_bins=2.0,
+            subtract_baseline=True,
+            apply_stripping=False,
+            peak_tolerance_keV=peak_tolerance_keV,
+        )
+        detected: set[str] = set()
+        max_line_overall = 0.0
+        best_iso: str | None = None
+        for iso, counts in line_counts.items():
+            if not counts:
+                continue
+            max_line = float(max(counts))
+            if max_line > max_line_overall:
+                max_line_overall = max_line
+                best_iso = iso
+            if max_line <= 0.0:
+                continue
+            threshold = max(detect_threshold_abs, detect_threshold_rel * max_line)
+            num_above = sum(val >= threshold for val in counts)
+            min_required = min_peaks.get(iso, 1)
+            if num_above >= min_required:
+                detected.add(iso)
+                continue
+            if min_required > 1 and num_above >= 1:
+                other_peak_ok = any(val >= detect_threshold_abs for val in counts if val < threshold)
+                if other_peak_ok:
+                    detected.add(iso)
+        if not detected and best_iso is not None and max_line_overall > 0.0:
+            detected = {best_iso}
+        return detected, peaks_by_iso
+
+    def peak_line_counts(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        isotopes: Sequence[str] | None = None,
+        window_keV: float | None = 5.0,
+        window_sigma: float = 3.0,
+        smooth_sigma_bins: float = 2.0,
+        subtract_baseline: bool = True,
+        apply_stripping: bool = True,
+        peak_tolerance_keV: float = 10.0,
+    ) -> Dict[str, list[float]]:
+        """
+        Compute per-line peak areas for each isotope using energy windows.
+
+        This follows Eq. (20) style window integration and can optionally apply
+        spectral stripping to separate overlapping peaks. If window_keV is None,
+        use ±window_sigma * sigma(E) based on the detector resolution model.
+        """
+        corrected = np.asarray(spectrum, dtype=float)
+        if smooth_sigma_bins > 0.0:
+            corrected = gaussian_smooth(corrected, sigma_bins=smooth_sigma_bins)
+        if subtract_baseline:
+            base = asymmetric_least_squares(
+                corrected,
+                lam=BASELINE_LAM,
+                p=BASELINE_P,
+                niter=BASELINE_NITER,
+            )
+            corrected = np.clip(corrected - base, a_min=0.0, a_max=None)
+        energy_axis = self.energy_axis
+        iso_names = list(isotopes) if isotopes is not None else list(self.isotope_names)
+        library_subset = {iso: self.library[iso] for iso in iso_names if iso in self.library}
+        peaks: list[Peak] = []
+        for iso, nuclide in library_subset.items():
+            for line in nuclide.lines:
+                half_width = window_keV
+                if half_width is None:
+                    sigma = float(self.resolution_fn(line.energy_keV))
+                    half_width = max(window_sigma * sigma, 1e-6)
+                mask = np.abs(energy_axis - line.energy_keV) <= float(half_width)
+                if not np.any(mask):
+                    continue
+                peaks.append(Peak(energy_keV=float(line.energy_keV), area=float(np.sum(corrected[mask]))))
+        if apply_stripping and peaks:
+            _, stripped_peaks = strip_overlaps(
+                peaks,
+                library_subset,
+                tolerance_keV=peak_tolerance_keV,
+                efficiency_fn=self.efficiency_fn,
+            )
+        else:
+            stripped_peaks = peaks
+
+        def _closest_peak(energy: float) -> Peak | None:
+            best: Peak | None = None
+            min_diff = peak_tolerance_keV
+            for pk in stripped_peaks:
+                diff = abs(pk.energy_keV - energy)
+                if diff <= min_diff:
+                    min_diff = diff
+                    best = pk
+            return best
+
+        line_counts: Dict[str, list[float]] = {}
+        for iso, nuclide in library_subset.items():
+            counts: list[float] = []
+            for line in nuclide.lines:
+                match = _closest_peak(float(line.energy_keV))
+                counts.append(float(match.area) if match is not None else 0.0)
+            line_counts[iso] = counts
+        return line_counts
+
+    def peak_window_counts(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        isotopes: Sequence[str] | None = None,
+        window_keV: float | None = 5.0,
+        window_sigma: float = 3.0,
+        smooth_sigma_bins: float = 2.0,
+        subtract_baseline: bool = True,
+        apply_stripping: bool = True,
+        peak_tolerance_keV: float = 10.0,
+        peak_prominence: float = 0.05,
+        peak_distance: int = 5,
+    ) -> Dict[str, float]:
+        """
+        Compute isotope-wise counts by integrating windows around line energies.
+
+        Uses preprocessing to stabilize low-count spectra and weights line windows
+        by their relative intensities within each nuclide. When apply_stripping is
+        enabled, peak areas are first corrected using spectral stripping.
+        """
+        iso_names = list(isotopes) if isotopes is not None else list(self.isotope_names)
+        library_subset = {iso: self.library[iso] for iso in iso_names if iso in self.library}
+        total_intensity = {
+            name: sum(line.intensity for line in nuclide.lines) for name, nuclide in library_subset.items()
+        }
+        line_counts = self.peak_line_counts(
+            spectrum,
+            isotopes=iso_names,
+            window_keV=window_keV,
+            window_sigma=window_sigma,
+            smooth_sigma_bins=smooth_sigma_bins,
+            subtract_baseline=subtract_baseline,
+            apply_stripping=apply_stripping,
+            peak_tolerance_keV=peak_tolerance_keV,
+        )
+        counts: Dict[str, float] = {}
+        for iso in iso_names:
+            nuclide = library_subset.get(iso)
+            if nuclide is None:
+                continue
+            total_int = total_intensity.get(iso, 0.0)
+            if total_int <= 0.0:
+                counts[iso] = 0.0
+                continue
+            z_val = 0.0
+            per_line = line_counts.get(iso, [])
+            for line, line_val in zip(nuclide.lines, per_line):
+                weight = line.intensity / total_int
+                z_val += weight * float(line_val)
+            counts[iso] = float(z_val)
+        return counts
 
     @staticmethod
     def debug_baseline(
@@ -222,3 +481,46 @@ class SpectralDecomposer:
             peaks.append(Peak(energy_keV=float(energy), area=float(area)))
         ref_areas, _ = strip_overlaps(peaks, self.library, tolerance_keV=tolerance_keV)
         return ref_areas
+
+    @staticmethod
+    def _assign_peak_indices(
+        energy_axis: NDArray[np.float64],
+        peak_indices: NDArray[np.int64],
+        library: Dict[str, Nuclide],
+        tolerance_keV: float,
+    ) -> Tuple[Dict[str, list[int]], list[int]]:
+        """Assign detected peak indices to isotopes based on closest library lines."""
+        peaks_by_iso: Dict[str, list[int]] = {iso: [] for iso in library}
+        unassigned: list[int] = []
+        line_energies = {
+            iso: np.array([line.energy_keV for line in nuclide.lines], dtype=float)
+            for iso, nuclide in library.items()
+        }
+        for idx in peak_indices:
+            energy = float(energy_axis[int(idx)])
+            best_iso = None
+            best_diff = float("inf")
+            for iso, energies in line_energies.items():
+                if energies.size == 0:
+                    continue
+                diff = float(np.min(np.abs(energies - energy)))
+                if diff < best_diff:
+                    best_diff = diff
+                    best_iso = iso
+            if best_iso is not None and best_diff <= tolerance_keV:
+                peaks_by_iso[best_iso].append(int(idx))
+            else:
+                unassigned.append(int(idx))
+        return peaks_by_iso, unassigned
+
+    @staticmethod
+    def _min_peak_count_by_isotope(
+        library: Dict[str, Nuclide],
+        min_peaks_multi: int = 2,
+    ) -> Dict[str, int]:
+        """Return minimum peak counts required to accept each isotope."""
+        min_counts: Dict[str, int] = {}
+        for iso, nuclide in library.items():
+            line_count = len(nuclide.lines)
+            min_counts[iso] = 1 if line_count <= 1 else max(int(min_peaks_multi), 1)
+        return min_counts

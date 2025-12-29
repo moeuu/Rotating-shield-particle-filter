@@ -34,6 +34,9 @@ class RotatingShieldPFConfig:
         - orientation_selection_mode: "eig", "fisher", or "hybrid"
         - planning_particles: particle count used for orientation scoring (None = all)
         - planning_method: how to select planning particles (top_weight/resample)
+        - use_gpu: enable torch acceleration for continuous kernel evaluation
+        - gpu_device: torch device string (e.g., "cuda" or "cpu")
+        - gpu_dtype: torch dtype string ("float32" or "float64")
         - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
         - fisher_screening_metric: "ja" or "jd" for Fisher screening
         - fisher_screening_k: number of top candidates kept after Fisher screening
@@ -62,6 +65,9 @@ class RotatingShieldPFConfig:
     orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
     planning_method: str = "top_weight"
+    use_gpu: bool = False
+    gpu_device: str = "cuda"
+    gpu_dtype: str = "float32"
     eig_num_samples: int = 50
     fisher_screening_metric: str = "ja"
     fisher_screening_k: int = 12
@@ -136,7 +142,20 @@ class RotatingShieldPFEstimator:
             shield_params=self.shield_params,
             mu_by_isotope=self.mu_by_isotope,
         )
-        pf_conf = PFConfig(
+        pf_conf = self._build_pf_config()
+        if self.filters:
+            for iso in self.isotopes:
+                if iso in self.filters:
+                    self.filters[iso].set_kernel(self.kernel_cache)
+                else:
+                    self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+        else:
+            for iso in self.isotopes:
+                self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+
+    def _build_pf_config(self) -> PFConfig:
+        """Build a per-isotope PFConfig from the estimator configuration."""
+        return PFConfig(
             num_particles=self.pf_config.num_particles,
             max_sources=self.pf_config.max_sources,
             resample_threshold=self.pf_config.resample_threshold,
@@ -147,9 +166,81 @@ class RotatingShieldPFEstimator:
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
             use_discrete=False,
+            use_gpu=self.pf_config.use_gpu,
+            gpu_device=self.pf_config.gpu_device,
+            gpu_dtype=self.pf_config.gpu_dtype,
         )
-        for iso in self.isotopes:
-            self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+
+    def _gpu_enabled(self) -> bool:
+        """Return True if GPU computation is enabled and available."""
+        if not self.pf_config.use_gpu:
+            return False
+        try:
+            from pf import gpu_utils
+        except ImportError:
+            return False
+        if self.pf_config.gpu_device.startswith("cpu"):
+            return gpu_utils.torch_installed()
+        return gpu_utils.torch_available()
+
+    def expected_counts_pair_for_states(
+        self,
+        isotope: str,
+        pose_idx: int,
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+        states: Sequence[IsotopeState],
+    ) -> NDArray[np.float64]:
+        """
+        Compute Λ_{k,h}^{(n)} for an isotope over a list of states at a pose.
+
+        Uses torch acceleration when enabled; otherwise falls back to CPU kernels.
+        """
+        if not states:
+            return np.zeros(0, dtype=float)
+        if pose_idx < 0 or pose_idx >= len(self.poses):
+            raise IndexError("pose_idx out of range")
+        kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
+        detector_pos = np.asarray(self.poses[pose_idx], dtype=float)
+        if self._gpu_enabled():
+            from pf import gpu_utils
+
+            device = gpu_utils.resolve_device(self.pf_config.gpu_device)
+            dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
+            positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
+            mu_fe, mu_pb = kernel._mu_values(isotope=isotope)
+            shield_params = kernel.shield_params
+            lam_t = gpu_utils.expected_counts_pair_torch(
+                detector_pos=detector_pos,
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                mu_fe=mu_fe,
+                mu_pb=mu_pb,
+                thickness_fe_cm=shield_params.thickness_fe_cm,
+                thickness_pb_cm=shield_params.thickness_pb_cm,
+                live_time_s=live_time_s,
+                device=device,
+                dtype=dtype,
+            )
+            return lam_t.detach().cpu().numpy()
+        lam = np.zeros(len(states), dtype=float)
+        for i, st in enumerate(states):
+            lam[i] = kernel.expected_counts_pair(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources=st.positions,
+                strengths=st.strengths,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                background=st.background,
+            )
+        return lam
 
     def planning_particles(
         self,
@@ -228,12 +319,48 @@ class RotatingShieldPFEstimator:
             return 0.0
         return float(np.mean(entropies))
 
-    def add_measurement_pose(self, pose: NDArray[np.float64]) -> None:
-        """Register a new measurement pose (kernel built lazily on demand)."""
+    def add_measurement_pose(self, pose: NDArray[np.float64], reset_filters: bool = True) -> None:
+        """Register a new measurement pose and invalidate the kernel cache."""
         self.poses.append(np.asarray(pose, dtype=float))
         # Rebuild lazily on the next access.
         self.kernel_cache = None
-        self.filters = {}
+        if reset_filters:
+            self.filters = {}
+
+    def restrict_isotopes(self, active_isotopes: Sequence[str]) -> None:
+        """
+        Restrict estimator state to the specified isotopes.
+
+        This drops filters and cached estimates for isotopes that are not in
+        active_isotopes while preserving the original isotope ordering.
+        """
+        active_set = set(active_isotopes)
+        if not active_set:
+            raise ValueError("active_isotopes must contain at least one isotope.")
+        self.isotopes = [iso for iso in self.isotopes if iso in active_set]
+        if self.filters:
+            self.filters = {iso: filt for iso, filt in self.filters.items() if iso in active_set}
+        if self.history_estimates:
+            self.history_estimates = [
+                {iso: val for iso, val in est.items() if iso in active_set} for est in self.history_estimates
+            ]
+
+    def add_isotopes(self, new_isotopes: Sequence[str]) -> None:
+        """
+        Add isotopes to the estimator and initialize their PF filters.
+
+        This is useful when new isotopes are detected after an initial restriction.
+        """
+        to_add = [iso for iso in new_isotopes if iso not in self.isotopes]
+        if not to_add:
+            return
+        self.isotopes.extend(to_add)
+        if self.kernel_cache is None:
+            return
+        pf_conf = self._build_pf_config()
+        for iso in to_add:
+            if iso not in self.filters:
+                self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
 
     def update(
         self,
@@ -419,6 +546,7 @@ class RotatingShieldPFEstimator:
         alpha_by_isotope: Dict[str, float] | None = None,
         particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None = None,
         rng: np.random.Generator | None = None,
+        detector_pos: NDArray[np.float64] | None = None,
     ) -> float:
         """
         Monte-Carlo approximation of EIG (Eq. 3.44) for a Fe/Pb orientation pair.
@@ -426,24 +554,82 @@ class RotatingShieldPFEstimator:
         - Uses continuous particles and ContinuousKernel expected counts (Eq. 3.41).
         - For each isotope h: IG_h = H(w_h) - E_z[H(w'_h(z; RFe, RPb))].
         - Global IG = Σ_h α_h IG_h, with α_h uniform if not provided.
+        - If detector_pos is provided, pose_idx is ignored.
         """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
+        if detector_pos is None:
+            if self.kernel_cache is None:
+                self._ensure_kernel_cache()
+            detector_pos = self.kernel_cache.poses[pose_idx]
+        detector_pos = np.asarray(detector_pos, dtype=float)
         rng = rng or np.random.default_rng()
         num_samples = self.pf_config.eig_num_samples if num_samples is None else num_samples
         eps = 1e-12
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
         kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
-        detector_pos = self.kernel_cache.poses[pose_idx]
         alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
         # normalize alphas
         alpha_sum = sum(alphas.values()) or 1.0
         alphas = {k: v / alpha_sum for k, v in alphas.items()}
+        use_gpu = self._gpu_enabled()
+        gpu_utils = None
+        device = None
+        dtype = None
+        torch = None
+        if use_gpu:
+            from pf import gpu_utils as gpu_mod
+            import torch as torch_mod
+
+            gpu_utils = gpu_mod
+            device = gpu_utils.resolve_device(self.pf_config.gpu_device)
+            dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
+            torch = torch_mod
 
         def _logsumexp(x: NDArray[np.float64]) -> float:
             m = float(np.max(x))
             return m + float(np.log(np.sum(np.exp(x - m))))
+
+        def _compute_lam(states: Sequence[IsotopeState], isotope: str) -> NDArray[np.float64]:
+            if not states:
+                return np.zeros(0, dtype=float)
+            if gpu_utils is None:
+                lam_cpu = np.zeros(len(states), dtype=float)
+                for i, st in enumerate(states):
+                    lam_cpu[i] = kernel.expected_counts_pair(
+                        isotope=isotope,
+                        detector_pos=detector_pos,
+                        sources=st.positions,
+                        strengths=st.strengths,
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                        live_time_s=live_time_s,
+                        background=st.background,
+                )
+                return lam_cpu
+            return _compute_lam_torch(states, isotope).detach().cpu().numpy()
+
+        def _compute_lam_torch(states: Sequence[IsotopeState], isotope: str) -> "torch.Tensor":
+            if not states:
+                return torch.zeros(0, device=device, dtype=dtype)
+            positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
+            mu_fe, mu_pb = kernel._mu_values(isotope=isotope)
+            shield_params = kernel.shield_params
+            return gpu_utils.expected_counts_pair_torch(
+                detector_pos=detector_pos,
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_index=fe_idx,
+                pb_index=pb_idx,
+                mu_fe=mu_fe,
+                mu_pb=mu_pb,
+                thickness_fe_cm=shield_params.thickness_fe_cm,
+                thickness_pb_cm=shield_params.thickness_pb_cm,
+                live_time_s=live_time_s,
+                device=device,
+                dtype=dtype,
+            )
 
         total_ig = 0.0
         for iso, filt in self.filters.items():
@@ -458,32 +644,43 @@ class RotatingShieldPFEstimator:
                 continue
             weights = np.asarray(weights, dtype=float)
             weights = weights / max(np.sum(weights), eps)
-            lam = np.zeros(len(states), dtype=float)
-            for i, st in enumerate(states):
-                lam[i] = kernel.expected_counts_pair(
-                    isotope=iso,
-                    detector_pos=detector_pos,
-                    sources=st.positions,
-                    strengths=st.strengths,
-                    fe_index=fe_idx,
-                    pb_index=pb_idx,
-                    live_time_s=live_time_s,
-                    background=st.background,
-                )
-            # Prior entropy H(w)
-            H_prior = float(-np.sum(weights * np.log(weights + eps)))
-            # Monte-Carlo expectation over z ~ mixture of Poissons
-            H_post_accum = 0.0
-            for _ in range(num_samples):
-                idx = int(rng.choice(len(lam), p=weights))
-                z = rng.poisson(lam[idx])
-                logw = np.log(weights + eps) + z * np.log(lam + eps) - lam
-                logw -= _logsumexp(logw)
-                w_post = np.exp(logw)
-                H_post_accum += float(-np.sum(w_post * logw))
-            H_post_mean = H_post_accum / max(num_samples, 1)
-            ig_h = H_prior - H_post_mean
-            total_ig += alphas.get(iso, 0.0) * ig_h
+            if use_gpu:
+                lam_t = _compute_lam_torch(states, iso)
+                weights_t = torch.as_tensor(weights, device=device, dtype=dtype)
+                weight_sum = torch.sum(weights_t)
+                if float(weight_sum) <= 0.0:
+                    weights_t = torch.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
+                else:
+                    weights_t = weights_t / weight_sum
+                H_prior = -torch.sum(weights_t * torch.log(weights_t + eps))
+                if num_samples <= 0:
+                    H_post_mean = torch.zeros((), device=device, dtype=dtype)
+                else:
+                    idx = torch.multinomial(weights_t, num_samples, replacement=True)
+                    z = torch.poisson(lam_t[idx])
+                    logw = torch.log(weights_t + eps) + z.unsqueeze(1) * torch.log(lam_t + eps) - lam_t
+                    logw = logw - torch.logsumexp(logw, dim=1, keepdim=True)
+                    w_post = torch.exp(logw)
+                    H_post = -torch.sum(w_post * torch.log(w_post + eps), dim=1)
+                    H_post_mean = torch.mean(H_post)
+                ig_h = float((H_prior - H_post_mean).item())
+                total_ig += alphas.get(iso, 0.0) * ig_h
+            else:
+                lam = _compute_lam(states, iso)
+                # Prior entropy H(w)
+                H_prior = float(-np.sum(weights * np.log(weights + eps)))
+                # Monte-Carlo expectation over z ~ mixture of Poissons
+                H_post_accum = 0.0
+                for _ in range(num_samples):
+                    idx = int(rng.choice(len(lam), p=weights))
+                    z = rng.poisson(lam[idx])
+                    logw = np.log(weights + eps) + z * np.log(lam + eps) - lam
+                    logw -= _logsumexp(logw)
+                    w_post = np.exp(logw)
+                    H_post_accum += float(-np.sum(w_post * logw))
+                H_post_mean = H_post_accum / max(num_samples, 1)
+                ig_h = H_prior - H_post_mean
+                total_ig += alphas.get(iso, 0.0) * ig_h
         return float(total_ig)
 
     def orientation_fisher_criteria(
@@ -626,32 +823,31 @@ class RotatingShieldPFEstimator:
 
     def expected_uncertainty_after_rotation(
         self,
-        pose_idx: int,
-        *,
+        pose_xyz: NDArray[np.float64],
+        live_time_per_rot_s: float,
         tau_ig: float,
-        t_max_s: float,
-        t_short_s: float,
-        num_rollouts: int = 0,
-        use_mean_measurement: bool = True,
-        rng_seed: int | None = 0,
+        tmax_s: float,
+        n_rollouts: int = 64,
+        orient_selection: str = "IG",
         return_debug: bool = False,
     ) -> float | Tuple[float, Dict[str, Any]]:
         """
-        Estimate E[U_after-rotation | pose] for the full rotating-shield procedure.
+        Estimate E[U_after-rotation | pose_xyz] by Monte Carlo rollouts.
 
-        The rotation loop follows:
-          - select the orientation with max IG (Eq. 3.48)
-          - stop if ΔIG < tau_ig (Eq. 3.49)
-          - simulate a short-time measurement and update the PF
-          - stop if accumulated time >= t_max_s (Eq. 3.50)
-
-        If num_rollouts == 0, uses a deterministic approximation that treats the
-        mixture mean Λ̄ as the observation when use_mean_measurement is True.
-        Otherwise, Monte Carlo rollouts are performed using mixture-Poisson sampling.
+        This method has no side effects on the estimator state. Rotation policy:
+        - choose the next orientation by maximizing IG
+        - stop if max IG < tau_ig
+        - stop if accumulated live time reaches tmax_s
         """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        rng = np.random.default_rng(rng_seed) if rng_seed is not None else np.random.default_rng()
+        detector_pos = np.asarray(pose_xyz, dtype=float)
+        if detector_pos.shape != (3,):
+            raise ValueError("pose_xyz must be shape (3,).")
+        if orient_selection.lower() != "ig":
+            raise ValueError("Only orient_selection='IG' is supported.")
+        n_rollouts = int(n_rollouts)
+        use_mean_measurement = n_rollouts <= 0
+        rollouts = max(1, n_rollouts)
+        rng = np.random.default_rng(np.random.randint(0, 2**32 - 1))
         from measurement.shielding import generate_octant_rotation_matrices
 
         RFe_candidates = generate_octant_rotation_matrices()
@@ -660,19 +856,23 @@ class RotatingShieldPFEstimator:
         num_pb = len(RPb_candidates)
         alphas = self.pf_config.alpha_weights
 
-        def _select_best_orientation(estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator) -> Tuple[int, int, float]:
+        def _select_best_orientation(
+            estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator
+        ) -> Tuple[int, int, float]:
+            """Return the (fe_idx, pb_idx) pair with the maximum EIG at the given pose."""
             best_ig = -np.inf
             best_fe = 0
             best_pb = 0
             for fe_idx in range(num_fe):
                 for pb_idx in range(num_pb):
                     ig_val = estimator.orientation_expected_information_gain(
-                        pose_idx=pose_idx,
+                        pose_idx=0,
                         RFe=RFe_candidates[fe_idx],
                         RPb=RPb_candidates[pb_idx],
-                        live_time_s=t_short_s,
+                        live_time_s=live_time_per_rot_s,
                         alpha_by_isotope=alphas,
                         rng=rng_local,
+                        detector_pos=detector_pos,
                     )
                     if ig_val > best_ig:
                         best_ig = ig_val
@@ -686,33 +886,37 @@ class RotatingShieldPFEstimator:
             pb_idx: int,
             rng_local: np.random.Generator,
         ) -> Dict[str, float]:
+            """Simulate isotope-wise Poisson observations at the candidate pose."""
             z_k: Dict[str, float] = {}
             for iso, filt in estimator.filters.items():
                 if not filt.continuous_particles:
                     z_k[iso] = 0.0
                     continue
-                lam = filt._continuous_expected_counts_pair(
-                    pose_idx=pose_idx,
+                lam = filt._continuous_expected_counts_pair_at_pose(
+                    detector_pos=detector_pos,
                     fe_index=fe_idx,
                     pb_index=pb_idx,
-                    live_time_s=t_short_s,
+                    live_time_s=live_time_per_rot_s,
                 )
                 if lam.size == 0:
                     z_k[iso] = 0.0
                     continue
                 weights = filt.continuous_weights
-                if num_rollouts == 0 and use_mean_measurement:
+                if use_mean_measurement:
                     z_k[iso] = float(np.sum(weights * lam))
                 else:
                     idx = int(rng_local.choice(len(lam), p=weights))
                     z_k[iso] = float(rng_local.poisson(lam[idx]))
             return z_k
 
-        def _run_once(estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator) -> Tuple[float, Dict[str, Any]]:
+        def _run_once(
+            estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator
+        ) -> Tuple[float, Dict[str, Any]]:
+            """Run a single rotation rollout and return uncertainty plus debug metadata."""
             elapsed = 0.0
             rotations = 0
             iterations: List[Dict[str, Any]] = []
-            while elapsed < t_max_s:
+            while elapsed < tmax_s:
                 fe_idx, pb_idx, ig_val = _select_best_orientation(estimator, rng_local)
                 iterations.append(
                     {
@@ -725,14 +929,17 @@ class RotatingShieldPFEstimator:
                 if ig_val < tau_ig:
                     break
                 z_k = _simulate_measurement(estimator, fe_idx, pb_idx, rng_local)
-                estimator.update_pair(
-                    z_k=z_k,
-                    pose_idx=pose_idx,
-                    fe_index=fe_idx,
-                    pb_index=pb_idx,
-                    live_time_s=t_short_s,
-                )
-                elapsed += t_short_s
+                for iso, val in z_k.items():
+                    if iso not in estimator.filters:
+                        continue
+                    estimator.filters[iso].update_continuous_pair_at_pose(
+                        z_obs=val,
+                        detector_pos=detector_pos,
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                        live_time_s=live_time_per_rot_s,
+                    )
+                elapsed += live_time_per_rot_s
                 rotations += 1
             return estimator.global_uncertainty(), {
                 "iterations": iterations,
@@ -740,22 +947,48 @@ class RotatingShieldPFEstimator:
                 "num_rotations": rotations,
             }
 
-        if num_rollouts <= 0:
-            estimator_copy = copy.deepcopy(self)
-            u_val, debug = _run_once(estimator_copy, rng)
-            return (u_val, debug) if return_debug else u_val
-
         u_vals: List[float] = []
         debug_rollouts: List[Dict[str, Any]] = []
-        for _ in range(num_rollouts):
+        for _ in range(rollouts):
             estimator_copy = copy.deepcopy(self)
             u_val, debug = _run_once(estimator_copy, rng)
             u_vals.append(u_val)
             debug_rollouts.append(debug)
         mean_u = float(np.mean(u_vals)) if u_vals else 0.0
         if return_debug:
-            return mean_u, {"rollouts": debug_rollouts, "u_vals": u_vals}
+            debug_payload = {"rollouts": debug_rollouts, "u_vals": u_vals}
+            return mean_u, debug_payload
         return mean_u
+
+    def expected_uncertainty_after_rotation_at_pose(
+        self,
+        detector_pos: NDArray[np.float64],
+        *,
+        tau_ig: float,
+        t_max_s: float,
+        t_short_s: float,
+        num_rollouts: int = 0,
+        use_mean_measurement: bool = True,
+        rng_seed: int | None = 0,
+        return_debug: bool = False,
+    ) -> float | Tuple[float, Dict[str, Any]]:
+        """
+        Backward-compatible wrapper for expected_uncertainty_after_rotation.
+        """
+        n_rollouts = int(num_rollouts)
+        if n_rollouts <= 0 and not use_mean_measurement:
+            n_rollouts = 1
+        if rng_seed is not None:
+            np.random.seed(rng_seed)
+        return self.expected_uncertainty_after_rotation(
+            pose_xyz=detector_pos,
+            live_time_per_rot_s=t_short_s,
+            tau_ig=tau_ig,
+            tmax_s=t_max_s,
+            n_rollouts=n_rollouts,
+            orient_selection="IG",
+            return_debug=return_debug,
+        )
 
     def estimate_change_norm(self) -> float:
         """
@@ -926,18 +1159,31 @@ class RotatingShieldPFEstimator:
             live_time_s=live_time_s,
         )
 
-    def prune_spurious_sources(self, tau_mix: float = 0.9, epsilon: float = 1e-6) -> Dict[str, NDArray[np.bool_]]:
+    def prune_spurious_sources(
+        self,
+        tau_mix: float = 0.9,
+        epsilon: float = 1e-6,
+        min_strength_abs: float | None = None,
+        min_strength_ratio: float | None = None,
+    ) -> Dict[str, NDArray[np.bool_]]:
         """
         Apply the best-case measurement test (Sec. 3.4.5) and zero out spurious sources.
 
         For each isotope h and each candidate source, find the measurement index k* that
         maximises the ratio \\hat{Λ}_{k,h}/(z_{k,h}+ε) (Sec. 3.4.5). If the best-case ratio
-        falls below τ_mix, the source is marked spurious and removed.
+        falls below τ_mix, the source is marked spurious and removed. Optionally drop
+        sources below max(min_strength_abs, min_strength_ratio * max_strength).
         """
         if any(filt.continuous_particles for filt in self.filters.values()):
             from pf.mixing import prune_spurious_sources_continuous
 
-            keep_masks = prune_spurious_sources_continuous(self, tau_mix=tau_mix, epsilon=epsilon)
+            keep_masks = prune_spurious_sources_continuous(
+                self,
+                tau_mix=tau_mix,
+                epsilon=epsilon,
+                min_strength_abs=min_strength_abs,
+                min_strength_ratio=min_strength_ratio,
+            )
             for iso, filt in self.filters.items():
                 if not filt.continuous_particles:
                     continue
@@ -971,8 +1217,22 @@ class RotatingShieldPFEstimator:
 
             keep_mask = np.ones_like(expected_strength, dtype=bool)
             active_indices = np.nonzero(expected_strength > 0.0)[0]
+            max_strength = float(np.max(expected_strength)) if expected_strength.size else 0.0
+            min_strength = 0.0
+            if min_strength_abs is not None:
+                min_strength = max(min_strength, float(min_strength_abs))
+            if min_strength_ratio is not None:
+                min_strength = max(min_strength, float(min_strength_ratio) * max_strength)
 
             for idx_src in active_indices:
+                if min_strength > 0.0 and expected_strength[idx_src] < min_strength:
+                    keep_mask[idx_src] = False
+                    for st in filt.states:
+                        if idx_src in st.source_indices:
+                            mask = st.source_indices != idx_src
+                            st.source_indices = st.source_indices[mask]
+                            st.strengths = st.strengths[mask]
+                    continue
                 best_ratio: float | None = None
                 for rec in self.measurements:
                     if iso not in rec.z_k:
@@ -990,5 +1250,7 @@ class RotatingShieldPFEstimator:
                             mask = st.source_indices != idx_src
                             st.source_indices = st.source_indices[mask]
                             st.strengths = st.strengths[mask]
-            keep_masks[iso] = keep_mask
+            if not np.any(keep_mask) and expected_strength.size:
+                keep_mask[int(np.argmax(expected_strength))] = True
+        keep_masks[iso] = keep_mask
         return keep_masks

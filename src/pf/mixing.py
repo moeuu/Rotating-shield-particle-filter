@@ -15,12 +15,16 @@ def prune_spurious_sources_continuous(
     estimator: RotatingShieldPFEstimator,
     tau_mix: float = 0.9,
     epsilon: float = 1e-6,
+    min_strength_abs: float | None = None,
+    min_strength_ratio: float | None = None,
 ) -> Dict[str, NDArray[np.bool_]]:
     """
     Apply the best-case measurement test to continuous PF estimates (Sec. 3.4.5).
 
     Uses MMSE estimates as candidate sources. Returns a keep mask per isotope that
-    can be applied to continuous particle source indices by order.
+    can be applied to continuous particle source indices by order. Optionally drop
+    sources with strengths below max(min_strength_abs, min_strength_ratio * max_strength).
+    If all sources would be removed, keep the strongest one to avoid empty estimates.
     """
     if not estimator.measurements:
         return {iso: np.ones(0, dtype=bool) for iso in estimator.filters}
@@ -34,7 +38,16 @@ def prune_spurious_sources_continuous(
             keep_masks[iso] = np.ones(0, dtype=bool)
             continue
         keep_mask = np.ones(positions.shape[0], dtype=bool)
+        max_strength = float(np.max(strengths)) if strengths.size else 0.0
+        min_strength = 0.0
+        if min_strength_abs is not None:
+            min_strength = max(min_strength, float(min_strength_abs))
+        if min_strength_ratio is not None:
+            min_strength = max(min_strength, float(min_strength_ratio) * max_strength)
         for m, (pos, strength) in enumerate(zip(positions, strengths)):
+            if min_strength > 0.0 and strength < min_strength:
+                keep_mask[m] = False
+                continue
             best_ratio = None
             for rec in estimator.measurements:
                 z_obs = float(rec.z_k.get(iso, 0.0))
@@ -65,5 +78,7 @@ def prune_spurious_sources_continuous(
                     best_ratio = ratio
             if best_ratio is not None and best_ratio < tau_mix:
                 keep_mask[m] = False
+        if not np.any(keep_mask) and strengths.size:
+            keep_mask[int(np.argmax(strengths))] = True
         keep_masks[iso] = keep_mask
     return keep_masks

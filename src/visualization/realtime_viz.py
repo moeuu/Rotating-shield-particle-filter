@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, Optional, Tuple, List, Any, Sequence
 
 from pathlib import Path
 import numpy as np
@@ -50,6 +50,83 @@ DEFAULT_ISOTOPE_COLORS = {
     "Eu-154": "tab:green",
     "Eu-155": "tab:green",
 }
+
+
+def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return normalized weights with a uniform fallback when the sum is zero."""
+    w = np.asarray(weights, dtype=float)
+    if w.size == 0:
+        return w
+    total = float(np.sum(w))
+    if total <= 0.0:
+        return np.ones_like(w) / w.size
+    return w / total
+
+
+def _existence_probabilities(states: Sequence[Any], weights: NDArray[np.float64], max_r: int) -> NDArray[np.float64]:
+    """Return per-slot existence probabilities for a list of particle states."""
+    if max_r <= 0 or not states:
+        return np.zeros(0, dtype=float)
+    w = _normalize_weights(weights)
+    probs = np.zeros(max_r, dtype=float)
+    for wi, st in zip(w, states):
+        num_sources = int(getattr(st, "num_sources", 0))
+        if num_sources > 0:
+            probs[:num_sources] += wi
+    return probs
+
+
+def _mmse_estimate_by_slot(
+    states: Sequence[Any],
+    weights: NDArray[np.float64],
+) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
+    """Compute per-slot MMSE estimates for positions/strengths and a slot-valid mask."""
+    if not states:
+        return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
+    max_r = max(int(getattr(st, "num_sources", 0)) for st in states)
+    if max_r <= 0:
+        return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
+    positions = np.zeros((max_r, 3), dtype=float)
+    strengths = np.zeros(max_r, dtype=float)
+    slot_valid = np.zeros(max_r, dtype=bool)
+    w = _normalize_weights(weights)
+    for j in range(max_r):
+        pos_stack: list[NDArray[np.float64]] = []
+        str_stack: list[float] = []
+        w_stack: list[float] = []
+        for wi, st in zip(w, states):
+            if int(getattr(st, "num_sources", 0)) > j:
+                pos_stack.append(st.positions[j])
+                str_stack.append(float(st.strengths[j]))
+                w_stack.append(float(wi))
+        if not w_stack:
+            continue
+        slot_valid[j] = True
+        wj = _normalize_weights(np.asarray(w_stack, dtype=float))
+        pos_arr = np.vstack(pos_stack)
+        str_arr = np.asarray(str_stack, dtype=float)
+        positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+        strengths[j] = float(np.sum(wj * str_arr))
+    return positions, strengths, slot_valid
+
+
+def _filter_estimates(
+    positions: NDArray[np.float64],
+    strengths: NDArray[np.float64],
+    slot_valid: NDArray[np.bool_],
+    existence_probs: NDArray[np.float64],
+    min_strength: float | None,
+    min_existence_prob: float | None,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Filter estimates by strength and existence probability thresholds."""
+    if strengths.size == 0:
+        return positions, strengths
+    mask = slot_valid.copy() if slot_valid.size else np.ones(strengths.shape[0], dtype=bool)
+    if min_existence_prob is not None and existence_probs.size:
+        mask = mask & (existence_probs[: strengths.shape[0]] >= min_existence_prob)
+    if min_strength is not None:
+        mask = mask & (strengths >= min_strength)
+    return positions[mask], strengths[mask]
 
 
 class RealTimePFVisualizer:
@@ -115,6 +192,7 @@ class RealTimePFVisualizer:
         self._particle_weight_exponent = 1.0
         self._projection_linewidth = 1.8
         self.estimate_colors = {}
+        self._active_isotopes: set[str] | None = None
         # Plot true sources once if provided (as legend entries)
         for iso, pos in self.true_sources.items():
             if pos.size:
@@ -135,6 +213,19 @@ class RealTimePFVisualizer:
                 self._true_projection_artists.extend(self._axis_projection_lines(pos, self.colors.get(iso, "black")))
         for iso in self.isotopes:
             self.estimate_colors[iso] = self._estimate_color(self.colors.get(iso, "black"))
+
+    def set_active_isotopes(self, isotopes: Sequence[str] | None) -> None:
+        """Restrict legend/label reporting to the given isotopes."""
+        if isotopes is None:
+            self._active_isotopes = None
+            return
+        self._active_isotopes = set(isotopes)
+
+    def _iter_active_isotopes(self) -> List[str]:
+        """Return the list of isotopes to display in legends/labels."""
+        if self._active_isotopes is None:
+            return list(self.isotopes)
+        return [iso for iso in self.isotopes if iso in self._active_isotopes]
 
     def _init_axes(self) -> None:
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
@@ -175,7 +266,10 @@ class RealTimePFVisualizer:
     def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
         """Build legend-style label lines with matching colors and markers."""
         lines: List[Tuple[str, str, str, str]] = []
+        active = set(self._iter_active_isotopes())
         for iso, pos in self.true_sources.items():
+            if iso not in active:
+                continue
             if pos.size:
                 strength = self.true_strengths.get(iso, None)
                 label = f"True {iso}"
@@ -184,7 +278,7 @@ class RealTimePFVisualizer:
                 lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
-        for iso in self.isotopes:
+        for iso in self._iter_active_isotopes():
             color = self.colors.get(iso, "black")
             lines.append((f"{iso} particles", color, ".", "None"))
             lines.append((f"{iso} est", self.estimate_colors.get(iso, color), "x", "None"))
@@ -195,7 +289,10 @@ class RealTimePFVisualizer:
     def _legend_lines_estimates_only(self) -> List[Tuple[str, str, str, str]]:
         """Build legend lines for the estimates-only view."""
         lines: List[Tuple[str, str, str, str]] = []
+        active = set(self._iter_active_isotopes())
         for iso, pos in self.true_sources.items():
+            if iso not in active:
+                continue
             if pos.size:
                 strength = self.true_strengths.get(iso, None)
                 label = f"True {iso}"
@@ -204,7 +301,7 @@ class RealTimePFVisualizer:
                 lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
-        for iso in self.isotopes:
+        for iso in self._iter_active_isotopes():
             color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             lines.append((f"{iso} est", color, "x", "None"))
         return lines
@@ -212,7 +309,7 @@ class RealTimePFVisualizer:
     def _estimate_lines(self, frame: PFFrame) -> List[Tuple[str, str]]:
         """Build estimate text lines for the strongest source per isotope."""
         lines: List[Tuple[str, str]] = []
-        for iso in self.isotopes:
+        for iso in self._iter_active_isotopes():
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             strengths = frame.estimated_strengths.get(iso, np.zeros(0))
             if strengths.size and est_pos.size:
@@ -228,7 +325,7 @@ class RealTimePFVisualizer:
     def _estimate_lines_all(self, frame: PFFrame) -> List[Tuple[str, str]]:
         """Build estimate text lines for all sources per isotope."""
         lines: List[Tuple[str, str]] = []
-        for iso in self.isotopes:
+        for iso in self._iter_active_isotopes():
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             strengths = frame.estimated_strengths.get(iso, np.zeros(0))
             color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
@@ -587,6 +684,10 @@ def build_frame_from_pf(
     measurement,
     step_index: int,
     time_sec: float,
+    *,
+    estimate_mode: str = "mmse",
+    min_est_strength: float | None = None,
+    min_existence_prob: float | None = None,
 ) -> PFFrame:
     """
     Construct a PFFrame snapshot from a PF (ParallelIsotopePF-like) and a Measurement.
@@ -596,6 +697,9 @@ def build_frame_from_pf(
         measurement: Measurement with counts_by_isotope, pose_idx/orient_idx/RFe/RPb (optional)
         step_index: integer step
         time_sec: cumulative time in seconds
+        estimate_mode: "mmse" for weighted mean or "map" for max-weight particle
+        min_est_strength: optional minimum strength threshold for displayed estimates
+        min_existence_prob: optional minimum existence probability for displayed estimates
     """
     if hasattr(pf, "estimate_all"):
         est = pf.estimate_all()
@@ -605,6 +709,10 @@ def build_frame_from_pf(
     particle_weights: Dict[str, NDArray[np.float64]] = {}
     estimated_sources: Dict[str, NDArray[np.float64]] = {}
     estimated_strengths: Dict[str, NDArray[np.float64]] = {}
+
+    mode = estimate_mode.lower()
+    if mode not in {"mmse", "map"}:
+        raise ValueError(f"Unknown estimate_mode: {estimate_mode}")
 
     for iso, filt in pf.filters.items():
         positions: list[NDArray[np.float64]] = []
@@ -620,20 +728,57 @@ def build_frame_from_pf(
                     weights.append(float(w))
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
         particle_weights[iso] = np.asarray(weights, dtype=float)
-        if iso in est:
-            val = est[iso]
-            if hasattr(val, "positions"):
-                estimated_sources[iso] = val.positions
-                estimated_strengths[iso] = val.strengths
-            elif isinstance(val, tuple) and len(val) == 2:
-                estimated_sources[iso] = val[0]
-                estimated_strengths[iso] = val[1]
+        if cont_particles and len(cont_weights) == len(cont_particles):
+            states = [p.state for p in cont_particles]
+            weights_arr = np.asarray(cont_weights, dtype=float)
+            if mode == "map":
+                best = max(cont_particles, key=lambda p: p.log_weight).state
+                est_pos = best.positions.copy()
+                est_str = best.strengths.copy()
+                exist_probs = _existence_probabilities(states, weights_arr, max(len(est_str), 0))
+                slot_valid = np.ones(len(est_str), dtype=bool)
+                est_pos, est_str = _filter_estimates(
+                    est_pos,
+                    est_str,
+                    slot_valid,
+                    exist_probs,
+                    min_strength=min_est_strength,
+                    min_existence_prob=min_existence_prob,
+                )
             else:
-                estimated_sources[iso] = np.zeros((0, 3))
-                estimated_strengths[iso] = np.zeros(0)
+                est_pos, est_str, slot_valid = _mmse_estimate_by_slot(states, weights_arr)
+                exist_probs = _existence_probabilities(states, weights_arr, est_str.shape[0])
+                est_pos, est_str = _filter_estimates(
+                    est_pos,
+                    est_str,
+                    slot_valid,
+                    exist_probs,
+                    min_strength=min_est_strength,
+                    min_existence_prob=min_existence_prob,
+                )
+            estimated_sources[iso] = est_pos
+            estimated_strengths[iso] = est_str
         else:
-            estimated_sources[iso] = np.zeros((0, 3))
-            estimated_strengths[iso] = np.zeros(0)
+            if iso in est:
+                val = est[iso]
+                if hasattr(val, "positions"):
+                    est_pos = val.positions
+                    est_str = val.strengths
+                elif isinstance(val, tuple) and len(val) == 2:
+                    est_pos = val[0]
+                    est_str = val[1]
+                else:
+                    est_pos = np.zeros((0, 3))
+                    est_str = np.zeros(0)
+            else:
+                est_pos = np.zeros((0, 3))
+                est_str = np.zeros(0)
+            if min_est_strength is not None and est_str.size:
+                mask = est_str >= min_est_strength
+                est_pos = est_pos[mask]
+                est_str = est_str[mask]
+            estimated_sources[iso] = est_pos
+            estimated_strengths[iso] = est_str
 
     RFe = getattr(measurement, "RFe", np.eye(3))
     RPb = getattr(measurement, "RPb", np.eye(3))

@@ -6,13 +6,15 @@ import pytest
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.state import ParticleState, IsotopeState
-from planning.pose_selection import select_next_pose
+from planning.pose_selection import select_next_pose, select_next_pose_after_rotation
+from planning.candidate_generation import generate_candidate_poses
 from planning.shield_rotation import rotation_policy_step, select_best_orientation
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_rotation_matrices
 
 
 def _build_simple_estimator() -> RotatingShieldPFEstimator:
+    """Build a minimal estimator with deterministic particle setup for tests."""
     isotopes = ["Cs-137"]
     candidate_sources = np.array([[1.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
@@ -126,6 +128,70 @@ def test_select_next_pose_balances_information_and_cost() -> None:
     assert next_idx == 1
 
 
+def test_select_next_pose_after_rotation_prefers_lower_score() -> None:
+    """After-rotation selection should pick the candidate with lower expected uncertainty."""
+
+    class DummyEstimator:
+        def __init__(self) -> None:
+            """Track calls for expected uncertainty evaluations."""
+            self.calls: list[np.ndarray] = []
+
+        def expected_uncertainty_after_rotation(
+            self,
+            pose_xyz: np.ndarray,
+            live_time_per_rot_s: float,
+            tau_ig: float,
+            tmax_s: float,
+            n_rollouts: int,
+            orient_selection: str = "IG",
+            return_debug: bool = False,
+        ) -> float:
+            """Return a deterministic score based on pose norm."""
+            self.calls.append(np.asarray(pose_xyz, dtype=float))
+            return float(np.linalg.norm(pose_xyz))
+
+    est = DummyEstimator()
+    current_pose = np.array([5.0, 5.0, 5.0], dtype=float)
+    visited = np.array([[5.0, 5.0, 5.0]], dtype=float)
+    candidates = generate_candidate_poses(
+        current_pose_xyz=current_pose,
+        n_candidates=4,
+        strategy="ring",
+        visited_poses_xyz=visited,
+    )
+    expected_scores = [np.linalg.norm(pose) for pose in candidates]
+    expected_pose = candidates[int(np.argmin(expected_scores))]
+    selected = select_next_pose_after_rotation(
+        estimator=est,
+        current_pose_xyz=current_pose,
+        visited_poses_xyz=visited,
+        n_candidates=4,
+        n_rollouts=0,
+        candidate_strategy="ring",
+    )
+    assert selected.shape == (3,)
+    assert np.allclose(selected, expected_pose)
+    assert len(est.calls) == candidates.shape[0]
+
+
+def test_select_next_pose_after_rotation_runs_with_estimator() -> None:
+    """After-rotation selection should run with the real estimator."""
+    est = _build_simple_estimator()
+    est.pf_config.eig_num_samples = 0
+    current_pose = np.array([5.0, 5.0, 5.0], dtype=float)
+    visited = np.array([[5.0, 5.0, 5.0]], dtype=float)
+    selected = select_next_pose_after_rotation(
+        estimator=est,
+        current_pose_xyz=current_pose,
+        visited_poses_xyz=visited,
+        n_candidates=1,
+        n_rollouts=0,
+        candidate_strategy="ring",
+    )
+    assert isinstance(selected, np.ndarray)
+    assert selected.shape == (3,)
+
+
 def test_orientation_expected_information_gain_positive_when_strengths_differ() -> None:
     """Monte-Carlo EIG (Eq. 3.44) should be positive when particles predict different Λ."""
     np.random.seed(0)
@@ -173,7 +239,11 @@ def test_expected_uncertainty_after_rotation_stops_with_zero_time() -> None:
     est = _build_simple_estimator()
     u0 = est.global_uncertainty()
     u_after = est.expected_uncertainty_after_rotation(
-        pose_idx=0, tau_ig=1e-3, t_max_s=0.0, t_short_s=1.0, rng_seed=0
+        pose_xyz=np.array([0.0, 0.0, 0.0]),
+        live_time_per_rot_s=1.0,
+        tau_ig=1e-3,
+        tmax_s=0.0,
+        n_rollouts=0,
     )
     assert u_after == pytest.approx(u0)
 
@@ -183,7 +253,11 @@ def test_expected_uncertainty_after_rotation_stops_with_large_tau() -> None:
     est = _build_simple_estimator()
     u0 = est.global_uncertainty()
     u_after = est.expected_uncertainty_after_rotation(
-        pose_idx=0, tau_ig=1e9, t_max_s=1.0, t_short_s=1.0, rng_seed=0
+        pose_xyz=np.array([0.0, 0.0, 0.0]),
+        live_time_per_rot_s=1.0,
+        tau_ig=1e9,
+        tmax_s=1.0,
+        n_rollouts=0,
     )
     assert u_after == pytest.approx(u0)
 
@@ -191,17 +265,17 @@ def test_expected_uncertainty_after_rotation_stops_with_large_tau() -> None:
 def test_expected_uncertainty_after_rotation_one_step() -> None:
     """When t_max_s == t_short_s and tau_ig == 0, exactly one rotation is simulated."""
     est = _build_simple_estimator()
-    est.pf_config.eig_num_samples = 100
+    est.pf_config.eig_num_samples = 0
     u_after, debug = est.expected_uncertainty_after_rotation(
-        pose_idx=0,
+        pose_xyz=np.array([0.0, 0.0, 0.0]),
+        live_time_per_rot_s=1.0,
         tau_ig=0.0,
-        t_max_s=1.0,
-        t_short_s=1.0,
-        rng_seed=0,
+        tmax_s=1.0,
+        n_rollouts=0,
         return_debug=True,
     )
     assert isinstance(u_after, float)
-    assert debug["num_rotations"] == 1
+    assert debug["rollouts"][0]["num_rotations"] == 1
 
 
 def test_orientation_fisher_criteria_positive() -> None:

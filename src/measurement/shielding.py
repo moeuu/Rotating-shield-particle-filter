@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,6 +23,49 @@ OCTANT_NORMALS: NDArray[np.float64] = np.array(
     dtype=float,
 )
 OCTANT_NORMALS /= np.linalg.norm(OCTANT_NORMALS, axis=1, keepdims=True)
+
+# Half-value layer (HVL) and tenth-value layer (TVL) in millimeters.
+HVL_TVL_TABLE_MM: dict[str, dict[str, dict[str, float]]] = {
+    "Cs-137": {"pb": {"hvl": 7.0, "tvl": 22.0}, "fe": {"hvl": 15.0, "tvl": 50.0}},
+    "Co-60": {"pb": {"hvl": 12.0, "tvl": 40.0}, "fe": {"hvl": 20.0, "tvl": 67.0}},
+    "Eu-154": {"pb": {"hvl": 7.4, "tvl": 24.6}, "fe": {"hvl": 13.8, "tvl": 45.8}},
+}
+CS137_TVL_PB_MM = float(HVL_TVL_TABLE_MM["Cs-137"]["pb"]["tvl"])
+CS137_TVL_FE_MM = float(HVL_TVL_TABLE_MM["Cs-137"]["fe"]["tvl"])
+
+
+def mu_from_tvl_mm(tvl_mm: float) -> float:
+    """Return linear attenuation coefficient (1/cm) for a TVL given in millimeters."""
+    if tvl_mm <= 0:
+        raise ValueError("tvl_mm must be positive.")
+    return float(np.log(10.0) / (tvl_mm / 10.0))
+
+
+def mu_by_isotope_from_tvl_mm(
+    table_mm: dict[str, dict[str, dict[str, float]]],
+    isotopes: Sequence[str] | None = None,
+) -> dict[str, dict[str, float]]:
+    """
+    Build per-isotope attenuation coefficients from TVL values (mm).
+
+    Returns:
+        dict: {isotope: {"fe": mu_fe, "pb": mu_pb}} with mu in 1/cm.
+    """
+    isotopes = list(isotopes) if isotopes is not None else list(table_mm.keys())
+    mu_by_isotope: dict[str, dict[str, float]] = {}
+    for iso in isotopes:
+        entry = table_mm.get(iso)
+        if entry is None:
+            continue
+        fe_tvl = entry.get("fe", {}).get("tvl")
+        pb_tvl = entry.get("pb", {}).get("tvl")
+        if fe_tvl is None or pb_tvl is None:
+            continue
+        mu_by_isotope[iso] = {
+            "fe": mu_from_tvl_mm(float(fe_tvl)),
+            "pb": mu_from_tvl_mm(float(pb_tvl)),
+        }
+    return mu_by_isotope
 
 
 def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, float]:
