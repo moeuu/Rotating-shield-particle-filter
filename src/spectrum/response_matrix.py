@@ -9,6 +9,14 @@ from numpy.typing import NDArray
 
 from spectrum.library import Nuclide, NuclideLine
 
+try:
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+    _TORCH_AVAILABLE = False
+
 # Electron rest energy.
 ME_C2_KEV = 511.0  # keV
 # Compton continuum-to-peak ratio (per line).
@@ -21,6 +29,61 @@ def gaussian_peak(energy_axis: NDArray[np.float64], center: float, sigma: float)
     """Return a Gaussian peak with the given center and sigma."""
     norm = 1.0 / (np.sqrt(2.0 * np.pi) * sigma)
     return norm * np.exp(-0.5 * ((energy_axis - center) / sigma) ** 2)
+
+
+def _resolve_torch_context(
+    use_gpu: bool | None,
+    gpu_device: str,
+    gpu_dtype: str,
+) -> tuple["torch.device", "torch.dtype"] | None:
+    """Return torch device/dtype when GPU response building is requested and available."""
+    if not use_gpu or not _TORCH_AVAILABLE or torch is None:
+        return None
+    if gpu_device.startswith("cuda") and not torch.cuda.is_available():
+        return None
+    if gpu_dtype == "float32":
+        dtype = torch.float32
+    elif gpu_dtype == "float64":
+        dtype = torch.float64
+    else:
+        raise ValueError(f"Unsupported torch dtype: {gpu_dtype}")
+    return torch.device(gpu_device), dtype
+
+
+def _gaussian_peak_torch(
+    energy_axis: "torch.Tensor",
+    center: float,
+    sigma: float,
+) -> "torch.Tensor":
+    """Return a Gaussian peak on a torch energy axis."""
+    norm = 1.0 / (np.sqrt(2.0 * np.pi) * sigma)
+    return norm * torch.exp(-0.5 * ((energy_axis - center) / sigma) ** 2)
+
+
+def _compton_continuum_shape_torch(
+    energy_bins_keV: "torch.Tensor",
+    E_gamma_keV: float,
+    shape: str = "exponential",
+) -> "torch.Tensor":
+    """Approximate the Compton continuum shape for a single gamma line on torch."""
+    Ec = compton_edge_energy(E_gamma_keV)
+    continuum = torch.zeros_like(energy_bins_keV)
+    if Ec <= 0.0:
+        return continuum
+    mask = (energy_bins_keV >= 0.0) & (energy_bins_keV <= Ec)
+    if not torch.any(mask):
+        return continuum
+    if shape == "triangular":
+        continuum[mask] = energy_bins_keV[mask] / Ec
+    elif shape == "exponential":
+        tau = Ec / 3.0 if Ec > 0 else 1.0
+        continuum[mask] = torch.exp(-energy_bins_keV[mask] / tau)
+    else:
+        raise ValueError(f"Unknown Compton shape: {shape}")
+    total = torch.sum(continuum)
+    if float(total) > 0.0:
+        continuum = continuum / total
+    return continuum
 
 
 def compton_edge(e_gamma_keV: float) -> float:
@@ -177,12 +240,18 @@ def build_response_matrix(
     resolution_fn: Callable[[float], float],
     efficiency_fn: Callable[[float], float],
     bin_width_keV: float | None = None,
+    *,
+    use_gpu: bool | None = None,
+    gpu_device: str = "cuda",
+    gpu_dtype: str = "float32",
 ) -> NDArray[np.float64]:
     """
     Build a response matrix from the nuclide library.
 
     Rows are energy bins, columns are nuclides, and entries represent expected counts
     per unit activity.
+
+    GPU acceleration is enabled when use_gpu=True and torch supports the device.
     """
     if bin_width_keV is None:
         if energy_axis.size < 2:
@@ -191,10 +260,21 @@ def build_response_matrix(
     num_bins = energy_axis.size
     num_iso = len(library)
     matrix = np.zeros((num_bins, num_iso), dtype=float)
+    ctx = _resolve_torch_context(use_gpu, gpu_device, gpu_dtype)
     for col_idx, nuclide in enumerate(library.values()):
-        matrix[:, col_idx] = _nuclide_response(
-            energy_axis, nuclide.lines, resolution_fn, efficiency_fn, bin_width_keV
-        )
+        if ctx is None:
+            matrix[:, col_idx] = _nuclide_response(
+                energy_axis, nuclide.lines, resolution_fn, efficiency_fn, bin_width_keV
+            )
+        else:
+            matrix[:, col_idx] = _nuclide_response_torch(
+                energy_axis,
+                nuclide.lines,
+                resolution_fn,
+                efficiency_fn,
+                bin_width_keV,
+                ctx,
+            )
     return matrix
 
 
@@ -233,3 +313,44 @@ def _nuclide_response(
                 back *= efficiency_fn(e_back)
                 response += line.intensity * back
     return response
+
+
+def _nuclide_response_torch(
+    energy_axis: NDArray[np.float64],
+    lines: Iterable[NuclideLine],
+    resolution_fn: Callable[[float], float],
+    efficiency_fn: Callable[[float], float],
+    bin_width_keV: float,
+    ctx: tuple["torch.device", "torch.dtype"],
+) -> NDArray[np.float64]:
+    """Compute the response for a single nuclide using torch for vector ops."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    device, dtype = ctx
+    energy_t = torch.as_tensor(energy_axis, device=device, dtype=dtype)
+    response_t = torch.zeros_like(energy_t)
+    for line in lines:
+        sigma = float(resolution_fn(line.energy_keV))
+        peak_t = _gaussian_peak_torch(energy_t, center=float(line.energy_keV), sigma=sigma)
+        peak_area = torch.sum(peak_t) * float(bin_width_keV)
+        cont_shape = _compton_continuum_shape_torch(energy_t, float(line.energy_keV), shape="exponential")
+        cont_sum = torch.sum(cont_shape)
+        if float(cont_sum) > 0.0:
+            cont_shape = cont_shape / cont_sum
+        cont_t = COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape
+        eff = float(efficiency_fn(line.energy_keV))
+        peak_t = peak_t * eff
+        cont_t = cont_t * eff
+        response_t = response_t + line.intensity * peak_t * float(bin_width_keV)
+        response_t = response_t + line.intensity * cont_t
+        if line.energy_keV > 200.0:
+            e_back = backscatter_energy(line.energy_keV)
+            sigma_back = float(resolution_fn(e_back))
+            back_t = _gaussian_peak_torch(energy_t, center=float(e_back), sigma=sigma_back)
+            back_norm = torch.sum(back_t) * float(bin_width_keV)
+            if float(back_norm) > 0.0:
+                area_back = BACKSCATTER_FRACTION * peak_area
+                back_t = back_t * (area_back / back_norm)
+                back_t = back_t * float(efficiency_fn(e_back))
+                response_t = response_t + line.intensity * back_t
+    return response_t.detach().cpu().numpy()

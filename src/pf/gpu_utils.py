@@ -120,7 +120,7 @@ def expected_counts_pair_torch(
     dist = torch.linalg.norm(direction, dim=-1)
     dist = torch.where(dist <= tol, torch.full_like(dist, tol), dist)
     dir_unit = direction / dist.unsqueeze(-1)
-    geom = 1.0 / (4.0 * np.pi * dist**2)
+    geom = 1.0 / (dist**2)
 
     theta = torch.acos(torch.clamp(dir_unit[..., 2], -1.0, 1.0))
     phi = torch.atan2(dir_unit[..., 1], dir_unit[..., 0]) % (2.0 * np.pi)

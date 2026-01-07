@@ -21,13 +21,53 @@ from measurement.shielding import (
     resolve_mu_values,
 )
 
+try:  # optional dependency
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+    _TORCH_AVAILABLE = False
+
 
 def geometric_term(detector: NDArray[np.float64], source: NDArray[np.float64]) -> float:
-    """Inverse-square geometric term 1/(4π d^2) (Eq. 3.6)."""
+    """Inverse-square geometric term 1/d^2 (cps@1m scaling)."""
     d = float(np.linalg.norm(detector - source))
     if d == 0.0:
         d = 1e-6
-    return float(1.0 / (4.0 * np.pi * d**2))
+    return float(1.0 / (d**2))
+
+
+def _torch_available() -> bool:
+    """Return True if torch is available and CUDA is usable."""
+    return bool(_TORCH_AVAILABLE and torch is not None and torch.cuda.is_available())
+
+
+def _torch_installed() -> bool:
+    """Return True if torch is available (CUDA not required)."""
+    return bool(_TORCH_AVAILABLE and torch is not None)
+
+
+def _resolve_device(device: str | None) -> "torch.device":
+    """Resolve a torch device string with CUDA fallback."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    if device is None:
+        device = "cuda"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(device)
+
+
+def _resolve_dtype(dtype: str) -> "torch.dtype":
+    """Map a dtype string to a torch dtype."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    if dtype == "float32":
+        return torch.float32
+    if dtype == "float64":
+        return torch.float64
+    raise ValueError(f"Unsupported torch dtype: {dtype}")
 
 
 @dataclass
@@ -43,6 +83,9 @@ class ContinuousKernel:
     shield_params: ShieldParams = field(default_factory=ShieldParams)
     octant_shield: OctantShield = OctantShield()
     orientations: NDArray[np.float64] = field(default_factory=generate_octant_orientations)
+    use_gpu: bool = False
+    gpu_device: str = "cuda"
+    gpu_dtype: str = "float32"
 
     def _mu_values(self, isotope: str) -> tuple[float, float]:
         """Return (mu_fe, mu_pb) for the given isotope with fallbacks."""
@@ -52,6 +95,139 @@ class ContinuousKernel:
             default_fe=self.shield_params.mu_fe,
             default_pb=self.shield_params.mu_pb,
         )
+
+    def _gpu_enabled(self) -> bool:
+        """Return True if GPU computation is enabled and available."""
+        if not self.use_gpu:
+            return False
+        if self.gpu_device.startswith("cpu"):
+            return _torch_installed()
+        return _torch_available()
+
+    def _blocked_mask_numpy(
+        self,
+        dir_unit: NDArray[np.float64],
+        octant_index: int,
+        tol: float,
+    ) -> NDArray[np.bool_]:
+        """Return a boolean mask for rays blocked by the selected octant."""
+        (theta_low, theta_high), (phi_low, phi_high) = self.octant_shield.theta_phi_ranges[octant_index]
+        theta = np.arccos(np.clip(dir_unit[:, 2], -1.0, 1.0))
+        phi = np.mod(np.arctan2(dir_unit[:, 1], dir_unit[:, 0]), 2.0 * np.pi)
+        return (
+            (theta + tol >= theta_low)
+            & (theta - tol < theta_high)
+            & (phi + tol >= phi_low)
+            & (phi - tol < phi_high)
+        )
+
+    def _expected_rate_pair_numpy(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        background: float,
+        tol: float = 1e-6,
+    ) -> float:
+        """Compute expected rate for a Fe/Pb orientation pair using NumPy."""
+        sources = np.asarray(sources, dtype=float)
+        strengths = np.asarray(strengths, dtype=float)
+        if sources.size == 0:
+            return float(background)
+        direction = detector_pos - sources
+        dist = np.linalg.norm(direction, axis=1)
+        dist = np.where(dist <= tol, tol, dist)
+        dir_unit = direction / dist[:, None]
+        geom = 1.0 / (dist**2)
+
+        blocked_fe = self._blocked_mask_numpy(dir_unit, fe_index, tol)
+        blocked_pb = self._blocked_mask_numpy(dir_unit, pb_index, tol)
+        normal_fe = self.orientations[fe_index]
+        normal_pb = self.orientations[pb_index]
+        cos_fe = np.clip(np.sum(dir_unit * normal_fe, axis=1), 0.0, 1.0)
+        cos_pb = np.clip(np.sum(dir_unit * normal_pb, axis=1), 0.0, 1.0)
+        L_fe = np.zeros_like(cos_fe)
+        L_pb = np.zeros_like(cos_pb)
+        mask_fe = blocked_fe & (cos_fe > tol)
+        mask_pb = blocked_pb & (cos_pb > tol)
+        if np.any(mask_fe):
+            L_fe[mask_fe] = self.shield_params.thickness_fe_cm / cos_fe[mask_fe]
+        if np.any(mask_pb):
+            L_pb[mask_pb] = self.shield_params.thickness_pb_cm / cos_pb[mask_pb]
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        att = np.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+        rate = float(background) + float(np.sum(geom * att * strengths))
+        return float(rate)
+
+    def _blocked_mask_torch(
+        self,
+        dir_unit: "torch.Tensor",
+        octant_index: int,
+        tol: float,
+    ) -> "torch.Tensor":
+        """Return a boolean mask for rays blocked by the selected octant (torch)."""
+        (theta_low, theta_high), (phi_low, phi_high) = self.octant_shield.theta_phi_ranges[octant_index]
+        theta = torch.acos(torch.clamp(dir_unit[:, 2], -1.0, 1.0))
+        phi = torch.remainder(torch.atan2(dir_unit[:, 1], dir_unit[:, 0]), 2.0 * np.pi)
+        tol_t = torch.as_tensor(tol, device=dir_unit.device, dtype=dir_unit.dtype)
+        return (
+            (theta + tol_t >= theta_low)
+            & (theta - tol_t < theta_high)
+            & (phi + tol_t >= phi_low)
+            & (phi - tol_t < phi_high)
+        )
+
+    def _expected_rate_pair_torch(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        background: float,
+        tol: float = 1e-6,
+    ) -> float:
+        """Compute expected rate for a Fe/Pb orientation pair using torch."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
+        if sources_t.numel() == 0:
+            return float(background)
+        strengths_t = torch.as_tensor(strengths, device=device, dtype=dtype)
+        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 3)
+        direction = detector_t - sources_t
+        dist = torch.linalg.norm(direction, dim=1)
+        tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
+        dist = torch.where(dist <= tol_t, tol_t, dist)
+        dir_unit = direction / dist.unsqueeze(-1)
+        geom = 1.0 / (dist**2)
+
+        blocked_fe = self._blocked_mask_torch(dir_unit, fe_index, tol)
+        blocked_pb = self._blocked_mask_torch(dir_unit, pb_index, tol)
+        normal_fe = torch.as_tensor(self.orientations[fe_index], device=device, dtype=dtype)
+        normal_pb = torch.as_tensor(self.orientations[pb_index], device=device, dtype=dtype)
+        cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=1), 0.0, 1.0)
+        cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=1), 0.0, 1.0)
+        L_fe = torch.where(
+            blocked_fe & (cos_fe > tol_t),
+            torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_fe,
+            torch.zeros_like(cos_fe),
+        )
+        L_pb = torch.where(
+            blocked_pb & (cos_pb > tol_t),
+            torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_pb,
+            torch.zeros_like(cos_pb),
+        )
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+        rate = torch.sum(geom * att * strengths_t) + float(background)
+        return float(rate.detach().cpu().item())
 
     def attenuation_factor(
         self,
@@ -143,10 +319,15 @@ class ContinuousKernel:
         """
         Compute λ_{k,h} = b_h + Σ_j K_{k,j,h} q_{h,j} (Eq. 3.12).
         """
-        total = background
-        for src_pos, q in zip(sources, strengths):
-            total += self.kernel_value(isotope, detector_pos, src_pos, orient_idx) * float(q)
-        return float(total)
+        return self.expected_rate_pair(
+            isotope=isotope,
+            detector_pos=detector_pos,
+            sources=sources,
+            strengths=strengths,
+            fe_index=orient_idx,
+            pb_index=orient_idx,
+            background=background,
+        )
 
     def expected_rate_pair(
         self,
@@ -161,10 +342,25 @@ class ContinuousKernel:
         """
         Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
         """
-        total = background
-        for src_pos, q in zip(sources, strengths):
-            total += self.kernel_value_pair(isotope, detector_pos, src_pos, fe_index, pb_index) * float(q)
-        return float(total)
+        if self._gpu_enabled():
+            return self._expected_rate_pair_torch(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources=sources,
+                strengths=strengths,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                background=background,
+            )
+        return self._expected_rate_pair_numpy(
+            isotope=isotope,
+            detector_pos=detector_pos,
+            sources=sources,
+            strengths=strengths,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            background=background,
+        )
 
     def expected_counts(
         self,
@@ -224,6 +420,9 @@ def expected_counts_single_isotope(
     kernel: ContinuousKernel | None = None,
     mu_by_isotope: Dict[str, object] | None = None,
     shield_params: ShieldParams | None = None,
+    use_gpu: bool | None = None,
+    gpu_device: str = "cuda",
+    gpu_dtype: str = "float32",
 ) -> float:
     """
     Continuous expected counts Λ_{k,h} for a single isotope and time step (Sec. 3.2–3.3).
@@ -231,9 +430,16 @@ def expected_counts_single_isotope(
     RFe / RPb are interpreted as orientation matrices; the third column is used as the
     shield normal. If a 3-vector is passed, it is used directly.
     mu_by_isotope and shield_params are used only when a kernel is not provided.
+    use_gpu controls optional CUDA acceleration for batch kernel evaluation.
     """
     if kernel is None:
-        k = ContinuousKernel(mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams())
+        k = ContinuousKernel(
+            mu_by_isotope=mu_by_isotope,
+            shield_params=shield_params or ShieldParams(),
+            use_gpu=bool(use_gpu) if use_gpu is not None else False,
+            gpu_device=gpu_device,
+            gpu_dtype=gpu_dtype,
+        )
     else:
         k = kernel
 

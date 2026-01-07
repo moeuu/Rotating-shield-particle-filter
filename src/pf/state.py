@@ -58,10 +58,15 @@ def jitter_state(
     strength_sigma: float = 0.1,
     background_sigma: float = 0.1,
 ) -> ParticleState:
-    """Add small post-resampling jitter to strengths and background."""
+    """Add log-space jitter to strengths and Gaussian jitter to background."""
     new_state = state.copy()
     if new_state.strengths.size:
-        noise = np.random.normal(scale=strength_sigma, size=new_state.strengths.shape)
-        new_state.strengths = np.clip(new_state.strengths + noise, a_min=0.0, a_max=None)
+        strength_floor = 1e-12
+        safe = np.maximum(new_state.strengths, strength_floor)
+        log_strengths = np.log(safe)
+        log_strengths = log_strengths + np.random.normal(
+            scale=strength_sigma, size=log_strengths.shape
+        )
+        new_state.strengths = np.exp(log_strengths)
     new_state.background = max(0.0, new_state.background + np.random.normal(scale=background_sigma))
     return new_state

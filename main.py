@@ -37,18 +37,34 @@ def main() -> None:
         help="Run without an interactive window (forces Agg backend and disables live updates).",
     )
     parser.add_argument(
-        "--all-orientations", action="store_true", help="Measure all 64 Fe/Pb orientation pairs at each pose."
-    )
-    parser.add_argument(
         "--source-config",
         type=str,
         default=DEFAULT_SOURCE_CONFIG.as_posix(),
         help="Path to a JSON file that defines the point sources.",
     )
     parser.add_argument(
+        "--ig-threshold-mode",
+        type=str,
+        default="relative_pose",
+        choices=("absolute", "relative_max", "relative_pose"),
+        help="IG threshold mode: absolute or relative to max IG.",
+    )
+    parser.add_argument(
+        "--ig-threshold-rel",
+        type=float,
+        default=0.02,
+        help="Relative IG threshold fraction for dynamic modes.",
+    )
+    parser.add_argument(
+        "--ig-threshold-min",
+        type=float,
+        default=None,
+        help="Minimum IG threshold floor (defaults to config value).",
+    )
+    parser.add_argument(
         "--detect-threshold-abs",
         type=float,
-        default=0.1,
+        default=30.0,
         help="Absolute detection threshold for peak-matched activity (counts).",
     )
     parser.add_argument(
@@ -67,7 +83,7 @@ def main() -> None:
     parser.add_argument(
         "--detect-consecutive",
         type=int,
-        default=2,
+        default=10,
         help="Consecutive detections required to enable an isotope.",
     )
     parser.add_argument(
@@ -93,12 +109,14 @@ def main() -> None:
     run_live_pf(
         live=not (args.no_live or args.headless),
         max_steps=args.max_steps,
-        all_orientations=args.all_orientations,
         sources=sources,
         detect_threshold_abs=args.detect_threshold_abs,
         detect_threshold_rel=args.detect_threshold_rel,
         detect_consecutive=args.detect_consecutive,
         detect_min_steps=args.detect_min_steps,
+        ig_threshold_mode=args.ig_threshold_mode,
+        ig_threshold_rel=args.ig_threshold_rel,
+        ig_threshold_min=args.ig_threshold_min,
     )
 
 

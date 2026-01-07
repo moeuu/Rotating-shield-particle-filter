@@ -8,6 +8,14 @@ from typing import Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
+try:  # optional dependency
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
+    _TORCH_AVAILABLE = False
+
 # Signed unit normals for the eight octants ((+,+,+), (+,+,-), ...).
 OCTANT_NORMALS: NDArray[np.float64] = np.array(
     [
@@ -23,6 +31,17 @@ OCTANT_NORMALS: NDArray[np.float64] = np.array(
     dtype=float,
 )
 OCTANT_NORMALS /= np.linalg.norm(OCTANT_NORMALS, axis=1, keepdims=True)
+
+OCTANT_THETA_PHI_RANGES: list[tuple[tuple[float, float], tuple[float, float]]] = [
+    ((0.0, np.pi / 2.0), (0.0, np.pi / 2.0)),
+    ((np.pi / 2.0, np.pi), (0.0, np.pi / 2.0)),
+    ((0.0, np.pi / 2.0), (3.0 * np.pi / 2.0, 2.0 * np.pi)),
+    ((np.pi / 2.0, np.pi), (3.0 * np.pi / 2.0, 2.0 * np.pi)),
+    ((0.0, np.pi / 2.0), (np.pi / 2.0, np.pi)),
+    ((np.pi / 2.0, np.pi), (np.pi / 2.0, np.pi)),
+    ((0.0, np.pi / 2.0), (np.pi, 3.0 * np.pi / 2.0)),
+    ((np.pi / 2.0, np.pi), (np.pi, 3.0 * np.pi / 2.0)),
+]
 
 # Half-value layer (HVL) and tenth-value layer (TVL) in millimeters.
 HVL_TVL_TABLE_MM: dict[str, dict[str, dict[str, float]]] = {
@@ -82,6 +101,54 @@ def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, floa
     theta = float(np.arccos(z / r))
     phi = float(np.arctan2(y, x) % (2 * np.pi))
     return r, theta, phi
+
+
+def blocks_ray_torch(direction: "torch.Tensor", octant_index: int, tol: float = 1e-6) -> "torch.Tensor":
+    """
+    Return a boolean mask indicating which directions fall in an octant (torch).
+
+    direction: (N, 3) tensor of direction vectors.
+    """
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    if octant_index < 0 or octant_index >= len(OCTANT_THETA_PHI_RANGES):
+        raise ValueError("octant_index must be in [0, 7]")
+    r = torch.linalg.norm(direction, dim=1)
+    tol_t = torch.as_tensor(tol, device=direction.device, dtype=direction.dtype)
+    r = torch.where(r <= tol_t, tol_t, r)
+    dir_unit = direction / r.unsqueeze(-1)
+    theta = torch.acos(torch.clamp(dir_unit[:, 2], -1.0, 1.0))
+    phi = torch.remainder(torch.atan2(dir_unit[:, 1], dir_unit[:, 0]), 2 * np.pi)
+    (theta_low, theta_high), (phi_low, phi_high) = OCTANT_THETA_PHI_RANGES[octant_index]
+    return (
+        (theta + tol_t >= theta_low)
+        & (theta - tol_t < theta_high)
+        & (phi + tol_t >= phi_low)
+        & (phi - tol_t < phi_high)
+    )
+
+
+def path_length_cm_torch(
+    direction: "torch.Tensor",
+    shield_normal: "torch.Tensor",
+    thickness_cm: float,
+    blocked_mask: "torch.Tensor",
+    tol: float = 1e-9,
+) -> "torch.Tensor":
+    """
+    Compute path length through the octant shell (torch, batched).
+
+    direction: (N, 3) tensor, shield_normal: (3,) tensor.
+    """
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    norm = torch.linalg.norm(direction, dim=1)
+    tol_t = torch.as_tensor(tol, device=direction.device, dtype=direction.dtype)
+    norm = torch.where(norm <= tol_t, tol_t, norm)
+    dir_unit = direction / norm.unsqueeze(-1)
+    cos_theta = torch.clamp(torch.sum(dir_unit * shield_normal, dim=1), 0.0, 1.0)
+    thickness = torch.as_tensor(thickness_cm, device=direction.device, dtype=direction.dtype)
+    return torch.where(blocked_mask & (cos_theta > tol_t), thickness / cos_theta, torch.zeros_like(cos_theta))
 
 
 def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArray[np.float64], tol: float = 1e-6) -> bool:

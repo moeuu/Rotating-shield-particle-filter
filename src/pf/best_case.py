@@ -24,7 +24,19 @@ def prune_spurious_sources(
     mark spurious and remove.
     """
     pruned: Dict[str, IsotopeState] = {}
-    kernel_helper = ContinuousKernel()
+    use_gpu = False
+    gpu_device = "cuda"
+    gpu_dtype = "float32"
+    if pf.filters:
+        first_pf = next(iter(pf.filters.values()))
+        use_gpu = bool(first_pf.config.use_gpu)
+        gpu_device = first_pf.config.gpu_device
+        gpu_dtype = first_pf.config.gpu_dtype
+    kernel_helper = ContinuousKernel(
+        use_gpu=use_gpu,
+        gpu_device=gpu_device,
+        gpu_dtype=gpu_dtype,
+    )
 
     for iso, filt in pf.filters.items():
         if not filt.continuous_particles:

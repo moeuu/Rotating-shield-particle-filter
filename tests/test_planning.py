@@ -6,7 +6,12 @@ import pytest
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.state import ParticleState, IsotopeState
-from planning.pose_selection import select_next_pose, select_next_pose_after_rotation
+from planning.pose_selection import (
+    estimate_lambda_cost,
+    recommend_num_rollouts,
+    select_next_pose,
+    select_next_pose_after_rotation,
+)
 from planning.candidate_generation import generate_candidate_poses
 from planning.shield_rotation import rotation_policy_step, select_best_orientation
 from pf.particle_filter import IsotopeParticle
@@ -172,6 +177,39 @@ def test_select_next_pose_after_rotation_prefers_lower_score() -> None:
     assert selected.shape == (3,)
     assert np.allclose(selected, expected_pose)
     assert len(est.calls) == candidates.shape[0]
+
+
+def test_estimate_lambda_cost_range_scales_motion() -> None:
+    """Range-based lambda should match uncertainty and motion-cost ranges."""
+    uncertainties = np.array([1.0, 2.0, 4.0], dtype=float)
+    distances = np.array([0.5, 1.0, 2.5], dtype=float)
+    lam = estimate_lambda_cost(uncertainties, distances, method="range")
+    expected = (4.0 - 1.0) / (2.5 - 0.5)
+    assert lam == pytest.approx(expected)
+
+
+def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:
+    """recommend_num_rollouts should pick the smallest rollout meeting the target SE."""
+    samples = {
+        1: [6.0, 14.0, 8.0, 12.0],
+        2: [9.0, 11.0, 10.0, 10.0],
+        4: [9.6, 10.4, 9.8, 10.2],
+        8: [9.9, 10.1, 9.95, 10.05],
+    }
+
+    def eval_fn(n_rollouts: int, seed: int) -> float:
+        values = samples[int(n_rollouts)]
+        idx = int(seed) % len(values)
+        return float(values[idx])
+
+    recommended = recommend_num_rollouts(
+        candidate_rollouts=(1, 2, 4, 8),
+        trials=4,
+        rel_se_target=0.015,
+        rng_seed=0,
+        eval_fn=eval_fn,
+    )
+    assert recommended == 8
 
 
 def test_select_next_pose_after_rotation_runs_with_estimator() -> None:

@@ -17,6 +17,49 @@ def _normalize_weights(weights: np.ndarray) -> np.ndarray:
     return weights / total
 
 
+def _resolve_gpu_context(
+    estimator: RotatingShieldPFEstimator,
+) -> Tuple[object, object, object, object] | None:
+    """Return (torch, gpu_utils, device, dtype) for GPU evaluation if available."""
+    if not hasattr(estimator, "_gpu_enabled") or not estimator._gpu_enabled():
+        return None
+    try:
+        from pf import gpu_utils
+        import torch
+    except ImportError:
+        return None
+    device = gpu_utils.resolve_device(estimator.pf_config.gpu_device)
+    dtype = gpu_utils.resolve_dtype(estimator.pf_config.gpu_dtype)
+    return torch, gpu_utils, device, dtype
+
+
+def _normalize_weights_torch(weights_t: object, torch_mod: object) -> object:
+    """Normalize a torch weight vector with a uniform fallback."""
+    weight_sum = torch_mod.sum(weights_t)
+    if float(weight_sum) <= 0.0:
+        return torch_mod.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
+    return weights_t / weight_sum
+
+
+def _pack_states_by_isotope(
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    torch_mod: object,
+    gpu_utils: object,
+    device: object,
+    dtype: object,
+) -> Dict[str, Tuple[object, object, object, object, object]]:
+    """Pack isotope particle states into GPU tensors with normalized weights."""
+    packed: Dict[str, Tuple[object, object, object, object, object]] = {}
+    for iso, (states, weights) in particles_by_isotope.items():
+        if not states:
+            continue
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
+        weights_t = torch_mod.as_tensor(np.asarray(weights, dtype=float), device=device, dtype=dtype)
+        weights_t = _normalize_weights_torch(weights_t, torch_mod)
+        packed[iso] = (positions, strengths, backgrounds, mask, weights_t)
+    return packed
+
+
 def _surrogate_scores(
     estimator: RotatingShieldPFEstimator,
     pose_idx: int,
@@ -41,6 +84,23 @@ def _surrogate_scores(
     alpha_sum = sum(alphas.values()) or 1.0
     alphas = {k: v / alpha_sum for k, v in alphas.items()}
     eps = 1e-12
+    gpu_ctx = _resolve_gpu_context(estimator)
+    if gpu_ctx is not None:
+        scores = _surrogate_scores_gpu(
+            estimator=estimator,
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+            particles_by_isotope=particles_by_isotope,
+            RFe_candidates=RFe_candidates,
+            RPb_candidates=RPb_candidates,
+            alphas=alphas,
+            allowed_indices=allowed_indices,
+            metric=metric,
+            gpu_ctx=gpu_ctx,
+            eps=eps,
+        )
+        if scores:
+            return scores
     scores: Dict[int, float] = {}
     for fe_idx, RFe in enumerate(RFe_candidates):
         for pb_idx, RPb in enumerate(RPb_candidates):
@@ -67,6 +127,75 @@ def _surrogate_scores(
                 mean = float(np.sum(weights * vals))
                 var = float(np.sum(weights * (vals - mean) ** 2))
                 score += alphas.get(iso, 0.0) * var
+            scores[oid] = score
+    return scores
+
+
+def _surrogate_scores_gpu(
+    estimator: RotatingShieldPFEstimator,
+    pose_idx: int,
+    live_time_s: float,
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    RFe_candidates: np.ndarray,
+    RPb_candidates: np.ndarray,
+    alphas: Dict[str, float],
+    allowed_indices: set[int] | None,
+    metric: str,
+    gpu_ctx: Tuple[object, object, object, object],
+    eps: float,
+) -> Dict[int, float]:
+    """Compute surrogate scores on GPU using packed particle tensors."""
+    if pose_idx < 0 or pose_idx >= len(estimator.poses):
+        raise IndexError("pose_idx out of range")
+    torch_mod, gpu_utils, device, dtype = gpu_ctx
+    from measurement.continuous_kernels import ContinuousKernel
+
+    packed = _pack_states_by_isotope(particles_by_isotope, torch_mod, gpu_utils, device, dtype)
+    if not packed:
+        return {}
+    detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
+    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
+    from measurement.shielding import octant_index_from_rotation
+
+    fe_indices = [octant_index_from_rotation(R) for R in RFe_candidates]
+    pb_indices = [octant_index_from_rotation(R) for R in RPb_candidates]
+    mu_by_iso = {iso: kernel._mu_values(isotope=iso) for iso in packed}
+    shield_params = kernel.shield_params
+    scores: Dict[int, float] = {}
+    num_pb = len(RPb_candidates)
+    for fe_idx in range(len(RFe_candidates)):
+        for pb_idx in range(len(RPb_candidates)):
+            oid = fe_idx * num_pb + pb_idx
+            if allowed_indices is not None and oid not in allowed_indices:
+                continue
+            score = 0.0
+            for iso, (positions, strengths, backgrounds, mask, weights_t) in packed.items():
+                mu_fe, mu_pb = mu_by_iso[iso]
+                lam_t = gpu_utils.expected_counts_pair_torch(
+                    detector_pos=detector_pos,
+                    positions=positions,
+                    strengths=strengths,
+                    backgrounds=backgrounds,
+                    mask=mask,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                    mu_fe=mu_fe,
+                    mu_pb=mu_pb,
+                    thickness_fe_cm=shield_params.thickness_fe_cm,
+                    thickness_pb_cm=shield_params.thickness_pb_cm,
+                    live_time_s=live_time_s,
+                    device=device,
+                    dtype=dtype,
+                )
+                if metric == "var_log_lambda":
+                    vals = torch_mod.log(lam_t + eps)
+                elif metric == "var_lambda":
+                    vals = lam_t
+                else:
+                    raise ValueError(f"Unknown surrogate metric: {metric}")
+                mean = torch_mod.sum(weights_t * vals)
+                var = torch_mod.sum(weights_t * (vals - mean) ** 2)
+                score += alphas.get(iso, 0.0) * float(var.item())
             scores[oid] = score
     return scores
 
@@ -100,9 +229,29 @@ def _eig_scores(
     RPb_candidates: np.ndarray,
     alpha_by_isotope: Dict[str, float] | None,
     particles_by_isotope: Dict[str, Tuple[list, np.ndarray]] | None,
-    num_samples: int,
+    num_samples: int | None,
 ) -> Dict[int, float]:
     """Compute EIG scores for a list of orientation ids."""
+    if not candidate_ids:
+        return {}
+    if num_samples is None:
+        num_samples = estimator.pf_config.eig_num_samples
+    gpu_ctx = _resolve_gpu_context(estimator)
+    if gpu_ctx is not None and particles_by_isotope:
+        scores = _eig_scores_gpu(
+            estimator=estimator,
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+            candidate_ids=candidate_ids,
+            RFe_candidates=RFe_candidates,
+            RPb_candidates=RPb_candidates,
+            alpha_by_isotope=alpha_by_isotope,
+            particles_by_isotope=particles_by_isotope,
+            num_samples=num_samples,
+            gpu_ctx=gpu_ctx,
+        )
+        if scores:
+            return scores
     scores: Dict[int, float] = {}
     num_pb = len(RPb_candidates)
     for oid in candidate_ids:
@@ -118,6 +267,96 @@ def _eig_scores(
             particles_by_isotope=particles_by_isotope,
         )
         scores[oid] = score
+    return scores
+
+
+def _eig_scores_gpu(
+    estimator: RotatingShieldPFEstimator,
+    pose_idx: int,
+    live_time_s: float,
+    candidate_ids: List[int],
+    RFe_candidates: np.ndarray,
+    RPb_candidates: np.ndarray,
+    alpha_by_isotope: Dict[str, float] | None,
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    num_samples: int | None,
+    gpu_ctx: Tuple[object, object, object, object],
+) -> Dict[int, float]:
+    """Compute EIG scores on GPU by reusing packed particle tensors."""
+    if pose_idx < 0 or pose_idx >= len(estimator.poses):
+        raise IndexError("pose_idx out of range")
+    if not candidate_ids:
+        return {}
+    torch_mod, gpu_utils, device, dtype = gpu_ctx
+    from measurement.continuous_kernels import ContinuousKernel
+
+    detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
+    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
+    packed = _pack_states_by_isotope(particles_by_isotope, torch_mod, gpu_utils, device, dtype)
+    if not packed:
+        return {}
+    alphas = alpha_by_isotope or {iso: 1.0 for iso in packed}
+    alpha_sum = sum(alphas.values()) or 1.0
+    alphas = {k: v / alpha_sum for k, v in alphas.items()}
+    eps = 1e-12
+    num_pb = len(RPb_candidates)
+    if num_samples is None:
+        num_samples = estimator.pf_config.eig_num_samples
+    num_samples = int(num_samples)
+    mu_by_iso = {iso: kernel._mu_values(isotope=iso) for iso in packed}
+    shield_params = kernel.shield_params
+    cache: Dict[str, Tuple[object, object, object, object, object, object, object, object, object]] = {}
+    for iso, (positions, strengths, backgrounds, mask, weights_t) in packed.items():
+        log_weights_t = torch_mod.log(weights_t + eps)
+        H_prior = -torch_mod.sum(weights_t * log_weights_t)
+        mu_fe, mu_pb = mu_by_iso[iso]
+        cache[iso] = (positions, strengths, backgrounds, mask, weights_t, log_weights_t, H_prior, mu_fe, mu_pb)
+
+    scores: Dict[int, float] = {}
+    for oid in candidate_ids:
+        fe_idx = oid // num_pb
+        pb_idx = oid % num_pb
+        total_ig = 0.0
+        for iso, (
+            positions,
+            strengths,
+            backgrounds,
+            mask,
+            weights_t,
+            log_weights_t,
+            H_prior,
+            mu_fe,
+            mu_pb,
+        ) in cache.items():
+            lam_t = gpu_utils.expected_counts_pair_torch(
+                detector_pos=detector_pos,
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_index=fe_idx,
+                pb_index=pb_idx,
+                mu_fe=mu_fe,
+                mu_pb=mu_pb,
+                thickness_fe_cm=shield_params.thickness_fe_cm,
+                thickness_pb_cm=shield_params.thickness_pb_cm,
+                live_time_s=live_time_s,
+                device=device,
+                dtype=dtype,
+            )
+            if num_samples <= 0:
+                H_post_mean = torch_mod.zeros((), device=device, dtype=dtype)
+            else:
+                idx = torch_mod.multinomial(weights_t, num_samples, replacement=True)
+                z = torch_mod.poisson(lam_t[idx])
+                logw = log_weights_t + z.unsqueeze(1) * torch_mod.log(lam_t + eps) - lam_t
+                logw = logw - torch_mod.logsumexp(logw, dim=1, keepdim=True)
+                w_post = torch_mod.exp(logw)
+                H_post = -torch_mod.sum(w_post * torch_mod.log(w_post + eps), dim=1)
+                H_post_mean = torch_mod.mean(H_post)
+            ig_h = float((H_prior - H_post_mean).item())
+            total_ig += alphas.get(iso, 0.0) * ig_h
+        scores[oid] = float(total_ig)
     return scores
 
 
@@ -240,6 +479,15 @@ def select_best_orientation(
             max_particles=planning_particles,
             method=planning_method,
         )
+        candidate_ids: List[int] = []
+        for fe_idx in range(len(RFe_candidates)):
+            for pb_idx in range(len(RPb_candidates)):
+                oid = fe_idx * len(RPb_candidates) + pb_idx
+                if allowed is not None and oid not in allowed:
+                    continue
+                candidate_ids.append(oid)
+        if not candidate_ids:
+            return -1, 0.0
         if criterion == "hybrid":
             fisher_metric = estimator.pf_config.fisher_screening_metric if fisher_metric is None else fisher_metric
             fisher_screening_k = (
@@ -255,13 +503,6 @@ def select_best_orientation(
             )
             if fisher_metric not in {"ja", "jd"}:
                 raise ValueError(f"Unknown Fisher metric: {fisher_metric}")
-            candidate_ids = []
-            for fe_idx in range(len(RFe_candidates)):
-                for pb_idx in range(len(RPb_candidates)):
-                    oid = fe_idx * len(RPb_candidates) + pb_idx
-                    if allowed is not None and oid not in allowed:
-                        continue
-                    candidate_ids.append(oid)
             fisher_scores = _fisher_scores(
                 estimator=estimator,
                 pose_idx=pose_idx,
@@ -297,33 +538,37 @@ def select_best_orientation(
                 return best_id, float(eig_scores[best_id])
             best_id = max(fisher_scores.keys(), key=lambda oid: fisher_scores[oid])
             return best_id, float(fisher_scores[best_id])
-        for fe_idx, RFe in enumerate(RFe_candidates):
-            for pb_idx, RPb in enumerate(RPb_candidates):
-                oid = fe_idx * len(RPb_candidates) + pb_idx
-                if allowed is not None and oid not in allowed:
-                    continue
-                if criterion == "eig":
-                    score = estimator.orientation_expected_information_gain(
-                        pose_idx=pose_idx,
-                        RFe=RFe,
-                        RPb=RPb,
-                        live_time_s=live_time_s,
-                        alpha_by_isotope=alpha_by_isotope,
-                        num_samples=eig_samples,
-                        particles_by_isotope=particles_by_iso,
-                    )
-                else:
-                    JA, JD = estimator.orientation_fisher_criteria(
-                        pose_idx=pose_idx,
-                        RFe=RFe,
-                        RPb=RPb,
-                        live_time_s=live_time_s,
-                        beta_by_isotope=beta_by_isotope,
-                        particles_by_isotope=particles_by_iso,
-                    )
-                    score = JA if criterion == "ja" else JD
-                scores.append(score)
-                ids.append(oid)
+        if criterion == "eig":
+            eig_scores = _eig_scores(
+                estimator=estimator,
+                pose_idx=pose_idx,
+                live_time_s=live_time_s,
+                candidate_ids=candidate_ids,
+                RFe_candidates=RFe_candidates,
+                RPb_candidates=RPb_candidates,
+                alpha_by_isotope=alpha_by_isotope,
+                particles_by_isotope=particles_by_iso,
+                num_samples=eig_samples,
+            )
+            if not eig_scores:
+                return -1, 0.0
+            best_id = max(eig_scores.keys(), key=lambda oid: eig_scores[oid])
+            return best_id, float(eig_scores[best_id])
+        fisher_scores = _fisher_scores(
+            estimator=estimator,
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+            candidate_ids=candidate_ids,
+            RFe_candidates=RFe_candidates,
+            RPb_candidates=RPb_candidates,
+            beta_by_isotope=beta_by_isotope,
+            particles_by_isotope=particles_by_iso,
+            metric=criterion,
+        )
+        if not fisher_scores:
+            return -1, 0.0
+        best_id = max(fisher_scores.keys(), key=lambda oid: fisher_scores[oid])
+        return best_id, float(fisher_scores[best_id])
     else:
         raise ValueError(f"Unknown criterion: {criterion}")
     best_idx = int(np.argmax(scores)) if scores else -1
@@ -399,6 +644,8 @@ def select_top_k_orientations(
                 if allowed is not None and oid not in allowed:
                     continue
                 candidate_ids.append(oid)
+        if not candidate_ids:
+            return []
 
         if criterion == "hybrid":
             fisher_metric = estimator.pf_config.fisher_screening_metric if fisher_metric is None else fisher_metric
@@ -481,52 +728,54 @@ def select_top_k_orientations(
                     k_min=preselect_k_min,
                     k_max=preselect_k_max,
                 )
-
-            for fe_idx, RFe in enumerate(RFe_candidates):
-                for pb_idx, RPb in enumerate(RPb_candidates):
-                    oid = fe_idx * len(RPb_candidates) + pb_idx
-                    if oid not in candidate_ids:
-                        continue
-                    if criterion == "eig":
-                        if len(eig_racing_steps) > 1:
-                            scores_dict = _eig_scores_with_racing(
-                                estimator=estimator,
-                                pose_idx=pose_idx,
-                                live_time_s=live_time_s,
-                                candidate_ids=candidate_ids,
-                                RFe_candidates=RFe_candidates,
-                                RPb_candidates=RPb_candidates,
-                                alpha_by_isotope=alpha_by_isotope,
-                                particles_by_isotope=particles_by_iso,
-                                steps=eig_racing_steps,
-                                margin=eig_racing_margin,
-                            )
-                            scores = [scores_dict[oid] for oid in candidate_ids]
-                            ids = candidate_ids
-                            break
-                        score = estimator.orientation_expected_information_gain(
-                            pose_idx=pose_idx,
-                            RFe=RFe,
-                            RPb=RPb,
-                            live_time_s=live_time_s,
-                            alpha_by_isotope=alpha_by_isotope,
-                            num_samples=eig_samples,
-                            particles_by_isotope=particles_by_iso,
-                        )
-                    else:
-                        JA, JD = estimator.orientation_fisher_criteria(
-                            pose_idx=pose_idx,
-                            RFe=RFe,
-                            RPb=RPb,
-                            live_time_s=live_time_s,
-                            beta_by_isotope=beta_by_isotope,
-                            particles_by_isotope=particles_by_iso,
-                        )
-                        score = JA if criterion == "ja" else JD
-                    scores.append(score)
-                    ids.append(oid)
-                if len(eig_racing_steps) > 1 and criterion == "eig" and ids:
-                    break
+            if not candidate_ids:
+                return []
+            if criterion == "eig":
+                if len(eig_racing_steps) > 1:
+                    scores_dict = _eig_scores_with_racing(
+                        estimator=estimator,
+                        pose_idx=pose_idx,
+                        live_time_s=live_time_s,
+                        candidate_ids=candidate_ids,
+                        RFe_candidates=RFe_candidates,
+                        RPb_candidates=RPb_candidates,
+                        alpha_by_isotope=alpha_by_isotope,
+                        particles_by_isotope=particles_by_iso,
+                        steps=eig_racing_steps,
+                        margin=eig_racing_margin,
+                    )
+                else:
+                    scores_dict = _eig_scores(
+                        estimator=estimator,
+                        pose_idx=pose_idx,
+                        live_time_s=live_time_s,
+                        candidate_ids=candidate_ids,
+                        RFe_candidates=RFe_candidates,
+                        RPb_candidates=RPb_candidates,
+                        alpha_by_isotope=alpha_by_isotope,
+                        particles_by_isotope=particles_by_iso,
+                        num_samples=eig_samples,
+                    )
+                if not scores_dict:
+                    return []
+                ids = candidate_ids
+                scores = [scores_dict[oid] for oid in candidate_ids]
+            else:
+                fisher_scores = _fisher_scores(
+                    estimator=estimator,
+                    pose_idx=pose_idx,
+                    live_time_s=live_time_s,
+                    candidate_ids=candidate_ids,
+                    RFe_candidates=RFe_candidates,
+                    RPb_candidates=RPb_candidates,
+                    beta_by_isotope=beta_by_isotope,
+                    particles_by_isotope=particles_by_iso,
+                    metric=criterion,
+                )
+                if not fisher_scores:
+                    return []
+                ids = candidate_ids
+                scores = [fisher_scores[oid] for oid in candidate_ids]
     if not scores:
         return []
     order = np.argsort(scores)[::-1]

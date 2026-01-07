@@ -73,17 +73,29 @@ def _sample_sobol(
     hi: NDArray[np.float64],
     n_samples: int,
 ) -> NDArray[np.float64]:
-    """Sample points using a Sobol sequence; fall back to uniform if unavailable."""
+    """
+    Sample points using a Sobol sequence; fall back to uniform if unavailable.
+
+    Degenerate dimensions (lo == hi) are kept fixed at their bound value.
+    """
     if n_samples <= 0:
         return np.zeros((0, 3), dtype=float)
     try:
         from scipy.stats import qmc
     except ImportError:
         return _sample_uniform(rng, lo, hi, n_samples)
+    active_dims = hi > lo
+    if not np.any(active_dims):
+        return np.repeat(lo[None, :], n_samples, axis=0)
     seed = int(rng.integers(0, 2**32 - 1))
-    sampler = qmc.Sobol(d=3, scramble=True, seed=seed)
-    sample = sampler.random(n_samples)
-    return qmc.scale(sample, lo, hi)
+    sampler = qmc.Sobol(d=int(np.sum(active_dims)), scramble=True, seed=seed)
+    m = int(np.ceil(np.log2(max(n_samples, 1))))
+    sample = sampler.random_base2(m)
+    sample = sample[:n_samples]
+    scaled = qmc.scale(sample, lo[active_dims], hi[active_dims])
+    out = np.repeat(lo[None, :], n_samples, axis=0)
+    out[:, active_dims] = scaled
+    return out
 
 
 def _generate_ring_candidates(
@@ -123,7 +135,7 @@ def generate_candidate_poses(
     map_api: object | None = None,
     n_candidates: int = 1024,
     strategy: str = "free_space_sobol",
-    min_dist_from_visited: float = 0.5,
+    min_dist_from_visited: float = 1.0,
     visited_poses_xyz: NDArray[np.float64] | None = None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     rng: np.random.Generator | None = None,
@@ -163,7 +175,7 @@ def generate_candidate_poses(
     filtered = _filter_candidates(raw, visited, min_dist_from_visited, is_free_fn)
     if filtered.shape[0] < n_candidates:
         extra = _sample_uniform(rng, lo, hi, max(n_candidates, 1))
-        extra = _filter_candidates(extra, None, 0.0, is_free_fn)
+        extra = _filter_candidates(extra, visited, min_dist_from_visited, is_free_fn)
         if extra.size:
             filtered = np.vstack([filtered, extra])
     return filtered[:n_candidates]

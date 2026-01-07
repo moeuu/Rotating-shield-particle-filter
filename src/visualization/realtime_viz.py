@@ -187,7 +187,7 @@ class RealTimePFVisualizer:
         self._true_artists: list = []
         self._projection_artists: list = []
         self._true_projection_artists: list = []
-        self._particle_size_range = (0.6, 18.0)
+        self._particle_size_range = (0.3, 6.0)
         self._particle_alpha_range = (0.05, 0.95)
         self._particle_weight_exponent = 1.0
         self._projection_linewidth = 1.8

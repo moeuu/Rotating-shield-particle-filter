@@ -25,6 +25,7 @@ class PFConfig:
     max_particles: int | None = None
     max_sources: int | None = None
     resample_threshold: float = 0.5  # relative to N
+    position_sigma: float = 0.1
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     min_strength: float = 0.01
@@ -39,7 +40,7 @@ class PFConfig:
     init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
     init_strength_log_sigma: float = 1.0
     use_discrete: bool = True  # set False to skip legacy discrete initialisation
-    use_gpu: bool = False
+    use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float32"
 
@@ -442,7 +443,7 @@ class IsotopeParticleFilter:
                 IsotopeParticle(state=st, log_weight=float(-np.log(self.N))) for st in self.continuous_particles
             ]
             self.regularize_continuous(
-                sigma_pos=self.config.strength_sigma,
+                sigma_pos=self.config.position_sigma,
                 sigma_int=self.config.strength_sigma,
                 p_birth=self.config.p_birth,
                 p_kill=0.1,
@@ -488,7 +489,7 @@ class IsotopeParticleFilter:
         self.config.num_particles = target_n
         if jitter:
             self.regularize_continuous(
-                sigma_pos=self.config.strength_sigma,
+                sigma_pos=self.config.position_sigma,
                 sigma_int=self.config.strength_sigma,
                 p_birth=self.config.p_birth,
                 p_kill=0.1,
@@ -511,7 +512,7 @@ class IsotopeParticleFilter:
         Apply small Gaussian jitter to positions/strengths and simple birth/death moves (Sec. 3.3.4).
 
         - positions: s <- s + N(0, sigma_pos^2 I)
-        - strengths: q <- max(q + N(0, sigma_int^2), 0)
+        - strengths: log(q) <- log(q) + N(0, sigma_int^2)
         - delete sources with q < intensity_threshold with prob p_kill
         - with prob p_birth, add a new source uniformly in workspace with small initial strength
         """
@@ -523,7 +524,13 @@ class IsotopeParticleFilter:
             if st.positions.size:
                 st.positions = st.positions + np.random.normal(scale=sigma_pos, size=st.positions.shape)
                 st.positions = np.clip(st.positions, lo, hi)
-                st.strengths = np.maximum(st.strengths + np.random.normal(scale=sigma_int, size=st.strengths.shape), 0.0)
+                strength_floor = 1e-12
+                safe = np.maximum(st.strengths, strength_floor)
+                log_strengths = np.log(safe)
+                log_strengths = log_strengths + np.random.normal(
+                    scale=sigma_int, size=log_strengths.shape
+                )
+                st.strengths = np.exp(log_strengths)
                 # kill weak sources
                 mask = np.ones(st.num_sources, dtype=bool)
                 for i, q in enumerate(st.strengths):
@@ -606,27 +613,72 @@ class IsotopeParticleFilter:
         """
         if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
-        w = self.continuous_weights
-        max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
-        positions = np.zeros((max_r, 3), dtype=float)
-        strengths = np.zeros(max_r, dtype=float)
-        for j in range(max_r):
-            pos_stack = []
-            str_stack = []
-            w_stack = []
-            for wi, p in zip(w, self.continuous_particles):
-                if p.state.num_sources > j:
-                    pos_stack.append(p.state.positions[j])
-                    str_stack.append(p.state.strengths[j])
-                    w_stack.append(wi)
-            if not w_stack:
-                continue
-            wj = np.array(w_stack, dtype=float)
-            wj = wj / max(np.sum(wj), 1e-12)
-            pos_arr = np.vstack(pos_stack)
-            str_arr = np.array(str_stack, dtype=float)
-            positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
-            strengths[j] = float(np.sum(wj * str_arr))
+        if self._gpu_enabled():
+            try:
+                from pf import gpu_utils
+                import torch
+            except ImportError:
+                w = self.continuous_weights
+                max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
+                positions = np.zeros((max_r, 3), dtype=float)
+                strengths = np.zeros(max_r, dtype=float)
+                for j in range(max_r):
+                    pos_stack = []
+                    str_stack = []
+                    w_stack = []
+                    for wi, p in zip(w, self.continuous_particles):
+                        if p.state.num_sources > j:
+                            pos_stack.append(p.state.positions[j])
+                            str_stack.append(p.state.strengths[j])
+                            w_stack.append(wi)
+                    if not w_stack:
+                        continue
+                    wj = np.array(w_stack, dtype=float)
+                    wj = wj / max(np.sum(wj), 1e-12)
+                    pos_arr = np.vstack(pos_stack)
+                    str_arr = np.array(str_stack, dtype=float)
+                    positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+                    strengths[j] = float(np.sum(wj * str_arr))
+            else:
+                device = gpu_utils.resolve_device(self.config.gpu_device)
+                dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+                states = [p.state for p in self.continuous_particles]
+                positions_t, strengths_t, _, mask_t = gpu_utils.pack_states(states, device=device, dtype=dtype)
+                weights = torch.as_tensor(self.continuous_weights, device=device, dtype=dtype)
+                weight_sum = torch.sum(weights)
+                if float(weight_sum) <= 0.0:
+                    weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
+                else:
+                    weights = weights / weight_sum
+                w_mask = weights[:, None] * mask_t
+                w_sum = torch.sum(w_mask, dim=0)
+                w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
+                pos_mean = torch.sum(w_mask[:, :, None] * positions_t, dim=0) / w_sum_safe[:, None]
+                str_mean = torch.sum(w_mask * strengths_t, dim=0) / w_sum_safe
+                positions = pos_mean.detach().cpu().numpy()
+                strengths = str_mean.detach().cpu().numpy()
+        else:
+            w = self.continuous_weights
+            max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
+            positions = np.zeros((max_r, 3), dtype=float)
+            strengths = np.zeros(max_r, dtype=float)
+            for j in range(max_r):
+                pos_stack = []
+                str_stack = []
+                w_stack = []
+                for wi, p in zip(w, self.continuous_particles):
+                    if p.state.num_sources > j:
+                        pos_stack.append(p.state.positions[j])
+                        str_stack.append(p.state.strengths[j])
+                        w_stack.append(wi)
+                if not w_stack:
+                    continue
+                wj = np.array(w_stack, dtype=float)
+                wj = wj / max(np.sum(wj), 1e-12)
+                pos_arr = np.vstack(pos_stack)
+                str_arr = np.array(str_stack, dtype=float)
+                positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+                strengths[j] = float(np.sum(wj * str_arr))
         # Trim zero-strength slots.
         mask = strengths > 0
         positions = positions[mask]

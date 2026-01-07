@@ -13,6 +13,46 @@ from spectrum.library import Nuclide
 from spectrum.smoothing import gaussian_smooth
 
 
+def _cuda_available() -> bool:
+    """Return True if torch with CUDA is available."""
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+def _compute_weight_matrix(
+    energy_axis_keV: NDArray[np.float64],
+    library: Dict[str, Nuclide],
+    window_keV: float,
+) -> Tuple[List[str], NDArray[np.float64]]:
+    """
+    Precompute per-isotope weight vectors for line windows.
+
+    Returns:
+        (isotope_names, weight_matrix) where weight_matrix shape = (H, B)
+    """
+    energy_axis_keV = np.asarray(energy_axis_keV, dtype=float)
+    iso_names = list(library.keys())
+    num_bins = energy_axis_keV.size
+    weight_matrix = np.zeros((len(iso_names), num_bins), dtype=float)
+    total_intensity: Dict[str, float] = {
+        name: sum(line.intensity for line in nuclide.lines) for name, nuclide in library.items()
+    }
+    for j, iso in enumerate(iso_names):
+        nuclide = library[iso]
+        total_int = total_intensity.get(iso, 0.0)
+        if total_int <= 0.0:
+            continue
+        for line in nuclide.lines:
+            weight = line.intensity / total_int
+            mask = np.abs(energy_axis_keV - line.energy_keV) <= window_keV
+            if np.any(mask):
+                weight_matrix[j, mask] += weight
+    return iso_names, weight_matrix
+
+
 def _dead_time_scale(total_counts: float, live_time_s: float, dead_time_s: float) -> float:
     """Return a global scale factor using a non-paralyzable dead-time model."""
     if dead_time_s <= 0.0 or live_time_s <= 0.0:
@@ -49,6 +89,7 @@ def build_isotope_count_sequence(
     window_keV: float = 5.0,
     smooth_sigma_bins: float | None = None,
     subtract_baseline: bool = True,
+    use_gpu: bool | None = None,
 ) -> Tuple[List[str], NDArray[np.float64]]:
     """
     Build isotope-wise count sequences z_k from short-time spectra.
@@ -62,44 +103,48 @@ def build_isotope_count_sequence(
         window_keV: Integration window (±window_keV) around each line.
         smooth_sigma_bins: Smoothing sigma in bins (None or 0 disables).
         subtract_baseline: Whether to subtract the baseline.
+        use_gpu: If True, use CUDA for the final matrix multiply when available.
 
     Returns:
         (isotope_names, counts_matrix) where counts_matrix shape = (T, H)
     """
     energy_axis_keV = np.asarray(energy_axis_keV, dtype=float)
-    iso_names = list(library.keys())
+    spectra_list = list(spectra)
+    iso_names, weight_matrix = _compute_weight_matrix(energy_axis_keV, library, window_keV)
     live_times = (
-        [float(live_time_s)] * len(list(spectra))
+        [float(live_time_s)] * len(spectra_list)
         if isinstance(live_time_s, (int, float))
         else [float(v) for v in live_time_s]
     )
-    spectra_list = list(spectra)
     if len(spectra_list) != len(live_times):
         raise ValueError("Number of spectra and live_time_s entries must match")
 
-    counts_matrix = np.zeros((len(spectra_list), len(iso_names)), dtype=float)
-    # Pre-compute total line intensities.
-    total_intensity: Dict[str, float] = {
-        name: sum(line.intensity for line in nuclide.lines) for name, nuclide in library.items()
-    }
-
+    processed_stack = np.zeros((len(spectra_list), energy_axis_keV.size), dtype=float)
     for idx, (spec, lt) in enumerate(zip(spectra_list, live_times)):
-        processed = _apply_preprocess(
-            np.asarray(spec, dtype=float), live_time_s=lt, dead_time_s=dead_time_s,
-            smooth_sigma_bins=smooth_sigma_bins, subtract_baseline=subtract_baseline
+        processed_stack[idx] = _apply_preprocess(
+            np.asarray(spec, dtype=float),
+            live_time_s=lt,
+            dead_time_s=dead_time_s,
+            smooth_sigma_bins=smooth_sigma_bins,
+            subtract_baseline=subtract_baseline,
         )
-        for j, iso in enumerate(iso_names):
-            nuclide = library[iso]
-            total_int = total_intensity.get(iso, 0.0)
-            if total_int <= 0.0:
-                continue
-            z_val = 0.0
-            for line in nuclide.lines:
-                weight = line.intensity / total_int
-                mask = np.abs(energy_axis_keV - line.energy_keV) <= window_keV
-                if not np.any(mask):
-                    continue
-                y_hp = processed[mask].sum()
-                z_val += weight * y_hp
-            counts_matrix[idx, j] = z_val
-    return iso_names, counts_matrix
+
+    if use_gpu is None:
+        use_gpu = _cuda_available()
+    if use_gpu:
+        try:
+            import torch
+        except ImportError:
+            use_gpu = False
+        else:
+            if not torch.cuda.is_available():
+                use_gpu = False
+    if use_gpu:
+        device = torch.device("cuda")
+        spectra_t = torch.as_tensor(processed_stack, device=device, dtype=torch.float64)
+        weights_t = torch.as_tensor(weight_matrix, device=device, dtype=torch.float64)
+        counts_t = spectra_t @ weights_t.T
+        counts_matrix = counts_t.detach().cpu().numpy()
+    else:
+        counts_matrix = processed_stack @ weight_matrix.T
+    return iso_names, np.asarray(counts_matrix, dtype=float)

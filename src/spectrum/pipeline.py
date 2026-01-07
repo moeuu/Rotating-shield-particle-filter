@@ -56,11 +56,23 @@ class SpectralDecomposer:
         self,
         spectrum_config: SpectrumConfig | None = None,
         library: Dict[str, Nuclide] | None = None,
+        *,
+        use_gpu: bool | None = None,
+        gpu_device: str = "cuda",
+        gpu_dtype: str = "float32",
     ) -> None:
-        """Initialize the response matrix and pipeline configuration."""
+        """
+        Initialize the response matrix and pipeline configuration.
+
+        GPU acceleration for response/smoothing is enabled when use_gpu=True
+        and torch supports the requested device.
+        """
         self.config = spectrum_config or SpectrumConfig()
         self.library = library or default_library()
         self.energy_axis = self.config.energy_axis()
+        self.use_gpu = use_gpu
+        self.gpu_device = gpu_device
+        self.gpu_dtype = gpu_dtype
         self.resolution_fn = default_resolution()
         # Energy-dependent efficiency model (CeBr3 assumption).
         from spectrum.response_matrix import cebr3_efficiency
@@ -73,6 +85,9 @@ class SpectralDecomposer:
             resolution_fn=self.resolution_fn,
             efficiency_fn=self.efficiency_fn,
             bin_width_keV=self.config.bin_width_keV,
+            use_gpu=self.use_gpu,
+            gpu_device=self.gpu_device,
+            gpu_dtype=self.gpu_dtype,
         )
         self.isotope_names = list(self.library.keys())
 
@@ -162,7 +177,13 @@ class SpectralDecomposer:
 
     def preprocess(self, spectrum: NDArray[np.float64]) -> NDArray[np.float64]:
         """Apply smoothing and baseline correction to stabilise peak detection."""
-        smoothed = gaussian_smooth(spectrum, sigma_bins=2.0)
+        smoothed = gaussian_smooth(
+            spectrum,
+            sigma_bins=2.0,
+            use_gpu=self.use_gpu,
+            gpu_device=self.gpu_device,
+            gpu_dtype=self.gpu_dtype,
+        )
         baseline = asymmetric_least_squares(
             smoothed,
             lam=BASELINE_LAM,
@@ -268,7 +289,13 @@ class SpectralDecomposer:
         corrected = self.preprocess(spectrum)
         work = corrected
         if float(np.max(work)) <= 0.0:
-            work = gaussian_smooth(np.asarray(spectrum, dtype=float), sigma_bins=2.0)
+            work = gaussian_smooth(
+                np.asarray(spectrum, dtype=float),
+                sigma_bins=2.0,
+                use_gpu=self.use_gpu,
+                gpu_device=self.gpu_device,
+                gpu_dtype=self.gpu_dtype,
+            )
         peak_indices = detect_peaks(work, prominence=peak_prominence, distance=peak_distance)
         peaks_by_iso, _ = self._assign_peak_indices(
             self.energy_axis,
@@ -334,7 +361,13 @@ class SpectralDecomposer:
         """
         corrected = np.asarray(spectrum, dtype=float)
         if smooth_sigma_bins > 0.0:
-            corrected = gaussian_smooth(corrected, sigma_bins=smooth_sigma_bins)
+            corrected = gaussian_smooth(
+                corrected,
+                sigma_bins=smooth_sigma_bins,
+                use_gpu=self.use_gpu,
+                gpu_device=self.gpu_device,
+                gpu_dtype=self.gpu_dtype,
+            )
         if subtract_baseline:
             base = asymmetric_least_squares(
                 corrected,

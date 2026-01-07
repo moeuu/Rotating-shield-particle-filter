@@ -15,6 +15,7 @@ from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
 from pf.particle_filter import IsotopeParticleFilter, PFConfig
+from pf.resampling import systematic_resample
 from pf.state import IsotopeState
 
 
@@ -29,6 +30,7 @@ class RotatingShieldPFConfig:
         - max_dwell_time_s: per-pose dwell cap
         - credible_volume_threshold: max ellipsoid volume for positional credible regions
         - lambda_cost: motion-cost weight in Eq. 3.51
+        - position_sigma: Gaussian jitter for positions (meters)
         - alpha_weights / beta_weights: isotope weights for IG / Fisher criteria
         - orientation_k: number of orientations to execute per pose
         - orientation_selection_mode: "eig", "fisher", or "hybrid"
@@ -38,6 +40,9 @@ class RotatingShieldPFConfig:
         - gpu_device: torch device string (e.g., "cuda" or "cpu")
         - gpu_dtype: torch dtype string ("float32" or "float64")
         - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
+        - planning_eig_samples: Monte-Carlo samples for EIG inside planning rollouts
+        - planning_rollout_particles: particle cap for IG evaluation in rollouts
+        - planning_rollout_method: selection method for rollout particles
         - fisher_screening_metric: "ja" or "jd" for Fisher screening
         - fisher_screening_k: number of top candidates kept after Fisher screening
         - hybrid_eig_samples: small-sample count for EIG refinement
@@ -48,6 +53,7 @@ class RotatingShieldPFConfig:
     num_particles: int = 200
     max_sources: int | None = None
     resample_threshold: float = 0.5
+    position_sigma: float = 0.1
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     min_strength: float = 0.01
@@ -65,10 +71,13 @@ class RotatingShieldPFConfig:
     orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
     planning_method: str = "top_weight"
-    use_gpu: bool = False
+    use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float32"
     eig_num_samples: int = 50
+    planning_eig_samples: int | None = None
+    planning_rollout_particles: int | None = None
+    planning_rollout_method: str | None = None
     fisher_screening_metric: str = "ja"
     fisher_screening_k: int = 12
     hybrid_eig_samples: int = 20
@@ -141,6 +150,9 @@ class RotatingShieldPFEstimator:
             orientations=self.normals,
             shield_params=self.shield_params,
             mu_by_isotope=self.mu_by_isotope,
+            use_gpu=self.pf_config.use_gpu,
+            gpu_device=self.pf_config.gpu_device,
+            gpu_dtype=self.pf_config.gpu_dtype,
         )
         pf_conf = self._build_pf_config()
         if self.filters:
@@ -159,6 +171,7 @@ class RotatingShieldPFEstimator:
             num_particles=self.pf_config.num_particles,
             max_sources=self.pf_config.max_sources,
             resample_threshold=self.pf_config.resample_threshold,
+            position_sigma=self.pf_config.position_sigma,
             strength_sigma=self.pf_config.strength_sigma,
             background_sigma=self.pf_config.background_sigma,
             min_strength=self.pf_config.min_strength,
@@ -830,6 +843,7 @@ class RotatingShieldPFEstimator:
         n_rollouts: int = 64,
         orient_selection: str = "IG",
         return_debug: bool = False,
+        rng_seed: int | None = None,
     ) -> float | Tuple[float, Dict[str, Any]]:
         """
         Estimate E[U_after-rotation | pose_xyz] by Monte Carlo rollouts.
@@ -838,6 +852,8 @@ class RotatingShieldPFEstimator:
         - choose the next orientation by maximizing IG
         - stop if max IG < tau_ig
         - stop if accumulated live time reaches tmax_s
+
+        rng_seed can be set to make rollouts deterministic for debugging.
         """
         detector_pos = np.asarray(pose_xyz, dtype=float)
         if detector_pos.shape != (3,):
@@ -847,7 +863,10 @@ class RotatingShieldPFEstimator:
         n_rollouts = int(n_rollouts)
         use_mean_measurement = n_rollouts <= 0
         rollouts = max(1, n_rollouts)
-        rng = np.random.default_rng(np.random.randint(0, 2**32 - 1))
+        if rng_seed is None:
+            rng = np.random.default_rng(np.random.randint(0, 2**32 - 1))
+        else:
+            rng = np.random.default_rng(int(rng_seed))
         from measurement.shielding import generate_octant_rotation_matrices
 
         RFe_candidates = generate_octant_rotation_matrices()
@@ -855,6 +874,32 @@ class RotatingShieldPFEstimator:
         num_fe = len(RFe_candidates)
         num_pb = len(RPb_candidates)
         alphas = self.pf_config.alpha_weights
+        eig_samples = (
+            self.pf_config.planning_eig_samples
+            if self.pf_config.planning_eig_samples is not None
+            else self.pf_config.eig_num_samples
+        )
+        rollout_particles = self.pf_config.planning_rollout_particles
+        if rollout_particles is None:
+            rollout_particles = self.pf_config.planning_particles
+        rollout_method = self.pf_config.planning_rollout_method or self.pf_config.planning_method
+
+        fast_result = self._expected_uncertainty_after_rotation_fast(
+            detector_pos=detector_pos,
+            live_time_per_rot_s=live_time_per_rot_s,
+            tau_ig=tau_ig,
+            tmax_s=tmax_s,
+            rollouts=rollouts,
+            eig_samples=eig_samples,
+            alpha_by_isotope=alphas,
+            rollout_particles=rollout_particles,
+            rollout_method=rollout_method,
+            use_mean_measurement=use_mean_measurement,
+            rng=rng,
+            return_debug=return_debug,
+        )
+        if fast_result is not None:
+            return fast_result
 
         def _select_best_orientation(
             estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator
@@ -863,6 +908,13 @@ class RotatingShieldPFEstimator:
             best_ig = -np.inf
             best_fe = 0
             best_pb = 0
+            particles_by_iso = None
+            if rollout_particles is not None and rollout_particles > 0:
+                particles_by_iso = estimator.planning_particles(
+                    max_particles=int(rollout_particles),
+                    method=rollout_method,
+                    rng=rng_local,
+                )
             for fe_idx in range(num_fe):
                 for pb_idx in range(num_pb):
                     ig_val = estimator.orientation_expected_information_gain(
@@ -870,7 +922,9 @@ class RotatingShieldPFEstimator:
                         RFe=RFe_candidates[fe_idx],
                         RPb=RPb_candidates[pb_idx],
                         live_time_s=live_time_per_rot_s,
+                        num_samples=eig_samples,
                         alpha_by_isotope=alphas,
+                        particles_by_isotope=particles_by_iso,
                         rng=rng_local,
                         detector_pos=detector_pos,
                     )
@@ -960,6 +1014,265 @@ class RotatingShieldPFEstimator:
             return mean_u, debug_payload
         return mean_u
 
+    def _expected_uncertainty_after_rotation_fast(
+        self,
+        detector_pos: NDArray[np.float64],
+        live_time_per_rot_s: float,
+        tau_ig: float,
+        tmax_s: float,
+        rollouts: int,
+        eig_samples: int,
+        alpha_by_isotope: Dict[str, float] | None,
+        rollout_particles: int | None,
+        rollout_method: str | None,
+        use_mean_measurement: bool,
+        rng: np.random.Generator,
+        return_debug: bool,
+    ) -> float | Tuple[float, Dict[str, Any]] | None:
+        """
+        Fast GPU rollout evaluation using precomputed lambdas and index-based updates.
+
+        Returns None when the fast path cannot be used.
+        """
+        if not self._gpu_enabled():
+            return None
+        try:
+            from pf import gpu_utils
+            import torch
+        except ImportError:
+            return None
+        from measurement.shielding import generate_octant_rotation_matrices
+
+        RFe_candidates = generate_octant_rotation_matrices()
+        RPb_candidates = generate_octant_rotation_matrices()
+        num_fe = len(RFe_candidates)
+        num_pb = len(RPb_candidates)
+        num_orients = num_fe * num_pb
+        fe_indices = np.repeat(np.arange(num_fe), num_pb)
+        pb_indices = np.tile(np.arange(num_pb), num_fe)
+        eps = 1e-12
+        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
+        alpha_sum = sum(alphas.values()) or 1.0
+        alphas = {k: v / alpha_sum for k, v in alphas.items()}
+        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
+
+        iso_data: Dict[str, Dict[str, Any]] = {}
+        for iso, filt in self.filters.items():
+            if not filt.continuous_particles:
+                continue
+            weights = np.asarray(filt.continuous_weights, dtype=float)
+            if weights.size == 0:
+                continue
+            weights = weights / max(np.sum(weights), eps)
+            states = [p.state for p in filt.continuous_particles]
+            positions, strengths, backgrounds, mask = gpu_utils.pack_states(
+                states, device=device, dtype=dtype
+            )
+            mu_fe, mu_pb = filt.continuous_kernel._mu_values(isotope=iso)
+            shield_params = filt.continuous_kernel.shield_params
+            lam_list = []
+            for fe_idx, pb_idx in zip(fe_indices, pb_indices):
+                lam_t = gpu_utils.expected_counts_pair_torch(
+                    detector_pos=detector_pos,
+                    positions=positions,
+                    strengths=strengths,
+                    backgrounds=backgrounds,
+                    mask=mask,
+                    fe_index=int(fe_idx),
+                    pb_index=int(pb_idx),
+                    mu_fe=mu_fe,
+                    mu_pb=mu_pb,
+                    thickness_fe_cm=shield_params.thickness_fe_cm,
+                    thickness_pb_cm=shield_params.thickness_pb_cm,
+                    live_time_s=live_time_per_rot_s,
+                    device=device,
+                    dtype=dtype,
+                )
+                lam_list.append(lam_t)
+            if not lam_list:
+                continue
+            lam_all = torch.stack(lam_list, dim=0)
+            iso_data[iso] = {
+                "lam": lam_all,
+                "strengths": strengths,
+                "weights": weights,
+                "num_particles": weights.size,
+                "resample_threshold": filt.config.resample_threshold,
+            }
+        if not iso_data:
+            return 0.0 if not return_debug else (0.0, {"rollouts": [], "u_vals": []})
+
+        def _select_subset(
+            weights: NDArray[np.float64],
+            indices: NDArray[np.int64],
+            max_particles: int | None,
+            method: str | None,
+            rng_local: np.random.Generator,
+        ) -> Tuple[NDArray[np.int64], NDArray[np.float64]]:
+            """Return subset indices and normalized weights for EIG evaluation."""
+            if max_particles is None or max_particles <= 0 or max_particles >= len(weights):
+                return indices, weights
+            method = method or "top_weight"
+            if method == "top_weight":
+                sel = np.argsort(weights)[::-1][:max_particles]
+                sel_weights = weights[sel]
+                sel_weights = sel_weights / max(np.sum(sel_weights), eps)
+                return indices[sel], sel_weights
+            if method == "resample":
+                sel = rng_local.choice(len(weights), size=max_particles, p=weights)
+                sel_weights = np.ones(max_particles, dtype=float) / max(max_particles, 1)
+                return indices[sel], sel_weights
+            raise ValueError(f"Unknown planning particle selection method: {method}")
+
+        def _ig_scores_from_lam(
+            lam_all: "torch.Tensor",
+            subset_indices: NDArray[np.int64],
+            subset_weights: NDArray[np.float64],
+            num_samples: int,
+        ) -> "torch.Tensor":
+            """Compute IG scores for all orientations from precomputed lambdas."""
+            if num_samples <= 0:
+                weights_t = torch.as_tensor(subset_weights, device=lam_all.device, dtype=lam_all.dtype)
+                weights_t = weights_t / torch.sum(weights_t)
+                h_prior = -torch.sum(weights_t * torch.log(weights_t + eps))
+                return torch.full((lam_all.shape[0],), h_prior, device=lam_all.device, dtype=lam_all.dtype)
+            idx_t = torch.as_tensor(subset_indices, device=lam_all.device, dtype=torch.long)
+            lam_sel = torch.index_select(lam_all, 1, idx_t)
+            weights_t = torch.as_tensor(subset_weights, device=lam_all.device, dtype=lam_all.dtype)
+            weights_t = weights_t / torch.sum(weights_t)
+            log_weights = torch.log(weights_t + eps)
+            h_prior = -torch.sum(weights_t * log_weights)
+            weights_row = weights_t.expand(lam_sel.shape[0], -1)
+            idx_samples = torch.multinomial(weights_row, num_samples, replacement=True)
+            lam_samples = torch.gather(lam_sel, 1, idx_samples)
+            z = torch.poisson(lam_samples)
+            log_lam = torch.log(lam_sel + eps)
+            logw = log_weights.view(1, 1, -1) + z.unsqueeze(2) * log_lam.unsqueeze(1) - lam_sel.unsqueeze(1)
+            logw = logw - torch.logsumexp(logw, dim=2, keepdim=True)
+            w_post = torch.exp(logw)
+            h_post = -torch.sum(w_post * torch.log(w_post + eps), dim=2)
+            h_post_mean = torch.mean(h_post, dim=1)
+            return h_prior - h_post_mean
+
+        def _update_weights(
+            lam_curr: NDArray[np.float64],
+            weights: NDArray[np.float64],
+            z_obs: float,
+        ) -> NDArray[np.float64]:
+            """Update weights using Poisson log-likelihood and normalize."""
+            logw = np.log(weights + eps) + z_obs * np.log(lam_curr + eps) - lam_curr
+            logw -= np.max(logw)
+            w = np.exp(logw)
+            total = np.sum(w)
+            if total <= 0.0:
+                return np.ones_like(weights) / max(len(weights), 1)
+            return w / total
+
+        u_vals: List[float] = []
+        debug_rollouts: List[Dict[str, Any]] = []
+        for _ in range(int(rollouts)):
+            weights_by_iso: Dict[str, NDArray[np.float64]] = {}
+            indices_by_iso: Dict[str, NDArray[np.int64]] = {}
+            for iso, data in iso_data.items():
+                n_particles = int(data["num_particles"])
+                weights_by_iso[iso] = data["weights"].copy()
+                indices_by_iso[iso] = np.arange(n_particles, dtype=int)
+            elapsed = 0.0
+            iterations: List[Dict[str, Any]] = []
+            while elapsed < tmax_s:
+                total_ig: "torch.Tensor" | None = None
+                for iso, data in iso_data.items():
+                    weights = weights_by_iso[iso]
+                    indices = indices_by_iso[iso]
+                    if weights.size == 0:
+                        continue
+                    subset_idx, subset_w = _select_subset(
+                        weights=weights,
+                        indices=indices,
+                        max_particles=rollout_particles,
+                        method=rollout_method,
+                        rng_local=rng,
+                    )
+                    if subset_w.size == 0:
+                        continue
+                    ig_scores = _ig_scores_from_lam(
+                        lam_all=data["lam"],
+                        subset_indices=subset_idx,
+                        subset_weights=subset_w,
+                        num_samples=int(eig_samples),
+                    )
+                    weight = float(alphas.get(iso, 0.0))
+                    ig_scores = ig_scores * weight
+                    if total_ig is None:
+                        total_ig = ig_scores
+                    else:
+                        total_ig = total_ig + ig_scores
+                if total_ig is None:
+                    break
+                best_orient = int(torch.argmax(total_ig).item())
+                best_ig = float(total_ig[best_orient].detach().cpu().item())
+                iterations.append(
+                    {
+                        "fe_idx": int(fe_indices[best_orient]),
+                        "pb_idx": int(pb_indices[best_orient]),
+                        "ig": best_ig,
+                        "elapsed": elapsed,
+                    }
+                )
+                if best_ig < tau_ig:
+                    break
+                for iso, data in iso_data.items():
+                    weights = weights_by_iso[iso]
+                    indices = indices_by_iso[iso]
+                    if weights.size == 0:
+                        continue
+                    idx_t = torch.as_tensor(indices, device=device, dtype=torch.long)
+                    lam_curr_t = torch.index_select(data["lam"][best_orient], 0, idx_t)
+                    lam_curr = lam_curr_t.detach().cpu().numpy()
+                    if lam_curr.size == 0:
+                        continue
+                    if use_mean_measurement:
+                        z_obs = float(np.sum(weights * lam_curr))
+                    else:
+                        idx = int(rng.choice(len(lam_curr), p=weights))
+                        z_obs = float(rng.poisson(lam_curr[idx]))
+                    weights = _update_weights(lam_curr, weights, z_obs)
+                    ess = 1.0 / max(np.sum(weights**2), eps)
+                    if ess < float(data["resample_threshold"]) * len(weights):
+                        resampled = systematic_resample(np.log(weights + eps))
+                        indices = indices[resampled]
+                        weights = np.ones_like(weights) / max(len(weights), 1)
+                    weights_by_iso[iso] = weights
+                    indices_by_iso[iso] = indices
+                elapsed += live_time_per_rot_s
+            total_u = 0.0
+            for iso, data in iso_data.items():
+                weights = weights_by_iso[iso]
+                indices = indices_by_iso[iso]
+                if weights.size == 0:
+                    continue
+                idx_t = torch.as_tensor(indices, device=device, dtype=torch.long)
+                strengths_t = torch.index_select(data["strengths"], 0, idx_t)
+                weights_t = torch.as_tensor(weights, device=device, dtype=dtype)
+                weights_t = weights_t / torch.sum(weights_t)
+                mean = torch.sum(weights_t[:, None] * strengths_t, dim=0)
+                var = torch.sum(weights_t[:, None] * (strengths_t - mean) ** 2, dim=0)
+                total_u += float(torch.sum(var).detach().cpu().item())
+            u_vals.append(total_u)
+            debug_rollouts.append(
+                {
+                    "iterations": iterations,
+                    "elapsed": elapsed,
+                    "num_rotations": len(iterations),
+                }
+            )
+        mean_u = float(np.mean(u_vals)) if u_vals else 0.0
+        if return_debug:
+            debug_payload = {"rollouts": debug_rollouts, "u_vals": u_vals}
+            return mean_u, debug_payload
+        return mean_u
+
     def expected_uncertainty_after_rotation_at_pose(
         self,
         detector_pos: NDArray[np.float64],
@@ -988,6 +1301,7 @@ class RotatingShieldPFEstimator:
             n_rollouts=n_rollouts,
             orient_selection="IG",
             return_debug=return_debug,
+            rng_seed=rng_seed,
         )
 
     def estimate_change_norm(self) -> float:
@@ -1018,18 +1332,50 @@ class RotatingShieldPFEstimator:
         for iso, filt in self.filters.items():
             # Prefer continuous PF if available; otherwise fallback to legacy grid
             if filt.continuous_particles:
-                w = filt.continuous_weights
-                max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
-                if max_r == 0:
-                    continue
-                strengths = np.zeros((len(filt.continuous_particles), max_r), dtype=float)
-                for i, p in enumerate(filt.continuous_particles):
-                    r = p.state.num_sources
-                    if r > 0:
-                        strengths[i, :r] = p.state.strengths
-                mean = np.sum(w[:, None] * strengths, axis=0)
-                var = np.sum(w[:, None] * (strengths - mean) ** 2, axis=0)
-                total += float(np.sum(var))
+                if self._gpu_enabled():
+                    try:
+                        from pf import gpu_utils
+                        import torch
+                    except ImportError:
+                        w = filt.continuous_weights
+                        max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
+                        if max_r == 0:
+                            continue
+                        strengths = np.zeros((len(filt.continuous_particles), max_r), dtype=float)
+                        for i, p in enumerate(filt.continuous_particles):
+                            r = p.state.num_sources
+                            if r > 0:
+                                strengths[i, :r] = p.state.strengths
+                        mean = np.sum(w[:, None] * strengths, axis=0)
+                        var = np.sum(w[:, None] * (strengths - mean) ** 2, axis=0)
+                        total += float(np.sum(var))
+                    else:
+                        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
+                        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
+                        states = [p.state for p in filt.continuous_particles]
+                        _, strengths_t, _, _ = gpu_utils.pack_states(states, device=device, dtype=dtype)
+                        weights = torch.as_tensor(filt.continuous_weights, device=device, dtype=dtype)
+                        weight_sum = torch.sum(weights)
+                        if float(weight_sum) <= 0.0:
+                            weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
+                        else:
+                            weights = weights / weight_sum
+                        mean = torch.sum(weights[:, None] * strengths_t, dim=0)
+                        var = torch.sum(weights[:, None] * (strengths_t - mean) ** 2, dim=0)
+                        total += float(torch.sum(var).detach().cpu().item())
+                else:
+                    w = filt.continuous_weights
+                    max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
+                    if max_r == 0:
+                        continue
+                    strengths = np.zeros((len(filt.continuous_particles), max_r), dtype=float)
+                    for i, p in enumerate(filt.continuous_particles):
+                        r = p.state.num_sources
+                        if r > 0:
+                            strengths[i, :r] = p.state.strengths
+                    mean = np.sum(w[:, None] * strengths, axis=0)
+                    var = np.sum(w[:, None] * (strengths - mean) ** 2, axis=0)
+                    total += float(np.sum(var))
             else:
                 weights = np.exp(filt.log_weights)
                 weights = weights / max(np.sum(weights), 1e-12)

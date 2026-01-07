@@ -29,7 +29,13 @@ def prune_spurious_sources_continuous(
     if not estimator.measurements:
         return {iso: np.ones(0, dtype=bool) for iso in estimator.filters}
 
-    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
+    kernel = ContinuousKernel(
+        mu_by_isotope=estimator.mu_by_isotope,
+        shield_params=estimator.shield_params,
+        use_gpu=estimator._gpu_enabled(),
+        gpu_device=estimator.pf_config.gpu_device,
+        gpu_dtype=estimator.pf_config.gpu_dtype,
+    )
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
     estimates = estimator.estimates()
 
