@@ -10,6 +10,9 @@ import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+from measurement.obstacles import ObstacleGrid
 
 
 @dataclass
@@ -144,12 +147,15 @@ class RealTimePFVisualizer:
         world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
         true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
         true_strengths: Optional[Dict[str, float]] = None,
+        obstacle_grid: ObstacleGrid | None = None,
         show_counts: bool = True,
     ) -> None:
+        """Initialize the visualizer and optional obstacle overlay."""
         self.isotopes = isotopes
         self.world_bounds = world_bounds or (0, 10, 0, 10, 0, 3)
         self.true_sources = true_sources or {}
         self.true_strengths = true_strengths or {}
+        self.obstacle_grid = obstacle_grid
         self.show_counts = show_counts
         self.fig = plt.figure(figsize=(12, 6))
         if self.show_counts:
@@ -187,6 +193,7 @@ class RealTimePFVisualizer:
         self._true_artists: list = []
         self._projection_artists: list = []
         self._true_projection_artists: list = []
+        self._obstacle_artist = None
         self._particle_size_range = (0.3, 6.0)
         self._particle_alpha_range = (0.05, 0.95)
         self._particle_weight_exponent = 1.0
@@ -255,6 +262,19 @@ class RealTimePFVisualizer:
             Y, Z = np.meshgrid([y], zs)
             X = np.array([[xmin, xmin], [xmax, xmax]])
             self.ax3d.plot_wireframe(X, Y, Z, color="gray", alpha=0.2)
+        if self.obstacle_grid is not None:
+            self._draw_obstacle_grid()
+
+    def _draw_obstacle_grid(self) -> None:
+        """Draw obstacle cells as black squares on the z=0 plane."""
+        if self.obstacle_grid is None:
+            return
+        polygons = self.obstacle_grid.blocked_polygons(z=0.0)
+        if not polygons:
+            return
+        collection = Poly3DCollection(polygons, facecolors="black", edgecolors="none", alpha=0.85)
+        self.ax3d.add_collection3d(collection)
+        self._obstacle_artist = collection
 
     def _init_label_axis(self) -> None:
         """Initialize the label panel axis."""
@@ -278,6 +298,8 @@ class RealTimePFVisualizer:
                 lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
+        if self.obstacle_grid is not None and self.obstacle_grid.blocked_cells:
+            lines.append(("obstacles", "black", "s", "None"))
         for iso in self._iter_active_isotopes():
             color = self.colors.get(iso, "black")
             lines.append((f"{iso} particles", color, ".", "None"))
@@ -301,6 +323,8 @@ class RealTimePFVisualizer:
                 lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
+        if self.obstacle_grid is not None and self.obstacle_grid.blocked_cells:
+            lines.append(("obstacles", "black", "s", "None"))
         for iso in self._iter_active_isotopes():
             color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             lines.append((f"{iso} est", color, "x", "None"))

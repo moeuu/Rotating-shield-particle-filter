@@ -7,12 +7,15 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import PatchCollection
 from matplotlib.colors import ListedColormap
+from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
 
 from measurement.continuous_kernels import ContinuousKernel, geometric_term
 from measurement.kernels import ShieldParams
 from measurement.shielding import octant_index_from_normal
+from measurement.obstacles import ObstacleGrid
 
 try:
     import torch
@@ -127,13 +130,30 @@ def _expected_intensity_at_points(
     return intensities_t.detach().cpu().numpy()
 
 
+def _draw_obstacle_cells(ax: plt.Axes, obstacles: ObstacleGrid) -> None:
+    """Draw obstacle grid cells as black rectangles."""
+    patches: list[Rectangle] = []
+    for x0, x1, y0, y1 in obstacles.blocked_bounds():
+        patches.append(Rectangle((x0, y0), x1 - x0, y1 - y0))
+    if not patches:
+        return
+    collection = PatchCollection(
+        patches,
+        facecolor="black",
+        edgecolor="none",
+        alpha=0.85,
+        label="Obstacles",
+    )
+    ax.add_collection(collection)
+
+
 def render_heatmap(
     env_bounds: Tuple[float, float, float, float],
     trajectory: NDArray[np.float64],
     estimates: Dict[str, Dict[str, NDArray[np.float64]]],
     resolution: float = 0.5,
     shield_normal: Optional[NDArray[np.float64]] = None,
-    obstacles: Optional[Iterable[Tuple[float, float]]] = None,
+    obstacles: Optional[Iterable[Tuple[float, float]] | ObstacleGrid] = None,
     cmap: str = "inferno",
     output_path: Optional[Path] = None,
     mu_by_isotope: Optional[Dict[str, object]] = None,
@@ -151,7 +171,7 @@ def render_heatmap(
         estimates: dict[iso] -> {"positions": (M,3), "strengths": (M,)}
         resolution: grid spacing (m)
         shield_normal: optional shielding orientation to model attenuation
-        obstacles: iterable of (x,y) points to mark obstacles
+        obstacles: iterable of (x,y) points or ObstacleGrid to mark obstacles
         cmap: matplotlib colormap name
         output_path: if provided, save the figure to this path
         mu_by_isotope: optional per-isotope attenuation coefficients for Fe/Pb
@@ -185,9 +205,11 @@ def render_heatmap(
     plt.colorbar(im, ax=ax, label="Expected intensity (a.u.)")
     if trajectory is not None and trajectory.size:
         ax.plot(trajectory[:, 0], trajectory[:, 1], "-o", color="cyan", label="Trajectory")
-    if obstacles:
+    if isinstance(obstacles, ObstacleGrid):
+        _draw_obstacle_cells(ax, obstacles)
+    elif obstacles:
         obs = np.array(list(obstacles))
-        ax.scatter(obs[:, 0], obs[:, 1], color="red", marker="x", label="Obstacles")
+        ax.scatter(obs[:, 0], obs[:, 1], color="black", marker="s", label="Obstacles")
     # Plot estimated sources
     for iso, est in estimates.items():
         pos3d = est.get("positions", np.zeros((0, 3)))

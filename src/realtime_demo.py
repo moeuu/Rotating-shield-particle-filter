@@ -28,6 +28,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource
+from measurement.obstacles import load_or_generate_obstacle_grid
 from measurement.shielding import (
     HVL_TVL_TABLE_MM,
     generate_octant_orientations,
@@ -51,16 +52,19 @@ from visualization.realtime_viz import (
     RealTimePFVisualizer,
     build_frame_from_pf,
 )
+from evaluation_metrics import compute_metrics, print_metrics_report
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
 SPECTRUM_DIR = RESULTS_DIR / "spetrum"
 PF_DIR = RESULTS_DIR / "pf"
+OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_INTERVAL = 10
 PRUNE_MIN_STRENGTH_ABS = 5.0
 PRUNE_MIN_STRENGTH_RATIO = 0.001
 PRUNE_TAU_MIX = 0.6
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
+DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -277,16 +281,38 @@ def run_live_pf(
     ig_threshold_mode: str = "relative_pose",
     ig_threshold_rel: float = 0.02,
     ig_threshold_min: float | None = None,
+    obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
+    obstacle_seed: int | None = None,
+    eval_match_radius_m: float = 0.5,
 ) -> None:
     """
     Run a simple PF loop with live visualization (active pose/orientation selection).
 
     If max_steps is None, run until the information-gain threshold is met.
     If max_poses is None, run without a pose-count limit.
+    If obstacle_layout_path is provided, blocked grid cells are excluded and shown
+    in black.
     """
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
+    obstacle_grid = None
+    if obstacle_layout_path:
+        obstacle_path = Path(obstacle_layout_path)
+        if not obstacle_path.is_absolute():
+            obstacle_path = (ROOT / obstacle_path).resolve()
+        keep_free = None
+        if env.detector_position is not None:
+            keep_free = [(env.detector_position[0], env.detector_position[1])]
+        obstacle_grid = load_or_generate_obstacle_grid(
+            obstacle_path,
+            size_x=env.size_x,
+            size_y=env.size_y,
+            cell_size=1.0,
+            blocked_fraction=0.4,
+            rng_seed=obstacle_seed,
+            keep_free_points=keep_free,
+        )
     normals = generate_octant_orientations()
     rot_mats = generate_octant_rotation_matrices()
     num_orients = len(rot_mats)
@@ -364,6 +390,7 @@ def run_live_pf(
         world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
         true_sources=true_src,
         true_strengths=true_strengths,
+        obstacle_grid=obstacle_grid,
         show_counts=False,
     )
     estimate_mode = "mmse"
@@ -571,6 +598,7 @@ def run_live_pf(
         print("Generating candidate poses for next measurement point...")
         candidates = generate_candidate_poses(
             current_pose_xyz=pose,
+            map_api=obstacle_grid,
             n_candidates=16,
             strategy="free_space_sobol",
             min_dist_from_visited=3.0,
@@ -607,6 +635,37 @@ def run_live_pf(
     if last_spectrum is not None:
         print(f"Final spectrum saved to: {spectrum_out_path}")
     print(f"Total measurements: {step_counter}, total live time (simulated): {total_meas_time:.1f} s")
+    gt_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
+    for src in sources:
+        gt_by_iso.setdefault(src.isotope, []).append(
+            {
+                "pos": [
+                    float(src.position[0]),
+                    float(src.position[1]),
+                    float(src.position[2]),
+                ],
+                "strength": float(src.intensity_cps_1m),
+            }
+        )
+    est_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
+    for iso, estimate in estimator.estimates().items():
+        positions = np.asarray(estimate[0], dtype=float)
+        strengths = np.asarray(estimate[1], dtype=float)
+        est_list: list[dict[str, float | list[float]]] = []
+        for pos, strength in zip(positions, strengths):
+            est_list.append(
+                {
+                    "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+                    "strength": float(strength),
+                }
+            )
+        est_by_iso[iso] = est_list
+    metrics = compute_metrics(
+        gt_by_iso,
+        est_by_iso,
+        match_radius_m=eval_match_radius_m,
+    )
+    print_metrics_report(metrics)
     if live:
         plt.ioff()
         plt.pause(0.1)

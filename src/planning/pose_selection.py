@@ -493,6 +493,7 @@ def select_next_pose_after_rotation(
     estimator: RotatingShieldPFEstimator,
     current_pose_xyz: NDArray[np.float64],
     visited_poses_xyz: NDArray[np.float64],
+    map_api: object | None = None,
     n_candidates: int = 1024,
     n_rollouts: int = 64,
     live_time_per_rot_s: float = 1.0,
@@ -511,6 +512,7 @@ def select_next_pose_after_rotation(
         E[U_after-rotation | q] + lambda_cost * ||q - q_current||_2
 
     Candidate poses are generated on-demand using the requested strategy.
+    map_api can be used to reject poses inside obstacle cells.
 
     GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
     """
@@ -533,6 +535,7 @@ def select_next_pose_after_rotation(
 
         candidates = generate_candidate_poses(
             current_pose_xyz=current_pose_xyz,
+            map_api=map_api,
             n_candidates=n_candidates,
             strategy=candidate_strategy,
             visited_poses_xyz=visited_poses_xyz,
