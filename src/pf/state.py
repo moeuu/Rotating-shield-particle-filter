@@ -1,15 +1,8 @@
-"""Define per-isotope particle state vectors (source count, positions, intensities, background).
-
-Two representations exist while transitioning to the Chapter 3.3 formulation:
-- `IsotopeState`: continuous 3D positions (s_{h,m}), strengths (q_{h,m}), background b_h.
-- `ParticleState`: legacy grid-index representation (kept temporarily for compatibility).
-"""
+"""Define per-isotope particle state vectors (source count, positions, intensities, background)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
-
 import numpy as np
 from numpy.typing import NDArray
 
@@ -36,37 +29,3 @@ class IsotopeState:
             covariances=None if self.covariances is None else self.covariances.copy(),
         )
 
-
-@dataclass
-class ParticleState:
-    """Legacy grid-index particle state (Sec. 3.4, discrete candidate_sources)."""
-
-    source_indices: NDArray[np.int32]  # shape (r_h,)
-    strengths: NDArray[np.float64]  # shape (r_h,)
-    background: float
-
-    def copy(self) -> "ParticleState":
-        return ParticleState(
-            source_indices=self.source_indices.copy(),
-            strengths=self.strengths.copy(),
-            background=float(self.background),
-        )
-
-
-def jitter_state(
-    state: ParticleState,
-    strength_sigma: float = 0.1,
-    background_sigma: float = 0.1,
-) -> ParticleState:
-    """Add log-space jitter to strengths and Gaussian jitter to background."""
-    new_state = state.copy()
-    if new_state.strengths.size:
-        strength_floor = 1e-12
-        safe = np.maximum(new_state.strengths, strength_floor)
-        log_strengths = np.log(safe)
-        log_strengths = log_strengths + np.random.normal(
-            scale=strength_sigma, size=log_strengths.shape
-        )
-        new_state.strengths = np.exp(log_strengths)
-    new_state.background = max(0.0, new_state.background + np.random.normal(scale=background_sigma))
-    return new_state

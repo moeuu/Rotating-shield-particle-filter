@@ -87,7 +87,7 @@ def test_poisson_weight_update_prefers_higher_lambda() -> None:
     ]
     pf.kernel = dummy_kernel
     z_obs = 1.0
-    pf.update_continuous(z_obs=z_obs, pose_idx=0, orient_idx=0, live_time_s=1.0)
+    pf.update_continuous_pair(z_obs=z_obs, pose_idx=0, fe_index=0, pb_index=0, live_time_s=1.0)
     weights = pf.continuous_weights
     assert weights[0] > weights[1]
 

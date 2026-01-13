@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
-from pf.state import ParticleState, IsotopeState
-from pf.weights import effective_sample_size, log_weight_update_poisson
+from pf.state import IsotopeState
 from pf.resampling import systematic_resample
-from pf.regularization import regularize_states
 
 
 @dataclass
@@ -28,8 +26,10 @@ class PFConfig:
     position_sigma: float = 0.1
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
+    background_level: float | dict[str, float] = 0.0
     min_strength: float = 0.01
     p_birth: float = 0.05
+    p_kill: float = 0.1
     ess_low: float = 0.5
     ess_high: float = 0.9
     # Continuous PF priors (Sec. 3.3.2)
@@ -39,10 +39,16 @@ class PFConfig:
     # Strength prior (cps@1m scale). Defaults cover ~1e3–1e5 cps via log-normal.
     init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
     init_strength_log_sigma: float = 1.0
-    use_discrete: bool = True  # set False to skip legacy discrete initialisation
     use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float32"
+    label_alignment_iters: int = 2
+    label_pos_weight: float = 1.0
+    label_strength_weight: float = 0.2
+    label_missing_cost: float = 1e3
+    label_pos_scale: float | None = None
+    label_strength_scale: float | None = None
+    label_enable: bool = True
 
 
 @dataclass
@@ -66,10 +72,6 @@ class IsotopeParticleFilter:
         self.kernel = kernel
         self.config = config or PFConfig()
         self.N = self.config.num_particles
-        self.states: List[ParticleState] = []
-        self.log_weights: NDArray[np.float64] = np.zeros(self.N)
-        if self.kernel is not None and self.config.use_discrete:
-            self._init_particles()
         mu_by_isotope = getattr(kernel, "mu_by_isotope", None) if kernel is not None else None
         shield_params = getattr(kernel, "shield_params", ShieldParams()) if kernel is not None else ShieldParams()
         self.continuous_kernel = ContinuousKernel(
@@ -77,6 +79,7 @@ class IsotopeParticleFilter:
             shield_params=shield_params,
         )
         self.continuous_particles: List[IsotopeParticle] = []
+        self._label_reference: IsotopeState | None = None
         self._init_continuous_particles()
 
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
@@ -105,21 +108,19 @@ class IsotopeParticleFilter:
             else:
                 positions = np.zeros((0, 3), dtype=float)
                 strengths = np.zeros(0, dtype=float)
-            b_h = float(max(0.0, np.random.normal(loc=0.1, scale=0.05)))
+            b_h = self._background_level()
             st = IsotopeState(num_sources=r_h, positions=positions, strengths=strengths, background=b_h)
             self.continuous_particles.append(IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N))))
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
+        from pf import gpu_utils
+
         if not self.config.use_gpu:
-            return False
-        try:
-            from pf import gpu_utils
-        except ImportError:
-            return False
-        if self.config.gpu_device.startswith("cpu"):
-            return gpu_utils.torch_installed()
-        return gpu_utils.torch_available()
+            raise RuntimeError("GPU-only mode: enable use_gpu in PFConfig.")
+        if not gpu_utils.torch_available():
+            raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
+        return True
 
     def _continuous_expected_counts_torch(
         self, pose_idx: int, orient_idx: int, live_time_s: float
@@ -170,6 +171,7 @@ class IsotopeParticleFilter:
             mu_pb=mu_pb,
             thickness_fe_cm=shield_params.thickness_fe_cm,
             thickness_pb_cm=shield_params.thickness_pb_cm,
+            use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
@@ -214,49 +216,19 @@ class IsotopeParticleFilter:
 
     def _continuous_expected_counts(self, pose_idx: int, orient_idx: int, live_time_s: float) -> NDArray[np.float64]:
         """Compute Λ_{k,h}^{(n)} for each continuous particle using ContinuousKernel."""
-        if self._gpu_enabled():
-            return self._continuous_expected_counts_gpu(
-                pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
-            )
-        lam = np.zeros(len(self.continuous_particles), dtype=float)
-        detector_pos = self.kernel.poses[pose_idx]
-        orient_vec = self.kernel.orientations[orient_idx]
-        for i, p in enumerate(self.continuous_particles):
-            st = p.state
-            lam[i] = self.continuous_kernel.expected_counts(
-                isotope=self.isotope,
-                detector_pos=detector_pos,
-                sources=st.positions,
-                strengths=st.strengths,
-                orient_idx=self.continuous_kernel.orient_index_from_vector(orient_vec),
-                live_time_s=live_time_s,
-                background=st.background,
-            )
-        return lam
+        self._gpu_enabled()
+        return self._continuous_expected_counts_gpu(
+            pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
+        )
 
     def _continuous_expected_counts_pair(
         self, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float
     ) -> NDArray[np.float64]:
         """Compute Λ_{k,h}^{(n)} using Fe/Pb octant indices (Eq. 3.41)."""
-        if self._gpu_enabled():
-            return self._continuous_expected_counts_pair_gpu(
-                pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s
-            )
-        lam = np.zeros(len(self.continuous_particles), dtype=float)
-        detector_pos = self.kernel.poses[pose_idx]
-        for i, p in enumerate(self.continuous_particles):
-            st = p.state
-            lam[i] = self.continuous_kernel.expected_counts_pair(
-                isotope=self.isotope,
-                detector_pos=detector_pos,
-                sources=st.positions,
-                strengths=st.strengths,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-                background=st.background,
-            )
-        return lam
+        self._gpu_enabled()
+        return self._continuous_expected_counts_pair_gpu(
+            pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s
+        )
 
     def _continuous_expected_counts_pair_at_pose_torch(
         self,
@@ -293,6 +265,7 @@ class IsotopeParticleFilter:
             mu_pb=mu_pb,
             thickness_fe_cm=shield_params.thickness_fe_cm,
             thickness_pb_cm=shield_params.thickness_pb_cm,
+            use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
@@ -306,52 +279,14 @@ class IsotopeParticleFilter:
         live_time_s: float,
     ) -> NDArray[np.float64]:
         """Compute Λ_{k,h}^{(n)} for explicit detector position."""
-        if self._gpu_enabled():
-            lam_t = self._continuous_expected_counts_pair_at_pose_torch(
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-            )
-            return lam_t.detach().cpu().numpy()
-        lam = np.zeros(len(self.continuous_particles), dtype=float)
-        for i, p in enumerate(self.continuous_particles):
-            st = p.state
-            lam[i] = self.continuous_kernel.expected_counts_pair(
-                isotope=self.isotope,
-                detector_pos=np.asarray(detector_pos, dtype=float),
-                sources=st.positions,
-                strengths=st.strengths,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-                background=st.background,
-            )
-        return lam
-
-    def update_continuous(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
-        """
-        Poisson log-weight update for continuous particles (Sec. 3.3.3).
-
-        z_obs should come from spectrum unfolding (Chapter 2.5.7). Expected Λ is
-        computed via continuous kernel; no shortcut counts are used.
-        """
-        if self._gpu_enabled():
-            lam_t = self._continuous_expected_counts_torch(
-                pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
-            )
-            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
-            self._maybe_resample_continuous()
-            return
-        lam = self._continuous_expected_counts(pose_idx, orient_idx, live_time_s)
-        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
-        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
-        log_unnorm -= np.max(log_unnorm)
-        w = np.exp(log_unnorm)
-        w /= np.sum(w)
-        for p, wi in zip(self.continuous_particles, w):
-            p.log_weight = float(np.log(wi + 1e-20))
-        self._maybe_resample_continuous()
+        self._gpu_enabled()
+        lam_t = self._continuous_expected_counts_pair_at_pose_torch(
+            detector_pos=detector_pos,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+        )
+        return lam_t.detach().cpu().numpy()
 
     def update_continuous_pair(self, z_obs: float, pose_idx: int, fe_index: int, pb_index: int, live_time_s: float) -> None:
         """
@@ -359,30 +294,17 @@ class IsotopeParticleFilter:
 
         z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
         """
-        if self._gpu_enabled():
-            lam_t = self._continuous_expected_counts_pair_torch(
-                pose_idx=pose_idx,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-            )
-            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
-            self._maybe_resample_continuous()
-            return
-        lam = self._continuous_expected_counts_pair(
+        self._gpu_enabled()
+        lam_t = self._continuous_expected_counts_pair_torch(
             pose_idx=pose_idx,
             fe_index=fe_index,
             pb_index=pb_index,
             live_time_s=live_time_s,
         )
-        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
-        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
-        log_unnorm -= np.max(log_unnorm)
-        w = np.exp(log_unnorm)
-        w /= np.sum(w)
-        for p, wi in zip(self.continuous_particles, w):
-            p.log_weight = float(np.log(wi + 1e-20))
+        self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
         self._maybe_resample_continuous()
+        self.adapt_num_particles()
+        self.align_continuous_labels()
 
     def update_continuous_pair_at_pose(
         self,
@@ -397,30 +319,17 @@ class IsotopeParticleFilter:
 
         This avoids reliance on pose indices for planning-time evaluations.
         """
-        if self._gpu_enabled():
-            lam_t = self._continuous_expected_counts_pair_at_pose_torch(
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-            )
-            self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
-            self._maybe_resample_continuous()
-            return
-        lam = self._continuous_expected_counts_pair_at_pose(
+        self._gpu_enabled()
+        lam_t = self._continuous_expected_counts_pair_at_pose_torch(
             detector_pos=detector_pos,
             fe_index=fe_index,
             pb_index=pb_index,
             live_time_s=live_time_s,
         )
-        log_unnorm = np.array([p.log_weight for p in self.continuous_particles], dtype=float)
-        log_unnorm = log_unnorm + z_obs * np.log(lam + 1e-12) - lam
-        log_unnorm -= np.max(log_unnorm)
-        w = np.exp(log_unnorm)
-        w /= np.sum(w)
-        for p, wi in zip(self.continuous_particles, w):
-            p.log_weight = float(np.log(wi + 1e-20))
+        self._update_continuous_weights_gpu(lam_t=lam_t, z_obs=z_obs)
         self._maybe_resample_continuous()
+        self.adapt_num_particles()
+        self.align_continuous_labels()
 
     @property
     def continuous_weights(self) -> NDArray[np.float64]:
@@ -446,9 +355,165 @@ class IsotopeParticleFilter:
                 sigma_pos=self.config.position_sigma,
                 sigma_int=self.config.strength_sigma,
                 p_birth=self.config.p_birth,
-                p_kill=0.1,
+                p_kill=self.config.p_kill,
                 intensity_threshold=self.config.min_strength,
             )
+
+    def _label_scales(
+        self,
+        ref_positions: NDArray[np.float64],
+        ref_strengths: NDArray[np.float64],
+    ) -> tuple[float, float]:
+        """Return (pos_scale, strength_scale) for label alignment costs."""
+        if self.config.label_pos_scale is not None:
+            pos_scale = float(self.config.label_pos_scale)
+        else:
+            span = np.array(self.config.position_max, dtype=float) - np.array(self.config.position_min, dtype=float)
+            pos_scale = float(np.linalg.norm(span))
+        if pos_scale <= 0.0:
+            pos_scale = 1.0
+        if self.config.label_strength_scale is not None:
+            strength_scale = float(self.config.label_strength_scale)
+        else:
+            positive = ref_strengths[ref_strengths > 0]
+            strength_scale = float(np.median(positive)) if positive.size else 1.0
+        if strength_scale <= 0.0:
+            strength_scale = 1.0
+        return pos_scale, strength_scale
+
+    def _label_cost_matrix(
+        self,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        ref_positions: NDArray[np.float64],
+        ref_strengths: NDArray[np.float64],
+        pos_scale: float,
+        strength_scale: float,
+    ) -> NDArray[np.float64]:
+        """Compute the label-alignment cost matrix between particle and reference sources."""
+        self._gpu_enabled()
+        import torch
+        from pf import gpu_utils
+
+        device = gpu_utils.resolve_device(self.config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+        pos_t = torch.as_tensor(positions, device=device, dtype=dtype)
+        ref_pos_t = torch.as_tensor(ref_positions, device=device, dtype=dtype)
+        str_t = torch.as_tensor(strengths, device=device, dtype=dtype)
+        ref_str_t = torch.as_tensor(ref_strengths, device=device, dtype=dtype)
+        if pos_t.numel() == 0 or ref_pos_t.numel() == 0:
+            return np.zeros((positions.shape[0], ref_positions.shape[0]), dtype=float)
+        diff = pos_t[:, None, :] - ref_pos_t[None, :, :]
+        pos_cost = torch.linalg.norm(diff, dim=-1) / float(pos_scale)
+        str_cost = torch.abs(str_t[:, None] - ref_str_t[None, :]) / float(strength_scale)
+        cost = self.config.label_pos_weight * pos_cost + self.config.label_strength_weight * str_cost
+        return cost.detach().cpu().numpy()
+
+    def _align_particle_to_reference(
+        self,
+        particle: IsotopeParticle,
+        ref_positions: NDArray[np.float64],
+        ref_strengths: NDArray[np.float64],
+        pos_scale: float,
+        strength_scale: float,
+    ) -> None:
+        """Reorder a particle's sources to best match the reference ordering."""
+        from scipy.optimize import linear_sum_assignment
+
+        st = particle.state
+        if st.num_sources == 0 or ref_positions.size == 0:
+            return
+        cost = self._label_cost_matrix(
+            positions=st.positions,
+            strengths=st.strengths,
+            ref_positions=ref_positions,
+            ref_strengths=ref_strengths,
+            pos_scale=pos_scale,
+            strength_scale=strength_scale,
+        )
+        n_rows, n_cols = cost.shape
+        size = max(n_rows, n_cols)
+        padded = np.full((size, size), float(self.config.label_missing_cost), dtype=float)
+        padded[:n_rows, :n_cols] = cost
+        row_ind, col_ind = linear_sum_assignment(padded)
+        assigned = {c: r for r, c in zip(row_ind, col_ind) if r < n_rows and c < n_cols}
+        ordered_pos: list[NDArray[np.float64]] = []
+        ordered_str: list[float] = []
+        used_rows: set[int] = set()
+        for ref_idx in range(n_cols):
+            row = assigned.get(ref_idx)
+            if row is None:
+                continue
+            ordered_pos.append(st.positions[row])
+            ordered_str.append(float(st.strengths[row]))
+            used_rows.add(row)
+        for row in range(n_rows):
+            if row in used_rows:
+                continue
+            ordered_pos.append(st.positions[row])
+            ordered_str.append(float(st.strengths[row]))
+        if ordered_pos:
+            st.positions = np.vstack(ordered_pos)
+            st.strengths = np.array(ordered_str, dtype=float)
+            st.num_sources = st.positions.shape[0]
+
+    def _reference_from_particles(self, ref_count: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Compute a weighted reference ordering from the aligned particle set."""
+        if ref_count <= 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        w = self.continuous_weights
+        positions = np.zeros((ref_count, 3), dtype=float)
+        strengths = np.zeros(ref_count, dtype=float)
+        for j in range(ref_count):
+            pos_list = []
+            str_list = []
+            w_list = []
+            for wi, p in zip(w, self.continuous_particles):
+                if p.state.num_sources > j:
+                    pos_list.append(p.state.positions[j])
+                    str_list.append(p.state.strengths[j])
+                    w_list.append(wi)
+            if not w_list:
+                continue
+            wj = np.array(w_list, dtype=float)
+            wj = wj / max(np.sum(wj), 1e-12)
+            pos_arr = np.vstack(pos_list)
+            str_arr = np.array(str_list, dtype=float)
+            positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+            strengths[j] = float(np.sum(wj * str_arr))
+        return positions, strengths
+
+    def align_continuous_labels(self) -> None:
+        """
+        Align per-particle source ordering to mitigate label switching.
+
+        Uses Hungarian assignment against a reference ordering built from the
+        highest-weight particle, then refines the reference iteratively.
+        """
+        if not self.config.label_enable or not self.continuous_particles:
+            return
+        ref_state = self._label_reference or self.best_particle().state
+        if ref_state.num_sources == 0:
+            return
+        ref_positions = ref_state.positions.copy()
+        ref_strengths = ref_state.strengths.copy()
+        pos_scale, strength_scale = self._label_scales(ref_positions, ref_strengths)
+        for _ in range(max(1, int(self.config.label_alignment_iters))):
+            for particle in self.continuous_particles:
+                self._align_particle_to_reference(
+                    particle=particle,
+                    ref_positions=ref_positions,
+                    ref_strengths=ref_strengths,
+                    pos_scale=pos_scale,
+                    strength_scale=strength_scale,
+                )
+            ref_positions, ref_strengths = self._reference_from_particles(ref_positions.shape[0])
+        self._label_reference = IsotopeState(
+            num_sources=ref_positions.shape[0],
+            positions=ref_positions,
+            strengths=ref_strengths,
+            background=0.0,
+        )
 
     def adapt_num_particles(self) -> None:
         """
@@ -492,7 +557,7 @@ class IsotopeParticleFilter:
                 sigma_pos=self.config.position_sigma,
                 sigma_int=self.config.strength_sigma,
                 p_birth=self.config.p_birth,
-                p_kill=0.1,
+                p_kill=self.config.p_kill,
                 intensity_threshold=self.config.min_strength,
             )
 
@@ -512,7 +577,7 @@ class IsotopeParticleFilter:
         Apply small Gaussian jitter to positions/strengths and simple birth/death moves (Sec. 3.3.4).
 
         - positions: s <- s + N(0, sigma_pos^2 I)
-        - strengths: log(q) <- log(q) + N(0, sigma_int^2)
+        - strengths: q <- max(q + N(0, sigma_int^2), intensity_threshold)
         - delete sources with q < intensity_threshold with prob p_kill
         - with prob p_birth, add a new source uniformly in workspace with small initial strength
         """
@@ -521,23 +586,19 @@ class IsotopeParticleFilter:
         max_sources = self.config.max_sources
         for p in self.continuous_particles:
             st = p.state
+            st.background = self._background_level()
             if st.positions.size:
                 st.positions = st.positions + np.random.normal(scale=sigma_pos, size=st.positions.shape)
                 st.positions = np.clip(st.positions, lo, hi)
-                strength_floor = 1e-12
-                safe = np.maximum(st.strengths, strength_floor)
-                log_strengths = np.log(safe)
-                log_strengths = log_strengths + np.random.normal(
-                    scale=sigma_int, size=log_strengths.shape
-                )
-                st.strengths = np.exp(log_strengths)
+                st.strengths = st.strengths + np.random.normal(scale=sigma_int, size=st.strengths.shape)
+                st.strengths = np.maximum(st.strengths, 0.0)
                 # kill weak sources
                 mask = np.ones(st.num_sources, dtype=bool)
                 for i, q in enumerate(st.strengths):
                     if q < intensity_threshold and np.random.rand() < p_kill:
                         mask[i] = False
                 st.positions = st.positions[mask]
-                st.strengths = st.strengths[mask]
+                st.strengths = np.maximum(st.strengths[mask], intensity_threshold)
                 st.num_sources = st.positions.shape[0]
             # birth
             if np.random.rand() < p_birth:
@@ -549,63 +610,12 @@ class IsotopeParticleFilter:
                 st.strengths = np.append(st.strengths, new_strength)
                 st.num_sources = st.positions.shape[0]
 
-    def _init_particles(self) -> None:
-        """Randomly initialise discrete particles over source indices and strengths."""
-        self.states = []
-        J = self.kernel.num_sources
-        min_r = max(1, int(self.config.init_num_sources[0]))
-        if self.config.max_sources is None:
-            max_r = max(min_r, int(self.config.init_num_sources[1]))
-        else:
-            max_r = max(min_r, int(self.config.max_sources))
-        for _ in range(self.N):
-            r = np.random.randint(min_r, max_r + 1)
-            replace = r > J
-            idx = np.random.choice(J, size=r, replace=replace)
-            strengths = np.abs(np.random.normal(loc=1.0, scale=0.5, size=r))
-            self.states.append(ParticleState(source_indices=idx.astype(np.int32), strengths=strengths, background=0.1))
-        self.log_weights = np.log(np.ones(self.N) / self.N)
-
-    def predict(self) -> None:
-        """Predict step for the discrete PF (diffuse strengths and background only)."""
-        self.states = regularize_states(
-            self.states,
-            kernel=self.kernel,
-            strength_sigma=self.config.strength_sigma,
-            background_sigma=self.config.background_sigma,
-            min_strength=self.config.min_strength,
-            p_birth=self.config.p_birth,
-            max_sources=self.config.max_sources,
-        )
-
-    def update(self, z_obs: float, pose_idx: int, orient_idx: int, live_time_s: float) -> None:
-        """
-        Poisson log-weight update for the discrete PF.
-
-        z_obs must come from spectrum unfolding (Sec. 2.5.7). This method never
-        synthesises observations from geometry; expected counts are computed only
-        for comparison with the observed isotope-wise counts.
-        """
-        # PF now consumes isotope-wise counts from spectrum unfolding; expected rate
-        # is approximated using current strengths and geometric kernels.
-        lam = np.zeros(self.N, dtype=float)
-        for i, st in enumerate(self.states):
-            contrib = 0.0
-            for idx_src, strength in zip(st.source_indices, st.strengths):
-                kvec = self.kernel.kernel(self.isotope, pose_idx, orient_idx)
-                contrib += kvec[idx_src] * strength
-            lam[i] = live_time_s * (contrib + st.background)
-        self.log_weights = log_weight_update_poisson(self.log_weights, z_obs=z_obs, lambda_exp=lam)
-        self._maybe_resample()
-
-    def _maybe_resample(self) -> None:
-        """Resample when effective sample size falls below the threshold."""
-        ess = effective_sample_size(self.log_weights)
-        if ess < self.config.resample_threshold * self.N:
-            idx = systematic_resample(self.log_weights)
-            self.states = [self.states[i].copy() for i in idx]
-            self.log_weights = np.log(np.ones(self.N) / self.N)
-            self.predict()
+    def _background_level(self) -> float:
+        """Resolve per-isotope background level."""
+        level = self.config.background_level
+        if isinstance(level, dict):
+            return float(level.get(self.isotope, 0.0))
+        return float(level)
 
     def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
         """
@@ -613,72 +623,27 @@ class IsotopeParticleFilter:
         """
         if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
-        if self._gpu_enabled():
-            try:
-                from pf import gpu_utils
-                import torch
-            except ImportError:
-                w = self.continuous_weights
-                max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
-                positions = np.zeros((max_r, 3), dtype=float)
-                strengths = np.zeros(max_r, dtype=float)
-                for j in range(max_r):
-                    pos_stack = []
-                    str_stack = []
-                    w_stack = []
-                    for wi, p in zip(w, self.continuous_particles):
-                        if p.state.num_sources > j:
-                            pos_stack.append(p.state.positions[j])
-                            str_stack.append(p.state.strengths[j])
-                            w_stack.append(wi)
-                    if not w_stack:
-                        continue
-                    wj = np.array(w_stack, dtype=float)
-                    wj = wj / max(np.sum(wj), 1e-12)
-                    pos_arr = np.vstack(pos_stack)
-                    str_arr = np.array(str_stack, dtype=float)
-                    positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
-                    strengths[j] = float(np.sum(wj * str_arr))
-            else:
-                device = gpu_utils.resolve_device(self.config.gpu_device)
-                dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
-                states = [p.state for p in self.continuous_particles]
-                positions_t, strengths_t, _, mask_t = gpu_utils.pack_states(states, device=device, dtype=dtype)
-                weights = torch.as_tensor(self.continuous_weights, device=device, dtype=dtype)
-                weight_sum = torch.sum(weights)
-                if float(weight_sum) <= 0.0:
-                    weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
-                else:
-                    weights = weights / weight_sum
-                w_mask = weights[:, None] * mask_t
-                w_sum = torch.sum(w_mask, dim=0)
-                w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
-                pos_mean = torch.sum(w_mask[:, :, None] * positions_t, dim=0) / w_sum_safe[:, None]
-                str_mean = torch.sum(w_mask * strengths_t, dim=0) / w_sum_safe
-                positions = pos_mean.detach().cpu().numpy()
-                strengths = str_mean.detach().cpu().numpy()
+        self._gpu_enabled()
+        from pf import gpu_utils
+        import torch
+
+        device = gpu_utils.resolve_device(self.config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+        states = [p.state for p in self.continuous_particles]
+        positions_t, strengths_t, _, mask_t = gpu_utils.pack_states(states, device=device, dtype=dtype)
+        weights = torch.as_tensor(self.continuous_weights, device=device, dtype=dtype)
+        weight_sum = torch.sum(weights)
+        if float(weight_sum) <= 0.0:
+            weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
         else:
-            w = self.continuous_weights
-            max_r = max((p.state.num_sources for p in self.continuous_particles), default=0)
-            positions = np.zeros((max_r, 3), dtype=float)
-            strengths = np.zeros(max_r, dtype=float)
-            for j in range(max_r):
-                pos_stack = []
-                str_stack = []
-                w_stack = []
-                for wi, p in zip(w, self.continuous_particles):
-                    if p.state.num_sources > j:
-                        pos_stack.append(p.state.positions[j])
-                        str_stack.append(p.state.strengths[j])
-                        w_stack.append(wi)
-                if not w_stack:
-                    continue
-                wj = np.array(w_stack, dtype=float)
-                wj = wj / max(np.sum(wj), 1e-12)
-                pos_arr = np.vstack(pos_stack)
-                str_arr = np.array(str_stack, dtype=float)
-                positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
-                strengths[j] = float(np.sum(wj * str_arr))
+            weights = weights / weight_sum
+        w_mask = weights[:, None] * mask_t
+        w_sum = torch.sum(w_mask, dim=0)
+        w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
+        pos_mean = torch.sum(w_mask[:, :, None] * positions_t, dim=0) / w_sum_safe[:, None]
+        str_mean = torch.sum(w_mask * strengths_t, dim=0) / w_sum_safe
+        positions = pos_mean.detach().cpu().numpy()
+        strengths = str_mean.detach().cpu().numpy()
         # Trim zero-strength slots.
         mask = strengths > 0
         positions = positions[mask]

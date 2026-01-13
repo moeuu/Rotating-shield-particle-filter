@@ -51,7 +51,7 @@ def _resolve_device(device: str) -> "torch.device":
     import torch
 
     if device.startswith("cuda") and not torch.cuda.is_available():
-        return torch.device("cpu")
+        raise RuntimeError("CUDA device requested but not available.")
     return torch.device(device)
 
 
@@ -74,6 +74,7 @@ class ShieldParams:
     mu_fe: float = CS137_MU_FE_CM_INV  # 1/cm based on Cs-137 TVL.
     thickness_pb_cm: float = CS137_TVL_PB_CM
     thickness_fe_cm: float = CS137_TVL_FE_CM
+    use_angle_attenuation: bool = False  # When True, scale thickness by 1/cos(theta).
 
 
 class KernelPrecomputer:
@@ -90,7 +91,7 @@ class KernelPrecomputer:
         orientations: NDArray[np.float64],
         shield_params: ShieldParams,
         mu_by_isotope: Dict[str, object],
-        use_gpu: bool = False,
+        use_gpu: bool = True,
         gpu_device: str = "cuda",
         gpu_dtype: str = "float32",
     ) -> None:
@@ -123,10 +124,10 @@ class KernelPrecomputer:
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
         if not self.use_gpu:
-            return False
-        if self.gpu_device.startswith("cpu"):
-            return _torch_installed()
-        return _torch_available()
+            raise RuntimeError("GPU-only mode: enable use_gpu for KernelPrecomputer.")
+        if not _torch_available():
+            raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
+        return True
 
     def _sources_torch(self, device: "torch.device", dtype: "torch.dtype") -> "torch.Tensor":
         """Return sources as a cached torch tensor on the requested device/dtype."""
@@ -168,16 +169,28 @@ class KernelPrecomputer:
 
         normal = torch.as_tensor(self.orientations[orient_idx], device=device, dtype=dtype)
         cos_theta = torch.clamp(torch.sum(dir_unit * normal, dim=1), 0.0, 1.0)
-        L_fe = torch.where(
-            blocked & (cos_theta > tol),
-            torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_theta,
-            torch.zeros_like(cos_theta),
-        )
-        L_pb = torch.where(
-            blocked & (cos_theta > tol),
-            torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_theta,
-            torch.zeros_like(cos_theta),
-        )
+        if self.shield_params.use_angle_attenuation:
+            L_fe = torch.where(
+                blocked & (cos_theta > tol),
+                torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+            L_pb = torch.where(
+                blocked & (cos_theta > tol),
+                torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+        else:
+            L_fe = torch.where(
+                blocked,
+                torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype),
+                torch.zeros_like(cos_theta),
+            )
+            L_pb = torch.where(
+                blocked,
+                torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype),
+                torch.zeros_like(cos_theta),
+            )
         mu_fe, mu_pb = resolve_mu_values(
             self.mu_by_isotope, isotope, default_fe=self.shield_params.mu_fe, default_pb=self.shield_params.mu_pb
         )
@@ -204,29 +217,8 @@ class KernelPrecomputer:
         Includes geometric term and exponential attenuation based on shield thickness
         and per-isotope linear attenuation coefficients.
         """
-        if self._gpu_enabled():
-            return self._kernel_gpu(isotope, pose_idx, orient_idx)
-        pose = self.poses[pose_idx]
-        kernels = np.zeros(self.num_sources, dtype=float)
-        oct_idx = octant_index_from_normal(self.orientations[orient_idx])
-        mu_fe, mu_pb = resolve_mu_values(
-            self.mu_by_isotope, isotope, default_fe=self.shield_params.mu_fe, default_pb=self.shield_params.mu_pb
-        )
-        normal = self.orientations[orient_idx]
-        for j, src in enumerate(self.sources):
-            vec = pose - src
-            dist = np.linalg.norm(vec)
-            if dist == 0:
-                dist = 1e-6
-            geom = 1.0 / (dist**2)
-            blocked = self.octant_shield.blocks_ray(
-                detector_position=pose, source_position=src, octant_index=oct_idx
-            )
-            L_fe = path_length_cm(vec, normal, self.shield_params.thickness_fe_cm, blocked=blocked)
-            L_pb = path_length_cm(vec, normal, self.shield_params.thickness_pb_cm, blocked=blocked)
-            att = float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
-            kernels[j] = geom * att
-        return kernels
+        self._gpu_enabled()
+        return self._kernel_gpu(isotope, pose_idx, orient_idx)
 
     def expected_counts(
         self,

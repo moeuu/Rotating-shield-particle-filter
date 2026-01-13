@@ -41,6 +41,7 @@ RESULTS_DIR = ROOT / "results" / "baseline_pf"
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = ROOT / "obstacle_layouts" / "demo_obstacles.json"
 MEASUREMENT_TIME_S = 30.0
+DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 3}
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -176,7 +177,8 @@ def run_baseline_pf(
     out_dir = RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     estimate_mode = "mmse"
-    estimate_min_strength = 100.0
+    estimate_min_strength = 500.0
+    estimate_min_existence_prob = None
     if live:
         plt.ion()
         plt.show(block=False)
@@ -195,6 +197,7 @@ def run_baseline_pf(
             spectrum,
             detect_threshold_abs=detect_threshold_abs,
             detect_threshold_rel=detect_threshold_rel,
+            min_peaks_by_isotope=DETECT_MIN_PEAKS_BY_ISOTOPE,
         )
         measurement = BaselineMeasurement(
             counts_by_isotope=counts,
@@ -213,7 +216,20 @@ def run_baseline_pf(
             time_sec=elapsed,
             estimate_mode=estimate_mode,
             min_est_strength=estimate_min_strength,
+            min_existence_prob=estimate_min_existence_prob,
         )
+        est_override = pf.estimate_all()
+        frame.estimated_sources = {}
+        frame.estimated_strengths = {}
+        for iso, state in est_override.items():
+            positions = np.asarray(state.positions, dtype=float)
+            strengths = np.asarray(state.strengths, dtype=float)
+            if estimate_min_strength is not None and strengths.size:
+                mask = strengths >= estimate_min_strength
+                positions = positions[mask]
+                strengths = strengths[mask]
+            frame.estimated_sources[iso] = positions
+            frame.estimated_strengths[iso] = strengths
         viz.update(frame)
         print(f"[step {step_idx}] pose={pose.tolist()} measurement={counts}")
         step_path = out_dir / f"step_{step_idx:04d}_pf.png"
@@ -242,6 +258,10 @@ def run_baseline_pf(
         est_list: list[dict[str, float | list[float]]] = []
         positions = np.asarray(state.positions, dtype=float)
         strengths = np.asarray(state.strengths, dtype=float)
+        if estimate_min_strength is not None and strengths.size:
+            mask = strengths >= estimate_min_strength
+            positions = positions[mask]
+            strengths = strengths[mask]
         for pos, strength in zip(positions, strengths):
             est_list.append(
                 {

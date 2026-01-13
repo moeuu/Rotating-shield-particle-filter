@@ -14,20 +14,11 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None
     TORCH_AVAILABLE = False
 
-from measurement.shielding import generate_octant_orientations
+from measurement.shielding import OCTANT_THETA_PHI_RANGES, generate_octant_orientations
 from pf.state import IsotopeState
 
 
-_OCTANT_RANGES = [
-    ((0.0, np.pi / 2.0), (0.0, np.pi / 2.0)),
-    ((np.pi / 2.0, np.pi), (0.0, np.pi / 2.0)),
-    ((0.0, np.pi / 2.0), (3.0 * np.pi / 2.0, 2.0 * np.pi)),
-    ((np.pi / 2.0, np.pi), (3.0 * np.pi / 2.0, 2.0 * np.pi)),
-    ((0.0, np.pi / 2.0), (np.pi / 2.0, np.pi)),
-    ((np.pi / 2.0, np.pi), (np.pi / 2.0, np.pi)),
-    ((0.0, np.pi / 2.0), (np.pi, 3.0 * np.pi / 2.0)),
-    ((np.pi / 2.0, np.pi), (np.pi, 3.0 * np.pi / 2.0)),
-]
+_OCTANT_RANGES = OCTANT_THETA_PHI_RANGES
 
 
 def torch_available() -> bool:
@@ -47,7 +38,7 @@ def resolve_device(device: str | None) -> "torch.device":
     if device is None:
         device = "cuda"
     if device.startswith("cuda") and not torch.cuda.is_available():
-        return torch.device("cpu")
+        raise RuntimeError("CUDA device requested but not available.")
     return torch.device(device)
 
 
@@ -108,10 +99,14 @@ def expected_counts_pair_torch(
     live_time_s: float,
     device: "torch.device",
     dtype: "torch.dtype",
+    use_angle_attenuation: bool = False,
     tol: float = 1e-6,
 ) -> "torch.Tensor":
     """
     Compute Λ for all particles at a Fe/Pb orientation pair on GPU.
+
+    When use_angle_attenuation is False, the shield path length is treated as a
+    constant thickness for blocked rays (no 1/cos(theta) scaling).
     """
     if torch is None:
         raise RuntimeError("torch is not available")
@@ -147,8 +142,14 @@ def expected_counts_pair_torch(
     normal_pb = normals[pb_index]
     cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=-1), 0.0, 1.0)
     cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
-    L_fe = torch.where(blocked_fe & (cos_fe > tol), thickness_fe_cm / cos_fe, torch.zeros_like(cos_fe))
-    L_pb = torch.where(blocked_pb & (cos_pb > tol), thickness_pb_cm / cos_pb, torch.zeros_like(cos_pb))
+    thickness_fe = torch.as_tensor(thickness_fe_cm, device=device, dtype=dtype)
+    thickness_pb = torch.as_tensor(thickness_pb_cm, device=device, dtype=dtype)
+    if use_angle_attenuation:
+        L_fe = torch.where(blocked_fe & (cos_fe > tol), thickness_fe / cos_fe, torch.zeros_like(cos_fe))
+        L_pb = torch.where(blocked_pb & (cos_pb > tol), thickness_pb / cos_pb, torch.zeros_like(cos_pb))
+    else:
+        L_fe = torch.where(blocked_fe, thickness_fe, torch.zeros_like(cos_fe))
+        L_pb = torch.where(blocked_pb, thickness_pb, torch.zeros_like(cos_pb))
     att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
 
     strengths = strengths * mask

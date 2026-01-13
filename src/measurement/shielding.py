@@ -133,6 +133,7 @@ def path_length_cm_torch(
     shield_normal: "torch.Tensor",
     thickness_cm: float,
     blocked_mask: "torch.Tensor",
+    use_angle_attenuation: bool = False,
     tol: float = 1e-9,
 ) -> "torch.Tensor":
     """
@@ -148,7 +149,9 @@ def path_length_cm_torch(
     dir_unit = direction / norm.unsqueeze(-1)
     cos_theta = torch.clamp(torch.sum(dir_unit * shield_normal, dim=1), 0.0, 1.0)
     thickness = torch.as_tensor(thickness_cm, device=direction.device, dtype=direction.dtype)
-    return torch.where(blocked_mask & (cos_theta > tol_t), thickness / cos_theta, torch.zeros_like(cos_theta))
+    if use_angle_attenuation:
+        return torch.where(blocked_mask & (cos_theta > tol_t), thickness / cos_theta, torch.zeros_like(cos_theta))
+    return torch.where(blocked_mask, thickness, torch.zeros_like(cos_theta))
 
 
 def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArray[np.float64], tol: float = 1e-6) -> bool:
@@ -204,6 +207,7 @@ def path_length_cm(
     shield_normal: NDArray[np.float64],
     thickness_cm: float,
     blocked: bool | None = None,
+    use_angle_attenuation: bool = False,
     tol: float = 1e-9,
 ) -> float:
     """
@@ -211,11 +215,14 @@ def path_length_cm(
 
     When blocked is None, a sign-based octant check is used. Otherwise the caller can
     pass a precomputed blocked flag (e.g., OctantShield.blocks_ray).
+    When use_angle_attenuation is False, the path length equals the nominal thickness.
     """
     if blocked is None:
         blocked = shield_blocks_radiation(direction, shield_normal)
     if not blocked:
         return 0.0
+    if not use_angle_attenuation:
+        return float(thickness_cm)
     norm = float(np.linalg.norm(direction))
     if norm <= tol:
         return 0.0

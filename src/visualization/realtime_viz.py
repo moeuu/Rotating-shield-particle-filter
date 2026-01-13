@@ -82,11 +82,17 @@ def _existence_probabilities(states: Sequence[Any], weights: NDArray[np.float64]
 def _mmse_estimate_by_slot(
     states: Sequence[Any],
     weights: NDArray[np.float64],
+    *,
+    max_r: int | None = None,
 ) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
     """Compute per-slot MMSE estimates for positions/strengths and a slot-valid mask."""
     if not states:
         return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
-    max_r = max(int(getattr(st, "num_sources", 0)) for st in states)
+    if max_r is None:
+        max_r = max(int(getattr(st, "num_sources", 0)) for st in states)
+    max_r = int(max_r)
+    if max_r < 0:
+        max_r = 0
     if max_r <= 0:
         return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
     positions = np.zeros((max_r, 3), dtype=float)
@@ -125,10 +131,18 @@ def _filter_estimates(
     if strengths.size == 0:
         return positions, strengths
     mask = slot_valid.copy() if slot_valid.size else np.ones(strengths.shape[0], dtype=bool)
+    mask_strength = np.ones(strengths.shape[0], dtype=bool)
+    mask_exist = np.ones(strengths.shape[0], dtype=bool)
     if min_existence_prob is not None and existence_probs.size:
-        mask = mask & (existence_probs[: strengths.shape[0]] >= min_existence_prob)
+        mask_exist = existence_probs[: strengths.shape[0]] >= min_existence_prob
     if min_strength is not None:
-        mask = mask & (strengths >= min_strength)
+        mask_strength = strengths >= min_strength
+    mask = mask & mask_exist & mask_strength
+    if not np.any(mask) and min_existence_prob is not None and existence_probs.size:
+        idx = int(np.argmax(existence_probs[: strengths.shape[0]]))
+        if min_strength is None or strengths[idx] >= float(min_strength):
+            mask = np.zeros_like(mask, dtype=bool)
+            mask[idx] = True
     return positions[mask], strengths[mask]
 
 
@@ -157,14 +171,27 @@ class RealTimePFVisualizer:
         self.true_strengths = true_strengths or {}
         self.obstacle_grid = obstacle_grid
         self.show_counts = show_counts
-        self.fig = plt.figure(figsize=(12, 6))
+        self.fig = plt.figure(figsize=(15, 6))
+        plot_ratio = 3.2
+        side_ratio = 2.4
         if self.show_counts:
-            layout = self.fig.add_gridspec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1])
+            layout = self.fig.add_gridspec(
+                2,
+                2,
+                width_ratios=[plot_ratio, side_ratio],
+                height_ratios=[1, 1],
+                wspace=0.3,
+            )
             self.ax3d = self.fig.add_subplot(layout[:, 0], projection="3d")
             self.ax_counts = self.fig.add_subplot(layout[0, 1])
             self.ax_labels = self.fig.add_subplot(layout[1, 1])
         else:
-            layout = self.fig.add_gridspec(1, 2, width_ratios=[3, 1])
+            layout = self.fig.add_gridspec(
+                1,
+                2,
+                width_ratios=[plot_ratio, side_ratio],
+                wspace=0.3,
+            )
             self.ax3d = self.fig.add_subplot(layout[0, 0], projection="3d")
             self.ax_counts = None
             self.ax_labels = self.fig.add_subplot(layout[0, 1])
@@ -175,9 +202,17 @@ class RealTimePFVisualizer:
                 self.colors[iso] = DEFAULT_ISOTOPE_COLORS[iso]
             else:
                 self.colors[iso] = cmap(i % 10)
+        self._label_title_fontsize = 16
+        self._label_section_fontsize = 14
+        self._label_text_fontsize = 13
+        self._label_text_x = 0.16
+        self._label_marker_line = (0.02, 0.1)
+        self._label_marker_point = 0.06
         self._init_axes()
         self._init_label_axis()
-        plt.tight_layout()
+        self.fig.tight_layout()
+        self.fig.subplots_adjust(left=0.02, right=0.98, wspace=0.3)
+        self._apply_layout()
         self._particle_artists: Dict[str, Any] = {}
         self._est_artists: Dict[str, Any] = {}
         self._robot_artist = None
@@ -280,8 +315,28 @@ class RealTimePFVisualizer:
         """Initialize the label panel axis."""
         if self.ax_labels is None:
             return
-        self.ax_labels.set_title("Legend / Estimates")
+        self.ax_labels.set_title(
+            "Legend / Estimates",
+            fontsize=self._label_title_fontsize,
+            loc="left",
+        )
         self.ax_labels.axis("off")
+
+    def _apply_layout(self) -> None:
+        """Apply explicit axes positions for a larger PF view and readable labels."""
+        left = 0.02
+        right = 0.98
+        gap = 0.02
+        pf_width = 0.54
+        side_left = left + pf_width + gap
+        side_width = right - side_left
+        if self.ax3d is not None:
+            self.ax3d.set_position([left, 0.06, pf_width, 0.88])
+        if self.show_counts and self.ax_counts is not None and self.ax_labels is not None:
+            self.ax_counts.set_position([side_left, 0.58, side_width, 0.36])
+            self.ax_labels.set_position([side_left, 0.06, side_width, 0.48])
+        elif self.ax_labels is not None:
+            self.ax_labels.set_position([side_left, 0.06, side_width, 0.88])
 
     def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
         """Build legend-style label lines with matching colors and markers."""
@@ -304,8 +359,6 @@ class RealTimePFVisualizer:
             color = self.colors.get(iso, "black")
             lines.append((f"{iso} particles", color, ".", "None"))
             lines.append((f"{iso} est", self.estimate_colors.get(iso, color), "x", "None"))
-        lines.append(("Fe shield", "magenta", ">", "None"))
-        lines.append(("Pb shield", "green", "<", "None"))
         return lines
 
     def _legend_lines_estimates_only(self) -> List[Tuple[str, str, str, str]]:
@@ -427,14 +480,19 @@ class RealTimePFVisualizer:
         if self.ax_labels is None:
             return
         self.ax_labels.cla()
-        self.ax_labels.set_title("Legend / Estimates")
+        step_text = f"Step {frame.step_index} t={frame.time:.2f}s"
+        self.ax_labels.set_title(
+            step_text,
+            fontsize=self._label_title_fontsize,
+            loc="left",
+        )
         self.ax_labels.axis("off")
         legend_lines = self._legend_lines() if legend_lines is None else legend_lines
-        estimate_lines = self._estimate_lines(frame) if estimate_lines is None else estimate_lines
+        estimate_lines = self._estimate_lines_all(frame) if estimate_lines is None else estimate_lines
         gap_lines = 1
         total_lines = len(legend_lines) + len(estimate_lines) + 2 + gap_lines
         line_height = 0.95 / max(total_lines, 1)
-        y = 0.98
+        y = 0.96
         self.ax_labels.text(
             0.0,
             y,
@@ -442,42 +500,42 @@ class RealTimePFVisualizer:
             transform=self.ax_labels.transAxes,
             va="top",
             ha="left",
-            fontsize=9,
+            fontsize=self._label_section_fontsize,
             fontweight="bold",
             color="black",
         )
         y -= line_height
         for text, color, marker, linestyle in legend_lines:
             self.ax_labels.text(
-                0.1,
+                self._label_text_x,
                 y,
                 text,
                 transform=self.ax_labels.transAxes,
                 va="top",
                 ha="left",
-                fontsize=8,
+                fontsize=self._label_text_fontsize,
                 color=color,
             )
             if linestyle != "None":
                 self.ax_labels.plot(
-                    [0.02, 0.06],
-                    [y - 0.005, y - 0.005],
+                    list(self._label_marker_line),
+                    [y - 0.012, y - 0.012],
                     transform=self.ax_labels.transAxes,
                     color=color,
                     linestyle=linestyle,
                     marker=marker,
-                    markersize=6,
+                    markersize=7,
                     linewidth=1.0,
                 )
             else:
                 self.ax_labels.plot(
-                    [0.03],
-                    [y - 0.005],
+                    [self._label_marker_point],
+                    [y - 0.012],
                     transform=self.ax_labels.transAxes,
                     color=color,
                     linestyle="None",
                     marker=marker,
-                    markersize=6,
+                    markersize=7,
                 )
             y -= line_height
         y -= line_height
@@ -488,7 +546,7 @@ class RealTimePFVisualizer:
             transform=self.ax_labels.transAxes,
             va="top",
             ha="left",
-            fontsize=9,
+            fontsize=self._label_section_fontsize,
             fontweight="bold",
             color="black",
         )
@@ -501,7 +559,7 @@ class RealTimePFVisualizer:
                 transform=self.ax_labels.transAxes,
                 va="top",
                 ha="left",
-                fontsize=8,
+                fontsize=self._label_text_fontsize,
                 color=color,
             )
             y -= line_height
@@ -633,7 +691,7 @@ class RealTimePFVisualizer:
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
             est_color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             self._projection_artists.extend(self._axis_projection_lines(est_pos, est_color))
-        self.ax3d.set_title(f"Step {frame.step_index} t={frame.time:.2f}s")
+        self.ax3d.set_title("")
         # Counts bar (reuse)
         if self.ax_counts is not None and frame.counts_by_isotope:
             names = list(frame.counts_by_isotope.keys())
@@ -757,9 +815,19 @@ def build_frame_from_pf(
             weights_arr = np.asarray(cont_weights, dtype=float)
             if mode == "map":
                 best = max(cont_particles, key=lambda p: p.log_weight).state
-                est_pos = best.positions.copy()
-                est_str = best.strengths.copy()
-                exist_probs = _existence_probabilities(states, weights_arr, max(len(est_str), 0))
+                best_r = int(getattr(best, "num_sources", 0))
+                if best_r <= 0:
+                    est_pos = np.zeros((0, 3), dtype=float)
+                    est_str = np.zeros(0, dtype=float)
+                else:
+                    est_pos = best.positions[:best_r].copy()
+                    est_str = best.strengths[:best_r].copy()
+                exist_probs_full = (
+                    _existence_probabilities(states, weights_arr, best_r)
+                    if min_existence_prob is not None and best_r > 0
+                    else np.zeros(0, dtype=float)
+                )
+                exist_probs = exist_probs_full[: est_str.shape[0]] if exist_probs_full.size else np.zeros(0)
                 slot_valid = np.ones(len(est_str), dtype=bool)
                 est_pos, est_str = _filter_estimates(
                     est_pos,
@@ -770,8 +838,18 @@ def build_frame_from_pf(
                     min_existence_prob=min_existence_prob,
                 )
             else:
-                est_pos, est_str, slot_valid = _mmse_estimate_by_slot(states, weights_arr)
-                exist_probs = _existence_probabilities(states, weights_arr, est_str.shape[0])
+                max_r_all = max(int(getattr(st, "num_sources", 0)) for st in states) if states else 0
+                est_pos, est_str, slot_valid = _mmse_estimate_by_slot(
+                    states,
+                    weights_arr,
+                    max_r=max_r_all,
+                )
+                exist_probs_full = (
+                    _existence_probabilities(states, weights_arr, max_r_all)
+                    if min_existence_prob is not None and max_r_all > 0
+                    else np.zeros(0, dtype=float)
+                )
+                exist_probs = exist_probs_full[: est_str.shape[0]] if exist_probs_full.size else np.zeros(0)
                 est_pos, est_str = _filter_estimates(
                     est_pos,
                     est_str,

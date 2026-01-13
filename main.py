@@ -86,26 +86,26 @@ def main() -> None:
     parser.add_argument(
         "--detect-threshold-abs",
         type=float,
-        default=30.0,
+        default=100.0,
         help="Absolute detection threshold for peak-matched activity (counts).",
     )
     parser.add_argument(
         "--detect-threshold",
         dest="detect_threshold_abs",
         type=float,
-        default=0.1,
+        default=argparse.SUPPRESS,
         help="Alias for --detect-threshold-abs.",
     )
     parser.add_argument(
         "--detect-threshold-rel",
         type=float,
-        default=0.2,
+        default=0.5,
         help="Relative detection threshold as a fraction of max peak-matched activity.",
     )
     parser.add_argument(
         "--detect-consecutive",
         type=int,
-        default=10,
+        default=20,
         help="Consecutive detections required to enable an isotope.",
     )
     parser.add_argument(

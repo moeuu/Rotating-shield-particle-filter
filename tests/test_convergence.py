@@ -4,7 +4,8 @@ import numpy as np
 
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
-from pf.state import ParticleState
+from pf.state import IsotopeState
+from pf.particle_filter import IsotopeParticle
 
 
 def _build_stable_estimator(strength: float = 10.0) -> RotatingShieldPFEstimator:
@@ -24,13 +25,18 @@ def _build_stable_estimator(strength: float = 10.0) -> RotatingShieldPFEstimator
     est.add_measurement_pose(np.array([0.5, 0.0, 0.0]))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
-    filt.states = [
-        ParticleState(source_indices=np.array([0], dtype=np.int32), strengths=np.array([strength]), background=0.0)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([strength], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(1.0 / filt.N)),
+        )
         for _ in range(filt.N)
     ]
-    filt.log_weights = np.log(np.ones(filt.N) / filt.N)
-    # Remove continuous particles to keep uncertainty zeroed for this grid-based convergence check
-    filt.continuous_particles = []
     # populate history with identical estimates to simulate stabilization
     est.history_estimates = [est.estimates(), est.estimates()]
     return est
@@ -49,8 +55,8 @@ def test_should_not_stop_when_uncertain() -> None:
     est = _build_stable_estimator()
     filt = est.filters["Cs-137"]
     # Inject variance in strengths to raise U
-    filt.states[0].strengths = np.array([1.0])
-    filt.states[1].strengths = np.array([10.0])
+    filt.continuous_particles[0].state.strengths = np.array([1.0])
+    filt.continuous_particles[1].state.strengths = np.array([10.0])
     est.history_estimates = [est.estimates(), est.estimates()]
     assert not est.should_stop_exploration(
         ig_threshold=1e-6, change_tol=1e-6, uncertainty_tol=1e-3, live_time_s=1.0

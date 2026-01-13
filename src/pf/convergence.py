@@ -80,7 +80,6 @@ def has_converged(
     estimator: RotatingShieldPFEstimator,
     pose_idx: int | None = None,
     ig_threshold: float | None = None,
-    fisher_threshold: float | None = None,
     change_tol: float | None = None,
     uncertainty_tol: float | None = None,
     credible_volume_threshold: float | None = None,
@@ -92,7 +91,6 @@ def has_converged(
     return estimator.should_stop_shield_rotation(
         pose_idx=pose_idx if pose_idx is not None else (len(estimator.poses) - 1),
         ig_threshold=ig_threshold if ig_threshold is not None else estimator.pf_config.ig_threshold,
-        fisher_threshold=fisher_threshold if fisher_threshold is not None else 1e-3,
         change_tol=change_tol if change_tol is not None else 1e-2,
         uncertainty_tol=uncertainty_tol if uncertainty_tol is not None else 1e-3,
         live_time_s=live_time_s,

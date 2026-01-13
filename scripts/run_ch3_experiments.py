@@ -23,7 +23,6 @@ import numpy as np
 from measurement.model import EnvironmentConfig, PointSource
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
-from measurement.shielding import OctantShield
 from spectrum.pipeline import SpectralDecomposer
 
 
@@ -77,21 +76,22 @@ def _build_estimator(scn: ExperimentScenario) -> RotatingShieldPFEstimator:
 
 def _simulate_measurements(
     scn: ExperimentScenario, est: RotatingShieldPFEstimator, rng: np.random.Generator
-) -> Iterable[Dict[str, float]]:
+) -> Iterable[tuple[Dict[str, float], int, int]]:
     """
     Simulate isotope-wise counts z_k using the same kernel and poses as the PF.
 
     Uses spectral simulation + unfolding (Sec. 2.5.7 + Sec. 3.4.3) so PF observes
     isotope-wise counts derived from spectra, not direct kernel means.
     """
-    oct_shield = OctantShield()
     decomposer = SpectralDecomposer()
 
     for k, pose in enumerate(scn.poses):
-        orient_idx = k % scn.normals.shape[0]
-        z_k: Dict[str, float] = {}
+        num_orient = scn.normals.shape[0]
+        fe_index = k % num_orient
+        pb_index = (k // num_orient) % num_orient
         env = EnvironmentConfig(detector_position=tuple(pose.tolist()))
-        orientation = scn.normals[orient_idx]
+        fe_orientation = scn.normals[fe_index]
+        pb_orientation = scn.normals[pb_index]
         sources = [
             PointSource(ts.isotope, position=tuple(scn.candidate_sources[ts.candidate_index].tolist()), intensity_cps_1m=ts.strength)
             for ts in scn.true_sources
@@ -101,11 +101,13 @@ def _simulate_measurements(
             environment=env,
             acquisition_time=scn.live_time_s,
             rng=rng,
-            shield_orientation=orientation,
-            octant_shield=oct_shield,
+            fe_shield_orientation=fe_orientation,
+            pb_shield_orientation=pb_orientation,
+            mu_by_isotope=scn.mu_by_isotope,
+            shield_params=ShieldParams(),
         )
         z_k = decomposer.isotope_counts(spectrum)
-        yield z_k
+        yield z_k, fe_index, pb_index
 
 
 def _match_errors(
@@ -143,8 +145,14 @@ def run_single_trial(scn: ExperimentScenario, seed: int) -> Dict[str, float]:
     """Run one Monte Carlo trial and return logged metrics."""
     rng = np.random.default_rng(seed)
     est = _build_estimator(scn)
-    for k, z_k in enumerate(_simulate_measurements(scn, est, rng)):
-        est.update(z_k=z_k, pose_idx=k, orient_idx=k % scn.normals.shape[0], live_time_s=scn.live_time_s)
+    for k, (z_k, fe_index, pb_index) in enumerate(_simulate_measurements(scn, est, rng)):
+        est.update_pair(
+            z_k=z_k,
+            pose_idx=k,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=scn.live_time_s,
+        )
     pos_err, str_err, iso_acc = _match_errors(est, scn)
     return {
         "scenario": scn.name,

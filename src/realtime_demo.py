@@ -59,10 +59,16 @@ RESULTS_DIR = ROOT / "results"
 SPECTRUM_DIR = RESULTS_DIR / "spetrum"
 PF_DIR = RESULTS_DIR / "pf"
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
-PRUNE_INTERVAL = 10
 PRUNE_MIN_STRENGTH_ABS = 5.0
 PRUNE_MIN_STRENGTH_RATIO = 0.001
 PRUNE_TAU_MIX = 0.6
+PRUNE_MIN_SUPPORT = 2
+PRUNE_MIN_OBS_COUNT = 0.0
+PRUNE_MIN_MEASUREMENTS = 10
+DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 2}
+DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.2}
+DETECT_CONSECUTIVE_BY_ISOTOPE = {"Eu-154": 5}
+DETECT_MISS_AFTER_LOCK = 30
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
 
@@ -121,24 +127,30 @@ def _update_detection_hysteresis(
     miss_counts: dict[str, int],
     active_isotopes: set[str],
     consecutive: int,
+    miss_consecutive: int | None = None,
+    consecutive_by_isotope: dict[str, int] | None = None,
 ) -> set[str]:
     """
     Update detection state with consecutive hit/miss hysteresis.
 
     Isotopes are activated after `consecutive` hits and deactivated after
-    `consecutive` misses.
+    `miss_consecutive` misses (defaults to `consecutive`).
     """
     updated = set(active_isotopes)
+    miss_required = consecutive if miss_consecutive is None else miss_consecutive
     for iso in detect_counts:
+        hit_required = consecutive
+        if consecutive_by_isotope and iso in consecutive_by_isotope:
+            hit_required = int(consecutive_by_isotope[iso])
         if iso in candidates:
             detect_counts[iso] += 1
             miss_counts[iso] = 0
         else:
             miss_counts[iso] += 1
             detect_counts[iso] = 0
-        if detect_counts[iso] >= consecutive:
+        if detect_counts[iso] >= hit_required:
             updated.add(iso)
-        if miss_counts[iso] >= consecutive:
+        if miss_counts[iso] >= miss_required:
             updated.discard(iso)
     return updated
 
@@ -274,10 +286,11 @@ def run_live_pf(
     max_steps: int | None = None,
     max_poses: int | None = 10,
     sources: list[PointSource] | None = None,
-    detect_threshold_abs: float = 30.0,
-    detect_threshold_rel: float = 0.2,
+    detect_threshold_abs: float = 50.0,
+    detect_threshold_rel: float = 0.3,
     detect_consecutive: int = 10,
     detect_min_steps: int | None = None,
+    min_peaks_by_isotope: dict[str, int] | None = None,
     ig_threshold_mode: str = "relative_pose",
     ig_threshold_rel: float = 0.02,
     ig_threshold_min: float | None = None,
@@ -296,6 +309,9 @@ def run_live_pf(
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
+    if min_peaks_by_isotope is None:
+        min_peaks_by_isotope = dict(DETECT_MIN_PEAKS_BY_ISOTOPE)
+    detect_threshold_rel_by_isotope = dict(DETECT_REL_THRESH_BY_ISOTOPE)
     obstacle_grid = None
     if obstacle_layout_path:
         obstacle_path = Path(obstacle_layout_path)
@@ -344,20 +360,26 @@ def run_live_pf(
             iso: {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb} for iso in isotopes
         }
     use_gpu = _default_use_gpu()
+    background_by_isotope = {iso: 5.0 for iso in isotopes}
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
-        resample_threshold=0.5,
+        min_particles=num_particles,
+        max_particles=num_particles * 2,
+        resample_threshold=0.7,
         position_sigma=0.1,
-        min_strength=0.01,
-        p_birth=0.05,
+        background_level=background_by_isotope,
+        min_strength=5.0,
+        p_birth=0.01,
+        p_kill=0.2,
         short_time_s=30.0,
         max_dwell_time_s=10000.0,
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
         orientation_k=16,
-        planning_eig_samples=None,
+        planning_eig_samples=50,
         planning_rollout_particles=256,
         planning_rollout_method="top_weight",
+        use_fast_gpu_rollout=True,
         use_gpu=use_gpu,
         gpu_device="cuda",
         gpu_dtype="float32",
@@ -395,7 +417,7 @@ def run_live_pf(
     )
     estimate_mode = "mmse"
     estimate_min_strength = 100.0
-    estimate_min_existence_prob = 0.2
+    estimate_min_existence_prob = None
     if live:
         plt.ion()
         plt.show(block=False)
@@ -493,15 +515,23 @@ def run_live_pf(
                 spectrum,
                 detect_threshold_abs=detect_threshold_abs,
                 detect_threshold_rel=detect_threshold_rel,
+                detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                min_peaks_by_isotope=min_peaks_by_isotope,
             )
+            if candidates:
+                nnls_counts = decomposer.decompose_subset(spectrum, isotopes=sorted(candidates))
+                z_full = {iso: float(nnls_counts.get(iso, 0.0)) for iso in decomposer.isotope_names}
             last_candidates = set(candidates)
             if detect_consecutive > 0:
+                miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
                 active_isotopes = _update_detection_hysteresis(
                     candidates,
                     detect_counts,
                     miss_counts,
                     active_isotopes,
                     consecutive=detect_consecutive,
+                    miss_consecutive=miss_required,
+                    consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
                 )
                 detected_isotopes = set(active_isotopes)
                 last_candidates = set(detected_isotopes)
@@ -516,9 +546,11 @@ def run_live_pf(
                         estimator.add_isotopes(sorted(new_isotopes))
                         print(f"Detected isotopes expanded to: {sorted(estimator.isotopes)}")
                     removed_isotopes = set(estimator.isotopes) - set(detected_isotopes)
-                    if removed_isotopes and detected_isotopes:
-                        estimator.restrict_isotopes(sorted(detected_isotopes))
-                        print(f"Detected isotopes reduced to: {sorted(estimator.isotopes)}")
+                    if removed_isotopes:
+                        remaining = [iso for iso in estimator.isotopes if iso not in removed_isotopes]
+                        if remaining:
+                            estimator.restrict_isotopes(remaining)
+                            print(f"Detected isotopes pruned to: {sorted(estimator.isotopes)}")
             if detection_locked:
                 viz.set_active_isotopes(estimator.isotopes)
             else:
@@ -536,9 +568,15 @@ def run_live_pf(
                 detector_position=pose,
             )
             estimator.update_pair(z_k=z_k, pose_idx=current_pose_idx, fe_index=fe_idx, pb_index=pb_idx, live_time_s=live_time)
-            if detection_locked and (step_counter + 1) % PRUNE_INTERVAL == 0:
+            if (
+                detection_locked
+                and estimator.measurements
+                and len(estimator.measurements) >= PRUNE_MIN_MEASUREMENTS
+            ):
                 estimator.prune_spurious_sources(
                     tau_mix=PRUNE_TAU_MIX,
+                    min_support=PRUNE_MIN_SUPPORT,
+                    min_obs_count=PRUNE_MIN_OBS_COUNT,
                     min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
                     min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
                 )
@@ -618,6 +656,19 @@ def run_live_pf(
         current_pose = candidates[next_idx]
         estimator.add_measurement_pose(current_pose, reset_filters=False)
         current_pose_idx = len(estimator.poses) - 1
+
+    if (
+        detection_locked
+        and estimator.measurements
+        and len(estimator.measurements) >= PRUNE_MIN_MEASUREMENTS
+    ):
+        estimator.prune_spurious_sources(
+            tau_mix=PRUNE_TAU_MIX,
+            min_support=PRUNE_MIN_SUPPORT,
+            min_obs_count=PRUNE_MIN_OBS_COUNT,
+            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+        )
 
     # Save final snapshots
     pf_out_path = RESULTS_DIR / "result_pf.png"

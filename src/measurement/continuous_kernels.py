@@ -55,7 +55,7 @@ def _resolve_device(device: str | None) -> "torch.device":
     if device is None:
         device = "cuda"
     if device.startswith("cuda") and not torch.cuda.is_available():
-        return torch.device("cpu")
+        raise RuntimeError("CUDA device requested but not available.")
     return torch.device(device)
 
 
@@ -83,7 +83,7 @@ class ContinuousKernel:
     shield_params: ShieldParams = field(default_factory=ShieldParams)
     octant_shield: OctantShield = OctantShield()
     orientations: NDArray[np.float64] = field(default_factory=generate_octant_orientations)
-    use_gpu: bool = False
+    use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float32"
 
@@ -99,68 +99,10 @@ class ContinuousKernel:
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
         if not self.use_gpu:
-            return False
-        if self.gpu_device.startswith("cpu"):
-            return _torch_installed()
-        return _torch_available()
-
-    def _blocked_mask_numpy(
-        self,
-        dir_unit: NDArray[np.float64],
-        octant_index: int,
-        tol: float,
-    ) -> NDArray[np.bool_]:
-        """Return a boolean mask for rays blocked by the selected octant."""
-        (theta_low, theta_high), (phi_low, phi_high) = self.octant_shield.theta_phi_ranges[octant_index]
-        theta = np.arccos(np.clip(dir_unit[:, 2], -1.0, 1.0))
-        phi = np.mod(np.arctan2(dir_unit[:, 1], dir_unit[:, 0]), 2.0 * np.pi)
-        return (
-            (theta + tol >= theta_low)
-            & (theta - tol < theta_high)
-            & (phi + tol >= phi_low)
-            & (phi - tol < phi_high)
-        )
-
-    def _expected_rate_pair_numpy(
-        self,
-        isotope: str,
-        detector_pos: NDArray[np.float64],
-        sources: NDArray[np.float64],
-        strengths: NDArray[np.float64],
-        fe_index: int,
-        pb_index: int,
-        background: float,
-        tol: float = 1e-6,
-    ) -> float:
-        """Compute expected rate for a Fe/Pb orientation pair using NumPy."""
-        sources = np.asarray(sources, dtype=float)
-        strengths = np.asarray(strengths, dtype=float)
-        if sources.size == 0:
-            return float(background)
-        direction = detector_pos - sources
-        dist = np.linalg.norm(direction, axis=1)
-        dist = np.where(dist <= tol, tol, dist)
-        dir_unit = direction / dist[:, None]
-        geom = 1.0 / (dist**2)
-
-        blocked_fe = self._blocked_mask_numpy(dir_unit, fe_index, tol)
-        blocked_pb = self._blocked_mask_numpy(dir_unit, pb_index, tol)
-        normal_fe = self.orientations[fe_index]
-        normal_pb = self.orientations[pb_index]
-        cos_fe = np.clip(np.sum(dir_unit * normal_fe, axis=1), 0.0, 1.0)
-        cos_pb = np.clip(np.sum(dir_unit * normal_pb, axis=1), 0.0, 1.0)
-        L_fe = np.zeros_like(cos_fe)
-        L_pb = np.zeros_like(cos_pb)
-        mask_fe = blocked_fe & (cos_fe > tol)
-        mask_pb = blocked_pb & (cos_pb > tol)
-        if np.any(mask_fe):
-            L_fe[mask_fe] = self.shield_params.thickness_fe_cm / cos_fe[mask_fe]
-        if np.any(mask_pb):
-            L_pb[mask_pb] = self.shield_params.thickness_pb_cm / cos_pb[mask_pb]
-        mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        att = np.exp(-(mu_fe * L_fe + mu_pb * L_pb))
-        rate = float(background) + float(np.sum(geom * att * strengths))
-        return float(rate)
+            raise RuntimeError("GPU-only mode: enable use_gpu for ContinuousKernel.")
+        if not _torch_available():
+            raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
+        return True
 
     def _blocked_mask_torch(
         self,
@@ -214,16 +156,28 @@ class ContinuousKernel:
         normal_pb = torch.as_tensor(self.orientations[pb_index], device=device, dtype=dtype)
         cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=1), 0.0, 1.0)
         cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=1), 0.0, 1.0)
-        L_fe = torch.where(
-            blocked_fe & (cos_fe > tol_t),
-            torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_fe,
-            torch.zeros_like(cos_fe),
-        )
-        L_pb = torch.where(
-            blocked_pb & (cos_pb > tol_t),
-            torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_pb,
-            torch.zeros_like(cos_pb),
-        )
+        if self.shield_params.use_angle_attenuation:
+            L_fe = torch.where(
+                blocked_fe & (cos_fe > tol_t),
+                torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_fe,
+                torch.zeros_like(cos_fe),
+            )
+            L_pb = torch.where(
+                blocked_pb & (cos_pb > tol_t),
+                torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_pb,
+                torch.zeros_like(cos_pb),
+            )
+        else:
+            L_fe = torch.where(
+                blocked_fe,
+                torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype),
+                torch.zeros_like(cos_fe),
+            )
+            L_pb = torch.where(
+                blocked_pb,
+                torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype),
+                torch.zeros_like(cos_pb),
+            )
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
         rate = torch.sum(geom * att * strengths_t) + float(background)
@@ -249,8 +203,20 @@ class ContinuousKernel:
         )
         direction = detector_pos - source_pos
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        L_fe = path_length_cm(direction, normal, self.shield_params.thickness_fe_cm, blocked=blocked)
-        L_pb = path_length_cm(direction, normal, self.shield_params.thickness_pb_cm, blocked=blocked)
+        L_fe = path_length_cm(
+            direction,
+            normal,
+            self.shield_params.thickness_fe_cm,
+            blocked=blocked,
+            use_angle_attenuation=self.shield_params.use_angle_attenuation,
+        )
+        L_pb = path_length_cm(
+            direction,
+            normal,
+            self.shield_params.thickness_pb_cm,
+            blocked=blocked,
+            use_angle_attenuation=self.shield_params.use_angle_attenuation,
+        )
         return float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
 
     def attenuation_factor_pair(
@@ -276,8 +242,20 @@ class ContinuousKernel:
             source_position=source_pos,
             octant_index=pb_index,
         )
-        L_fe = path_length_cm(direction, normal_fe, self.shield_params.thickness_fe_cm, blocked=blocked_fe)
-        L_pb = path_length_cm(direction, normal_pb, self.shield_params.thickness_pb_cm, blocked=blocked_pb)
+        L_fe = path_length_cm(
+            direction,
+            normal_fe,
+            self.shield_params.thickness_fe_cm,
+            blocked=blocked_fe,
+            use_angle_attenuation=self.shield_params.use_angle_attenuation,
+        )
+        L_pb = path_length_cm(
+            direction,
+            normal_pb,
+            self.shield_params.thickness_pb_cm,
+            blocked=blocked_pb,
+            use_angle_attenuation=self.shield_params.use_angle_attenuation,
+        )
         return float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
 
     def kernel_value(
@@ -342,17 +320,8 @@ class ContinuousKernel:
         """
         Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
         """
-        if self._gpu_enabled():
-            return self._expected_rate_pair_torch(
-                isotope=isotope,
-                detector_pos=detector_pos,
-                sources=sources,
-                strengths=strengths,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                background=background,
-            )
-        return self._expected_rate_pair_numpy(
+        self._gpu_enabled()
+        return self._expected_rate_pair_torch(
             isotope=isotope,
             detector_pos=detector_pos,
             sources=sources,
@@ -436,7 +405,7 @@ def expected_counts_single_isotope(
         k = ContinuousKernel(
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params or ShieldParams(),
-            use_gpu=bool(use_gpu) if use_gpu is not None else False,
+            use_gpu=bool(use_gpu) if use_gpu is not None else True,
             gpu_device=gpu_device,
             gpu_dtype=gpu_dtype,
         )

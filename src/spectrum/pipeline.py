@@ -230,16 +230,21 @@ class SpectralDecomposer:
         detect_isotopes: bool = True,
         detect_threshold_abs: float = 0.1,
         detect_threshold_rel: float = 0.2,
+        detect_threshold_rel_by_isotope: Dict[str, float] | None = None,
         peak_prominence: float = 0.05,
         peak_distance: int = 5,
         peak_tolerance_keV: float = 10.0,
         min_peaks_multi: int = 2,
+        min_peaks_by_isotope: Dict[str, int] | None = None,
     ) -> Tuple[Dict[str, float], set[str]]:
         """
         Return isotope-wise counts plus detected isotopes.
 
         Detection uses peak matching and minimum peak counts before fitting NNLS
-        on the subset of candidate isotopes.
+        on the subset of candidate isotopes. Use min_peaks_by_isotope to override
+        the required peak count for specific isotopes. Use
+        detect_threshold_rel_by_isotope to override the relative threshold for
+        specific isotopes.
         """
         if not detect_isotopes:
             return self.decompose(spectrum), set(self.isotope_names)
@@ -247,10 +252,12 @@ class SpectralDecomposer:
             spectrum,
             detect_threshold_abs=detect_threshold_abs,
             detect_threshold_rel=detect_threshold_rel,
+            detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
             peak_prominence=peak_prominence,
             peak_distance=peak_distance,
             peak_tolerance_keV=peak_tolerance_keV,
             min_peaks_multi=min_peaks_multi,
+            min_peaks_by_isotope=min_peaks_by_isotope,
         )
         counts_partial = self.decompose_subset(spectrum, isotopes=sorted(detected)) if detected else {}
         counts_full = {iso: float(counts_partial.get(iso, 0.0)) for iso in self.isotope_names}
@@ -275,10 +282,12 @@ class SpectralDecomposer:
         *,
         detect_threshold_abs: float = 0.1,
         detect_threshold_rel: float = 0.2,
+        detect_threshold_rel_by_isotope: Dict[str, float] | None = None,
         peak_prominence: float = 0.05,
         peak_distance: int = 5,
         peak_tolerance_keV: float = 10.0,
         min_peaks_multi: int = 2,
+        min_peaks_by_isotope: Dict[str, int] | None = None,
     ) -> Tuple[set[str], Dict[str, list[int]]]:
         """
         Detect isotopes using peak assignments and area thresholds.
@@ -303,7 +312,11 @@ class SpectralDecomposer:
             self.library,
             tolerance_keV=peak_tolerance_keV,
         )
-        min_peaks = self._min_peak_count_by_isotope(self.library, min_peaks_multi=min_peaks_multi)
+        min_peaks = self._min_peak_count_by_isotope(
+            self.library,
+            min_peaks_multi=min_peaks_multi,
+            overrides=min_peaks_by_isotope,
+        )
         line_counts = self.peak_line_counts(
             spectrum,
             isotopes=list(self.isotope_names),
@@ -326,17 +339,19 @@ class SpectralDecomposer:
                 best_iso = iso
             if max_line <= 0.0:
                 continue
-            threshold = max(detect_threshold_abs, detect_threshold_rel * max_line)
+            rel_threshold = detect_threshold_rel
+            if detect_threshold_rel_by_isotope and iso in detect_threshold_rel_by_isotope:
+                rel_threshold = float(detect_threshold_rel_by_isotope[iso])
+            threshold = max(detect_threshold_abs, rel_threshold * max_line)
             num_above = sum(val >= threshold for val in counts)
             min_required = min_peaks.get(iso, 1)
+            num_peak_hits = len(peaks_by_iso.get(iso, []))
             if num_above >= min_required:
                 detected.add(iso)
                 continue
-            if min_required > 1 and num_above >= 1:
-                other_peak_ok = any(val >= detect_threshold_abs for val in counts if val < threshold)
-                if other_peak_ok:
-                    detected.add(iso)
-        if not detected and best_iso is not None and max_line_overall > 0.0:
+            if num_peak_hits >= min_required and max_line >= detect_threshold_abs:
+                detected.add(iso)
+        if not detected and best_iso is not None and max_line_overall >= detect_threshold_abs:
             detected = {best_iso}
         return detected, peaks_by_iso
 
@@ -550,10 +565,22 @@ class SpectralDecomposer:
     def _min_peak_count_by_isotope(
         library: Dict[str, Nuclide],
         min_peaks_multi: int = 2,
+        overrides: Dict[str, int] | None = None,
     ) -> Dict[str, int]:
         """Return minimum peak counts required to accept each isotope."""
         min_counts: Dict[str, int] = {}
         for iso, nuclide in library.items():
             line_count = len(nuclide.lines)
             min_counts[iso] = 1 if line_count <= 1 else max(int(min_peaks_multi), 1)
+        if overrides:
+            for iso, value in overrides.items():
+                if iso not in min_counts:
+                    continue
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if count < 1:
+                    count = 1
+                min_counts[iso] = count
         return min_counts

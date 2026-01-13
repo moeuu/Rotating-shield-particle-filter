@@ -5,7 +5,7 @@ import pytest
 
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
-from pf.state import ParticleState, IsotopeState
+from pf.state import IsotopeState
 from planning.pose_selection import (
     estimate_lambda_cost,
     recommend_num_rollouts,
@@ -35,16 +35,11 @@ def _build_simple_estimator() -> RotatingShieldPFEstimator:
     )
     est.add_measurement_pose(np.array([0.0, 0.0, 0.0]))
     est._ensure_kernel_cache()
-    filt = est.filters["Cs-137"]
-    filt.states = [
-        ParticleState(source_indices=np.array([0], dtype=np.int32), strengths=np.array([10.0]), background=0.0),
-        ParticleState(source_indices=np.array([0], dtype=np.int32), strengths=np.array([0.0]), background=0.0),
-    ]
-    filt.log_weights = np.log(np.ones(2) / 2.0)
     # Deterministic continuous particles for EIG tests (unblocked should dominate)
     from pf.particle_filter import IsotopeParticle
     from pf.state import IsotopeState
 
+    filt = est.filters["Cs-137"]
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
@@ -82,7 +77,6 @@ def test_select_best_orientation_prefers_unblocked_direction() -> None:
             estimator=est,
             pose_idx=0,
             live_time_s=1.0,
-            criterion="eig",
             RFe_candidates=[RFe],
             RPb_candidates=[RPb],
         )[1]
@@ -94,14 +88,14 @@ def test_select_best_orientation_prefers_unblocked_direction() -> None:
 
 
 def test_rotation_policy_stops_when_information_low() -> None:
-    """rotation_policy_step should stop if both IG and Fisher surrogates are below thresholds."""
+    """rotation_policy_step should stop if IG is below the threshold."""
     est = _build_simple_estimator()
     # Zero out strengths to make IG ~ 0
     filt = est.filters["Cs-137"]
-    for st in filt.states:
-        st.strengths[:] = 0.0
+    for p in filt.continuous_particles:
+        p.state.strengths[:] = 0.0
     should_stop, orient_idx, score = rotation_policy_step(
-        estimator=est, pose_idx=0, ig_threshold=1e-6, fisher_threshold=1e-6, live_time_s=1.0
+        estimator=est, pose_idx=0, ig_threshold=1e-6, live_time_s=1.0
     )
     assert should_stop
     assert orient_idx == -1
@@ -316,45 +310,6 @@ def test_expected_uncertainty_after_rotation_one_step() -> None:
     assert debug["rollouts"][0]["num_rotations"] == 1
 
 
-def test_orientation_fisher_criteria_positive() -> None:
-    """Fisher criteria JA/JD should be finite and non-negative for simple setup (Eq. 3.46–3.47)."""
-    np.random.seed(1)
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=2, max_sources=1)
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=normals,
-        mu_by_isotope=mu,
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([5.0]), background=0.1
-            ),
-            log_weight=np.log(0.6),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([2.0]), background=0.2
-            ),
-            log_weight=np.log(0.4),
-        ),
-    ]
-    mats = generate_octant_rotation_matrices()
-    JA, JD = est.orientation_fisher_criteria(pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=1.0)
-    assert JA >= 0.0
-    assert np.isfinite(JD)
-
-
 def test_short_time_update_uses_default_duration() -> None:
     """short_time_update should use pf_config.short_time_s when live_time_s is omitted."""
     isotopes = ["Cs-137"]
@@ -406,7 +361,6 @@ def test_should_stop_shield_rotation_by_dwell_time() -> None:
     assert est.should_stop_shield_rotation(
         pose_idx=0,
         ig_threshold=config.ig_threshold,
-        fisher_threshold=1e6,
         change_tol=1e6,
         uncertainty_tol=1e6,
         live_time_s=config.short_time_s,
