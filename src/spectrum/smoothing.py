@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter1d
 
 try:
     import torch
@@ -44,11 +43,24 @@ def _gaussian_kernel_torch(
     """Return a 1D Gaussian kernel for torch convolution."""
     if sigma_bins <= 0.0:
         return torch.ones(1, device=device, dtype=dtype)
-    radius = max(1, int(np.ceil(3.0 * sigma_bins)))
+    radius = max(1, int(np.ceil(4.0 * sigma_bins)))
     x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
     kernel = torch.exp(-0.5 * (x / sigma_bins) ** 2)
     kernel = kernel / torch.sum(kernel)
     return kernel
+
+
+def _gaussian_kernel_np(sigma_bins: float) -> NDArray[np.float64]:
+    """Return a 1D Gaussian kernel for discrete convolution."""
+    if sigma_bins <= 0.0:
+        return np.ones(1, dtype=float)
+    radius = max(1, int(np.ceil(4.0 * sigma_bins)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / float(sigma_bins)) ** 2)
+    kernel_sum = float(np.sum(kernel))
+    if kernel_sum > 0.0:
+        kernel = kernel / kernel_sum
+    return kernel.astype(float, copy=False)
 
 
 def gaussian_smooth(
@@ -76,10 +88,20 @@ def gaussian_smooth(
         return np.asarray(signal, dtype=float)
     ctx = _resolve_torch_context(use_gpu, gpu_device, gpu_dtype)
     if ctx is None:
-        return gaussian_filter1d(signal, sigma=sigma_bins, mode="nearest")
+        data = np.asarray(signal, dtype=float)
+        if data.size == 0:
+            return data
+        kernel = _gaussian_kernel_np(sigma_bins)
+        smoothed = np.convolve(data, kernel, mode="same")
+        return np.asarray(smoothed, dtype=float)
     device, dtype = ctx
     if torch is None or torch_f is None:
-        return gaussian_filter1d(signal, sigma=sigma_bins, mode="nearest")
+        data = np.asarray(signal, dtype=float)
+        if data.size == 0:
+            return data
+        kernel = _gaussian_kernel_np(sigma_bins)
+        smoothed = np.convolve(data, kernel, mode="same")
+        return np.asarray(smoothed, dtype=float)
     signal_t = torch.as_tensor(np.asarray(signal, dtype=float), device=device, dtype=dtype).view(1, 1, -1)
     kernel = _gaussian_kernel_torch(sigma_bins, device=device, dtype=dtype).view(1, 1, -1)
     pad = kernel.shape[-1] // 2

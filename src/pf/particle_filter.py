@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
+from pf.likelihood import delta_log_likelihood_remove, delta_log_likelihood_update, expected_counts_per_source
 from pf.state import IsotopeState
 from pf.resampling import systematic_resample
 
@@ -30,6 +31,22 @@ class PFConfig:
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
+    death_low_q_streak: int = 10
+    death_delta_ll_threshold: float = 0.0
+    support_ema_alpha: float = 0.3
+    support_window: int = 1
+    birth_window: int = 10
+    birth_softmax_temp: float = 1.0
+    birth_min_score: float = 1e-12
+    split_prob: float = 0.05
+    split_strength_min: float = 0.1
+    split_position_sigma: float = 0.25
+    split_strength_min_frac: float = 0.3
+    split_strength_max_frac: float = 0.7
+    split_delta_ll_threshold: float = 0.0
+    merge_prob: float = 0.0
+    merge_distance_max: float = 0.5
+    merge_delta_ll_threshold: float = 0.0
     ess_low: float = 0.5
     ess_high: float = 0.9
     # Continuous PF priors (Sec. 3.3.2)
@@ -57,6 +74,17 @@ class IsotopeParticle:
 
     state: IsotopeState
     log_weight: float
+
+
+@dataclass(frozen=True)
+class MeasurementData:
+    """Bundle measurement arrays for birth/death and split/merge proposals."""
+
+    z_k: NDArray[np.float64]
+    detector_positions: NDArray[np.float64]
+    fe_indices: NDArray[np.int64]
+    pb_indices: NDArray[np.int64]
+    live_times: NDArray[np.float64]
 
 
 class IsotopeParticleFilter:
@@ -105,11 +133,25 @@ class IsotopeParticleFilter:
                 strengths = np.random.lognormal(
                     mean=self.config.init_strength_log_mean, sigma=self.config.init_strength_log_sigma, size=r_h
                 )
+                ages = np.zeros(r_h, dtype=int)
+                low_q_streaks = np.zeros(r_h, dtype=int)
+                support_scores = np.zeros(r_h, dtype=float)
             else:
                 positions = np.zeros((0, 3), dtype=float)
                 strengths = np.zeros(0, dtype=float)
+                ages = np.zeros(0, dtype=int)
+                low_q_streaks = np.zeros(0, dtype=int)
+                support_scores = np.zeros(0, dtype=float)
             b_h = self._background_level()
-            st = IsotopeState(num_sources=r_h, positions=positions, strengths=strengths, background=b_h)
+            st = IsotopeState(
+                num_sources=r_h,
+                positions=positions,
+                strengths=strengths,
+                background=b_h,
+                ages=ages,
+                low_q_streaks=low_q_streaks,
+                support_scores=support_scores,
+            )
             self.continuous_particles.append(IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N))))
 
     def _gpu_enabled(self) -> bool:
@@ -423,6 +465,7 @@ class IsotopeParticleFilter:
         st = particle.state
         if st.num_sources == 0 or ref_positions.size == 0:
             return
+        self._ensure_source_metadata(st)
         cost = self._label_cost_matrix(
             positions=st.positions,
             strengths=st.strengths,
@@ -439,6 +482,7 @@ class IsotopeParticleFilter:
         assigned = {c: r for r, c in zip(row_ind, col_ind) if r < n_rows and c < n_cols}
         ordered_pos: list[NDArray[np.float64]] = []
         ordered_str: list[float] = []
+        ordered_rows: list[int] = []
         used_rows: set[int] = set()
         for ref_idx in range(n_cols):
             row = assigned.get(ref_idx)
@@ -446,15 +490,20 @@ class IsotopeParticleFilter:
                 continue
             ordered_pos.append(st.positions[row])
             ordered_str.append(float(st.strengths[row]))
+            ordered_rows.append(row)
             used_rows.add(row)
         for row in range(n_rows):
             if row in used_rows:
                 continue
             ordered_pos.append(st.positions[row])
             ordered_str.append(float(st.strengths[row]))
+            ordered_rows.append(row)
         if ordered_pos:
             st.positions = np.vstack(ordered_pos)
             st.strengths = np.array(ordered_str, dtype=float)
+            st.ages = st.ages[ordered_rows]
+            st.low_q_streaks = st.low_q_streaks[ordered_rows]
+            st.support_scores = st.support_scores[ordered_rows]
             st.num_sources = st.positions.shape[0]
 
     def _reference_from_particles(self, ref_count: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -565,6 +614,114 @@ class IsotopeParticleFilter:
         """Return the particle with maximum log_weight."""
         return max(self.continuous_particles, key=lambda p: p.log_weight)
 
+    def _resize_metadata_array(
+        self,
+        arr: NDArray[np.float64] | NDArray[np.int64] | None,
+        size: int,
+        fill_value: float,
+        dtype: type,
+    ) -> NDArray:
+        """Resize or initialize a metadata array to a target length."""
+        if arr is None:
+            return np.full(size, fill_value, dtype=dtype)
+        arr = np.asarray(arr)
+        if arr.size == size:
+            return arr.astype(dtype, copy=False)
+        if arr.size < size:
+            pad = np.full(size - arr.size, fill_value, dtype=dtype)
+            return np.concatenate([arr.astype(dtype, copy=False), pad])
+        return arr[:size].astype(dtype, copy=False)
+
+    def _ensure_source_metadata(self, st: IsotopeState) -> None:
+        """Ensure per-source metadata arrays exist and match num_sources."""
+        r = int(st.num_sources)
+        st.ages = self._resize_metadata_array(st.ages, r, 0, int)
+        st.low_q_streaks = self._resize_metadata_array(st.low_q_streaks, r, 0, int)
+        st.support_scores = self._resize_metadata_array(st.support_scores, r, 0.0, float)
+
+    def _lambda_components(
+        self,
+        st: IsotopeState,
+        data: MeasurementData,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return (lambda_m, lambda_total) for a state across measurements."""
+        if data.z_k.size == 0:
+            return np.zeros((0, st.num_sources), dtype=float), np.zeros(0, dtype=float)
+        lambda_m = expected_counts_per_source(
+            kernel=self.continuous_kernel,
+            isotope=self.isotope,
+            detector_positions=data.detector_positions,
+            sources=st.positions,
+            strengths=st.strengths,
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+        )
+        background_counts = float(st.background) * data.live_times
+        lambda_total = background_counts + np.sum(lambda_m, axis=1)
+        return lambda_m, lambda_total
+
+    def _compute_birth_proposal(
+        self,
+        data: MeasurementData | None,
+        candidate_positions: NDArray[np.float64] | None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], float] | None:
+        """
+        Build residual-driven birth proposal (probabilities, kernel_sums, residual_sum).
+        """
+        if data is None or candidate_positions is None or candidate_positions.size == 0:
+            return None
+        best = self.best_particle().state
+        if data.z_k.size == 0:
+            return None
+        background_counts = float(best.background) * data.live_times
+        if best.num_sources > 0:
+            lambda_m = expected_counts_per_source(
+                kernel=self.continuous_kernel,
+                isotope=self.isotope,
+                detector_positions=data.detector_positions,
+                sources=best.positions,
+                strengths=best.strengths,
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+            )
+            lambda_total = background_counts + np.sum(lambda_m, axis=1)
+        else:
+            lambda_total = background_counts
+        residual = np.maximum(data.z_k - lambda_total, 0.0)
+        residual_sum = float(np.sum(residual))
+        if residual_sum <= 0.0:
+            return None
+
+        scores = np.zeros(candidate_positions.shape[0], dtype=float)
+        kernel_sums = np.zeros(candidate_positions.shape[0], dtype=float)
+        for j, pos in enumerate(candidate_positions):
+            k_sum = 0.0
+            s_sum = 0.0
+            for k in range(data.z_k.size):
+                kernel_val = self.continuous_kernel.kernel_value_pair(
+                    isotope=self.isotope,
+                    detector_pos=data.detector_positions[k],
+                    source_pos=pos,
+                    fe_index=int(data.fe_indices[k]),
+                    pb_index=int(data.pb_indices[k]),
+                )
+                contrib = float(data.live_times[k]) * kernel_val
+                k_sum += contrib
+                s_sum += residual[k] * contrib
+            kernel_sums[j] = k_sum
+            scores[j] = s_sum
+        if np.max(scores) <= 0.0:
+            return None
+        scores = np.maximum(scores, float(self.config.birth_min_score))
+        temp = max(float(self.config.birth_softmax_temp), 1e-6)
+        scaled = scores / temp
+        scaled = scaled - np.max(scaled)
+        probs = np.exp(scaled)
+        probs = probs / max(float(np.sum(probs)), 1e-12)
+        return probs, kernel_sums, residual_sum
+
     def regularize_continuous(
         self,
         sigma_pos: float = 0.05,
@@ -574,41 +731,209 @@ class IsotopeParticleFilter:
         intensity_threshold: float = 0.05,
     ) -> None:
         """
-        Apply small Gaussian jitter to positions/strengths and simple birth/death moves (Sec. 3.3.4).
+        Apply small Gaussian jitter to positions/strengths (Sec. 3.3.4).
 
-        - positions: s <- s + N(0, sigma_pos^2 I)
-        - strengths: q <- max(q + N(0, sigma_int^2), intensity_threshold)
-        - delete sources with q < intensity_threshold with prob p_kill
-        - with prob p_birth, add a new source uniformly in workspace with small initial strength
+        Birth/death moves are handled in apply_birth_death().
         """
         lo = np.array(self.config.position_min, dtype=float)
         hi = np.array(self.config.position_max, dtype=float)
-        max_sources = self.config.max_sources
         for p in self.continuous_particles:
             st = p.state
+            self._ensure_source_metadata(st)
             st.background = self._background_level()
             if st.positions.size:
                 st.positions = st.positions + np.random.normal(scale=sigma_pos, size=st.positions.shape)
                 st.positions = np.clip(st.positions, lo, hi)
                 st.strengths = st.strengths + np.random.normal(scale=sigma_int, size=st.strengths.shape)
                 st.strengths = np.maximum(st.strengths, 0.0)
-                # kill weak sources
-                mask = np.ones(st.num_sources, dtype=bool)
-                for i, q in enumerate(st.strengths):
-                    if q < intensity_threshold and np.random.rand() < p_kill:
-                        mask[i] = False
-                st.positions = st.positions[mask]
-                st.strengths = np.maximum(st.strengths[mask], intensity_threshold)
                 st.num_sources = st.positions.shape[0]
-            # birth
-            if np.random.rand() < p_birth:
-                if max_sources is not None and st.num_sources >= max_sources:
+
+    def apply_birth_death(
+        self,
+        support_data: MeasurementData | None,
+        birth_data: MeasurementData | None,
+        candidate_positions: NDArray[np.float64] | None = None,
+    ) -> None:
+        """
+        Apply hysteretic death, residual-driven birth, and split/merge proposals.
+        """
+        if not self.continuous_particles:
+            return
+        birth_proposal = self._compute_birth_proposal(birth_data, candidate_positions)
+        if birth_proposal is not None:
+            birth_probs, birth_kernel_sums, residual_sum = birth_proposal
+        else:
+            birth_probs = None
+            birth_kernel_sums = None
+            residual_sum = 0.0
+
+        for particle in self.continuous_particles:
+            st = particle.state
+            self._ensure_source_metadata(st)
+            has_support = support_data is not None and support_data.z_k.size > 0
+            if st.num_sources > 0:
+                st.ages = st.ages + 1
+                below = st.strengths < float(self.config.min_strength)
+                st.low_q_streaks[below] += 1
+                st.low_q_streaks[~below] = 0
+            lambda_m = None
+            lambda_total = None
+            if has_support and st.num_sources > 0:
+                lambda_m, lambda_total = self._lambda_components(st, support_data)
+                delta_ll = delta_log_likelihood_remove(
+                    support_data.z_k,
+                    lambda_total,
+                    lambda_m,
+                )
+                alpha = float(self.config.support_ema_alpha)
+                st.support_scores = (1.0 - alpha) * st.support_scores + alpha * delta_ll
+            if st.num_sources > 0 and has_support:
+                kill_mask = np.ones(st.num_sources, dtype=bool)
+                kill_candidates = (st.low_q_streaks >= int(self.config.death_low_q_streak)) & (
+                    st.support_scores < float(self.config.death_delta_ll_threshold)
+                )
+                for idx, do_kill in enumerate(kill_candidates):
+                    if do_kill and np.random.rand() < float(self.config.p_kill):
+                        kill_mask[idx] = False
+                if not np.all(kill_mask):
+                    st.positions = st.positions[kill_mask]
+                    st.strengths = st.strengths[kill_mask]
+                    st.ages = st.ages[kill_mask]
+                    st.low_q_streaks = st.low_q_streaks[kill_mask]
+                    st.support_scores = st.support_scores[kill_mask]
+                    st.num_sources = st.positions.shape[0]
+
+            if (
+                st.num_sources > 0
+                and support_data is not None
+                and support_data.z_k.size
+                and np.random.rand() < float(self.config.split_prob)
+            ):
+                if self.config.max_sources is not None and st.num_sources >= self.config.max_sources:
                     continue
-                new_pos = lo + np.random.rand(3) * (hi - lo)
-                new_strength = float(np.abs(np.random.normal(loc=0.1, scale=0.05)))
-                st.positions = np.vstack([st.positions, new_pos])
-                st.strengths = np.append(st.strengths, new_strength)
+                candidates = np.where(st.strengths >= float(self.config.split_strength_min))[0]
+                if candidates.size > 0:
+                    idx = int(np.random.choice(candidates))
+                    if lambda_total is None or lambda_m is None:
+                        lambda_m, lambda_total = self._lambda_components(st, support_data)
+                    delta = np.random.normal(scale=float(self.config.split_position_sigma), size=3)
+                    lo = np.array(self.config.position_min, dtype=float)
+                    hi = np.array(self.config.position_max, dtype=float)
+                    s1 = np.clip(st.positions[idx] + delta, lo, hi)
+                    s2 = np.clip(st.positions[idx] - delta, lo, hi)
+                    u_min = float(self.config.split_strength_min_frac)
+                    u_max = float(self.config.split_strength_max_frac)
+                    u_low, u_high = (u_min, u_max) if u_min <= u_max else (u_max, u_min)
+                    u = np.random.uniform(u_low, u_high)
+                    q1 = float(st.strengths[idx]) * float(u)
+                    q2 = float(st.strengths[idx]) * float(1.0 - u)
+                    lam_new = expected_counts_per_source(
+                        kernel=self.continuous_kernel,
+                        isotope=self.isotope,
+                        detector_positions=support_data.detector_positions,
+                        sources=np.vstack([s1, s2]),
+                        strengths=np.array([q1, q2], dtype=float),
+                        live_times=support_data.live_times,
+                        fe_indices=support_data.fe_indices,
+                        pb_indices=support_data.pb_indices,
+                    )
+                    lambda_new = lambda_total - lambda_m[:, idx] + np.sum(lam_new, axis=1)
+                    delta_ll = delta_log_likelihood_update(
+                        support_data.z_k,
+                        lambda_total,
+                        lambda_new,
+                    )
+                    if delta_ll >= float(self.config.split_delta_ll_threshold):
+                        if np.log(np.random.rand()) < delta_ll:
+                            st.positions = np.vstack([st.positions[:idx], st.positions[idx + 1 :], s1, s2])
+                            st.strengths = np.concatenate(
+                                [st.strengths[:idx], st.strengths[idx + 1 :], [q1, q2]]
+                            )
+                            st.ages = np.concatenate([st.ages[:idx], st.ages[idx + 1 :], [0, 0]])
+                            st.low_q_streaks = np.concatenate(
+                                [st.low_q_streaks[:idx], st.low_q_streaks[idx + 1 :], [0, 0]]
+                            )
+                            st.support_scores = np.concatenate(
+                                [st.support_scores[:idx], st.support_scores[idx + 1 :], [0.0, 0.0]]
+                            )
+                            st.num_sources = st.positions.shape[0]
+
+            if (
+                st.num_sources >= 2
+                and support_data is not None
+                and support_data.z_k.size
+                and np.random.rand() < float(self.config.merge_prob)
+            ):
+                pos = st.positions
+                diff = pos[:, None, :] - pos[None, :, :]
+                dist = np.linalg.norm(diff, axis=-1)
+                dist = np.where(np.eye(dist.shape[0], dtype=bool), np.inf, dist)
+                i, j = np.unravel_index(np.argmin(dist), dist.shape)
+                if dist[i, j] <= float(self.config.merge_distance_max):
+                    if lambda_total is None or lambda_m is None:
+                        lambda_m, lambda_total = self._lambda_components(st, support_data)
+                    q1 = float(st.strengths[i])
+                    q2 = float(st.strengths[j])
+                    if q1 + q2 > 0.0:
+                        merged_pos = (q1 * st.positions[i] + q2 * st.positions[j]) / (q1 + q2)
+                    else:
+                        merged_pos = 0.5 * (st.positions[i] + st.positions[j])
+                    merged_strength = q1 + q2
+                    lam_merge = expected_counts_per_source(
+                        kernel=self.continuous_kernel,
+                        isotope=self.isotope,
+                        detector_positions=support_data.detector_positions,
+                        sources=np.array([merged_pos]),
+                        strengths=np.array([merged_strength], dtype=float),
+                        live_times=support_data.live_times,
+                        fe_indices=support_data.fe_indices,
+                        pb_indices=support_data.pb_indices,
+                    )
+                    lambda_new = lambda_total - lambda_m[:, i] - lambda_m[:, j] + lam_merge[:, 0]
+                    delta_ll = delta_log_likelihood_update(
+                        support_data.z_k,
+                        lambda_total,
+                        lambda_new,
+                    )
+                    if delta_ll >= float(self.config.merge_delta_ll_threshold):
+                        if np.log(np.random.rand()) < delta_ll:
+                            keep = np.ones(st.num_sources, dtype=bool)
+                            keep[[i, j]] = False
+                            st.positions = np.vstack([st.positions[keep], merged_pos])
+                            st.strengths = np.append(st.strengths[keep], merged_strength)
+                            st.ages = np.append(st.ages[keep], max(int(st.ages[i]), int(st.ages[j])))
+                            st.low_q_streaks = np.append(
+                                st.low_q_streaks[keep], min(int(st.low_q_streaks[i]), int(st.low_q_streaks[j]))
+                            )
+                            st.support_scores = np.append(
+                                st.support_scores[keep], max(float(st.support_scores[i]), float(st.support_scores[j]))
+                            )
+                            st.num_sources = st.positions.shape[0]
+
+            if (
+                birth_probs is not None
+                and birth_kernel_sums is not None
+                and residual_sum > 0.0
+                and np.random.rand() < float(self.config.p_birth)
+            ):
+                if self.config.max_sources is not None and st.num_sources >= self.config.max_sources:
+                    continue
+                idx = int(np.random.choice(len(birth_probs), p=birth_probs))
+                denom = float(birth_kernel_sums[idx])
+                if denom <= 0.0:
+                    continue
+                q_new = residual_sum / max(denom, 1e-12)
+                if q_new <= 0.0:
+                    continue
+                pos_new = candidate_positions[idx]
+                st.positions = np.vstack([st.positions, pos_new])
+                st.strengths = np.append(st.strengths, q_new)
+                st.ages = np.append(st.ages, 0)
+                st.low_q_streaks = np.append(st.low_q_streaks, 0)
+                st.support_scores = np.append(st.support_scores, 0.0)
                 st.num_sources = st.positions.shape[0]
+
+        self.align_continuous_labels()
 
     def _background_level(self) -> float:
         """Resolve per-isotope background level."""

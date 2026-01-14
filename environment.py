@@ -10,7 +10,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 ROOT = Path(__file__).resolve().parent
@@ -82,27 +81,51 @@ def _resolve_path(path: Path) -> Path:
     return path if path.is_absolute() else (ROOT / path).resolve()
 
 
+def _axis_line_style(ax: plt.Axes) -> tuple[str, float]:
+    """Return line color and width that match the axis lines."""
+    color = "black"
+    linewidth = 1.2
+    axis_line = getattr(ax.xaxis, "line", None)
+    if axis_line is not None:
+        color = axis_line.get_color()
+        try:
+            axis_width = float(axis_line.get_linewidth())
+        except (TypeError, ValueError):
+            axis_width = linewidth
+        if axis_width > 0:
+            linewidth = axis_width
+    return color, linewidth
+
+
 def _draw_room_bounds(
     ax: plt.Axes,
     bounds: tuple[float, float, float, float, float, float],
 ) -> None:
-    """Draw a wireframe box showing the room boundaries."""
+    """Draw a solid line box showing the room boundaries."""
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
-    xs = [xmin, xmax]
-    ys = [ymin, ymax]
-    zs = [zmin, zmax]
-    for z in zs:
-        X, Y = np.meshgrid(xs, ys)
-        Z = np.full_like(X, z)
-        ax.plot_wireframe(X, Y, Z, color="gray", alpha=0.25)
-    for x in xs:
-        X, Z = np.meshgrid([x], zs)
-        Y = np.array([[ymin, ymin], [ymax, ymax]])
-        ax.plot_wireframe(X, Y, Z, color="gray", alpha=0.25)
-    for y in ys:
-        Y, Z = np.meshgrid([y], zs)
-        X = np.array([[xmin, xmin], [xmax, xmax]])
-        ax.plot_wireframe(X, Y, Z, color="gray", alpha=0.25)
+    color, linewidth = _axis_line_style(ax)
+    edges = [
+        ((xmin, ymin, zmin), (xmax, ymin, zmin)),
+        ((xmin, ymax, zmin), (xmax, ymax, zmin)),
+        ((xmin, ymin, zmax), (xmax, ymin, zmax)),
+        ((xmin, ymax, zmax), (xmax, ymax, zmax)),
+        ((xmin, ymin, zmin), (xmin, ymax, zmin)),
+        ((xmax, ymin, zmin), (xmax, ymax, zmin)),
+        ((xmin, ymin, zmax), (xmin, ymax, zmax)),
+        ((xmax, ymin, zmax), (xmax, ymax, zmax)),
+        ((xmin, ymin, zmin), (xmin, ymin, zmax)),
+        ((xmax, ymin, zmin), (xmax, ymin, zmax)),
+        ((xmin, ymax, zmin), (xmin, ymax, zmax)),
+        ((xmax, ymax, zmin), (xmax, ymax, zmax)),
+    ]
+    for start, end in edges:
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            [start[2], end[2]],
+            color=color,
+            linewidth=linewidth,
+        )
 
 
 def _draw_obstacles(ax: plt.Axes, grid: ObstacleGrid) -> None:

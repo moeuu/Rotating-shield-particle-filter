@@ -15,7 +15,8 @@ from scipy.stats import chi2
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
-from pf.particle_filter import IsotopeParticleFilter, PFConfig
+from pf.likelihood import expected_counts_per_source, poisson_log_likelihood
+from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.resampling import systematic_resample
 from pf.state import IsotopeState
 
@@ -33,6 +34,22 @@ class RotatingShieldPFConfig:
         - lambda_cost: motion-cost weight in Eq. 3.51
         - position_sigma: Gaussian jitter for positions (meters)
         - alpha_weights: isotope weights for IG criteria
+        - death_low_q_streak: steps below min_strength before death is allowed
+        - death_delta_ll_threshold: ΔLL threshold required to kill weak sources
+        - support_ema_alpha: EMA weight for per-source ΔLL support
+        - support_window: measurement window for per-source support scoring
+        - birth_window: measurement window for residual-driven birth proposals
+        - birth_softmax_temp: temperature for residual proposal sampling
+        - birth_min_score: score floor for residual proposal sampling
+        - split_prob: probability of split proposals per particle
+        - split_strength_min: minimum strength for split candidates
+        - split_position_sigma: position jitter for split proposals
+        - split_strength_min_frac: min split fraction for q1/q2
+        - split_strength_max_frac: max split fraction for q1/q2
+        - split_delta_ll_threshold: ΔLL threshold for split acceptance
+        - merge_prob: probability of merge proposals per particle
+        - merge_distance_max: max distance for merge candidates
+        - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
         - orientation_k: number of orientations to execute per pose
         - orientation_selection_mode: "eig"
         - planning_particles: particle count used for orientation scoring (None = all)
@@ -62,6 +79,22 @@ class RotatingShieldPFConfig:
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
+    death_low_q_streak: int = 10
+    death_delta_ll_threshold: float = 0.0
+    support_ema_alpha: float = 0.3
+    support_window: int = 1
+    birth_window: int = 10
+    birth_softmax_temp: float = 1.0
+    birth_min_score: float = 1e-12
+    split_prob: float = 0.05
+    split_strength_min: float = 0.1
+    split_position_sigma: float = 0.25
+    split_strength_min_frac: float = 0.3
+    split_strength_max_frac: float = 0.7
+    split_delta_ll_threshold: float = 0.0
+    merge_prob: float = 0.0
+    merge_distance_max: float = 0.5
+    merge_delta_ll_threshold: float = 0.0
     short_time_s: float = 0.5  # Recommended short-time measurement (Sec. 3.4.3).
     ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
@@ -242,6 +275,22 @@ class RotatingShieldPFEstimator:
             min_strength=self.pf_config.min_strength,
             p_birth=self.pf_config.p_birth,
             p_kill=self.pf_config.p_kill,
+            death_low_q_streak=self.pf_config.death_low_q_streak,
+            death_delta_ll_threshold=self.pf_config.death_delta_ll_threshold,
+            support_ema_alpha=self.pf_config.support_ema_alpha,
+            support_window=self.pf_config.support_window,
+            birth_window=self.pf_config.birth_window,
+            birth_softmax_temp=self.pf_config.birth_softmax_temp,
+            birth_min_score=self.pf_config.birth_min_score,
+            split_prob=self.pf_config.split_prob,
+            split_strength_min=self.pf_config.split_strength_min,
+            split_position_sigma=self.pf_config.split_position_sigma,
+            split_strength_min_frac=self.pf_config.split_strength_min_frac,
+            split_strength_max_frac=self.pf_config.split_strength_max_frac,
+            split_delta_ll_threshold=self.pf_config.split_delta_ll_threshold,
+            merge_prob=self.pf_config.merge_prob,
+            merge_distance_max=self.pf_config.merge_distance_max,
+            merge_delta_ll_threshold=self.pf_config.merge_delta_ll_threshold,
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
             use_gpu=self.pf_config.use_gpu,
@@ -505,6 +554,55 @@ class RotatingShieldPFEstimator:
                 ig_value=None,
             )
         )
+        self._apply_birth_death()
+
+    def _measurement_data_for_iso(
+        self,
+        isotope: str,
+        window: int | None,
+    ) -> MeasurementData | None:
+        """Build measurement arrays for a single isotope with an optional window."""
+        if not self.measurements:
+            return None
+        if window is None or window <= 0:
+            records = self.measurements
+        else:
+            records = self.measurements[-int(window) :]
+        if not records:
+            return None
+        z_list = []
+        poses = []
+        fe_indices = []
+        pb_indices = []
+        live_times = []
+        for rec in records:
+            z_list.append(float(rec.z_k.get(isotope, 0.0)))
+            poses.append(self.poses[rec.pose_idx])
+            live_times.append(float(rec.live_time_s))
+            if rec.fe_index is not None and rec.pb_index is not None:
+                fe_indices.append(int(rec.fe_index))
+                pb_indices.append(int(rec.pb_index))
+            else:
+                fe_indices.append(int(rec.orient_idx))
+                pb_indices.append(int(rec.orient_idx))
+        return MeasurementData(
+            z_k=np.asarray(z_list, dtype=float),
+            detector_positions=np.asarray(poses, dtype=float),
+            fe_indices=np.asarray(fe_indices, dtype=int),
+            pb_indices=np.asarray(pb_indices, dtype=int),
+            live_times=np.asarray(live_times, dtype=float),
+        )
+
+    def _apply_birth_death(self) -> None:
+        """Apply per-isotope birth/death updates using recent measurements."""
+        for iso, filt in self.filters.items():
+            support_data = self._measurement_data_for_iso(iso, self.pf_config.support_window)
+            birth_data = self._measurement_data_for_iso(iso, self.pf_config.birth_window)
+            filt.apply_birth_death(
+                support_data=support_data,
+                birth_data=birth_data,
+                candidate_positions=self.candidate_sources,
+            )
 
     def estimates(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Return per-isotope position/strength estimates (MMSE over continuous particles)."""
@@ -513,6 +611,51 @@ class RotatingShieldPFEstimator:
     def estimate_all(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Alias for estimates() to align with visualization helpers."""
         return self.estimates()
+
+    def isotope_log_likelihood_gain(self, window: int | None = None) -> Dict[str, float]:
+        """
+        Return per-isotope log-likelihood gain vs background-only (evidence mixing).
+        """
+        if not self.measurements:
+            return {iso: 0.0 for iso in self.filters}
+        estimates = self.estimates()
+        gains: Dict[str, float] = {}
+        for iso, filt in self.filters.items():
+            data = self._measurement_data_for_iso(iso, window)
+            if data is None or data.z_k.size == 0:
+                gains[iso] = 0.0
+                continue
+            positions, strengths = estimates.get(iso, (np.zeros((0, 3)), np.zeros(0)))
+            if filt.continuous_particles:
+                background_rate = float(filt.best_particle().state.background)
+            else:
+                background_rate = 0.0
+            background_counts = background_rate * data.live_times
+            if positions.size == 0:
+                gains[iso] = 0.0
+                continue
+            lambda_m = expected_counts_per_source(
+                kernel=filt.continuous_kernel,
+                isotope=iso,
+                detector_positions=data.detector_positions,
+                sources=positions,
+                strengths=strengths,
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+            )
+            lambda_total = background_counts + np.sum(lambda_m, axis=1)
+            ll = poisson_log_likelihood(data.z_k, lambda_total)
+            ll_bg = poisson_log_likelihood(data.z_k, background_counts)
+            gains[iso] = float(ll - ll_bg)
+        return gains
+
+    def isotopes_by_evidence(self, min_delta_ll: float = 0.0, window: int | None = None) -> List[str]:
+        """
+        Return isotopes whose LL gain exceeds min_delta_ll for the given window.
+        """
+        gains = self.isotope_log_likelihood_gain(window=window)
+        return [iso for iso, gain in gains.items() if gain >= float(min_delta_ll)]
 
     @property
     def num_orientations(self) -> int:
@@ -1342,6 +1485,8 @@ class RotatingShieldPFEstimator:
 
     def prune_spurious_sources(
         self,
+        method: str = "deltaLL",
+        params: Dict[str, float] | None = None,
         tau_mix: float = 0.9,
         epsilon: float = 1e-6,
         min_support: int = 1,
@@ -1350,17 +1495,23 @@ class RotatingShieldPFEstimator:
         min_strength_ratio: float | None = None,
     ) -> Dict[str, NDArray[np.bool_]]:
         """
-        Apply the best-case measurement test (Sec. 3.4.5) and zero out spurious sources.
+        Prune spurious sources using delta-LL, best-case residual gating, or legacy dominance.
 
-        For each isotope h and each candidate source, find the measurement index k* that
-        maximises the ratio \\hat{Λ}_{k,h}/(z_{k,h}+ε) (Sec. 3.4.5). If the best-case ratio
-        falls below τ_mix, the source is marked spurious and removed. Optionally drop
-        sources below max(min_strength_abs, min_strength_ratio * max_strength).
+        For each isotope h and each candidate source, the pruning method is applied using
+        per-measurement expected counts from the continuous kernel. Optionally drop sources
+        below max(min_strength_abs, min_strength_ratio * max_strength).
+
+        Method params (passed via params):
+        - deltaLL: deltaLL_min, penalty_d (BIC-style), epsilon
+        - bestcase: alpha, lambda_min, lrt_threshold, epsilon
+        - legacy: tau_mix, epsilon
         """
         from pf.mixing import prune_spurious_sources_continuous
 
         keep_masks = prune_spurious_sources_continuous(
             self,
+            method=method,
+            params=params,
             tau_mix=tau_mix,
             epsilon=epsilon,
             min_support=min_support,

@@ -120,6 +120,13 @@ def main() -> None:
         default=0.5,
         help="Match radius (m) for evaluation metrics.",
     )
+    parser.add_argument(
+        "--count",
+        type=str,
+        default="spectrum",
+        choices=("spectrum", "expected"),
+        help="Counts to pass to the PF: spectrum (default) or expected.",
+    )
     args = parser.parse_args()
     sources = None
     if args.source_config:
@@ -148,6 +155,7 @@ def main() -> None:
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
         eval_match_radius_m=args.eval_match_radius,
+        count_mode=args.count,
     )
 
 

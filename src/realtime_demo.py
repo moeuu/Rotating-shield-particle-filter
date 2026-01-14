@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import warnings
 
 import matplotlib
 
@@ -36,9 +37,12 @@ from measurement.shielding import (
     mu_by_isotope_from_tvl_mm,
 )
 from measurement.kernels import ShieldParams
-from spectrum.library import Nuclide
+from measurement.continuous_kernels import ContinuousKernel
+from spectrum.library import get_detection_lines_keV
 from spectrum.peak_detection import detect_peaks
 from spectrum.pipeline import SpectralDecomposer
+from spectrum.baseline import baseline_als
+from spectrum.smoothing import gaussian_smooth
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
 from planning.candidate_generation import generate_candidate_poses
@@ -52,12 +56,14 @@ from visualization.realtime_viz import (
     RealTimePFVisualizer,
     build_frame_from_pf,
 )
+from visualization.ig_shield_geometry import render_octant_grid
 from evaluation_metrics import compute_metrics, print_metrics_report
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
 SPECTRUM_DIR = RESULTS_DIR / "spetrum"
 PF_DIR = RESULTS_DIR / "pf"
+IG_DIR = RESULTS_DIR / "IG"
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_MIN_STRENGTH_ABS = 5.0
 PRUNE_MIN_STRENGTH_RATIO = 0.001
@@ -67,7 +73,7 @@ PRUNE_MIN_OBS_COUNT = 0.0
 PRUNE_MIN_MEASUREMENTS = 10
 DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 2}
 DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.2}
-DETECT_CONSECUTIVE_BY_ISOTOPE = {"Eu-154": 5}
+DETECT_CONSECUTIVE_BY_ISOTOPE = {"Cs-137": 3, "Co-60": 3, "Eu-154": 5}
 DETECT_MISS_AFTER_LOCK = 30
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
@@ -185,37 +191,6 @@ def _resolve_ig_threshold(
     raise ValueError(f"Unknown IG threshold mode: {mode}")
 
 
-def _assign_peak_indices(
-    energy_axis: np.ndarray,
-    peak_indices: np.ndarray,
-    library: dict[str, Nuclide],
-    tolerance_keV: float,
-) -> tuple[dict[str, list[int]], list[int]]:
-    """Assign detected peak indices to isotopes based on closest library lines."""
-    peaks_by_iso: dict[str, list[int]] = {iso: [] for iso in library}
-    unassigned: list[int] = []
-    line_energies = {
-        iso: np.array([line.energy_keV for line in nuclide.lines], dtype=float)
-        for iso, nuclide in library.items()
-    }
-    for idx in peak_indices:
-        energy = float(energy_axis[int(idx)])
-        best_iso = None
-        best_diff = float("inf")
-        for iso, energies in line_energies.items():
-            if energies.size == 0:
-                continue
-            diff = float(np.min(np.abs(energies - energy)))
-            if diff < best_diff:
-                best_diff = diff
-                best_iso = iso
-        if best_iso is not None and best_diff <= tolerance_keV:
-            peaks_by_iso[best_iso].append(int(idx))
-        else:
-            unassigned.append(int(idx))
-    return peaks_by_iso, unassigned
-
-
 def _default_use_gpu() -> bool:
     """Return True if CUDA is available for torch acceleration."""
     try:
@@ -225,37 +200,141 @@ def _default_use_gpu() -> bool:
     return gpu_utils.torch_available()
 
 
+def _compute_ig_grid(
+    estimator: RotatingShieldPFEstimator,
+    rot_mats: Sequence[np.ndarray],
+    *,
+    pose_idx: int,
+    live_time_s: float,
+    planning_isotopes: Sequence[str] | None = None,
+) -> np.ndarray:
+    """
+    Compute expected IG over all Fe/Pb orientation pairs for the current PF state.
+    """
+    eig_samples = estimator.pf_config.planning_eig_samples
+    if eig_samples is None:
+        eig_samples = estimator.pf_config.eig_num_samples
+    rollout_particles = estimator.pf_config.planning_rollout_particles
+    if rollout_particles is None:
+        rollout_particles = estimator.pf_config.planning_particles
+    rollout_method = estimator.pf_config.planning_rollout_method or estimator.pf_config.planning_method
+    particles_by_iso = estimator.planning_particles(
+        max_particles=rollout_particles,
+        method=rollout_method,
+    )
+    alpha_weights = estimator.pf_config.alpha_weights
+    if planning_isotopes is not None:
+        planning_set = set(planning_isotopes)
+        particles_by_iso = {
+            iso: val for iso, val in particles_by_iso.items() if iso in planning_set
+        }
+        if alpha_weights is None:
+            alpha_weights = {iso: 1.0 for iso in planning_set}
+        else:
+            alpha_weights = {
+                iso: float(alpha_weights.get(iso, 1.0)) for iso in planning_set
+            }
+    size = len(rot_mats)
+    scores = np.zeros((size, size), dtype=float)
+    for fe_idx, RFe in enumerate(rot_mats):
+        for pb_idx, RPb in enumerate(rot_mats):
+            scores[fe_idx, pb_idx] = estimator.orientation_expected_information_gain(
+                pose_idx=pose_idx,
+                RFe=RFe,
+                RPb=RPb,
+                live_time_s=live_time_s,
+                num_samples=eig_samples,
+                alpha_by_isotope=alpha_weights,
+                particles_by_isotope=particles_by_iso,
+            )
+    return scores
+
+
 def _save_spectrum_plot(
     decomposer: SpectralDecomposer,
     spectrum: np.ndarray,
     output_path: Path,
     peak_tolerance_keV: float = 10.0,
     highlight_isotopes: set[str] | None = None,
+    counts_by_isotope: dict[str, float] | None = None,
+    use_detection_lines: bool = True,
+    window_keV: float | None = None,
+    window_sigma: float = 3.0,
 ) -> None:
-    """Save the final measurement spectrum with nuclide lines and colored peaks."""
+    """Save the measurement spectrum with nuclide lines and colored count windows."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     energy_axis = decomposer.energy_axis
     library = decomposer.library
     if highlight_isotopes is not None:
         library = {iso: library[iso] for iso in library if iso in highlight_isotopes}
+    line_map: dict[str, list[float]] = {}
+    for iso, nuclide in library.items():
+        if use_detection_lines:
+            lines = get_detection_lines_keV(iso)
+        else:
+            lines = [line.energy_keV for line in nuclide.lines]
+        if lines:
+            line_map[iso] = lines
     colors = _build_isotope_colors(list(library.keys()))
-    corrected = decomposer.preprocess(spectrum)
+    smoothed = gaussian_smooth(
+        spectrum,
+        sigma_bins=2.0,
+        use_gpu=decomposer.use_gpu,
+        gpu_device=decomposer.gpu_device,
+        gpu_dtype=decomposer.gpu_dtype,
+    )
+    baseline = baseline_als(
+        smoothed,
+        lam=decomposer.config.baseline_lam,
+        p=decomposer.config.baseline_p,
+        niter=decomposer.config.baseline_niter,
+    )
+    corrected = np.clip(smoothed - baseline, a_min=0.0, a_max=None)
     peak_indices = detect_peaks(corrected, prominence=0.05, distance=5)
-    peaks_by_iso, unassigned = _assign_peak_indices(
+    line_energies = {iso: np.array(lines, dtype=float) for iso, lines in line_map.items()} if use_detection_lines else None
+    peaks_by_iso, unassigned = decomposer._assign_peak_indices(
         energy_axis,
         peak_indices,
         library,
         tolerance_keV=peak_tolerance_keV,
+        line_energies=line_energies,
     )
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(energy_axis, spectrum, color="black", linewidth=1.0, label="Spectrum")
     for iso, nuclide in library.items():
+        if iso not in line_map:
+            continue
+        if counts_by_isotope is not None and counts_by_isotope.get(iso, 0.0) <= 0.0:
+            continue
+        color = colors.get(iso, "gray")
+        for line_keV in line_map[iso]:
+            half_width = window_keV
+            if half_width is None:
+                sigma = float(decomposer.resolution_fn(line_keV))
+                sigma_width = max(window_sigma * sigma, 1e-6)
+                if use_detection_lines:
+                    half_width = max(float(decomposer.config.detect_half_window_keV), sigma_width)
+                else:
+                    half_width = sigma_width
+            mask = np.abs(energy_axis - line_keV) <= float(half_width)
+            if np.any(mask):
+                ax.fill_between(
+                    energy_axis[mask],
+                    baseline[mask],
+                    smoothed[mask],
+                    color=color,
+                    alpha=0.2,
+                    linewidth=0.0,
+                )
+    for iso, nuclide in library.items():
+        if iso not in line_map:
+            continue
         color = colors.get(iso, "gray")
         labeled = False
-        for line in nuclide.lines:
+        for line_keV in line_map[iso]:
             label = iso if not labeled else None
             ax.axvline(
-                line.energy_keV,
+                line_keV,
                 color=color,
                 linestyle="--",
                 linewidth=1.0,
@@ -281,6 +360,41 @@ def _save_spectrum_plot(
     plt.close(fig)
 
 
+def _expected_counts(
+    kernel: ContinuousKernel,
+    sources: list[PointSource],
+    isotopes: list[str],
+    detector_pos: NDArray[np.float64],
+    fe_index: int,
+    pb_index: int,
+    live_time_s: float,
+) -> dict[str, float]:
+    """Compute inverse-square + shield-attenuated expected counts per isotope."""
+    counts: dict[str, float] = {}
+    for iso in isotopes:
+        iso_sources = [src for src in sources if src.isotope == iso]
+        if not iso_sources:
+            counts[iso] = 0.0
+            continue
+        positions = np.vstack([src.position_array() for src in iso_sources])
+        strengths = np.array([src.intensity_cps_1m for src in iso_sources], dtype=float)
+        counts[iso] = float(
+            kernel.expected_counts_pair(
+                isotope=iso,
+                detector_pos=detector_pos,
+                sources=positions,
+                strengths=strengths,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                background=0.0,
+            )
+        )
+    return counts
+
+
+
+
 def run_live_pf(
     live: bool = True,
     max_steps: int | None = None,
@@ -297,7 +411,11 @@ def run_live_pf(
     obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
     obstacle_seed: int | None = None,
     eval_match_radius_m: float = 0.5,
-) -> None:
+    count_mode: str = "spectrum",
+    pf_config_overrides: dict[str, object] | None = None,
+    save_outputs: bool = True,
+    return_state: bool = False,
+) -> RotatingShieldPFEstimator | None:
     """
     Run a simple PF loop with live visualization (active pose/orientation selection).
 
@@ -305,7 +423,18 @@ def run_live_pf(
     If max_poses is None, run without a pose-count limit.
     If obstacle_layout_path is provided, blocked grid cells are excluded and shown
     in black.
+    count_mode controls the per-isotope counts passed to the PF:
+    - "spectrum": use spectrum-derived counts (default).
+    - "expected": use expected counts from the kernel.
+
+    Args:
+        pf_config_overrides: Optional overrides applied to the PF configuration.
+        save_outputs: When False, skip writing plots and snapshot images.
+        return_state: When True, return the estimator for inspection/testing.
     """
+    count_mode = count_mode.strip().lower()
+    if count_mode not in {"spectrum", "expected"}:
+        raise ValueError(f"Unknown count_mode: {count_mode}")
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
@@ -332,7 +461,8 @@ def run_live_pf(
     normals = generate_octant_orientations()
     rot_mats = generate_octant_rotation_matrices()
     num_orients = len(rot_mats)
-    PF_DIR.mkdir(parents=True, exist_ok=True)
+    if save_outputs:
+        PF_DIR.mkdir(parents=True, exist_ok=True)
 
     # Candidate sources: coarse grid inside environment
     xs_src = np.linspace(0.5, env.size_x - 0.5, 4)
@@ -349,6 +479,7 @@ def run_live_pf(
     miss_counts = {iso: 0 for iso in isotopes}
     detected_isotopes: set[str] = set()
     detection_locked = False
+    locked_isotopes_for_planning: set[str] = set()
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
     # Use a moderate particle count for the demo (previous default was 200)
@@ -360,6 +491,13 @@ def run_live_pf(
             iso: {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb} for iso in isotopes
         }
     use_gpu = _default_use_gpu()
+    expected_kernel = ContinuousKernel(
+        mu_by_isotope=mu_by_isotope,
+        shield_params=shield_params,
+        use_gpu=use_gpu,
+        gpu_device="cuda",
+        gpu_dtype="float32",
+    )
     background_by_isotope = {iso: 5.0 for iso in isotopes}
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
@@ -384,6 +522,11 @@ def run_live_pf(
         gpu_device="cuda",
         gpu_dtype="float32",
     )
+    if pf_config_overrides:
+        for key, value in pf_config_overrides.items():
+            if not hasattr(pf_conf, key):
+                raise ValueError(f"Unknown PF config override: {key}")
+            setattr(pf_conf, key, value)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
     estimator = RotatingShieldPFEstimator(
@@ -406,7 +549,7 @@ def run_live_pf(
         if positions:
             true_src[iso] = np.vstack(positions)
         if strengths:
-            true_strengths[iso] = float(np.max(strengths))
+            true_strengths[iso] = [float(val) for val in strengths]
     viz = RealTimePFVisualizer(
         isotopes=isotopes,
         world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
@@ -429,12 +572,24 @@ def run_live_pf(
     total_pairs = num_orients * num_orients
     visited_poses: list[NDArray[np.float64]] = []
     last_spectrum: np.ndarray | None = None
+    last_counts: dict[str, float] | None = None
     last_max_ig: float | None = None
     if max_steps is not None and max_steps <= 0:
         max_steps = None
     if max_poses is not None and max_poses <= 0:
         max_poses = None
     gpu_status = "enabled" if estimator._gpu_enabled() else "disabled"
+    cfg = decomposer.config
+    if save_outputs:
+        IG_DIR.mkdir(parents=True, exist_ok=True)
+    print(
+        "Spectrum config: "
+        f"bin_width_keV={cfg.bin_width_keV}, live_time_s={live_time}, "
+        f"smooth_sigma_bins={cfg.smooth_sigma_bins}, "
+        f"als_lambda={cfg.als_lambda}, als_p={cfg.als_p}, als_niter={cfg.als_niter}, "
+        f"resolution_a={cfg.resolution_a}, resolution_b={cfg.resolution_b}, "
+        f"peak_window_sigma={cfg.peak_window_sigma}, dead_time_tau_s={cfg.dead_time_tau_s}"
+    )
     print(
         "Rotation IG threshold: "
         f"mode={ig_threshold_mode}, floor={estimator.pf_config.ig_threshold:.6g}, "
@@ -499,6 +654,25 @@ def run_live_pf(
             pb_idx = best_pair_idx % num_orients
             RFe_sel = rot_mats[fe_idx]
             RPb_sel = rot_mats[pb_idx]
+            planning_isotopes = None
+            if detection_locked and locked_isotopes_for_planning:
+                planning_isotopes = sorted(locked_isotopes_for_planning)
+            ig_scores = _compute_ig_grid(
+                estimator,
+                rot_mats,
+                pose_idx=current_pose_idx,
+                live_time_s=live_time,
+                planning_isotopes=planning_isotopes,
+            )
+            if save_outputs:
+                ig_path = IG_DIR / f"ig_grid_step_{step_counter:04d}.png"
+                render_octant_grid(
+                    ig_path,
+                    ig_scores=ig_scores,
+                    highlight_idx=(fe_idx, pb_idx),
+                    highlight_max=False,
+                    font_size=12,
+                )
             env_step = EnvironmentConfig(detector_position=tuple(pose))
             spectrum, _ = decomposer.simulate_spectrum(
                 sources=sources,
@@ -511,21 +685,21 @@ def run_live_pf(
                 shield_params=shield_params,
             )
             last_spectrum = spectrum.copy()
-            z_full, candidates = decomposer.isotope_counts_with_detection(
+            z_detected, detected = decomposer.isotope_counts_with_detection(
                 spectrum,
+                live_time_s=live_time,
+                active_isotopes=sorted(active_isotopes) if active_isotopes else None,
                 detect_threshold_abs=detect_threshold_abs,
                 detect_threshold_rel=detect_threshold_rel,
                 detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
                 min_peaks_by_isotope=min_peaks_by_isotope,
             )
-            if candidates:
-                nnls_counts = decomposer.decompose_subset(spectrum, isotopes=sorted(candidates))
-                z_full = {iso: float(nnls_counts.get(iso, 0.0)) for iso in decomposer.isotope_names}
-            last_candidates = set(candidates)
+            last_counts = {iso: float(val) for iso, val in z_detected.items()}
+            last_candidates = set(detected)
             if detect_consecutive > 0:
                 miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
                 active_isotopes = _update_detection_hysteresis(
-                    candidates,
+                    set(detected),
                     detect_counts,
                     miss_counts,
                     active_isotopes,
@@ -536,26 +710,44 @@ def run_live_pf(
                 detected_isotopes = set(active_isotopes)
                 last_candidates = set(detected_isotopes)
                 if not detection_locked:
-                    if step_counter + 1 >= detect_min_steps and detected_isotopes:
-                        estimator.restrict_isotopes(sorted(detected_isotopes))
+                    should_lock = step_counter + 1 >= detect_min_steps and detected_isotopes
+                    allow_lock = any(iso != "Eu-154" for iso in detected_isotopes)
+                    if should_lock and allow_lock:
+                        locked_isotopes_for_planning |= set(detected_isotopes)
                         detection_locked = True
-                        print(f"Detected isotopes locked to: {sorted(detected_isotopes)}")
+                        print(
+                            "Detected isotopes locked to: "
+                            f"{sorted(locked_isotopes_for_planning)}"
+                        )
                 else:
-                    new_isotopes = set(detected_isotopes) - set(estimator.isotopes)
-                    if new_isotopes:
-                        estimator.add_isotopes(sorted(new_isotopes))
-                        print(f"Detected isotopes expanded to: {sorted(estimator.isotopes)}")
-                    removed_isotopes = set(estimator.isotopes) - set(detected_isotopes)
-                    if removed_isotopes:
-                        remaining = [iso for iso in estimator.isotopes if iso not in removed_isotopes]
-                        if remaining:
-                            estimator.restrict_isotopes(remaining)
-                            print(f"Detected isotopes pruned to: {sorted(estimator.isotopes)}")
-            if detection_locked:
-                viz.set_active_isotopes(estimator.isotopes)
-            else:
-                viz.set_active_isotopes(sorted(detected_isotopes))
-            z_k = {iso: float(z_full.get(iso, 0.0)) for iso in estimator.isotopes} if detection_locked else z_full
+                    new_locked = locked_isotopes_for_planning | set(detected_isotopes)
+                    if new_locked != locked_isotopes_for_planning:
+                        locked_isotopes_for_planning = new_locked
+                        print(
+                            "Detected isotopes expanded to: "
+                            f"{sorted(locked_isotopes_for_planning)}"
+                        )
+            expected_counts = _expected_counts(
+                expected_kernel,
+                sources,
+                isotopes,
+                detector_pos=pose,
+                fe_index=fe_idx,
+                pb_index=pb_idx,
+                live_time_s=live_time,
+            )
+            counts_for_pf = expected_counts if count_mode == "expected" else z_detected
+            z_counts = counts_for_pf
+            z_k = counts_for_pf
+            if detection_locked and locked_isotopes_for_planning:
+                missing_non_locked = (
+                    set(isotopes) - set(locked_isotopes_for_planning) - set(z_k.keys())
+                )
+                if missing_non_locked:
+                    warnings.warn(
+                        "Isotope lock is active but measurement record dropped isotopes; this will break pruning.",
+                        RuntimeWarning,
+                    )
             meas = Measurement(
                 counts_by_isotope=z_k,
                 pose_idx=current_pose_idx,
@@ -591,30 +783,40 @@ def run_live_pf(
                 min_existence_prob=estimate_min_existence_prob,
             )
             viz.update(frame)
-            rfe_dir = RFe_sel[:, 2].tolist()
-            rpb_dir = RPb_sel[:, 2].tolist()
             # Log only measurement point and shield orientations
             print(
                 f"[step {step_counter}] pose={pose.tolist()} orient_pair={best_pair_idx} "
                 f"ig={ig_val:.6g} ig_threshold={ig_threshold_current:.6g} "
-                f"fe_idx={fe_idx} pb_idx={pb_idx} RFe_dir={rfe_dir} RPb_dir={rpb_dir}"
+                f"fe_idx={fe_idx} pb_idx={pb_idx} "
+                f"z_keys={sorted(z_k.keys())} counts={z_counts} "
+                f"The Expected Counts={expected_counts}"
             )
             if live:
                 plt.pause(0.05)
             step_counter += 1
             rotation_count += 1
             remaining_orientations.discard(best_pair_idx)
-            if last_spectrum is not None and step_counter % 10 == 0:
-                highlight = set(estimator.isotopes) if detection_locked else last_candidates
+            if save_outputs and last_spectrum is not None and step_counter % 10 == 0:
+                highlight = (
+                    set(locked_isotopes_for_planning)
+                    if detection_locked
+                    else last_candidates
+                )
                 spectrum_path = SPECTRUM_DIR / f"spectrum_step_{step_counter:04d}.png"
-                _save_spectrum_plot(decomposer, last_spectrum, spectrum_path, highlight_isotopes=highlight)
+                _save_spectrum_plot(
+                    decomposer,
+                    last_spectrum,
+                    spectrum_path,
+                    highlight_isotopes=highlight,
+                    counts_by_isotope=last_counts,
+                )
             if max_steps is not None and step_counter >= max_steps:
                 stop_run = True
                 break
             pose_elapsed += live_time
             if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
                 break
-        if estimator.measurements and estimator.measurements[-1].pose_idx == current_pose_idx:
+        if save_outputs and estimator.measurements and estimator.measurements[-1].pose_idx == current_pose_idx:
             pf_step = current_pose_idx + 1
             pf_path = PF_DIR / f"pf_step_{pf_step:03d}.png"
             viz.save_final(pf_path.as_posix())
@@ -671,20 +873,32 @@ def run_live_pf(
         )
 
     # Save final snapshots
-    pf_out_path = RESULTS_DIR / "result_pf.png"
-    spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
-    estimates_out_path = RESULTS_DIR / "result_estimates.png"
-    pf_out_path.parent.mkdir(parents=True, exist_ok=True)
-    viz.save_final(pf_out_path.as_posix())
-    viz.save_estimates_only(estimates_out_path.as_posix())
-    if last_spectrum is not None:
-        highlight = set(estimator.isotopes) if detection_locked else last_candidates
-        _save_spectrum_plot(decomposer, last_spectrum, spectrum_out_path, highlight_isotopes=highlight)
+    if save_outputs:
+        pf_out_path = RESULTS_DIR / "result_pf.png"
+        spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
+        estimates_out_path = RESULTS_DIR / "result_estimates.png"
+        pf_out_path.parent.mkdir(parents=True, exist_ok=True)
+        viz.save_final(pf_out_path.as_posix())
+        viz.save_estimates_only(estimates_out_path.as_posix())
+        if last_spectrum is not None:
+            highlight = (
+                set(locked_isotopes_for_planning)
+                if detection_locked
+                else last_candidates
+            )
+            _save_spectrum_plot(
+                decomposer,
+                last_spectrum,
+                spectrum_out_path,
+                highlight_isotopes=highlight,
+                counts_by_isotope=last_counts,
+            )
     total_meas_time = step_counter * live_time
-    print(f"Final PF visualization saved to: {pf_out_path}")
-    print(f"Final estimates-only visualization saved to: {estimates_out_path}")
-    if last_spectrum is not None:
-        print(f"Final spectrum saved to: {spectrum_out_path}")
+    if save_outputs:
+        print(f"Final PF visualization saved to: {pf_out_path}")
+        print(f"Final estimates-only visualization saved to: {estimates_out_path}")
+        if last_spectrum is not None:
+            print(f"Final spectrum saved to: {spectrum_out_path}")
     print(f"Total measurements: {step_counter}, total live time (simulated): {total_meas_time:.1f} s")
     gt_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
     for src in sources:
@@ -721,6 +935,9 @@ def run_live_pf(
         plt.ioff()
         plt.pause(0.1)
     plt.close("all")
+    if return_state:
+        return estimator
+    return None
 
 
 def run_realtime_pf() -> None:

@@ -2,17 +2,124 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Callable, Dict
 
 import numpy as np
 from numpy.typing import NDArray
 
 from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
+from pf.likelihood import delta_log_likelihood_remove, expected_counts_per_source
+
+
+def prune_spurious_sources(
+    z_k: NDArray[np.float64],
+    live_times: NDArray[np.float64],
+    positions: NDArray[np.float64],
+    strengths: NDArray[np.float64],
+    background: float | NDArray[np.float64],
+    forward_model: Callable[[NDArray[np.float64], NDArray[np.float64]], NDArray[np.float64]],
+    method: str = "deltaLL",
+    params: Dict[str, float] | None = None,
+) -> NDArray[np.bool_]:
+    """
+    Prune spurious sources using delta-LL, best-case residual gating, or legacy dominance.
+
+    forward_model must return a (K, M) array of per-source expected counts.
+    """
+    if positions.size == 0:
+        return np.ones(0, dtype=bool)
+    if params is None:
+        params = {}
+    epsilon = float(params.get("epsilon", 1e-12))
+    tau_mix = float(params.get("tau_mix", 0.9))
+    delta_ll_min = float(params.get("deltaLL_min", 0.0))
+    penalty_d = float(params.get("penalty_d", 0.0))
+    alpha = float(params.get("alpha", 0.7))
+    lambda_min = float(params.get("lambda_min", 0.0))
+    lrt_threshold = float(params.get("lrt_threshold", 0.0))
+    min_strength_abs = params.get("min_strength_abs")
+    min_strength_ratio = params.get("min_strength_ratio")
+    min_obs_count = float(params.get("min_obs_count", 0.0))
+
+    lambda_m = forward_model(positions, strengths)
+    if lambda_m.ndim != 2:
+        raise ValueError("forward_model must return a (K, M) array.")
+    if lambda_m.shape[1] != strengths.shape[0]:
+        raise ValueError("forward_model output must have one column per source.")
+    if np.isscalar(background):
+        background_k = np.full(lambda_m.shape[0], float(background), dtype=float)
+    else:
+        background_k = np.asarray(background, dtype=float)
+    lambda_total = background_k + np.sum(lambda_m, axis=1)
+
+    max_strength = float(np.max(strengths)) if strengths.size else 0.0
+    min_strength = 0.0
+    if min_strength_abs is not None:
+        min_strength = max(min_strength, float(min_strength_abs))
+    if min_strength_ratio is not None:
+        min_strength = max(min_strength, float(min_strength_ratio) * max_strength)
+    strength_ok = strengths >= min_strength if min_strength > 0.0 else np.ones_like(strengths, dtype=bool)
+
+    method_key = method.lower()
+    if method_key not in {"deltall", "bestcase", "legacy"}:
+        raise ValueError(f"Unsupported pruning method: {method}")
+
+    if method_key in {"bestcase", "legacy"} and min_obs_count > 0.0:
+        obs_mask = z_k > min_obs_count
+        if not np.any(obs_mask):
+            return strength_ok
+        z_use = z_k[obs_mask]
+        lambda_m_use = lambda_m[obs_mask]
+        lambda_total_use = lambda_total[obs_mask]
+    else:
+        z_use = z_k
+        lambda_m_use = lambda_m
+        lambda_total_use = lambda_total
+
+    if method_key == "deltall":
+        if z_use.size == 0:
+            return strength_ok
+        delta_ll = delta_log_likelihood_remove(z_use, lambda_total_use, lambda_m_use, epsilon=epsilon)
+        score = delta_ll
+        if penalty_d > 0.0:
+            penalty = 0.5 * penalty_d * np.log(max(int(z_use.size), 1))
+            score = delta_ll - penalty
+        keep_mask = (delta_ll >= delta_ll_min) & (score > 0.0)
+        return keep_mask & strength_ok
+
+    if method_key == "legacy":
+        denom = z_use + epsilon
+        ratios = np.max(lambda_m_use / denom[:, None], axis=0)
+        keep_mask = ratios >= tau_mix
+        return keep_mask & strength_ok
+
+    if z_use.size == 0:
+        return strength_ok
+    keep_mask = np.ones(lambda_m_use.shape[1], dtype=bool)
+    for m in range(lambda_m_use.shape[1]):
+        lam_m = lambda_m_use[:, m]
+        k_star = int(np.argmax(lam_m))
+        lam_star = float(lam_m[k_star])
+        if lam_star < lambda_min:
+            keep_mask[m] = False
+            continue
+        total_star = float(lambda_total_use[k_star])
+        residual = float(z_use[k_star] - (total_star - lam_star))
+        if residual >= alpha * lam_star:
+            continue
+        total_star_safe = max(total_star, epsilon)
+        ratio = min(lam_star / total_star_safe, 1.0 - epsilon)
+        delta_ll = float(z_use[k_star] * (-np.log1p(-ratio)) - lam_star)
+        if delta_ll < lrt_threshold:
+            keep_mask[m] = False
+    return keep_mask & strength_ok
 
 
 def prune_spurious_sources_continuous(
     estimator: RotatingShieldPFEstimator,
+    method: str = "deltaLL",
+    params: Dict[str, float] | None = None,
     tau_mix: float = 0.9,
     epsilon: float = 1e-6,
     min_support: int = 1,
@@ -21,13 +128,10 @@ def prune_spurious_sources_continuous(
     min_strength_ratio: float | None = None,
 ) -> Dict[str, NDArray[np.bool_]]:
     """
-    Apply the best-case measurement test to continuous PF estimates (Sec. 3.4.5).
+    Apply spurious-source pruning to continuous PF estimates.
 
     Uses MMSE estimates as candidate sources. Returns a keep mask per isotope that
-    can be applied to continuous particle source indices by order. Optionally drop
-    sources with strengths below max(min_strength_abs, min_strength_ratio * max_strength).
-    Measurements with z_obs <= min_obs_count are ignored for the best-case test.
-    If all sources would be removed, keep the strongest one to avoid empty estimates.
+    can be applied to continuous particle source indices by order.
     """
     if not estimator.measurements:
         return {iso: np.ones(0, dtype=bool) for iso in estimator.filters}
@@ -35,66 +139,79 @@ def prune_spurious_sources_continuous(
     kernel = ContinuousKernel(
         mu_by_isotope=estimator.mu_by_isotope,
         shield_params=estimator.shield_params,
-        use_gpu=estimator._gpu_enabled(),
-        gpu_device=estimator.pf_config.gpu_device,
-        gpu_dtype=estimator.pf_config.gpu_dtype,
+        use_gpu=False,
     )
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
     estimates = estimator.estimates()
+    method_params = dict(params or {})
+    method_params.setdefault("epsilon", float(epsilon))
+    method_params.setdefault("tau_mix", float(tau_mix))
+    if min_obs_count > 0.0:
+        method_params.setdefault("min_obs_count", float(min_obs_count))
+    if min_strength_abs is not None:
+        method_params.setdefault("min_strength_abs", float(min_strength_abs))
+    if min_strength_ratio is not None:
+        method_params.setdefault("min_strength_ratio", float(min_strength_ratio))
 
     for iso, (positions, strengths) in estimates.items():
         if positions.size == 0:
             keep_masks[iso] = np.ones(0, dtype=bool)
             continue
-        keep_mask = np.ones(positions.shape[0], dtype=bool)
-        max_strength = float(np.max(strengths)) if strengths.size else 0.0
-        min_strength = 0.0
-        if min_strength_abs is not None:
-            min_strength = max(min_strength, float(min_strength_abs))
-        if min_strength_ratio is not None:
-            min_strength = max(min_strength, float(min_strength_ratio) * max_strength)
-        for m, (pos, strength) in enumerate(zip(positions, strengths)):
-            if min_strength > 0.0 and strength < min_strength:
-                keep_mask[m] = False
+        z_list: list[float] = []
+        live_times: list[float] = []
+        poses: list[NDArray[np.float64]] = []
+        fe_indices: list[int] = []
+        pb_indices: list[int] = []
+        for rec in estimator.measurements:
+            if iso not in rec.z_k:
                 continue
-            best_ratio = None
-            support = 0
-            for rec in estimator.measurements:
-                z_obs = float(rec.z_k.get(iso, 0.0))
-                if z_obs <= min_obs_count:
-                    continue
-                support += 1
-                det_pos = estimator.poses[rec.pose_idx]
-                if rec.fe_index is not None and rec.pb_index is not None:
-                    pred = kernel.expected_counts_pair(
-                        isotope=iso,
-                        detector_pos=det_pos,
-                        sources=np.array([pos]),
-                        strengths=np.array([strength]),
-                        fe_index=rec.fe_index,
-                        pb_index=rec.pb_index,
-                        live_time_s=rec.live_time_s,
-                        background=0.0,
-                    )
-                else:
-                    pred = kernel.expected_counts(
-                        isotope=iso,
-                        detector_pos=det_pos,
-                        sources=np.array([pos]),
-                        strengths=np.array([strength]),
-                        orient_idx=rec.orient_idx,
-                        live_time_s=rec.live_time_s,
-                        background=0.0,
-                    )
-                ratio = float(pred) / (z_obs + epsilon)
-                if best_ratio is None or ratio > best_ratio:
-                    best_ratio = ratio
-            if support < max(1, int(min_support)):
-                keep_mask[m] = False
-                continue
-            if best_ratio is not None and best_ratio < tau_mix:
-                keep_mask[m] = False
-        if not np.any(keep_mask) and strengths.size:
-            keep_mask[int(np.argmax(strengths))] = True
-        keep_masks[iso] = keep_mask
+            z_list.append(float(rec.z_k[iso]))
+            live_times.append(float(rec.live_time_s))
+            poses.append(estimator.poses[rec.pose_idx])
+            fe_indices.append(int(rec.fe_index) if rec.fe_index is not None else -1)
+            pb_indices.append(int(rec.pb_index) if rec.pb_index is not None else -1)
+        assert len(z_list) == len(live_times) == len(poses) == len(fe_indices) == len(pb_indices)
+        if not z_list:
+            keep_masks[iso] = np.ones(positions.shape[0], dtype=bool)
+            continue
+        z_k = np.asarray(z_list, dtype=float)
+        live_times_arr = np.asarray(live_times, dtype=float)
+        poses_arr = np.asarray(poses, dtype=float)
+        fe_arr = np.asarray(fe_indices, dtype=int)
+        pb_arr = np.asarray(pb_indices, dtype=int)
+
+        if min_support > 0 and int(z_k.size) < int(min_support):
+            keep_masks[iso] = np.ones(positions.shape[0], dtype=bool)
+            continue
+
+        def _forward_model(pos: NDArray[np.float64], strg: NDArray[np.float64]) -> NDArray[np.float64]:
+            return expected_counts_per_source(
+                kernel=kernel,
+                isotope=iso,
+                detector_positions=poses_arr,
+                sources=pos,
+                strengths=strg,
+                live_times=live_times_arr,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+            )
+
+        background_rate = 0.0
+        if iso in estimator.filters and estimator.filters[iso].continuous_particles:
+            background_rate = float(estimator.filters[iso].best_particle().state.background)
+        elif iso in estimator.filters:
+            background_rate = estimator.filters[iso].config.background_level
+            if isinstance(background_rate, dict):
+                background_rate = float(background_rate.get(iso, 0.0))
+        background_counts = float(background_rate) * live_times_arr
+        keep_masks[iso] = prune_spurious_sources(
+            z_k=z_k,
+            live_times=live_times_arr,
+            positions=positions,
+            strengths=strengths,
+            background=background_counts,
+            forward_model=_forward_model,
+            method=method,
+            params=method_params,
+        )
     return keep_masks

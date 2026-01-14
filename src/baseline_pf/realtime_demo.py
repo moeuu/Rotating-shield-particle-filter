@@ -164,7 +164,7 @@ def run_baseline_pf(
         if pos_list:
             true_src[iso] = np.vstack(pos_list)
         if str_list:
-            true_strengths[iso] = float(np.max(str_list))
+            true_strengths[iso] = [float(val) for val in str_list]
 
     viz = RealTimePFVisualizer(
         isotopes=isotopes,
@@ -195,6 +195,7 @@ def run_baseline_pf(
         )
         counts, _ = decomposer.isotope_counts_with_detection(
             spectrum,
+            live_time_s=MEASUREMENT_TIME_S,
             detect_threshold_abs=detect_threshold_abs,
             detect_threshold_rel=detect_threshold_rel,
             min_peaks_by_isotope=DETECT_MIN_PEAKS_BY_ISOTOPE,

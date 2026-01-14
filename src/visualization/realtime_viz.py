@@ -10,6 +10,8 @@ import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as path_effects
+from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from measurement.obstacles import ObstacleGrid
@@ -45,6 +47,16 @@ class PFFrame:
     particle_weights: Dict[str, NDArray[np.float64]]
     estimated_sources: Dict[str, NDArray[np.float64]]
     estimated_strengths: Dict[str, NDArray[np.float64]]
+
+
+@dataclass(frozen=True)
+class LayoutGeometry:
+    """Figure size and axes positions for the PF visualization layout."""
+
+    fig_size: Tuple[float, float]
+    pf_pos: Tuple[float, float, float, float]
+    counts_pos: Tuple[float, float, float, float] | None
+    labels_pos: Tuple[float, float, float, float]
 
 
 DEFAULT_ISOTOPE_COLORS = {
@@ -155,12 +167,36 @@ class RealTimePFVisualizer:
     - save_estimates_only(path) saves a view with only estimate markers visible.
     """
 
+    _BASE_FIGSIZE = (15.0, 6.0)
+    _BASE_LAYOUT_FRACS = {
+        "left": 0.02,
+        "right": 0.02,
+        "gap": 0.02,
+        "pf": 0.54,
+    }
+    _VERTICAL_LAYOUT = {
+        "bottom": 0.17,
+        "top": 0.94,
+        "labels_frac": 0.57,
+        "counts_frac": 0.43,
+    }
+    _MIN_SIDE_FRAC = 0.26
+    _PF_PANEL_SCALE = 1.0
+    _PF_PLOT_ZOOM = 1.35
+    _X_TICK_OFFSET_PX = 2.0
+    _X_LABEL_OFFSET_PX = 8.0
+    _X_TICK_MIN_AX_Y = 0.0
+    _X_LABEL_MIN_AX_Y = 0.0
+    _ESTIMATE_TEXT_OFFSET = 0.2
+    _ESTIMATE_TEXT_PAD_PX = 6.0
+    _LABEL_LINE_SPACING = 1.3
+
     def __init__(
         self,
         isotopes: List[str],
         world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
         true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
-        true_strengths: Optional[Dict[str, float]] = None,
+        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
         obstacle_grid: ObstacleGrid | None = None,
         show_counts: bool = True,
     ) -> None:
@@ -171,30 +207,20 @@ class RealTimePFVisualizer:
         self.true_strengths = true_strengths or {}
         self.obstacle_grid = obstacle_grid
         self.show_counts = show_counts
-        self.fig = plt.figure(figsize=(15, 6))
-        plot_ratio = 3.2
-        side_ratio = 2.4
+        self._fig_width = self._BASE_FIGSIZE[0]
+        self._fig_height = self._BASE_FIGSIZE[1]
+        layout = self._layout_geometry()
+        self.fig = plt.figure(figsize=layout.fig_size)
         if self.show_counts:
-            layout = self.fig.add_gridspec(
-                2,
-                2,
-                width_ratios=[plot_ratio, side_ratio],
-                height_ratios=[1, 1],
-                wspace=0.3,
-            )
-            self.ax3d = self.fig.add_subplot(layout[:, 0], projection="3d")
-            self.ax_counts = self.fig.add_subplot(layout[0, 1])
-            self.ax_labels = self.fig.add_subplot(layout[1, 1])
+            self.ax3d = self.fig.add_axes(layout.pf_pos, projection="3d")
+            if layout.counts_pos is None:
+                raise ValueError("Counts axis position missing for counts layout.")
+            self.ax_counts = self.fig.add_axes(layout.counts_pos)
+            self.ax_labels = self.fig.add_axes(layout.labels_pos)
         else:
-            layout = self.fig.add_gridspec(
-                1,
-                2,
-                width_ratios=[plot_ratio, side_ratio],
-                wspace=0.3,
-            )
-            self.ax3d = self.fig.add_subplot(layout[0, 0], projection="3d")
+            self.ax3d = self.fig.add_axes(layout.pf_pos, projection="3d")
             self.ax_counts = None
-            self.ax_labels = self.fig.add_subplot(layout[0, 1])
+            self.ax_labels = self.fig.add_axes(layout.labels_pos)
         cmap = plt.get_cmap("tab10")
         self.colors = {}
         for i, iso in enumerate(isotopes):
@@ -208,13 +234,20 @@ class RealTimePFVisualizer:
         self._label_text_x = 0.16
         self._label_marker_line = (0.02, 0.1)
         self._label_marker_point = 0.06
+        self._x_label_artist = None
+        self._x_tick_artists: list = []
+        self._x_label_cid = None
         self._init_axes()
         self._init_label_axis()
-        self.fig.tight_layout()
-        self.fig.subplots_adjust(left=0.02, right=0.98, wspace=0.3)
         self._apply_layout()
+        self._attach_draw_handler()
         self._particle_artists: Dict[str, Any] = {}
         self._est_artists: Dict[str, Any] = {}
+        self._estimate_text_artists: Dict[str, list] = {}
+        self._estimate_text_positions: Dict[str, NDArray[np.float64]] = {}
+        self._true_text_artists: Dict[str, list] = {}
+        self._true_text_positions: Dict[str, NDArray[np.float64]] = {}
+        self._true_halo_artists: list = []
         self._robot_artist = None
         self._traj_line = None
         self._shield_arrows: Dict[str, Any] = {}
@@ -240,8 +273,23 @@ class RealTimePFVisualizer:
             if pos.size:
                 strength = self.true_strengths.get(iso, None)
                 label = f"True {iso}"
-                if strength is not None:
+                if strength is not None and not isinstance(strength, (list, tuple, np.ndarray)):
                     label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                halo = self.ax3d.scatter(
+                    pos[:, 0],
+                    pos[:, 1],
+                    pos[:, 2],
+                    marker="*",
+                    s=140,
+                    color="white",
+                    edgecolors="white",
+                    linewidths=1.5,
+                    alpha=0.85,
+                    label="_nolegend_",
+                    depthshade=False,
+                    zorder=26,
+                )
+                self._true_halo_artists.append(halo)
                 art = self.ax3d.scatter(
                     pos[:, 0],
                     pos[:, 1],
@@ -250,9 +298,12 @@ class RealTimePFVisualizer:
                     s=100,
                     color=self.colors.get(iso, "black"),
                     label=label,
+                    depthshade=False,
+                    zorder=27,
                 )
                 self._true_artists.append(art)
                 self._true_projection_artists.extend(self._axis_projection_lines(pos, self.colors.get(iso, "black")))
+                self._update_true_texts(iso, pos, self.colors.get(iso, "black"))
         for iso in self.isotopes:
             self.estimate_colors[iso] = self._estimate_color(self.colors.get(iso, "black"))
 
@@ -269,34 +320,170 @@ class RealTimePFVisualizer:
             return list(self.isotopes)
         return [iso for iso in self.isotopes if iso in self._active_isotopes]
 
+    def _layout_geometry(self) -> LayoutGeometry:
+        """Return figure size and axes positions with fixed margins."""
+        fig_width = self._fig_width
+        fig_height = self._fig_height
+        left = self._BASE_LAYOUT_FRACS["left"]
+        right = self._BASE_LAYOUT_FRACS["right"]
+        gap = self._BASE_LAYOUT_FRACS["gap"]
+        base_pf = self._BASE_LAYOUT_FRACS["pf"]
+        available = 1.0 - left - right - gap
+        min_side = min(self._MIN_SIDE_FRAC, available)
+        pf_width = base_pf * self._PF_PANEL_SCALE
+        if pf_width > available - min_side:
+            pf_width = max(available - min_side, 0.0)
+        side_width = max(available - pf_width, 0.0)
+        side_left = left + pf_width + gap
+        bottom = self._VERTICAL_LAYOUT["bottom"]
+        top = self._VERTICAL_LAYOUT["top"]
+        pf_height = max(top - bottom, 0.0)
+        pf_pos = (left, bottom, pf_width, pf_height)
+        if self.show_counts:
+            labels_height = pf_height * self._VERTICAL_LAYOUT["labels_frac"]
+            counts_height = pf_height * self._VERTICAL_LAYOUT["counts_frac"]
+            counts_bottom = bottom + labels_height
+            counts_pos = (side_left, counts_bottom, side_width, counts_height)
+            labels_pos = (side_left, bottom, side_width, labels_height)
+        else:
+            counts_pos = None
+            labels_pos = (side_left, bottom, side_width, pf_height)
+        return LayoutGeometry(
+            fig_size=(fig_width, fig_height),
+            pf_pos=pf_pos,
+            counts_pos=counts_pos,
+            labels_pos=labels_pos,
+        )
+
+    def _axis_line_style(self) -> Tuple[str, float]:
+        """Return line color and width that match the axis lines."""
+        color = "black"
+        linewidth = 1.2
+        axis_line = None
+        if self.ax3d is not None:
+            axis_line = getattr(self.ax3d.xaxis, "line", None)
+        if axis_line is not None:
+            color = axis_line.get_color()
+            try:
+                axis_width = float(axis_line.get_linewidth())
+            except (TypeError, ValueError):
+                axis_width = linewidth
+            if axis_width > 0:
+                linewidth = axis_width
+        return color, linewidth
+
+    def _tune_axis_style(self) -> None:
+        """Apply axis pane and tick styling for consistent visibility."""
+        if self.ax3d is None:
+            return
+        for axis in (self.ax3d.xaxis, self.ax3d.yaxis, self.ax3d.zaxis):
+            pane = axis.pane
+            pane.set_facecolor((1.0, 1.0, 1.0, 0.0))
+            pane.set_edgecolor((1.0, 1.0, 1.0, 0.0))
+            pane.set_alpha(0.0)
+        self.ax3d.computed_zorder = False
+        y_tick_pad = 3.5
+        if self.ax3d.yaxis.majorTicks:
+            y_tick_pad = float(self.ax3d.yaxis.majorTicks[0].get_pad())
+        self.ax3d.tick_params(axis="x", pad=y_tick_pad)
+        self.ax3d.grid(True, alpha=0.35)
+
+    def _ensure_x_label(self) -> None:
+        """Ensure the default x-axis label is visible."""
+        if self.ax3d is None:
+            return
+        self.ax3d.set_xlabel("x [m]")
+        if self._x_label_artist is not None:
+            self._x_label_artist.set_visible(False)
+        for art in self._x_tick_artists:
+            art.set_visible(False)
+
+    def _project_to_axes(self, pos: NDArray[np.float64]) -> tuple[float, float] | None:
+        """Project a 3D point into axes coordinates for 2D annotations."""
+        if self.ax3d is None:
+            return None
+        x2, y2, _ = proj3d.proj_transform(
+            float(pos[0]),
+            float(pos[1]),
+            float(pos[2] + self._ESTIMATE_TEXT_OFFSET),
+            self.ax3d.get_proj(),
+        )
+        x_disp, y_disp = self.ax3d.transData.transform((x2, y2))
+        x_ax, y_ax = self.ax3d.transAxes.inverted().transform((x_disp, y_disp))
+        return float(x_ax), float(y_ax)
+
+    def _update_x_label_position(self, event: Any | None = None) -> None:
+        """No-op: use the default matplotlib x-axis label and ticks."""
+        return
+
+    def _attach_draw_handler(self) -> None:
+        """Attach a draw callback to keep the x label aligned with ticks."""
+        if self._x_label_cid is None:
+            self._x_label_cid = self.fig.canvas.mpl_connect("draw_event", self._on_draw)
+
+    def _on_draw(self, event: Any) -> None:
+        """Update custom label placement after draw events."""
+        self._ensure_x_label()
+        self._update_x_label_position(event)
+        self._position_all_estimate_texts()
+
+    def _set_box_aspect(self, aspect: Tuple[float, float, float]) -> None:
+        """Set the 3D box aspect ratio with the configured zoom."""
+        if self.ax3d is None:
+            return
+        try:
+            self.ax3d.set_box_aspect(aspect, zoom=self._PF_PLOT_ZOOM)
+        except TypeError:
+            self.ax3d.set_box_aspect(aspect)
+
+    def _draw_room_bounds(self) -> None:
+        """Draw the environment bounds as solid edges."""
+        if self.ax3d is None:
+            return
+        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
+        color, linewidth = self._axis_line_style()
+        edges = [
+            ((xmin, ymin, zmin), (xmax, ymin, zmin)),
+            ((xmin, ymax, zmin), (xmax, ymax, zmin)),
+            ((xmin, ymin, zmax), (xmax, ymin, zmax)),
+            ((xmin, ymax, zmax), (xmax, ymax, zmax)),
+            ((xmin, ymin, zmin), (xmin, ymax, zmin)),
+            ((xmax, ymin, zmin), (xmax, ymax, zmin)),
+            ((xmin, ymin, zmax), (xmin, ymax, zmax)),
+            ((xmax, ymin, zmax), (xmax, ymax, zmax)),
+            ((xmin, ymin, zmin), (xmin, ymin, zmax)),
+            ((xmax, ymin, zmin), (xmax, ymin, zmax)),
+            ((xmin, ymax, zmin), (xmin, ymax, zmax)),
+            ((xmax, ymax, zmin), (xmax, ymax, zmax)),
+        ]
+        for start, end in edges:
+            line = self.ax3d.plot(
+                [start[0], end[0]],
+                [start[1], end[1]],
+                [start[2], end[2]],
+                color=color,
+                linewidth=linewidth,
+            )[0]
+            line.set_clip_on(False)
+            line.set_alpha(1.0)
+            line.set_zorder(10)
+
     def _init_axes(self) -> None:
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
         self.ax3d.set_xlim(xmin, xmax)
         self.ax3d.set_ylim(ymin, ymax)
         self.ax3d.set_zlim(zmin, zmax)
-        self.ax3d.set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
-        self.ax3d.set_xlabel("x [m]")
+        self.ax3d.set_yticks(np.arange(ymin, ymax + 1e-6, 2.0))
+        self._set_box_aspect((xmax - xmin, ymax - ymin, zmax - zmin))
         self.ax3d.set_ylabel("y [m]")
         self.ax3d.set_zlabel("z [m]")
+        self.ax3d.set_yticks(np.arange(ymin, ymax + 1e-6, 2.0))
         if self.ax_counts is not None:
             self.ax_counts.set_ylabel("Counts")
             self.ax_counts.set_title("Isotope-wise counts")
-        # Draw wireframe cube for bounds
-        xs = [xmin, xmax]
-        ys = [ymin, ymax]
-        zs = [zmin, zmax]
-        for z in zs:
-            X, Y = np.meshgrid(xs, ys)
-            Z = np.full_like(X, z)
-            self.ax3d.plot_wireframe(X, Y, Z, color="gray", alpha=0.2)
-        for x in xs:
-            X, Z = np.meshgrid([x], zs)
-            Y = np.array([[ymin, ymin], [ymax, ymax]])
-            self.ax3d.plot_wireframe(X, Y, Z, color="gray", alpha=0.2)
-        for y in ys:
-            Y, Z = np.meshgrid([y], zs)
-            X = np.array([[xmin, xmin], [xmax, xmax]])
-            self.ax3d.plot_wireframe(X, Y, Z, color="gray", alpha=0.2)
+        self._tune_axis_style()
+        self._ensure_x_label()
+        self._draw_room_bounds()
         if self.obstacle_grid is not None:
             self._draw_obstacle_grid()
 
@@ -307,7 +494,13 @@ class RealTimePFVisualizer:
         polygons = self.obstacle_grid.blocked_polygons(z=0.0)
         if not polygons:
             return
-        collection = Poly3DCollection(polygons, facecolors="black", edgecolors="none", alpha=0.85)
+        collection = Poly3DCollection(polygons, facecolors="black", edgecolors="none", alpha=0.75)
+        collection.set_zorder(0)
+        collection.set_sort_zpos(-1e6)
+        try:
+            collection.set_zsort("min")
+        except AttributeError:
+            pass
         self.ax3d.add_collection3d(collection)
         self._obstacle_artist = collection
 
@@ -323,20 +516,18 @@ class RealTimePFVisualizer:
         self.ax_labels.axis("off")
 
     def _apply_layout(self) -> None:
-        """Apply explicit axes positions for a larger PF view and readable labels."""
-        left = 0.02
-        right = 0.98
-        gap = 0.02
-        pf_width = 0.54
-        side_left = left + pf_width + gap
-        side_width = right - side_left
+        """Apply explicit axes positions for the PF/legend layout."""
+        layout = self._layout_geometry()
+        self.fig.set_size_inches(*layout.fig_size, forward=True)
         if self.ax3d is not None:
-            self.ax3d.set_position([left, 0.06, pf_width, 0.88])
+            self.ax3d.set_position(layout.pf_pos)
         if self.show_counts and self.ax_counts is not None and self.ax_labels is not None:
-            self.ax_counts.set_position([side_left, 0.58, side_width, 0.36])
-            self.ax_labels.set_position([side_left, 0.06, side_width, 0.48])
+            if layout.counts_pos is None:
+                raise ValueError("Counts axis position missing for counts layout.")
+            self.ax_counts.set_position(layout.counts_pos)
+            self.ax_labels.set_position(layout.labels_pos)
         elif self.ax_labels is not None:
-            self.ax_labels.set_position([side_left, 0.06, side_width, 0.88])
+            self.ax_labels.set_position(layout.labels_pos)
 
     def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
         """Build legend-style label lines with matching colors and markers."""
@@ -346,11 +537,14 @@ class RealTimePFVisualizer:
             if iso not in active:
                 continue
             if pos.size:
-                strength = self.true_strengths.get(iso, None)
-                label = f"True {iso}"
-                if strength is not None:
-                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
-                lines.append((label, self.colors.get(iso, "black"), "*", "None"))
+                positions = np.atleast_2d(pos)
+                strengths = self._true_strengths_for_iso(iso, positions.shape[0])
+                for idx, pos_row in enumerate(positions):
+                    label = f"True {iso} pos={pos_row.round(2).tolist()}"
+                    strength = strengths[idx]
+                    if strength is not None:
+                        label = f"{label} q={strength:.1f} cps@1m"
+                    lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
         if self.obstacle_grid is not None and self.obstacle_grid.blocked_cells:
@@ -369,11 +563,14 @@ class RealTimePFVisualizer:
             if iso not in active:
                 continue
             if pos.size:
-                strength = self.true_strengths.get(iso, None)
-                label = f"True {iso}"
-                if strength is not None:
-                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
-                lines.append((label, self.colors.get(iso, "black"), "*", "None"))
+                positions = np.atleast_2d(pos)
+                strengths = self._true_strengths_for_iso(iso, positions.shape[0])
+                for idx, pos_row in enumerate(positions):
+                    label = f"True {iso} pos={pos_row.round(2).tolist()}"
+                    strength = strengths[idx]
+                    if strength is not None:
+                        label = f"{label} q={strength:.1f} cps@1m"
+                    lines.append((label, self.colors.get(iso, "black"), "*", "None"))
         lines.append(("trajectory", "cyan", "o", "-"))
         lines.append(("robot", "cyan", "o", "None"))
         if self.obstacle_grid is not None and self.obstacle_grid.blocked_cells:
@@ -382,6 +579,21 @@ class RealTimePFVisualizer:
             color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             lines.append((f"{iso} est", color, "x", "None"))
         return lines
+
+    def _true_strengths_for_iso(self, iso: str, count: int) -> List[float | None]:
+        """Return per-source true strengths for an isotope."""
+        strengths = self.true_strengths.get(iso, None)
+        if strengths is None:
+            return [None] * count
+        if isinstance(strengths, np.ndarray):
+            values = strengths.reshape(-1).tolist()
+        elif isinstance(strengths, (list, tuple)):
+            values = list(strengths)
+        else:
+            values = [float(strengths)]
+        if len(values) < count:
+            values.extend([None] * (count - len(values)))
+        return [float(v) if v is not None else None for v in values[:count]]
 
     def _estimate_lines(self, frame: PFFrame) -> List[Tuple[str, str]]:
         """Build estimate text lines for the strongest source per isotope."""
@@ -415,13 +627,134 @@ class RealTimePFVisualizer:
         return lines
 
     def _estimate_color(self, base_color: str) -> Tuple[float, float, float]:
-        """Return a lighter variant of the base color for estimate markers."""
+        """Return a darker variant of the base color for estimate markers."""
         rgb = np.array(mcolors.to_rgb(base_color))
         hsv = mcolors.rgb_to_hsv(rgb)
-        hsv[0] = (hsv[0] + 0.12) % 1.0
-        hsv[1] = min(1.0, hsv[1] * 0.7 + 0.3)
-        hsv[2] = min(1.0, hsv[2] * 0.8 + 0.2)
+        hsv[1] = min(1.0, hsv[1] * 1.1 + 0.2)
+        hsv[2] = max(0.2, hsv[2] * 0.6)
         return tuple(mcolors.hsv_to_rgb(hsv))
+
+    def _update_estimate_texts(self, iso: str, positions: NDArray[np.float64], color: str) -> None:
+        """Update estimate position text above markers for one isotope."""
+        if self.ax3d is None:
+            return
+        self._estimate_text_positions[iso] = positions.copy()
+        artists = self._estimate_text_artists.setdefault(iso, [])
+        for idx, pos in enumerate(positions):
+            coords = [f"{val:.2f}" for val in pos.tolist()]
+            text = f"[{', '.join(coords)}]"
+            if idx >= len(artists):
+                art = self.ax3d.text2D(
+                    0.0,
+                    0.0,
+                    text,
+                    transform=self.ax3d.transAxes,
+                    color=color,
+                    fontsize=self._label_text_fontsize,
+                    ha="center",
+                    va="bottom",
+                    rotation=0,
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.35, boxstyle="round,pad=0.15"),
+                )
+                art.set_path_effects([])
+                art.set_clip_on(False)
+                artists.append(art)
+            else:
+                art = artists[idx]
+                art.set_text(text)
+                art.set_color(color)
+                art.set_visible(True)
+                art.set_path_effects([])
+            art.set_zorder(30)
+        for extra in artists[len(positions) :]:
+            extra.set_visible(False)
+
+    def _update_true_texts(self, iso: str, positions: NDArray[np.float64], color: str) -> None:
+        """Update true position text above markers for one isotope."""
+        if self.ax3d is None:
+            return
+        self._true_text_positions[iso] = positions.copy()
+        artists = self._true_text_artists.setdefault(iso, [])
+        for idx, pos in enumerate(positions):
+            coords = [f"{val:.2f}" for val in pos.tolist()]
+            text = f"True[{', '.join(coords)}]"
+            if idx >= len(artists):
+                art = self.ax3d.text2D(
+                    0.0,
+                    0.0,
+                    text,
+                    transform=self.ax3d.transAxes,
+                    color=color,
+                    fontsize=self._label_text_fontsize,
+                    ha="center",
+                    va="bottom",
+                    rotation=0,
+                    bbox=dict(facecolor="white", edgecolor="none", alpha=0.35, boxstyle="round,pad=0.15"),
+                )
+                art.set_path_effects(
+                    [
+                        path_effects.withStroke(linewidth=2.5, foreground="white"),
+                        path_effects.Normal(),
+                    ]
+                )
+                art.set_clip_on(False)
+                artists.append(art)
+            else:
+                art = artists[idx]
+                art.set_text(text)
+                art.set_color(color)
+                art.set_visible(True)
+                art.set_path_effects(
+                    [
+                        path_effects.withStroke(linewidth=2.5, foreground="white"),
+                        path_effects.Normal(),
+                    ]
+                )
+            art.set_zorder(29)
+        for extra in artists[len(positions) :]:
+            extra.set_visible(False)
+
+    def _position_all_estimate_texts(self) -> None:
+        """Update positions for all estimate text labels."""
+        if self.ax3d is None:
+            return
+        renderer = self.fig.canvas.get_renderer()
+        items: list[dict[str, Any]] = []
+        for artists_map, positions_map in (
+            (self._estimate_text_artists, self._estimate_text_positions),
+            (self._true_text_artists, self._true_text_positions),
+        ):
+            for iso, artists in artists_map.items():
+                positions = positions_map.get(iso, np.zeros((0, 3)))
+                for pos, art in zip(positions, artists):
+                    coords = self._project_to_axes(pos)
+                    if coords is None:
+                        art.set_visible(False)
+                        continue
+                    art.set_position(coords)
+                    art.set_visible(True)
+                    x_disp, y_disp = self.ax3d.transAxes.transform(coords)
+                    bbox = art.get_window_extent(renderer=renderer)
+                    items.append(
+                        {
+                            "artist": art,
+                            "x_disp": float(x_disp),
+                            "y_disp": float(y_disp),
+                            "bbox": bbox,
+                        }
+                    )
+        placed = []
+        for item in sorted(items, key=lambda i: i["bbox"].y0, reverse=True):
+            bbox = item["bbox"]
+            shift = 0.0
+            while any(bbox.overlaps(prev) for prev in placed):
+                shift += self._ESTIMATE_TEXT_PAD_PX
+                bbox = item["bbox"].translated(0, shift)
+            x_disp = item["x_disp"]
+            y_disp = item["y_disp"] + shift
+            x_ax, y_ax = self.ax3d.transAxes.inverted().transform((x_disp, y_disp))
+            item["artist"].set_position((float(x_ax), float(y_ax)))
+            placed.append(bbox)
 
     def _axis_projection_lines(
         self,
@@ -429,28 +762,19 @@ class RealTimePFVisualizer:
         color: str,
         alpha: float = 0.35,
     ) -> list:
-        """Draw thin dotted projection lines from points to each axis."""
+        """Draw thin dotted projection lines from points to each axis plane."""
         if points.size == 0:
             return []
-        xmin, _, ymin, _, zmin, _ = self.world_bounds
+        x0 = 0.0
+        y0 = 0.0
+        z0 = 0.0
         artists: list = []
         for x, y, z in points:
             artists.append(
                 self.ax3d.plot(
                     [x, x],
-                    [y, ymin],
-                    [z, zmin],
-                    linestyle=":",
-                    linewidth=self._projection_linewidth,
-                    color=color,
-                    alpha=alpha,
-                )[0]
-            )
-            artists.append(
-                self.ax3d.plot(
-                    [x, xmin],
                     [y, y],
-                    [z, zmin],
+                    [z, z0],
                     linestyle=":",
                     linewidth=self._projection_linewidth,
                     color=color,
@@ -459,8 +783,8 @@ class RealTimePFVisualizer:
             )
             artists.append(
                 self.ax3d.plot(
-                    [x, xmin],
-                    [y, ymin],
+                    [x, x],
+                    [y, y0],
                     [z, z],
                     linestyle=":",
                     linewidth=self._projection_linewidth,
@@ -468,7 +792,37 @@ class RealTimePFVisualizer:
                     alpha=alpha,
                 )[0]
             )
+            artists.append(
+                self.ax3d.plot(
+                    [x, x0],
+                    [y, y],
+                    [z, z],
+                    linestyle=":",
+                    linewidth=self._projection_linewidth,
+                    color=color,
+                    alpha=alpha,
+                )[0]
+            )
+        for art in artists:
+            art.set_clip_on(False)
+            art.set_zorder(4)
         return artists
+
+    def _ensure_label_height(self, total_lines: int) -> None:
+        """Expand the figure height so label lines keep readable spacing."""
+        if self.ax_labels is None or total_lines <= 0:
+            return
+        layout = self._layout_geometry()
+        label_height_frac = layout.labels_pos[3]
+        if label_height_frac <= 0.0:
+            return
+        current_height = self._fig_height
+        line_height_in = (self._label_text_fontsize / 72.0) * self._LABEL_LINE_SPACING
+        required_axis_in = line_height_in * total_lines / 0.95
+        required_fig_height = required_axis_in / label_height_frac
+        if required_fig_height > current_height + 1e-3:
+            self._fig_height = required_fig_height
+            self._apply_layout()
 
     def _update_labels(
         self,
@@ -491,6 +845,7 @@ class RealTimePFVisualizer:
         estimate_lines = self._estimate_lines_all(frame) if estimate_lines is None else estimate_lines
         gap_lines = 1
         total_lines = len(legend_lines) + len(estimate_lines) + 2 + gap_lines
+        self._ensure_label_height(total_lines)
         line_height = 0.95 / max(total_lines, 1)
         y = 0.96
         self.ax_labels.text(
@@ -589,18 +944,37 @@ class RealTimePFVisualizer:
     def update(self, frame: PFFrame) -> None:
         """Redraw the scene for the given PFFrame."""
         self._last_frame = frame
+        if self.ax3d is not None:
+            self.ax3d.computed_zorder = False
         # maintain trajectory history
         self._traj_history.append(frame.robot_position)
         # Robot and trajectory
         traj_arr = np.vstack(self._traj_history)
         if self._traj_line is None:
-            (self._traj_line,) = self.ax3d.plot(traj_arr[:, 0], traj_arr[:, 1], traj_arr[:, 2], "-o", color="cyan", label="trajectory")
+            (self._traj_line,) = self.ax3d.plot(
+                traj_arr[:, 0],
+                traj_arr[:, 1],
+                traj_arr[:, 2],
+                "-o",
+                color="cyan",
+                label="trajectory",
+                zorder=20,
+            )
         else:
             self._traj_line.set_data(traj_arr[:, 0], traj_arr[:, 1])
             self._traj_line.set_3d_properties(traj_arr[:, 2])
+            self._traj_line.set_zorder(20)
         if self._robot_artist is None:
             self._robot_artist = self.ax3d.scatter(
-                frame.robot_position[0], frame.robot_position[1], frame.robot_position[2], color="cyan", marker="o", s=80, label="robot"
+                frame.robot_position[0],
+                frame.robot_position[1],
+                frame.robot_position[2],
+                color="cyan",
+                marker="o",
+                s=80,
+                label="robot",
+                depthshade=False,
+                zorder=21,
             )
         else:
             self._robot_artist._offsets3d = (
@@ -608,6 +982,7 @@ class RealTimePFVisualizer:
                 np.array([frame.robot_position[1]]),
                 np.array([frame.robot_position[2]]),
             )
+            self._robot_artist.set_zorder(21)
         # Shields as arrows
         for arr in self._shield_arrows.values():
             arr.remove()
@@ -630,6 +1005,7 @@ class RealTimePFVisualizer:
                 normalize=True,
                 label=f"{name} shield",
             )
+            arr.set_zorder(19)
             self._shield_arrows[name] = arr
         # Estimated sources and particles
         for iso in self.isotopes:
@@ -647,7 +1023,7 @@ class RealTimePFVisualizer:
                         c=colors if colors.size else color,
                         label=f"{iso} particles",
                         depthshade=False,
-                        zorder=1,
+                        zorder=3,
                     )
             else:
                 art = self._particle_artists[iso]
@@ -658,6 +1034,7 @@ class RealTimePFVisualizer:
                     if colors.size:
                         art.set_facecolors(colors)
                         art.set_edgecolors(colors)
+                    art.set_zorder(3)
                 else:
                     art._offsets3d = ([], [], [])
             est_pos = frame.estimated_sources.get(iso, np.zeros((0, 3)))
@@ -674,16 +1051,20 @@ class RealTimePFVisualizer:
                         linewidths=2.5,
                         label=f"{iso} est",
                         depthshade=False,
-                        zorder=10,
+                        zorder=28,
                     )
             else:
                 art = self._est_artists[iso]
                 if est_pos.size:
                     art._offsets3d = (est_pos[:, 0], est_pos[:, 1], est_pos[:, 2])
                     art.set_color(est_color)
-                    art.set_zorder(10)
+                    art.set_zorder(28)
                 else:
                     art._offsets3d = ([], [], [])
+            if est_pos.size:
+                self._update_estimate_texts(iso, est_pos, est_color)
+            else:
+                self._update_estimate_texts(iso, np.zeros((0, 3)), est_color)
         for art in self._projection_artists:
             art.remove()
         self._projection_artists = []
@@ -692,6 +1073,9 @@ class RealTimePFVisualizer:
             est_color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             self._projection_artists.extend(self._axis_projection_lines(est_pos, est_color))
         self.ax3d.set_title("")
+        self._ensure_x_label()
+        self._update_x_label_position()
+        self._position_all_estimate_texts()
         # Counts bar (reuse)
         if self.ax_counts is not None and frame.counts_by_isotope:
             names = list(frame.counts_by_isotope.keys())
