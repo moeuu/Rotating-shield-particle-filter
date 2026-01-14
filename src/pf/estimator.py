@@ -50,6 +50,7 @@ class RotatingShieldPFConfig:
         - merge_prob: probability of merge proposals per particle
         - merge_distance_max: max distance for merge candidates
         - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
+        - init_num_sources: inclusive range for initial source count per particle
         - orientation_k: number of orientations to execute per pose
         - orientation_selection_mode: "eig"
         - planning_particles: particle count used for orientation scoring (None = all)
@@ -63,6 +64,7 @@ class RotatingShieldPFConfig:
         - planning_rollout_method: selection method for rollout particles
         - preselect_*: optional surrogate stage settings for candidate reduction
         - use_fast_gpu_rollout: enable approximate fast GPU rollouts for uncertainty prediction
+        - ig_workers: number of parallel workers for IG grid evaluation (0 = auto)
     """
 
     num_particles: int = 200
@@ -103,6 +105,7 @@ class RotatingShieldPFConfig:
     credible_volume_threshold: float = 1e-3  # Max 95% credible volume for convergence.
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
+    init_num_sources: Tuple[int, int] = (0, 3)
     orientation_k: int = 16
     orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
@@ -120,6 +123,7 @@ class RotatingShieldPFConfig:
     preselect_k_min: int = 8
     preselect_k_max: int = 16
     use_fast_gpu_rollout: bool = False
+    ig_workers: int = 0
 
     def __post_init__(self) -> None:
         if self.min_particles is None:
@@ -130,6 +134,9 @@ class RotatingShieldPFConfig:
         self.ess_high = float(self.ess_high)
         if not 0.0 < self.ess_low < self.ess_high < 1.0:
             raise ValueError("ess_low and ess_high must satisfy 0 < ess_low < ess_high < 1.")
+        self.ig_workers = int(self.ig_workers)
+        if self.ig_workers < 0:
+            raise ValueError("ig_workers must be >= 0.")
 
 
 @dataclass(frozen=True)
@@ -293,6 +300,7 @@ class RotatingShieldPFEstimator:
             merge_delta_ll_threshold=self.pf_config.merge_delta_ll_threshold,
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
+            init_num_sources=self.pf_config.init_num_sources,
             use_gpu=self.pf_config.use_gpu,
             gpu_device=self.pf_config.gpu_device,
             gpu_dtype=self.pf_config.gpu_dtype,
@@ -612,13 +620,94 @@ class RotatingShieldPFEstimator:
         """Alias for estimates() to align with visualization helpers."""
         return self.estimates()
 
+    def step_diagnostics(self, top_k: int = 3) -> Dict[str, Dict[str, Any]]:
+        """
+        Return per-isotope diagnostics for the current PF state.
+
+        The diagnostics include ESS, resample/birth/kill counts, r distribution
+        (mean/variance), MAP/MMSE estimates, and top-k particle summaries.
+        """
+        diagnostics: Dict[str, Dict[str, Any]] = {}
+        eps = 1e-12
+        k = max(0, int(top_k))
+        for iso, filt in self.filters.items():
+            if not filt.continuous_particles:
+                diagnostics[iso] = {
+                    "ess_pre": 0.0,
+                    "resampled": False,
+                    "ess_post": None,
+                    "n_after_adapt": 0,
+                    "resample_count": int(getattr(filt, "last_resample_count", 0)),
+                    "birth_count": int(getattr(filt, "last_birth_count", 0)),
+                    "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                    "r_mean": 0.0,
+                    "r_var": 0.0,
+                    "map": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+                    "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+                    "top_k": [],
+                }
+                continue
+            weights = np.asarray(filt.continuous_weights, dtype=float)
+            total = float(np.sum(weights))
+            if total > 0.0:
+                weights = weights / total
+            r_vals = np.array([p.state.num_sources for p in filt.continuous_particles], dtype=float)
+            r_mean = float(np.mean(r_vals)) if r_vals.size else 0.0
+            r_var = float(np.var(r_vals)) if r_vals.size else 0.0
+            ess_pre = getattr(filt, "last_ess_pre", None)
+            if ess_pre is None and weights.size:
+                ess_pre = float(1.0 / max(np.sum(weights**2), eps))
+            if ess_pre is None:
+                ess_pre = 0.0
+            resampled = bool(getattr(filt, "last_resample_ess", False))
+            ess_post = getattr(filt, "last_ess_post", None)
+            n_after_adapt = getattr(filt, "last_n_after_adapt", None)
+            if n_after_adapt is None:
+                n_after_adapt = int(len(filt.continuous_particles))
+            best_state = filt.best_particle().state
+            map_positions = best_state.positions.copy()
+            map_strengths = best_state.strengths.copy()
+            try:
+                mmse_positions, mmse_strengths = filt.estimate()
+            except RuntimeError:
+                mmse_positions = np.zeros((0, 3), dtype=float)
+                mmse_strengths = np.zeros(0, dtype=float)
+            top_entries: List[Dict[str, Any]] = []
+            if k > 0 and weights.size:
+                order = np.argsort(weights)[::-1][:k]
+                for idx in order:
+                    state = filt.continuous_particles[int(idx)].state
+                    top_entries.append(
+                        {
+                            "weight": float(weights[idx]),
+                            "num_sources": int(state.num_sources),
+                            "positions": state.positions.copy(),
+                            "strengths": state.strengths.copy(),
+                        }
+                    )
+            diagnostics[iso] = {
+                "ess_pre": float(ess_pre),
+                "resampled": resampled,
+                "ess_post": ess_post,
+                "n_after_adapt": int(n_after_adapt),
+                "resample_count": int(getattr(filt, "last_resample_count", 0)),
+                "birth_count": int(getattr(filt, "last_birth_count", 0)),
+                "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                "r_mean": r_mean,
+                "r_var": r_var,
+                "map": (map_positions, map_strengths),
+                "mmse": (mmse_positions, mmse_strengths),
+                "top_k": top_entries,
+            }
+        return diagnostics
+
     def isotope_log_likelihood_gain(self, window: int | None = None) -> Dict[str, float]:
         """
         Return per-isotope log-likelihood gain vs background-only (evidence mixing).
         """
         if not self.measurements:
             return {iso: 0.0 for iso in self.filters}
-        estimates = self.estimates()
+        estimates = self.pruned_estimates(method="legacy")
         gains: Dict[str, float] = {}
         for iso, filt in self.filters.items():
             data = self._measurement_data_for_iso(iso, window)
@@ -1485,7 +1574,7 @@ class RotatingShieldPFEstimator:
 
     def prune_spurious_sources(
         self,
-        method: str = "deltaLL",
+        method: str = "legacy",
         params: Dict[str, float] | None = None,
         tau_mix: float = 0.9,
         epsilon: float = 1e-6,
@@ -1495,7 +1584,7 @@ class RotatingShieldPFEstimator:
         min_strength_ratio: float | None = None,
     ) -> Dict[str, NDArray[np.bool_]]:
         """
-        Prune spurious sources using delta-LL, best-case residual gating, or legacy dominance.
+        Compute spurious-source keep masks using delta-LL, best-case residual gating, or legacy dominance.
 
         For each isotope h and each candidate source, the pruning method is applied using
         per-measurement expected counts from the continuous kernel. Optionally drop sources
@@ -1519,18 +1608,44 @@ class RotatingShieldPFEstimator:
             min_strength_abs=min_strength_abs,
             min_strength_ratio=min_strength_ratio,
         )
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
+        return keep_masks
+
+    def pruned_estimates(
+        self,
+        method: str = "legacy",
+        params: Dict[str, float] | None = None,
+        tau_mix: float = 0.9,
+        epsilon: float = 1e-6,
+        min_support: int = 1,
+        min_obs_count: float = 0.0,
+        min_strength_abs: float | None = None,
+        min_strength_ratio: float | None = None,
+    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+        """
+        Return non-destructively pruned estimates derived from MMSE outputs.
+
+        This uses prune_spurious_sources_continuous() in estimate space and does not
+        mutate particle states.
+        """
+        from pf.mixing import prune_spurious_sources_continuous
+
+        est = self.estimates()
+        keep_masks = prune_spurious_sources_continuous(
+            self,
+            method=method,
+            params=params,
+            tau_mix=tau_mix,
+            epsilon=epsilon,
+            min_support=min_support,
+            min_obs_count=min_obs_count,
+            min_strength_abs=min_strength_abs,
+            min_strength_ratio=min_strength_ratio,
+        )
+        pruned: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
+        for iso, (pos, strg) in est.items():
             keep = keep_masks.get(iso)
             if keep is None or keep.size == 0:
-                continue
-            for p in filt.continuous_particles:
-                r = p.state.num_sources
-                if r == 0:
-                    continue
-                keep_idx = keep[:r] if keep.size >= r else np.pad(keep, (0, r - keep.size), constant_values=True)
-                p.state.positions = p.state.positions[keep_idx]
-                p.state.strengths = p.state.strengths[keep_idx]
-                p.state.num_sources = p.state.positions.shape[0]
-        return keep_masks
+                pruned[iso] = (pos, strg)
+            else:
+                pruned[iso] = (pos[keep], strg[keep])
+        return pruned

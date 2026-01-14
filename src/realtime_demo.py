@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import sys
-import warnings
+import time
 
 import matplotlib
 
@@ -45,12 +47,12 @@ from spectrum.baseline import baseline_als
 from spectrum.smoothing import gaussian_smooth
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
+from pf.particle_filter import PFConfig
 from planning.candidate_generation import generate_candidate_poses
 from planning.pose_selection import (
     DEFAULT_PLANNING_ROLLOUTS,
     select_next_pose_from_candidates,
 )
-from planning.shield_rotation import select_best_orientation
 from visualization.realtime_viz import (
     DEFAULT_ISOTOPE_COLORS,
     RealTimePFVisualizer,
@@ -77,6 +79,9 @@ DETECT_CONSECUTIVE_BY_ISOTOPE = {"Cs-137": 3, "Co-60": 3, "Eu-154": 5}
 DETECT_MISS_AFTER_LOCK = 30
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
+CANDIDATE_GRID_SPACING = (0.5, 0.5, 0.5)
+CANDIDATE_GRID_MARGIN = 0.5
+HEALTH_LOG_TOP_K = 3
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -86,6 +91,60 @@ def _build_demo_sources() -> list[PointSource]:
         PointSource("Co-60", position=(2.0, 15.0, 7.0), intensity_cps_1m=20000.0),
         PointSource("Eu-154", position=(7.0, 5.0, 3.0), intensity_cps_1m=30000.0),
     ]
+
+
+def _candidate_axis_points(start: float, stop: float, step: float) -> NDArray[np.float64]:
+    """Return evenly spaced axis points within [start, stop] using the given step."""
+    if step <= 0:
+        raise ValueError("step must be positive.")
+    if stop < start:
+        return np.zeros(0, dtype=float)
+    count = int(np.floor((stop - start) / step)) + 1
+    if count <= 0:
+        return np.zeros(0, dtype=float)
+    return start + step * np.arange(count, dtype=float)
+
+
+def _build_candidate_sources(
+    env: EnvironmentConfig,
+    spacing: tuple[float, float, float],
+    margin: float,
+) -> NDArray[np.float64]:
+    """Create a dense 3D grid of candidate sources inside the environment bounds."""
+    xs = _candidate_axis_points(margin, env.size_x - margin, spacing[0])
+    ys = _candidate_axis_points(margin, env.size_y - margin, spacing[1])
+    zs = _candidate_axis_points(margin, env.size_z - margin, spacing[2])
+    if xs.size == 0 or ys.size == 0 or zs.size == 0:
+        raise ValueError("Candidate grid is empty; check spacing and margin values.")
+    return np.array([[x, y, z] for x in xs for y in ys for z in zs], dtype=float)
+
+
+def _initial_particle_nearby_probability(
+    num_particles: int,
+    position_min: tuple[float, float, float],
+    position_max: tuple[float, float, float],
+    radius_m: float,
+    init_num_sources: tuple[int, int],
+) -> float:
+    """
+    Return the probability that at least one initial source lies within radius_m of a target.
+
+    Assumes each source position is uniformly sampled within the bounding box.
+    """
+    if radius_m <= 0.0 or num_particles <= 0:
+        return 0.0
+    bounds_lo = np.asarray(position_min, dtype=float)
+    bounds_hi = np.asarray(position_max, dtype=float)
+    span = bounds_hi - bounds_lo
+    volume = float(np.prod(span)) if np.all(span > 0.0) else 0.0
+    if volume <= 0.0:
+        return 0.0
+    p = (4.0 / 3.0) * np.pi * (radius_m**3) / volume
+    p = float(np.clip(p, 0.0, 1.0))
+    r_min, r_max = init_num_sources
+    r_min, r_max = (int(r_min), int(r_max)) if r_min <= r_max else (int(r_max), int(r_min))
+    per_particle = sum((1.0 - p) ** r for r in range(r_min, r_max + 1)) / (r_max - r_min + 1)
+    return float(1.0 - per_particle**num_particles)
 
 
 def load_sources_from_json(path: Path) -> list[PointSource]:
@@ -161,6 +220,23 @@ def _update_detection_hysteresis(
     return updated
 
 
+def _detect_isotopes_from_counts(
+    counts: dict[str, float],
+    detect_threshold_abs: float,
+    detect_threshold_rel: float,
+    detect_threshold_rel_by_isotope: dict[str, float] | None,
+) -> set[str]:
+    """Return isotopes detected from counts using absolute/relative thresholds."""
+    max_c = max(counts.values()) if counts else 0.0
+    detected: set[str] = set()
+    rel_by_iso = detect_threshold_rel_by_isotope or {}
+    for iso, val in counts.items():
+        rel_thresh = float(rel_by_iso.get(iso, detect_threshold_rel))
+        if val >= detect_threshold_abs and (max_c <= 0.0 or val / max_c >= rel_thresh):
+            detected.add(iso)
+    return detected
+
+
 def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
     """Return a consistent color mapping for isotope-specific plots."""
     cmap = plt.get_cmap("tab10")
@@ -171,6 +247,90 @@ def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
         else:
             colors[iso] = cmap(i % 10)
     return colors
+
+
+def _fmt_pos(pos: NDArray[np.float64]) -> str:
+    """Format a position vector for logging."""
+    return np.array2string(np.asarray(pos, dtype=float), precision=2, floatmode="fixed", separator=", ")
+
+
+def _fmt_counts(counts: dict[str, float]) -> str:
+    """Format a count dict for logging."""
+    items = ", ".join(f"{iso}: {float(val):.1f}" for iso, val in sorted(counts.items()))
+    return "{" + items + "}"
+
+
+def _fmt_sources(positions: NDArray[np.float64], strengths: NDArray[np.float64]) -> str:
+    """Format a list of source positions/strengths for logging."""
+    positions = np.asarray(positions, dtype=float)
+    strengths = np.asarray(strengths, dtype=float)
+    if positions.size == 0 or strengths.size == 0:
+        return "[]"
+    chunks = []
+    for pos, strength in zip(positions, strengths):
+        pos_str = np.array2string(pos, precision=2, floatmode="fixed", separator=", ")
+        chunks.append(f"{pos_str}|{float(strength):.2f}")
+    return "[" + ", ".join(chunks) + "]"
+
+
+def _fmt_top_k(entries: list[dict[str, object]]) -> str:
+    """Format top-k particle summaries for logging."""
+    chunks = []
+    for entry in entries:
+        weight = float(entry.get("weight", 0.0))
+        num_sources = int(entry.get("num_sources", 0))
+        positions = np.asarray(
+            entry.get("positions", np.zeros((0, 3))),
+            dtype=float,
+        )
+        strengths = np.asarray(entry.get("strengths", np.zeros(0)), dtype=float)
+        sources = _fmt_sources(positions, strengths)
+        chunks.append(f"(w={weight:.3f}, r={num_sources}, sources={sources})")
+    return "[" + "; ".join(chunks) + "]"
+
+
+def _fmt_optional_float(value: float | None, precision: int = 2) -> str:
+    """Format an optional float for logging."""
+    if value is None:
+        return "NA"
+    return f"{float(value):.{precision}f}"
+
+
+def _log_pf_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    step_index: int,
+    top_k: int = HEALTH_LOG_TOP_K,
+) -> None:
+    """Log per-step PF diagnostics for each isotope."""
+    diagnostics = estimator.step_diagnostics(top_k=top_k)
+    if not diagnostics:
+        print(f"[step {step_index}] pf_diagnostics: no active filters")
+        return
+    for iso, stats in diagnostics.items():
+        ess_pre = float(stats["ess_pre"])
+        resampled = bool(stats["resampled"])
+        ess_post = stats["ess_post"]
+        n_after_adapt = int(stats["n_after_adapt"])
+        resamples = int(stats["resample_count"])
+        births = int(stats["birth_count"])
+        kills = int(stats["kill_count"])
+        r_mean = float(stats["r_mean"])
+        r_var = float(stats["r_var"])
+        map_pos, map_str = stats["map"]
+        mmse_pos, mmse_str = stats["mmse"]
+        top_entries = stats["top_k"]
+        print(
+            f"[step {step_index}] pf[{iso}] ess_pre={ess_pre:.2f} resampled={resampled} "
+            f"ess_post={_fmt_optional_float(ess_post)} n_after={n_after_adapt} "
+            f"resamples={resamples} births={births} kills={kills} "
+            f"r_mean={r_mean:.2f} r_var={r_var:.2f}"
+        )
+        print(
+            f"[step {step_index}] pf[{iso}] map={_fmt_sources(map_pos, map_str)} "
+            f"mmse={_fmt_sources(mmse_pos, mmse_str)}"
+        )
+        if top_entries:
+            print(f"[step {step_index}] pf[{iso}] top_k={_fmt_top_k(top_entries)}")
 
 
 def _resolve_ig_threshold(
@@ -198,6 +358,17 @@ def _default_use_gpu() -> bool:
     except ImportError:
         return False
     return gpu_utils.torch_available()
+
+
+def _resolve_ig_workers(ig_workers: int | None) -> int:
+    """Return a worker count for IG evaluation (0 or None means auto)."""
+    if ig_workers is None:
+        return 1
+    workers = int(ig_workers)
+    if workers <= 0:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(4, cpu_count))
+    return workers
 
 
 def _compute_ig_grid(
@@ -236,9 +407,11 @@ def _compute_ig_grid(
             }
     size = len(rot_mats)
     scores = np.zeros((size, size), dtype=float)
-    for fe_idx, RFe in enumerate(rot_mats):
-        for pb_idx, RPb in enumerate(rot_mats):
-            scores[fe_idx, pb_idx] = estimator.orientation_expected_information_gain(
+
+    def _ig_for_pair(fe_idx: int, pb_idx: int, RFe: np.ndarray, RPb: np.ndarray) -> float:
+        """Compute expected IG for a single Fe/Pb orientation pair."""
+        return float(
+            estimator.orientation_expected_information_gain(
                 pose_idx=pose_idx,
                 RFe=RFe,
                 RPb=RPb,
@@ -247,7 +420,57 @@ def _compute_ig_grid(
                 alpha_by_isotope=alpha_weights,
                 particles_by_isotope=particles_by_iso,
             )
+        )
+
+    total_pairs = size * size
+    workers = _resolve_ig_workers(getattr(estimator.pf_config, "ig_workers", None))
+    if workers <= 1 or total_pairs <= 1:
+        for fe_idx, RFe in enumerate(rot_mats):
+            for pb_idx, RPb in enumerate(rot_mats):
+                scores[fe_idx, pb_idx] = _ig_for_pair(fe_idx, pb_idx, RFe, RPb)
+        return scores
+
+    max_workers = min(workers, total_pairs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for fe_idx, RFe in enumerate(rot_mats):
+            for pb_idx, RPb in enumerate(rot_mats):
+                future = executor.submit(_ig_for_pair, fe_idx, pb_idx, RFe, RPb)
+                futures[future] = (fe_idx, pb_idx)
+        for future in as_completed(futures):
+            fe_idx, pb_idx = futures[future]
+            scores[fe_idx, pb_idx] = float(future.result())
     return scores
+
+
+def _select_best_pair_from_scores(
+    scores: NDArray[np.float64],
+    allowed_indices: set[int] | None,
+) -> tuple[int, float]:
+    """Return the best (fe,pb) pair index and score from a full IG grid."""
+    if scores.size == 0:
+        return -1, 0.0
+    size = int(scores.shape[0])
+    if scores.ndim != 2 or scores.shape[0] != scores.shape[1]:
+        raise ValueError("scores must be a square 2D array.")
+    if allowed_indices is None:
+        allowed_iter = range(size * size)
+    else:
+        allowed_iter = sorted(allowed_indices)
+    best_idx = -1
+    best_score = -np.inf
+    for oid in allowed_iter:
+        fe_idx = int(oid) // size
+        pb_idx = int(oid) % size
+        score = float(scores[fe_idx, pb_idx])
+        if np.isnan(score):
+            continue
+        if score > best_score:
+            best_score = score
+            best_idx = int(oid)
+    if best_idx < 0:
+        return -1, 0.0
+    return best_idx, float(best_score)
 
 
 def _save_spectrum_plot(
@@ -411,6 +634,8 @@ def run_live_pf(
     obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
     obstacle_seed: int | None = None,
     eval_match_radius_m: float = 0.5,
+    candidate_grid_spacing: tuple[float, float, float] | None = None,
+    candidate_grid_margin: float = CANDIDATE_GRID_MARGIN,
     count_mode: str = "spectrum",
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
@@ -431,6 +656,8 @@ def run_live_pf(
         pf_config_overrides: Optional overrides applied to the PF configuration.
         save_outputs: When False, skip writing plots and snapshot images.
         return_state: When True, return the estimator for inspection/testing.
+        candidate_grid_spacing: Optional (x, y, z) spacing for birth candidate grid.
+        candidate_grid_margin: Margin from the environment bounds for candidate sources.
     """
     count_mode = count_mode.strip().lower()
     if count_mode not in {"spectrum", "expected"}:
@@ -464,11 +691,9 @@ def run_live_pf(
     if save_outputs:
         PF_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Candidate sources: coarse grid inside environment
-    xs_src = np.linspace(0.5, env.size_x - 0.5, 4)
-    ys_src = np.linspace(0.5, env.size_y - 0.5, 4)
-    zs_src = np.linspace(0.5, env.size_z - 0.5, 2)
-    grid = np.array([[x, y, z] for x in xs_src for y in ys_src for z in zs_src], dtype=float)
+    # Candidate sources: dense grid inside environment (used by birth proposals).
+    spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
+    grid = _build_candidate_sources(env, spacing=spacing, margin=float(candidate_grid_margin))
 
     bounds_lo = np.array([0.0, 0.0, env.detector_position[2]], dtype=float)
     bounds_hi = np.array([env.size_x, env.size_y, env.detector_position[2]], dtype=float)
@@ -496,23 +721,27 @@ def run_live_pf(
         shield_params=shield_params,
         use_gpu=use_gpu,
         gpu_device="cuda",
-        gpu_dtype="float32",
+        gpu_dtype="float64",
     )
     background_by_isotope = {iso: 5.0 for iso in isotopes}
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
         min_particles=num_particles,
-        max_particles=num_particles * 2,
+        max_particles=num_particles,
+        max_sources=1,
         resample_threshold=0.7,
-        position_sigma=0.1,
+        position_sigma=0.5,
         background_level=background_by_isotope,
         min_strength=5.0,
-        p_birth=0.01,
-        p_kill=0.2,
+        p_birth=0.0,
+        p_kill=0.0,
         short_time_s=30.0,
         max_dwell_time_s=10000.0,
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
+        init_num_sources=(1, 1),
+        split_prob=0.0,
+        merge_prob=0.0,
         orientation_k=16,
         planning_eig_samples=50,
         planning_rollout_particles=256,
@@ -520,7 +749,7 @@ def run_live_pf(
         use_fast_gpu_rollout=True,
         use_gpu=use_gpu,
         gpu_device="cuda",
-        gpu_dtype="float32",
+        gpu_dtype="float64",
     )
     if pf_config_overrides:
         for key, value in pf_config_overrides.items():
@@ -529,6 +758,15 @@ def run_live_pf(
             setattr(pf_conf, key, value)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
+    init_pf = PFConfig()
+    init_pf.init_num_sources = pf_conf.init_num_sources
+    init_support_prob = _initial_particle_nearby_probability(
+        num_particles=int(pf_conf.num_particles),
+        position_min=pf_conf.position_min,
+        position_max=pf_conf.position_max,
+        radius_m=float(eval_match_radius_m),
+        init_num_sources=init_pf.init_num_sources,
+    )
     estimator = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=grid,
@@ -595,6 +833,26 @@ def run_live_pf(
         f"mode={ig_threshold_mode}, floor={estimator.pf_config.ig_threshold:.6g}, "
         f"rel={ig_threshold_rel:.6g}"
     )
+    ig_workers = _resolve_ig_workers(estimator.pf_config.ig_workers)
+    print(f"IG grid workers: {ig_workers}")
+    print(
+        "Candidate grid: "
+        f"spacing={spacing} margin={float(candidate_grid_margin):.2f} "
+        f"points={grid.shape[0]}"
+    )
+    print(
+        "Init support probability: "
+        f"radius={float(eval_match_radius_m):.2f}m "
+        f"prob≈{init_support_prob:.3f} "
+        f"(init_num_sources={init_pf.init_num_sources})"
+    )
+    print(
+        "PF init prior: "
+        f"init_num_sources={init_pf.init_num_sources}, "
+        f"init_strength_log_mean={init_pf.init_strength_log_mean:.2f}, "
+        f"init_strength_log_sigma={init_pf.init_strength_log_sigma:.2f}, "
+        f"max_sources={pf_conf.max_sources}"
+    )
     print(
         "Planning rollout settings: "
         f"eig_samples={estimator.pf_config.planning_eig_samples}, "
@@ -624,16 +882,26 @@ def run_live_pf(
             if not remaining_orientations:
                 print("All orientation pairs exhausted; moving to the next pose.")
                 break
-            best_pair_idx, ig_score = select_best_orientation(
+            planning_isotopes = None
+            if detection_locked and locked_isotopes_for_planning:
+                planning_isotopes = sorted(locked_isotopes_for_planning)
+            ig_start = time.perf_counter()
+            ig_scores = _compute_ig_grid(
                 estimator,
+                rot_mats,
                 pose_idx=current_pose_idx,
                 live_time_s=live_time,
-                allowed_indices=remaining_orientations,
+                planning_isotopes=planning_isotopes,
+            )
+            ig_elapsed = time.perf_counter() - ig_start
+            best_pair_idx, ig_score = _select_best_pair_from_scores(
+                ig_scores,
+                remaining_orientations,
             )
             if best_pair_idx < 0:
                 print("No valid orientation candidates; moving to the next pose.")
                 break
-            ig_val = float(ig_score)
+            ig_val = max(float(ig_score), 0.0)
             last_max_ig = ig_val
             ig_max_global = max(ig_max_global, ig_val)
             ig_max_pose = max(ig_max_pose, ig_val)
@@ -654,17 +922,7 @@ def run_live_pf(
             pb_idx = best_pair_idx % num_orients
             RFe_sel = rot_mats[fe_idx]
             RPb_sel = rot_mats[pb_idx]
-            planning_isotopes = None
-            if detection_locked and locked_isotopes_for_planning:
-                planning_isotopes = sorted(locked_isotopes_for_planning)
-            ig_scores = _compute_ig_grid(
-                estimator,
-                rot_mats,
-                pose_idx=current_pose_idx,
-                live_time_s=live_time,
-                planning_isotopes=planning_isotopes,
-            )
-            if save_outputs:
+            if save_outputs and (step_counter + 1) % 10 == 0:
                 ig_path = IG_DIR / f"ig_grid_step_{step_counter:04d}.png"
                 render_octant_grid(
                     ig_path,
@@ -685,15 +943,34 @@ def run_live_pf(
                 shield_params=shield_params,
             )
             last_spectrum = spectrum.copy()
-            z_detected, detected = decomposer.isotope_counts_with_detection(
-                spectrum,
+            expected_counts = _expected_counts(
+                expected_kernel,
+                sources,
+                isotopes,
+                detector_pos=pose,
+                fe_index=fe_idx,
+                pb_index=pb_idx,
                 live_time_s=live_time,
-                active_isotopes=sorted(active_isotopes) if active_isotopes else None,
-                detect_threshold_abs=detect_threshold_abs,
-                detect_threshold_rel=detect_threshold_rel,
-                detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
-                min_peaks_by_isotope=min_peaks_by_isotope,
             )
+            if count_mode == "expected":
+                z_detected = expected_counts
+                detected = _detect_isotopes_from_counts(
+                    expected_counts,
+                    detect_threshold_abs=detect_threshold_abs,
+                    detect_threshold_rel=detect_threshold_rel,
+                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                )
+            else:
+                z_detected, detected = decomposer.isotope_counts_with_detection(
+                    spectrum,
+                    live_time_s=live_time,
+                    # Always detect across the full library so the lock can expand.
+                    active_isotopes=None,
+                    detect_threshold_abs=detect_threshold_abs,
+                    detect_threshold_rel=detect_threshold_rel,
+                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                    min_peaks_by_isotope=min_peaks_by_isotope,
+                )
             last_counts = {iso: float(val) for iso, val in z_detected.items()}
             last_candidates = set(detected)
             if detect_consecutive > 0:
@@ -724,30 +1001,13 @@ def run_live_pf(
                     if new_locked != locked_isotopes_for_planning:
                         locked_isotopes_for_planning = new_locked
                         print(
-                            "Detected isotopes expanded to: "
+                            "pes expanded to: "
                             f"{sorted(locked_isotopes_for_planning)}"
                         )
-            expected_counts = _expected_counts(
-                expected_kernel,
-                sources,
-                isotopes,
-                detector_pos=pose,
-                fe_index=fe_idx,
-                pb_index=pb_idx,
-                live_time_s=live_time,
-            )
             counts_for_pf = expected_counts if count_mode == "expected" else z_detected
-            z_counts = counts_for_pf
-            z_k = counts_for_pf
-            if detection_locked and locked_isotopes_for_planning:
-                missing_non_locked = (
-                    set(isotopes) - set(locked_isotopes_for_planning) - set(z_k.keys())
-                )
-                if missing_non_locked:
-                    warnings.warn(
-                        "Isotope lock is active but measurement record dropped isotopes; this will break pruning.",
-                        RuntimeWarning,
-                    )
+            z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in isotopes}
+            z_counts = z_k_full
+            z_k = z_k_full
             meas = Measurement(
                 counts_by_isotope=z_k,
                 pose_idx=current_pose_idx,
@@ -759,20 +1019,18 @@ def run_live_pf(
                 RPb=RPb_sel,
                 detector_position=pose,
             )
-            estimator.update_pair(z_k=z_k, pose_idx=current_pose_idx, fe_index=fe_idx, pb_index=pb_idx, live_time_s=live_time)
-            if (
-                detection_locked
-                and estimator.measurements
-                and len(estimator.measurements) >= PRUNE_MIN_MEASUREMENTS
-            ):
-                estimator.prune_spurious_sources(
-                    tau_mix=PRUNE_TAU_MIX,
-                    min_support=PRUNE_MIN_SUPPORT,
-                    min_obs_count=PRUNE_MIN_OBS_COUNT,
-                    min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                    min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-                )
+            pf_start = time.perf_counter()
+            estimator.update_pair(
+                z_k=z_k,
+                pose_idx=current_pose_idx,
+                fe_index=fe_idx,
+                pb_index=pb_idx,
+                live_time_s=live_time,
+            )
+            pf_elapsed = time.perf_counter() - pf_start
             elapsed += live_time
+            viz_elapsed = 0.0
+            viz_start = time.perf_counter()
             frame = build_frame_from_pf(
                 estimator,
                 meas,
@@ -782,17 +1040,47 @@ def run_live_pf(
                 min_est_strength=estimate_min_strength,
                 min_existence_prob=estimate_min_existence_prob,
             )
+            viz_elapsed += time.perf_counter() - viz_start
+            prune_start = time.perf_counter()
+            pruned = estimator.pruned_estimates(
+                method="legacy",
+                tau_mix=PRUNE_TAU_MIX,
+                min_support=PRUNE_MIN_SUPPORT,
+                min_obs_count=PRUNE_MIN_OBS_COUNT,
+                min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+                min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+            )
+            prune_elapsed = time.perf_counter() - prune_start
+            viz_start = time.perf_counter()
+            if hasattr(frame, "estimated_sources") and hasattr(frame, "estimated_strengths"):
+                frame.estimated_sources = {}
+                frame.estimated_strengths = {}
+                for iso in isotopes:
+                    pos, strg = pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
+                    if estimate_min_strength is not None and strg.size:
+                        mask = strg >= estimate_min_strength
+                        pos = pos[mask]
+                        strg = strg[mask]
+                    frame.estimated_sources[iso] = pos
+                    frame.estimated_strengths[iso] = strg
             viz.update(frame)
             # Log only measurement point and shield orientations
             print(
-                f"[step {step_counter}] pose={pose.tolist()} orient_pair={best_pair_idx} "
+                f"[step {step_counter}] pose={_fmt_pos(pose)} orient_pair={best_pair_idx} "
                 f"ig={ig_val:.6g} ig_threshold={ig_threshold_current:.6g} "
                 f"fe_idx={fe_idx} pb_idx={pb_idx} "
-                f"z_keys={sorted(z_k.keys())} counts={z_counts} "
-                f"The Expected Counts={expected_counts}"
+                f"live_time_s={live_time:.1f} z_keys={sorted(z_k.keys())} "
+                f"z_obs={_fmt_counts(z_counts)} "
+                f"expected={_fmt_counts(expected_counts)}"
             )
             if live:
                 plt.pause(0.05)
+            viz_elapsed += time.perf_counter() - viz_start
+            _log_pf_diagnostics(estimator, step_counter)
+            print(
+                f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
+                f"prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s"
+            )
             step_counter += 1
             rotation_count += 1
             remaining_orientations.discard(best_pair_idx)
@@ -859,19 +1147,6 @@ def run_live_pf(
         estimator.add_measurement_pose(current_pose, reset_filters=False)
         current_pose_idx = len(estimator.poses) - 1
 
-    if (
-        detection_locked
-        and estimator.measurements
-        and len(estimator.measurements) >= PRUNE_MIN_MEASUREMENTS
-    ):
-        estimator.prune_spurious_sources(
-            tau_mix=PRUNE_TAU_MIX,
-            min_support=PRUNE_MIN_SUPPORT,
-            min_obs_count=PRUNE_MIN_OBS_COUNT,
-            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-        )
-
     # Save final snapshots
     if save_outputs:
         pf_out_path = RESULTS_DIR / "result_pf.png"
@@ -912,8 +1187,16 @@ def run_live_pf(
                 "strength": float(src.intensity_cps_1m),
             }
         )
+    estimates = estimator.pruned_estimates(
+        method="legacy",
+        tau_mix=PRUNE_TAU_MIX,
+        min_support=PRUNE_MIN_SUPPORT,
+        min_obs_count=PRUNE_MIN_OBS_COUNT,
+        min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+        min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+    )
     est_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
-    for iso, estimate in estimator.estimates().items():
+    for iso, estimate in estimates.items():
         positions = np.asarray(estimate[0], dtype=float)
         strengths = np.asarray(estimate[1], dtype=float)
         est_list: list[dict[str, float | list[float]]] = []

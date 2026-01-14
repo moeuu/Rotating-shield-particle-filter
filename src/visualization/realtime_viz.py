@@ -91,6 +91,12 @@ def _existence_probabilities(states: Sequence[Any], weights: NDArray[np.float64]
     return probs
 
 
+def _format_pos(pos: NDArray[np.float64]) -> str:
+    """Format a position vector with two decimal places."""
+    coords = ", ".join(f"{val:.2f}" for val in np.asarray(pos, dtype=float).ravel())
+    return f"[{coords}]"
+
+
 def _mmse_estimate_by_slot(
     states: Sequence[Any],
     weights: NDArray[np.float64],
@@ -274,7 +280,7 @@ class RealTimePFVisualizer:
                 strength = self.true_strengths.get(iso, None)
                 label = f"True {iso}"
                 if strength is not None and not isinstance(strength, (list, tuple, np.ndarray)):
-                    label = f"{label} pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                    label = f"{label} pos={_format_pos(pos)} q={strength:.1f} cps@1m"
                 halo = self.ax3d.scatter(
                     pos[:, 0],
                     pos[:, 1],
@@ -540,7 +546,7 @@ class RealTimePFVisualizer:
                 positions = np.atleast_2d(pos)
                 strengths = self._true_strengths_for_iso(iso, positions.shape[0])
                 for idx, pos_row in enumerate(positions):
-                    label = f"True {iso} pos={pos_row.round(2).tolist()}"
+                    label = f"True {iso} pos={_format_pos(pos_row)}"
                     strength = strengths[idx]
                     if strength is not None:
                         label = f"{label} q={strength:.1f} cps@1m"
@@ -566,7 +572,7 @@ class RealTimePFVisualizer:
                 positions = np.atleast_2d(pos)
                 strengths = self._true_strengths_for_iso(iso, positions.shape[0])
                 for idx, pos_row in enumerate(positions):
-                    label = f"True {iso} pos={pos_row.round(2).tolist()}"
+                    label = f"True {iso} pos={_format_pos(pos_row)}"
                     strength = strengths[idx]
                     if strength is not None:
                         label = f"{label} q={strength:.1f} cps@1m"
@@ -605,7 +611,7 @@ class RealTimePFVisualizer:
                 idx = int(np.argmax(strengths))
                 pos = est_pos[idx]
                 strength = float(strengths[idx])
-                text = f"{iso}: pos={pos.round(2).tolist()} q={strength:.1f} cps@1m"
+                text = f"{iso}: pos={_format_pos(pos)} q={strength:.1f} cps@1m"
             else:
                 text = f"{iso}: no estimate"
             lines.append((text, self.estimate_colors.get(iso, self.colors.get(iso, "black"))))
@@ -620,7 +626,7 @@ class RealTimePFVisualizer:
             color = self.estimate_colors.get(iso, self.colors.get(iso, "black"))
             if strengths.size and est_pos.size:
                 for idx, (pos, strength) in enumerate(zip(est_pos, strengths)):
-                    text = f"{iso}[{idx}]: pos={pos.round(2).tolist()} q={float(strength):.1f} cps@1m"
+                    text = f"{iso}[{idx}]: pos={_format_pos(pos)} q={float(strength):.1f} cps@1m"
                     lines.append((text, color))
             else:
                 lines.append((f"{iso}: no estimate", color))

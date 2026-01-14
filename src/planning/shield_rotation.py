@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -55,6 +55,29 @@ def _pack_states_by_isotope(
         weights_t = _normalize_weights_torch(weights_t, torch_mod)
         packed[iso] = (positions, strengths, backgrounds, mask, weights_t)
     return packed
+
+
+def _filter_planning_isotopes(
+    planning_isotopes: Sequence[str] | None,
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    alpha_by_isotope: Dict[str, float] | None,
+) -> Tuple[Dict[str, Tuple[list, np.ndarray]], Dict[str, float] | None]:
+    """Filter particles/weights to the requested planning isotopes when provided."""
+    if planning_isotopes is None:
+        return particles_by_isotope, alpha_by_isotope
+    planning_set = set(planning_isotopes)
+    filtered_particles = {
+        iso: val for iso, val in particles_by_isotope.items() if iso in planning_set
+    }
+    if not filtered_particles:
+        return particles_by_isotope, alpha_by_isotope
+    if alpha_by_isotope is None:
+        filtered_alpha = {iso: 1.0 for iso in planning_set}
+    else:
+        filtered_alpha = {
+            iso: float(alpha_by_isotope.get(iso, 1.0)) for iso in planning_set
+        }
+    return filtered_particles, filtered_alpha
 
 
 def _surrogate_scores(
@@ -354,6 +377,7 @@ def select_best_orientation(
     RFe_candidates=None,
     RPb_candidates=None,
     alpha_by_isotope=None,
+    planning_isotopes: Sequence[str] | None = None,
     allowed_indices=None,
     eig_samples: int | None = None,
     planning_particles: int | None = None,
@@ -381,6 +405,11 @@ def select_best_orientation(
     particles_by_iso = estimator.planning_particles(
         max_particles=planning_particles,
         method=planning_method,
+    )
+    particles_by_iso, alpha_by_isotope = _filter_planning_isotopes(
+        planning_isotopes,
+        particles_by_iso,
+        alpha_by_isotope,
     )
     candidate_ids: List[int] = []
     for fe_idx in range(len(RFe_candidates)):
@@ -446,7 +475,8 @@ def select_best_orientation(
     if not scores_dict:
         return -1, 0.0
     best_id = max(scores_dict.keys(), key=lambda oid: scores_dict[oid])
-    return best_id, float(scores_dict[best_id])
+    best_score = max(float(scores_dict[best_id]), 0.0)
+    return best_id, best_score
 
 
 def select_top_k_orientations(
@@ -457,6 +487,7 @@ def select_top_k_orientations(
     RFe_candidates=None,
     RPb_candidates=None,
     alpha_by_isotope=None,
+    planning_isotopes: Sequence[str] | None = None,
     allowed_indices=None,
     eig_samples: int | None = None,
     planning_particles: int | None = None,
@@ -487,6 +518,11 @@ def select_top_k_orientations(
     particles_by_iso = estimator.planning_particles(
         max_particles=planning_particles,
         method=planning_method,
+    )
+    particles_by_iso, alpha_by_isotope = _filter_planning_isotopes(
+        planning_isotopes,
+        particles_by_iso,
+        alpha_by_isotope,
     )
     candidate_ids: List[int] = []
     for fe_idx in range(len(RFe_candidates)):

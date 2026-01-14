@@ -108,6 +108,14 @@ class IsotopeParticleFilter:
         )
         self.continuous_particles: List[IsotopeParticle] = []
         self._label_reference: IsotopeState | None = None
+        self.last_ess: float | None = None
+        self.last_ess_pre: float | None = None
+        self.last_ess_post: float | None = None
+        self.last_resample_ess = False
+        self.last_resample_count = 0
+        self.last_birth_count = 0
+        self.last_kill_count = 0
+        self.last_n_after_adapt: int | None = None
         self._init_continuous_particles()
 
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
@@ -153,6 +161,17 @@ class IsotopeParticleFilter:
                 support_scores=support_scores,
             )
             self.continuous_particles.append(IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N))))
+
+    def reset_step_stats(self) -> None:
+        """Reset per-step diagnostic counters."""
+        self.last_ess = None
+        self.last_ess_pre = None
+        self.last_ess_post = None
+        self.last_resample_ess = False
+        self.last_resample_count = 0
+        self.last_birth_count = 0
+        self.last_kill_count = 0
+        self.last_n_after_adapt = None
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
@@ -336,6 +355,7 @@ class IsotopeParticleFilter:
 
         z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
         """
+        self.reset_step_stats()
         self._gpu_enabled()
         lam_t = self._continuous_expected_counts_pair_torch(
             pose_idx=pose_idx,
@@ -361,6 +381,7 @@ class IsotopeParticleFilter:
 
         This avoids reliance on pose indices for planning-time evaluations.
         """
+        self.reset_step_stats()
         self._gpu_enabled()
         lam_t = self._continuous_expected_counts_pair_at_pose_torch(
             detector_pos=detector_pos,
@@ -385,14 +406,27 @@ class IsotopeParticleFilter:
     def _maybe_resample_continuous(self) -> None:
         """ESS check and systematic resampling for continuous particles (Sec. 3.3.4, Eq. 3.29)."""
         w = self.continuous_weights
-        ess = 1.0 / np.sum(w**2)
+        if w.size == 0:
+            self.last_ess = 0.0
+            self.last_ess_pre = 0.0
+            self.last_ess_post = 0.0
+            self.last_resample_ess = False
+            return
+        ess = 1.0 / max(np.sum(w**2), 1e-12)
+        self.last_ess = float(ess)
+        self.last_ess_pre = float(ess)
+        self.last_ess_post = None
+        self.last_resample_ess = False
         if ess < self.config.resample_threshold * self.N:
+            self.last_resample_ess = True
+            self.last_resample_count += 1
             idx = systematic_resample(np.log(w))
             self.continuous_particles = [self.continuous_particles[i].state.copy() for i in idx]
             # reset weights to uniform
             self.continuous_particles = [
                 IsotopeParticle(state=st, log_weight=float(-np.log(self.N))) for st in self.continuous_particles
             ]
+            self.last_ess_post = float(len(self.continuous_particles))
             self.regularize_continuous(
                 sigma_pos=self.config.position_sigma,
                 sigma_int=self.config.strength_sigma,
@@ -569,6 +603,7 @@ class IsotopeParticleFilter:
         Optional: adapt N based on variance/entropy of weights (Chapter 3.3.4).
         """
         if not self.continuous_particles:
+            self.last_n_after_adapt = 0
             return
         min_particles = (
             max(1, int(self.config.min_particles))
@@ -589,10 +624,12 @@ class IsotopeParticleFilter:
         elif ess_ratio > self.config.ess_high and len(w) > min_particles:
             target = max(min_particles, int(len(w) * 0.8))
             self._resample_continuous_to(target, jitter=False)
+        self.last_n_after_adapt = int(len(self.continuous_particles))
 
     def _resample_continuous_to(self, target_n: int, jitter: bool = False) -> None:
         """Resample the continuous particles to a new population size."""
         target_n = max(1, int(target_n))
+        self.last_resample_count += 1
         w = self.continuous_weights
         idx = np.random.choice(len(self.continuous_particles), size=target_n, p=w)
         states = [self.continuous_particles[i].state.copy() for i in idx]
@@ -796,6 +833,7 @@ class IsotopeParticleFilter:
                     if do_kill and np.random.rand() < float(self.config.p_kill):
                         kill_mask[idx] = False
                 if not np.all(kill_mask):
+                    self.last_kill_count += int(np.sum(~kill_mask))
                     st.positions = st.positions[kill_mask]
                     st.strengths = st.strengths[kill_mask]
                     st.ages = st.ages[kill_mask]
@@ -932,6 +970,7 @@ class IsotopeParticleFilter:
                 st.low_q_streaks = np.append(st.low_q_streaks, 0)
                 st.support_scores = np.append(st.support_scores, 0.0)
                 st.num_sources = st.positions.shape[0]
+                self.last_birth_count += 1
 
         self.align_continuous_labels()
 

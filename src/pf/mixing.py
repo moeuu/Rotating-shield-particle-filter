@@ -19,7 +19,7 @@ def prune_spurious_sources(
     strengths: NDArray[np.float64],
     background: float | NDArray[np.float64],
     forward_model: Callable[[NDArray[np.float64], NDArray[np.float64]], NDArray[np.float64]],
-    method: str = "deltaLL",
+    method: str = "legacy",
     params: Dict[str, float] | None = None,
 ) -> NDArray[np.bool_]:
     """
@@ -118,7 +118,7 @@ def prune_spurious_sources(
 
 def prune_spurious_sources_continuous(
     estimator: RotatingShieldPFEstimator,
-    method: str = "deltaLL",
+    method: str = "legacy",
     params: Dict[str, float] | None = None,
     tau_mix: float = 0.9,
     epsilon: float = 1e-6,

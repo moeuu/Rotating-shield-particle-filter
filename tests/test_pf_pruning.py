@@ -75,8 +75,17 @@ def test_prune_spurious_source_best_case_measurement() -> None:
     )
     assert keep_mask["Cs-137"][0]
     assert not keep_mask["Cs-137"][1]
+    pruned = estimator.pruned_estimates(
+        method="bestcase",
+        params={"alpha": 0.8, "lambda_min": 1e-6, "lrt_threshold": 0.0},
+        min_support=1,
+        min_obs_count=0.0,
+    )
+    pos, strg = pruned["Cs-137"]
+    assert pos.shape[0] == 1
+    assert strg.shape[0] == 1
     for p in estimator.filters["Cs-137"].continuous_particles:
-        assert p.state.num_sources == 1
+        assert p.state.num_sources == 2
 
 
 def test_delta_ll_keeps_shared_sources_vs_legacy() -> None:

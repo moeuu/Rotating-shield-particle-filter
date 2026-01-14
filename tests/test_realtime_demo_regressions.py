@@ -96,10 +96,6 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         """Return an empty frame placeholder."""
         return {}
 
-    def _fake_best_orientation(*args: object, **kwargs: object) -> tuple[int, float]:
-        """Return a fixed orientation with positive IG."""
-        return 0, 1.0
-
     def _fake_candidate_poses(*args: object, **kwargs: object) -> np.ndarray:
         """Return two deterministic candidate poses."""
         return np.array([[1.0, 1.0, 0.5], [2.0, 2.0, 0.5]], dtype=float)
@@ -116,7 +112,6 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
     monkeypatch.setattr(realtime_demo, "_expected_counts", _fake_expected_counts)
-    monkeypatch.setattr(realtime_demo, "select_best_orientation", _fake_best_orientation)
     monkeypatch.setattr(
         realtime_demo,
         "generate_candidate_poses",

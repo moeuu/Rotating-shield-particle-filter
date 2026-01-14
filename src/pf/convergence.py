@@ -60,7 +60,7 @@ def summarize_estimates(estimator: RotatingShieldPFEstimator) -> Dict[str, List[
         {iso: [{"position": (3,), "strength": float, "cov": (4,4)}], ...}
     """
     summary: Dict[str, List[Dict[str, NDArray[np.float64]]]] = {}
-    estimates = estimator.estimates()
+    estimates = estimator.pruned_estimates(method="legacy")
     for iso, (pos, strengths) in estimates.items():
         items: List[Dict[str, NDArray[np.float64]]] = []
         covs = None
