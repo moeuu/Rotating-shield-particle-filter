@@ -21,6 +21,7 @@ def test_compute_metrics_counts_with_gate() -> None:
     counts = metrics["isotopes"]["Cs-137"]["counts"]
     assert counts["gt"] == 2
     assert counts["est"] == 2
+    assert counts["assigned"] == 2
     assert counts["matched"] == 2
     assert counts["fp"] == 0
     assert counts["fn"] == 0

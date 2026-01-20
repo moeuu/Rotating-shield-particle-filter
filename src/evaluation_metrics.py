@@ -164,7 +164,8 @@ def compute_metrics(
     """
     Compute per-isotope evaluation metrics for estimated sources.
 
-    Matching always uses the closest 1-to-1 assignment (no gating).
+    Matching uses the closest 1-to-1 assignment (no gating).
+    Position and strength errors are summarized over assigned matches.
     """
     eps = 1e-12
     isotopes = sorted(set(gt_by_iso.keys()) | set(est_by_iso.keys()))
@@ -173,17 +174,22 @@ def compute_metrics(
         gt = _normalize_sources(gt_by_iso.get(iso, []))
         est = _normalize_sources(est_by_iso.get(iso, []))
         dist = _pairwise_distances(gt, est)
-        assignments = _hungarian_assignment(dist)
+        if dist.size == 0:
+            assignments = []
+        else:
+            q_true = np.asarray([src.strength for src in gt], dtype=float)
+            q_hat = np.asarray([src.strength for src in est], dtype=float)
+            strength_diff = np.abs(q_true[:, None] - q_hat[None, :]) / np.maximum(q_true[:, None], eps)
+            # Prefer strength-matched assignments when estimates are not far apart.
+            within = dist <= float(match_radius_m)
+            cost = np.where(within, strength_diff + 1e-6 * dist, dist + 1e3)
+            assignments = _hungarian_assignment(cost)
         matched: List[Tuple[int, int, float]] = []
-        matched_gt = set()
-        matched_est = set()
         for i, j in assignments:
             d = float(dist[i, j])
             matched.append((i, j, d))
-            matched_gt.add(i)
-            matched_est.add(j)
-        fp = max(0, len(est) - len(matched_est))
-        fn = max(0, len(gt) - len(matched_gt))
+        fp = max(0, len(est) - len(matched))
+        fn = max(0, len(gt) - len(matched))
         pos_errors = [d for _, _, d in matched]
         abs_errors = []
         rel_errors = []
@@ -200,7 +206,7 @@ def compute_metrics(
                     "gt_index": i,
                     "est_index": j,
                     "distance": d,
-                    "within_radius": d <= match_radius_m,
+                    "within_radius": bool(d <= float(match_radius_m)),
                     "q_true": q_true,
                     "q_hat": q_hat,
                     "abs_err": abs_err,
@@ -211,6 +217,7 @@ def compute_metrics(
             "counts": {
                 "gt": len(gt),
                 "est": len(est),
+                "assigned": len(matched),
                 "matched": len(matched),
                 "fp": fp,
                 "fn": fn,
@@ -238,18 +245,20 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
     match_radius = metrics.get("match_radius_m", None)
     isotopes = metrics.get("isotopes", {})
     print("=== Evaluation Metrics (PF Final) ===")
-    if match_radius is not None:
-        print(f"Match radius: {float(match_radius):.2f} m (closest matching)")
     for iso in sorted(isotopes.keys()):
         data = isotopes[iso]
         counts = data["counts"]
+        assigned = counts.get("assigned", None)
         pos_err = data["position_error"]
         abs_err = data["intensity_abs_error"]
         rel_err = data["intensity_rel_error_pct"]
         print(f"\n[Isotope: {iso}]")
+        assigned_msg = ""
+        if assigned is not None:
+            assigned_msg = f", Assigned={assigned}"
         print(
-            f"  GT={counts['gt']}, EST={counts['est']}, Matched={counts['matched']}, "
-            f"FP={counts['fp']}, FN={counts['fn']}"
+            f"  GT={counts['gt']}, EST={counts['est']}{assigned_msg}, "
+            f"TP={counts['matched']}, FP={counts['fp']}, FN={counts['fn']}"
         )
         print(
             "  Position error [m]: "

@@ -35,6 +35,7 @@ def test_generate_measurement_positions_avoids_obstacles() -> None:
         measurement_time_s=30.0,
     )
     assert positions.shape == (3, 3)
+    assert np.unique(positions[:, :2], axis=0).shape[0] == positions.shape[0]
     for pos in positions:
         assert grid.is_free(pos)
         assert np.isclose(pos[2], env.detector()[2])

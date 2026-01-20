@@ -42,3 +42,18 @@ uv run python main.py
 ```
 
 The run shows robot trajectory, shield orientations, particle clouds, and estimated sources; `results/result_pf.png` is written at the end, alongside the final spectrum as `results/result_spectrum.png`.
+
+## Birth move smoke test
+
+Use these commands to verify birth is disabled/enabled:
+
+```
+# Birth disabled (default): r_mean stays at 1 and births remain 0.
+uv run python main.py --max-steps 20
+
+# Birth enabled: with max_sources=3, births should become >0 within a few steps.
+uv run python main.py --birth --max-sources 3 --max-steps 20
+
+# Stabilized expected-count run (reduce tempering resamples, skip roughening on temper-resample).
+uv run python main.py --count expected --temper-max-resamples 0 --no-roughen-on-temper-resample
+```

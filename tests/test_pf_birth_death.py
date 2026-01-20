@@ -139,7 +139,7 @@ def test_weak_source_survives_with_support() -> None:
     np.random.seed(2)
     filt = _build_filter(
         p_birth=0.0,
-        min_strength=1.0,
+        min_strength=0.1,
         max_sources=2,
         num_particles=1,
         death_low_q_streak=2,
@@ -182,3 +182,91 @@ def test_weak_source_survives_with_support() -> None:
     for _ in range(3):
         filt.apply_birth_death(support_data=support_data, birth_data=None, candidate_positions=None)
     assert filt.continuous_particles[0].state.num_sources == 2
+
+
+def test_birth_disabled_skips_moves() -> None:
+    """Birth mode disabled should skip birth/kill/split/merge moves."""
+    np.random.seed(3)
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=2,
+        birth_enable=False,
+        p_kill=1.0,
+        split_prob=1.0,
+        merge_prob=1.0,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([1.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        )
+        for _ in range(filt.N)
+    ]
+    support_data = MeasurementData(
+        z_k=np.array([0.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([7], dtype=int),
+        pb_indices=np.array([7], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    birth_data = MeasurementData(
+        z_k=np.array([5.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([7], dtype=int),
+        pb_indices=np.array([7], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    filt.apply_birth_death(
+        support_data=support_data,
+        birth_data=birth_data,
+        candidate_positions=filt.kernel.sources,
+    )
+    assert all(p.state.num_sources == 1 for p in filt.continuous_particles)
+    assert filt.last_birth_count == 0
+    assert filt.last_kill_count == 0
+
+
+def test_birth_enabled_adds_sources() -> None:
+    """Birth mode enabled should allow adding sources."""
+    np.random.seed(4)
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=3,
+        birth_enable=True,
+        birth_min_sep_m=0.0,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([0.1], dtype=float),
+                background=0.1,
+            ),
+            log_weight=float(np.log(1.0 / filt.N)),
+        )
+        for _ in range(filt.N)
+    ]
+    birth_data = MeasurementData(
+        z_k=np.array([100.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([7], dtype=int),
+        pb_indices=np.array([7], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    filt.apply_birth_death(
+        support_data=None,
+        birth_data=birth_data,
+        candidate_positions=filt.kernel.sources,
+    )
+    assert any(p.state.num_sources > 1 for p in filt.continuous_particles)
+    assert filt.last_birth_count > 0

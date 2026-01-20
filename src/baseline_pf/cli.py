@@ -82,6 +82,18 @@ def main() -> None:
         default=0.5,
         help="Match radius (m) for evaluation metrics.",
     )
+    parser.add_argument(
+        "--count",
+        type=str,
+        default="spectrum",
+        choices=("spectrum", "expected"),
+        help="Counts to pass to the PF: spectrum (default) or expected.",
+    )
+    parser.add_argument(
+        "--converge",
+        action="store_true",
+        help="Enable per-isotope convergence gating (default: disabled).",
+    )
     args = parser.parse_args()
 
     sources = None
@@ -111,6 +123,8 @@ def main() -> None:
         detect_threshold_abs=args.detect_threshold_abs,
         detect_threshold_rel=args.detect_threshold_rel,
         eval_match_radius_m=args.eval_match_radius,
+        count_mode=args.count,
+        converge=args.converge,
     )
 
 

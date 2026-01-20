@@ -268,9 +268,9 @@ class RealTimePFVisualizer:
         self._projection_artists: list = []
         self._true_projection_artists: list = []
         self._obstacle_artist = None
-        self._particle_size_range = (0.3, 6.0)
+        self._particle_size_range = (0.8, 10.0)
         self._particle_alpha_range = (0.05, 0.95)
-        self._particle_weight_exponent = 1.0
+        self._particle_weight_exponent = 0.7
         self._projection_linewidth = 1.8
         self.estimate_colors = {}
         self._active_isotopes: set[str] | None = None
@@ -502,9 +502,9 @@ class RealTimePFVisualizer:
             return
         collection = Poly3DCollection(polygons, facecolors="black", edgecolors="none", alpha=0.75)
         collection.set_zorder(0)
-        collection.set_sort_zpos(-1e6)
+        collection.set_clip_on(False)
         try:
-            collection.set_zsort("min")
+            collection.set_zsort("average")
         except AttributeError:
             pass
         self.ax3d.add_collection3d(collection)
@@ -1203,7 +1203,18 @@ def build_frame_from_pf(
         if cont_particles and len(cont_weights) == len(cont_particles):
             states = [p.state for p in cont_particles]
             weights_arr = np.asarray(cont_weights, dtype=float)
-            if mode == "map":
+            use_clustered = bool(
+                getattr(filt, "config", None)
+                and getattr(filt.config, "birth_enable", False)
+                and getattr(filt.config, "use_clustered_output", False)
+            )
+            if use_clustered and hasattr(filt, "estimate_clustered"):
+                est_pos, est_str = filt.estimate_clustered()
+                if min_est_strength is not None and est_str.size:
+                    mask = est_str >= min_est_strength
+                    est_pos = est_pos[mask]
+                    est_str = est_str[mask]
+            elif mode == "map":
                 best = max(cont_particles, key=lambda p: p.log_weight).state
                 best_r = int(getattr(best, "num_sources", 0))
                 if best_r <= 0:

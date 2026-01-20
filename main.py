@@ -86,7 +86,7 @@ def main() -> None:
     parser.add_argument(
         "--detect-threshold-abs",
         type=float,
-        default=100.0,
+        default=30.0,
         help="Absolute detection threshold for peak-matched activity (counts).",
     )
     parser.add_argument(
@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument(
         "--detect-threshold-rel",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Relative detection threshold as a fraction of max peak-matched activity.",
     )
     parser.add_argument(
@@ -127,7 +127,66 @@ def main() -> None:
         choices=("spectrum", "expected"),
         help="Counts to pass to the PF: spectrum (default) or expected.",
     )
+    parser.add_argument(
+        "--birth",
+        action="store_true",
+        help="Enable birth/death/split/merge moves (default: disabled).",
+    )
+    parser.add_argument(
+        "--max-sources",
+        type=int,
+        default=None,
+        help="Maximum number of sources per isotope (defaults to 3 with --birth, else 1).",
+    )
+    parser.add_argument(
+        "--temper-max-resamples",
+        type=int,
+        default=2,
+        help="Max resamples per observation during tempering (default: 2).",
+    )
+    parser.add_argument(
+        "--no-roughen-on-temper-resample",
+        action="store_true",
+        help="Disable roughening on resamples triggered inside tempering.",
+    )
+    parser.add_argument(
+        "--roughening-k",
+        type=float,
+        default=None,
+        help="Override roughening coefficient k (optional).",
+    )
+    parser.add_argument(
+        "--min-sigma-pos",
+        type=float,
+        default=None,
+        help="Override minimum roughening sigma (optional).",
+    )
+    parser.add_argument(
+        "--max-sigma-pos",
+        type=float,
+        default=None,
+        help="Override maximum roughening sigma (optional).",
+    )
+    parser.add_argument(
+        "--converge",
+        action="store_true",
+        help="Enable per-isotope convergence gating (default: disabled).",
+    )
     args = parser.parse_args()
+    if args.max_sources is None:
+        args.max_sources = 3 if args.birth else 1
+    pf_overrides: dict[str, object] = {
+        "max_sources": args.max_sources,
+        "max_resamples_per_observation": args.temper_max_resamples,
+    }
+    if args.no_roughen_on_temper_resample:
+        pf_overrides["disable_regularize_on_temper_resample"] = True
+    if args.roughening_k is not None:
+        pf_overrides["roughening_k"] = float(args.roughening_k)
+    if args.min_sigma_pos is not None:
+        pf_overrides["min_sigma_pos"] = float(args.min_sigma_pos)
+    if args.max_sigma_pos is not None:
+        pf_overrides["max_sigma_pos"] = float(args.max_sigma_pos)
     sources = None
     if args.source_config:
         source_path = Path(args.source_config)
@@ -156,6 +215,9 @@ def main() -> None:
         obstacle_seed=args.obstacle_seed,
         eval_match_radius_m=args.eval_match_radius,
         count_mode=args.count,
+        birth_enabled=args.birth,
+        pf_config_overrides=pf_overrides,
+        converge=args.converge,
     )
 
 

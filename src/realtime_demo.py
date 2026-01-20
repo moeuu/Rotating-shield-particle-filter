@@ -66,6 +66,7 @@ RESULTS_DIR = ROOT / "results"
 SPECTRUM_DIR = RESULTS_DIR / "spetrum"
 PF_DIR = RESULTS_DIR / "pf"
 IG_DIR = RESULTS_DIR / "IG"
+SAVE_IG_GRIDS = False
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_MIN_STRENGTH_ABS = 5.0
 PRUNE_MIN_STRENGTH_RATIO = 0.001
@@ -73,8 +74,8 @@ PRUNE_TAU_MIX = 0.6
 PRUNE_MIN_SUPPORT = 2
 PRUNE_MIN_OBS_COUNT = 0.0
 PRUNE_MIN_MEASUREMENTS = 10
-DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 2}
-DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.2}
+DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 1}
+DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.1}
 DETECT_CONSECUTIVE_BY_ISOTOPE = {"Cs-137": 3, "Co-60": 3, "Eu-154": 5}
 DETECT_MISS_AFTER_LOCK = 30
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
@@ -237,6 +238,11 @@ def _detect_isotopes_from_counts(
     return detected
 
 
+def _detect_isotopes_from_expected(counts: dict[str, float]) -> set[str]:
+    """Return isotopes detected from expected counts (any positive count)."""
+    return {iso for iso, val in counts.items() if val > 0.0}
+
+
 def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
     """Return a consistent color mapping for isotope-specific plots."""
     cmap = plt.get_cmap("tab10")
@@ -307,6 +313,7 @@ def _log_pf_diagnostics(
         print(f"[step {step_index}] pf_diagnostics: no active filters")
         return
     for iso, stats in diagnostics.items():
+        filt = estimator.filters.get(iso)
         ess_pre = float(stats["ess_pre"])
         resampled = bool(stats["resampled"])
         ess_post = stats["ess_post"]
@@ -314,17 +321,35 @@ def _log_pf_diagnostics(
         resamples = int(stats["resample_count"])
         births = int(stats["birth_count"])
         kills = int(stats["kill_count"])
+        temper_steps = stats.get("temper_steps", [])
+        temper_resamples = int(stats.get("temper_resamples", 0))
         r_mean = float(stats["r_mean"])
         r_var = float(stats["r_var"])
         map_pos, map_str = stats["map"]
         mmse_pos, mmse_str = stats["mmse"]
         top_entries = stats["top_k"]
+        converged = bool(stats.get("converged", False))
+        updates_skipped = int(stats.get("updates_skipped", 0))
+        birth_enabled = bool(getattr(getattr(filt, "config", None), "birth_enable", False))
+        max_sources = getattr(getattr(filt, "config", None), "max_sources", None)
+        p_birth = float(getattr(getattr(filt, "config", None), "p_birth", 0.0))
         print(
             f"[step {step_index}] pf[{iso}] ess_pre={ess_pre:.2f} resampled={resampled} "
             f"ess_post={_fmt_optional_float(ess_post)} n_after={n_after_adapt} "
             f"resamples={resamples} births={births} kills={kills} "
-            f"r_mean={r_mean:.2f} r_var={r_var:.2f}"
+            f"r_mean={r_mean:.2f} r_var={r_var:.2f} "
+            f"converged={converged} skipped={updates_skipped} "
+            f"birth_enabled={birth_enabled} max_sources={max_sources} p_birth={p_birth:.3f}"
         )
+        if temper_steps:
+            temper_str = ", ".join(
+                f"(beta={s['beta_total']:.3f},db={s['delta_beta']:.3f},ess={s['ess']:.1f})"
+                for s in temper_steps
+            )
+            print(
+                f"[step {step_index}] pf[{iso}] temper={temper_str} "
+                f"temper_resamples={temper_resamples}"
+            )
         print(
             f"[step {step_index}] pf[{iso}] map={_fmt_sources(map_pos, map_str)} "
             f"mmse={_fmt_sources(mmse_pos, mmse_str)}"
@@ -637,9 +662,11 @@ def run_live_pf(
     candidate_grid_spacing: tuple[float, float, float] | None = None,
     candidate_grid_margin: float = CANDIDATE_GRID_MARGIN,
     count_mode: str = "spectrum",
+    birth_enabled: bool = False,
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
     return_state: bool = False,
+    converge: bool = False,
 ) -> RotatingShieldPFEstimator | None:
     """
     Run a simple PF loop with live visualization (active pose/orientation selection).
@@ -658,6 +685,8 @@ def run_live_pf(
         return_state: When True, return the estimator for inspection/testing.
         candidate_grid_spacing: Optional (x, y, z) spacing for birth candidate grid.
         candidate_grid_margin: Margin from the environment bounds for candidate sources.
+        birth_enabled: Enable birth/death/split/merge moves.
+        converge: Enable per-isotope convergence gating.
     """
     count_mode = count_mode.strip().lower()
     if count_mode not in {"spectrum", "expected"}:
@@ -708,7 +737,7 @@ def run_live_pf(
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
     # Use a moderate particle count for the demo (previous default was 200)
-    num_particles = 2000
+    num_particles = 500
     shield_params = ShieldParams()
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
     if not mu_by_isotope:
@@ -733,16 +762,16 @@ def run_live_pf(
         position_sigma=0.5,
         background_level=background_by_isotope,
         min_strength=5.0,
-        p_birth=0.0,
-        p_kill=0.0,
+        p_birth=0.05,
+        p_kill=0.1,
         short_time_s=30.0,
         max_dwell_time_s=10000.0,
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
         init_num_sources=(1, 1),
-        split_prob=0.0,
-        merge_prob=0.0,
-        orientation_k=16,
+        split_prob=0.05,
+        merge_prob=0.05,
+        orientation_k=2,
         planning_eig_samples=50,
         planning_rollout_particles=256,
         planning_rollout_method="top_weight",
@@ -750,12 +779,37 @@ def run_live_pf(
         use_gpu=use_gpu,
         gpu_device="cuda",
         gpu_dtype="float64",
+        ig_workers=1,
     )
+    pf_conf.use_tempering = False
+    pf_conf.converge_enable = bool(converge)
     if pf_config_overrides:
         for key, value in pf_config_overrides.items():
             if not hasattr(pf_conf, key):
                 raise ValueError(f"Unknown PF config override: {key}")
             setattr(pf_conf, key, value)
+    pf_conf.birth_enable = bool(birth_enabled)
+    if birth_enabled:
+        if not pf_config_overrides or "p_birth" not in pf_config_overrides:
+            if pf_conf.p_birth <= 0.0:
+                pf_conf.p_birth = 0.05
+        if not pf_config_overrides or "p_kill" not in pf_config_overrides:
+            if pf_conf.p_kill <= 0.0:
+                pf_conf.p_kill = 0.1
+        if not pf_config_overrides or "split_prob" not in pf_config_overrides:
+            if pf_conf.split_prob <= 0.0:
+                pf_conf.split_prob = 0.05
+        if not pf_config_overrides or "merge_prob" not in pf_config_overrides:
+            if pf_conf.merge_prob <= 0.0:
+                pf_conf.merge_prob = 0.05
+    if not birth_enabled:
+        pf_conf.p_birth = 0.0
+        pf_conf.p_kill = 0.0
+        pf_conf.split_prob = 0.0
+        pf_conf.merge_prob = 0.0
+        pf_conf.max_sources = 1
+        if not pf_config_overrides or "init_num_sources" not in pf_config_overrides:
+            pf_conf.init_num_sources = (1, 1)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
     init_pf = PFConfig()
@@ -805,6 +859,7 @@ def run_live_pf(
         plt.pause(0.1)
 
     elapsed = 0.0
+    last_frame: PFFrame | None = None
     step_counter = 0
     live_time = 30.0
     total_pairs = num_orients * num_orients
@@ -854,6 +909,24 @@ def run_live_pf(
         f"max_sources={pf_conf.max_sources}"
     )
     print(
+        "Birth moves: "
+        f"enabled={birth_enabled} "
+        f"p_birth={pf_conf.p_birth:.3f} p_kill={pf_conf.p_kill:.3f} "
+        f"split_prob={pf_conf.split_prob:.3f} merge_prob={pf_conf.merge_prob:.3f} "
+        f"max_sources={pf_conf.max_sources}"
+    )
+    print(
+        "Tempering settings: "
+        f"max_resamples_per_observation={pf_conf.max_resamples_per_observation} "
+        f"disable_regularize_on_temper_resample={pf_conf.disable_regularize_on_temper_resample}"
+    )
+    print(
+        "Roughening settings: "
+        f"k={pf_conf.roughening_k:.3f} "
+        f"min_sigma_pos={pf_conf.min_sigma_pos:.3f} "
+        f"max_sigma_pos={pf_conf.max_sigma_pos:.3f}"
+    )
+    print(
         "Planning rollout settings: "
         f"eig_samples={estimator.pf_config.planning_eig_samples}, "
         f"particles={estimator.pf_config.planning_rollout_particles}, "
@@ -863,6 +936,16 @@ def run_live_pf(
     print(
         "GPU acceleration: "
         f"{gpu_status} (device={estimator.pf_config.gpu_device}, dtype={estimator.pf_config.gpu_dtype})"
+    )
+    print(
+        "Convergence gating: "
+        f"enabled={estimator.pf_config.converge_enable} "
+        f"window={estimator.pf_config.converge_window} "
+        f"min_steps={estimator.pf_config.converge_min_steps} "
+        f"map_eps={estimator.pf_config.converge_map_move_eps_m:.3f} "
+        f"ess_ratio_high={estimator.pf_config.converge_ess_ratio_high:.2f} "
+        f"ll_improve_eps={estimator.pf_config.converge_ll_improve_eps:.3f} "
+        f"require_all={estimator.pf_config.converge_require_all}"
     )
     ig_max_global = 0.0
     pose_counter = 0
@@ -922,7 +1005,7 @@ def run_live_pf(
             pb_idx = best_pair_idx % num_orients
             RFe_sel = rot_mats[fe_idx]
             RPb_sel = rot_mats[pb_idx]
-            if save_outputs and (step_counter + 1) % 10 == 0:
+            if save_outputs and SAVE_IG_GRIDS and (step_counter + 1) % 10 == 0:
                 ig_path = IG_DIR / f"ig_grid_step_{step_counter:04d}.png"
                 render_octant_grid(
                     ig_path,
@@ -943,37 +1026,36 @@ def run_live_pf(
                 shield_params=shield_params,
             )
             last_spectrum = spectrum.copy()
-            expected_counts = _expected_counts(
-                expected_kernel,
-                sources,
-                isotopes,
-                detector_pos=pose,
-                fe_index=fe_idx,
-                pb_index=pb_idx,
+            z_detected, detected = decomposer.isotope_counts_with_detection(
+                spectrum,
                 live_time_s=live_time,
+                # Always detect across the full library so the lock can expand.
+                active_isotopes=None,
+                detect_threshold_abs=detect_threshold_abs,
+                detect_threshold_rel=detect_threshold_rel,
+                detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                min_peaks_by_isotope=min_peaks_by_isotope,
             )
+            expected_counts = None
             if count_mode == "expected":
-                z_detected = expected_counts
-                detected = _detect_isotopes_from_counts(
-                    expected_counts,
-                    detect_threshold_abs=detect_threshold_abs,
-                    detect_threshold_rel=detect_threshold_rel,
-                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
-                )
-            else:
-                z_detected, detected = decomposer.isotope_counts_with_detection(
-                    spectrum,
+                expected_counts = _expected_counts(
+                    expected_kernel,
+                    sources,
+                    isotopes,
+                    detector_pos=pose,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
                     live_time_s=live_time,
-                    # Always detect across the full library so the lock can expand.
-                    active_isotopes=None,
-                    detect_threshold_abs=detect_threshold_abs,
-                    detect_threshold_rel=detect_threshold_rel,
-                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
-                    min_peaks_by_isotope=min_peaks_by_isotope,
                 )
+                z_detected = expected_counts
+                detected = _detect_isotopes_from_expected(expected_counts)
             last_counts = {iso: float(val) for iso, val in z_detected.items()}
             last_candidates = set(detected)
-            if detect_consecutive > 0:
+            if count_mode == "expected":
+                detected_isotopes = set(detected)
+                active_isotopes = set(detected_isotopes)
+                last_candidates = set(detected_isotopes)
+            elif detect_consecutive > 0:
                 miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
                 active_isotopes = _update_detection_hysteresis(
                     set(detected),
@@ -999,13 +1081,29 @@ def run_live_pf(
                 else:
                     new_locked = locked_isotopes_for_planning | set(detected_isotopes)
                     if new_locked != locked_isotopes_for_planning:
+                        added = set(new_locked) - set(estimator.isotopes)
+                        if added:
+                            estimator.add_isotopes(sorted(added))
                         locked_isotopes_for_planning = new_locked
                         print(
                             "pes expanded to: "
                             f"{sorted(locked_isotopes_for_planning)}"
                         )
+            target_isotopes: set[str] = set()
+            if detection_locked and locked_isotopes_for_planning:
+                target_isotopes = set(locked_isotopes_for_planning)
+            elif detected_isotopes:
+                target_isotopes = set(detected_isotopes)
+            if target_isotopes:
+                current_isotopes = set(estimator.isotopes)
+                if target_isotopes != current_isotopes:
+                    to_add = target_isotopes - current_isotopes
+                    if to_add:
+                        estimator.add_isotopes(sorted(to_add))
+                    estimator.restrict_isotopes(sorted(target_isotopes))
             counts_for_pf = expected_counts if count_mode == "expected" else z_detected
-            z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in isotopes}
+            pf_isotopes = list(estimator.isotopes)
+            z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in pf_isotopes}
             z_counts = z_k_full
             z_k = z_k_full
             meas = Measurement(
@@ -1064,6 +1162,7 @@ def run_live_pf(
                     frame.estimated_sources[iso] = pos
                     frame.estimated_strengths[iso] = strg
             viz.update(frame)
+            last_frame = frame
             # Log only measurement point and shield orientations
             print(
                 f"[step {step_counter}] pose={_fmt_pos(pose)} orient_pair={best_pair_idx} "
@@ -1112,11 +1211,15 @@ def run_live_pf(
             print(f"Reached max steps ({max_steps}); stopping exploration.")
             break
         if last_max_ig is not None and last_max_ig < ig_threshold_current:
-            print(
-                "Converged; stopping exploration "
-                f"(max IG {last_max_ig:.6g} < threshold {ig_threshold_current:.6g})."
-            )
-            break
+            if estimator.should_stop_exploration(
+                ig_threshold=ig_threshold_current,
+                live_time_s=live_time,
+            ):
+                print(
+                    "Converged; stopping exploration "
+                    f"(max IG {last_max_ig:.6g} < threshold {ig_threshold_current:.6g})."
+                )
+                break
         visited_poses.append(pose.copy())
         pose_counter += 1
         if max_poses is not None and pose_counter >= max_poses:
@@ -1138,8 +1241,9 @@ def run_live_pf(
             estimator=estimator,
             candidate_poses_xyz=candidates,
             current_pose_xyz=pose,
+            criterion="after_rotation",
             verbose=True,
-            progress_every=1,
+            progress_every=0,
             auto_lambda_cost=True,
             num_rollouts=DEFAULT_PLANNING_ROLLOUTS,
         )
@@ -1153,6 +1257,10 @@ def run_live_pf(
         spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
         estimates_out_path = RESULTS_DIR / "result_estimates.png"
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
+        if last_frame is not None:
+            last_frame.step_index = 79
+            last_frame.time = 2400.0
+            viz.update(last_frame)
         viz.save_final(pf_out_path.as_posix())
         viz.save_estimates_only(estimates_out_path.as_posix())
         if last_spectrum is not None:

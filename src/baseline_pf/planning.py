@@ -66,6 +66,56 @@ def _farthest_point_sample(
     return points[np.array(selected_indices, dtype=int)]
 
 
+def _path_length(points: NDArray[np.float64]) -> float:
+    """Return total path length through a sequence of points."""
+    if points.shape[0] < 2:
+        return 0.0
+    diffs = points[1:] - points[:-1]
+    return float(np.sum(np.linalg.norm(diffs, axis=1)))
+
+
+def _two_opt_route(points: NDArray[np.float64], max_iters: int = 50) -> NDArray[np.float64]:
+    """Improve a route using 2-opt swaps."""
+    route = points.copy()
+    best_len = _path_length(route)
+    n = route.shape[0]
+    if n < 4:
+        return route
+    for _ in range(max_iters):
+        improved = False
+        for i in range(1, n - 2):
+            for k in range(i + 1, n - 1):
+                new_route = route.copy()
+                new_route[i:k + 1] = route[i:k + 1][::-1]
+                new_len = _path_length(new_route)
+                if new_len + 1e-9 < best_len:
+                    route = new_route
+                    best_len = new_len
+                    improved = True
+        if not improved:
+            break
+    return route
+
+
+def _shortest_route(
+    points: NDArray[np.float64],
+    start_xy: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return a short route visiting each point once (nearest neighbor + 2-opt)."""
+    remaining = list(range(points.shape[0]))
+    current = np.asarray(start_xy, dtype=float).reshape(1, 2)
+    route_indices: list[int] = []
+    while remaining:
+        pts = points[remaining]
+        dists = np.linalg.norm(pts - current, axis=1)
+        next_idx = int(np.argmin(dists))
+        chosen = remaining.pop(next_idx)
+        route_indices.append(chosen)
+        current = points[chosen:chosen + 1]
+    ordered = points[np.array(route_indices, dtype=int)]
+    return _two_opt_route(ordered)
+
+
 def generate_measurement_positions(
     env: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None,
@@ -73,7 +123,7 @@ def generate_measurement_positions(
     *,
     measurement_time_s: float = 30.0,
 ) -> NDArray[np.float64]:
-    """Return evenly spaced measurement positions that avoid obstacles."""
+    """Return measurement positions and a short visiting route, repeating if needed."""
     num_measurements = measurement_count(
         total_time_s,
         measurement_time_s=measurement_time_s,
@@ -91,19 +141,15 @@ def generate_measurement_positions(
         )
     if centers.size == 0:
         raise ValueError("No free grid cells available for measurement.")
-    selected = _farthest_point_sample(
-        centers,
-        min(num_measurements, centers.shape[0]),
-    )
-    if num_measurements > selected.shape[0]:
-        repeats = num_measurements // selected.shape[0]
-        remainder = num_measurements % selected.shape[0]
-        tiled = [selected for _ in range(repeats)]
-        if remainder:
-            tiled.append(selected[:remainder])
-        selected = np.vstack(tiled)
+    if num_measurements > centers.shape[0]:
+        selected = centers.copy()
+    else:
+        selected = _farthest_point_sample(centers, num_measurements)
+    start_xy = np.asarray(env.detector()[:2], dtype=float)
+    ordered = _shortest_route(selected, start_xy)
+    if num_measurements > ordered.shape[0]:
+        repeats = int(np.ceil(num_measurements / ordered.shape[0]))
+        ordered = np.tile(ordered, (repeats, 1))[:num_measurements]
     z = float(env.detector()[2])
-    positions = np.column_stack(
-        [selected, np.full(selected.shape[0], z, dtype=float)]
-    )
+    positions = np.column_stack([ordered, np.full(ordered.shape[0], z, dtype=float)])
     return positions

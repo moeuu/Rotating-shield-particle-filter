@@ -280,16 +280,20 @@ def select_next_pose_from_candidates(
     ig_breakdown_k: int | None = None,
     ig_breakdown_max_steps: int = 6,
     ig_breakdown_max_rollouts: int = 2,
+    criterion: str = "after_rotation",
 ) -> int:
     """
-    Select the next pose from explicit candidate coordinates (after-rotation criterion).
+    Select the next pose from explicit candidate coordinates using an uncertainty criterion.
 
-    Score_k = E[U_after-rotation | q_k] + lambda_cost * C_move
+    Score_k = E[U | q_k] + lambda_cost * C_move
+    where U is either after-rotation or after-pose uncertainty depending on criterion.
 
     GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
     When verbose is True, top_k and ig_breakdown_k control extra diagnostics.
     If ig_breakdown_k is None, the IG breakdown is reported for top_k candidates.
     If auto_lambda_cost is True, lambda_cost is computed from candidate scales.
+    criterion controls whether the uncertainty is computed after rotation
+    ("after_rotation") or after a single pose measurement ("after_pose").
     """
     def _spinner_worker(
         stop_event: threading.Event,
@@ -311,6 +315,9 @@ def select_next_pose_from_candidates(
             stop_event.wait(0.1)
 
     with _temporary_gpu_settings(estimator, use_gpu, gpu_device, gpu_dtype):
+        criterion = criterion.strip().lower()
+        if criterion not in {"after_rotation", "after_pose"}:
+            raise ValueError(f"Unknown criterion: {criterion}")
         candidate_poses_xyz = np.asarray(candidate_poses_xyz, dtype=float)
         if candidate_poses_xyz.ndim != 2 or candidate_poses_xyz.shape[1] != 3:
             raise ValueError("candidate_poses_xyz must be shape (N, 3).")
@@ -375,15 +382,29 @@ def select_next_pose_from_candidates(
                     daemon=True,
                 )
                 spinner_thread.start()
-            uncertainty = estimator.expected_uncertainty_after_rotation(
-                pose_xyz=pose,
-                live_time_per_rot_s=t_short_s,
-                tau_ig=tau_ig,
-                tmax_s=t_max_s,
-                n_rollouts=rollouts,
-                orient_selection="IG",
-                rng_seed=int(candidate_seeds[idx]),
-            )
+            if criterion == "after_rotation":
+                uncertainty = estimator.expected_uncertainty_after_rotation(
+                    pose_xyz=pose,
+                    live_time_per_rot_s=t_short_s,
+                    tau_ig=tau_ig,
+                    tmax_s=t_max_s,
+                    n_rollouts=rollouts,
+                    orient_selection="IG",
+                    rng_seed=int(candidate_seeds[idx]),
+                )
+            else:
+                if not hasattr(estimator, "expected_uncertainty_after_pose_xyz"):
+                    raise ValueError("Estimator missing expected_uncertainty_after_pose_xyz.")
+                rng_local = np.random.default_rng(int(candidate_seeds[idx]))
+                num_samples = max(1, int(rollouts))
+                uncertainty = estimator.expected_uncertainty_after_pose_xyz(
+                    pose_xyz=pose,
+                    fe_index=0,
+                    pb_index=0,
+                    live_time_s=t_short_s,
+                    num_samples=num_samples,
+                    rng=rng_local,
+                )
             if spinner_thread is not None and stop_event is not None:
                 stop_event.set()
                 spinner_thread.join()
@@ -446,9 +467,15 @@ def select_next_pose_from_candidates(
                     f"motion_cost={motion_costs[int(idx)]:.6g} "
                     f"score={scores[int(idx)]:.6g}"
                 )
-        if verbose and ig_breakdown_k is None:
+        if verbose and ig_breakdown_k is None and criterion == "after_rotation":
             ig_breakdown_k = top_k
-        if verbose and ig_breakdown_k is not None and ig_breakdown_k > 0 and scores.size:
+        if (
+            verbose
+            and criterion == "after_rotation"
+            and ig_breakdown_k is not None
+            and ig_breakdown_k > 0
+            and scores.size
+        ):
             order = np.argsort(scores)
             ig_breakdown_k = min(int(ig_breakdown_k), len(order))
             ig_breakdown_max_steps = max(int(ig_breakdown_max_steps), 1)

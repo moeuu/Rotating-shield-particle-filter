@@ -41,6 +41,23 @@ class RotatingShieldPFConfig:
         - birth_window: measurement window for residual-driven birth proposals
         - birth_softmax_temp: temperature for residual proposal sampling
         - birth_min_score: score floor for residual proposal sampling
+        - birth_enable: enable birth/death/split/merge moves
+        - birth_topk_particles: number of top-weight particles for residual mix
+        - birth_use_weighted_topk: weight residual mix by particle weights
+        - birth_min_sep_m: minimum separation between sources during birth
+        - birth_candidate_jitter_sigma: position jitter (m) for birth candidates
+        - birth_num_local_jitter: local jitter samples per candidate
+        - birth_alpha: damping factor for new source strength
+        - birth_q_max: clamp max for new source strength
+        - birth_q_min: clamp min for new source strength
+        - birth_residual_clip_quantile: clip residuals at this quantile
+        - refit_after_moves: refit strengths after birth/kill/split/merge
+        - refit_iters: iterations for strength refit
+        - refit_eps: epsilon for refit stability
+        - min_age_to_split: minimum age before split proposals
+        - use_clustered_output: use clustered estimate when birth is enabled
+        - cluster_eps_m: clustering radius in meters
+        - cluster_min_samples: minimum samples per cluster
         - split_prob: probability of split proposals per particle
         - split_strength_min: minimum strength for split candidates
         - split_position_sigma: position jitter for split proposals
@@ -51,6 +68,12 @@ class RotatingShieldPFConfig:
         - merge_distance_max: max distance for merge candidates
         - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
         - init_num_sources: inclusive range for initial source count per particle
+        - roughening_k: roughening coefficient for post-resample position jitter
+        - min_sigma_pos: minimum roughening sigma (meters)
+        - max_sigma_pos: maximum roughening sigma (meters)
+        - roughening_decay: multiplier decay per resample within an observation
+        - roughening_min_mult: minimum multiplier for roughening decay
+        - strength_log_sigma: log-space jitter for strengths
         - orientation_k: number of orientations to execute per pose
         - orientation_selection_mode: "eig"
         - planning_particles: particle count used for orientation scoring (None = all)
@@ -58,6 +81,15 @@ class RotatingShieldPFConfig:
         - use_gpu: enable torch acceleration for continuous kernel evaluation
         - gpu_device: torch device string (e.g., "cuda" or "cpu")
         - gpu_dtype: torch dtype string ("float32" or "float64")
+        - target_ess_ratio: target ESS/N for tempered updates
+        - max_temper_steps: max sub-steps for tempered updates
+        - min_delta_beta: minimum delta_beta for tempering
+        - use_tempering: enable ESS-targeted likelihood tempering
+        - max_resamples_per_observation: cap resamples per observation update
+        - temper_resample_cooldown_steps: substeps to skip resampling after resample
+        - temper_resample_force_ratio: ESS/N ratio forcing resample despite cooldown
+        - disable_regularize_on_temper_resample: skip roughening on temper resamples
+        - adapt_cooldown_steps: block particle-count shrink steps after resampling
         - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
         - planning_eig_samples: Monte-Carlo samples for EIG inside planning rollouts
         - planning_rollout_particles: particle cap for IG evaluation in rollouts
@@ -65,6 +97,16 @@ class RotatingShieldPFConfig:
         - preselect_*: optional surrogate stage settings for candidate reduction
         - use_fast_gpu_rollout: enable approximate fast GPU rollouts for uncertainty prediction
         - ig_workers: number of parallel workers for IG grid evaluation (0 = auto)
+        - use_tempering: enable ESS-targeted tempered updates in the PF
+        - label_enable: enable label alignment for continuous particles
+        - label_alignment_iters: iterations for label alignment refinement
+        - converge_enable: enable per-isotope convergence gating
+        - converge_window: window length for convergence checks
+        - converge_map_move_eps_m: map position stability threshold (meters)
+        - converge_ess_ratio_high: ESS/N threshold for convergence
+        - converge_ll_improve_eps: LL improvement tolerance
+        - converge_min_steps: minimum steps before convergence
+        - converge_require_all: if True, all criteria must hold; else any two
     """
 
     num_particles: int = 200
@@ -88,6 +130,23 @@ class RotatingShieldPFConfig:
     birth_window: int = 10
     birth_softmax_temp: float = 1.0
     birth_min_score: float = 1e-12
+    birth_enable: bool = True
+    birth_topk_particles: int = 10
+    birth_use_weighted_topk: bool = True
+    birth_min_sep_m: float = 0.8
+    birth_candidate_jitter_sigma: float = 0.5
+    birth_num_local_jitter: int = 8
+    birth_alpha: float = 0.2
+    birth_q_max: float = 3e5
+    birth_q_min: float = 1e2
+    birth_residual_clip_quantile: float = 0.95
+    refit_after_moves: bool = True
+    refit_iters: int = 3
+    refit_eps: float = 1e-12
+    min_age_to_split: int = 5
+    use_clustered_output: bool = True
+    cluster_eps_m: float = 0.8
+    cluster_min_samples: int = 20
     split_prob: float = 0.05
     split_strength_min: float = 0.1
     split_position_sigma: float = 0.25
@@ -103,10 +162,25 @@ class RotatingShieldPFConfig:
     lambda_cost: float = 1.0  # Motion-cost weight (Eq. 3.51).
     alpha_weights: Dict[str, float] | None = None  # EIG isotope weights alpha_h.
     credible_volume_threshold: float = 1e-3  # Max 95% credible volume for convergence.
+    target_ess_ratio: float = 0.5
+    max_temper_steps: int = 16
+    min_delta_beta: float = 1e-3
+    use_tempering: bool = True
+    max_resamples_per_observation: int = 2
+    temper_resample_cooldown_steps: int = 2
+    temper_resample_force_ratio: float = 0.1
+    disable_regularize_on_temper_resample: bool = False
+    adapt_cooldown_steps: int = 0
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (0, 3)
-    orientation_k: int = 16
+    roughening_k: float = 0.5
+    min_sigma_pos: float = 0.05
+    max_sigma_pos: float = 1.5
+    roughening_decay: float = 0.5
+    roughening_min_mult: float = 0.25
+    strength_log_sigma: float = 0.3
+    orientation_k: int = 8
     orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
     planning_method: str = "top_weight"
@@ -124,6 +198,16 @@ class RotatingShieldPFConfig:
     preselect_k_max: int = 16
     use_fast_gpu_rollout: bool = False
     ig_workers: int = 0
+    use_tempering: bool = True
+    label_enable: bool = True
+    label_alignment_iters: int = 2
+    converge_enable: bool = False
+    converge_window: int = 10
+    converge_map_move_eps_m: float = 0.2
+    converge_ess_ratio_high: float = 0.9
+    converge_ll_improve_eps: float = 0.0
+    converge_min_steps: int = 20
+    converge_require_all: bool = True
 
     def __post_init__(self) -> None:
         if self.min_particles is None:
@@ -289,6 +373,23 @@ class RotatingShieldPFEstimator:
             birth_window=self.pf_config.birth_window,
             birth_softmax_temp=self.pf_config.birth_softmax_temp,
             birth_min_score=self.pf_config.birth_min_score,
+            birth_enable=self.pf_config.birth_enable,
+            birth_topk_particles=self.pf_config.birth_topk_particles,
+            birth_use_weighted_topk=self.pf_config.birth_use_weighted_topk,
+            birth_min_sep_m=self.pf_config.birth_min_sep_m,
+            birth_candidate_jitter_sigma=self.pf_config.birth_candidate_jitter_sigma,
+            birth_num_local_jitter=self.pf_config.birth_num_local_jitter,
+            birth_alpha=self.pf_config.birth_alpha,
+            birth_q_max=self.pf_config.birth_q_max,
+            birth_q_min=self.pf_config.birth_q_min,
+            birth_residual_clip_quantile=self.pf_config.birth_residual_clip_quantile,
+            refit_after_moves=self.pf_config.refit_after_moves,
+            refit_iters=self.pf_config.refit_iters,
+            refit_eps=self.pf_config.refit_eps,
+            min_age_to_split=self.pf_config.min_age_to_split,
+            use_clustered_output=self.pf_config.use_clustered_output,
+            cluster_eps_m=self.pf_config.cluster_eps_m,
+            cluster_min_samples=self.pf_config.cluster_min_samples,
             split_prob=self.pf_config.split_prob,
             split_strength_min=self.pf_config.split_strength_min,
             split_position_sigma=self.pf_config.split_position_sigma,
@@ -298,12 +399,36 @@ class RotatingShieldPFEstimator:
             merge_prob=self.pf_config.merge_prob,
             merge_distance_max=self.pf_config.merge_distance_max,
             merge_delta_ll_threshold=self.pf_config.merge_delta_ll_threshold,
+            target_ess_ratio=self.pf_config.target_ess_ratio,
+            max_temper_steps=self.pf_config.max_temper_steps,
+            min_delta_beta=self.pf_config.min_delta_beta,
+            max_resamples_per_observation=self.pf_config.max_resamples_per_observation,
+            temper_resample_cooldown_steps=self.pf_config.temper_resample_cooldown_steps,
+            temper_resample_force_ratio=self.pf_config.temper_resample_force_ratio,
+            disable_regularize_on_temper_resample=self.pf_config.disable_regularize_on_temper_resample,
+            adapt_cooldown_steps=self.pf_config.adapt_cooldown_steps,
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
             init_num_sources=self.pf_config.init_num_sources,
+            roughening_k=self.pf_config.roughening_k,
+            min_sigma_pos=self.pf_config.min_sigma_pos,
+            max_sigma_pos=self.pf_config.max_sigma_pos,
+            roughening_decay=self.pf_config.roughening_decay,
+            roughening_min_mult=self.pf_config.roughening_min_mult,
+            strength_log_sigma=self.pf_config.strength_log_sigma,
             use_gpu=self.pf_config.use_gpu,
             gpu_device=self.pf_config.gpu_device,
             gpu_dtype=self.pf_config.gpu_dtype,
+            use_tempering=self.pf_config.use_tempering,
+            label_enable=self.pf_config.label_enable,
+            label_alignment_iters=self.pf_config.label_alignment_iters,
+            converge_enable=self.pf_config.converge_enable,
+            converge_window=self.pf_config.converge_window,
+            converge_map_move_eps_m=self.pf_config.converge_map_move_eps_m,
+            converge_ess_ratio_high=self.pf_config.converge_ess_ratio_high,
+            converge_ll_improve_eps=self.pf_config.converge_ll_improve_eps,
+            converge_min_steps=self.pf_config.converge_min_steps,
+            converge_require_all=self.pf_config.converge_require_all,
         )
 
     def _gpu_enabled(self) -> bool:
@@ -385,6 +510,8 @@ class RotatingShieldPFEstimator:
         rng = rng or np.random.default_rng()
         subsets: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] = {}
         for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
             if not filt.continuous_particles:
                 continue
             weights = filt.continuous_weights
@@ -548,7 +675,58 @@ class RotatingShieldPFEstimator:
                 continue
             # Use continuous PF update that relies on spectrum-unfolded counts.
             self.filters[iso].update_continuous_pair(
-                z_obs=val, pose_idx=pose_idx, fe_index=fe_index, pb_index=pb_index, live_time_s=live_time_s
+                z_obs=val,
+                pose_idx=pose_idx,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                step_idx=len(self.measurements),
+            )
+        self.history_estimates.append(self.estimates())
+        self.measurements.append(
+            MeasurementRecord(
+                z_k={iso: float(v) for iso, v in z_k.items()},
+                pose_idx=pose_idx,
+                orient_idx=fe_index,
+                live_time_s=live_time_s,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                ig_value=None,
+            )
+        )
+        self._apply_birth_death()
+
+    def update_pair_at_pose(
+        self,
+        z_k: Dict[str, float],
+        detector_pos: NDArray[np.float64],
+        pose_idx: int,
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+    ) -> None:
+        """
+        Update PFs using explicit detector position without rebuilding the kernel cache.
+
+        This avoids kernel-cache growth with many poses by using per-pose updates.
+        """
+        if pose_idx < 0 or pose_idx >= len(self.poses):
+            raise IndexError("pose_idx out of range")
+        detector_pos = np.asarray(detector_pos, dtype=float)
+        if not self.filters:
+            pf_conf = self._build_pf_config()
+            for iso in self.isotopes:
+                self.filters[iso] = IsotopeParticleFilter(iso, kernel=None, config=pf_conf)
+        for iso, val in z_k.items():
+            if iso not in self.filters:
+                continue
+            self.filters[iso].update_continuous_pair_at_pose(
+                z_obs=val,
+                detector_pos=detector_pos,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                step_idx=len(self.measurements),
             )
         self.history_estimates.append(self.estimates())
         self.measurements.append(
@@ -604,6 +782,8 @@ class RotatingShieldPFEstimator:
     def _apply_birth_death(self) -> None:
         """Apply per-isotope birth/death updates using recent measurements."""
         for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
             support_data = self._measurement_data_for_iso(iso, self.pf_config.support_window)
             birth_data = self._measurement_data_for_iso(iso, self.pf_config.birth_window)
             filt.apply_birth_death(
@@ -640,11 +820,15 @@ class RotatingShieldPFEstimator:
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
                     "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                    "temper_steps": [],
+                    "temper_resamples": 0,
                     "r_mean": 0.0,
                     "r_var": 0.0,
                     "map": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "top_k": [],
+                    "converged": bool(getattr(filt, "is_converged", False)),
+                    "updates_skipped": int(getattr(filt, "updates_skipped", 0)),
                 }
                 continue
             weights = np.asarray(filt.continuous_weights, dtype=float)
@@ -668,7 +852,12 @@ class RotatingShieldPFEstimator:
             map_positions = best_state.positions.copy()
             map_strengths = best_state.strengths.copy()
             try:
-                mmse_positions, mmse_strengths = filt.estimate()
+                if bool(filt.config.birth_enable and filt.config.use_clustered_output) and hasattr(
+                    filt, "estimate_clustered"
+                ):
+                    mmse_positions, mmse_strengths = filt.estimate_clustered()
+                else:
+                    mmse_positions, mmse_strengths = filt.estimate()
             except RuntimeError:
                 mmse_positions = np.zeros((0, 3), dtype=float)
                 mmse_strengths = np.zeros(0, dtype=float)
@@ -693,11 +882,15 @@ class RotatingShieldPFEstimator:
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
                 "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                "temper_steps": list(getattr(filt, "last_temper_steps", [])),
+                "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "r_mean": r_mean,
                 "r_var": r_var,
                 "map": (map_positions, map_strengths),
                 "mmse": (mmse_positions, mmse_strengths),
                 "top_k": top_entries,
+                "converged": bool(getattr(filt, "is_converged", False)),
+                "updates_skipped": int(getattr(filt, "updates_skipped", 0)),
             }
         return diagnostics
 
@@ -761,6 +954,8 @@ class RotatingShieldPFEstimator:
         ig_total = 0.0
         eps = 1e-9
         for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
             use_continuous = bool(filt.continuous_particles)
             if use_continuous:
                 lam = filt._continuous_expected_counts(
@@ -853,6 +1048,8 @@ class RotatingShieldPFEstimator:
 
         total_ig = 0.0
         for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
             if particles_by_isotope is not None and iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:
@@ -930,6 +1127,58 @@ class RotatingShieldPFEstimator:
                 )
             else:
                 lam = filt._continuous_expected_counts(pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s)
+            strengths_mat = self._strength_matrix(filt)
+            U_accum = 0.0
+            for _ in range(num_samples):
+                n = int(rng.choice(len(lam), p=weights))
+                z = rng.poisson(lam[n])
+                logw = np.log(weights + eps) + z * np.log(lam + eps) - lam
+                logw -= logsumexp(logw)
+                w_post = np.exp(logw)
+                if strengths_mat.size == 0:
+                    continue
+                mean = np.sum(w_post[:, None] * strengths_mat, axis=0)
+                var = np.sum(w_post[:, None] * (strengths_mat - mean) ** 2, axis=0)
+                U_accum += float(np.sum(var))
+            total_U += U_accum / max(num_samples, 1)
+        return float(total_U)
+
+    def expected_uncertainty_after_pose_xyz(
+        self,
+        pose_xyz: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float = 1.0,
+        num_samples: int = 20,
+        rng: np.random.Generator | None = None,
+    ) -> float:
+        """
+        Monte-Carlo estimate of E[U | pose_xyz] for an explicit detector position.
+
+        Uses Fe/Pb indices to compute expected counts without relying on pose indices.
+        """
+        detector_pos = np.asarray(pose_xyz, dtype=float)
+        if detector_pos.shape != (3,):
+            raise ValueError("pose_xyz must be shape (3,).")
+        rng = rng or np.random.default_rng()
+        num_samples = max(int(num_samples), 1)
+        eps = 1e-12
+        total_U = 0.0
+        for iso, filt in self.filters.items():
+            if not filt.continuous_particles:
+                continue
+            weights = np.asarray(filt.continuous_weights, dtype=float)
+            if weights.size == 0:
+                continue
+            weights = weights / max(np.sum(weights), eps)
+            lam = filt._continuous_expected_counts_pair_at_pose(
+                detector_pos=detector_pos,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+            )
+            if lam.size == 0:
+                continue
             strengths_mat = self._strength_matrix(filt)
             U_accum = 0.0
             for _ in range(num_samples):
