@@ -65,7 +65,7 @@ def prune_spurious_sources(
     if method_key not in {"deltall", "bestcase", "legacy"}:
         raise ValueError(f"Unsupported pruning method: {method}")
 
-    if method_key in {"bestcase", "legacy"} and min_obs_count > 0.0:
+    if min_obs_count > 0.0:
         obs_mask = z_k > min_obs_count
         if not np.any(obs_mask):
             return strength_ok

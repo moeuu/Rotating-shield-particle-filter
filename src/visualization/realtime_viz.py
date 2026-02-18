@@ -177,7 +177,7 @@ class RealTimePFVisualizer:
     _BASE_LAYOUT_FRACS = {
         "left": 0.02,
         "right": 0.02,
-        "gap": 0.02,
+        "gap": 0.005,
         "pf": 0.54,
     }
     _VERTICAL_LAYOUT = {
@@ -840,7 +840,10 @@ class RealTimePFVisualizer:
         if self.ax_labels is None:
             return
         self.ax_labels.cla()
-        step_text = f"Step {frame.step_index} t={frame.time:.2f}s"
+        if frame.step_index < 0:
+            step_text = "Initialize"
+        else:
+            step_text = f"Step {frame.step_index} t={frame.time:.2f}s"
         self.ax_labels.set_title(
             step_text,
             fontsize=self._label_title_fontsize,
@@ -952,6 +955,7 @@ class RealTimePFVisualizer:
         self._last_frame = frame
         if self.ax3d is not None:
             self.ax3d.computed_zorder = False
+        init_frame = frame.step_index < 0
         # maintain trajectory history
         self._traj_history.append(frame.robot_position)
         # Robot and trajectory
@@ -1018,7 +1022,15 @@ class RealTimePFVisualizer:
             pts = frame.particle_positions.get(iso, np.zeros((0, 3)))
             weights = frame.particle_weights.get(iso, np.zeros(0))
             color = self.colors.get(iso, None)
-            sizes, colors = self._particle_style(weights, color)
+            if init_frame and pts.size:
+                _, max_size = self._particle_size_range
+                _, max_alpha = self._particle_alpha_range
+                sizes = np.full(pts.shape[0], max_size, dtype=float)
+                base_rgba = mcolors.to_rgba(color)
+                colors = np.tile(base_rgba, (pts.shape[0], 1))
+                colors[:, 3] = max_alpha
+            else:
+                sizes, colors = self._particle_style(weights, color)
             if iso not in self._particle_artists:
                 if pts.size:
                     self._particle_artists[iso] = self.ax3d.scatter(

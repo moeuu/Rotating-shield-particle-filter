@@ -32,9 +32,36 @@ def main() -> None:
         help="Maximum number of measurement steps (default: run until convergence).",
     )
     parser.add_argument(
+        "--max-poses",
+        type=int,
+        default=15,
+        help="Maximum number of measurement poses (default: 15).",
+    )
+    parser.add_argument(
+        "--pose-candidates",
+        type=int,
+        default=64,
+        help="Number of candidate poses to generate per step (default: 64).",
+    )
+    parser.add_argument(
+        "--pose-min-dist",
+        type=float,
+        default=3.0,
+        help="Minimum distance (m) from visited poses for candidates (default: 3.0).",
+    )
+    parser.add_argument(
         "--no-live",
         action="store_true",
-        help="Disable interactive updating (still saves results/result_pf.png and results/result_spectrum.png).",
+        help=(
+            "Disable interactive updating (still saves results/result_pf.png and "
+            "results/result_spectrum.png by default)."
+        ),
+    )
+    parser.add_argument(
+        "--output-tag",
+        type=str,
+        default=None,
+        help="Optional tag appended to result output filenames (ex: ex5 -> result_pf_ex5.png).",
     )
     parser.add_argument(
         "--headless",
@@ -133,6 +160,30 @@ def main() -> None:
         help="Enable birth/death/split/merge moves (default: disabled).",
     )
     parser.add_argument(
+        "--merge-prob",
+        type=float,
+        default=None,
+        help="Merge proposal probability when birth/death is enabled (default: 0.4).",
+    )
+    parser.add_argument(
+        "--merge-distance-max",
+        type=float,
+        default=None,
+        help="Max distance (m) to merge nearby sources (default: 1.0).",
+    )
+    parser.add_argument(
+        "--merge-delta-ll-threshold",
+        type=float,
+        default=None,
+        help="Log-likelihood threshold for merge acceptance (default: -1.0).",
+    )
+    parser.add_argument(
+        "--cluster-eps-m",
+        type=float,
+        default=None,
+        help="Clustering epsilon (m) for output estimates (default: 1.2).",
+    )
+    parser.add_argument(
         "--max-sources",
         type=int,
         default=None,
@@ -179,6 +230,22 @@ def main() -> None:
         "max_sources": args.max_sources,
         "max_resamples_per_observation": args.temper_max_resamples,
     }
+    if args.merge_prob is not None:
+        pf_overrides["merge_prob"] = float(args.merge_prob)
+    elif args.birth:
+        pf_overrides["merge_prob"] = 0.4
+    if args.merge_distance_max is not None:
+        pf_overrides["merge_distance_max"] = float(args.merge_distance_max)
+    elif args.birth:
+        pf_overrides["merge_distance_max"] = 1.0
+    if args.merge_delta_ll_threshold is not None:
+        pf_overrides["merge_delta_ll_threshold"] = float(args.merge_delta_ll_threshold)
+    elif args.birth:
+        pf_overrides["merge_delta_ll_threshold"] = -1.0
+    if args.cluster_eps_m is not None:
+        pf_overrides["cluster_eps_m"] = float(args.cluster_eps_m)
+    elif args.birth:
+        pf_overrides["cluster_eps_m"] = 1.2
     if args.no_roughen_on_temper_resample:
         pf_overrides["disable_regularize_on_temper_resample"] = True
     if args.roughening_k is not None:
@@ -203,6 +270,7 @@ def main() -> None:
     run_live_pf(
         live=not (args.no_live or args.headless),
         max_steps=args.max_steps,
+        max_poses=args.max_poses,
         sources=sources,
         detect_threshold_abs=args.detect_threshold_abs,
         detect_threshold_rel=args.detect_threshold_rel,
@@ -217,6 +285,9 @@ def main() -> None:
         count_mode=args.count,
         birth_enabled=args.birth,
         pf_config_overrides=pf_overrides,
+        output_tag=args.output_tag,
+        pose_candidates=args.pose_candidates,
+        pose_min_dist=args.pose_min_dist,
         converge=args.converge,
     )
 

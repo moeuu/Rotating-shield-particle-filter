@@ -12,16 +12,27 @@ import time
 import matplotlib
 
 
+def _has_display() -> bool:
+    """Return True when a GUI display is likely available."""
+    if sys.platform.startswith("linux"):
+        return bool(
+            os.environ.get("DISPLAY")
+            or os.environ.get("WAYLAND_DISPLAY")
+            or os.environ.get("MIR_SOCKET")
+        )
+    return True
+
+
 def _configure_matplotlib() -> None:
     """Configure matplotlib backend for interactive or headless use."""
-    headless = "--headless" in sys.argv
-    if headless:
+    headless = "--headless" in sys.argv or "--no-live" in sys.argv
+    if headless or not _has_display():
         matplotlib.use("Agg")
-    else:
-        try:
-            matplotlib.use("TkAgg")
-        except Exception:
-            matplotlib.use("Agg")
+        return
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        matplotlib.use("Agg")
 
 
 _configure_matplotlib()
@@ -55,6 +66,7 @@ from planning.pose_selection import (
 )
 from visualization.realtime_viz import (
     DEFAULT_ISOTOPE_COLORS,
+    PFFrame,
     RealTimePFVisualizer,
     build_frame_from_pf,
 )
@@ -71,6 +83,10 @@ OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_MIN_STRENGTH_ABS = 5.0
 PRUNE_MIN_STRENGTH_RATIO = 0.001
 PRUNE_TAU_MIX = 0.6
+PRUNE_METHOD = "legacy"
+PRUNE_DELTALL_MIN = 0.0
+FINAL_ESTIMATE_MIN_STRENGTH_ABS = 500.0
+FINAL_MERGE_DISTANCE_M = 1.5
 PRUNE_MIN_SUPPORT = 2
 PRUNE_MIN_OBS_COUNT = 0.0
 PRUNE_MIN_MEASUREMENTS = 10
@@ -646,7 +662,7 @@ def _expected_counts(
 def run_live_pf(
     live: bool = True,
     max_steps: int | None = None,
-    max_poses: int | None = 10,
+    max_poses: int | None = 15,
     sources: list[PointSource] | None = None,
     detect_threshold_abs: float = 50.0,
     detect_threshold_rel: float = 0.3,
@@ -665,6 +681,9 @@ def run_live_pf(
     birth_enabled: bool = False,
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
+    output_tag: str | None = None,
+    pose_candidates: int = 64,
+    pose_min_dist: float = 3.0,
     return_state: bool = False,
     converge: bool = False,
 ) -> RotatingShieldPFEstimator | None:
@@ -682,6 +701,9 @@ def run_live_pf(
     Args:
         pf_config_overrides: Optional overrides applied to the PF configuration.
         save_outputs: When False, skip writing plots and snapshot images.
+        output_tag: Optional tag appended to result output filenames.
+        pose_candidates: Number of pose candidates to generate per step.
+        pose_min_dist: Minimum distance from visited poses for candidates (meters).
         return_state: When True, return the estimator for inspection/testing.
         candidate_grid_spacing: Optional (x, y, z) spacing for birth candidate grid.
         candidate_grid_margin: Margin from the environment bounds for candidate sources.
@@ -719,6 +741,13 @@ def run_live_pf(
     num_orients = len(rot_mats)
     if save_outputs:
         PF_DIR.mkdir(parents=True, exist_ok=True)
+    output_suffix = ""
+    if output_tag:
+        cleaned_tag = output_tag.strip().replace(" ", "_")
+        cleaned_tag = cleaned_tag.replace("/", "_").replace("\\", "_")
+        cleaned_tag = cleaned_tag.lstrip("_")
+        if cleaned_tag:
+            output_suffix = f"_{cleaned_tag}"
 
     # Candidate sources: dense grid inside environment (used by birth proposals).
     spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
@@ -737,7 +766,7 @@ def run_live_pf(
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
     # Use a moderate particle count for the demo (previous default was 200)
-    num_particles = 500
+    num_particles = 2000
     shield_params = ShieldParams()
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
     if not mu_by_isotope:
@@ -769,6 +798,7 @@ def run_live_pf(
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
         init_num_sources=(1, 1),
+        init_grid_spacing_m=1.0,
         split_prob=0.05,
         merge_prob=0.05,
         orientation_k=2,
@@ -781,7 +811,10 @@ def run_live_pf(
         gpu_dtype="float64",
         ig_workers=1,
     )
-    pf_conf.use_tempering = False
+    pf_conf.use_tempering = True
+    pf_conf.max_temper_steps = 8
+    pf_conf.min_delta_beta = 0.01
+    pf_conf.target_ess_ratio = 0.4
     pf_conf.converge_enable = bool(converge)
     if pf_config_overrides:
         for key, value in pf_config_overrides.items():
@@ -821,16 +854,6 @@ def run_live_pf(
         radius_m=float(eval_match_radius_m),
         init_num_sources=init_pf.init_num_sources,
     )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=grid,
-        shield_normals=normals,
-        mu_by_isotope=mu_by_isotope,
-        pf_config=pf_conf,
-    )
-    current_pose = np.array(env.detector_position, dtype=float)
-    estimator.add_measurement_pose(current_pose)
-    current_pose_idx = len(estimator.poses) - 1
 
     # Build true sources dict for visualization
     true_src = {}
@@ -842,17 +865,203 @@ def run_live_pf(
             true_src[iso] = np.vstack(positions)
         if strengths:
             true_strengths[iso] = [float(val) for val in strengths]
-    viz = RealTimePFVisualizer(
-        isotopes=isotopes,
-        world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
-        true_sources=true_src,
-        true_strengths=true_strengths,
-        obstacle_grid=obstacle_grid,
-        show_counts=False,
-    )
     estimate_mode = "mmse"
     estimate_min_strength = 100.0
     estimate_min_existence_prob = None
+    final_estimate_min_strength = max(
+        estimate_min_strength,
+        FINAL_ESTIMATE_MIN_STRENGTH_ABS,
+    )
+    live_time = 30.0
+    prune_min_obs_count = PRUNE_MIN_OBS_COUNT
+    if background_by_isotope:
+        background_level = float(np.median(list(background_by_isotope.values())))
+        prune_min_obs_count = max(prune_min_obs_count, background_level * live_time)
+
+    def _build_estimator() -> tuple[RotatingShieldPFEstimator, NDArray[np.float64], int]:
+        """Create a fresh estimator and register the initial pose."""
+        estimator_local = RotatingShieldPFEstimator(
+            isotopes=isotopes,
+            candidate_sources=grid,
+            shield_normals=normals,
+            mu_by_isotope=mu_by_isotope,
+            pf_config=pf_conf,
+        )
+        pose_local = np.array(env.detector_position, dtype=float)
+        estimator_local.add_measurement_pose(pose_local)
+        pose_idx_local = len(estimator_local.poses) - 1
+        return estimator_local, pose_local, pose_idx_local
+
+    def _build_visualizer() -> RealTimePFVisualizer:
+        """Create a new PF visualizer."""
+        return RealTimePFVisualizer(
+            isotopes=isotopes,
+            world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
+            true_sources=true_src,
+            true_strengths=true_strengths,
+            obstacle_grid=obstacle_grid,
+            show_counts=False,
+        )
+
+    def _grid_centers() -> NDArray[np.float64]:
+        """Return 1m grid-center positions for the environment bounds."""
+        spacing = 1.0
+        xs = np.arange(0.5, env.size_x, spacing)
+        ys = np.arange(0.5, env.size_y, spacing)
+        zs = np.arange(0.5, env.size_z, spacing)
+        grid_pos = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1)
+        return grid_pos.reshape(-1, 3)
+
+    def _apply_display_thresholds(
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        min_strength: float | None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Filter estimates using the same min-strength cutoff as the display."""
+        if min_strength is None or strengths.size == 0:
+            return positions, strengths
+        mask = strengths >= float(min_strength)
+        return positions[mask], strengths[mask]
+
+    def _merge_close_estimates(
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        max_distance: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """
+        Merge nearby estimates by summing strengths and weighted-average positions.
+
+        The merge uses a greedy agglomeration sorted by strength, combining any
+        points within max_distance into a single estimate.
+        """
+        if positions.size == 0 or strengths.size == 0:
+            return positions, strengths
+        if max_distance <= 0.0:
+            return positions, strengths
+        order = np.argsort(strengths)[::-1]
+        merged_pos: list[NDArray[np.float64]] = []
+        merged_strengths: list[float] = []
+        for idx in order:
+            pos = positions[int(idx)]
+            strength = float(strengths[int(idx)])
+            merged = False
+            for j, center in enumerate(merged_pos):
+                if float(np.linalg.norm(pos - center)) <= max_distance:
+                    total = merged_strengths[j] + strength
+                    if total > 0.0:
+                        merged_pos[j] = (center * merged_strengths[j] + pos * strength) / total
+                    merged_strengths[j] = total
+                    merged = True
+                    break
+            if not merged:
+                merged_pos.append(pos.copy())
+                merged_strengths.append(strength)
+        pos_out = np.vstack(merged_pos) if merged_pos else np.zeros((0, 3), dtype=float)
+        str_out = np.asarray(merged_strengths, dtype=float) if merged_strengths else np.zeros(0, dtype=float)
+        return pos_out, str_out
+
+    def _build_final_estimates(
+        estimator_final: RotatingShieldPFEstimator,
+        isotope_list: list[str],
+        min_strength: float | None,
+        min_obs_count: float,
+        use_pruning: bool = True,
+    ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
+        """
+        Build final estimates using LLR pruning with a legacy fallback per isotope.
+
+        If LLR pruning removes all sources for an isotope, fall back to legacy
+        pruning. If that is also empty but raw estimates exist, keep the strongest
+        raw estimate to avoid empty outputs. When use_pruning is False,
+        return the raw PF estimates without pruning or thresholding.
+        """
+        if not use_pruning:
+            raw_estimates = estimator_final.estimates()
+            final_estimates: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
+            for iso in isotope_list:
+                pos, strg = raw_estimates.get(
+                    iso, (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float))
+                )
+                pos_arr = np.asarray(pos, dtype=float)
+                str_arr = np.asarray(strg, dtype=float)
+                final_estimates[iso] = (pos_arr, str_arr)
+            return final_estimates
+        llr_pruned = estimator_final.pruned_estimates(
+            method="deltall",
+            params={"deltaLL_min": PRUNE_DELTALL_MIN},
+            tau_mix=PRUNE_TAU_MIX,
+            min_support=PRUNE_MIN_SUPPORT,
+            min_obs_count=min_obs_count,
+            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+        )
+        legacy_pruned = estimator_final.pruned_estimates(
+            method="legacy",
+            params=None,
+            tau_mix=PRUNE_TAU_MIX,
+            min_support=PRUNE_MIN_SUPPORT,
+            min_obs_count=min_obs_count,
+            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+        )
+        raw_estimates = estimator_final.estimates()
+        final_estimates: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
+        for iso in isotope_list:
+            pos, strg = llr_pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
+            pos, strg = _apply_display_thresholds(pos, strg, min_strength)
+            if pos.size == 0:
+                pos, strg = legacy_pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
+                pos, strg = _apply_display_thresholds(pos, strg, min_strength)
+            if pos.size == 0:
+                raw_pos, raw_strg = raw_estimates.get(
+                    iso, (np.zeros((0, 3)), np.zeros(0))
+                )
+                if raw_strg.size:
+                    best_idx = int(np.argmax(raw_strg))
+                    pos = raw_pos[[best_idx]]
+                    strg = np.array([raw_strg[best_idx]], dtype=float)
+            pos, strg = _merge_close_estimates(pos, strg, FINAL_MERGE_DISTANCE_M)
+            pos, strg = _apply_display_thresholds(pos, strg, min_strength)
+            final_estimates[iso] = (pos, strg)
+        return final_estimates
+
+    if live:
+        plt.ion()
+        plt.show(block=False)
+        plt.pause(0.1)
+        preview_pose = np.array(env.detector_position, dtype=float)
+        preview_viz = RealTimePFVisualizer(
+            isotopes=["Cs-137"],
+            world_bounds=(0, env.size_x, 0, env.size_y, 0, env.size_z),
+            true_sources={},
+            true_strengths={},
+            obstacle_grid=obstacle_grid,
+            show_counts=False,
+        )
+        grid_pos = _grid_centers()
+        preview_frame = PFFrame(
+            step_index=-1,
+            time=0.0,
+            robot_position=preview_pose,
+            robot_orientation=None,
+            RFe=np.eye(3),
+            RPb=np.eye(3),
+            duration=0.0,
+            counts_by_isotope={},
+            particle_positions={"Cs-137": grid_pos},
+            particle_weights={"Cs-137": np.ones(grid_pos.shape[0], dtype=float)},
+            estimated_sources={"Cs-137": np.zeros((0, 3), dtype=float)},
+            estimated_strengths={"Cs-137": np.zeros(0, dtype=float)},
+        )
+        preview_viz.update(preview_frame)
+        preview_viz.fig.canvas.draw()
+        if hasattr(preview_viz.fig.canvas, "flush_events"):
+            preview_viz.fig.canvas.flush_events()
+        plt.pause(5.0)
+        plt.close(preview_viz.fig)
+
+    estimator, current_pose, current_pose_idx = _build_estimator()
+    viz = _build_visualizer()
     if live:
         plt.ion()
         plt.show(block=False)
@@ -861,7 +1070,6 @@ def run_live_pf(
     elapsed = 0.0
     last_frame: PFFrame | None = None
     step_counter = 0
-    live_time = 30.0
     total_pairs = num_orients * num_orients
     visited_poses: list[NDArray[np.float64]] = []
     last_spectrum: np.ndarray | None = None
@@ -953,6 +1161,7 @@ def run_live_pf(
         pose = current_pose
         stop_run = False
         pose_elapsed = 0.0
+        zero_ig_override = False
         remaining_orientations = set(range(total_pairs))
         rotation_limit = max(1, int(estimator.pf_config.orientation_k))
         rotation_count = 0
@@ -995,6 +1204,11 @@ def run_live_pf(
                 ig_max_global=ig_max_global,
                 ig_max_pose=ig_max_pose,
             )
+            if ig_max_pose <= 0.0 and ig_threshold_current > 0.0:
+                if not zero_ig_override:
+                    print("IG grid returned zero; forcing rotation despite threshold.")
+                    zero_ig_override = True
+                ig_threshold_current = 0.0
             if ig_val < ig_threshold_current:
                 print(
                     "Stopping rotation at this pose "
@@ -1141,10 +1355,11 @@ def run_live_pf(
             viz_elapsed += time.perf_counter() - viz_start
             prune_start = time.perf_counter()
             pruned = estimator.pruned_estimates(
-                method="legacy",
+                method=PRUNE_METHOD,
+                params={"deltaLL_min": PRUNE_DELTALL_MIN},
                 tau_mix=PRUNE_TAU_MIX,
                 min_support=PRUNE_MIN_SUPPORT,
-                min_obs_count=PRUNE_MIN_OBS_COUNT,
+                min_obs_count=prune_min_obs_count,
                 min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
                 min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
             )
@@ -1155,10 +1370,7 @@ def run_live_pf(
                 frame.estimated_strengths = {}
                 for iso in isotopes:
                     pos, strg = pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-                    if estimate_min_strength is not None and strg.size:
-                        mask = strg >= estimate_min_strength
-                        pos = pos[mask]
-                        strg = strg[mask]
+                    pos, strg = _apply_display_thresholds(pos, strg, estimate_min_strength)
                     frame.estimated_sources[iso] = pos
                     frame.estimated_strengths[iso] = strg
             viz.update(frame)
@@ -1230,12 +1442,30 @@ def run_live_pf(
         candidates = generate_candidate_poses(
             current_pose_xyz=pose,
             map_api=obstacle_grid,
-            n_candidates=16,
+            n_candidates=pose_candidates,
             strategy="free_space_sobol",
-            min_dist_from_visited=3.0,
+            min_dist_from_visited=pose_min_dist,
             visited_poses_xyz=visited_arr,
             bounds_xyz=(bounds_lo, bounds_hi),
         )
+        if candidates.size == 0 and pose_min_dist > 0.0:
+            relaxed_dist = max(pose_min_dist * 0.5, 0.5)
+            print(
+                "No candidates with current spacing; retrying with min_dist="
+                f"{relaxed_dist:.2f}."
+            )
+            candidates = generate_candidate_poses(
+                current_pose_xyz=pose,
+                map_api=obstacle_grid,
+                n_candidates=max(pose_candidates * 2, pose_candidates),
+                strategy="free_space_sobol",
+                min_dist_from_visited=relaxed_dist,
+                visited_poses_xyz=visited_arr,
+                bounds_xyz=(bounds_lo, bounds_hi),
+            )
+        if candidates.size == 0:
+            print("No candidate poses available; stopping exploration.")
+            break
         print(f"Generated {len(candidates)} candidate poses. Computing best next pose...")
         next_idx = select_next_pose_from_candidates(
             estimator=estimator,
@@ -1253,16 +1483,50 @@ def run_live_pf(
 
     # Save final snapshots
     if save_outputs:
-        pf_out_path = RESULTS_DIR / "result_pf.png"
-        spectrum_out_path = RESULTS_DIR / "result_spectrum.png"
-        estimates_out_path = RESULTS_DIR / "result_estimates.png"
+        pf_out_path = RESULTS_DIR / f"result_pf{output_suffix}.png"
+        spectrum_out_path = RESULTS_DIR / f"result_spectrum{output_suffix}.png"
+        estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_estimates = None
         if last_frame is not None:
             last_frame.step_index = 79
             last_frame.time = 2400.0
+            final_estimates = _build_final_estimates(
+                estimator,
+                isotopes,
+                final_estimate_min_strength,
+                prune_min_obs_count,
+                use_pruning=True,
+            )
+            raw_estimates = _build_final_estimates(
+                estimator,
+                isotopes,
+                final_estimate_min_strength,
+                prune_min_obs_count,
+                use_pruning=False,
+            )
+            last_frame.estimated_sources = {
+                iso: pos for iso, (pos, _) in final_estimates.items()
+            }
+            last_frame.estimated_strengths = {
+                iso: strg for iso, (_, strg) in final_estimates.items()
+            }
             viz.update(last_frame)
         viz.save_final(pf_out_path.as_posix())
-        viz.save_estimates_only(estimates_out_path.as_posix())
+        if last_frame is not None:
+            viz.save_estimates_only(estimates_out_path.as_posix())
+        if last_frame is not None and raw_estimates is not None:
+            last_frame.estimated_sources = {
+                iso: pos for iso, (pos, _) in raw_estimates.items()
+            }
+            last_frame.estimated_strengths = {
+                iso: strg for iso, (_, strg) in raw_estimates.items()
+            }
+            viz.update(last_frame)
+            if estimator.poses:
+                pf_step = len(estimator.poses)
+                estimates_step_path = PF_DIR / f"estimates_step_{pf_step:03d}.png"
+                viz.save_estimates_only(estimates_step_path.as_posix())
         if last_spectrum is not None:
             highlight = (
                 set(locked_isotopes_for_planning)
@@ -1295,13 +1559,12 @@ def run_live_pf(
                 "strength": float(src.intensity_cps_1m),
             }
         )
-    estimates = estimator.pruned_estimates(
-        method="legacy",
-        tau_mix=PRUNE_TAU_MIX,
-        min_support=PRUNE_MIN_SUPPORT,
-        min_obs_count=PRUNE_MIN_OBS_COUNT,
-        min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-        min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
+    estimates = _build_final_estimates(
+        estimator,
+        isotopes,
+        final_estimate_min_strength,
+        prune_min_obs_count,
+        use_pruning=False,
     )
     est_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
     for iso, estimate in estimates.items():

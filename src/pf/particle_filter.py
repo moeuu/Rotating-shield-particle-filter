@@ -88,6 +88,7 @@ class PFConfig:
     # Strength prior (cps@1m scale). Defaults cover ~1e3–1e5 cps via log-normal.
     init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
     init_strength_log_sigma: float = 1.0
+    init_grid_spacing_m: float | None = None
     strength_log_sigma: float = 0.3
     use_gpu: bool = True
     gpu_device: str = "cuda"
@@ -100,11 +101,11 @@ class PFConfig:
     label_strength_scale: float | None = None
     label_enable: bool = True
     converge_enable: bool = False
-    converge_window: int = 10
-    converge_map_move_eps_m: float = 0.2
-    converge_ess_ratio_high: float = 0.9
-    converge_ll_improve_eps: float = 0.0
-    converge_min_steps: int = 20
+    converge_window: int = 8
+    converge_map_move_eps_m: float = 0.4
+    converge_ess_ratio_high: float = 0.2
+    converge_ll_improve_eps: float = 1e5
+    converge_min_steps: int = 30
     converge_require_all: bool = True
 
 
@@ -127,14 +128,14 @@ class PFConvergenceMonitor:
     def update_stats(
         self,
         step_idx: int,
-        map_pos: NDArray[np.float64] | None,
+        pos: NDArray[np.float64] | None,
         ess_ratio: float,
         ll_value: float,
     ) -> None:
         """Append the latest statistics to the window."""
         if step_idx < 0:
             return
-        self.positions.append(map_pos.copy() if map_pos is not None else None)
+        self.positions.append(pos.copy() if pos is not None else None)
         self.ess_ratios.append(float(ess_ratio))
         self.ll_values.append(float(ll_value))
 
@@ -236,9 +237,69 @@ class IsotopeParticleFilter:
             shield_params=getattr(kernel, "shield_params", ShieldParams()),
         )
 
+    def _initial_grid_positions(self) -> NDArray[np.float64]:
+        """Return initial grid-center positions when grid init is enabled."""
+        spacing = self.config.init_grid_spacing_m
+        if spacing is None:
+            return np.zeros((0, 3), dtype=float)
+        spacing = float(spacing)
+        if spacing <= 0.0:
+            return np.zeros((0, 3), dtype=float)
+        lo = np.array(self.config.position_min, dtype=float)
+        hi = np.array(self.config.position_max, dtype=float)
+        starts = lo + spacing * 0.5
+        xs = np.arange(starts[0], hi[0], spacing)
+        ys = np.arange(starts[1], hi[1], spacing)
+        zs = np.arange(starts[2], hi[2], spacing)
+        if xs.size == 0 or ys.size == 0 or zs.size == 0:
+            return np.zeros((0, 3), dtype=float)
+        grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1)
+        return grid.reshape(-1, 3)
+
     def _init_continuous_particles(self) -> None:
         """Sample continuous positions/strengths/background from broad priors (Sec. 3.3.2)."""
         self.continuous_particles = []
+        grid_positions = self._initial_grid_positions()
+        if grid_positions.size:
+            target_n = int(grid_positions.shape[0])
+            self.N = target_n
+            self.config.num_particles = target_n
+            self.config.min_particles = target_n
+            self.config.max_particles = target_n
+            for pos in grid_positions:
+                r_h = 1
+                if self.config.max_sources is not None and self.config.max_sources <= 0:
+                    r_h = 0
+                if r_h > 0:
+                    positions = pos.reshape(1, 3)
+                    strengths = np.random.lognormal(
+                        mean=self.config.init_strength_log_mean,
+                        sigma=self.config.init_strength_log_sigma,
+                        size=r_h,
+                    )
+                    ages = np.zeros(r_h, dtype=int)
+                    low_q_streaks = np.zeros(r_h, dtype=int)
+                    support_scores = np.zeros(r_h, dtype=float)
+                else:
+                    positions = np.zeros((0, 3), dtype=float)
+                    strengths = np.zeros(0, dtype=float)
+                    ages = np.zeros(0, dtype=int)
+                    low_q_streaks = np.zeros(0, dtype=int)
+                    support_scores = np.zeros(0, dtype=float)
+                b_h = self._background_level()
+                st = IsotopeState(
+                    num_sources=r_h,
+                    positions=positions,
+                    strengths=strengths,
+                    background=b_h,
+                    ages=ages,
+                    low_q_streaks=low_q_streaks,
+                    support_scores=support_scores,
+                )
+                self.continuous_particles.append(
+                    IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N)))
+                )
+            return
         lo = np.array(self.config.position_min, dtype=float)
         hi = np.array(self.config.position_max, dtype=float)
         min_r, max_r = self.config.init_num_sources
@@ -334,6 +395,31 @@ class IsotopeParticleFilter:
         eps = 1e-12
         return float(z_obs * np.log(lam + eps) - lam)
 
+    def _mmse_primary_position(self) -> NDArray[np.float64] | None:
+        """Return the MMSE position for the first source slot, if available."""
+        if not self.continuous_particles:
+            return None
+        weights = np.asarray(self.continuous_weights, dtype=float)
+        if weights.size == 0:
+            return None
+        pos_stack: list[NDArray[np.float64]] = []
+        w_stack: list[float] = []
+        for weight, particle in zip(weights, self.continuous_particles):
+            state = particle.state
+            if state.num_sources > 0:
+                pos_stack.append(state.positions[0])
+                w_stack.append(float(weight))
+        if not w_stack:
+            return None
+        w = np.asarray(w_stack, dtype=float)
+        w_sum = float(np.sum(w))
+        if w_sum <= 0.0:
+            w = np.full_like(w, 1.0 / max(len(w), 1))
+        else:
+            w = w / w_sum
+        pos_arr = np.vstack(pos_stack)
+        return np.sum(w[:, None] * pos_arr, axis=0)
+
     def _maybe_update_convergence(
         self,
         step_idx: int | None,
@@ -350,8 +436,7 @@ class IsotopeParticleFilter:
             return
         if not self.continuous_particles:
             return
-        best_state = self.best_particle().state
-        map_pos = best_state.positions[0].copy() if best_state.num_sources > 0 else None
+        mmse_pos = self._mmse_primary_position()
         ess_pre = self.last_ess_pre
         if ess_pre is None:
             w = self.continuous_weights
@@ -364,7 +449,7 @@ class IsotopeParticleFilter:
             live_time_s=live_time_s,
             z_obs=z_obs,
         )
-        self._converge_monitor.update_stats(step_idx, map_pos, ess_ratio, ll_value)
+        self._converge_monitor.update_stats(step_idx, mmse_pos, ess_ratio, ll_value)
         if self._converge_monitor.is_converged(step_idx):
             self.is_converged = True
             self.frozen_estimate = self.estimate()

@@ -160,11 +160,16 @@ def compute_metrics(
     est_by_iso: Dict[str, List[Any]],
     *,
     match_radius_m: float,
+    match_strength_weight: float = 2.0,
+    match_distance_weight: float = 1.0,
+    outside_radius_penalty: float = 1e3,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Compute per-isotope evaluation metrics for estimated sources.
 
-    Matching uses the closest 1-to-1 assignment (no gating).
+    Matching uses a weighted cost based on position and strength differences.
+    Pairs outside match_radius_m receive an additional penalty to prefer
+    within-radius matches when available.
     Position and strength errors are summarized over assigned matches.
     """
     eps = 1e-12
@@ -180,9 +185,10 @@ def compute_metrics(
             q_true = np.asarray([src.strength for src in gt], dtype=float)
             q_hat = np.asarray([src.strength for src in est], dtype=float)
             strength_diff = np.abs(q_true[:, None] - q_hat[None, :]) / np.maximum(q_true[:, None], eps)
-            # Prefer strength-matched assignments when estimates are not far apart.
             within = dist <= float(match_radius_m)
-            cost = np.where(within, strength_diff + 1e-6 * dist, dist + 1e3)
+            cost = float(match_distance_weight) * dist + float(match_strength_weight) * strength_diff
+            if float(outside_radius_penalty) > 0.0:
+                cost = np.where(within, cost, cost + float(outside_radius_penalty))
             assignments = _hungarian_assignment(cost)
         matched: List[Tuple[int, int, float]] = []
         for i, j in assignments:

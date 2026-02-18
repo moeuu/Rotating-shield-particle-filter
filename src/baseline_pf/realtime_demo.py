@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
 import matplotlib
 
 
+def _has_display() -> bool:
+    """Return True when a GUI display is likely available."""
+    if sys.platform.startswith("linux"):
+        return bool(
+            os.environ.get("DISPLAY")
+            or os.environ.get("WAYLAND_DISPLAY")
+            or os.environ.get("MIR_SOCKET")
+        )
+    return True
+
+
 def _configure_matplotlib() -> None:
     """Configure matplotlib backend for interactive or headless use."""
-    headless = "--headless" in sys.argv
-    if headless:
+    headless = "--headless" in sys.argv or "--no-live" in sys.argv
+    if headless or not _has_display():
         matplotlib.use("Agg")
-    else:
-        try:
-            matplotlib.use("TkAgg")
-        except Exception:
-            matplotlib.use("Agg")
+        return
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        matplotlib.use("Agg")
 
 
 _configure_matplotlib()
@@ -278,9 +290,9 @@ def run_baseline_pf(
     _report_gpu_status()
     print(f"[baseline] Convergence gating enabled: {bool(converge)}")
     pf_conf = PFConfig(
-        num_particles=500,
-        min_particles=500,
-        max_particles=500,
+        num_particles=2000,
+        min_particles=2000,
+        max_particles=2000,
         max_sources=3,
         resample_threshold=0.7,
         position_sigma=0.5,
@@ -291,6 +303,7 @@ def run_baseline_pf(
         use_tempering=False,
         label_enable=True,
         label_alignment_iters=2,
+        init_grid_spacing_m=1.0,
         converge_enable=bool(converge),
     )
     baseline_pf = NoShieldPF(isotopes=isotopes, config=pf_conf)
@@ -328,6 +341,30 @@ def run_baseline_pf(
         plt.ion()
         plt.show(block=False)
         plt.pause(0.1)
+    init_counts = {iso: 0.0 for iso in isotopes}
+    init_meas = BaselineMeasurement(
+        counts_by_isotope=init_counts,
+        live_time_s=0.0,
+        detector_position=current_pose,
+        pose_idx=current_pose_idx,
+        RFe=np.eye(3),
+        RPb=np.eye(3),
+    )
+    init_frame = build_frame_from_pf(
+        baseline_pf,
+        init_meas,
+        step_index=-1,
+        time_sec=0.0,
+        estimate_mode=estimate_mode,
+        min_est_strength=estimate_min_strength,
+        min_existence_prob=estimate_min_existence_prob,
+    )
+    viz.update(init_frame)
+    if live:
+        viz.fig.canvas.draw()
+        if hasattr(viz.fig.canvas, "flush_events"):
+            viz.fig.canvas.flush_events()
+        plt.pause(5.0)
 
     elapsed = 0.0
     last_frame = None

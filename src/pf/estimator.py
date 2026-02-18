@@ -68,6 +68,7 @@ class RotatingShieldPFConfig:
         - merge_distance_max: max distance for merge candidates
         - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
         - init_num_sources: inclusive range for initial source count per particle
+        - init_grid_spacing_m: grid spacing for deterministic particle initialization
         - roughening_k: roughening coefficient for post-resample position jitter
         - min_sigma_pos: minimum roughening sigma (meters)
         - max_sigma_pos: maximum roughening sigma (meters)
@@ -102,7 +103,7 @@ class RotatingShieldPFConfig:
         - label_alignment_iters: iterations for label alignment refinement
         - converge_enable: enable per-isotope convergence gating
         - converge_window: window length for convergence checks
-        - converge_map_move_eps_m: map position stability threshold (meters)
+        - converge_map_move_eps_m: MMSE position stability threshold (meters)
         - converge_ess_ratio_high: ESS/N threshold for convergence
         - converge_ll_improve_eps: LL improvement tolerance
         - converge_min_steps: minimum steps before convergence
@@ -174,6 +175,7 @@ class RotatingShieldPFConfig:
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (0, 3)
+    init_grid_spacing_m: float | None = None
     roughening_k: float = 0.5
     min_sigma_pos: float = 0.05
     max_sigma_pos: float = 1.5
@@ -202,11 +204,11 @@ class RotatingShieldPFConfig:
     label_enable: bool = True
     label_alignment_iters: int = 2
     converge_enable: bool = False
-    converge_window: int = 10
-    converge_map_move_eps_m: float = 0.2
-    converge_ess_ratio_high: float = 0.9
-    converge_ll_improve_eps: float = 0.0
-    converge_min_steps: int = 20
+    converge_window: int = 8
+    converge_map_move_eps_m: float = 0.4
+    converge_ess_ratio_high: float = 0.2
+    converge_ll_improve_eps: float = 1e5
+    converge_min_steps: int = 30
     converge_require_all: bool = True
 
     def __post_init__(self) -> None:
@@ -410,6 +412,7 @@ class RotatingShieldPFEstimator:
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
             init_num_sources=self.pf_config.init_num_sources,
+            init_grid_spacing_m=self.pf_config.init_grid_spacing_m,
             roughening_k=self.pf_config.roughening_k,
             min_sigma_pos=self.pf_config.min_sigma_pos,
             max_sigma_pos=self.pf_config.max_sigma_pos,
