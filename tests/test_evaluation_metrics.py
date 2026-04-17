@@ -25,3 +25,21 @@ def test_compute_metrics_counts_with_gate() -> None:
     assert counts["matched"] == 2
     assert counts["fp"] == 0
     assert counts["fn"] == 0
+
+
+def test_compute_metrics_position_target_flag() -> None:
+    """Position-error summaries should include the fixed 0.5 m target check."""
+    gt_by_iso = {
+        "Cs-137": [
+            {"pos": [0.0, 0.0, 0.0], "strength": 100.0},
+        ]
+    }
+    est_by_iso = {
+        "Cs-137": [
+            {"pos": [0.3, 0.0, 0.0], "strength": 95.0},
+        ]
+    }
+    metrics = compute_metrics(gt_by_iso, est_by_iso, match_radius_m=0.5)
+    position_error = metrics["isotopes"]["Cs-137"]["position_error"]
+    assert position_error["target_m"] == 0.5
+    assert position_error["within_target"] is True

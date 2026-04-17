@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 
+POSITION_ERROR_TARGET_M = 0.5
+
 
 @dataclass(frozen=True)
 class Source:
@@ -155,6 +157,15 @@ def _summary_abs(values: Sequence[float]) -> Dict[str, float | None]:
     }
 
 
+def _position_error_summary(values: Sequence[float]) -> Dict[str, float | bool | None]:
+    """Return position-error summary stats augmented with the fixed target check."""
+    summary = _summary_stats(values)
+    mean_error = summary["mean"]
+    summary["target_m"] = float(POSITION_ERROR_TARGET_M)
+    summary["within_target"] = None if mean_error is None else bool(mean_error <= POSITION_ERROR_TARGET_M)
+    return summary
+
+
 def compute_metrics(
     gt_by_iso: Dict[str, List[Any]],
     est_by_iso: Dict[str, List[Any]],
@@ -228,7 +239,7 @@ def compute_metrics(
                 "fp": fp,
                 "fn": fn,
             },
-            "position_error": _summary_stats(pos_errors),
+            "position_error": _position_error_summary(pos_errors),
             "intensity_abs_error": _summary_abs(abs_errors),
             "intensity_rel_error_pct": _summary_abs(rel_errors),
             "matches": match_details,
@@ -272,6 +283,11 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
             f"median={_format_value(pos_err['median'])}, "
             f"rmse={_format_value(pos_err['rmse'])}, "
             f"max={_format_value(pos_err['max'])}"
+        )
+        print(
+            "  Position target [m]: "
+            f"<={_format_value(pos_err.get('target_m'))}, "
+            f"within_target={pos_err.get('within_target')}"
         )
         print(
             "  Intensity abs error [cps@1m]: "
