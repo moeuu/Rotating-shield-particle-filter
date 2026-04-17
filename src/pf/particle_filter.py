@@ -29,6 +29,7 @@ class PFConfig:
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
+    measurement_scale_by_isotope: dict[str, float] | None = None
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
@@ -229,6 +230,13 @@ class IsotopeParticleFilter:
         )
         self._init_continuous_particles()
 
+    def _measurement_source_scale(self) -> float:
+        """Return the isotope-specific source response scale for PF likelihoods."""
+        scales = self.config.measurement_scale_by_isotope
+        if not isinstance(scales, dict):
+            return 1.0
+        return max(float(scales.get(self.isotope, 1.0)), 0.0)
+
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
         """Attach a kernel and refresh the continuous-kernel configuration."""
         self.kernel = kernel
@@ -381,6 +389,7 @@ class IsotopeParticleFilter:
             return 0.0
         state = self.best_particle().state
         lam_rate = float(state.background)
+        source_scale = self._measurement_source_scale()
         if state.num_sources > 0:
             for pos, strength in zip(state.positions[:state.num_sources], state.strengths[:state.num_sources]):
                 kernel_val = self.continuous_kernel.kernel_value_pair(
@@ -390,7 +399,7 @@ class IsotopeParticleFilter:
                     fe_index=fe_index,
                     pb_index=pb_index,
                 )
-                lam_rate += float(kernel_val) * float(strength)
+                lam_rate += source_scale * float(kernel_val) * float(strength)
         lam = float(live_time_s) * lam_rate
         eps = 1e-12
         return float(z_obs * np.log(lam + eps) - lam)
@@ -507,6 +516,7 @@ class IsotopeParticleFilter:
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
+            source_scale=self._measurement_source_scale(),
         )
 
     def _current_log_weights_torch(self, device: "torch.device") -> "torch.Tensor":
@@ -768,6 +778,7 @@ class IsotopeParticleFilter:
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
+            source_scale=self._measurement_source_scale(),
         )
 
     def _continuous_expected_counts_pair_at_pose(
@@ -1221,6 +1232,7 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
+            source_scale=self._measurement_source_scale(),
         )
         background_counts = float(st.background) * data.live_times
         lambda_total = background_counts + np.sum(lambda_m, axis=1)
@@ -1263,6 +1275,7 @@ class IsotopeParticleFilter:
                     live_times=data.live_times,
                     fe_indices=data.fe_indices,
                     pb_indices=data.pb_indices,
+                    source_scale=self._measurement_source_scale(),
                 )
                 lambda_total = background_counts + np.sum(lambda_m, axis=1)
             else:
@@ -1417,6 +1430,7 @@ class IsotopeParticleFilter:
         num_sources = int(st.num_sources)
         num_meas = int(data.z_k.size)
         k_mat = np.zeros((num_meas, num_sources), dtype=float)
+        source_scale = self._measurement_source_scale()
         for j in range(num_sources):
             pos = st.positions[j]
             for k in range(num_meas):
@@ -1427,7 +1441,7 @@ class IsotopeParticleFilter:
                     fe_index=int(data.fe_indices[k]),
                     pb_index=int(data.pb_indices[k]),
                 )
-                k_mat[k, j] = float(data.live_times[k]) * kernel_val
+                k_mat[k, j] = float(data.live_times[k]) * source_scale * kernel_val
         q_min = float(self.config.birth_q_min)
         q_max = float(self.config.birth_q_max)
         if q_max < q_min:
@@ -1650,6 +1664,7 @@ class IsotopeParticleFilter:
                         live_times=support_data.live_times,
                         fe_indices=support_data.fe_indices,
                         pb_indices=support_data.pb_indices,
+                        source_scale=self._measurement_source_scale(),
                     )
                     lambda_new = lambda_total - lambda_m[:, idx] + np.sum(lam_new, axis=1)
                     delta_ll = delta_log_likelihood_update(
@@ -1707,6 +1722,7 @@ class IsotopeParticleFilter:
                         live_times=support_data.live_times,
                         fe_indices=support_data.fe_indices,
                         pb_indices=support_data.pb_indices,
+                        source_scale=self._measurement_source_scale(),
                     )
                     lambda_new = lambda_total - lambda_m[:, i] - lambda_m[:, j] + lam_merge[:, 0]
                     delta_ll = delta_log_likelihood_update(

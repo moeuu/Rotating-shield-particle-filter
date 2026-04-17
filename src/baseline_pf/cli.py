@@ -54,10 +54,20 @@ def main() -> None:
         help="Path to a JSON file that defines blocked grid cells.",
     )
     parser.add_argument(
+        "--environment-mode",
+        type=str,
+        default="fixed",
+        choices=("fixed", "random"),
+        help=(
+            "Environment generation mode: fixed loads the obstacle JSON, "
+            "random creates a fresh obstacle layout at startup."
+        ),
+    )
+    parser.add_argument(
         "--obstacle-seed",
         type=int,
         default=None,
-        help="RNG seed used when creating a new obstacle layout file.",
+        help="RNG seed used when creating a fixed missing layout or a random startup layout.",
     )
     parser.add_argument(
         "--no-obstacles",
@@ -94,6 +104,24 @@ def main() -> None:
         action="store_true",
         help="Enable per-isotope convergence gating (default: disabled).",
     )
+    parser.add_argument(
+        "--blender-executable",
+        type=str,
+        default=None,
+        help="Blender executable path used by --environment-mode random.",
+    )
+    parser.add_argument(
+        "--blender-output",
+        type=str,
+        default=None,
+        help="Optional USD output path for the Blender-generated random environment.",
+    )
+    parser.add_argument(
+        "--blender-timeout-s",
+        type=float,
+        default=120.0,
+        help="Timeout for Blender random environment generation.",
+    )
     args = parser.parse_args()
 
     sources = None
@@ -118,6 +146,7 @@ def main() -> None:
         live=not (args.no_live or args.headless),
         total_time_s=args.total_time_s,
         sources=sources,
+        environment_mode=args.environment_mode,
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
         detect_threshold_abs=args.detect_threshold_abs,
@@ -125,6 +154,9 @@ def main() -> None:
         eval_match_radius_m=args.eval_match_radius,
         count_mode=args.count,
         converge=args.converge,
+        blender_executable=args.blender_executable,
+        blender_output_path=args.blender_output,
+        blender_timeout_s=args.blender_timeout_s,
     )
 
 

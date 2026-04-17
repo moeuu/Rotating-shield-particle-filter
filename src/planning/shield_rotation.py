@@ -176,6 +176,7 @@ def _surrogate_scores_gpu(
                     live_time_s=live_time_s,
                     device=device,
                     dtype=dtype,
+                    source_scale=estimator.response_scale_for_isotope(iso),
                 )
                 if metric == "var_log_lambda":
                     vals = torch_mod.log(lam_t + eps)
@@ -317,6 +318,7 @@ def _eig_scores_gpu(
                 live_time_s=live_time_s,
                 device=device,
                 dtype=dtype,
+                source_scale=estimator.response_scale_for_isotope(iso),
             )
             if num_samples <= 0:
                 H_post_mean = torch_mod.zeros((), device=device, dtype=dtype)

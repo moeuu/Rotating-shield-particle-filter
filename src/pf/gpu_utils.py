@@ -100,6 +100,7 @@ def expected_counts_pair_torch(
     device: "torch.device",
     dtype: "torch.dtype",
     use_angle_attenuation: bool = False,
+    source_scale: float = 1.0,
     tol: float = 1e-6,
 ) -> "torch.Tensor":
     """
@@ -153,5 +154,6 @@ def expected_counts_pair_torch(
     att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
 
     strengths = strengths * mask
-    rate = torch.sum(geom * att * strengths, dim=-1) + backgrounds
+    source_scale_t = torch.as_tensor(max(float(source_scale), 0.0), device=device, dtype=dtype)
+    rate = source_scale_t * torch.sum(geom * att * strengths, dim=-1) + backgrounds
     return live_time_s * rate

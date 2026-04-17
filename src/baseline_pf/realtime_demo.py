@@ -40,8 +40,9 @@ import numpy as np
 import time
 
 from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
-from measurement.obstacles import load_or_generate_obstacle_grid
+from measurement.obstacles import build_obstacle_grid
 from spectrum.pipeline import SpectralDecomposer
+from sim.blender_environment import generate_blender_environment_usd
 from visualization.realtime_viz import RealTimePFVisualizer, build_frame_from_pf
 from evaluation_metrics import compute_metrics, print_metrics_report
 
@@ -243,6 +244,7 @@ def run_baseline_pf(
     live: bool = True,
     total_time_s: float = 300.0,
     sources: list[PointSource] | None = None,
+    environment_mode: str = "fixed",
     obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
     obstacle_seed: int | None = None,
     detect_threshold_abs: float = 30.0,
@@ -250,6 +252,9 @@ def run_baseline_pf(
     eval_match_radius_m: float = 0.5,
     count_mode: str = "spectrum",
     converge: bool = False,
+    blender_executable: str | None = None,
+    blender_output_path: str | None = None,
+    blender_timeout_s: float = 120.0,
 ) -> None:
     """Run the baseline PF with active pose selection and no shielding."""
     count_mode = count_mode.strip().lower()
@@ -264,15 +269,21 @@ def run_baseline_pf(
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
     obstacle_grid = None
-    if obstacle_layout_path:
-        obstacle_path = Path(obstacle_layout_path)
-        if not obstacle_path.is_absolute():
-            obstacle_path = (ROOT / obstacle_path).resolve()
+    normalized_environment_mode = environment_mode.strip().lower()
+    if normalized_environment_mode not in {"fixed", "random"}:
+        raise ValueError(f"Unknown environment_mode: {environment_mode}")
+    if obstacle_layout_path is not None:
+        obstacle_path: Path | None = None
+        if obstacle_layout_path:
+            obstacle_path = Path(obstacle_layout_path)
+            if not obstacle_path.is_absolute():
+                obstacle_path = (ROOT / obstacle_path).resolve()
         keep_free = None
         if env.detector_position is not None:
             keep_free = [(env.detector_position[0], env.detector_position[1])]
-        obstacle_grid = load_or_generate_obstacle_grid(
-            obstacle_path,
+        obstacle_grid = build_obstacle_grid(
+            mode=normalized_environment_mode,
+            path=obstacle_path,
             size_x=env.size_x,
             size_y=env.size_y,
             cell_size=1.0,
@@ -280,6 +291,31 @@ def run_baseline_pf(
             rng_seed=obstacle_seed,
             keep_free_points=keep_free,
         )
+        mode_message = f"Obstacle environment mode: {normalized_environment_mode}"
+        if normalized_environment_mode == "fixed" and obstacle_path is not None:
+            mode_message += f" ({obstacle_path})"
+        if obstacle_seed is not None:
+            mode_message += f", seed={int(obstacle_seed)}"
+        mode_message += f", blocked_fraction={obstacle_grid.blocked_fraction:.3f}"
+        print(mode_message)
+        if normalized_environment_mode == "random":
+            if blender_output_path:
+                generated_output_path = Path(blender_output_path)
+                if not generated_output_path.is_absolute():
+                    generated_output_path = (ROOT / generated_output_path).resolve()
+            else:
+                seed_token = "unseeded" if obstacle_seed is None else f"seed_{int(obstacle_seed)}"
+                generated_output_path = RESULTS_DIR / "blender_environments" / f"random_{seed_token}.usda"
+            generated_usd = generate_blender_environment_usd(
+                grid=obstacle_grid,
+                output_path=generated_output_path,
+                room_size_xyz=(env.size_x, env.size_y, env.size_z),
+                obstacle_height_m=2.0,
+                obstacle_material="concrete",
+                blender_executable=blender_executable,
+                timeout_s=blender_timeout_s,
+            )
+            print(f"Generated Blender random environment: {generated_usd}")
     positions = generate_measurement_positions(
         env,
         obstacle_grid,

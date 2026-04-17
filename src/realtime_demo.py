@@ -42,7 +42,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource
-from measurement.obstacles import load_or_generate_obstacle_grid
+from measurement.obstacles import build_obstacle_grid
 from measurement.shielding import (
     HVL_TVL_TABLE_MM,
     generate_octant_orientations,
@@ -55,6 +55,7 @@ from spectrum.library import get_detection_lines_keV
 from spectrum.peak_detection import detect_peaks
 from spectrum.pipeline import SpectralDecomposer
 from spectrum.baseline import baseline_als
+from spectrum.net_response import NetResponseCalibration
 from spectrum.smoothing import gaussian_smooth
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
@@ -72,12 +73,15 @@ from visualization.realtime_viz import (
 )
 from visualization.ig_shield_geometry import render_octant_grid
 from evaluation_metrics import compute_metrics, print_metrics_report
+from sim import SimulationCommand, create_simulation_runtime, load_runtime_config
+from sim.blender_environment import generate_blender_environment_usd
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
 SPECTRUM_DIR = RESULTS_DIR / "spetrum"
 PF_DIR = RESULTS_DIR / "pf"
 IG_DIR = RESULTS_DIR / "IG"
+BLENDER_ENV_DIR = RESULTS_DIR / "blender_environments"
 SAVE_IG_GRIDS = False
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_MIN_STRENGTH_ABS = 5.0
@@ -276,8 +280,10 @@ def _fmt_pos(pos: NDArray[np.float64]) -> str:
     return np.array2string(np.asarray(pos, dtype=float), precision=2, floatmode="fixed", separator=", ")
 
 
-def _fmt_counts(counts: dict[str, float]) -> str:
+def _fmt_counts(counts: dict[str, float] | None) -> str:
     """Format a count dict for logging."""
+    if counts is None:
+        return "{}"
     items = ", ".join(f"{iso}: {float(val):.1f}" for iso, val in sorted(counts.items()))
     return "{" + items + "}"
 
@@ -657,6 +663,37 @@ def _expected_counts(
     return counts
 
 
+def _resolve_runtime_path(path_value: str, runtime_config_path: str | None) -> Path:
+    """Resolve a runtime-config path relative to the config file or repository root."""
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    bases: list[Path] = []
+    if runtime_config_path:
+        bases.append(Path(runtime_config_path).expanduser().resolve().parent)
+    bases.append(ROOT)
+    for base in bases:
+        candidate = (base / path).resolve()
+        if candidate.exists():
+            return candidate
+    return (bases[0] / path).resolve()
+
+
+def _load_net_response_calibration(
+    runtime_config: dict[str, object],
+    runtime_config_path: str | None,
+) -> NetResponseCalibration | None:
+    """Load optional Geant4 net-response calibration from runtime config."""
+    inline_payload = runtime_config.get("net_response_calibration")
+    if isinstance(inline_payload, dict):
+        return NetResponseCalibration.from_dict(inline_payload)
+    path_value = runtime_config.get("net_response_calibration_path")
+    if path_value in (None, ""):
+        return None
+    calibration_path = _resolve_runtime_path(str(path_value), runtime_config_path)
+    return NetResponseCalibration.load(calibration_path)
+
+
 
 
 def run_live_pf(
@@ -672,6 +709,7 @@ def run_live_pf(
     ig_threshold_mode: str = "relative_pose",
     ig_threshold_rel: float = 0.02,
     ig_threshold_min: float | None = None,
+    environment_mode: str = "fixed",
     obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
     obstacle_seed: int | None = None,
     eval_match_radius_m: float = 0.5,
@@ -686,6 +724,13 @@ def run_live_pf(
     pose_min_dist: float = 3.0,
     return_state: bool = False,
     converge: bool = False,
+    sim_backend: str = "analytic",
+    sim_config_path: str | None = None,
+    blender_executable: str | None = None,
+    blender_output_path: str | None = None,
+    blender_timeout_s: float = 120.0,
+    nominal_motion_speed_m_s: float = 0.5,
+    rotation_overhead_s: float = 0.5,
 ) -> RotatingShieldPFEstimator | None:
     """
     Run a simple PF loop with live visualization (active pose/orientation selection).
@@ -709,26 +754,49 @@ def run_live_pf(
         candidate_grid_margin: Margin from the environment bounds for candidate sources.
         birth_enabled: Enable birth/death/split/merge moves.
         converge: Enable per-isotope convergence gating.
+        environment_mode: Obstacle environment mode ("fixed" or "random").
+        sim_backend: Simulation backend name ("analytic", "isaacsim", or "geant4").
+        sim_config_path: Optional JSON config for the selected simulation backend.
+        blender_executable: Optional Blender executable path for random mode.
+        blender_output_path: Optional USD path written by Blender in random mode.
+        blender_timeout_s: Timeout for Blender environment generation.
+        nominal_motion_speed_m_s: Nominal robot speed used for mission-time estimates.
+        rotation_overhead_s: Fixed shield-actuation overhead per measurement.
     """
     count_mode = count_mode.strip().lower()
     if count_mode not in {"spectrum", "expected"}:
         raise ValueError(f"Unknown count_mode: {count_mode}")
+    runtime_config = load_runtime_config(sim_config_path)
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
+    default_count_method = (
+        "peak_window"
+        if str(runtime_config.get("engine_mode", "")).strip().lower() == "external"
+        else "response_matrix"
+    )
+    spectrum_count_method = str(runtime_config.get("spectrum_count_method", default_count_method)).strip().lower()
+    if spectrum_count_method not in {"peak_window", "response_matrix"}:
+        raise ValueError(f"Unknown spectrum_count_method: {spectrum_count_method}")
     if min_peaks_by_isotope is None:
         min_peaks_by_isotope = dict(DETECT_MIN_PEAKS_BY_ISOTOPE)
     detect_threshold_rel_by_isotope = dict(DETECT_REL_THRESH_BY_ISOTOPE)
     obstacle_grid = None
-    if obstacle_layout_path:
-        obstacle_path = Path(obstacle_layout_path)
-        if not obstacle_path.is_absolute():
-            obstacle_path = (ROOT / obstacle_path).resolve()
+    normalized_environment_mode = environment_mode.strip().lower()
+    if normalized_environment_mode not in {"fixed", "random"}:
+        raise ValueError(f"Unknown environment_mode: {environment_mode}")
+    if obstacle_layout_path is not None:
+        obstacle_path: Path | None = None
+        if obstacle_layout_path:
+            obstacle_path = Path(obstacle_layout_path)
+            if not obstacle_path.is_absolute():
+                obstacle_path = (ROOT / obstacle_path).resolve()
         keep_free = None
         if env.detector_position is not None:
             keep_free = [(env.detector_position[0], env.detector_position[1])]
-        obstacle_grid = load_or_generate_obstacle_grid(
-            obstacle_path,
+        obstacle_grid = build_obstacle_grid(
+            mode=normalized_environment_mode,
+            path=obstacle_path,
             size_x=env.size_x,
             size_y=env.size_y,
             cell_size=1.0,
@@ -736,18 +804,50 @@ def run_live_pf(
             rng_seed=obstacle_seed,
             keep_free_points=keep_free,
         )
+        mode_message = f"Obstacle environment mode: {normalized_environment_mode}"
+        if normalized_environment_mode == "fixed" and obstacle_path is not None:
+            mode_message += f" ({obstacle_path})"
+        if obstacle_seed is not None:
+            mode_message += f", seed={int(obstacle_seed)}"
+        mode_message += f", blocked_fraction={obstacle_grid.blocked_fraction:.3f}"
+        print(mode_message)
     normals = generate_octant_orientations()
     rot_mats = generate_octant_rotation_matrices()
     num_orients = len(rot_mats)
     if save_outputs:
         PF_DIR.mkdir(parents=True, exist_ok=True)
     output_suffix = ""
+    cleaned_tag = ""
     if output_tag:
         cleaned_tag = output_tag.strip().replace(" ", "_")
         cleaned_tag = cleaned_tag.replace("/", "_").replace("\\", "_")
         cleaned_tag = cleaned_tag.lstrip("_")
         if cleaned_tag:
             output_suffix = f"_{cleaned_tag}"
+    generated_blender_usd_path: Path | None = None
+    if obstacle_grid is not None and normalized_environment_mode == "random":
+        if blender_output_path:
+            generated_output_path = Path(blender_output_path)
+            if not generated_output_path.is_absolute():
+                generated_output_path = (ROOT / generated_output_path).resolve()
+        else:
+            if obstacle_seed is None:
+                path_token = f"random_{int(time.time() * 1000)}"
+            else:
+                path_token = f"random_seed_{int(obstacle_seed)}"
+            if cleaned_tag:
+                path_token = f"{path_token}_{cleaned_tag}"
+            generated_output_path = BLENDER_ENV_DIR / f"{path_token}.usda"
+        generated_blender_usd_path = generate_blender_environment_usd(
+            grid=obstacle_grid,
+            output_path=generated_output_path,
+            room_size_xyz=(env.size_x, env.size_y, env.size_z),
+            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+            obstacle_material="concrete",
+            blender_executable=blender_executable,
+            timeout_s=blender_timeout_s,
+        )
+        print(f"Generated Blender random environment: {generated_blender_usd_path}")
 
     # Candidate sources: dense grid inside environment (used by birth proposals).
     spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
@@ -773,6 +873,18 @@ def run_live_pf(
         mu_by_isotope = {
             iso: {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb} for iso in isotopes
         }
+    net_response_calibration = _load_net_response_calibration(runtime_config, sim_config_path)
+    measurement_scale_by_isotope = (
+        {
+            iso: net_response_calibration.response_scale(iso)
+            for iso in isotopes
+            if net_response_calibration.response_scale(iso) != 1.0
+        }
+        if net_response_calibration is not None
+        else None
+    )
+    if measurement_scale_by_isotope:
+        print(f"Loaded net-response calibration: {_fmt_counts(measurement_scale_by_isotope)}")
     use_gpu = _default_use_gpu()
     expected_kernel = ContinuousKernel(
         mu_by_isotope=mu_by_isotope,
@@ -782,6 +894,15 @@ def run_live_pf(
         gpu_dtype="float64",
     )
     background_by_isotope = {iso: 5.0 for iso in isotopes}
+    simulation_runtime = create_simulation_runtime(
+        sim_backend,
+        sources=sources,
+        decomposer=decomposer,
+        mu_by_isotope=mu_by_isotope,
+        shield_params=shield_params,
+        runtime_config=runtime_config,
+        runtime_config_path=sim_config_path,
+    )
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
         min_particles=num_particles,
@@ -790,6 +911,7 @@ def run_live_pf(
         resample_threshold=0.7,
         position_sigma=0.5,
         background_level=background_by_isotope,
+        measurement_scale_by_isotope=measurement_scale_by_isotope,
         min_strength=5.0,
         p_birth=0.05,
         p_kill=0.1,
@@ -1075,6 +1197,20 @@ def run_live_pf(
     last_spectrum: np.ndarray | None = None
     last_counts: dict[str, float] | None = None
     last_max_ig: float | None = None
+    total_motion_distance_m = 0.0
+    total_motion_time_s = 0.0
+    total_rotation_time_s = 0.0
+    pending_motion_distance_m = 0.0
+    pending_motion_time_s = 0.0
+    pending_path_segment: dict[str, object] | None = None
+    path_segments: list[dict[str, object]] = []
+    total_ig_wall_s = 0.0
+    total_pf_wall_s = 0.0
+    total_prune_wall_s = 0.0
+    total_viz_wall_s = 0.0
+    ig_wall_samples_s: list[float] = []
+    pf_wall_samples_s: list[float] = []
+    run_wall_start = time.perf_counter()
     if max_steps is not None and max_steps <= 0:
         max_steps = None
     if max_poses is not None and max_poses <= 0:
@@ -1145,6 +1281,13 @@ def run_live_pf(
         "GPU acceleration: "
         f"{gpu_status} (device={estimator.pf_config.gpu_device}, dtype={estimator.pf_config.gpu_dtype})"
     )
+    print(f"Simulation backend: {sim_backend}")
+    print(
+        "Mission timing model: "
+        f"robot_speed={float(nominal_motion_speed_m_s):.3f}m/s "
+        f"shield_overhead={float(rotation_overhead_s):.3f}s/measurement "
+        "mission_time=travel+shield+live"
+    )
     print(
         "Convergence gating: "
         f"enabled={estimator.pf_config.converge_enable} "
@@ -1155,331 +1298,432 @@ def run_live_pf(
         f"ll_improve_eps={estimator.pf_config.converge_ll_improve_eps:.3f} "
         f"require_all={estimator.pf_config.converge_require_all}"
     )
+    simulation_runtime.reset(
+        {
+            "usd_path": None
+            if generated_blender_usd_path is None
+            else generated_blender_usd_path.as_posix(),
+            "room_size_xyz": [env.size_x, env.size_y, env.size_z],
+            "source_count": len(sources),
+            "sources": [
+                {
+                    "isotope": source.isotope,
+                    "position": [
+                        float(source.position[0]),
+                        float(source.position[1]),
+                        float(source.position[2]),
+                    ],
+                    "intensity_cps_1m": float(source.intensity_cps_1m),
+                }
+                for source in sources
+            ],
+            "obstacle_origin_xy": (
+                [0.0, 0.0]
+                if obstacle_grid is None
+                else list(obstacle_grid.origin)
+            ),
+            "obstacle_cell_size_m": 1.0
+            if obstacle_grid is None
+            else float(obstacle_grid.cell_size),
+            "obstacle_material": "concrete",
+            "obstacle_grid_shape": [0, 0]
+            if obstacle_grid is None
+            else list(obstacle_grid.grid_shape),
+            "obstacle_cells": [] if obstacle_grid is None else list(obstacle_grid.blocked_cells),
+            "author_obstacle_prims": generated_blender_usd_path is None,
+        }
+    )
     ig_max_global = 0.0
     pose_counter = 0
-    while True:
-        pose = current_pose
-        stop_run = False
-        pose_elapsed = 0.0
-        zero_ig_override = False
-        remaining_orientations = set(range(total_pairs))
-        rotation_limit = max(1, int(estimator.pf_config.orientation_k))
-        rotation_count = 0
-        ig_max_pose = 0.0
-        ig_threshold_current = estimator.pf_config.ig_threshold
+    try:
         while True:
-            if rotation_count >= rotation_limit:
-                print(f"Reached max rotations per pose ({rotation_limit}); moving to the next pose.")
-                break
-            if not remaining_orientations:
-                print("All orientation pairs exhausted; moving to the next pose.")
-                break
-            planning_isotopes = None
-            if detection_locked and locked_isotopes_for_planning:
-                planning_isotopes = sorted(locked_isotopes_for_planning)
-            ig_start = time.perf_counter()
-            ig_scores = _compute_ig_grid(
-                estimator,
-                rot_mats,
-                pose_idx=current_pose_idx,
-                live_time_s=live_time,
-                planning_isotopes=planning_isotopes,
-            )
-            ig_elapsed = time.perf_counter() - ig_start
-            best_pair_idx, ig_score = _select_best_pair_from_scores(
-                ig_scores,
-                remaining_orientations,
-            )
-            if best_pair_idx < 0:
-                print("No valid orientation candidates; moving to the next pose.")
-                break
-            ig_val = max(float(ig_score), 0.0)
-            last_max_ig = ig_val
-            ig_max_global = max(ig_max_global, ig_val)
-            ig_max_pose = max(ig_max_pose, ig_val)
-            ig_threshold_current = _resolve_ig_threshold(
-                mode=ig_threshold_mode,
-                ig_floor=estimator.pf_config.ig_threshold,
-                ig_rel=ig_threshold_rel,
-                ig_max_global=ig_max_global,
-                ig_max_pose=ig_max_pose,
-            )
-            if ig_max_pose <= 0.0 and ig_threshold_current > 0.0:
-                if not zero_ig_override:
-                    print("IG grid returned zero; forcing rotation despite threshold.")
-                    zero_ig_override = True
-                ig_threshold_current = 0.0
-            if ig_val < ig_threshold_current:
-                print(
-                    "Stopping rotation at this pose "
-                    f"(max IG {ig_val:.6g} < threshold {ig_threshold_current:.6g})."
+            pose = current_pose
+            stop_run = False
+            pose_elapsed = 0.0
+            zero_ig_override = False
+            remaining_orientations = set(range(total_pairs))
+            rotation_limit = max(1, int(estimator.pf_config.orientation_k))
+            rotation_count = 0
+            ig_max_pose = 0.0
+            ig_threshold_current = estimator.pf_config.ig_threshold
+            while True:
+                if rotation_count >= rotation_limit:
+                    print(
+                        f"Reached max rotations per pose ({rotation_limit}); "
+                        "moving to the next pose."
+                    )
+                    break
+                if not remaining_orientations:
+                    print("All orientation pairs exhausted; moving to the next pose.")
+                    break
+                planning_isotopes = None
+                if detection_locked and locked_isotopes_for_planning:
+                    planning_isotopes = sorted(locked_isotopes_for_planning)
+                ig_start = time.perf_counter()
+                ig_scores = _compute_ig_grid(
+                    estimator,
+                    rot_mats,
+                    pose_idx=current_pose_idx,
+                    live_time_s=live_time,
+                    planning_isotopes=planning_isotopes,
                 )
-                break
-            fe_idx = best_pair_idx // num_orients
-            pb_idx = best_pair_idx % num_orients
-            RFe_sel = rot_mats[fe_idx]
-            RPb_sel = rot_mats[pb_idx]
-            if save_outputs and SAVE_IG_GRIDS and (step_counter + 1) % 10 == 0:
-                ig_path = IG_DIR / f"ig_grid_step_{step_counter:04d}.png"
-                render_octant_grid(
-                    ig_path,
-                    ig_scores=ig_scores,
-                    highlight_idx=(fe_idx, pb_idx),
-                    highlight_max=False,
-                    font_size=12,
+                ig_elapsed = time.perf_counter() - ig_start
+                total_ig_wall_s += ig_elapsed
+                ig_wall_samples_s.append(float(ig_elapsed))
+                best_pair_idx, ig_score = _select_best_pair_from_scores(
+                    ig_scores,
+                    remaining_orientations,
                 )
-            env_step = EnvironmentConfig(detector_position=tuple(pose))
-            spectrum, _ = decomposer.simulate_spectrum(
-                sources=sources,
-                environment=env_step,
-                acquisition_time=live_time,
-                rng=np.random.default_rng(123 + step_counter),
-                fe_shield_orientation=normals[fe_idx],
-                pb_shield_orientation=normals[pb_idx],
-                mu_by_isotope=mu_by_isotope,
-                shield_params=shield_params,
-            )
-            last_spectrum = spectrum.copy()
-            z_detected, detected = decomposer.isotope_counts_with_detection(
-                spectrum,
-                live_time_s=live_time,
-                # Always detect across the full library so the lock can expand.
-                active_isotopes=None,
-                detect_threshold_abs=detect_threshold_abs,
-                detect_threshold_rel=detect_threshold_rel,
-                detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
-                min_peaks_by_isotope=min_peaks_by_isotope,
-            )
-            expected_counts = None
-            if count_mode == "expected":
-                expected_counts = _expected_counts(
-                    expected_kernel,
-                    sources,
-                    isotopes,
-                    detector_pos=pose,
+                if best_pair_idx < 0:
+                    print("No valid orientation candidates; moving to the next pose.")
+                    break
+                ig_val = max(float(ig_score), 0.0)
+                last_max_ig = ig_val
+                ig_max_global = max(ig_max_global, ig_val)
+                ig_max_pose = max(ig_max_pose, ig_val)
+                ig_threshold_current = _resolve_ig_threshold(
+                    mode=ig_threshold_mode,
+                    ig_floor=estimator.pf_config.ig_threshold,
+                    ig_rel=ig_threshold_rel,
+                    ig_max_global=ig_max_global,
+                    ig_max_pose=ig_max_pose,
+                )
+                if ig_max_pose <= 0.0 and ig_threshold_current > 0.0:
+                    if not zero_ig_override:
+                        print("IG grid returned zero; forcing rotation despite threshold.")
+                        zero_ig_override = True
+                    ig_threshold_current = 0.0
+                if ig_val < ig_threshold_current:
+                    print(
+                        "Stopping rotation at this pose "
+                        f"(max IG {ig_val:.6g} < threshold {ig_threshold_current:.6g})."
+                    )
+                    break
+                fe_idx = best_pair_idx // num_orients
+                pb_idx = best_pair_idx % num_orients
+                RFe_sel = rot_mats[fe_idx]
+                RPb_sel = rot_mats[pb_idx]
+                if save_outputs and SAVE_IG_GRIDS and (step_counter + 1) % 10 == 0:
+                    ig_path = IG_DIR / f"ig_grid_step_{step_counter:04d}.png"
+                    render_octant_grid(
+                        ig_path,
+                        ig_scores=ig_scores,
+                        highlight_idx=(fe_idx, pb_idx),
+                        highlight_max=False,
+                        font_size=12,
+                    )
+                step_motion_distance_m = float(pending_motion_distance_m)
+                step_motion_time_s = float(pending_motion_time_s)
+                step_rotation_time_s = float(rotation_overhead_s)
+                observation = simulation_runtime.step(
+                    SimulationCommand(
+                        step_id=step_counter,
+                        target_pose_xyz=tuple(float(v) for v in pose),
+                        target_base_yaw_rad=0.0,
+                        fe_orientation_index=fe_idx,
+                        pb_orientation_index=pb_idx,
+                        dwell_time_s=live_time,
+                        travel_time_s=step_motion_time_s,
+                        shield_actuation_time_s=step_rotation_time_s,
+                    )
+                )
+                pending_motion_distance_m = 0.0
+                pending_motion_time_s = 0.0
+                step_path_segment = pending_path_segment
+                pending_path_segment = None
+                total_motion_distance_m += step_motion_distance_m
+                total_motion_time_s += step_motion_time_s
+                total_rotation_time_s += step_rotation_time_s
+                if step_path_segment is not None:
+                    path_segments.append(step_path_segment)
+                elapsed += step_motion_time_s + step_rotation_time_s
+                spectrum = np.asarray(observation.spectrum_counts, dtype=float)
+                if spectrum.shape != decomposer.energy_axis.shape:
+                    raise ValueError(
+                        "Simulator returned an unexpected spectrum shape: "
+                        f"{spectrum.shape} != {decomposer.energy_axis.shape}"
+                    )
+                last_spectrum = spectrum.copy()
+                z_detected, detected = decomposer.isotope_counts_with_detection(
+                    spectrum,
+                    live_time_s=live_time,
+                    count_method=spectrum_count_method,
+                    # Always detect across the full library so the lock can expand.
+                    active_isotopes=None,
+                    detect_threshold_abs=detect_threshold_abs,
+                    detect_threshold_rel=detect_threshold_rel,
+                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                    min_peaks_by_isotope=min_peaks_by_isotope,
+                )
+                expected_counts = None
+                if count_mode == "expected":
+                    ideal_expected_counts = _expected_counts(
+                        expected_kernel,
+                        sources,
+                        isotopes,
+                        detector_pos=np.asarray(observation.detector_pose_xyz, dtype=float),
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                        live_time_s=live_time,
+                    )
+                    expected_counts = (
+                        net_response_calibration.apply_expected_counts(ideal_expected_counts)
+                        if net_response_calibration is not None
+                        else ideal_expected_counts
+                    )
+                    z_detected = expected_counts
+                    detected = _detect_isotopes_from_expected(expected_counts)
+                last_counts = {iso: float(val) for iso, val in z_detected.items()}
+                last_candidates = set(detected)
+                if count_mode == "expected":
+                    detected_isotopes = set(detected)
+                    active_isotopes = set(detected_isotopes)
+                    last_candidates = set(detected_isotopes)
+                elif detect_consecutive > 0:
+                    miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
+                    active_isotopes = _update_detection_hysteresis(
+                        set(detected),
+                        detect_counts,
+                        miss_counts,
+                        active_isotopes,
+                        consecutive=detect_consecutive,
+                        miss_consecutive=miss_required,
+                        consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
+                    )
+                    detected_isotopes = set(active_isotopes)
+                    last_candidates = set(detected_isotopes)
+                    if not detection_locked:
+                        should_lock = step_counter + 1 >= detect_min_steps and detected_isotopes
+                        allow_lock = any(iso != "Eu-154" for iso in detected_isotopes)
+                        if should_lock and allow_lock:
+                            locked_isotopes_for_planning |= set(detected_isotopes)
+                            detection_locked = True
+                            print(
+                                "Detected isotopes locked to: "
+                                f"{sorted(locked_isotopes_for_planning)}"
+                            )
+                    else:
+                        new_locked = locked_isotopes_for_planning | set(detected_isotopes)
+                        if new_locked != locked_isotopes_for_planning:
+                            added = set(new_locked) - set(estimator.isotopes)
+                            if added:
+                                estimator.add_isotopes(sorted(added))
+                            locked_isotopes_for_planning = new_locked
+                            print(
+                                "pes expanded to: "
+                                f"{sorted(locked_isotopes_for_planning)}"
+                            )
+                target_isotopes: set[str] = set()
+                if detection_locked and locked_isotopes_for_planning:
+                    target_isotopes = set(locked_isotopes_for_planning)
+                elif detected_isotopes:
+                    target_isotopes = set(detected_isotopes)
+                if target_isotopes:
+                    current_isotopes = set(estimator.isotopes)
+                    if target_isotopes != current_isotopes:
+                        to_add = target_isotopes - current_isotopes
+                        if to_add:
+                            estimator.add_isotopes(sorted(to_add))
+                        estimator.restrict_isotopes(sorted(target_isotopes))
+                counts_for_pf = expected_counts if count_mode == "expected" else z_detected
+                pf_isotopes = list(estimator.isotopes)
+                z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in pf_isotopes}
+                z_counts = z_k_full
+                z_k = z_k_full
+                pose_for_pf = np.asarray(observation.detector_pose_xyz, dtype=float)
+                meas = Measurement(
+                    counts_by_isotope=z_k,
+                    pose_idx=current_pose_idx,
+                    orient_idx=best_pair_idx,
+                    live_time_s=live_time,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                    RFe=RFe_sel,
+                    RPb=RPb_sel,
+                    detector_position=pose_for_pf,
+                )
+                pf_start = time.perf_counter()
+                estimator.update_pair(
+                    z_k=z_k,
+                    pose_idx=current_pose_idx,
                     fe_index=fe_idx,
                     pb_index=pb_idx,
                     live_time_s=live_time,
                 )
-                z_detected = expected_counts
-                detected = _detect_isotopes_from_expected(expected_counts)
-            last_counts = {iso: float(val) for iso, val in z_detected.items()}
-            last_candidates = set(detected)
-            if count_mode == "expected":
-                detected_isotopes = set(detected)
-                active_isotopes = set(detected_isotopes)
-                last_candidates = set(detected_isotopes)
-            elif detect_consecutive > 0:
-                miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
-                active_isotopes = _update_detection_hysteresis(
-                    set(detected),
-                    detect_counts,
-                    miss_counts,
-                    active_isotopes,
-                    consecutive=detect_consecutive,
-                    miss_consecutive=miss_required,
-                    consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
+                pf_elapsed = time.perf_counter() - pf_start
+                total_pf_wall_s += pf_elapsed
+                pf_wall_samples_s.append(float(pf_elapsed))
+                elapsed += live_time
+                viz_elapsed = 0.0
+                viz_start = time.perf_counter()
+                frame = build_frame_from_pf(
+                    estimator,
+                    meas,
+                    step_index=step_counter,
+                    time_sec=elapsed,
+                    estimate_mode=estimate_mode,
+                    min_est_strength=estimate_min_strength,
+                    min_existence_prob=estimate_min_existence_prob,
                 )
-                detected_isotopes = set(active_isotopes)
-                last_candidates = set(detected_isotopes)
-                if not detection_locked:
-                    should_lock = step_counter + 1 >= detect_min_steps and detected_isotopes
-                    allow_lock = any(iso != "Eu-154" for iso in detected_isotopes)
-                    if should_lock and allow_lock:
-                        locked_isotopes_for_planning |= set(detected_isotopes)
-                        detection_locked = True
-                        print(
-                            "Detected isotopes locked to: "
-                            f"{sorted(locked_isotopes_for_planning)}"
-                        )
-                else:
-                    new_locked = locked_isotopes_for_planning | set(detected_isotopes)
-                    if new_locked != locked_isotopes_for_planning:
-                        added = set(new_locked) - set(estimator.isotopes)
-                        if added:
-                            estimator.add_isotopes(sorted(added))
-                        locked_isotopes_for_planning = new_locked
-                        print(
-                            "pes expanded to: "
-                            f"{sorted(locked_isotopes_for_planning)}"
-                        )
-            target_isotopes: set[str] = set()
-            if detection_locked and locked_isotopes_for_planning:
-                target_isotopes = set(locked_isotopes_for_planning)
-            elif detected_isotopes:
-                target_isotopes = set(detected_isotopes)
-            if target_isotopes:
-                current_isotopes = set(estimator.isotopes)
-                if target_isotopes != current_isotopes:
-                    to_add = target_isotopes - current_isotopes
-                    if to_add:
-                        estimator.add_isotopes(sorted(to_add))
-                    estimator.restrict_isotopes(sorted(target_isotopes))
-            counts_for_pf = expected_counts if count_mode == "expected" else z_detected
-            pf_isotopes = list(estimator.isotopes)
-            z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in pf_isotopes}
-            z_counts = z_k_full
-            z_k = z_k_full
-            meas = Measurement(
-                counts_by_isotope=z_k,
-                pose_idx=current_pose_idx,
-                orient_idx=best_pair_idx,
-                live_time_s=live_time,
-                fe_index=fe_idx,
-                pb_index=pb_idx,
-                RFe=RFe_sel,
-                RPb=RPb_sel,
-                detector_position=pose,
-            )
-            pf_start = time.perf_counter()
-            estimator.update_pair(
-                z_k=z_k,
-                pose_idx=current_pose_idx,
-                fe_index=fe_idx,
-                pb_index=pb_idx,
-                live_time_s=live_time,
-            )
-            pf_elapsed = time.perf_counter() - pf_start
-            elapsed += live_time
-            viz_elapsed = 0.0
-            viz_start = time.perf_counter()
-            frame = build_frame_from_pf(
-                estimator,
-                meas,
-                step_index=step_counter,
-                time_sec=elapsed,
-                estimate_mode=estimate_mode,
-                min_est_strength=estimate_min_strength,
-                min_existence_prob=estimate_min_existence_prob,
-            )
-            viz_elapsed += time.perf_counter() - viz_start
-            prune_start = time.perf_counter()
-            pruned = estimator.pruned_estimates(
-                method=PRUNE_METHOD,
-                params={"deltaLL_min": PRUNE_DELTALL_MIN},
-                tau_mix=PRUNE_TAU_MIX,
-                min_support=PRUNE_MIN_SUPPORT,
-                min_obs_count=prune_min_obs_count,
-                min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-            )
-            prune_elapsed = time.perf_counter() - prune_start
-            viz_start = time.perf_counter()
-            if hasattr(frame, "estimated_sources") and hasattr(frame, "estimated_strengths"):
-                frame.estimated_sources = {}
-                frame.estimated_strengths = {}
-                for iso in isotopes:
-                    pos, strg = pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-                    pos, strg = _apply_display_thresholds(pos, strg, estimate_min_strength)
-                    frame.estimated_sources[iso] = pos
-                    frame.estimated_strengths[iso] = strg
-            viz.update(frame)
-            last_frame = frame
-            # Log only measurement point and shield orientations
-            print(
-                f"[step {step_counter}] pose={_fmt_pos(pose)} orient_pair={best_pair_idx} "
-                f"ig={ig_val:.6g} ig_threshold={ig_threshold_current:.6g} "
-                f"fe_idx={fe_idx} pb_idx={pb_idx} "
-                f"live_time_s={live_time:.1f} z_keys={sorted(z_k.keys())} "
-                f"z_obs={_fmt_counts(z_counts)} "
-                f"expected={_fmt_counts(expected_counts)}"
-            )
-            if live:
-                plt.pause(0.05)
-            viz_elapsed += time.perf_counter() - viz_start
-            _log_pf_diagnostics(estimator, step_counter)
-            print(
-                f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
-                f"prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s"
-            )
-            step_counter += 1
-            rotation_count += 1
-            remaining_orientations.discard(best_pair_idx)
-            if save_outputs and last_spectrum is not None and step_counter % 10 == 0:
-                highlight = (
-                    set(locked_isotopes_for_planning)
-                    if detection_locked
-                    else last_candidates
+                viz_elapsed += time.perf_counter() - viz_start
+                prune_start = time.perf_counter()
+                pruned = estimator.pruned_estimates(
+                    method=PRUNE_METHOD,
+                    params={"deltaLL_min": PRUNE_DELTALL_MIN},
+                    tau_mix=PRUNE_TAU_MIX,
+                    min_support=PRUNE_MIN_SUPPORT,
+                    min_obs_count=prune_min_obs_count,
+                    min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
+                    min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
                 )
-                spectrum_path = SPECTRUM_DIR / f"spectrum_step_{step_counter:04d}.png"
-                _save_spectrum_plot(
-                    decomposer,
-                    last_spectrum,
-                    spectrum_path,
-                    highlight_isotopes=highlight,
-                    counts_by_isotope=last_counts,
-                )
-            if max_steps is not None and step_counter >= max_steps:
-                stop_run = True
-                break
-            pose_elapsed += live_time
-            if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
-                break
-        if save_outputs and estimator.measurements and estimator.measurements[-1].pose_idx == current_pose_idx:
-            pf_step = current_pose_idx + 1
-            pf_path = PF_DIR / f"pf_step_{pf_step:03d}.png"
-            viz.save_final(pf_path.as_posix())
-        if stop_run:
-            print(f"Reached max steps ({max_steps}); stopping exploration.")
-            break
-        if last_max_ig is not None and last_max_ig < ig_threshold_current:
-            if estimator.should_stop_exploration(
-                ig_threshold=ig_threshold_current,
-                live_time_s=live_time,
-            ):
+                prune_elapsed = time.perf_counter() - prune_start
+                total_prune_wall_s += prune_elapsed
+                viz_start = time.perf_counter()
+                if hasattr(frame, "estimated_sources") and hasattr(frame, "estimated_strengths"):
+                    frame.estimated_sources = {}
+                    frame.estimated_strengths = {}
+                    for iso in isotopes:
+                        pos, strg = pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
+                        pos, strg = _apply_display_thresholds(pos, strg, estimate_min_strength)
+                        frame.estimated_sources[iso] = pos
+                        frame.estimated_strengths[iso] = strg
+                viz.update(frame)
+                last_frame = frame
                 print(
-                    "Converged; stopping exploration "
-                    f"(max IG {last_max_ig:.6g} < threshold {ig_threshold_current:.6g})."
+                    f"[step {step_counter}] pose={_fmt_pos(pose_for_pf)} "
+                    f"orient_pair={best_pair_idx} "
+                    f"ig={ig_val:.6g} ig_threshold={ig_threshold_current:.6g} "
+                    f"fe_idx={fe_idx} pb_idx={pb_idx} "
+                    f"travel_distance_m={step_motion_distance_m:.3f} "
+                    f"travel_time_s={step_motion_time_s:.1f} "
+                    f"shield_time_s={step_rotation_time_s:.1f} "
+                    f"live_time_s={live_time:.1f} mission_time_s={elapsed:.1f} "
+                    f"z_keys={sorted(z_k.keys())} "
+                    f"z_obs={_fmt_counts(z_counts)} "
+                    f"expected={_fmt_counts(expected_counts)}"
                 )
+                if live:
+                    plt.pause(0.05)
+                viz_elapsed += time.perf_counter() - viz_start
+                total_viz_wall_s += viz_elapsed
+                _log_pf_diagnostics(estimator, step_counter)
+                print(
+                    f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
+                    f"prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s "
+                    f"travel={step_motion_time_s:.1f}s shield={step_rotation_time_s:.1f}s"
+                )
+                step_counter += 1
+                rotation_count += 1
+                remaining_orientations.discard(best_pair_idx)
+                if save_outputs and last_spectrum is not None and step_counter % 10 == 0:
+                    highlight = (
+                        set(locked_isotopes_for_planning)
+                        if detection_locked
+                        else last_candidates
+                    )
+                    spectrum_path = SPECTRUM_DIR / f"spectrum_step_{step_counter:04d}.png"
+                    _save_spectrum_plot(
+                        decomposer,
+                        last_spectrum,
+                        spectrum_path,
+                        highlight_isotopes=highlight,
+                        counts_by_isotope=last_counts,
+                    )
+                if max_steps is not None and step_counter >= max_steps:
+                    stop_run = True
+                    break
+                pose_elapsed += live_time + step_rotation_time_s
+                if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
+                    break
+            if (
+                save_outputs
+                and estimator.measurements
+                and estimator.measurements[-1].pose_idx == current_pose_idx
+            ):
+                pf_step = current_pose_idx + 1
+                pf_path = PF_DIR / f"pf_step_{pf_step:03d}.png"
+                viz.save_final(pf_path.as_posix())
+            if stop_run:
+                print(f"Reached max steps ({max_steps}); stopping exploration.")
                 break
-        visited_poses.append(pose.copy())
-        pose_counter += 1
-        if max_poses is not None and pose_counter >= max_poses:
-            print(f"Reached max poses ({max_poses}); stopping exploration.")
-            break
-        visited_arr = np.vstack(visited_poses) if visited_poses else None
-        print("Generating candidate poses for next measurement point...")
-        candidates = generate_candidate_poses(
-            current_pose_xyz=pose,
-            map_api=obstacle_grid,
-            n_candidates=pose_candidates,
-            strategy="free_space_sobol",
-            min_dist_from_visited=pose_min_dist,
-            visited_poses_xyz=visited_arr,
-            bounds_xyz=(bounds_lo, bounds_hi),
-        )
-        if candidates.size == 0 and pose_min_dist > 0.0:
-            relaxed_dist = max(pose_min_dist * 0.5, 0.5)
-            print(
-                "No candidates with current spacing; retrying with min_dist="
-                f"{relaxed_dist:.2f}."
-            )
+            if last_max_ig is not None and last_max_ig < ig_threshold_current:
+                if estimator.should_stop_exploration(
+                    ig_threshold=ig_threshold_current,
+                    live_time_s=live_time,
+                ):
+                    print(
+                        "Converged; stopping exploration "
+                        f"(max IG {last_max_ig:.6g} < threshold {ig_threshold_current:.6g})."
+                    )
+                    break
+            visited_poses.append(pose.copy())
+            pose_counter += 1
+            if max_poses is not None and pose_counter >= max_poses:
+                print(f"Reached max poses ({max_poses}); stopping exploration.")
+                break
+            visited_arr = np.vstack(visited_poses) if visited_poses else None
+            print("Generating candidate poses for next measurement point...")
             candidates = generate_candidate_poses(
                 current_pose_xyz=pose,
                 map_api=obstacle_grid,
-                n_candidates=max(pose_candidates * 2, pose_candidates),
+                n_candidates=pose_candidates,
                 strategy="free_space_sobol",
-                min_dist_from_visited=relaxed_dist,
+                min_dist_from_visited=pose_min_dist,
                 visited_poses_xyz=visited_arr,
                 bounds_xyz=(bounds_lo, bounds_hi),
             )
-        if candidates.size == 0:
-            print("No candidate poses available; stopping exploration.")
-            break
-        print(f"Generated {len(candidates)} candidate poses. Computing best next pose...")
-        next_idx = select_next_pose_from_candidates(
-            estimator=estimator,
-            candidate_poses_xyz=candidates,
-            current_pose_xyz=pose,
-            criterion="after_rotation",
-            verbose=True,
-            progress_every=0,
-            auto_lambda_cost=True,
-            num_rollouts=DEFAULT_PLANNING_ROLLOUTS,
-        )
-        current_pose = candidates[next_idx]
-        estimator.add_measurement_pose(current_pose, reset_filters=False)
-        current_pose_idx = len(estimator.poses) - 1
+            if candidates.size == 0 and pose_min_dist > 0.0:
+                relaxed_dist = max(pose_min_dist * 0.5, 0.5)
+                print(
+                    "No candidates with current spacing; retrying with min_dist="
+                    f"{relaxed_dist:.2f}."
+                )
+                candidates = generate_candidate_poses(
+                    current_pose_xyz=pose,
+                    map_api=obstacle_grid,
+                    n_candidates=max(pose_candidates * 2, pose_candidates),
+                    strategy="free_space_sobol",
+                    min_dist_from_visited=relaxed_dist,
+                    visited_poses_xyz=visited_arr,
+                    bounds_xyz=(bounds_lo, bounds_hi),
+                )
+            if candidates.size == 0:
+                print("No candidate poses available; stopping exploration.")
+                break
+            print(f"Generated {len(candidates)} candidate poses. Computing best next pose...")
+            next_idx = select_next_pose_from_candidates(
+                estimator=estimator,
+                candidate_poses_xyz=candidates,
+                current_pose_xyz=pose,
+                criterion="after_rotation",
+                verbose=True,
+                progress_every=0,
+                auto_lambda_cost=True,
+                num_rollouts=DEFAULT_PLANNING_ROLLOUTS,
+            )
+            next_pose = candidates[next_idx]
+            motion_distance_m = float(np.linalg.norm(next_pose - pose))
+            motion_time_s = motion_distance_m / max(float(nominal_motion_speed_m_s), 1e-9)
+            pending_motion_distance_m = motion_distance_m
+            pending_motion_time_s = motion_time_s
+            pending_path_segment = {
+                "from_pose_xyz": [float(v) for v in pose],
+                "to_pose_xyz": [float(v) for v in next_pose],
+                "distance_m": float(motion_distance_m),
+                "travel_time_s": float(motion_time_s),
+                "speed_m_s": float(nominal_motion_speed_m_s),
+            }
+            print(
+                "Robot travel segment: "
+                f"distance={motion_distance_m:.3f}m "
+                f"time={motion_time_s:.1f}s "
+                f"speed={float(nominal_motion_speed_m_s):.3f}m/s"
+            )
+            current_pose = next_pose
+            estimator.add_measurement_pose(current_pose, reset_filters=False)
+            current_pose_idx = len(estimator.poses) - 1
+    finally:
+        simulation_runtime.close()
 
     # Save final snapshots
     if save_outputs:
@@ -1541,12 +1785,68 @@ def run_live_pf(
                 counts_by_isotope=last_counts,
             )
     total_meas_time = step_counter * live_time
+    total_mission_time_s = float(total_meas_time + total_motion_time_s + total_rotation_time_s)
+    mean_ig_wall_s = float(np.mean(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
+    max_ig_wall_s = float(np.max(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
+    mean_pf_wall_s = float(np.mean(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
+    max_pf_wall_s = float(np.max(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
+    total_compute_time_s = float(
+        total_ig_wall_s
+        + total_pf_wall_s
+        + total_prune_wall_s
+        + total_viz_wall_s
+    )
+    wall_clock_runtime_s = float(time.perf_counter() - run_wall_start)
+    mission_metrics = {
+        "total_measurements": int(step_counter),
+        "total_live_time_s": float(total_meas_time),
+        "total_motion_distance_m": float(total_motion_distance_m),
+        "nominal_motion_speed_m_s": float(nominal_motion_speed_m_s),
+        "total_travel_time_s": float(total_motion_time_s),
+        "estimated_motion_time_s": float(total_motion_time_s),
+        "rotation_overhead_s_per_measurement": float(rotation_overhead_s),
+        "total_shield_actuation_time_s": float(total_rotation_time_s),
+        "estimated_rotation_time_s": float(total_rotation_time_s),
+        "total_mission_time_s": float(total_mission_time_s),
+        "estimated_end_to_end_time_s": float(total_mission_time_s),
+        "total_move_measure_time_s": float(total_mission_time_s),
+        "path_segments": path_segments,
+        "num_motion_segments": int(len(path_segments)),
+        "total_compute_time_s": total_compute_time_s,
+        "ig_compute_time_s": float(total_ig_wall_s),
+        "mean_orientation_selection_time_s": mean_ig_wall_s,
+        "max_orientation_selection_time_s": max_ig_wall_s,
+        "pf_compute_time_s": float(total_pf_wall_s),
+        "mean_pf_update_time_s": mean_pf_wall_s,
+        "max_pf_update_time_s": max_pf_wall_s,
+        "prune_time_s": float(total_prune_wall_s),
+        "viz_time_s": float(total_viz_wall_s),
+        "wall_clock_runtime_s": wall_clock_runtime_s,
+    }
+    setattr(estimator, "mission_metrics", mission_metrics)
     if save_outputs:
         print(f"Final PF visualization saved to: {pf_out_path}")
         print(f"Final estimates-only visualization saved to: {estimates_out_path}")
         if last_spectrum is not None:
             print(f"Final spectrum saved to: {spectrum_out_path}")
-    print(f"Total measurements: {step_counter}, total live time (simulated): {total_meas_time:.1f} s")
+    print(
+        f"Total measurements: {step_counter}, "
+        f"live={total_meas_time:.1f}s, "
+        f"travel={total_motion_time_s:.1f}s, "
+        f"shield={total_rotation_time_s:.1f}s, "
+        f"mission={total_mission_time_s:.1f}s"
+    )
+    print(
+        "Mission timing summary: "
+        f"distance={total_motion_distance_m:.2f}m "
+        f"motion={total_motion_time_s:.1f}s "
+        f"rotation={total_rotation_time_s:.1f}s "
+        f"end_to_end={mission_metrics['estimated_end_to_end_time_s']:.1f}s "
+        f"compute={total_compute_time_s:.3f}s "
+        f"ig_mean={mean_ig_wall_s:.3f}s "
+        f"pf_mean={mean_pf_wall_s:.3f}s "
+        f"wall_clock={wall_clock_runtime_s:.2f}s"
+    )
     gt_by_iso: dict[str, list[dict[str, float | list[float]]]] = {}
     for src in sources:
         gt_by_iso.setdefault(src.isotope, []).append(

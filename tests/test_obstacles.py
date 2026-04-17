@@ -6,6 +6,7 @@ import numpy as np
 
 from measurement.obstacles import (
     ObstacleGrid,
+    build_obstacle_grid,
     generate_obstacle_grid,
     load_or_generate_obstacle_grid,
 )
@@ -61,3 +62,52 @@ def test_load_or_generate_obstacle_grid_creates_file(tmp_path: Path) -> None:
     assert path.exists()
     loaded = ObstacleGrid.load(path)
     assert loaded == grid
+
+
+def test_build_obstacle_grid_fixed_uses_json_layout(tmp_path: Path) -> None:
+    """Fixed mode should load the JSON-backed obstacle layout."""
+    path = tmp_path / "fixed_layout.json"
+    original = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((0, 1), (2, 2)),
+    )
+    original.save(path)
+
+    loaded = build_obstacle_grid(
+        mode="fixed",
+        path=path,
+        size_x=3.0,
+        size_y=3.0,
+        rng_seed=123,
+    )
+
+    assert loaded == original
+    assert ObstacleGrid.load(path) == original
+
+
+def test_build_obstacle_grid_random_is_ephemeral_and_seeded(tmp_path: Path) -> None:
+    """Random mode should create an in-memory layout without writing a file."""
+    path = tmp_path / "random_layout.json"
+
+    grid_one = build_obstacle_grid(
+        mode="random",
+        path=path,
+        size_x=6.0,
+        size_y=6.0,
+        blocked_fraction=0.35,
+        rng_seed=7,
+    )
+    grid_two = build_obstacle_grid(
+        mode="random",
+        path=path,
+        size_x=6.0,
+        size_y=6.0,
+        blocked_fraction=0.35,
+        rng_seed=7,
+    )
+
+    assert not path.exists()
+    assert grid_one == grid_two
+    assert grid_one.blocked_cells

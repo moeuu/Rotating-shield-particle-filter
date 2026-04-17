@@ -81,10 +81,20 @@ def main() -> None:
         help="Path to a JSON file that defines blocked grid cells.",
     )
     parser.add_argument(
+        "--environment-mode",
+        type=str,
+        default="fixed",
+        choices=("fixed", "random"),
+        help=(
+            "Environment generation mode: fixed loads the obstacle JSON, "
+            "random creates a fresh obstacle layout at startup."
+        ),
+    )
+    parser.add_argument(
         "--obstacle-seed",
         type=int,
         default=None,
-        help="RNG seed used when creating a new obstacle layout file.",
+        help="RNG seed used when creating a fixed missing layout or a random startup layout.",
     )
     parser.add_argument(
         "--no-obstacles",
@@ -223,6 +233,49 @@ def main() -> None:
         action="store_true",
         help="Enable per-isotope convergence gating (default: disabled).",
     )
+    parser.add_argument(
+        "--sim-backend",
+        type=str,
+        default="analytic",
+        choices=("analytic", "isaacsim", "geant4"),
+        help="Simulation backend used for observation generation.",
+    )
+    parser.add_argument(
+        "--sim-config",
+        type=str,
+        default=None,
+        help="Optional JSON config path for the selected simulation backend.",
+    )
+    parser.add_argument(
+        "--blender-executable",
+        type=str,
+        default=None,
+        help="Blender executable path used by --environment-mode random.",
+    )
+    parser.add_argument(
+        "--blender-output",
+        type=str,
+        default=None,
+        help="Optional USD output path for the Blender-generated random environment.",
+    )
+    parser.add_argument(
+        "--blender-timeout-s",
+        type=float,
+        default=120.0,
+        help="Timeout for Blender random environment generation.",
+    )
+    parser.add_argument(
+        "--robot-speed",
+        type=float,
+        default=0.5,
+        help="Nominal robot travel speed in m/s used for mission-time accounting.",
+    )
+    parser.add_argument(
+        "--rotation-overhead-s",
+        type=float,
+        default=0.5,
+        help="Fixed shield actuation overhead per measurement in seconds.",
+    )
     args = parser.parse_args()
     if args.max_sources is None:
         args.max_sources = 3 if args.birth else 1
@@ -279,6 +332,7 @@ def main() -> None:
         ig_threshold_mode=args.ig_threshold_mode,
         ig_threshold_rel=args.ig_threshold_rel,
         ig_threshold_min=args.ig_threshold_min,
+        environment_mode=args.environment_mode,
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
         eval_match_radius_m=args.eval_match_radius,
@@ -289,6 +343,13 @@ def main() -> None:
         pose_candidates=args.pose_candidates,
         pose_min_dist=args.pose_min_dist,
         converge=args.converge,
+        sim_backend=args.sim_backend,
+        sim_config_path=args.sim_config,
+        blender_executable=args.blender_executable,
+        blender_output_path=args.blender_output,
+        blender_timeout_s=args.blender_timeout_s,
+        nominal_motion_speed_m_s=args.robot_speed,
+        rotation_overhead_s=args.rotation_overhead_s,
     )
 
 

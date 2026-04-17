@@ -330,6 +330,60 @@ class SpectralDecomposer:
         fitted = design @ coeffs
         return {name: float(val) for name, val in zip(iso_names, coeffs)}, fitted
 
+    def compute_response_model_counts(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        isotopes: Sequence[str],
+        include_background: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Estimate isotope counts by fitting the full detector response matrix.
+
+        The peak-window method is useful for line-level diagnostics, but it is not
+        a conservative unmixing operator when multiple isotopes contribute
+        overlapping continua or neighboring photopeaks. This method fits the raw
+        spectrum to the same response columns used by ``simulate_spectrum`` and
+        therefore returns source-equivalent counts on the transport-model scale.
+        """
+        energy_axis = np.asarray(self.energy_axis, dtype=float)
+        observed = np.asarray(spectrum, dtype=float)
+        requested = [str(isotope) for isotope in isotopes]
+        counts: Dict[str, float] = {isotope: 0.0 for isotope in requested}
+        if observed.size == 0 or energy_axis.size == 0:
+            return counts
+        if observed.size != energy_axis.size:
+            min_len = min(observed.size, energy_axis.size)
+            logger.warning(
+                "Spectrum length (%d) != energy axis length (%d); truncating to %d",
+                observed.size,
+                energy_axis.size,
+                min_len,
+            )
+            observed = observed[:min_len]
+            response_matrix = self.response_matrix[:min_len, :]
+            background_shape = self._background_shape[:min_len]
+        else:
+            response_matrix = self.response_matrix
+            background_shape = self._background_shape
+
+        indices = [
+            self.isotope_names.index(isotope)
+            for isotope in requested
+            if isotope in self.isotope_names
+        ]
+        if not indices:
+            return counts
+        design_columns = [response_matrix[:, index] for index in indices]
+        fit_names = [self.isotope_names[index] for index in indices]
+        if include_background:
+            design_columns.append(np.asarray(background_shape, dtype=float))
+        design = np.column_stack(design_columns)
+        coeffs = nnls_solve(design, observed)
+        for name, value in zip(fit_names, coeffs[: len(fit_names)]):
+            counts[name] = max(float(value), 0.0)
+        return counts
+
     def isotope_counts(self, spectrum: NDArray[np.float64]) -> Dict[str, float]:
         """Return isotope-wise counts suitable for PF updates."""
         return self.compute_isotope_counts_thesis(
@@ -651,6 +705,7 @@ class SpectralDecomposer:
         spectrum: NDArray[np.float64],
         *,
         live_time_s: float = 1.0,
+        count_method: str = "peak_window",
         detect_isotopes: bool = True,
         detect_threshold_abs: float = 0.1,
         detect_threshold_rel: float = 0.2,
@@ -677,18 +732,32 @@ class SpectralDecomposer:
         Return isotope-wise counts plus detected isotopes.
 
         Detection uses peak matching and minimum peak counts. The returned
-        isotope-wise counts follow the thesis pipeline: smoothing, ALS baseline,
-        net peak integration within ±3 sigma(E), and branching-ratio weighting.
+        isotope-wise counts follow ``count_method``:
+
+        - ``peak_window`` uses the thesis pipeline: smoothing, ALS baseline,
+          net peak integration within ±3 sigma(E), and branching-ratio weighting.
+        - ``response_matrix`` fits the full detector response matrix by NNLS and
+          returns source-equivalent counts on the transport-model scale.
+
         Use min_peaks_by_isotope to override the required peak count for specific
         isotopes. Use detect_threshold_rel_by_isotope to override the relative
         threshold for specific isotopes.
         """
+        normalized_count_method = str(count_method).strip().lower()
+        if normalized_count_method not in {"peak_window", "response_matrix"}:
+            raise ValueError(f"Unknown count_method: {count_method}")
         if not detect_isotopes:
-            counts = self.compute_isotope_counts_thesis(
-                spectrum,
-                live_time_s=live_time_s,
-                isotopes=self._analysis_isotopes(),
-            )
+            if normalized_count_method == "response_matrix":
+                counts = self.compute_response_model_counts(
+                    spectrum,
+                    isotopes=self._analysis_isotopes(),
+                )
+            else:
+                counts = self.compute_isotope_counts_thesis(
+                    spectrum,
+                    live_time_s=live_time_s,
+                    isotopes=self._analysis_isotopes(),
+                )
             return counts, set(self._analysis_isotopes())
         cfg = self.config
         active_set = set(active_isotopes or [])
@@ -735,12 +804,18 @@ class SpectralDecomposer:
         else:
             new_active = set(detected)
         debug_lines = cfg.detect_debug if debug_detection is None else debug_detection
-        counts_full = self.compute_isotope_counts_thesis(
-            spectrum,
-            live_time_s=live_time_s,
-            isotopes=self._analysis_isotopes(),
-            debug_lines=bool(debug_lines),
-        )
+        if normalized_count_method == "response_matrix":
+            counts_full = self.compute_response_model_counts(
+                spectrum,
+                isotopes=self._analysis_isotopes(),
+            )
+        else:
+            counts_full = self.compute_isotope_counts_thesis(
+                spectrum,
+                live_time_s=live_time_s,
+                isotopes=self._analysis_isotopes(),
+                debug_lines=bool(debug_lines),
+            )
         if "Eu-154" in new_active and counts_full.get("Eu-154", 0.0) > 0.0:
             active_wo_eu = [iso for iso in new_active if iso != "Eu-154"]
             if active_wo_eu:

@@ -1,0 +1,52 @@
+{
+  "fit_statistics": {
+    "Co-60": {
+      "max_abs_relative_residual": 1.4185085698651772e-12,
+      "mean_relative_residual": -8.511051419357508e-14,
+      "net_counts_sum": 25636.3636364,
+      "num_fit_points": 2.0,
+      "relative_standard_error": 1.3306789903062698e-12,
+      "scale": 1.0000000000014186,
+      "standard_error": 1.3306789903081576e-12,
+      "theory_counts_sum": 25636.363636363632
+    },
+    "Cs-137": {
+      "max_abs_relative_residual": 8.628703653812409e-13,
+      "mean_relative_residual": 6.291763080845917e-14,
+      "net_counts_sum": 67835.3658536,
+      "num_fit_points": 2.0,
+      "relative_standard_error": 7.974746072972617e-13,
+      "scale": 0.999999999999137,
+      "standard_error": 7.974746072965735e-13,
+      "theory_counts_sum": 67835.36585365854
+    },
+    "Eu-154": {
+      "max_abs_relative_residual": 7.844282663364538e-12,
+      "mean_relative_residual": 3.996734044397954e-13,
+      "net_counts_sum": 17611.6838488,
+      "num_fit_points": 2.0,
+      "relative_standard_error": 7.433884133203406e-12,
+      "scale": 1.0000000000001559,
+      "standard_error": 7.433884133204565e-12,
+      "theory_counts_sum": 17611.68384879725
+    }
+  },
+  "measurement_space": "spectrum_net_counts",
+  "metadata": {
+    "config": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/shield_validation_scene.json",
+    "count_method": "geant4_source_tally",
+    "fit_role": "fit",
+    "history_scale": 5.0,
+    "measurement_replicates": 1,
+    "protocol": "built-in",
+    "source_config": "/home/moeu/research/Rotating-shield-particle-filter/source_layouts/shield_validation.json",
+    "template_intensity_scale": 5.0,
+    "validation_role": "validate"
+  },
+  "model": "net_counts = response_scale[isotope] * ideal_inverse_square_shield_counts",
+  "scale_by_isotope": {
+    "Co-60": 1.0000000000014186,
+    "Cs-137": 0.999999999999137,
+    "Eu-154": 1.0000000000001559
+  }
+}

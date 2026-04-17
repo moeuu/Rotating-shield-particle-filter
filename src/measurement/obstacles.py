@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 import numpy as np
 
@@ -258,3 +258,49 @@ def load_or_generate_obstacle_grid(
     )
     grid.save(path)
     return grid
+
+
+def build_obstacle_grid(
+    *,
+    mode: Literal["fixed", "random"],
+    path: Path | None,
+    size_x: float,
+    size_y: float,
+    cell_size: float = 1.0,
+    blocked_fraction: float = 0.4,
+    rng_seed: int | None = None,
+    keep_free_points: Iterable[Sequence[float]] | None = None,
+) -> ObstacleGrid:
+    """
+    Build an obstacle grid in fixed or random mode.
+
+    Fixed mode keeps the current JSON-backed workflow by loading the layout from
+    disk or generating it once when the file does not exist. Random mode always
+    creates a fresh in-memory layout for the current run and never writes it to
+    disk.
+    """
+    normalized_mode = mode.strip().lower()
+    if normalized_mode == "fixed":
+        if path is None:
+            raise ValueError("path is required when mode is 'fixed'.")
+        return load_or_generate_obstacle_grid(
+            path,
+            size_x=size_x,
+            size_y=size_y,
+            cell_size=cell_size,
+            blocked_fraction=blocked_fraction,
+            rng_seed=rng_seed,
+            keep_free_points=keep_free_points,
+        )
+    if normalized_mode == "random":
+        rng = np.random.default_rng(rng_seed)
+        return generate_obstacle_grid(
+            size_x=size_x,
+            size_y=size_y,
+            cell_size=cell_size,
+            blocked_fraction=blocked_fraction,
+            origin=(0.0, 0.0),
+            rng=rng,
+            keep_free_points=keep_free_points,
+        )
+    raise ValueError(f"Unknown obstacle grid mode: {mode}")

@@ -61,11 +61,14 @@ def expected_counts_per_source(
     fe_indices: NDArray[np.int64] | None = None,
     pb_indices: NDArray[np.int64] | None = None,
     orient_indices: NDArray[np.int64] | None = None,
+    source_scale: float = 1.0,
 ) -> NDArray[np.float64]:
     """
     Return per-source expected counts Λ_{k,m} for each measurement k.
 
     Supports either paired Fe/Pb indices or single orientation indices.
+    source_scale maps ideal source counts into the measurement domain while
+    leaving the additive background term to the caller.
     """
     if sources.size == 0:
         return np.zeros((len(live_times), 0), dtype=float)
@@ -95,5 +98,5 @@ def expected_counts_per_source(
                 )
             else:
                 raise ValueError("Either fe_indices/pb_indices or orient_indices must be provided.")
-            lambda_m[k, m] = live_time * kernel_val * float(strengths[m])
+            lambda_m[k, m] = live_time * max(float(source_scale), 0.0) * kernel_val * float(strengths[m])
     return lambda_m

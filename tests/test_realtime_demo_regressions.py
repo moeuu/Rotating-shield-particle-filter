@@ -101,8 +101,8 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         return np.array([[1.0, 1.0, 0.5], [2.0, 2.0, 0.5]], dtype=float)
 
     def _fake_next_pose(*args: object, **kwargs: object) -> int:
-        """Select the first candidate pose."""
-        return 0
+        """Select the candidate that requires travel from the initial pose."""
+        return 1
 
     def _fake_gpu_enabled(self: RotatingShieldPFEstimator) -> bool:
         """Pretend GPU is disabled to avoid CUDA checks in tests."""
@@ -140,10 +140,32 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         pf_config_overrides={"orientation_k": 1},
         save_outputs=False,
         return_state=True,
+        nominal_motion_speed_m_s=1.0,
+        rotation_overhead_s=2.0,
     )
     assert estimator is not None
     assert len(estimator.measurements) >= 2
     assert len(estimator.poses) >= 2
+    metrics = estimator.mission_metrics
+    assert metrics["total_measurements"] >= 2
+    assert metrics["total_motion_distance_m"] == pytest.approx(np.sqrt(2.0))
+    assert metrics["total_travel_time_s"] == pytest.approx(np.sqrt(2.0))
+    assert metrics["total_shield_actuation_time_s"] == pytest.approx(
+        metrics["total_measurements"] * 2.0
+    )
+    assert metrics["total_mission_time_s"] == pytest.approx(
+        metrics["total_live_time_s"]
+        + metrics["total_travel_time_s"]
+        + metrics["total_shield_actuation_time_s"]
+    )
+    assert metrics["estimated_end_to_end_time_s"] == pytest.approx(
+        metrics["total_mission_time_s"]
+    )
+    assert metrics["num_motion_segments"] == 1
+    assert len(metrics["path_segments"]) == 1
+    assert metrics["path_segments"][0]["travel_time_s"] == pytest.approx(np.sqrt(2.0))
+    assert metrics["mean_orientation_selection_time_s"] >= 0.0
+    assert metrics["mean_pf_update_time_s"] >= 0.0
     for rec in estimator.measurements:
         for iso in ANALYSIS_ISOTOPES:
             assert iso in rec.z_k

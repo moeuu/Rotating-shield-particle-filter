@@ -99,6 +99,7 @@ class RotatingShieldPFConfig:
         - use_fast_gpu_rollout: enable approximate fast GPU rollouts for uncertainty prediction
         - ig_workers: number of parallel workers for IG grid evaluation (0 = auto)
         - use_tempering: enable ESS-targeted tempered updates in the PF
+        - measurement_scale_by_isotope: isotope-wise source response scales
         - label_enable: enable label alignment for continuous particles
         - label_alignment_iters: iterations for label alignment refinement
         - converge_enable: enable per-isotope convergence gating
@@ -121,6 +122,7 @@ class RotatingShieldPFConfig:
     strength_sigma: float = 0.1
     background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
+    measurement_scale_by_isotope: Dict[str, float] | None = None
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
@@ -365,6 +367,7 @@ class RotatingShieldPFEstimator:
             strength_sigma=self.pf_config.strength_sigma,
             background_sigma=self.pf_config.background_sigma,
             background_level=self.pf_config.background_level,
+            measurement_scale_by_isotope=self.pf_config.measurement_scale_by_isotope,
             min_strength=self.pf_config.min_strength,
             p_birth=self.pf_config.p_birth,
             p_kill=self.pf_config.p_kill,
@@ -444,6 +447,13 @@ class RotatingShieldPFEstimator:
             raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
         return True
 
+    def response_scale_for_isotope(self, isotope: str) -> float:
+        """Return the configured source response scale for one isotope."""
+        scales = self.pf_config.measurement_scale_by_isotope
+        if not isinstance(scales, dict):
+            return 1.0
+        return max(float(scales.get(isotope, 1.0)), 0.0)
+
     def expected_counts_pair_for_states(
         self,
         isotope: str,
@@ -488,6 +498,7 @@ class RotatingShieldPFEstimator:
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
+            source_scale=self.response_scale_for_isotope(isotope),
         )
         return lam_t.detach().cpu().numpy()
 
@@ -928,6 +939,7 @@ class RotatingShieldPFEstimator:
                 live_times=data.live_times,
                 fe_indices=data.fe_indices,
                 pb_indices=data.pb_indices,
+                source_scale=self.response_scale_for_isotope(iso),
             )
             lambda_total = background_counts + np.sum(lambda_m, axis=1)
             ll = poisson_log_likelihood(data.z_k, lambda_total)
@@ -1047,6 +1059,7 @@ class RotatingShieldPFEstimator:
                 live_time_s=live_time_s,
                 device=device,
                 dtype=dtype,
+                source_scale=self.response_scale_for_isotope(isotope),
             )
 
         total_ig = 0.0
@@ -1451,6 +1464,7 @@ class RotatingShieldPFEstimator:
                     live_time_s=live_time_per_rot_s,
                     device=device,
                     dtype=dtype,
+                    source_scale=self.response_scale_for_isotope(iso),
                 )
                 lam_list.append(lam_t)
             if not lam_list:
