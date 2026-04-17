@@ -136,7 +136,8 @@ class Geant4Application:
                 except ModuleNotFoundError as exc:
                     raise RuntimeError(
                         "Geant4 use_mock_stage=false requires Isaac Sim Python modules. "
-                        "Run the Geant4 bridge with sidecar_python pointing to Isaac Sim's python.sh."
+                        "Run the bridge with Isaac Sim's python.sh or set "
+                        "ISAACSIM_PYTHON=/path/to/isaacsim/python.sh for auto-start."
                     ) from exc
         self._stage_backend = backend
         self.scene_builder = SceneBuilder(

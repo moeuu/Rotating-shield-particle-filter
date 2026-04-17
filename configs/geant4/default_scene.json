@@ -5,6 +5,7 @@
   "timeout_s": 120.0,
   "start_isaacsim_sidecar_with_geant4": true,
   "isaacsim_sidecar_config_path": "configs/isaacsim/real_scene.json",
+  "isaacsim_sidecar_python_env": "ISAACSIM_PYTHON",
   "use_mock_stage": true,
   "headless": true,
   "renderer": "RayTracedLighting",

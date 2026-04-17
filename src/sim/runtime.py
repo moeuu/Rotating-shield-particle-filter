@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -352,6 +353,49 @@ def _merged_config_from_path(
     return merged
 
 
+def _resolve_executable_path(path_value: str) -> str:
+    """Expand shell variables and user home markers in an executable path."""
+    return Path(os.path.expandvars(path_value)).expanduser().as_posix()
+
+
+def _config_requires_isaacsim_python(config: dict[str, Any]) -> bool:
+    """Return True when a sidecar must be launched with Isaac Sim's Python."""
+    if bool(config.get("requires_isaacsim_python", False)):
+        return True
+    if str(config.get("mode", "")).strip().lower() == "real":
+        return True
+    return config.get("use_mock_stage") is False
+
+
+def _resolve_sidecar_python(config: dict[str, Any], sidecar_name: str) -> str:
+    """Resolve the Python executable used to launch a sidecar process."""
+    configured = config.get("sidecar_python")
+    if configured not in (None, ""):
+        return _resolve_executable_path(str(configured))
+
+    env_names: list[str] = ["SIMBRIDGE_SIDECAR_PYTHON"]
+    configured_env = config.get("sidecar_python_env")
+    if configured_env not in (None, ""):
+        env_names.insert(0, str(configured_env))
+    if (
+        _config_requires_isaacsim_python(config)
+        and "ISAACSIM_PYTHON" not in env_names
+    ):
+        env_names.append("ISAACSIM_PYTHON")
+    for env_name in env_names:
+        env_value = os.environ.get(env_name)
+        if env_value:
+            return _resolve_executable_path(env_value)
+
+    if _config_requires_isaacsim_python(config):
+        raise RuntimeError(
+            f"{sidecar_name} sidecar requires Isaac Sim Python. Set "
+            "ISAACSIM_PYTHON=/path/to/isaacsim/python.sh or set "
+            "sidecar_python in the config."
+        )
+    return sys.executable
+
+
 def _start_sidecar_process(
     *,
     script_path: Path,
@@ -367,8 +411,8 @@ def _start_sidecar_process(
     """Start a sidecar subprocess and wait until it accepts TCP connections."""
     root = _repo_root()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    python_executable = _resolve_sidecar_python(config, sidecar_name)
     log_handle = log_path.open("a", encoding="utf-8")
-    python_executable = str(config.get("sidecar_python", sys.executable))
     command = [
         python_executable,
         script_path.as_posix(),
@@ -527,10 +571,16 @@ def _start_isaacsim_sidecar(config: dict[str, Any]) -> IsaacSimTCPClientRuntime:
     if not log_path.is_absolute():
         log_path = (root / log_path).resolve()
     startup_timeout_s = float(config.get("isaacsim_sidecar_startup_timeout_s", 60.0))
-    process_config = dict(config)
+    process_config = dict(isaac_config)
     isaac_python = config.get("isaacsim_sidecar_python", isaac_config.get("sidecar_python"))
     if isaac_python not in (None, ""):
         process_config["sidecar_python"] = str(isaac_python)
+    isaac_python_env = config.get(
+        "isaacsim_sidecar_python_env",
+        isaac_config.get("sidecar_python_env"),
+    )
+    if isaac_python_env not in (None, ""):
+        process_config["sidecar_python_env"] = str(isaac_python_env)
     try:
         process, log_handle = _start_sidecar_process(
             script_path=script_path,

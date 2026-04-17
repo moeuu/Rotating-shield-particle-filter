@@ -33,13 +33,13 @@
   },
   "measurement_space": "spectrum_net_counts",
   "metadata": {
-    "config": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/shield_validation_scene.json",
+    "config": "configs/geant4/shield_validation_scene.json",
     "count_method": "geant4_source_tally",
     "fit_role": "fit",
     "history_scale": 5.0,
     "measurement_replicates": 1,
     "protocol": "built-in",
-    "source_config": "/home/moeu/research/Rotating-shield-particle-filter/source_layouts/shield_validation.json",
+    "source_config": "source_layouts/shield_validation.json",
     "template_intensity_scale": 5.0,
     "validation_role": "validate"
   },

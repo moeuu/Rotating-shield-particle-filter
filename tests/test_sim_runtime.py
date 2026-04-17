@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
 from types import ModuleType, SimpleNamespace
@@ -935,6 +936,50 @@ def test_create_simulation_runtime_supports_geant4() -> None:
     )
 
     assert isinstance(runtime, Geant4TCPClientRuntime)
+
+
+def test_sidecar_python_resolves_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Isaac-dependent sidecars should use an environment-configured Python."""
+    import sim.runtime as runtime_module
+
+    monkeypatch.setenv("ISAACSIM_PYTHON", "/opt/isaacsim/python.sh")
+    resolved = runtime_module._resolve_sidecar_python(
+        {"use_mock_stage": False},
+        "Geant4",
+    )
+
+    assert resolved == "/opt/isaacsim/python.sh"
+
+
+def test_sidecar_python_does_not_use_isaac_env_for_mock_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock sidecars should stay on the current Python unless explicitly configured."""
+    import sim.runtime as runtime_module
+
+    monkeypatch.setenv("ISAACSIM_PYTHON", "/opt/isaacsim/python.sh")
+    monkeypatch.delenv("SIMBRIDGE_SIDECAR_PYTHON", raising=False)
+    resolved = runtime_module._resolve_sidecar_python(
+        {"use_mock_stage": True},
+        "Geant4",
+    )
+
+    assert resolved == sys.executable
+
+
+def test_sidecar_python_requires_env_for_real_isaac_configs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real Isaac sidecars should fail early without a portable Python setting."""
+    import sim.runtime as runtime_module
+
+    monkeypatch.delenv("ISAACSIM_PYTHON", raising=False)
+    monkeypatch.delenv("SIMBRIDGE_SIDECAR_PYTHON", raising=False)
+
+    with pytest.raises(RuntimeError, match="ISAACSIM_PYTHON"):
+        runtime_module._resolve_sidecar_python({"mode": "real"}, "Isaac Sim")
 
 
 def test_create_simulation_runtime_auto_starts_geant4_sidecar(

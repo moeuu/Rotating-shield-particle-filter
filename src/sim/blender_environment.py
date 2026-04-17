@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,16 +17,16 @@ DEFAULT_BLENDER_SCRIPT = ROOT / "scripts" / "generate_blender_environment.py"
 
 def resolve_blender_executable(blender_executable: str | None = None) -> str:
     """Return the Blender executable path or raise a clear error."""
-    candidate = blender_executable or "blender"
+    candidate = blender_executable or os.environ.get("BLENDER") or "blender"
     if any(separator in candidate for separator in ("/", "\\")):
-        path = Path(candidate).expanduser()
+        path = Path(os.path.expandvars(candidate)).expanduser()
         if path.exists():
             return path.as_posix()
     resolved = shutil.which(candidate)
     if resolved is None:
         raise FileNotFoundError(
             "Blender executable was not found. Install Blender, add it to PATH, "
-            "or pass --blender-executable /path/to/blender."
+            "set BLENDER=/path/to/blender, or pass --blender-executable /path/to/blender."
         )
     return resolved
 

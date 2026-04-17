@@ -110,12 +110,14 @@ uv run python main.py \
 ```
 
 For a real Isaac Sim stage, run the sidecar with Isaac Sim's Python so the
-`isaacsim`, `omni`, and `pxr` packages are available. Replace the path below
-with your local Isaac Sim `python.sh` if needed.
+`isaacsim`, `omni`, and `pxr` packages are available. Set `ISAACSIM_PYTHON`
+once for your machine:
 
 ```bash
+export ISAACSIM_PYTHON=/path/to/isaacsim/python.sh
+
 # Terminal 1: real headless Isaac Sim sidecar.
-/home/moeu/.local/isaacsim/5.1.0/python.sh \
+"$ISAACSIM_PYTHON" \
   scripts/run_isaacsim_bridge.py \
   --config configs/isaacsim/real_scene.json
 
@@ -132,7 +134,7 @@ robot motion, shields, sources, and radiation visualization:
 
 ```bash
 # Terminal 1: GUI sidecar. This config keeps the sidecar alive after main exits.
-/home/moeu/.local/isaacsim/5.1.0/python.sh \
+"$ISAACSIM_PYTHON" \
   scripts/run_isaacsim_bridge.py \
   --config configs/isaacsim/gui_scene.json
 
@@ -162,9 +164,10 @@ meshes/textures, so it must be converted to USD before `real_scene.json` and
 uv run python scripts/prepare_manchester_dataset.py --list
 
 # Download, verify, extract, convert Drum_Store to USD, and write an Isaac config.
+# If Blender is not on PATH, set BLENDER=/path/to/blender first.
 uv run python scripts/prepare_manchester_dataset.py \
   --asset Drum_Store \
-  --blender-executable /home/moeu/.local/bin/blender
+  --blender-executable "${BLENDER:-blender}"
 ```
 
 Prepared files are written under `data/manchester_nuclear_assets/`, which is
@@ -176,7 +179,7 @@ Run the converted Manchester scene like this:
 
 ```bash
 # Terminal 1
-/home/moeu/.local/isaacsim/5.1.0/python.sh \
+"$ISAACSIM_PYTHON" \
   scripts/run_isaacsim_bridge.py \
   --config configs/isaacsim/manchester_drum_store.json
 
@@ -212,7 +215,7 @@ visualization. Start the Isaac sidecar with Isaac Sim Python first, then let
 
 ```bash
 # Terminal 1
-/home/moeu/.local/isaacsim/5.1.0/python.sh \
+"$ISAACSIM_PYTHON" \
   scripts/run_isaacsim_bridge.py \
   --config configs/isaacsim/real_scene.json
 
@@ -252,6 +255,8 @@ uv run python scripts/build_geant4_sidecar.py
 Run the PF loop with the external engine:
 
 ```bash
+export ISAACSIM_PYTHON=/path/to/isaacsim/python.sh
+
 uv run python main.py \
   --sim-backend geant4 \
   --sim-config configs/geant4/external_scene.json \

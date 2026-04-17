@@ -85,6 +85,15 @@ def _resolve_path(path_value: str | Path) -> Path:
     return (ROOT / path).resolve()
 
 
+def _metadata_path(path: Path) -> str:
+    """Return a repository-relative path for calibration metadata when possible."""
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.relative_to(ROOT).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
 def _load_protocol(path: Path | None, dwell_time_s: float) -> list[dict[str, Any]]:
     """Load a shot protocol or return the built-in shield-validation protocol."""
     if path is None:
@@ -572,9 +581,9 @@ def main() -> None:
         fit_records,
         isotopes=isotopes,
         metadata={
-            "config": config_path.as_posix(),
-            "source_config": source_path.as_posix(),
-            "protocol": "built-in" if protocol_path is None else protocol_path.as_posix(),
+            "config": _metadata_path(config_path),
+            "source_config": _metadata_path(source_path),
+            "protocol": "built-in" if protocol_path is None else _metadata_path(protocol_path),
             "fit_role": "fit",
             "validation_role": "validate",
             "count_method": count_method,

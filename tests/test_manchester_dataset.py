@@ -137,7 +137,8 @@ def test_usd_backed_geant4_configs_use_manchester_drum_store() -> None:
         assert payload["usd_path"] == expected_usd
         assert payload["use_mock_stage"] is False
         assert payload["author_obstacle_prims"] is False
-        assert payload["sidecar_python"] == "/home/moeu/.local/isaacsim/5.1.0/python.sh"
+        assert "sidecar_python" not in payload
+        assert payload["sidecar_python_env"] == "ISAACSIM_PYTHON"
         assert payload["stage_material_rules"] == [
             {"path_prefix": "/World/Environment", "material": "concrete"}
         ]
