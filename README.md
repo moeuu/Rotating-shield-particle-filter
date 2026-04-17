@@ -33,154 +33,258 @@ uv add torch
 The demo automatically enables GPU when CUDA is available. Set `use_gpu=False` in
 `RotatingShieldPFConfig` to force CPU mode.
 
-## Real-time visualization
+## Running simulations
 
-To run the real-time particle filter visualization demo:
+`main.py` runs the particle-filter loop. The `--sim-backend` option controls
+where observations come from:
 
+| Backend | Command role | External requirements |
+| --- | --- | --- |
+| `analytic` | In-process Python spectrum simulator. | None beyond `uv sync`. |
+| `isaacsim` | TCP client that talks to `scripts/run_isaacsim_bridge.py`. | Isaac Sim only for real mode; mock mode works without it. |
+| `geant4` | TCP client that talks to `scripts/run_geant4_bridge.py`. | Surrogate mode needs no native Geant4; external mode needs a built Geant4 executable. |
+
+All runs write final plots under `results/` by default:
+`results/result_pf*.png`, `results/result_estimates*.png`, and
+`results/result_spectrum*.png`. Use `--output-tag <name>` to keep results from
+different runs separate.
+
+Common options:
+
+```bash
+--headless                 # disable the interactive Matplotlib window
+--max-steps 5              # stop after a fixed number of measurements
+--max-poses 3              # stop after a fixed number of robot poses
+--source-config PATH       # load sources from JSON, default source_layouts/Ex1.json
+--obstacle-config PATH     # load blocked cells from JSON, default obstacle_layouts/Ex1_obstacles.json
+--environment-mode random  # generate a fresh obstacle map for this run
+--obstacle-seed 7          # make fixed generation or random mode reproducible
+--robot-speed 0.5          # nominal travel speed used in mission-time accounting
+--rotation-overhead-s 0.5  # fixed shield actuation overhead per measurement
 ```
-uv run python main.py
+
+### Analytic backend
+
+Use this for the fastest smoke tests and for development that does not need a
+live simulator process.
+
+```bash
+uv run python main.py --sim-backend analytic --headless --max-steps 3
 ```
 
-The run shows robot trajectory, shield orientations, particle clouds, and estimated sources; `results/result_pf.png` is written at the end, alongside the final spectrum as `results/result_spectrum.png`.
-
-## Isaac Sim bridge workflow
-
-This repository now supports a simulator backend boundary for observation generation.
-
-Default analytic backend:
+Interactive visualization is enabled by default when `--headless` is omitted:
 
 ```bash
 uv run python main.py --sim-backend analytic
 ```
 
-Bridge-based Isaac Sim backend:
+Random obstacle layouts can also be generated at startup. If Blender is
+available, a matching USD environment is written under
+`results/blender_environments/`.
 
 ```bash
-# Terminal 1: start the sidecar bridge in mock mode.
-# The default config points at the Manchester Drum_Store USD, but mock mode
-# keeps using the lightweight fake stage for fast smoke checks.
+uv run python main.py \
+  --sim-backend analytic \
+  --environment-mode random \
+  --obstacle-seed 7 \
+  --headless \
+  --max-steps 3
+```
+
+### Isaac Sim backend
+
+The Isaac Sim backend is a two-process workflow: first start the sidecar, then
+run `main.py` as a TCP client. Mock mode is the lightest check and does not
+start a real Isaac Sim Kit application.
+
+```bash
+# Terminal 1: mock sidecar on 127.0.0.1:5555.
 uv run python scripts/run_isaacsim_bridge.py --mock
 
-# Terminal 2: run the PF loop against the bridge.
-uv run python main.py --sim-backend isaacsim
+# Terminal 2: PF loop using that sidecar.
+uv run python main.py \
+  --sim-backend isaacsim \
+  --sim-config configs/isaacsim/default_scene.json \
+  --headless \
+  --max-steps 3
 ```
 
-Real Isaac Sim sidecar with the default Manchester Drum_Store USD:
+For a real Isaac Sim stage, run the sidecar with Isaac Sim's Python so the
+`isaacsim`, `omni`, and `pxr` packages are available. Replace the path below
+with your local Isaac Sim `python.sh` if needed.
 
 ```bash
-# Terminal 1: start Isaac Sim headless and load the Manchester Drum_Store stage.
-uv run python scripts/run_isaacsim_bridge.py --config configs/isaacsim/real_scene.json
+# Terminal 1: real headless Isaac Sim sidecar.
+/home/moeu/.local/isaacsim/5.1.0/python.sh \
+  scripts/run_isaacsim_bridge.py \
+  --config configs/isaacsim/real_scene.json
 
-# Terminal 2: run the PF loop against the live sidecar.
-uv run python main.py --sim-backend isaacsim
+# Terminal 2: PF loop using the same host/port/timeouts.
+uv run python main.py \
+  --sim-backend isaacsim \
+  --sim-config configs/isaacsim/real_scene.json \
+  --headless \
+  --max-steps 5
 ```
 
-The real sidecar opens the configured USD stage, authors helper prims for the robot, detector, shields, obstacles, and source markers, then streams observations back through the bridge. Observation generation now uses scene geometry for obstacle and shield attenuation by tracing the source-to-detector segment through authored solid prims. Path-prefix material rules are supported, prim-level `simbridge:material` overrides them, and standard USD `material:binding` is also resolved. Bound materials can override attenuation either with direct `simbridge_mu_*` inputs, with `simbridge_density_g_cm3` plus `simbridge_mass_att_*_cm2_g`, or with a `simbridge_material_preset` / `simbridge_composition` fallback when explicit isotope coefficients are missing. The real backend now applies attenuation per gamma line energy before response-matrix synthesis, so multi-line nuclides can harden spectrally through dense materials even though the detector itself is still modeled analytically rather than with a native Isaac radiation sensor.
+Use the GUI config when you want the Isaac Sim viewport to stay open and show
+robot motion, shields, sources, and radiation visualization:
 
-## Manchester nuclear environment assets
+```bash
+# Terminal 1: GUI sidecar. This config keeps the sidecar alive after main exits.
+/home/moeu/.local/isaacsim/5.1.0/python.sh \
+  scripts/run_isaacsim_bridge.py \
+  --config configs/isaacsim/gui_scene.json
+
+# Terminal 2: drive it from the PF loop.
+uv run python main.py \
+  --sim-backend isaacsim \
+  --sim-config configs/isaacsim/gui_scene.json \
+  --headless \
+  --max-steps 10
+```
+
+The real sidecar opens the configured USD stage, authors helper prims for the
+robot, detector, Fe/Pb shields, obstacles, and source markers, then streams
+observations back through the bridge. Obstacle and shield attenuation are
+computed by tracing the source-to-detector segment through authored solids.
+Material rules can be assigned by path prefix, `simbridge:material`, standard
+USD material bindings, or explicit attenuation metadata.
+
+### Manchester nuclear environment assets
 
 The University of Manchester dataset is distributed as Gazebo SDF plus Collada
-meshes/textures, so it must be converted to USD before Isaac Sim can load it.
-The helper below downloads one Figshare ZIP, verifies its MD5, extracts it, runs
-Blender to export USD, and writes an Isaac Sim bridge config. The default Isaac
-Sim configs now use the converted Drum_Store USD at
-`data/manchester_nuclear_assets/usd/drum_store.usda`; the older
-`configs/isaacsim/demo_room.usda` is kept only as a lightweight smoke-test
-asset.
+meshes/textures, so it must be converted to USD before `real_scene.json` and
+`gui_scene.json` can load the Drum_Store environment.
 
 ```bash
-# Show available assets and their Figshare download URLs.
+# Show available Figshare assets.
 uv run python scripts/prepare_manchester_dataset.py --list
 
-# Prepare the generic drum-store room environment.
-uv run python scripts/prepare_manchester_dataset.py --asset Drum_Store
-
-# Terminal 1: start Isaac Sim with the converted Manchester USD.
-uv run python scripts/run_isaacsim_bridge.py --config configs/isaacsim/manchester_drum_store.json
-
-# Terminal 2: run the PF loop against that scene.
-uv run python main.py --sim-backend isaacsim
+# Download, verify, extract, convert Drum_Store to USD, and write an Isaac config.
+uv run python scripts/prepare_manchester_dataset.py \
+  --asset Drum_Store \
+  --blender-executable /home/moeu/.local/bin/blender
 ```
 
-The prepared files are written under `data/manchester_nuclear_assets/`, which is
-ignored by git because the full dataset is large. Blender must be installed and
-available on `PATH`, or passed with
-`--blender-executable /home/moeu/.local/bin/blender`.
+Prepared files are written under `data/manchester_nuclear_assets/`, which is
+ignored by git because the full dataset is large. The default converted USD path
+is `data/manchester_nuclear_assets/usd/drum_store.usda`, and the generated
+config is `configs/isaacsim/manchester_drum_store.json`.
 
-## Geant4 bridge workflow
-
-This repository now also supports a `geant4` backend that keeps the existing PF loop unchanged and returns a detector spectrum through the same sidecar protocol.
-
-Default Geant4 surrogate backend with a mock stage:
+Run the converted Manchester scene like this:
 
 ```bash
-# Terminal 1: start the Geant4 sidecar.
-uv run python scripts/run_geant4_bridge.py --config configs/geant4/default_scene.json
+# Terminal 1
+/home/moeu/.local/isaacsim/5.1.0/python.sh \
+  scripts/run_isaacsim_bridge.py \
+  --config configs/isaacsim/manchester_drum_store.json
 
-# Terminal 2: run the PF loop against the Geant4 bridge.
-uv run python main.py --sim-backend geant4 --sim-config configs/geant4/default_scene.json
+# Terminal 2
+uv run python main.py \
+  --sim-backend isaacsim \
+  --sim-config configs/isaacsim/manchester_drum_store.json \
+  --headless \
+  --max-steps 5
 ```
 
-USD-backed Geant4 sidecar using the Manchester Drum_Store mesh:
+### Geant4 backend
+
+The Geant4 backend uses the same sidecar protocol as Isaac Sim. `main.py`
+auto-starts the Geant4 sidecar when no server is already listening on the
+configured port. Sidecar logs go to `results/sidecars/`.
+
+For a pure headless smoke test, use the surrogate engine with a mock stage and
+no Isaac Sim companion:
 
 ```bash
-# Terminal 1: start the Geant4 sidecar against the USD stage.
-# Manual starts must use Isaac Sim Python so USD mesh traversal is available.
-/home/moeu/.local/isaacsim/5.1.0/python.sh scripts/run_geant4_bridge.py --config configs/geant4/real_scene.json
-
-# Terminal 2: run the PF loop against the Geant4 bridge.
-uv run python main.py --sim-backend geant4 --sim-config configs/geant4/real_scene.json
+uv run python main.py \
+  --sim-backend geant4 \
+  --sim-config configs/geant4/surrogate_no_isaac.json \
+  --headless \
+  --max-steps 3
 ```
 
-When `main.py` auto-starts the sidecar, the Geant4 configs use their
-`sidecar_python` setting to launch the bridge with Isaac Sim Python. The Geant4
-sidecar reuses the Manchester USD stage as the scene source of truth, exports
-mesh geometry under `/World/Environment`, and generates a detector spectrum from
-that exported geometry. The current implementation includes Poisson source
-emission, stage/shield attenuation, scatter-continuum synthesis,
-detector-volume scaling, and dead-time scaling inside a surrogate engine so the
-runtime contract is ready before a native Geant4 executable is connected.
-
-Native Geant4 executable path:
+Use `configs/geant4/default_scene.json` when you want the surrogate Geant4
+observation model paired with an Isaac Sim sidecar for robot motion and
+visualization. Start the Isaac sidecar with Isaac Sim Python first, then let
+`main.py` auto-start the Geant4 sidecar and reuse the running Isaac sidecar.
 
 ```bash
-# Build the native sidecar after installing Geant4 and exposing geant4-config.
+# Terminal 1
+/home/moeu/.local/isaacsim/5.1.0/python.sh \
+  scripts/run_isaacsim_bridge.py \
+  --config configs/isaacsim/real_scene.json
+
+# Terminal 2
+uv run python main.py \
+  --sim-backend geant4 \
+  --sim-config configs/geant4/default_scene.json \
+  --headless \
+  --max-steps 5
+```
+
+For a real USD-backed surrogate run against the Manchester Drum_Store mesh,
+prepare the Manchester assets first, then use:
+
+```bash
+uv run python main.py \
+  --sim-backend geant4 \
+  --sim-config configs/geant4/real_scene.json \
+  --headless \
+  --max-steps 5
+```
+
+`configs/geant4/real_scene.json` uses the surrogate Geant4 engine while reading
+scene geometry from the USD stage. It includes Poisson source emission,
+stage/shield attenuation, scatter-continuum synthesis, detector-volume scaling,
+and dead-time scaling.
+
+### Native Geant4 executable
+
+Install Geant4 first and make sure `geant4-config` is on `PATH`, then build the
+native sidecar executable:
+
+```bash
 uv run python scripts/build_geant4_sidecar.py
-
-# Terminal 1: start the Python bridge against the native executable and USD mesh.
-/home/moeu/.local/isaacsim/5.1.0/python.sh scripts/run_geant4_bridge.py --config configs/geant4/external_scene.json
-
-# Terminal 2: run the PF loop against the Geant4 bridge.
-uv run python main.py --sim-backend geant4 --sim-config configs/geant4/external_scene.json
 ```
 
-The native Geant4 source lives in `native/geant4_sidecar/geant4_sidecar.cpp`. The external engine now uses a file-based protocol between Python and the native executable so the Geant4 code does not need a JSON dependency.
+Run the PF loop with the external engine:
+
+```bash
+uv run python main.py \
+  --sim-backend geant4 \
+  --sim-config configs/geant4/external_scene.json \
+  --headless \
+  --max-steps 5
+```
+
+The native source is `native/geant4_sidecar/geant4_sidecar.cpp`. The Python
+bridge communicates with it through a file-based request/response protocol, so
+the C++ executable does not need a JSON dependency. GUI external-engine configs
+are available as `configs/geant4/external_gui_scene.json`,
+`configs/geant4/demo_room_external_gui.json`, and
+`configs/geant4/demo_room_scatter_attenuation_external_gui.json`.
 
 ### Geant4 net-response calibration
 
 The PF likelihood expects isotope-wise counts in the same measurement space as
-the spectrum unfolding output. Analytic Python/surrogate runs use
+the spectrum unfolding output. Analytic Python and surrogate Geant4 runs use
 `spectrum_count_method: "response_matrix"` so mixed-isotope spectra are unfolded
-with the same detector response matrix that generated them. This avoids the
-non-conservative cross-talk that occurs when peak-window net areas are compared
-directly with inverse-square/shield theory. Native-external Geant4 configs point to
-`configs/geant4/net_response_calibration.json`, which stores isotope-specific
-response factors mapping ideal inverse-square/shield counts into spectrum-net
-counts. Regenerate the factors and shield-validation report with:
+with the same detector response matrix that generated them. Native external
+Geant4 configs use `configs/geant4/net_response_calibration.json` to map ideal
+inverse-square/shield counts into spectrum-net counts.
+
+Regenerate the calibration and validation report with:
 
 ```bash
 PYTHONPATH=src uv run python scripts/calibrate_geant4_net_response.py --dwell-time-s 30.0
 ```
 
-The validation layout in `source_layouts/shield_validation.json` places the
-sources in the octant that is blocked by `fe_index=7` / `pb_index=7`, while
-`configs/geant4/shield_validation_scene.json` runs an obstacle-free native
-Geant4 scene with `physics_profile: "theory_tvl"`. In that profile, the native
-sidecar applies the same Beer-Lambert TVL attenuation to the source term and
-disables the physical shield volume to avoid double attenuation. The validation
-script uses the sidecar's source-equivalent tally for the transport-scale
-comparison and keeps spectrum-derived peak-window counts as diagnostics in
-`results/geant4_net_response_validation.csv`.
+The validation layout is `source_layouts/shield_validation.json`, and the
+validation config is `configs/geant4/shield_validation_scene.json`. The script
+writes diagnostics to `results/geant4_net_response_validation.csv` and updates
+the JSON calibration payload.
 
 ## Birth move smoke test
 
