@@ -29,7 +29,9 @@ from sim.transport import (
     make_transport_segment,
 )
 from sim.shield_geometry import (
+    FE_SHIELD_INNER_RADIUS_M,
     FE_SHIELD_THICKNESS_CM,
+    PB_SHIELD_INNER_RADIUS_M,
     PB_SHIELD_THICKNESS_CM,
     spherical_octant_path_length_cm,
 )
@@ -277,12 +279,14 @@ class IsaacSimObservationModel(ObservationModel):
             detector_pose.translation_xyz,
             fe_pose.orientation_wxyz,
             thickness_cm=FE_SHIELD_THICKNESS_CM,
+            inner_radius_cm=FE_SHIELD_INNER_RADIUS_M * 100.0,
         )
         pb_length_cm = spherical_octant_path_length_cm(
             source_xyz,
             detector_pose.translation_xyz,
             pb_pose.orientation_wxyz,
             thickness_cm=PB_SHIELD_THICKNESS_CM,
+            inner_radius_cm=PB_SHIELD_INNER_RADIUS_M * 100.0,
         )
         return float(fe_length_cm), float(pb_length_cm)
 

@@ -1,11 +1,14 @@
 """Tests for continuous 3D kernel evaluation (Sec. 3.2–3.3)."""
 
 import numpy as np
+import pytest
 
 from measurement.continuous_kernels import ContinuousKernel, geometric_term
 from measurement.kernels import ShieldParams
+from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
 from measurement.continuous_kernels import expected_counts_single_isotope
+from pf.gpu_utils import expected_counts_pair_torch
 
 
 def test_geometric_term_inverse_square() -> None:
@@ -148,6 +151,155 @@ def test_expected_counts_pair_matches_single_helper() -> None:
         isotope_id="Cs-137",
         kernel=kernel,
     )
-    import pytest
-
     assert pair_counts == pytest.approx(single, rel=1e-12)
+
+
+def test_concrete_obstacle_path_reduces_kernel_value() -> None:
+    """A blocked concrete cell should attenuate the source-detector kernel by its path length."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    )
+    shield_params = ShieldParams(mu_fe=0.0, mu_pb=0.0)
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    free_kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+
+    assert kernel.obstacle_path_length_cm(source, detector) == pytest.approx(100.0)
+    blocked = kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
+    unblocked = free_kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
+    assert blocked == pytest.approx(unblocked * np.exp(-1.0), rel=1e-12)
+
+
+def test_spherical_shell_path_uses_radial_overlap_near_detector() -> None:
+    """Shield path length should use exact radial overlap with the spherical shell."""
+    shield_params = ShieldParams(
+        mu_fe=0.1,
+        mu_pb=0.0,
+        thickness_fe_cm=5.0,
+        thickness_pb_cm=0.0,
+        inner_radius_fe_cm=19.0,
+        inner_radius_pb_cm=26.0,
+    )
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.0}},
+        shield_params=shield_params,
+        use_gpu=False,
+    )
+    detector = np.zeros(3, dtype=float)
+    direction = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
+    source = direction * 0.205
+
+    attenuation = kernel.attenuation_factor_pair(
+        "Cs-137",
+        source,
+        detector,
+        fe_index=7,
+        pb_index=0,
+    )
+    assert attenuation == pytest.approx(np.exp(-0.1 * 1.5), rel=1e-12)
+
+
+def test_concrete_obstacle_misses_off_axis_ray() -> None:
+    """Obstacle attenuation should be unity when the ray does not cross blocked cells."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    )
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 2.0, 1.0], dtype=float)
+    detector = np.array([2.0, 2.0, 1.0], dtype=float)
+
+    assert kernel.obstacle_path_length_cm(source, detector) == pytest.approx(0.0)
+    assert kernel.attenuation_factor_pair("Cs-137", source, detector, 0, 0) == pytest.approx(1.0)
+
+
+def test_gpu_expected_counts_include_obstacle_attenuation_on_cpu_device() -> None:
+    """The torch expected-count path should apply the same obstacle attenuation."""
+    torch = pytest.importorskip("torch")
+    device = torch.device("cpu")
+    dtype = torch.float64
+    positions = torch.as_tensor([[[-1.0, 0.0, 1.0]]], device=device, dtype=dtype)
+    strengths = torch.as_tensor([[9.0]], device=device, dtype=dtype)
+    backgrounds = torch.zeros(1, device=device, dtype=dtype)
+    mask = torch.ones(1, 1, device=device, dtype=dtype)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+    boxes = np.array([[0.0, -0.5, 0.0, 1.0, 0.5, 2.0]], dtype=float)
+
+    counts = expected_counts_pair_torch(
+        detector_pos=detector,
+        positions=positions,
+        strengths=strengths,
+        backgrounds=backgrounds,
+        mask=mask,
+        fe_index=0,
+        pb_index=0,
+        mu_fe=0.0,
+        mu_pb=0.0,
+        thickness_fe_cm=0.0,
+        thickness_pb_cm=0.0,
+        live_time_s=1.0,
+        device=device,
+        dtype=dtype,
+        obstacle_boxes_m=boxes,
+        obstacle_mu_cm_inv=0.01,
+    )
+    expected = (9.0 / 9.0) * np.exp(-1.0)
+    assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
+
+
+def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
+    """The torch expected-count path should match exact spherical-shell path length."""
+    torch = pytest.importorskip("torch")
+    device = torch.device("cpu")
+    dtype = torch.float64
+    direction = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
+    source = direction * 0.205
+    positions = torch.as_tensor(source.reshape(1, 1, 3), device=device, dtype=dtype)
+    strengths = torch.ones(1, 1, device=device, dtype=dtype)
+    backgrounds = torch.zeros(1, device=device, dtype=dtype)
+    mask = torch.ones(1, 1, device=device, dtype=dtype)
+
+    counts = expected_counts_pair_torch(
+        detector_pos=np.zeros(3, dtype=float),
+        positions=positions,
+        strengths=strengths,
+        backgrounds=backgrounds,
+        mask=mask,
+        fe_index=7,
+        pb_index=0,
+        mu_fe=0.1,
+        mu_pb=0.0,
+        thickness_fe_cm=5.0,
+        thickness_pb_cm=0.0,
+        inner_radius_fe_cm=19.0,
+        inner_radius_pb_cm=26.0,
+        live_time_s=1.0,
+        device=device,
+        dtype=dtype,
+    )
+    expected = (1.0 / (0.205**2)) * np.exp(-0.15)
+    assert float(counts[0]) == pytest.approx(expected, rel=1e-12)

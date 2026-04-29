@@ -8,8 +8,10 @@ from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.state import IsotopeState
 from planning.pose_selection import (
     estimate_lambda_cost,
+    minimum_observation_shortfall,
     recommend_num_rollouts,
     select_next_pose,
+    select_next_pose_from_candidates,
     select_next_pose_after_rotation,
 )
 from planning.candidate_generation import generate_candidate_poses
@@ -180,6 +182,54 @@ def test_estimate_lambda_cost_range_scales_motion() -> None:
     lam = estimate_lambda_cost(uncertainties, distances, method="range")
     expected = (4.0 - 1.0) / (2.5 - 0.5)
     assert lam == pytest.approx(expected)
+
+
+def test_minimum_observation_shortfall_is_zero_only_when_all_isotopes_visible() -> None:
+    """Observation shortfall should penalize any isotope below the count target."""
+    assert minimum_observation_shortfall(
+        {"Cs-137": 5.0, "Co-60": 5.0},
+        min_counts=5.0,
+    ) == pytest.approx(0.0)
+    assert minimum_observation_shortfall(
+        {"Cs-137": 5.0, "Co-60": 0.0},
+        min_counts=5.0,
+    ) > 0.0
+
+
+def test_pose_selection_prefers_all_isotope_observability() -> None:
+    """Soft observability constraints should prevent single-isotope pose bias."""
+
+    class _FairnessEstimator:
+        """Minimal estimator exposing the pose-planning methods under test."""
+
+        pf_config = None
+
+        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
+            """Return identical uncertainty for every candidate."""
+            return 0.0
+
+        def expected_observation_counts_by_isotope_at_pose(
+            self,
+            pose_xyz: np.ndarray,
+            **kwargs: object,
+        ) -> dict[str, float]:
+            """Return candidate-dependent isotope observability."""
+            if float(pose_xyz[0]) < 0.5:
+                return {"Cs-137": 10.0, "Co-60": 0.0}
+            return {"Cs-137": 5.0, "Co-60": 5.0}
+
+    candidates = np.array([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=float)
+    selected = select_next_pose_from_candidates(
+        estimator=_FairnessEstimator(),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        lambda_cost=0.0,
+        min_observation_counts=5.0,
+        min_observation_penalty_scale=1.0,
+        num_rollouts=1,
+    )
+
+    assert selected == 1
 
 
 def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:

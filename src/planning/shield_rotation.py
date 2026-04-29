@@ -80,6 +80,19 @@ def _filter_planning_isotopes(
     return filtered_particles, filtered_alpha
 
 
+def _continuous_kernel_for_estimator(estimator: RotatingShieldPFEstimator):
+    """Build a ContinuousKernel matching the estimator observation model."""
+    from measurement.continuous_kernels import ContinuousKernel
+
+    return ContinuousKernel(
+        mu_by_isotope=estimator.mu_by_isotope,
+        shield_params=estimator.shield_params,
+        obstacle_grid=getattr(estimator, "obstacle_grid", None),
+        obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
+        obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
+    )
+
+
 def _surrogate_scores(
     estimator: RotatingShieldPFEstimator,
     pose_idx: int,
@@ -137,13 +150,11 @@ def _surrogate_scores_gpu(
     if pose_idx < 0 or pose_idx >= len(estimator.poses):
         raise IndexError("pose_idx out of range")
     torch_mod, gpu_utils, device, dtype = gpu_ctx
-    from measurement.continuous_kernels import ContinuousKernel
-
     packed = _pack_states_by_isotope(particles_by_isotope, torch_mod, gpu_utils, device, dtype)
     if not packed:
         return {}
     detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
-    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
+    kernel = _continuous_kernel_for_estimator(estimator)
     from measurement.shielding import octant_index_from_rotation
 
     fe_indices = [octant_index_from_rotation(R) for R in RFe_candidates]
@@ -172,11 +183,15 @@ def _surrogate_scores_gpu(
                     mu_pb=mu_pb,
                     thickness_fe_cm=shield_params.thickness_fe_cm,
                     thickness_pb_cm=shield_params.thickness_pb_cm,
+                    inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+                    inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+                    shield_geometry_model=shield_params.shield_geometry_model,
                     use_angle_attenuation=shield_params.use_angle_attenuation,
                     live_time_s=live_time_s,
                     device=device,
                     dtype=dtype,
                     source_scale=estimator.response_scale_for_isotope(iso),
+                    **kernel.obstacle_gpu_kwargs(iso),
                 )
                 if metric == "var_log_lambda":
                     vals = torch_mod.log(lam_t + eps)
@@ -262,10 +277,8 @@ def _eig_scores_gpu(
     if not candidate_ids:
         return {}
     torch_mod, gpu_utils, device, dtype = gpu_ctx
-    from measurement.continuous_kernels import ContinuousKernel
-
     detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
-    kernel = ContinuousKernel(mu_by_isotope=estimator.mu_by_isotope, shield_params=estimator.shield_params)
+    kernel = _continuous_kernel_for_estimator(estimator)
     packed = _pack_states_by_isotope(particles_by_isotope, torch_mod, gpu_utils, device, dtype)
     if not packed:
         return {}
@@ -314,11 +327,15 @@ def _eig_scores_gpu(
                 mu_pb=mu_pb,
                 thickness_fe_cm=shield_params.thickness_fe_cm,
                 thickness_pb_cm=shield_params.thickness_pb_cm,
+                inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+                inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+                shield_geometry_model=shield_params.shield_geometry_model,
                 use_angle_attenuation=shield_params.use_angle_attenuation,
                 live_time_s=live_time_s,
                 device=device,
                 dtype=dtype,
                 source_scale=estimator.response_scale_for_isotope(iso),
+                **kernel.obstacle_gpu_kwargs(iso),
             )
             if num_samples <= 0:
                 H_post_mean = torch_mod.zeros((), device=device, dtype=dtype)

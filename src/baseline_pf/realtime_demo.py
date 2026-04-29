@@ -39,7 +39,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 
-from measurement.model import EnvironmentConfig, PointSource, inverse_square_scale
+from measurement.model import EnvironmentConfig, PointSource
 from measurement.obstacles import build_obstacle_grid
 from spectrum.pipeline import SpectralDecomposer
 from sim.blender_environment import generate_blender_environment_usd
@@ -112,11 +112,6 @@ def _detect_isotopes_from_counts(
         if val >= detect_threshold_abs and (max_c <= 0.0 or val / max_c >= rel_thresh):
             detected.add(iso)
     return detected
-
-
-def _detect_isotopes_from_expected(counts: dict[str, float]) -> set[str]:
-    """Return isotopes detected from expected counts (any positive count)."""
-    return {iso for iso, val in counts.items() if val > 0.0}
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -218,27 +213,6 @@ def _report_gpu_status() -> None:
         print("[baseline] GPU check: torch not installed; using CPU.")
 
 
-def _expected_counts(
-    sources: list[PointSource],
-    isotopes: list[str],
-    detector_pos: np.ndarray,
-    live_time_s: float,
-) -> dict[str, float]:
-    """Compute inverse-square expected counts per isotope at an explicit pose."""
-    counts: dict[str, float] = {}
-    detector = np.asarray(detector_pos, dtype=float)
-    for iso in isotopes:
-        iso_sources = [src for src in sources if src.isotope == iso]
-        if not iso_sources:
-            counts[iso] = 0.0
-            continue
-        rate = 0.0
-        for src in iso_sources:
-            rate += float(src.intensity_cps_1m) * float(inverse_square_scale(detector, src))
-        counts[iso] = float(live_time_s * rate)
-    return counts
-
-
 def run_baseline_pf(
     *,
     live: bool = True,
@@ -250,16 +224,12 @@ def run_baseline_pf(
     detect_threshold_abs: float = 30.0,
     detect_threshold_rel: float = 0.2,
     eval_match_radius_m: float = 0.5,
-    count_mode: str = "spectrum",
     converge: bool = False,
     blender_executable: str | None = None,
     blender_output_path: str | None = None,
     blender_timeout_s: float = 120.0,
 ) -> None:
     """Run the baseline PF with active pose selection and no shielding."""
-    count_mode = count_mode.strip().lower()
-    if count_mode not in {"spectrum", "expected"}:
-        raise ValueError(f"Unknown count_mode: {count_mode}")
     env = EnvironmentConfig(
         size_x=10.0,
         size_y=20.0,
@@ -418,51 +388,35 @@ def run_baseline_pf(
             current_pose_idx = step_idx
         sim_elapsed = 0.0
         detect_elapsed = 0.0
-        counts_elapsed = 0.0
         pf_elapsed = 0.0
         viz_elapsed = 0.0
-        if count_mode == "expected":
-            counts_start = time.perf_counter()
-            counts_for_pf = _expected_counts(
-                sources,
-                isotopes,
-                detector_pos=current_pose,
-                live_time_s=MEASUREMENT_TIME_S,
-            )
-            counts_elapsed = time.perf_counter() - counts_start
-            detected = _detect_isotopes_from_expected(counts_for_pf)
-        else:
-            sim_start = time.perf_counter()
-            env_step = EnvironmentConfig(detector_position=tuple(current_pose))
-            spectrum, _ = decomposer.simulate_spectrum(
-                sources=sources,
-                environment=env_step,
-                acquisition_time=MEASUREMENT_TIME_S,
-                rng=np.random.default_rng(123 + step_idx),
-            )
-            sim_elapsed = time.perf_counter() - sim_start
-            detect_start = time.perf_counter()
-            spectrum_counts, detected = decomposer.isotope_counts_with_detection(
-                spectrum,
-                live_time_s=MEASUREMENT_TIME_S,
-                detect_threshold_abs=detect_threshold_abs,
-                detect_threshold_rel=detect_threshold_rel,
-                detect_threshold_rel_by_isotope=DETECT_REL_THRESH_BY_ISOTOPE,
-                min_peaks_by_isotope=DETECT_MIN_PEAKS_BY_ISOTOPE,
-            )
-            detect_elapsed = time.perf_counter() - detect_start
-            counts_for_pf = spectrum_counts
-        if count_mode == "expected":
-            active_isotopes = set(detected)
-        else:
-            active_isotopes = _update_detection_hysteresis(
-                set(detected),
-                detect_counts,
-                miss_counts,
-                active_isotopes,
-                consecutive=DETECT_CONSECUTIVE,
-                consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
-            )
+        sim_start = time.perf_counter()
+        env_step = EnvironmentConfig(detector_position=tuple(current_pose))
+        spectrum, _ = decomposer.simulate_spectrum(
+            sources=sources,
+            environment=env_step,
+            acquisition_time=MEASUREMENT_TIME_S,
+            rng=np.random.default_rng(123 + step_idx),
+        )
+        sim_elapsed = time.perf_counter() - sim_start
+        detect_start = time.perf_counter()
+        counts_for_pf, detected = decomposer.isotope_counts_with_detection(
+            spectrum,
+            live_time_s=MEASUREMENT_TIME_S,
+            detect_threshold_abs=detect_threshold_abs,
+            detect_threshold_rel=detect_threshold_rel,
+            detect_threshold_rel_by_isotope=DETECT_REL_THRESH_BY_ISOTOPE,
+            min_peaks_by_isotope=DETECT_MIN_PEAKS_BY_ISOTOPE,
+        )
+        detect_elapsed = time.perf_counter() - detect_start
+        active_isotopes = _update_detection_hysteresis(
+            set(detected),
+            detect_counts,
+            miss_counts,
+            active_isotopes,
+            consecutive=DETECT_CONSECUTIVE,
+            consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
+        )
         if active_isotopes:
             target_isotopes = set(active_isotopes)
         else:
@@ -523,7 +477,7 @@ def run_baseline_pf(
         print(
             f"[timing step {step_idx}] total={total_elapsed:.3f}s "
             f"sim={sim_elapsed:.3f}s detect={detect_elapsed:.3f}s "
-            f"counts={counts_elapsed:.3f}s pf={pf_elapsed:.3f}s viz={viz_elapsed:.3f}s"
+            f"pf={pf_elapsed:.3f}s viz={viz_elapsed:.3f}s"
         )
         if (step_idx + 1) % SAVE_EVERY_N_STEPS == 0:
             step_path = out_dir / f"step_{step_idx:04d}_pf.png"

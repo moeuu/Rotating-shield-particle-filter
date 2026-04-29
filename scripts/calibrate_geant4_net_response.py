@@ -1,4 +1,4 @@
-"""Fit and validate Geant4 spectrum-net response factors for the PF."""
+"""Validate Geant4 spectrum-derived counts against source-equivalent theory."""
 
 from __future__ import annotations
 
@@ -351,6 +351,11 @@ def _run_shot(
         live_time_s=live_time_s,
         isotopes=isotopes,
     )
+    photopeak_nnls_counts = decomposer.compute_photopeak_nnls_counts(
+        spectrum,
+        live_time_s=live_time_s,
+        isotopes=isotopes,
+    )
     response_matrix_counts = decomposer.compute_response_model_counts(
         spectrum,
         isotopes=isotopes,
@@ -368,6 +373,8 @@ def _run_shot(
     )
     if count_method == "response_matrix":
         net_counts = response_matrix_counts
+    elif count_method == "photopeak_nnls":
+        net_counts = photopeak_nnls_counts
     elif count_method == "geant4_response_matrix":
         net_counts = geant4_response_counts
     elif count_method == "geant4_source_tally":
@@ -404,6 +411,7 @@ def _run_shot(
                 "theory_counts": theory,
                 "net_counts": net,
                 "peak_window_counts": float(peak_window_counts.get(isotope, 0.0)),
+                "photopeak_nnls_counts": float(photopeak_nnls_counts.get(isotope, 0.0)),
                 "response_matrix_counts": float(response_matrix_counts.get(isotope, 0.0)),
                 "geant4_response_counts": float(geant4_response_counts.get(isotope, 0.0)),
                 "geant4_source_tally_counts": float(geant4_source_tally_counts.get(isotope, 0.0)),
@@ -472,7 +480,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dwell-time-s", type=float, default=30.0)
     parser.add_argument(
         "--count-method",
-        choices=("peak_window", "response_matrix", "geant4_response_matrix", "geant4_source_tally"),
+        choices=(
+            "photopeak_nnls",
+            "peak_window",
+            "response_matrix",
+            "geant4_response_matrix",
+            "geant4_source_tally",
+        ),
         default=None,
         help="Spectrum-to-isotope count extraction used for net_counts.",
     )
@@ -492,16 +506,28 @@ def parse_args() -> argparse.Namespace:
         "--history-scale",
         type=float,
         default=1.0,
-        help="Monte Carlo source-intensity multiplier for reported shots; spectra are divided back by this factor.",
+        help=(
+            "Monte Carlo source-intensity multiplier for reported shots; "
+            "spectra are divided back by this factor."
+        ),
     )
-    parser.add_argument("--calibration-output", default="configs/geant4/net_response_calibration.json")
-    parser.add_argument("--report-csv", default="results/geant4_net_response_validation.csv")
-    parser.add_argument("--report-json", default="results/geant4_net_response_validation.json")
+    parser.add_argument(
+        "--calibration-output",
+        default="results/geant4_count_extraction_check.json",
+    )
+    parser.add_argument(
+        "--report-csv",
+        default="results/geant4_net_response_validation.csv",
+    )
+    parser.add_argument(
+        "--report-json",
+        default="results/geant4_net_response_validation.json",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Run the Geant4 net-response calibration workflow."""
+    """Run the Geant4 count-extraction validation workflow."""
     args = parse_args()
     config_path = _resolve_path(args.config)
     source_path = _resolve_path(args.source_config)
@@ -515,18 +541,34 @@ def main() -> None:
         args.count_method
         or runtime_config.get("calibration_count_method")
         or runtime_config.get("spectrum_count_method")
-        or "peak_window"
+        or "photopeak_nnls"
     ).strip().lower()
-    if count_method not in {"peak_window", "response_matrix", "geant4_response_matrix", "geant4_source_tally"}:
+    if count_method not in {
+        "photopeak_nnls",
+        "peak_window",
+        "response_matrix",
+        "geant4_response_matrix",
+        "geant4_source_tally",
+    }:
         raise ValueError(f"Unknown count method: {count_method}")
     template_intensity_scale = float(
-        runtime_config.get("calibration_template_intensity_scale", args.template_intensity_scale)
+        runtime_config.get(
+            "calibration_template_intensity_scale",
+            args.template_intensity_scale,
+        )
     )
     measurement_replicates = max(
-        int(runtime_config.get("calibration_measurement_replicates", args.measurement_replicates)),
+        int(
+            runtime_config.get(
+                "calibration_measurement_replicates",
+                args.measurement_replicates,
+            )
+        ),
         1,
     )
-    history_scale = float(runtime_config.get("calibration_history_scale", args.history_scale))
+    history_scale = float(
+        runtime_config.get("calibration_history_scale", args.history_scale)
+    )
     executable_path = runtime_config.get("executable_path")
     if executable_path:
         resolved_executable = _resolve_path(str(executable_path))
@@ -541,7 +583,10 @@ def main() -> None:
         shield_params=ShieldParams(),
         use_gpu=False,
     )
-    scene = _build_scene(_scale_sources(sources, history_scale), usd_path=runtime_config.get("usd_path"))
+    scene = _build_scene(
+        _scale_sources(sources, history_scale),
+        usd_path=runtime_config.get("usd_path"),
+    )
     protocol = _load_protocol(protocol_path, float(args.dwell_time_s))
     response_templates = None
     if count_method == "geant4_response_matrix":

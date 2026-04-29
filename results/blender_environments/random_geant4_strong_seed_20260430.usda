@@ -1,0 +1,2438 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    doc = "Blender v4.0.2"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def "World"
+{
+    def Xform "Environment"
+    {
+        def Xform "World"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Xform "Environment"
+            {
+                matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                def Xform "EastWall"
+                {
+                    matrix4d xformOp:transform = ( (0.10000000149011612, 0, 0, 0), (0, 20, 0, 0), (0, 0, 3, 0), (10.050000190734863, 10, 1.5, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "EastWall"
+                    {
+                        float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 6, 5, 1, 4, 7, 3, 2, 0, 3, 7, 6, 4, 2, 1, 5]
+                        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0.5, 0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5)]
+                        bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                            interpolation = "uniform"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+
+                def Xform "Floor"
+                {
+                    matrix4d xformOp:transform = ( (10, 0, 0, 0), (0, 20, 0, 0), (0, 0, 0.10000000149011612, 0), (5, 10, -0.05000000074505806, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "Floor"
+                    {
+                        float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 6, 5, 1, 4, 7, 3, 2, 0, 3, 7, 6, 4, 2, 1, 5]
+                        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0.5, 0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5)]
+                        bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                            interpolation = "uniform"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+
+                def Xform "NorthWall"
+                {
+                    matrix4d xformOp:transform = ( (10, 0, 0, 0), (0, 0.10000000149011612, 0, 0), (0, 0, 3, 0), (5, 20.049999237060547, 1.5, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "NorthWall"
+                    {
+                        float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 6, 5, 1, 4, 7, 3, 2, 0, 3, 7, 6, 4, 2, 1, 5]
+                        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0.5, 0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5)]
+                        bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                            interpolation = "uniform"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+
+                def Xform "PillarMesh"
+                {
+                    matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.800000190734863, 10.800000190734863, 0, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "PillarMesh" (
+                        prepend apiSchemas = ["MaterialBindingAPI"]
+                    )
+                    {
+                        uniform bool doubleSided = 1
+                        float3[] extent = [(0, 0, 0), (0.4, 0.4, 2)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7]
+                        rel material:binding = </World/Environment/_materials/ConcreteMaterial_001>
+                        normal3f[] normals = [(-0.5773503, -0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503), (-0.5773503, -0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503), (-0.5773503, -0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (-0.5773503, -0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (0.5773503, -0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503), (0.5773503, 0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503), (-0.5773503, -0.5773503, 0.5773503), (-0.5773503, -0.5773503, 0.5773503), (-0.5773503, 0.5773503, 0.5773503)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0, 0, 0), (0.4, 0, 0), (0.4, 0.4, 0), (0, 0.4, 0), (0, 0, 2), (0.4, 0, 2), (0.4, 0.4, 2), (0, 0.4, 2)]
+                        color3f[] primvars:displayColor = [(0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62), (0.55, 0.6, 0.62)] (
+                            interpolation = "vertex"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+
+                def Xform "SouthWall"
+                {
+                    matrix4d xformOp:transform = ( (10, 0, 0, 0), (0, 0.10000000149011612, 0, 0), (0, 0, 3, 0), (5, -0.05000000074505806, 1.5, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "SouthWall"
+                    {
+                        float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 6, 5, 1, 4, 7, 3, 2, 0, 3, 7, 6, 4, 2, 1, 5]
+                        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0.5, 0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5)]
+                        bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                            interpolation = "uniform"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+
+                def Xform "WestWall"
+                {
+                    matrix4d xformOp:transform = ( (0.10000000149011612, 0, 0, 0), (0, 20, 0, 0), (0, 0, 3, 0), (-0.05000000074505806, 10, 1.5, 1) )
+                    uniform token[] xformOpOrder = ["xformOp:transform"]
+
+                    def Mesh "WestWall"
+                    {
+                        float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                        int[] faceVertexIndices = [0, 1, 2, 3, 4, 5, 6, 7, 0, 6, 5, 1, 4, 7, 3, 2, 0, 3, 7, 6, 4, 2, 1, 5]
+                        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0)] (
+                            interpolation = "faceVarying"
+                        )
+                        point3f[] points = [(0.5, 0.5, 0.5), (-0.5, 0.5, 0.5), (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (-0.5, -0.5, -0.5), (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5), (0.5, -0.5, -0.5)]
+                        bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                            interpolation = "uniform"
+                        )
+                        uniform token subdivisionScheme = "none"
+                    }
+                }
+            }
+
+            def Xform "Looks"
+            {
+                matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+                uniform token[] xformOpOrder = ["xformOp:transform"]
+            }
+        }
+
+        def "_materials"
+        {
+            def Material "ConcreteMaterial_001"
+            {
+                token outputs:surface.connect = </World/Environment/_materials/ConcreteMaterial_001/Principled_BSDF.outputs:surface>
+
+                def Shader "Principled_BSDF"
+                {
+                    uniform token info:id = "UsdPreviewSurface"
+                    float inputs:clearcoat = 0
+                    float inputs:clearcoatRoughness = 0.03
+                    color3f inputs:diffuseColor = (0.8, 0.8, 0.8)
+                    float inputs:ior = 1.45
+                    float inputs:metallic = 0
+                    float inputs:opacity = 1
+                    float inputs:roughness = 0.5
+                    float inputs:specular = 0.5
+                    token outputs:surface
+                }
+            }
+
+            def Material "ConcreteMaterial"
+            {
+                token outputs:surface.connect = </World/Environment/_materials/ConcreteMaterial/previewShader.outputs:surface>
+
+                def Shader "previewShader"
+                {
+                    uniform token info:id = "UsdPreviewSurface"
+                    color3f inputs:diffuseColor = (0.55, 0.58, 0.6)
+                    float inputs:metallic = 0
+                    float inputs:roughness = 0.4
+                    token outputs:surface
+                }
+            }
+        }
+
+        def Xform "Obstacle_0000"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 1.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_001" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0001"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 2.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_002" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0002"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_003" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0003"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_004" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0004"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 7.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_005" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0005"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 8.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_006" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0006"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 12.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_007" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0007"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 15.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_008" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0008"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0.5, 18.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_009" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0009"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (1.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_010" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0010"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (1.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_011" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0011"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (1.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_012" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0012"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (1.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_013" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0013"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (1.5, 17.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_014" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0014"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_015" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0015"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 1.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_016" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0016"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_017" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0017"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 4.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_018" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0018"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 5.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_019" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0019"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_020" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0020"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 8.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_021" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0021"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 9.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_022" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0022"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_023" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0023"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 16.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_024" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0024"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 18.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_025" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0025"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (2.5, 19.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_026" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0026"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_027" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0027"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 1.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_028" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0028"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_029" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0029"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_030" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0030"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 7.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_031" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0031"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 8.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_032" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0032"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 9.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_033" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0033"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_034" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0034"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_035" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0035"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 15.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_036" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0036"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 18.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_037" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0037"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (3.5, 19.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_038" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0038"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_039" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0039"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_040" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0040"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_041" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0041"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_042" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0042"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 14.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_043" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0043"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 15.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_044" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0044"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (4.5, 19.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_045" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0045"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_046" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0046"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 1.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_047" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0047"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 2.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_048" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0048"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_049" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0049"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 8.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_050" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0050"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_051" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0051"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 12.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_052" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0052"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_053" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0053"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (5.5, 18.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_054" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0054"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_055" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0055"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_056" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0056"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 7.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_057" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0057"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 8.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_058" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0058"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 9.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_059" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0059"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 10.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_060" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0060"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 12.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_061" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0061"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_062" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0062"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 14.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_063" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0063"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (6.5, 15.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_064" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0064"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7.5, 0.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_065" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0065"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7.5, 3.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_066" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0066"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7.5, 4.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_067" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0067"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7.5, 12.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_068" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0068"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7.5, 16.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_069" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0069"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 5.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_070" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0070"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 7.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_071" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0071"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 11.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_072" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0072"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 12.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_073" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0073"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 13.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_074" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0074"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 15.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_075" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0075"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (8.5, 19.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_076" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0076"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (9.5, 2.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_077" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0077"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (9.5, 4.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_078" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0078"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (9.5, 5.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_079" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+
+        def Xform "Obstacle_0079"
+        {
+            matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (9.5, 6.5, 1, 1) )
+            uniform token[] xformOpOrder = ["xformOp:transform"]
+
+            def Mesh "Cube_080" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                uniform bool doubleSided = 1
+                float3[] extent = [(-0.5, -0.5, -1), (0.5, 0.5, 1)]
+                int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+                int[] faceVertexIndices = [0, 1, 3, 2, 2, 3, 7, 6, 6, 7, 5, 4, 4, 5, 1, 0, 2, 6, 4, 0, 7, 3, 1, 5]
+                rel material:binding = </World/Environment/_materials/ConcreteMaterial>
+                normal3f[] normals = [(-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (0, 1, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (1, 0, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, -1, 0), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, -1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+                    interpolation = "faceVarying"
+                )
+                point3f[] points = [(-0.5, -0.5, -1), (-0.5, -0.5, 1), (-0.5, 0.5, -1), (-0.5, 0.5, 1), (0.5, -0.5, -1), (0.5, -0.5, 1), (0.5, 0.5, -1), (0.5, 0.5, 1)]
+                bool[] primvars:sharp_face = [1, 1, 1, 1, 1, 1] (
+                    interpolation = "uniform"
+                )
+                texCoord2f[] primvars:UVMap = [(0.375, 0), (0.625, 0), (0.625, 0.25), (0.375, 0.25), (0.375, 0.25), (0.625, 0.25), (0.625, 0.5), (0.375, 0.5), (0.375, 0.5), (0.625, 0.5), (0.625, 0.75), (0.375, 0.75), (0.375, 0.75), (0.625, 0.75), (0.625, 1), (0.375, 1), (0.125, 0.5), (0.375, 0.5), (0.375, 0.75), (0.125, 0.75), (0.625, 0.5), (0.875, 0.5), (0.875, 0.75), (0.625, 0.75)] (
+                    interpolation = "faceVarying"
+                )
+                uniform token subdivisionScheme = "none"
+            }
+        }
+    }
+}
+

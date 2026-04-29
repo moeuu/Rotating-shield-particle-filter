@@ -12,13 +12,15 @@
   "usd_path": "../isaacsim/demo_room.usda",
   "detector_height_m": 0.5,
   "obstacle_height_m": 2.0,
-  "engine_mode": "surrogate",
-  "spectrum_count_method": "response_matrix",
+  "engine_mode": "external",
+  "spectrum_count_method": "photopeak_nnls",
   "physics_profile": "balanced",
-  "thread_count": 4,
+  "thread_count": 8,
   "random_seed_base": 123,
   "dead_time_tau_s": 5.813e-9,
-  "scatter_gain": 0.12,
+  "scatter_gain": 0.0,
+  "persistent_process": true,
+  "executable_path": "build/geant4_sidecar",
   "radiation_visualization": {
     "enabled": true,
     "max_tracks": 96,
@@ -29,9 +31,10 @@
     "miss_spread_m": 0.75
   },
   "detector_model": {
-    "crystal_radius_m": 0.019,
-    "crystal_length_m": 0.038,
+    "crystal_radius_m": 0.038,
+    "crystal_length_m": 0.076,
     "housing_thickness_m": 0.0015,
+    "crystal_shape": "sphere",
     "crystal_material": "cebr3",
     "housing_material": "aluminum"
   },

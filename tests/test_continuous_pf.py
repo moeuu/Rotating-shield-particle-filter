@@ -3,6 +3,7 @@
 import numpy as np
 
 from measurement.continuous_kernels import expected_counts_single_isotope, ContinuousKernel
+from pf.likelihood import count_log_likelihood
 from pf.particle_filter import IsotopeParticleFilter, PFConfig, IsotopeParticle
 from pf.state import IsotopeState
 
@@ -90,6 +91,80 @@ def test_poisson_weight_update_prefers_higher_lambda() -> None:
     pf.update_continuous_pair(z_obs=z_obs, pose_idx=0, fe_index=0, pb_index=0, live_time_s=1.0)
     weights = pf.continuous_weights
     assert weights[0] > weights[1]
+
+
+def test_student_t_count_likelihood_softens_model_mismatch() -> None:
+    """Robust count likelihood should not over-trust a simplified transport kernel."""
+    z_obs = np.array([100.0], dtype=float)
+    lambda_good = np.array([100.0], dtype=float)
+    lambda_mismatch = np.array([50.0], dtype=float)
+
+    poisson_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="poisson",
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="poisson",
+    )
+    robust_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="student_t",
+        transport_model_rel_sigma=0.4,
+        spectrum_count_rel_sigma=0.2,
+        spectrum_count_abs_sigma=5.0,
+        student_t_df=5.0,
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="student_t",
+        transport_model_rel_sigma=0.4,
+        spectrum_count_rel_sigma=0.2,
+        spectrum_count_abs_sigma=5.0,
+        student_t_df=5.0,
+    )
+
+    assert robust_gap > 0.0
+    assert robust_gap < poisson_gap
+
+
+def test_observation_count_variance_softens_spectrum_unfolding_update() -> None:
+    """Spectrum decomposition variance should reduce overconfident count updates."""
+    z_obs = np.array([100.0], dtype=float)
+    lambda_good = np.array([100.0], dtype=float)
+    lambda_mismatch = np.array([60.0], dtype=float)
+
+    certain_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="student_t",
+        observation_count_variance=0.0,
+        student_t_df=5.0,
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="student_t",
+        observation_count_variance=0.0,
+        student_t_df=5.0,
+    )
+    uncertain_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="student_t",
+        observation_count_variance=400.0,
+        student_t_df=5.0,
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="student_t",
+        observation_count_variance=400.0,
+        student_t_df=5.0,
+    )
+
+    assert uncertain_gap > 0.0
+    assert uncertain_gap < certain_gap
 
 
 def test_resampling_increases_neff() -> None:

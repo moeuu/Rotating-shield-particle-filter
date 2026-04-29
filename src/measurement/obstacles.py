@@ -84,6 +84,42 @@ class ObstacleGrid:
             return True
         return idx not in self._blocked_set
 
+    def is_cell_free(self, cell: tuple[int, int]) -> bool:
+        """Return True if the grid cell is inside bounds and not blocked."""
+        ix, iy = (int(cell[0]), int(cell[1]))
+        if ix < 0 or iy < 0:
+            return False
+        if ix >= self.grid_shape[0] or iy >= self.grid_shape[1]:
+            return False
+        return (ix, iy) not in self._blocked_set
+
+    def has_free_path(
+        self,
+        start_point: Sequence[float],
+        goal_point: Sequence[float],
+    ) -> bool:
+        """Return True when two points are connected through free cells."""
+        start = self.cell_index(start_point)
+        goal = self.cell_index(goal_point)
+        if start is None or goal is None:
+            return False
+        if not self.is_cell_free(start) or not self.is_cell_free(goal):
+            return False
+        if start == goal:
+            return True
+        visited = {start}
+        frontier = [start]
+        while frontier:
+            ix, iy = frontier.pop(0)
+            for neighbor in ((ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1)):
+                if neighbor in visited or not self.is_cell_free(neighbor):
+                    continue
+                if neighbor == goal:
+                    return True
+                visited.add(neighbor)
+                frontier.append(neighbor)
+        return False
+
     def blocked_bounds(self) -> list[tuple[float, float, float, float]]:
         """Return (x0, x1, y0, y1) bounds for blocked cells."""
         bounds: list[tuple[float, float, float, float]] = []
@@ -92,6 +128,21 @@ class ObstacleGrid:
             y0 = self.origin[1] + iy * self.cell_size
             bounds.append((x0, x0 + self.cell_size, y0, y0 + self.cell_size))
         return bounds
+
+    def blocked_boxes(
+        self,
+        z_min: float = 0.0,
+        z_max: float = 2.0,
+    ) -> list[tuple[float, float, float, float, float, float]]:
+        """Return blocked cells as 3D boxes (x0, y0, z0, x1, y1, z1)."""
+        z_min = float(z_min)
+        z_max = float(z_max)
+        if z_max < z_min:
+            z_min, z_max = z_max, z_min
+        boxes: list[tuple[float, float, float, float, float, float]] = []
+        for x0, x1, y0, y1 in self.blocked_bounds():
+            boxes.append((x0, y0, z_min, x1, y1, z_max))
+        return boxes
 
     def blocked_polygons(
         self, z: float = 0.0
@@ -171,6 +222,115 @@ def _point_to_cell_index(
     return ix, iy
 
 
+def _cell_center(
+    cell: tuple[int, int],
+    origin: tuple[float, float],
+    cell_size: float,
+) -> tuple[float, float]:
+    """Return the center point of a grid cell."""
+    return (
+        origin[0] + (float(cell[0]) + 0.5) * cell_size,
+        origin[1] + (float(cell[1]) + 0.5) * cell_size,
+    )
+
+
+def _default_passage_points(
+    *,
+    keep_free_cells: set[tuple[int, int]],
+    origin: tuple[float, float],
+    cell_size: float,
+    grid_shape: tuple[int, int],
+) -> list[tuple[float, float]]:
+    """Return default passage waypoints through the grid."""
+    nx, ny = grid_shape
+    if nx <= 0 or ny <= 0:
+        return []
+    corners = [(0, 0), (nx - 1, 0), (0, ny - 1), (nx - 1, ny - 1)]
+    if keep_free_cells:
+        start = sorted(keep_free_cells)[0]
+        goal = max(
+            corners,
+            key=lambda cell: abs(cell[0] - start[0]) + abs(cell[1] - start[1]),
+        )
+    else:
+        start = (0, 0)
+        goal = (nx - 1, ny - 1)
+    return [
+        _cell_center(start, origin, cell_size),
+        _cell_center(goal, origin, cell_size),
+    ]
+
+
+def _random_manhattan_path(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    """Return a randomized 4-connected path between two grid cells."""
+    x, y = start
+    gx, gy = goal
+    path = [(x, y)]
+    while (x, y) != (gx, gy):
+        can_step_x = x != gx
+        can_step_y = y != gy
+        if can_step_x and can_step_y:
+            step_x = bool(rng.integers(0, 2))
+        else:
+            step_x = can_step_x
+        if step_x:
+            x += 1 if gx > x else -1
+        else:
+            y += 1 if gy > y else -1
+        path.append((x, y))
+    return path
+
+
+def _expand_cells(
+    cells: Iterable[tuple[int, int]],
+    *,
+    width_cells: int,
+    grid_shape: tuple[int, int],
+) -> set[tuple[int, int]]:
+    """Return cells expanded to reserve a corridor with the requested width."""
+    nx, ny = grid_shape
+    width = max(1, int(width_cells))
+    lo = (width - 1) // 2
+    hi = width // 2
+    expanded: set[tuple[int, int]] = set()
+    for ix, iy in cells:
+        for dx in range(-lo, hi + 1):
+            for dy in range(-lo, hi + 1):
+                cx = int(ix) + dx
+                cy = int(iy) + dy
+                if 0 <= cx < nx and 0 <= cy < ny:
+                    expanded.add((cx, cy))
+    return expanded
+
+
+def _passage_cells_from_points(
+    points: Iterable[Sequence[float]],
+    *,
+    origin: tuple[float, float],
+    cell_size: float,
+    grid_shape: tuple[int, int],
+    width_cells: int,
+    rng: np.random.Generator,
+) -> set[tuple[int, int]]:
+    """Return reserved cells for a passable corridor through waypoints."""
+    waypoint_cells: list[tuple[int, int]] = []
+    for point in points:
+        idx = _point_to_cell_index(point, origin, cell_size, grid_shape)
+        if idx is not None and (not waypoint_cells or waypoint_cells[-1] != idx):
+            waypoint_cells.append(idx)
+    if len(waypoint_cells) < 2:
+        return set(waypoint_cells)
+    path_cells: list[tuple[int, int]] = []
+    for start, goal in zip(waypoint_cells[:-1], waypoint_cells[1:]):
+        segment = _random_manhattan_path(start, goal, rng)
+        path_cells.extend(segment if not path_cells else segment[1:])
+    return _expand_cells(path_cells, width_cells=width_cells, grid_shape=grid_shape)
+
+
 def generate_obstacle_grid(
     size_x: float,
     size_y: float,
@@ -180,6 +340,8 @@ def generate_obstacle_grid(
     origin: tuple[float, float] = (0.0, 0.0),
     rng: np.random.Generator | None = None,
     keep_free_points: Iterable[Sequence[float]] | None = None,
+    passage_points: Iterable[Sequence[float]] | None = None,
+    passage_width_m: float = 0.0,
 ) -> ObstacleGrid:
     """
     Generate a random obstacle layout by blocking a fraction of grid cells.
@@ -206,10 +368,33 @@ def generate_obstacle_grid(
             idx = _point_to_cell_index(pt, origin, cell_size, (nx, ny))
             if idx is not None:
                 keep_free_cells.add(idx)
+    reserved_cells = set(keep_free_cells)
+    if passage_width_m > 0.0 or passage_points is not None:
+        width_cells = max(1, int(np.ceil(max(float(passage_width_m), cell_size) / cell_size)))
+        waypoints = (
+            list(passage_points)
+            if passage_points is not None
+            else _default_passage_points(
+                keep_free_cells=keep_free_cells,
+                origin=origin,
+                cell_size=cell_size,
+                grid_shape=(nx, ny),
+            )
+        )
+        reserved_cells.update(
+            _passage_cells_from_points(
+                waypoints,
+                origin=origin,
+                cell_size=cell_size,
+                grid_shape=(nx, ny),
+                width_cells=width_cells,
+                rng=rng,
+            )
+        )
     all_indices = np.arange(total)
-    if keep_free_cells:
+    if reserved_cells:
         keep_flat = np.array(
-            [cell[0] + cell[1] * nx for cell in keep_free_cells], dtype=int
+            [cell[0] + cell[1] * nx for cell in reserved_cells], dtype=int
         )
         mask = np.ones(total, dtype=bool)
         mask[keep_flat] = False
@@ -240,6 +425,8 @@ def load_or_generate_obstacle_grid(
     blocked_fraction: float = 0.4,
     rng_seed: int | None = None,
     keep_free_points: Iterable[Sequence[float]] | None = None,
+    passage_points: Iterable[Sequence[float]] | None = None,
+    passage_width_m: float = 0.0,
 ) -> ObstacleGrid:
     """
     Load a layout from disk, or generate and save one when missing.
@@ -255,6 +442,8 @@ def load_or_generate_obstacle_grid(
         origin=(0.0, 0.0),
         rng=rng,
         keep_free_points=keep_free_points,
+        passage_points=passage_points,
+        passage_width_m=passage_width_m,
     )
     grid.save(path)
     return grid
@@ -270,6 +459,8 @@ def build_obstacle_grid(
     blocked_fraction: float = 0.4,
     rng_seed: int | None = None,
     keep_free_points: Iterable[Sequence[float]] | None = None,
+    passage_points: Iterable[Sequence[float]] | None = None,
+    passage_width_m: float = 0.0,
 ) -> ObstacleGrid:
     """
     Build an obstacle grid in fixed or random mode.
@@ -291,6 +482,8 @@ def build_obstacle_grid(
             blocked_fraction=blocked_fraction,
             rng_seed=rng_seed,
             keep_free_points=keep_free_points,
+            passage_points=passage_points,
+            passage_width_m=passage_width_m,
         )
     if normalized_mode == "random":
         rng = np.random.default_rng(rng_seed)
@@ -302,5 +495,7 @@ def build_obstacle_grid(
             origin=(0.0, 0.0),
             rng=rng,
             keep_free_points=keep_free_points,
+            passage_points=passage_points,
+            passage_width_m=passage_width_m,
         )
     raise ValueError(f"Unknown obstacle grid mode: {mode}")

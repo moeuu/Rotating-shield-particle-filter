@@ -41,6 +41,13 @@ def prune_spurious_sources(
     min_strength_abs = params.get("min_strength_abs")
     min_strength_ratio = params.get("min_strength_ratio")
     min_obs_count = float(params.get("min_obs_count", 0.0))
+    likelihood_kwargs = {
+        "model": str(params.get("count_likelihood_model", params.get("model", "poisson"))),
+        "transport_model_rel_sigma": float(params.get("transport_model_rel_sigma", 0.0)),
+        "spectrum_count_rel_sigma": float(params.get("spectrum_count_rel_sigma", 0.0)),
+        "spectrum_count_abs_sigma": float(params.get("spectrum_count_abs_sigma", 0.0)),
+        "student_t_df": float(params.get("count_likelihood_df", 5.0)),
+    }
 
     lambda_m = forward_model(positions, strengths)
     if lambda_m.ndim != 2:
@@ -80,7 +87,13 @@ def prune_spurious_sources(
     if method_key == "deltall":
         if z_use.size == 0:
             return strength_ok
-        delta_ll = delta_log_likelihood_remove(z_use, lambda_total_use, lambda_m_use, epsilon=epsilon)
+        delta_ll = delta_log_likelihood_remove(
+            z_use,
+            lambda_total_use,
+            lambda_m_use,
+            epsilon=epsilon,
+            **likelihood_kwargs,
+        )
         score = delta_ll
         if penalty_d > 0.0:
             penalty = 0.5 * penalty_d * np.log(max(int(z_use.size), 1))
@@ -108,9 +121,15 @@ def prune_spurious_sources(
         residual = float(z_use[k_star] - (total_star - lam_star))
         if residual >= alpha * lam_star:
             continue
-        total_star_safe = max(total_star, epsilon)
-        ratio = min(lam_star / total_star_safe, 1.0 - epsilon)
-        delta_ll = float(z_use[k_star] * (-np.log1p(-ratio)) - lam_star)
+        delta_ll = float(
+            delta_log_likelihood_remove(
+                np.array([z_use[k_star]], dtype=float),
+                np.array([total_star], dtype=float),
+                np.array([[lam_star]], dtype=float),
+                epsilon=epsilon,
+                **likelihood_kwargs,
+            )[0]
+        )
         if delta_ll < lrt_threshold:
             keep_mask[m] = False
     return keep_mask & strength_ok
@@ -140,6 +159,9 @@ def prune_spurious_sources_continuous(
         mu_by_isotope=estimator.mu_by_isotope,
         shield_params=estimator.shield_params,
         use_gpu=False,
+        obstacle_grid=getattr(estimator, "obstacle_grid", None),
+        obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
+        obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
     )
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
     estimates = estimator.estimates()
@@ -183,6 +205,26 @@ def prune_spurious_sources_continuous(
         if min_support > 0 and int(z_k.size) < int(min_support):
             keep_masks[iso] = np.ones(positions.shape[0], dtype=bool)
             continue
+        params_for_iso = dict(method_params)
+        if iso in estimator.filters:
+            likelihood = estimator.filters[iso]._count_likelihood_kwargs()
+            params_for_iso.setdefault("count_likelihood_model", str(likelihood["model"]))
+            params_for_iso.setdefault(
+                "transport_model_rel_sigma",
+                float(likelihood["transport_model_rel_sigma"]),
+            )
+            params_for_iso.setdefault(
+                "spectrum_count_rel_sigma",
+                float(likelihood["spectrum_count_rel_sigma"]),
+            )
+            params_for_iso.setdefault(
+                "spectrum_count_abs_sigma",
+                float(likelihood["spectrum_count_abs_sigma"]),
+            )
+            params_for_iso.setdefault(
+                "count_likelihood_df",
+                float(likelihood["student_t_df"]),
+            )
 
         def _forward_model(pos: NDArray[np.float64], strg: NDArray[np.float64]) -> NDArray[np.float64]:
             return expected_counts_per_source(
@@ -194,6 +236,7 @@ def prune_spurious_sources_continuous(
                 live_times=live_times_arr,
                 fe_indices=fe_arr,
                 pb_indices=pb_arr,
+                source_scale=estimator.response_scale_for_isotope(iso),
             )
 
         background_rate = 0.0
@@ -212,6 +255,6 @@ def prune_spurious_sources_continuous(
             background=background_counts,
             forward_model=_forward_model,
             method=method,
-            params=method_params,
+            params=params_for_iso,
         )
     return keep_masks

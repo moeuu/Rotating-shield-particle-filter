@@ -48,6 +48,25 @@ def test_generate_obstacle_grid_respects_keep_free_points() -> None:
     assert (0, 0) not in grid.blocked_cells
 
 
+def test_generate_obstacle_grid_reserves_passable_corridor() -> None:
+    """Passage waypoints should remain connected even in a fully blocked layout."""
+    rng = np.random.default_rng(2)
+    grid = generate_obstacle_grid(
+        size_x=6.0,
+        size_y=6.0,
+        cell_size=1.0,
+        blocked_fraction=1.0,
+        rng=rng,
+        passage_points=[(0.5, 0.5), (5.5, 0.5)],
+        passage_width_m=2.0,
+    )
+
+    assert grid.has_free_path((0.5, 0.5), (5.5, 0.5))
+    for ix in range(6):
+        assert (ix, 0) not in grid.blocked_cells
+        assert (ix, 1) not in grid.blocked_cells
+
+
 def test_load_or_generate_obstacle_grid_creates_file(tmp_path: Path) -> None:
     """Missing obstacle layouts should be generated and saved."""
     path = tmp_path / "generated.json"
@@ -111,3 +130,19 @@ def test_build_obstacle_grid_random_is_ephemeral_and_seeded(tmp_path: Path) -> N
     assert not path.exists()
     assert grid_one == grid_two
     assert grid_one.blocked_cells
+
+
+def test_build_obstacle_grid_random_has_default_passage() -> None:
+    """Random mode should reserve a passage from the start to a far corner."""
+    grid = build_obstacle_grid(
+        mode="random",
+        path=None,
+        size_x=6.0,
+        size_y=6.0,
+        blocked_fraction=1.0,
+        rng_seed=9,
+        keep_free_points=[(1.5, 1.5)],
+        passage_width_m=1.0,
+    )
+
+    assert grid.has_free_path((1.5, 1.5), (5.5, 5.5))

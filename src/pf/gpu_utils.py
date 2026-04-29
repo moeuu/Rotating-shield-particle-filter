@@ -14,7 +14,15 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None
     TORCH_AVAILABLE = False
 
-from measurement.shielding import OCTANT_THETA_PHI_RANGES, generate_octant_orientations
+from measurement.shielding import (
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    OCTANT_THETA_PHI_RANGES,
+    SHIELD_GEOMETRY_SPHERICAL_OCTANT,
+    generate_octant_orientations,
+    spherical_shell_path_length_cm_torch,
+)
+from measurement.continuous_kernels import obstacle_path_lengths_cm_torch
 from pf.state import IsotopeState
 
 
@@ -101,6 +109,11 @@ def expected_counts_pair_torch(
     dtype: "torch.dtype",
     use_angle_attenuation: bool = False,
     source_scale: float = 1.0,
+    inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT,
+    obstacle_boxes_m: np.ndarray | "torch.Tensor" | None = None,
+    obstacle_mu_cm_inv: float = 0.0,
     tol: float = 1e-6,
 ) -> "torch.Tensor":
     """
@@ -145,13 +158,35 @@ def expected_counts_pair_torch(
     cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
     thickness_fe = torch.as_tensor(thickness_fe_cm, device=device, dtype=dtype)
     thickness_pb = torch.as_tensor(thickness_pb_cm, device=device, dtype=dtype)
-    if use_angle_attenuation:
+    if shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT and not use_angle_attenuation:
+        L_fe = spherical_shell_path_length_cm_torch(
+            direction,
+            inner_radius_fe_cm,
+            inner_radius_fe_cm + thickness_fe_cm,
+            blocked_fe,
+        )
+        L_pb = spherical_shell_path_length_cm_torch(
+            direction,
+            inner_radius_pb_cm,
+            inner_radius_pb_cm + thickness_pb_cm,
+            blocked_pb,
+        )
+    elif use_angle_attenuation:
         L_fe = torch.where(blocked_fe & (cos_fe > tol), thickness_fe / cos_fe, torch.zeros_like(cos_fe))
         L_pb = torch.where(blocked_pb & (cos_pb > tol), thickness_pb / cos_pb, torch.zeros_like(cos_pb))
     else:
         L_fe = torch.where(blocked_fe, thickness_fe, torch.zeros_like(cos_fe))
         L_pb = torch.where(blocked_pb, thickness_pb, torch.zeros_like(cos_pb))
     att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+    if obstacle_boxes_m is not None and float(obstacle_mu_cm_inv) > 0.0:
+        boxes_t = torch.as_tensor(obstacle_boxes_m, device=device, dtype=dtype)
+        if boxes_t.numel() > 0:
+            obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                positions=positions,
+                detector_pos=detector.view(3),
+                obstacle_boxes_m=boxes_t,
+            )
+            att = att * torch.exp(-float(obstacle_mu_cm_inv) * obstacle_path_cm)
 
     strengths = strengths * mask
     source_scale_t = torch.as_tensor(max(float(source_scale), 0.0), device=device, dtype=dtype)

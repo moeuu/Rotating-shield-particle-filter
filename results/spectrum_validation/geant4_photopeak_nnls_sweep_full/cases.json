@@ -1,0 +1,1119 @@
+[
+  {
+    "case": {
+      "description": "Single Cs-137 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_cs_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 7063415,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Cs-137": 3000.0
+    },
+    "num_primaries": 7063415.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 8.515344085935434,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 3353.13084730876,
+          "photopeak_nnls": 3128.0270096012246,
+          "response_matrix": 2824.7048828072648
+        },
+        "relative_errors": {
+          "peak_window": 0.1177102824362534,
+          "photopeak_nnls": 0.042675669867074856,
+          "response_matrix": -0.05843170573091174
+        },
+        "source_tally_counts": 3000.0,
+        "target_pf_counts": 3000.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 174.42526057642792,
+          "photopeak_nnls": 3.219574441282075,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 44.00243258476257,
+    "total_spectrum_counts": 3056.998189202598
+  },
+  {
+    "case": {
+      "description": "Single Co-60 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_co_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 8313660,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 3000.0
+    },
+    "num_primaries": 8313660.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 3095.2549922668923,
+          "photopeak_nnls": 2973.0223688058068,
+          "response_matrix": 3071.88444497427
+        },
+        "relative_errors": {
+          "peak_window": 0.031751664088964085,
+          "photopeak_nnls": -0.008992543731397745,
+          "response_matrix": 0.023961481658090027
+        },
+        "source_tally_counts": 3000.0,
+        "target_pf_counts": 3000.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 105.92527346724266,
+          "photopeak_nnls": 12.875554315525376,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 789.9581927838042,
+          "photopeak_nnls": 17.014963912139002,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 62.44119691848755,
+    "total_spectrum_counts": 3143.9980846700864
+  },
+  {
+    "case": {
+      "description": "Single Eu-154 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 8394265,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Eu-154": 3000.0
+    },
+    "num_primaries": 8394265.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 474.30975556748376,
+          "photopeak_nnls": 4.53447914677466e-13,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 57.53221883362598,
+          "photopeak_nnls": 16.344586873547918,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 3397.0313632893694,
+          "photopeak_nnls": 2992.018278929853,
+          "response_matrix": 2720.6529681380903
+        },
+        "relative_errors": {
+          "peak_window": 0.13234378776312314,
+          "photopeak_nnls": -0.0026605736900490533,
+          "response_matrix": -0.09311567728730324
+        },
+        "source_tally_counts": 3000.0,
+        "target_pf_counts": 3000.0
+      }
+    },
+    "runtime_s": 58.87466812133789,
+    "total_spectrum_counts": 3308.997878356902
+  },
+  {
+    "case": {
+      "description": "Two Cs-137 sources at different distances.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "two_cs_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 70.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 120.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            1.0,
+            3.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 13421776,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Cs-137": 3000.0
+    },
+    "num_primaries": 13421776.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 7.526474399575178,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 3307.853167852963,
+          "photopeak_nnls": 3254.716043997269,
+          "response_matrix": 2791.9360135881197
+        },
+        "relative_errors": {
+          "peak_window": 0.10261772261765434,
+          "photopeak_nnls": 0.08490534799908968,
+          "response_matrix": -0.06935466213729341
+        },
+        "source_tally_counts": 3000.0,
+        "target_pf_counts": 3000.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 146.63399293384742,
+          "photopeak_nnls": 2.3950745437310235,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 81.77964067459106,
+    "total_spectrum_counts": 3258.997941990535
+  },
+  {
+    "case": {
+      "description": "Two-isotope mixture with Cs-137 and Co-60.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "cs_co_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 12298697,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 2400.0,
+      "source_equivalent_counts_Cs-137": 2400.0
+    },
+    "num_primaries": 12298697.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1216.5150142062173,
+          "photopeak_nnls": 2273.7274564449494,
+          "response_matrix": 1838.2825797440757
+        },
+        "relative_errors": {
+          "peak_window": -0.4931187440807428,
+          "photopeak_nnls": -0.0526135598146044,
+          "response_matrix": -0.2340489251066351
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 2735.810049318092,
+          "photopeak_nnls": 2709.470728024969,
+          "response_matrix": 2144.0671971778133
+        },
+        "relative_errors": {
+          "peak_window": 0.13992085388253828,
+          "photopeak_nnls": 0.12894613667707044,
+          "response_matrix": -0.10663866784257778
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 1068.0564648506258,
+          "photopeak_nnls": 30.453465607568663,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 84.72447562217712,
+    "total_spectrum_counts": 4970.995211866239
+  },
+  {
+    "case": {
+      "description": "Two-isotope mixture with Cs-137 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "cs_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 12364179,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Cs-137": 2400.0,
+      "source_equivalent_counts_Eu-154": 2400.0
+    },
+    "num_primaries": 12364179.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 367.7851569268214,
+          "photopeak_nnls": 2.350499576910198e-13,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 2615.652864863776,
+          "photopeak_nnls": 2728.400901951685,
+          "response_matrix": 2134.450492072349
+        },
+        "relative_errors": {
+          "peak_window": 0.08985536035990663,
+          "photopeak_nnls": 0.1368337091465353,
+          "response_matrix": -0.11064562830318797
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 2628.484109596304,
+          "photopeak_nnls": 2095.406766368186,
+          "response_matrix": 1085.9620400689043
+        },
+        "relative_errors": {
+          "peak_window": 0.09520171233179325,
+          "photopeak_nnls": -0.12691384734658925,
+          "response_matrix": -0.5475158166379566
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      }
+    },
+    "runtime_s": 81.55932021141052,
+    "total_spectrum_counts": 5089.994979878589
+  },
+  {
+    "case": {
+      "description": "Two-isotope mixture with Co-60 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "co_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 13360251,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 2400.0,
+      "source_equivalent_counts_Eu-154": 2400.0
+    },
+    "num_primaries": 13360251.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 2666.509594920781,
+          "photopeak_nnls": 2206.2905702040002,
+          "response_matrix": 2085.387719399931
+        },
+        "relative_errors": {
+          "peak_window": 0.1110456645503255,
+          "photopeak_nnls": -0.0807122624149999,
+          "response_matrix": -0.13108845025002874
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 69.1578243546803,
+          "photopeak_nnls": 3.359178101179549e-14,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 3221.721544753493,
+          "photopeak_nnls": 2495.2123682692763,
+          "response_matrix": 2012.1542354924443
+        },
+        "relative_errors": {
+          "peak_window": 0.3423839769806222,
+          "photopeak_nnls": 0.039671820112198476,
+          "response_matrix": -0.16160240187814823
+        },
+        "source_tally_counts": 2400.0,
+        "target_pf_counts": 2400.0
+      }
+    },
+    "runtime_s": 96.83687162399292,
+    "total_spectrum_counts": 5130.994898678962
+  },
+  {
+    "case": {
+      "description": "Balanced three-isotope mixture at three directions.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_balanced_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            1.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 14261732,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 1800.0,
+      "source_equivalent_counts_Cs-137": 1800.0,
+      "source_equivalent_counts_Eu-154": 1800.0
+    },
+    "num_primaries": 14261732.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1857.3022966241829,
+          "photopeak_nnls": 1464.2966491120774,
+          "response_matrix": 1316.3716245419646
+        },
+        "relative_errors": {
+          "peak_window": 0.03183460923565715,
+          "photopeak_nnls": -0.18650186160440146,
+          "response_matrix": -0.2686824308100197
+        },
+        "source_tally_counts": 1800.0,
+        "target_pf_counts": 1800.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 1969.0605572000989,
+          "photopeak_nnls": 1944.9805110054704,
+          "response_matrix": 1548.768540044148
+        },
+        "relative_errors": {
+          "peak_window": 0.0939225317778327,
+          "photopeak_nnls": 0.08054472833637243,
+          "response_matrix": -0.13957303330880663
+        },
+        "source_tally_counts": 1800.0,
+        "target_pf_counts": 1800.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 2269.396206094012,
+          "photopeak_nnls": 1467.053943313181,
+          "response_matrix": 819.8718604152266
+        },
+        "relative_errors": {
+          "peak_window": 0.26077567005222896,
+          "photopeak_nnls": -0.18497003149267724,
+          "response_matrix": -0.5445156331026519
+        },
+        "source_tally_counts": 1800.0,
+        "target_pf_counts": 1800.0
+      }
+    },
+    "runtime_s": 98.78932332992554,
+    "total_spectrum_counts": 5495.99414709
+  },
+  {
+    "case": {
+      "description": "Three-isotope mixture with weak Co-60 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_imbalanced_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 120.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 35.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 25.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            1.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 13484734,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 1050.0,
+      "source_equivalent_counts_Cs-137": 3600.0,
+      "source_equivalent_counts_Eu-154": 750.0
+    },
+    "num_primaries": 13484734.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1164.5604160855225,
+          "photopeak_nnls": 929.3567522232266,
+          "response_matrix": 401.4189146208181
+        },
+        "relative_errors": {
+          "peak_window": 0.10910515817668814,
+          "photopeak_nnls": -0.11489833121597463,
+          "response_matrix": -0.617696271789697
+        },
+        "source_tally_counts": 1050.0,
+        "target_pf_counts": 1050.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 4152.067109234876,
+          "photopeak_nnls": 4185.525617744024,
+          "response_matrix": 3554.1996295201043
+        },
+        "relative_errors": {
+          "peak_window": 0.15335197478746548,
+          "photopeak_nnls": 0.1626460049288956,
+          "response_matrix": -0.012722325133304367
+        },
+        "source_tally_counts": 3600.0,
+        "target_pf_counts": 3600.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 1280.9569977761114,
+          "photopeak_nnls": 760.9965615764046,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": 0.7079426637014818,
+          "photopeak_nnls": 0.014662082101872784,
+          "response_matrix": -1.0
+        },
+        "source_tally_counts": 750.0,
+        "target_pf_counts": 750.0
+      }
+    },
+    "runtime_s": 88.03660559654236,
+    "total_spectrum_counts": 5614.993890883592
+  },
+  {
+    "case": {
+      "description": "Three-isotope mixture through the iron shield octant.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_fe_blocked",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 19011934,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 800.0,
+      "source_equivalent_counts_Cs-137": 800.0,
+      "source_equivalent_counts_Eu-154": 800.0
+    },
+    "num_primaries": 19011934.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 54.278733374703066,
+          "photopeak_nnls": 42.949975002659734,
+          "response_matrix": 89.13434285080677
+        },
+        "relative_errors": {
+          "peak_window": -0.6217243603487984,
+          "photopeak_nnls": -0.70067596907657,
+          "response_matrix": -0.3788110285474602
+        },
+        "source_tally_counts": 800.0,
+        "target_pf_counts": 143.4898991242262
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 93.13630538666794,
+          "photopeak_nnls": 30.43763740821568,
+          "response_matrix": 17.337311831208066
+        },
+        "relative_errors": {
+          "peak_window": 0.16420381733334927,
+          "photopeak_nnls": -0.619529532397304,
+          "response_matrix": -0.7832836021098991
+        },
+        "source_tally_counts": 800.0,
+        "target_pf_counts": 80.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 249.79024524468358,
+          "photopeak_nnls": 84.94334736390483,
+          "response_matrix": 102.75702362845644
+        },
+        "relative_errors": {
+          "peak_window": 2.8564574518519836,
+          "photopeak_nnls": 0.3114219276493322,
+          "response_matrix": 0.5864434142090479
+        },
+        "source_tally_counts": 800.0,
+        "target_pf_counts": 64.77194377568641
+      }
+    },
+    "runtime_s": 128.9360613822937,
+    "total_spectrum_counts": 1355.9996437137718
+  },
+  {
+    "case": {
+      "description": "Two Cs-137 sources with one direction blocked by Fe.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "cs_two_sources_one_fe_blocked",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            0.0,
+            2.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 11300919,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Cs-137": 1600.0
+    },
+    "num_primaries": 11300919.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 2.7412010743823148,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 862.2020652948706,
+          "photopeak_nnls": 758.79454172212,
+          "response_matrix": 703.2953109920807
+        },
+        "relative_errors": {
+          "peak_window": -0.020224925801283496,
+          "photopeak_nnls": -0.13773347531577282,
+          "response_matrix": -0.2008007829635448
+        },
+        "source_tally_counts": 1600.0,
+        "target_pf_counts": 880.0000000000001
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 40.45316958461167,
+          "photopeak_nnls": 2.047338984110647,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 70.51272058486938,
+    "total_spectrum_counts": 1555.9995308652901
+  },
+  {
+    "case": {
+      "description": "Three-isotope mixture with a concrete obstacle; excluded from accuracy summary because the PF target omits obstacle transport.",
+      "detector_pose_xyz": [
+        1.0,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 20.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": false,
+      "name": "three_isotope_obstacle_stress",
+      "obstacle_cells": [
+        [
+          2,
+          1
+        ]
+      ],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            4.0,
+            1.5,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            4.0,
+            1.5,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            4.0,
+            1.5,
+            0.8
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "isotropic",
+      "engine_mode": "external",
+      "num_primaries": 12677928,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Co-60": 160.0,
+      "source_equivalent_counts_Cs-137": 177.777778,
+      "source_equivalent_counts_Eu-154": 176.017602
+    },
+    "num_primaries": 12677928.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 0.0027098064693562296,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 0.1676434548880209
+        },
+        "relative_errors": {
+          "peak_window": -0.9999830637095665,
+          "photopeak_nnls": -1.0,
+          "response_matrix": -0.99895222840695
+        },
+        "source_tally_counts": 160.0,
+        "target_pf_counts": 159.99999999999997
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 0.9955623829874581,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 1.7788537212264552
+        },
+        "relative_errors": {
+          "peak_window": -0.9943999615956955,
+          "photopeak_nnls": -1.0,
+          "response_matrix": -0.9899939478181012
+        },
+        "source_tally_counts": 177.777778,
+        "target_pf_counts": 177.77777777777777
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 0.8811908005701817,
+          "photopeak_nnls": 0.0,
+          "response_matrix": 3.552402387125639
+        },
+        "relative_errors": {
+          "peak_window": -0.9949937347642607,
+          "photopeak_nnls": -1.0,
+          "response_matrix": -0.9798179139381424
+        },
+        "source_tally_counts": 176.017602,
+        "target_pf_counts": 176.01760176017603
+      }
+    },
+    "runtime_s": 86.03009414672852,
+    "total_spectrum_counts": 113.999996222692
+  }
+]

@@ -8,7 +8,13 @@ from typing import Any
 import numpy as np
 
 from sim.geant4_app.engine import Geant4EngineConfig, Geant4StepRequest, build_geant4_engine
-from sim.geant4_app.scene_export import ExportedDetectorModel, export_scene_for_geant4
+from sim.geant4_app.scene_export import (
+    DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
+    DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
+    DEFAULT_DETECTOR_HOUSING_THICKNESS_M,
+    ExportedDetectorModel,
+    export_scene_for_geant4,
+)
 from sim.isaacsim_app.app import IsaacAssetGeometry, StageMaterialRule
 from sim.isaacsim_app.robot_controller import RobotController
 from sim.isaacsim_app.scene_builder import SceneBuilder, SceneDescription
@@ -30,19 +36,26 @@ class Geant4AppConfig:
     robot_ground_z_m: float = 0.0
     obstacle_height_m: float = 2.0
     author_obstacle_prims: bool | None = None
+    author_room_boundary_prims: bool | None = None
     fe_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25)
     pb_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25)
     stage_material_rules: tuple[StageMaterialRule, ...] = field(default_factory=tuple)
-    engine_mode: str = "surrogate"
+    engine_mode: str = "external"
     physics_profile: str = "balanced"
     thread_count: int = 1
     random_seed_base: int = 123
     dead_time_tau_s: float = 5.813e-9
-    scatter_gain: float = 0.03
-    executable_path: str | None = None
+    scatter_gain: float = 0.0
+    executable_path: str | None = "build/geant4_sidecar"
     executable_args: tuple[str, ...] = field(default_factory=tuple)
     timeout_s: float = 120.0
+    persistent_process: bool = False
+    source_bias_mode: str = "mixture_cone_isotropic"
+    source_bias_cone_half_angle_deg: float = 0.0
+    source_bias_isotropic_fraction: float = 0.1
     detector_model: ExportedDetectorModel = field(default_factory=ExportedDetectorModel)
+    absorbing_transport_groups: tuple[str, ...] = field(default_factory=tuple)
+    absorbing_path_prefixes: tuple[str, ...] = field(default_factory=tuple)
     radiation_visualization: RadiationVisualizationConfig = field(default_factory=RadiationVisualizationConfig)
 
     @classmethod
@@ -61,6 +74,12 @@ class Geant4AppConfig:
         executable_args = payload.get("executable_args", ())
         if not isinstance(executable_args, (list, tuple)):
             raise ValueError("executable_args must be a list of strings.")
+        absorbing_transport_groups = payload.get("absorbing_transport_groups", ())
+        if not isinstance(absorbing_transport_groups, (list, tuple)):
+            raise ValueError("absorbing_transport_groups must be a list of strings.")
+        absorbing_path_prefixes = payload.get("absorbing_path_prefixes", ())
+        if not isinstance(absorbing_path_prefixes, (list, tuple)):
+            raise ValueError("absorbing_path_prefixes must be a list of strings.")
         return cls(
             use_mock_stage=bool(payload.get("use_mock_stage", True)),
             headless=bool(payload.get("headless", True)),
@@ -74,6 +93,11 @@ class Geant4AppConfig:
                 if payload.get("author_obstacle_prims") is None
                 else bool(payload.get("author_obstacle_prims"))
             ),
+            author_room_boundary_prims=(
+                None
+                if payload.get("author_room_boundary_prims") is None
+                else bool(payload.get("author_room_boundary_prims"))
+            ),
             fe_shield_size_xyz=tuple(float(v) for v in payload.get("fe_shield_size_xyz", (0.25, 0.08, 0.25))),
             pb_shield_size_xyz=tuple(float(v) for v in payload.get("pb_shield_size_xyz", (0.25, 0.08, 0.25))),
             stage_material_rules=tuple(
@@ -83,24 +107,46 @@ class Geant4AppConfig:
                 )
                 for entry in stage_material_rules_payload
             ),
-            engine_mode=str(payload.get("engine_mode", "surrogate")),
+            engine_mode=str(payload.get("engine_mode", "external")),
             physics_profile=str(payload.get("physics_profile", "balanced")),
             thread_count=int(payload.get("thread_count", 1)),
             random_seed_base=int(payload.get("random_seed_base", 123)),
             dead_time_tau_s=float(payload.get("dead_time_tau_s", 5.813e-9)),
-            scatter_gain=float(payload.get("scatter_gain", 0.03)),
-            executable_path=None
-            if payload.get("executable_path") in (None, "")
-            else str(payload.get("executable_path")),
+            scatter_gain=float(payload.get("scatter_gain", 0.0)),
+            executable_path=(
+                "build/geant4_sidecar"
+                if payload.get("executable_path") in (None, "")
+                else str(payload.get("executable_path"))
+            ),
             executable_args=tuple(str(v) for v in executable_args),
             timeout_s=float(payload.get("timeout_s", 120.0)),
+            persistent_process=bool(payload.get("persistent_process", False)),
+            source_bias_mode=str(payload.get("source_bias_mode", "mixture_cone_isotropic")),
+            source_bias_cone_half_angle_deg=float(
+                payload.get("source_bias_cone_half_angle_deg", 0.0)
+            ),
+            source_bias_isotropic_fraction=float(
+                payload.get("source_bias_isotropic_fraction", 0.1)
+            ),
             detector_model=ExportedDetectorModel(
-                crystal_radius_m=float(detector_payload.get("crystal_radius_m", 0.019)),
-                crystal_length_m=float(detector_payload.get("crystal_length_m", 0.038)),
-                housing_thickness_m=float(detector_payload.get("housing_thickness_m", 0.0015)),
+                crystal_radius_m=float(
+                    detector_payload.get("crystal_radius_m", DEFAULT_DETECTOR_CRYSTAL_RADIUS_M)
+                ),
+                crystal_length_m=float(
+                    detector_payload.get("crystal_length_m", DEFAULT_DETECTOR_CRYSTAL_LENGTH_M)
+                ),
+                housing_thickness_m=float(
+                    detector_payload.get(
+                        "housing_thickness_m",
+                        DEFAULT_DETECTOR_HOUSING_THICKNESS_M,
+                    )
+                ),
+                crystal_shape=str(detector_payload.get("crystal_shape", "sphere")),
                 crystal_material=str(detector_payload.get("crystal_material", "cebr3")),
                 housing_material=str(detector_payload.get("housing_material", "aluminum")),
             ),
+            absorbing_transport_groups=tuple(str(v) for v in absorbing_transport_groups),
+            absorbing_path_prefixes=tuple(str(v) for v in absorbing_path_prefixes),
             radiation_visualization=RadiationVisualizationConfig.from_dict(visualization_payload),
         )
 
@@ -165,6 +211,10 @@ class Geant4Application:
                 executable_path=self.config.executable_path,
                 executable_args=self.config.executable_args,
                 timeout_s=self.config.timeout_s,
+                persistent_process=self.config.persistent_process,
+                source_bias_mode=self.config.source_bias_mode,
+                source_bias_cone_half_angle_deg=self.config.source_bias_cone_half_angle_deg,
+                source_bias_isotropic_fraction=self.config.source_bias_isotropic_fraction,
                 radiation_visualization=self.config.radiation_visualization,
             ),
             engine_mode=self.config.engine_mode,
@@ -178,6 +228,8 @@ class Geant4Application:
             scene.usd_path = self.config.usd_path
         if self.config.author_obstacle_prims is not None:
             scene.author_obstacle_prims = self.config.author_obstacle_prims
+        if self.config.author_room_boundary_prims is not None:
+            scene.author_room_boundary_prims = self.config.author_room_boundary_prims
         self.scene = scene
         self.scene_builder.load_scene(scene, usd_path_override=None)
         self.robot_controller = RobotController(
@@ -195,6 +247,8 @@ class Geant4Application:
             asset_geometry=self.asset_geometry,
             detector_model=self.config.detector_model,
             stage_material_rules=self.config.stage_material_rules,
+            absorbing_transport_groups=self.config.absorbing_transport_groups,
+            absorbing_path_prefixes=self.config.absorbing_path_prefixes,
         )
         self._last_cache_hit = bool(self.engine.load_scene(exported_scene))
 

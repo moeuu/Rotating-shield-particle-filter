@@ -11,7 +11,13 @@ from numpy.typing import NDArray
 
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
-from pf.likelihood import delta_log_likelihood_remove, delta_log_likelihood_update, expected_counts_per_source
+from measurement.obstacles import ObstacleGrid
+from pf.likelihood import (
+    count_log_likelihood,
+    delta_log_likelihood_remove,
+    delta_log_likelihood_update,
+    expected_counts_per_source,
+)
 from pf.state import IsotopeState
 from pf.resampling import systematic_resample
 
@@ -30,6 +36,11 @@ class PFConfig:
     background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
     measurement_scale_by_isotope: dict[str, float] | None = None
+    count_likelihood_model: str = "poisson"
+    transport_model_rel_sigma: float | dict[str, float] = 0.0
+    spectrum_count_rel_sigma: float | dict[str, float] = 0.0
+    spectrum_count_abs_sigma: float | dict[str, float] = 0.0
+    count_likelihood_df: float = 5.0
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
@@ -44,6 +55,7 @@ class PFConfig:
     birth_topk_particles: int = 10
     birth_use_weighted_topk: bool = True
     birth_min_sep_m: float = 0.8
+    birth_detector_min_sep_m: float = 1.0
     birth_candidate_jitter_sigma: float = 0.5
     birth_num_local_jitter: int = 8
     birth_alpha: float = 0.2
@@ -174,6 +186,7 @@ class MeasurementData:
     """Bundle measurement arrays for birth/death and split/merge proposals."""
 
     z_k: NDArray[np.float64]
+    observation_variances: NDArray[np.float64]
     detector_positions: NDArray[np.float64]
     fe_indices: NDArray[np.int64]
     pb_indices: NDArray[np.int64]
@@ -188,14 +201,20 @@ class IsotopeParticleFilter:
         isotope: str,
         kernel: KernelPrecomputer | None,
         config: PFConfig | None = None,
+        obstacle_grid: ObstacleGrid | None = None,
+        obstacle_height_m: float = 2.0,
+        obstacle_mu_by_isotope: dict[str, float] | None = None,
     ) -> None:
         self.isotope = isotope
         self.kernel = kernel
         self.config = config or PFConfig()
         self.N = self.config.num_particles
+        self.obstacle_grid = obstacle_grid
+        self.obstacle_height_m = float(obstacle_height_m)
+        self.obstacle_mu_by_isotope = obstacle_mu_by_isotope
         mu_by_isotope = getattr(kernel, "mu_by_isotope", None) if kernel is not None else None
         shield_params = getattr(kernel, "shield_params", ShieldParams()) if kernel is not None else ShieldParams()
-        self.continuous_kernel = ContinuousKernel(
+        self.continuous_kernel = self._build_continuous_kernel(
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
         )
@@ -230,6 +249,20 @@ class IsotopeParticleFilter:
         )
         self._init_continuous_particles()
 
+    def _build_continuous_kernel(
+        self,
+        mu_by_isotope: dict[str, object] | None,
+        shield_params: ShieldParams,
+    ) -> ContinuousKernel:
+        """Build the continuous kernel with the filter's environment attenuation settings."""
+        return ContinuousKernel(
+            mu_by_isotope=mu_by_isotope,
+            shield_params=shield_params,
+            obstacle_grid=self.obstacle_grid,
+            obstacle_height_m=self.obstacle_height_m,
+            obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+        )
+
     def _measurement_source_scale(self) -> float:
         """Return the isotope-specific source response scale for PF likelihoods."""
         scales = self.config.measurement_scale_by_isotope
@@ -237,10 +270,82 @@ class IsotopeParticleFilter:
             return 1.0
         return max(float(scales.get(self.isotope, 1.0)), 0.0)
 
+    def _isotope_float_config(self, value: float | dict[str, float], default: float = 0.0) -> float:
+        """Resolve a scalar or isotope-indexed float config value."""
+        if isinstance(value, dict):
+            return max(float(value.get(self.isotope, default)), 0.0)
+        return max(float(value), 0.0)
+
+    def _count_likelihood_kwargs(self) -> dict[str, float | str]:
+        """Return likelihood keyword arguments for this isotope filter."""
+        return {
+            "model": str(self.config.count_likelihood_model),
+            "transport_model_rel_sigma": self._isotope_float_config(
+                self.config.transport_model_rel_sigma,
+            ),
+            "spectrum_count_rel_sigma": self._isotope_float_config(
+                self.config.spectrum_count_rel_sigma,
+            ),
+            "spectrum_count_abs_sigma": self._isotope_float_config(
+                self.config.spectrum_count_abs_sigma,
+            ),
+            "student_t_df": max(float(self.config.count_likelihood_df), 1.0),
+        }
+
+    def _count_log_likelihood_np(
+        self,
+        z_k: NDArray[np.float64],
+        lambda_k: NDArray[np.float64],
+        observation_count_variance: float | NDArray[np.float64] = 0.0,
+    ) -> float:
+        """Evaluate this filter's configured count log-likelihood in NumPy."""
+        return count_log_likelihood(
+            z_k,
+            lambda_k,
+            observation_count_variance=observation_count_variance,
+            **self._count_likelihood_kwargs(),
+        )
+
+    def _delta_log_likelihood_remove(
+        self,
+        z_k: NDArray[np.float64],
+        lambda_total: NDArray[np.float64],
+        lambda_m: NDArray[np.float64],
+        observation_count_variance: float | NDArray[np.float64] = 0.0,
+    ) -> NDArray[np.float64]:
+        """Return per-source support using the configured count likelihood."""
+        return delta_log_likelihood_remove(
+            z_k,
+            lambda_total,
+            lambda_m,
+            observation_count_variance=observation_count_variance,
+            **self._count_likelihood_kwargs(),
+        )
+
+    def _delta_log_likelihood_update(
+        self,
+        z_k: NDArray[np.float64],
+        lambda_old: NDArray[np.float64],
+        lambda_new: NDArray[np.float64],
+        observation_count_variance: float | NDArray[np.float64] = 0.0,
+    ) -> float:
+        """Return proposal support using the configured count likelihood."""
+        return delta_log_likelihood_update(
+            z_k,
+            lambda_old,
+            lambda_new,
+            observation_count_variance=observation_count_variance,
+            **self._count_likelihood_kwargs(),
+        )
+
+    def _obstacle_gpu_kwargs(self) -> dict[str, object]:
+        """Return obstacle attenuation kwargs for GPU expected-count kernels."""
+        return self.continuous_kernel.obstacle_gpu_kwargs(self.isotope)
+
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
         """Attach a kernel and refresh the continuous-kernel configuration."""
         self.kernel = kernel
-        self.continuous_kernel = ContinuousKernel(
+        self.continuous_kernel = self._build_continuous_kernel(
             mu_by_isotope=getattr(kernel, "mu_by_isotope", None),
             shield_params=getattr(kernel, "shield_params", ShieldParams()),
         )
@@ -401,8 +506,10 @@ class IsotopeParticleFilter:
                 )
                 lam_rate += source_scale * float(kernel_val) * float(strength)
         lam = float(live_time_s) * lam_rate
-        eps = 1e-12
-        return float(z_obs * np.log(lam + eps) - lam)
+        return self._count_log_likelihood_np(
+            np.array([float(z_obs)], dtype=float),
+            np.array([lam], dtype=float),
+        )
 
     def _mmse_primary_position(self) -> NDArray[np.float64] | None:
         """Return the MMSE position for the first source slot, if available."""
@@ -512,11 +619,15 @@ class IsotopeParticleFilter:
             mu_pb=mu_pb,
             thickness_fe_cm=shield_params.thickness_fe_cm,
             thickness_pb_cm=shield_params.thickness_pb_cm,
+            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+            shield_geometry_model=shield_params.shield_geometry_model,
             use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
             source_scale=self._measurement_source_scale(),
+            **self._obstacle_gpu_kwargs(),
         )
 
     def _current_log_weights_torch(self, device: "torch.device") -> "torch.Tensor":
@@ -529,14 +640,48 @@ class IsotopeParticleFilter:
             dtype=torch.float64,
         )
 
-    def _log_likelihood_increment_gpu(self, lam_t: "torch.Tensor", z_obs: float) -> "torch.Tensor":
-        """Return the per-particle Poisson log-likelihood increment in float64."""
+    def _log_likelihood_increment_gpu(
+        self,
+        lam_t: "torch.Tensor",
+        z_obs: float,
+        observation_count_variance: float = 0.0,
+    ) -> "torch.Tensor":
+        """Return the per-particle count log-likelihood increment in float64."""
         import torch
 
         lam_t = lam_t.to(dtype=torch.float64)
         lam_t = torch.clamp(lam_t, min=1e-12)
         z = torch.as_tensor(z_obs, device=lam_t.device, dtype=torch.float64)
-        return z * torch.log(lam_t) - lam_t
+        model = str(self.config.count_likelihood_model).strip().lower()
+        if model in {"poisson", ""}:
+            return z * torch.log(lam_t) - lam_t
+        if model == "normal":
+            model = "gaussian"
+        if model in {"robust", "robust_gaussian", "t"}:
+            model = "student_t"
+        if model not in {"gaussian", "student_t"}:
+            raise ValueError(f"Unknown count likelihood model: {self.config.count_likelihood_model}")
+
+        transport_rel = self._isotope_float_config(self.config.transport_model_rel_sigma)
+        spectrum_rel = self._isotope_float_config(self.config.spectrum_count_rel_sigma)
+        spectrum_abs = self._isotope_float_config(self.config.spectrum_count_abs_sigma)
+        obs_var = max(float(observation_count_variance), 0.0)
+        z_nonnegative = torch.clamp(z, min=0.0)
+        scale_ref = torch.maximum(lam_t, z_nonnegative)
+        variance = (
+            lam_t
+            + (float(transport_rel) * lam_t) ** 2
+            + (float(spectrum_rel) * scale_ref) ** 2
+            + float(spectrum_abs) ** 2
+            + obs_var
+        )
+        variance = torch.clamp(variance, min=1e-12)
+        residual = z - lam_t
+        if model == "gaussian":
+            return -0.5 * ((residual**2) / variance + torch.log(variance))
+
+        df = max(float(self.config.count_likelihood_df), 1.0 + 1e-12)
+        return -0.5 * (df + 1.0) * torch.log1p((residual**2) / (df * variance)) - 0.5 * torch.log(variance)
 
     def _normalized_log_weights_torch(self, logw: "torch.Tensor") -> "torch.Tensor":
         """Normalize log-weights using logsumexp in float64."""
@@ -563,6 +708,7 @@ class IsotopeParticleFilter:
         lam_t: "torch.Tensor",
         z_obs: float,
         *,
+        observation_count_variance: float = 0.0,
         delta_beta: float = 1.0,
         logw_prev: "torch.Tensor | None" = None,
         ll_t: "torch.Tensor | None" = None,
@@ -576,7 +722,11 @@ class IsotopeParticleFilter:
         if lam_t.numel() == 0:
             return
         logw_prev = logw_prev if logw_prev is not None else self._current_log_weights_torch(lam_t.device)
-        ll_t = ll_t if ll_t is not None else self._log_likelihood_increment_gpu(lam_t, z_obs)
+        ll_t = ll_t if ll_t is not None else self._log_likelihood_increment_gpu(
+            lam_t,
+            z_obs,
+            observation_count_variance=observation_count_variance,
+        )
         logw = self._normalized_log_weights_torch(logw_prev + float(delta_beta) * ll_t)
         self._assign_logw_from_torch(logw)
         if return_logw:
@@ -632,6 +782,7 @@ class IsotopeParticleFilter:
         self,
         lam_fn: Callable[[], "torch.Tensor"],
         z_obs: float,
+        observation_count_variance: float = 0.0,
     ) -> tuple[float, bool]:
         """
         Apply ESS-targeted tempering for a single Poisson update.
@@ -657,7 +808,11 @@ class IsotopeParticleFilter:
             self.last_temper_resample_count = 0
             return 0.0, False
         logw = self._current_log_weights_torch(lam_t.device)
-        ll_t = self._log_likelihood_increment_gpu(lam_t, z_obs)
+        ll_t = self._log_likelihood_increment_gpu(
+            lam_t,
+            z_obs,
+            observation_count_variance=observation_count_variance,
+        )
 
         cooldown_remaining = 0
         while beta_total < 1.0 - 1e-12:
@@ -698,7 +853,11 @@ class IsotopeParticleFilter:
                     if lam_t.numel() == 0:
                         break
                     logw = self._current_log_weights_torch(lam_t.device)
-                    ll_t = self._log_likelihood_increment_gpu(lam_t, z_obs)
+                    ll_t = self._log_likelihood_increment_gpu(
+                        lam_t,
+                        z_obs,
+                        observation_count_variance=observation_count_variance,
+                    )
         self.last_temper_steps = steps
         self.last_temper_resample_count = resamples
         if ess_min is None:
@@ -774,11 +933,15 @@ class IsotopeParticleFilter:
             mu_pb=mu_pb,
             thickness_fe_cm=shield_params.thickness_fe_cm,
             thickness_pb_cm=shield_params.thickness_pb_cm,
+            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+            shield_geometry_model=shield_params.shield_geometry_model,
             use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
             source_scale=self._measurement_source_scale(),
+            **self._obstacle_gpu_kwargs(),
         )
 
     def _continuous_expected_counts_pair_at_pose(
@@ -805,10 +968,11 @@ class IsotopeParticleFilter:
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        observation_count_variance: float = 0.0,
         step_idx: int | None = None,
     ) -> None:
         """
-        Poisson log-weight update using Fe/Pb orientation indices (Eq. 3.41–3.44).
+        Count-likelihood weight update using Fe/Pb orientation indices.
 
         z_obs must come from spectrum unfolding; expected Λ_{k,h} is computed via expected_counts_pair.
         """
@@ -828,10 +992,19 @@ class IsotopeParticleFilter:
             )
 
         if self.config.use_tempering:
-            ess_pre, resampled_any = self._tempered_update(lam_fn=_lam_fn, z_obs=z_obs)
+            ess_pre, resampled_any = self._tempered_update(
+                lam_fn=_lam_fn,
+                z_obs=z_obs,
+                observation_count_variance=observation_count_variance,
+            )
         else:
             lam_t = _lam_fn()
-            logw = self._update_continuous_weights_gpu(lam_t, z_obs, return_logw=True)
+            logw = self._update_continuous_weights_gpu(
+                lam_t,
+                z_obs,
+                observation_count_variance=observation_count_variance,
+                return_logw=True,
+            )
             if logw is None:
                 ess_pre = 0.0
             else:
@@ -863,10 +1036,11 @@ class IsotopeParticleFilter:
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        observation_count_variance: float = 0.0,
         step_idx: int | None = None,
     ) -> None:
         """
-        Poisson log-weight update using explicit detector position.
+        Count-likelihood weight update using explicit detector position.
 
         This avoids reliance on pose indices for planning-time evaluations.
         """
@@ -886,10 +1060,19 @@ class IsotopeParticleFilter:
             )
 
         if self.config.use_tempering:
-            ess_pre, resampled_any = self._tempered_update(lam_fn=_lam_fn, z_obs=z_obs)
+            ess_pre, resampled_any = self._tempered_update(
+                lam_fn=_lam_fn,
+                z_obs=z_obs,
+                observation_count_variance=observation_count_variance,
+            )
         else:
             lam_t = _lam_fn()
-            logw = self._update_continuous_weights_gpu(lam_t, z_obs, return_logw=True)
+            logw = self._update_continuous_weights_gpu(
+                lam_t,
+                z_obs,
+                observation_count_variance=observation_count_variance,
+                return_logw=True,
+            )
             if logw is None:
                 ess_pre = 0.0
             else:
@@ -1315,6 +1498,9 @@ class IsotopeParticleFilter:
             candidates = np.vstack([candidate_positions, jittered.reshape(-1, 3)])
         else:
             candidates = candidate_positions.copy()
+        candidates = self._exclude_birth_candidates_near_detectors(candidates, data)
+        if candidates.size == 0:
+            return None
 
         scores = np.zeros(candidates.shape[0], dtype=float)
         kernel_sums = np.zeros(candidates.shape[0], dtype=float)
@@ -1343,6 +1529,20 @@ class IsotopeParticleFilter:
         probs = np.exp(scaled)
         probs = probs / max(float(np.sum(probs)), 1e-12)
         return probs, kernel_sums, residual_sum, candidates
+
+    def _exclude_birth_candidates_near_detectors(
+        self,
+        candidates: NDArray[np.float64],
+        data: MeasurementData,
+    ) -> NDArray[np.float64]:
+        """Remove birth candidates that are too close to measured detector poses."""
+        min_sep = float(self.config.birth_detector_min_sep_m)
+        if min_sep <= 0.0 or candidates.size == 0 or data.detector_positions.size == 0:
+            return candidates
+        diff = candidates[:, None, :] - data.detector_positions[None, :, :]
+        distances = np.linalg.norm(diff, axis=2)
+        keep = np.all(distances >= min_sep, axis=1)
+        return candidates[keep]
 
     def _roughening_sigma_pos(self, num_particles: int) -> NDArray[np.float64]:
         """
@@ -1582,10 +1782,11 @@ class IsotopeParticleFilter:
             lambda_total = None
             if has_support and st.num_sources > 0:
                 lambda_m, lambda_total = self._lambda_components(st, support_data)
-                delta_ll = delta_log_likelihood_remove(
+                delta_ll = self._delta_log_likelihood_remove(
                     support_data.z_k,
                     lambda_total,
                     lambda_m,
+                    observation_count_variance=support_data.observation_variances,
                 )
                 alpha = float(self.config.support_ema_alpha)
                 st.support_scores = (1.0 - alpha) * st.support_scores + alpha * delta_ll
@@ -1667,10 +1868,11 @@ class IsotopeParticleFilter:
                         source_scale=self._measurement_source_scale(),
                     )
                     lambda_new = lambda_total - lambda_m[:, idx] + np.sum(lam_new, axis=1)
-                    delta_ll = delta_log_likelihood_update(
+                    delta_ll = self._delta_log_likelihood_update(
                         support_data.z_k,
                         lambda_total,
                         lambda_new,
+                        observation_count_variance=support_data.observation_variances,
                     )
                     if delta_ll >= float(self.config.split_delta_ll_threshold):
                         if np.log(np.random.rand()) < delta_ll:
@@ -1725,10 +1927,11 @@ class IsotopeParticleFilter:
                         source_scale=self._measurement_source_scale(),
                     )
                     lambda_new = lambda_total - lambda_m[:, i] - lambda_m[:, j] + lam_merge[:, 0]
-                    delta_ll = delta_log_likelihood_update(
+                    delta_ll = self._delta_log_likelihood_update(
                         support_data.z_k,
                         lambda_total,
                         lambda_new,
+                        observation_count_variance=support_data.observation_variances,
                     )
                     if delta_ll >= float(self.config.merge_delta_ll_threshold):
                         if np.log(np.random.rand()) < delta_ll:

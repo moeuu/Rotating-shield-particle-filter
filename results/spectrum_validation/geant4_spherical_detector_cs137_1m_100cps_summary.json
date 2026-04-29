@@ -1,0 +1,26 @@
+{
+  "detector_model": {
+    "crystal_length_m": 0.076,
+    "crystal_material": "cebr3",
+    "crystal_radius_m": 0.038,
+    "crystal_shape": "sphere",
+    "housing_material": "aluminum",
+    "housing_thickness_m": 0.0015
+  },
+  "metadata": {
+    "emission_model": "isotropic",
+    "expected_physical_primaries": 235457.063712,
+    "multithreaded_run_manager": true,
+    "num_primaries": 235625,
+    "reference_detector_acceptance": 0.000361,
+    "run_time_s": 1.416829,
+    "source_equivalent_counts_Cs-137": 100.0,
+    "weighted_transport": false
+  },
+  "response_counts": {
+    "Co-60": 0.0,
+    "Cs-137": 126.05418828461606,
+    "Eu-154": 0.0
+  },
+  "total_counts": 116.999920425906
+}

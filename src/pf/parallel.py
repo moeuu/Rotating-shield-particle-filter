@@ -24,6 +24,7 @@ class Measurement:
     RFe: np.ndarray | None = None
     RPb: np.ndarray | None = None
     detector_position: np.ndarray | None = None
+    count_variance_by_isotope: Dict[str, float] | None = None
     # Optional IG bookkeeping can be added by callers
 
 
@@ -93,6 +94,11 @@ class ParallelIsotopePF:
                 fe_index=measurement.fe_index,
                 pb_index=measurement.pb_index,
                 live_time_s=measurement.live_time_s,
+                observation_count_variance=(
+                    0.0
+                    if measurement.count_variance_by_isotope is None
+                    else float(measurement.count_variance_by_isotope.get(iso, 0.0))
+                ),
             )
 
     def estimate_all(self) -> Dict[str, IsotopeState]:

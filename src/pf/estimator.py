@@ -15,7 +15,8 @@ from scipy.stats import chi2
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
-from pf.likelihood import expected_counts_per_source, poisson_log_likelihood
+from measurement.obstacles import ObstacleGrid
+from pf.likelihood import expected_counts_per_source
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.resampling import systematic_resample
 from pf.state import IsotopeState
@@ -45,6 +46,7 @@ class RotatingShieldPFConfig:
         - birth_topk_particles: number of top-weight particles for residual mix
         - birth_use_weighted_topk: weight residual mix by particle weights
         - birth_min_sep_m: minimum separation between sources during birth
+        - birth_detector_min_sep_m: minimum separation from measured detector poses
         - birth_candidate_jitter_sigma: position jitter (m) for birth candidates
         - birth_num_local_jitter: local jitter samples per candidate
         - birth_alpha: damping factor for new source strength
@@ -74,8 +76,15 @@ class RotatingShieldPFConfig:
         - max_sigma_pos: maximum roughening sigma (meters)
         - roughening_decay: multiplier decay per resample within an observation
         - roughening_min_mult: minimum multiplier for roughening decay
+        - init_strength_log_mean: log-normal median for fallback strength initialization
+        - init_strength_log_sigma: log-normal spread for fallback strength initialization
         - strength_log_sigma: log-space jitter for strengths
-        - orientation_k: number of orientations to execute per pose
+        - adaptive_strength_prior: rescale early strength particles from observed counts
+        - adaptive_strength_prior_steps: number of first measurements allowed to rescale strengths
+        - adaptive_strength_prior_min_counts: Poisson upper-count floor for zero/weak observations
+        - adaptive_strength_prior_log_sigma: log-normal proposal spread around count-matched strength
+        - orientation_k: maximum number of orientations to execute per pose
+        - min_rotations_per_pose: minimum orientations before IG early stopping
         - orientation_selection_mode: "eig"
         - planning_particles: particle count used for orientation scoring (None = all)
         - planning_method: how to select planning particles (top_weight/resample)
@@ -100,8 +109,18 @@ class RotatingShieldPFConfig:
         - ig_workers: number of parallel workers for IG grid evaluation (0 = auto)
         - use_tempering: enable ESS-targeted tempered updates in the PF
         - measurement_scale_by_isotope: isotope-wise source response scales
+        - count_likelihood_model: "poisson", "gaussian", or "student_t"
+        - transport_model_rel_sigma: relative model mismatch from scatter/build-up omissions
+        - spectrum_count_rel_sigma: relative spectrum-decomposition count uncertainty
+        - spectrum_count_abs_sigma: additive spectrum-decomposition count uncertainty
+        - count_likelihood_df: Student-t degrees of freedom for robust count likelihood
         - label_enable: enable label alignment for continuous particles
         - label_alignment_iters: iterations for label alignment refinement
+        - label_pos_weight: position cost weight for label alignment
+        - label_strength_weight: strength cost weight for label alignment
+        - label_missing_cost: missing-source cost for label alignment
+        - label_pos_scale: optional position scale for label alignment
+        - label_strength_scale: optional strength scale for label alignment
         - converge_enable: enable per-isotope convergence gating
         - converge_window: window length for convergence checks
         - converge_map_move_eps_m: MMSE position stability threshold (meters)
@@ -123,6 +142,11 @@ class RotatingShieldPFConfig:
     background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
     measurement_scale_by_isotope: Dict[str, float] | None = None
+    count_likelihood_model: str = "poisson"
+    transport_model_rel_sigma: float | Dict[str, float] = 0.0
+    spectrum_count_rel_sigma: float | Dict[str, float] = 0.0
+    spectrum_count_abs_sigma: float | Dict[str, float] = 0.0
+    count_likelihood_df: float = 5.0
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
@@ -137,6 +161,7 @@ class RotatingShieldPFConfig:
     birth_topk_particles: int = 10
     birth_use_weighted_topk: bool = True
     birth_min_sep_m: float = 0.8
+    birth_detector_min_sep_m: float = 1.0
     birth_candidate_jitter_sigma: float = 0.5
     birth_num_local_jitter: int = 8
     birth_alpha: float = 0.2
@@ -183,8 +208,19 @@ class RotatingShieldPFConfig:
     max_sigma_pos: float = 1.5
     roughening_decay: float = 0.5
     roughening_min_mult: float = 0.25
+    init_strength_log_mean: float = 9.0
+    init_strength_log_sigma: float = 1.0
     strength_log_sigma: float = 0.3
+    adaptive_strength_prior: bool = False
+    adaptive_strength_prior_steps: int = 3
+    adaptive_strength_prior_min_counts: float = 3.0
+    adaptive_strength_prior_log_sigma: float = 0.7
+    pose_min_observation_counts: float = 0.0
+    pose_min_observation_penalty_scale: float = 1.0
+    pose_min_observation_aggregate: str = "max"
+    pose_min_observation_max_particles: int | None = None
     orientation_k: int = 8
+    min_rotations_per_pose: int = 0
     orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
     planning_method: str = "top_weight"
@@ -202,9 +238,13 @@ class RotatingShieldPFConfig:
     preselect_k_max: int = 16
     use_fast_gpu_rollout: bool = False
     ig_workers: int = 0
-    use_tempering: bool = True
     label_enable: bool = True
     label_alignment_iters: int = 2
+    label_pos_weight: float = 1.0
+    label_strength_weight: float = 0.2
+    label_missing_cost: float = 1e3
+    label_pos_scale: float | None = None
+    label_strength_scale: float | None = None
     converge_enable: bool = False
     converge_window: int = 8
     converge_map_move_eps_m: float = 0.4
@@ -225,6 +265,43 @@ class RotatingShieldPFConfig:
         self.ig_workers = int(self.ig_workers)
         if self.ig_workers < 0:
             raise ValueError("ig_workers must be >= 0.")
+        self.adaptive_strength_prior_steps = int(self.adaptive_strength_prior_steps)
+        if self.adaptive_strength_prior_steps < 0:
+            raise ValueError("adaptive_strength_prior_steps must be >= 0.")
+        self.adaptive_strength_prior_min_counts = float(self.adaptive_strength_prior_min_counts)
+        if self.adaptive_strength_prior_min_counts < 0.0:
+            raise ValueError("adaptive_strength_prior_min_counts must be >= 0.")
+        self.adaptive_strength_prior_log_sigma = float(self.adaptive_strength_prior_log_sigma)
+        if self.adaptive_strength_prior_log_sigma < 0.0:
+            raise ValueError("adaptive_strength_prior_log_sigma must be >= 0.")
+        self.pose_min_observation_counts = float(self.pose_min_observation_counts)
+        if self.pose_min_observation_counts < 0.0:
+            raise ValueError("pose_min_observation_counts must be >= 0.")
+        self.pose_min_observation_penalty_scale = float(
+            self.pose_min_observation_penalty_scale
+        )
+        if self.pose_min_observation_penalty_scale < 0.0:
+            raise ValueError("pose_min_observation_penalty_scale must be >= 0.")
+        self.pose_min_observation_aggregate = str(
+            self.pose_min_observation_aggregate
+        ).strip().lower()
+        if self.pose_min_observation_aggregate not in {"max", "mean"}:
+            raise ValueError("pose_min_observation_aggregate must be max or mean.")
+        if self.pose_min_observation_max_particles is not None:
+            self.pose_min_observation_max_particles = int(
+                self.pose_min_observation_max_particles
+            )
+            if self.pose_min_observation_max_particles < 0:
+                raise ValueError("pose_min_observation_max_particles must be >= 0.")
+        normalized_likelihood = str(self.count_likelihood_model).strip().lower()
+        if normalized_likelihood in {"normal"}:
+            normalized_likelihood = "gaussian"
+        if normalized_likelihood in {"robust", "robust_gaussian", "t"}:
+            normalized_likelihood = "student_t"
+        if normalized_likelihood not in {"poisson", "gaussian", "student_t"}:
+            raise ValueError("count_likelihood_model must be poisson, gaussian, or student_t.")
+        self.count_likelihood_model = normalized_likelihood
+        self.count_likelihood_df = max(float(self.count_likelihood_df), 1.0)
 
 
 @dataclass(frozen=True)
@@ -237,6 +314,7 @@ class MeasurementRecord:
     live_time_s: float
     fe_index: int | None = None
     pb_index: int | None = None
+    z_variance_k: Dict[str, float] | None = None
     ig_value: float | None = None
 
 
@@ -256,10 +334,16 @@ class RotatingShieldPFEstimator:
         mu_by_isotope: Dict[str, object] | None,
         pf_config: RotatingShieldPFConfig | None = None,
         shield_params: ShieldParams | None = None,
+        obstacle_grid: ObstacleGrid | None = None,
+        obstacle_height_m: float = 2.0,
+        obstacle_mu_by_isotope: Dict[str, float] | None = None,
     ) -> None:
         self.isotopes = list(isotopes)
         self.pf_config = pf_config or RotatingShieldPFConfig()
         self.shield_params = shield_params or ShieldParams()
+        self.obstacle_grid = obstacle_grid
+        self.obstacle_height_m = float(obstacle_height_m)
+        self.obstacle_mu_by_isotope = obstacle_mu_by_isotope
         # Measurement poses are appended incrementally.
         self.poses: List[NDArray[np.float64]] = []
         if shield_normals is None:
@@ -275,6 +359,7 @@ class RotatingShieldPFEstimator:
         self.history_estimates: List[Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]] = []
         self.history_scores: List[float] = []
         self.measurements: List[MeasurementRecord] = []
+        self.last_strength_prior_diagnostics: Dict[str, Dict[str, float]] = {}
 
     def _resolve_mu_by_isotope(self, mu_by_isotope: Dict[str, object] | None) -> Dict[str, object]:
         """
@@ -348,10 +433,21 @@ class RotatingShieldPFEstimator:
                 if iso in self.filters:
                     self.filters[iso].set_kernel(self.kernel_cache)
                 else:
-                    self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+                    self.filters[iso] = self._build_filter(iso, pf_conf)
         else:
             for iso in self.isotopes:
-                self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+                self.filters[iso] = self._build_filter(iso, pf_conf)
+
+    def _build_filter(self, isotope: str, pf_conf: PFConfig) -> IsotopeParticleFilter:
+        """Build an isotope filter with shared PF observation-model settings."""
+        return IsotopeParticleFilter(
+            isotope,
+            kernel=self.kernel_cache,
+            config=pf_conf,
+            obstacle_grid=self.obstacle_grid,
+            obstacle_height_m=self.obstacle_height_m,
+            obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+        )
 
     def _build_pf_config(self) -> PFConfig:
         """Build a per-isotope PFConfig from the estimator configuration."""
@@ -368,6 +464,11 @@ class RotatingShieldPFEstimator:
             background_sigma=self.pf_config.background_sigma,
             background_level=self.pf_config.background_level,
             measurement_scale_by_isotope=self.pf_config.measurement_scale_by_isotope,
+            count_likelihood_model=self.pf_config.count_likelihood_model,
+            transport_model_rel_sigma=self.pf_config.transport_model_rel_sigma,
+            spectrum_count_rel_sigma=self.pf_config.spectrum_count_rel_sigma,
+            spectrum_count_abs_sigma=self.pf_config.spectrum_count_abs_sigma,
+            count_likelihood_df=self.pf_config.count_likelihood_df,
             min_strength=self.pf_config.min_strength,
             p_birth=self.pf_config.p_birth,
             p_kill=self.pf_config.p_kill,
@@ -382,6 +483,7 @@ class RotatingShieldPFEstimator:
             birth_topk_particles=self.pf_config.birth_topk_particles,
             birth_use_weighted_topk=self.pf_config.birth_use_weighted_topk,
             birth_min_sep_m=self.pf_config.birth_min_sep_m,
+            birth_detector_min_sep_m=self.pf_config.birth_detector_min_sep_m,
             birth_candidate_jitter_sigma=self.pf_config.birth_candidate_jitter_sigma,
             birth_num_local_jitter=self.pf_config.birth_num_local_jitter,
             birth_alpha=self.pf_config.birth_alpha,
@@ -421,6 +523,8 @@ class RotatingShieldPFEstimator:
             max_sigma_pos=self.pf_config.max_sigma_pos,
             roughening_decay=self.pf_config.roughening_decay,
             roughening_min_mult=self.pf_config.roughening_min_mult,
+            init_strength_log_mean=self.pf_config.init_strength_log_mean,
+            init_strength_log_sigma=self.pf_config.init_strength_log_sigma,
             strength_log_sigma=self.pf_config.strength_log_sigma,
             use_gpu=self.pf_config.use_gpu,
             gpu_device=self.pf_config.gpu_device,
@@ -428,6 +532,11 @@ class RotatingShieldPFEstimator:
             use_tempering=self.pf_config.use_tempering,
             label_enable=self.pf_config.label_enable,
             label_alignment_iters=self.pf_config.label_alignment_iters,
+            label_pos_weight=self.pf_config.label_pos_weight,
+            label_strength_weight=self.pf_config.label_strength_weight,
+            label_missing_cost=self.pf_config.label_missing_cost,
+            label_pos_scale=self.pf_config.label_pos_scale,
+            label_strength_scale=self.pf_config.label_strength_scale,
             converge_enable=self.pf_config.converge_enable,
             converge_window=self.pf_config.converge_window,
             converge_map_move_eps_m=self.pf_config.converge_map_move_eps_m,
@@ -454,6 +563,145 @@ class RotatingShieldPFEstimator:
             return 1.0
         return max(float(scales.get(isotope, 1.0)), 0.0)
 
+    def adapt_strength_prior_to_observation(
+        self,
+        z_k: Dict[str, float],
+        pose_idx: int,
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+        z_variance_k: Dict[str, float] | None = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Rescale early source-strength particles using the current count observation.
+
+        The adaptation uses only spectrum-derived counts and the same forward
+        model used by the PF. For each particle, source positions and relative
+        source-strength proportions are kept fixed, while the total strength is
+        set to the value implied by z ~= T * sum_j q_j K_j. This creates a
+        count-conditioned proposal over strength without inserting any ground
+        truth source information or a scenario-specific cps value.
+        """
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        if pose_idx < 0 or pose_idx >= len(self.poses):
+            raise IndexError("pose_idx out of range")
+        return self._adapt_strength_prior_at_detector(
+            z_k=z_k,
+            detector_pos=np.asarray(self.poses[pose_idx], dtype=float),
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+            z_variance_k=z_variance_k,
+        )
+
+    def _adapt_strength_prior_at_detector(
+        self,
+        z_k: Dict[str, float],
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+        z_variance_k: Dict[str, float] | None = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """Apply the count-conditioned strength proposal at an explicit detector position."""
+        self.last_strength_prior_diagnostics = {}
+        if not bool(self.pf_config.adaptive_strength_prior):
+            return {}
+        max_steps = int(self.pf_config.adaptive_strength_prior_steps)
+        if max_steps <= 0 or len(self.measurements) >= max_steps:
+            return {}
+        live_time = float(live_time_s)
+        if live_time <= 0.0:
+            return {}
+        detector = np.asarray(detector_pos, dtype=float)
+        kernel = self._continuous_kernel()
+        min_counts = float(self.pf_config.adaptive_strength_prior_min_counts)
+        log_sigma = float(self.pf_config.adaptive_strength_prior_log_sigma)
+        min_strength = max(float(self.pf_config.min_strength), 0.0)
+        eps = 1e-12
+        diagnostics: Dict[str, Dict[str, float]] = {}
+        for iso, filt in self.filters.items():
+            if iso not in z_k:
+                continue
+            observed_counts = max(float(z_k.get(iso, 0.0)), 0.0)
+            target_counts = max(observed_counts, min_counts)
+            obs_variance = (
+                0.0
+                if z_variance_k is None
+                else max(float(z_variance_k.get(iso, target_counts)), 0.0)
+            )
+            relative_count_variance = obs_variance / max(target_counts**2, eps)
+            effective_log_sigma = float(
+                np.sqrt(log_sigma**2 + np.log1p(relative_count_variance))
+            )
+            source_scale = self.response_scale_for_isotope(iso)
+            before_totals: list[float] = []
+            after_totals: list[float] = []
+            for particle in filt.continuous_particles:
+                state = particle.state
+                num_sources = int(state.num_sources)
+                if num_sources <= 0 or state.strengths.size < num_sources:
+                    continue
+                strengths = np.maximum(
+                    np.asarray(state.strengths[:num_sources], dtype=float),
+                    0.0,
+                )
+                total_strength = float(np.sum(strengths))
+                if total_strength <= eps:
+                    proportions = np.ones(num_sources, dtype=float) / num_sources
+                else:
+                    proportions = strengths / total_strength
+                unit_rate = 0.0
+                for position, proportion in zip(
+                    state.positions[:num_sources],
+                    proportions,
+                ):
+                    kernel_value = kernel.kernel_value_pair(
+                        isotope=iso,
+                        detector_pos=detector,
+                        source_pos=np.asarray(position, dtype=float),
+                        fe_index=fe_index,
+                        pb_index=pb_index,
+                    )
+                    unit_rate += float(proportion) * source_scale * float(kernel_value)
+                unit_counts = live_time * unit_rate
+                if not np.isfinite(unit_counts) or unit_counts <= eps:
+                    continue
+                proposed_total = target_counts / unit_counts
+                if effective_log_sigma > 0.0:
+                    proposed_total *= float(
+                        np.random.lognormal(mean=0.0, sigma=effective_log_sigma)
+                    )
+                proposed_total = max(float(proposed_total), min_strength * num_sources)
+                if not np.isfinite(proposed_total):
+                    continue
+                before_totals.append(total_strength)
+                after_totals.append(proposed_total)
+                state.strengths[:num_sources] = proportions * proposed_total
+            if after_totals:
+                diagnostics[iso] = {
+                    "observed_counts": float(observed_counts),
+                    "target_counts": float(target_counts),
+                    "observation_count_variance": float(obs_variance),
+                    "effective_log_sigma": float(effective_log_sigma),
+                    "before_median_strength": float(np.median(before_totals)),
+                    "after_median_strength": float(np.median(after_totals)),
+                    "particles_changed": float(len(after_totals)),
+                }
+        self.last_strength_prior_diagnostics = diagnostics
+        return diagnostics
+
+    def _continuous_kernel(self) -> ContinuousKernel:
+        """Build a ContinuousKernel matching the estimator observation model."""
+        return ContinuousKernel(
+            mu_by_isotope=self.mu_by_isotope,
+            shield_params=self.shield_params,
+            obstacle_grid=self.obstacle_grid,
+            obstacle_height_m=self.obstacle_height_m,
+            obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+        )
+
     def expected_counts_pair_for_states(
         self,
         isotope: str,
@@ -472,8 +720,23 @@ class RotatingShieldPFEstimator:
             return np.zeros(0, dtype=float)
         if pose_idx < 0 or pose_idx >= len(self.poses):
             raise IndexError("pose_idx out of range")
-        kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
+        kernel = self._continuous_kernel()
         detector_pos = np.asarray(self.poses[pose_idx], dtype=float)
+        if not self.pf_config.use_gpu:
+            values = np.zeros(len(states), dtype=float)
+            source_scale = self.response_scale_for_isotope(isotope)
+            for idx, state in enumerate(states):
+                rate = float(state.background)
+                for pos, strength in zip(state.positions[: state.num_sources], state.strengths[: state.num_sources]):
+                    rate += source_scale * float(strength) * kernel.kernel_value_pair(
+                        isotope=isotope,
+                        detector_pos=detector_pos,
+                        source_pos=pos,
+                        fe_index=fe_index,
+                        pb_index=pb_index,
+                    )
+                values[idx] = float(live_time_s) * rate
+            return values
         self._gpu_enabled()
         from pf import gpu_utils
 
@@ -494,13 +757,129 @@ class RotatingShieldPFEstimator:
             mu_pb=mu_pb,
             thickness_fe_cm=shield_params.thickness_fe_cm,
             thickness_pb_cm=shield_params.thickness_pb_cm,
+            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+            shield_geometry_model=shield_params.shield_geometry_model,
             use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
             device=device,
             dtype=dtype,
             source_scale=self.response_scale_for_isotope(isotope),
+            **kernel.obstacle_gpu_kwargs(isotope),
         )
         return lam_t.detach().cpu().numpy()
+
+    def expected_observation_counts_by_isotope_at_pose(
+        self,
+        pose_xyz: NDArray[np.float64],
+        *,
+        live_time_s: float,
+        fe_pb_pairs: Sequence[tuple[int, int]] | None = None,
+        aggregate: str = "max",
+        max_particles: int | None = None,
+    ) -> Dict[str, float]:
+        """
+        Return posterior-mean expected counts for each isotope at a candidate pose.
+
+        The value for one isotope is computed from the same inverse-square,
+        spherical shield, and obstacle attenuation model used by PF updates.
+        Across shield pairs, ``aggregate="max"`` returns the best achievable
+        expected count at that pose, while ``aggregate="mean"`` returns the
+        orientation-average expected count.
+        """
+        detector = np.asarray(pose_xyz, dtype=float)
+        if detector.shape != (3,):
+            raise ValueError("pose_xyz must be shape (3,).")
+        live_time = float(live_time_s)
+        if live_time <= 0.0:
+            return {iso: 0.0 for iso in self.isotopes}
+        aggregate = str(aggregate).strip().lower()
+        if aggregate not in {"max", "mean"}:
+            raise ValueError("aggregate must be max or mean.")
+        num_orients = max(1, int(self.num_orientations))
+        if fe_pb_pairs is None:
+            pairs = [
+                (fe_index, pb_index)
+                for fe_index in range(num_orients)
+                for pb_index in range(num_orients)
+            ]
+        else:
+            pairs = [(int(fe), int(pb)) for fe, pb in fe_pb_pairs]
+        if not pairs:
+            return {iso: 0.0 for iso in self.isotopes}
+        particles = self.planning_particles(max_particles=max_particles)
+        kernel = self._continuous_kernel()
+        counts_by_isotope: Dict[str, float] = {}
+        eps = 1e-12
+        for iso in self.isotopes:
+            filt = self.filters.get(iso)
+            if (
+                max_particles is None
+                and filt is not None
+                and filt.continuous_particles
+                and self.pf_config.use_gpu
+            ):
+                weights_arr = np.asarray(filt.continuous_weights, dtype=float)
+                weight_sum = float(np.sum(weights_arr))
+                if weight_sum <= eps:
+                    weights_arr = np.ones(len(weights_arr), dtype=float) / max(
+                        len(weights_arr),
+                        1,
+                    )
+                else:
+                    weights_arr = weights_arr / weight_sum
+                pair_means = []
+                for fe_index, pb_index in pairs:
+                    lambdas = filt._continuous_expected_counts_pair_at_pose(
+                        detector_pos=detector,
+                        fe_index=fe_index,
+                        pb_index=pb_index,
+                        live_time_s=live_time,
+                    )
+                    pair_means.append(float(np.sum(weights_arr * lambdas)))
+                if aggregate == "mean":
+                    counts_by_isotope[iso] = float(np.mean(pair_means))
+                else:
+                    counts_by_isotope[iso] = float(np.max(pair_means))
+                continue
+            if iso not in particles:
+                counts_by_isotope[iso] = 0.0
+                continue
+            states, weights = particles[iso]
+            if not states:
+                counts_by_isotope[iso] = 0.0
+                continue
+            weights_arr = np.asarray(weights, dtype=float)
+            weight_sum = float(np.sum(weights_arr))
+            if weight_sum <= eps:
+                weights_arr = np.ones(len(states), dtype=float) / max(len(states), 1)
+            else:
+                weights_arr = weights_arr / weight_sum
+            source_scale = self.response_scale_for_isotope(iso)
+            pair_means: list[float] = []
+            for fe_index, pb_index in pairs:
+                lambdas = np.zeros(len(states), dtype=float)
+                for state_idx, state in enumerate(states):
+                    rate = float(state.background)
+                    for pos, strength in zip(
+                        state.positions[: state.num_sources],
+                        state.strengths[: state.num_sources],
+                    ):
+                        kernel_value = kernel.kernel_value_pair(
+                            isotope=iso,
+                            detector_pos=detector,
+                            source_pos=np.asarray(pos, dtype=float),
+                            fe_index=fe_index,
+                            pb_index=pb_index,
+                        )
+                        rate += source_scale * float(strength) * float(kernel_value)
+                    lambdas[state_idx] = max(live_time * rate, 0.0)
+                pair_means.append(float(np.sum(weights_arr * lambdas)))
+            if aggregate == "mean":
+                counts_by_isotope[iso] = float(np.mean(pair_means))
+            else:
+                counts_by_isotope[iso] = float(np.max(pair_means))
+        return counts_by_isotope
 
     def planning_particles(
         self,
@@ -676,6 +1055,7 @@ class RotatingShieldPFEstimator:
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        z_variance_k: Dict[str, float] | None = None,
     ) -> None:
         """
         Update PFs using Fe/Pb orientation indices (RFe, RPb) and isotope-wise counts z_k.
@@ -684,6 +1064,14 @@ class RotatingShieldPFEstimator:
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
+        self.adapt_strength_prior_to_observation(
+            z_k=z_k,
+            pose_idx=pose_idx,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+            z_variance_k=z_variance_k,
+        )
         for iso, val in z_k.items():
             if iso not in self.filters:
                 continue
@@ -694,6 +1082,11 @@ class RotatingShieldPFEstimator:
                 fe_index=fe_index,
                 pb_index=pb_index,
                 live_time_s=live_time_s,
+                observation_count_variance=(
+                    0.0
+                    if z_variance_k is None
+                    else float(z_variance_k.get(iso, 0.0))
+                ),
                 step_idx=len(self.measurements),
             )
         self.history_estimates.append(self.estimates())
@@ -705,6 +1098,9 @@ class RotatingShieldPFEstimator:
                 live_time_s=live_time_s,
                 fe_index=fe_index,
                 pb_index=pb_index,
+                z_variance_k=None
+                if z_variance_k is None
+                else {iso: float(v) for iso, v in z_variance_k.items()},
                 ig_value=None,
             )
         )
@@ -718,6 +1114,7 @@ class RotatingShieldPFEstimator:
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        z_variance_k: Dict[str, float] | None = None,
     ) -> None:
         """
         Update PFs using explicit detector position without rebuilding the kernel cache.
@@ -731,6 +1128,14 @@ class RotatingShieldPFEstimator:
             pf_conf = self._build_pf_config()
             for iso in self.isotopes:
                 self.filters[iso] = IsotopeParticleFilter(iso, kernel=None, config=pf_conf)
+        self._adapt_strength_prior_at_detector(
+            z_k=z_k,
+            detector_pos=detector_pos,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+            z_variance_k=z_variance_k,
+        )
         for iso, val in z_k.items():
             if iso not in self.filters:
                 continue
@@ -740,6 +1145,11 @@ class RotatingShieldPFEstimator:
                 fe_index=fe_index,
                 pb_index=pb_index,
                 live_time_s=live_time_s,
+                observation_count_variance=(
+                    0.0
+                    if z_variance_k is None
+                    else float(z_variance_k.get(iso, 0.0))
+                ),
                 step_idx=len(self.measurements),
             )
         self.history_estimates.append(self.estimates())
@@ -751,6 +1161,9 @@ class RotatingShieldPFEstimator:
                 live_time_s=live_time_s,
                 fe_index=fe_index,
                 pb_index=pb_index,
+                z_variance_k=None
+                if z_variance_k is None
+                else {iso: float(v) for iso, v in z_variance_k.items()},
                 ig_value=None,
             )
         )
@@ -775,8 +1188,15 @@ class RotatingShieldPFEstimator:
         fe_indices = []
         pb_indices = []
         live_times = []
+        variance_list = []
         for rec in records:
             z_list.append(float(rec.z_k.get(isotope, 0.0)))
+            if rec.z_variance_k is None:
+                variance_list.append(max(float(rec.z_k.get(isotope, 0.0)), 1.0))
+            else:
+                variance_list.append(
+                    max(float(rec.z_variance_k.get(isotope, 1.0)), 1.0)
+                )
             poses.append(self.poses[rec.pose_idx])
             live_times.append(float(rec.live_time_s))
             if rec.fe_index is not None and rec.pb_index is not None:
@@ -787,6 +1207,7 @@ class RotatingShieldPFEstimator:
                 pb_indices.append(int(rec.orient_idx))
         return MeasurementData(
             z_k=np.asarray(z_list, dtype=float),
+            observation_variances=np.asarray(variance_list, dtype=float),
             detector_positions=np.asarray(poses, dtype=float),
             fe_indices=np.asarray(fe_indices, dtype=int),
             pb_indices=np.asarray(pb_indices, dtype=int),
@@ -942,8 +1363,16 @@ class RotatingShieldPFEstimator:
                 source_scale=self.response_scale_for_isotope(iso),
             )
             lambda_total = background_counts + np.sum(lambda_m, axis=1)
-            ll = poisson_log_likelihood(data.z_k, lambda_total)
-            ll_bg = poisson_log_likelihood(data.z_k, background_counts)
+            ll = filt._count_log_likelihood_np(
+                data.z_k,
+                lambda_total,
+                observation_count_variance=data.observation_variances,
+            )
+            ll_bg = filt._count_log_likelihood_np(
+                data.z_k,
+                background_counts,
+                observation_count_variance=data.observation_variances,
+            )
             gains[iso] = float(ll - ll_bg)
         return gains
 
@@ -1023,7 +1452,7 @@ class RotatingShieldPFEstimator:
         eps = 1e-12
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
-        kernel = ContinuousKernel(mu_by_isotope=self.mu_by_isotope, shield_params=self.shield_params)
+        kernel = self._continuous_kernel()
         alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
         # normalize alphas
         alpha_sum = sum(alphas.values()) or 1.0
@@ -1055,11 +1484,15 @@ class RotatingShieldPFEstimator:
                 mu_pb=mu_pb,
                 thickness_fe_cm=shield_params.thickness_fe_cm,
                 thickness_pb_cm=shield_params.thickness_pb_cm,
+                inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+                inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+                shield_geometry_model=shield_params.shield_geometry_model,
                 use_angle_attenuation=shield_params.use_angle_attenuation,
                 live_time_s=live_time_s,
                 device=device,
                 dtype=dtype,
                 source_scale=self.response_scale_for_isotope(isotope),
+                **kernel.obstacle_gpu_kwargs(isotope),
             )
 
         total_ig = 0.0
@@ -1460,11 +1893,15 @@ class RotatingShieldPFEstimator:
                     mu_pb=mu_pb,
                     thickness_fe_cm=shield_params.thickness_fe_cm,
                     thickness_pb_cm=shield_params.thickness_pb_cm,
+                    inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
+                    inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
+                    shield_geometry_model=shield_params.shield_geometry_model,
                     use_angle_attenuation=shield_params.use_angle_attenuation,
                     live_time_s=live_time_per_rot_s,
                     device=device,
                     dtype=dtype,
                     source_scale=self.response_scale_for_isotope(iso),
+                    **filt.continuous_kernel.obstacle_gpu_kwargs(iso),
                 )
                 lam_list.append(lam_t)
             if not lam_list:

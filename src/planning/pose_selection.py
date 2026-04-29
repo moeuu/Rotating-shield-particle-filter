@@ -86,6 +86,50 @@ def estimate_lambda_cost(
     return float(scale) * (u_scale / d_scale)
 
 
+def minimum_observation_shortfall(
+    counts_by_isotope: dict[str, float],
+    min_counts: float,
+) -> float:
+    """
+    Return a dimensionless soft-constraint penalty for isotope observability.
+
+    The penalty is zero only when every candidate isotope has at least
+    ``min_counts`` expected counts. It is the mean squared relative shortfall,
+    so it is independent of the absolute count scale.
+    """
+    min_counts = float(min_counts)
+    if min_counts <= 0.0:
+        return 0.0
+    if not counts_by_isotope:
+        return 1.0
+    shortfalls = [
+        max(0.0, 1.0 - max(float(count), 0.0) / min_counts) ** 2
+        for count in counts_by_isotope.values()
+    ]
+    return float(np.mean(shortfalls)) if shortfalls else 0.0
+
+
+def _auto_scale_observation_penalty(
+    base_scores: NDArray[np.float64],
+    penalties: NDArray[np.float64],
+    scale: float,
+    eps: float = 1e-12,
+) -> float:
+    """Return a score-compatible weight for dimensionless observation penalties."""
+    scale = max(float(scale), 0.0)
+    if scale <= 0.0 or penalties.size == 0 or float(np.max(penalties)) <= eps:
+        return 0.0
+    base_scores = np.asarray(base_scores, dtype=float)
+    penalties = np.asarray(penalties, dtype=float)
+    base_range = float(np.ptp(base_scores))
+    if base_range <= eps:
+        base_range = max(float(np.mean(np.abs(base_scores))), 1.0)
+    penalty_range = float(np.ptp(penalties))
+    if penalty_range <= eps:
+        return scale * base_range
+    return scale * base_range / penalty_range
+
+
 def recommend_num_rollouts(
     *,
     estimator: RotatingShieldPFEstimator | None = None,
@@ -281,12 +325,18 @@ def select_next_pose_from_candidates(
     ig_breakdown_max_steps: int = 6,
     ig_breakdown_max_rollouts: int = 2,
     criterion: str = "after_rotation",
+    min_observation_counts: float = 0.0,
+    min_observation_penalty_scale: float = 1.0,
+    min_observation_aggregate: str = "max",
+    min_observation_max_particles: int | None = None,
 ) -> int:
     """
     Select the next pose from explicit candidate coordinates using an uncertainty criterion.
 
-    Score_k = E[U | q_k] + lambda_cost * C_move
+    Score_k = E[U | q_k] + lambda_cost * C_move + eta * G(q_k)
     where U is either after-rotation or after-pose uncertainty depending on criterion.
+    G(q_k) is a soft constraint penalizing poses whose posterior-predicted
+    isotope counts fall below ``min_observation_counts`` for any isotope.
 
     GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
     When verbose is True, top_k and ig_breakdown_k control extra diagnostics.
@@ -355,6 +405,8 @@ def select_next_pose_from_candidates(
             rollouts = 1
         uncertainties = []
         motion_costs = []
+        observation_penalties = []
+        observation_counts_by_candidate: list[dict[str, float]] = []
         spinner = ["|", "/", "-", "\\"]
         last_line_len = 0
         total_candidates = int(len(candidate_poses_xyz))
@@ -411,6 +463,23 @@ def select_next_pose_from_candidates(
             motion_cost = float(np.linalg.norm(pose - current_pose_xyz))
             uncertainties.append(float(uncertainty))
             motion_costs.append(motion_cost)
+            if min_observation_counts > 0.0:
+                counts_by_iso = estimator.expected_observation_counts_by_isotope_at_pose(
+                    pose,
+                    live_time_s=t_short_s,
+                    aggregate=min_observation_aggregate,
+                    max_particles=min_observation_max_particles,
+                )
+                observation_counts_by_candidate.append(counts_by_iso)
+                observation_penalties.append(
+                    minimum_observation_shortfall(
+                        counts_by_iso,
+                        min_counts=float(min_observation_counts),
+                    )
+                )
+            else:
+                observation_counts_by_candidate.append({})
+                observation_penalties.append(0.0)
         if verbose and progress_every > 0 and len(candidate_poses_xyz) > 0:
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -423,7 +492,14 @@ def select_next_pose_from_candidates(
                 method=lambda_cost_method,
                 scale=lambda_cost_scale,
             )
-        scores = uncertainties_arr + lam_cost * motion_costs_arr
+        base_scores = uncertainties_arr + lam_cost * motion_costs_arr
+        observation_penalties_arr = np.asarray(observation_penalties, dtype=float)
+        observation_penalty_weight = _auto_scale_observation_penalty(
+            base_scores,
+            observation_penalties_arr,
+            scale=float(min_observation_penalty_scale),
+        )
+        scores = base_scores + observation_penalty_weight * observation_penalties_arr
         best_idx = int(np.argmin(scores))
         if verbose and best_idx >= 0:
             best_pose = candidate_poses_xyz[best_idx]
@@ -437,13 +513,23 @@ def select_next_pose_from_candidates(
                 "Best candidate selected: "
                 f"idx={best_idx}, pose={best_pose.tolist()}, "
                 f"uncertainty={uncertainties_arr[best_idx]:.6g}, "
-                f"motion_cost={motion_costs_arr[best_idx]:.6g}, score={scores[best_idx]:.6g}"
+                f"motion_cost={motion_costs_arr[best_idx]:.6g}, "
+                f"observation_penalty={observation_penalties_arr[best_idx]:.6g}, "
+                f"score={scores[best_idx]:.6g}"
             )
             print(
                 "Selection reason: "
                 f"minimum score among {len(scores)} candidates "
-                f"(score = uncertainty + {lam_cost:.6g} * motion_cost)."
+                f"(score = uncertainty + {lam_cost:.6g} * motion_cost "
+                f"+ {observation_penalty_weight:.6g} * observation_penalty)."
             )
+            if min_observation_counts > 0.0:
+                print(
+                    "Observation guarantee: "
+                    f"min_counts={float(min_observation_counts):.6g}, "
+                    f"aggregate={min_observation_aggregate}, "
+                    f"counts={observation_counts_by_candidate[best_idx]}"
+                )
             if len(scores) > 1:
                 order = np.argsort(scores)
                 runner_up_idx = int(order[1])
@@ -454,6 +540,7 @@ def select_next_pose_from_candidates(
                     f"idx={runner_up_idx}, pose={runner_pose.tolist()}, "
                     f"uncertainty={uncertainties_arr[runner_up_idx]:.6g}, "
                     f"motion_cost={motion_costs_arr[runner_up_idx]:.6g}, "
+                    f"observation_penalty={observation_penalties_arr[runner_up_idx]:.6g}, "
                     f"score={scores[runner_up_idx]:.6g}, Δscore={delta:.6g}"
                 )
         if verbose and top_k > 0 and scores.size:
@@ -465,6 +552,7 @@ def select_next_pose_from_candidates(
                     f"  #{rank} idx={int(idx)} pose={candidate_poses_xyz[int(idx)].tolist()} "
                     f"uncertainty={uncertainties[int(idx)]:.6g} "
                     f"motion_cost={motion_costs[int(idx)]:.6g} "
+                    f"observation_penalty={observation_penalties_arr[int(idx)]:.6g} "
                     f"score={scores[int(idx)]:.6g}"
                 )
         if verbose and ig_breakdown_k is None and criterion == "after_rotation":

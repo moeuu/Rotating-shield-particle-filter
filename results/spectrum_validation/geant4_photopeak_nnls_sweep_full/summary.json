@@ -1,0 +1,460 @@
+{
+  "accuracy_summary": {
+    "peak_window": {
+      "max_abs_relative_error": 2.8564574518519836,
+      "max_absent_isotope_counts": 1068.0564648506258,
+      "mean_abs_relative_error": 0.3337746466079346,
+      "mean_absent_isotope_counts": 254.84771764915877,
+      "median_abs_relative_error": 0.12502703509968827,
+      "num_absent_isotope_points": 13.0,
+      "num_accuracy_points": 20.0
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 0.70067596907657,
+      "max_absent_isotope_counts": 30.453465607568663,
+      "mean_abs_relative_error": 0.16092547074593913,
+      "mean_absent_isotope_counts": 6.488504513685034,
+      "median_abs_relative_error": 0.12090608928128194,
+      "num_absent_isotope_points": 13.0,
+      "num_accuracy_points": 20.0
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 1.0,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.3034465969403282,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.18120159242084652,
+      "num_absent_isotope_points": 13.0,
+      "num_accuracy_points": 20.0
+    }
+  },
+  "cases": [
+    {
+      "description": "Single Cs-137 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_cs_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Single Co-60 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_co_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Single Eu-154 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Two Cs-137 sources at different distances.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "two_cs_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 70.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 120.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            1.0,
+            3.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Two-isotope mixture with Cs-137 and Co-60.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "cs_co_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Two-isotope mixture with Cs-137 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "cs_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Two-isotope mixture with Co-60 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "co_eu_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Balanced three-isotope mixture at three directions.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_balanced_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 60.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            1.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Three-isotope mixture with weak Co-60 and Eu-154.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_imbalanced_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 120.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 35.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.0,
+            2.0,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 25.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            1.0,
+            1.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Three-isotope mixture through the iron shield octant.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_fe_blocked",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Two Cs-137 sources with one direction blocked by Fe.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "cs_two_sources_one_fe_blocked",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            0.0,
+            2.0,
+            1.5
+          ]
+        }
+      ]
+    },
+    {
+      "description": "Three-isotope mixture with a concrete obstacle; excluded from accuracy summary because the PF target omits obstacle transport.",
+      "detector_pose_xyz": [
+        1.0,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 20.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": false,
+      "name": "three_isotope_obstacle_stress",
+      "obstacle_cells": [
+        [
+          2,
+          1
+        ]
+      ],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            4.0,
+            1.5,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            4.0,
+            1.5,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 80.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            4.0,
+            1.5,
+            0.8
+          ]
+        }
+      ]
+    }
+  ],
+  "config": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/high_fidelity_external_no_isaac.json",
+  "elapsed_s": 982.5970230102539,
+  "min_target_counts": 25.0,
+  "num_cases": 12,
+  "output_dir": "/home/moeu/research/Rotating-shield-particle-filter/results/spectrum_validation/geant4_photopeak_nnls_sweep_full"
+}

@@ -1,0 +1,81 @@
+{
+  "accuracy_summary": {
+    "peak_window": {
+      "max_abs_relative_error": 1.0191601322344526,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.38017674492773496,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.07774553951038864,
+      "num_absent_isotope_points": 0.0,
+      "num_accuracy_points": 3.0
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 0.45575010006447203,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.3969679072874383,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.37122039619313685,
+      "num_absent_isotope_points": 0.0,
+      "num_accuracy_points": 3.0
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 0.7443154290969966,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.5414688647779066,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.6186098827852101,
+      "num_absent_isotope_points": 0.0,
+      "num_accuracy_points": 3.0
+    }
+  },
+  "cases": [
+    {
+      "description": "High-statistics three-isotope mixture through the iron shield octant.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "three_isotope_fe_blocked_highstat",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 400.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 400.0,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 400.0,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            2.0,
+            2.0,
+            1.5
+          ]
+        }
+      ]
+    }
+  ],
+  "config": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/high_fidelity_external_no_isaac.json",
+  "elapsed_s": 638.2475399971008,
+  "min_target_counts": 25.0,
+  "num_cases": 1,
+  "output_dir": "/home/moeu/research/Rotating-shield-particle-filter/results/spectrum_validation/geant4_photopeak_nnls_sweep_highstat_shield"
+}

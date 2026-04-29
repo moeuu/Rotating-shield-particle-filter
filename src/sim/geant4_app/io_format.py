@@ -41,6 +41,7 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
             crystal_radius_m=scene.detector_model.crystal_radius_m,
             crystal_length_m=scene.detector_model.crystal_length_m,
             housing_thickness_m=scene.detector_model.housing_thickness_m,
+            crystal_shape=scene.detector_model.crystal_shape,
             crystal_material=scene.detector_model.crystal_material,
             housing_material=scene.detector_model.housing_material,
         ),
@@ -99,6 +100,8 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                 material_name=material_name,
                 density_g_cm3=density_g_cm3,
                 preset_name=preset_name,
+                transport_group=volume.transport_group or "-",
+                transport_mode=volume.transport_mode,
                 sx="-" if volume.size_xyz is None else volume.size_xyz[0],
                 sy="-" if volume.size_xyz is None else volume.size_xyz[1],
                 sz="-" if volume.size_xyz is None else volume.size_xyz[2],
@@ -178,6 +181,7 @@ def read_response_file(path: str | Path) -> tuple[np.ndarray, dict[str, Any]]:
     """Read a line-oriented response file written by the external executable."""
     response_path = Path(path)
     spectrum: np.ndarray | None = None
+    spectrum_variance: np.ndarray | None = None
     metadata: dict[str, Any] = {}
     for line in response_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -194,8 +198,21 @@ def read_response_file(path: str | Path) -> tuple[np.ndarray, dict[str, Any]]:
                 spectrum = np.asarray([float(part) for part in payload.split(",") if part], dtype=float)
             else:
                 spectrum = np.zeros(0, dtype=float)
+            continue
+        if stripped.startswith("SPECTRUM_VARIANCE "):
+            _, payload = stripped.split(" ", 1)
+            if payload.strip():
+                spectrum_variance = np.asarray(
+                    [float(part) for part in payload.split(",") if part],
+                    dtype=float,
+                )
+            else:
+                spectrum_variance = np.zeros(0, dtype=float)
     if spectrum is None:
         raise RuntimeError("External Geant4 response did not contain a SPECTRUM record.")
+    if spectrum_variance is not None:
+        metadata["spectrum_count_variance"] = spectrum_variance.tolist()
+        metadata["spectrum_count_variance_total"] = float(np.sum(spectrum_variance))
     return spectrum, metadata
 
 

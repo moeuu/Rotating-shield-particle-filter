@@ -1,0 +1,20 @@
+{
+  "metadata": {
+    "num_primaries": 7063415,
+    "source_equivalent_counts_Cs-137": 3000.0
+  },
+  "num_primaries": 7063415.0,
+  "photopeak_nnls_counts": {
+    "Co-60": 0.0,
+    "Cs-137": 3101.033397400862,
+    "Eu-154": 7.19164895040576e-15
+  },
+  "response_matrix_counts": {
+    "Co-60": 0.0,
+    "Cs-137": 2800.5069654976137,
+    "Eu-154": 0.0
+  },
+  "run_time_s": 43.71467161178589,
+  "source_equivalent_counts_Cs-137": 3000.0,
+  "total_counts": 3056.9981892028745
+}

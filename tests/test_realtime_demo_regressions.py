@@ -7,12 +7,17 @@ import pytest
 
 from pf.estimator import MeasurementRecord, RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.mixing import prune_spurious_sources_continuous
-from realtime_demo import run_live_pf
+from realtime_demo import (
+    ADAPTIVE_STEP_ID_STRIDE,
+    _acquire_spectrum_observation,
+    run_live_pf,
+)
+from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer
 
 
-def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure demo measurements keep all isotope keys after detection locking."""
     import realtime_demo
 
@@ -42,6 +47,7 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        z_variance_k: dict[str, float] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
         self.measurements.append(
@@ -52,6 +58,7 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
                 live_time_s=live_time_s,
                 fe_index=fe_index,
                 pb_index=pb_index,
+                z_variance_k=z_variance_k,
             )
         )
 
@@ -74,6 +81,7 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
     ) -> tuple[dict[str, float], set[str]]:
         """Return deterministic counts and a stable detection set."""
         counts = {iso: 10.0 for iso in ANALYSIS_ISOTOPES}
+        self.last_count_variances = {iso: 2.0 for iso in ANALYSIS_ISOTOPES}
         return counts, {"Cs-137"}
 
     def _fake_ig_grid(
@@ -85,12 +93,9 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         planning_isotopes: list[str] | None = None,
     ) -> np.ndarray:
         """Return a zero IG grid to bypass heavy IG evaluation."""
+        planning_isotope_args.append(planning_isotopes)
         size = len(rot_mats)
         return np.zeros((size, size), dtype=float)
-
-    def _fake_expected_counts(*args: object, **kwargs: object) -> dict[str, float]:
-        """Return deterministic expected counts for all analysis isotopes."""
-        return {iso: 5.0 for iso in ANALYSIS_ISOTOPES}
 
     def _fake_frame(*args: object, **kwargs: object) -> dict[str, object]:
         """Return an empty frame placeholder."""
@@ -108,10 +113,22 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
         """Pretend GPU is disabled to avoid CUDA checks in tests."""
         return False
 
+    def _forbidden_restrict(
+        self: RotatingShieldPFEstimator,
+        active_isotopes: list[str],
+    ) -> None:
+        """Fail if runtime detection tries to remove isotope filters."""
+        raise AssertionError("Detection must not restrict runtime isotopes.")
+
+    planning_isotope_args: list[list[str] | None] = []
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
-    monkeypatch.setattr(realtime_demo, "_expected_counts", _fake_expected_counts)
+    monkeypatch.setattr(
+        realtime_demo,
+        "DETECT_CONSECUTIVE_BY_ISOTOPE",
+        {"Cs-137": 1, "Co-60": 1, "Eu-154": 1},
+    )
     monkeypatch.setattr(
         realtime_demo,
         "generate_candidate_poses",
@@ -123,12 +140,12 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
+    monkeypatch.setattr(RotatingShieldPFEstimator, "restrict_isotopes", _forbidden_restrict)
 
     estimator = run_live_pf(
         live=False,
         max_steps=None,
         max_poses=2,
-        count_mode="expected",
         detect_threshold_abs=0.0,
         detect_threshold_rel=0.0,
         detect_consecutive=1,
@@ -169,6 +186,10 @@ def test_demo_expected_counts_keeps_all_isotopes(monkeypatch: pytest.MonkeyPatch
     for rec in estimator.measurements:
         for iso in ANALYSIS_ISOTOPES:
             assert iso in rec.z_k
+            assert rec.z_variance_k is not None
+            assert rec.z_variance_k[iso] == pytest.approx(2.0)
+    assert planning_isotope_args
+    assert all(value is None for value in planning_isotope_args)
     estimates = estimator.estimates()
     for iso in ANALYSIS_ISOTOPES:
         positions, strengths = estimates.get(iso, (np.zeros((0, 3)), np.zeros(0)))
@@ -221,3 +242,113 @@ def test_prune_missing_isotope_does_not_zero_fill(monkeypatch: pytest.MonkeyPatc
     )
     assert keep_masks["Co-60"].size == 1
     assert keep_masks["Co-60"].all()
+
+
+def test_adaptive_dwell_chunks_stop_at_ready_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adaptive dwell should stop after accumulated isotope counts are usable."""
+    decomposer = SpectralDecomposer()
+    commands: list[SimulationCommand] = []
+
+    class _FakeRuntime:
+        """Return deterministic spectra proportional to requested dwell time."""
+
+        def step(self, command: SimulationCommand) -> SimulationObservation:
+            """Record the command and return one non-zero spectrum bin."""
+            commands.append(command)
+            energy = np.asarray(decomposer.energy_axis, dtype=float)
+            step = float(np.median(np.diff(energy)))
+            spectrum = np.zeros_like(energy, dtype=float)
+            spectrum[0] = float(command.dwell_time_s) * 60.0
+            spectrum_variance = np.full_like(energy, float(command.dwell_time_s) * 25.0)
+            return SimulationObservation(
+                step_id=command.step_id,
+                detector_pose_xyz=command.target_pose_xyz,
+                detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+                fe_orientation_index=command.fe_orientation_index,
+                pb_orientation_index=command.pb_orientation_index,
+                spectrum_counts=spectrum.tolist(),
+                energy_bin_edges_keV=np.concatenate(
+                    [energy, [energy[-1] + step]]
+                ).tolist(),
+                metadata={
+                    "backend": "fake",
+                    "weighted_transport": True,
+                    "spectrum_count_variance": spectrum_variance.tolist(),
+                },
+            )
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return a Cs-137 count equal to total accumulated spectrum counts."""
+        count = float(np.sum(spectrum))
+        detected = {"Cs-137"} if count > 0.0 else set()
+        return {"Cs-137": count}, detected
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    def _fake_variance_floor(
+        self: SpectralDecomposer,
+        spectrum_variance: np.ndarray,
+        *,
+        isotopes: list[str],
+    ) -> dict[str, float]:
+        """Return a deterministic weighted-MC variance floor for the test."""
+        assert float(np.sum(spectrum_variance)) > 0.0
+        return {"Cs-137": 1000.0}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "estimate_count_variances_from_spectrum_variance",
+        _fake_variance_floor,
+    )
+    observation, actual_live, counts, variances, detected, reason, chunks = (
+        _acquire_spectrum_observation(
+            simulation_runtime=_FakeRuntime(),
+            decomposer=decomposer,
+            step_id=7,
+            pose_xyz=np.array([1.0, 2.0, 0.5], dtype=float),
+            fe_idx=3,
+            pb_idx=4,
+            live_time_s=30.0,
+            travel_time_s=5.0,
+            shield_actuation_time_s=2.0,
+            adaptive_dwell=True,
+            adaptive_dwell_chunk_s=2.0,
+            adaptive_min_dwell_s=2.0,
+            adaptive_ready_min_counts=200.0,
+            adaptive_ready_min_isotopes=1,
+            spectrum_count_method="photopeak_nnls",
+            detect_threshold_abs=0.0,
+            detect_threshold_rel=0.0,
+            detect_threshold_rel_by_isotope={},
+            min_peaks_by_isotope=None,
+        )
+    )
+
+    assert actual_live == pytest.approx(4.0)
+    assert counts["Cs-137"] == pytest.approx(240.0)
+    assert variances["Cs-137"] == pytest.approx(1000.0)
+    assert detected == {"Cs-137"}
+    assert reason == "detected_isotope_counts_ready"
+    assert chunks == 2
+    assert observation.step_id == 7
+    assert observation.metadata["adaptive_dwell_chunks"] == 2
+    assert "adaptive_dwell_count_variance_by_isotope" in observation.metadata
+    assert observation.metadata["spectrum_count_variance_total"] > 0.0
+    assert commands[0].step_id == 7 * ADAPTIVE_STEP_ID_STRIDE
+    assert commands[1].step_id == 7 * ADAPTIVE_STEP_ID_STRIDE + 1
+    assert commands[0].travel_time_s == pytest.approx(5.0)
+    assert commands[1].travel_time_s == pytest.approx(0.0)
+    assert commands[0].shield_actuation_time_s == pytest.approx(2.0)
+    assert commands[1].shield_actuation_time_s == pytest.approx(0.0)

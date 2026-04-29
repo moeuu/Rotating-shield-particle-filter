@@ -23,9 +23,46 @@ def _has_display() -> bool:
     return True
 
 
+def _argv_requests_cui(argv: list[str] | None = None) -> bool:
+    """Return True when command-line arguments request non-interactive CUI mode."""
+    args = sys.argv[1:] if argv is None else argv
+    if "--matplotlib-live" in args:
+        return False
+
+    def _is_run_mode_value(value: str) -> bool:
+        """Return True when a CLI value names a non-Matplotlib run mode."""
+        mode = value.strip().lower()
+        return mode in {"gui", "cui"} or mode.endswith(("-gui", "-cui"))
+
+    for index, arg in enumerate(args):
+        if arg in {
+            "--headless",
+            "--no-live",
+            "--cui",
+            "--python-gui",
+            "--geant4-isaacsim-gui",
+            "--python-cui",
+            "--geant4-cui",
+        }:
+            return True
+        if arg in {"--mode", "--ui-mode"}:
+            if index + 1 >= len(args):
+                continue
+            if _is_run_mode_value(args[index + 1]):
+                return True
+        if arg.startswith("--mode=") and _is_run_mode_value(arg.split("=", 1)[1]):
+            return True
+        if (
+            arg.startswith("--ui-mode=")
+            and _is_run_mode_value(arg.split("=", 1)[1])
+        ):
+            return True
+    return False
+
+
 def _configure_matplotlib() -> None:
     """Configure matplotlib backend for interactive or headless use."""
-    headless = "--headless" in sys.argv or "--no-live" in sys.argv
+    headless = _argv_requests_cui()
     if headless or not _has_display():
         matplotlib.use("Agg")
         return
@@ -55,15 +92,18 @@ from spectrum.library import get_detection_lines_keV
 from spectrum.peak_detection import detect_peaks
 from spectrum.pipeline import SpectralDecomposer
 from spectrum.baseline import baseline_als
-from spectrum.net_response import NetResponseCalibration
 from spectrum.smoothing import gaussian_smooth
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
-from pf.particle_filter import PFConfig
 from planning.candidate_generation import generate_candidate_poses
 from planning.pose_selection import (
     DEFAULT_PLANNING_ROLLOUTS,
     select_next_pose_from_candidates,
+)
+from planning.traversability import (
+    TraversabilityMap,
+    build_traversability_map_from_obstacle_grid,
+    render_traversability_map,
 )
 from visualization.realtime_viz import (
     DEFAULT_ISOTOPE_COLORS,
@@ -73,12 +113,19 @@ from visualization.realtime_viz import (
 )
 from visualization.ig_shield_geometry import render_octant_grid
 from evaluation_metrics import compute_metrics, print_metrics_report
-from sim import SimulationCommand, create_simulation_runtime, load_runtime_config
+from piplup_notify import PiplupNotificationConfig, PiplupNotifier
+from sim import (
+    SimulationCommand,
+    SimulationObservation,
+    SimulationRuntime,
+    create_simulation_runtime,
+    load_runtime_config,
+)
 from sim.blender_environment import generate_blender_environment_usd
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
-SPECTRUM_DIR = RESULTS_DIR / "spetrum"
+SPECTRUM_DIR = RESULTS_DIR / "spectrum"
 PF_DIR = RESULTS_DIR / "pf"
 IG_DIR = RESULTS_DIR / "IG"
 BLENDER_ENV_DIR = RESULTS_DIR / "blender_environments"
@@ -94,7 +141,7 @@ FINAL_MERGE_DISTANCE_M = 1.5
 PRUNE_MIN_SUPPORT = 2
 PRUNE_MIN_OBS_COUNT = 0.0
 PRUNE_MIN_MEASUREMENTS = 10
-DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 1}
+DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 2}
 DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.1}
 DETECT_CONSECUTIVE_BY_ISOTOPE = {"Cs-137": 3, "Co-60": 3, "Eu-154": 5}
 DETECT_MISS_AFTER_LOCK = 30
@@ -103,6 +150,7 @@ DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
 CANDIDATE_GRID_SPACING = (0.5, 0.5, 0.5)
 CANDIDATE_GRID_MARGIN = 0.5
 HEALTH_LOG_TOP_K = 3
+ADAPTIVE_STEP_ID_STRIDE = 100000
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -207,6 +255,24 @@ def load_sources_from_json(path: Path) -> list[PointSource]:
     return sources
 
 
+def _resolve_config_relative_path(
+    path_value: object,
+    config_path: str | None,
+) -> Path | None:
+    """Resolve a config path value relative to its JSON file."""
+    if path_value in (None, ""):
+        return None
+    path = Path(str(path_value)).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if config_path:
+        base_path = Path(config_path).expanduser()
+        if not base_path.is_absolute():
+            base_path = (ROOT / base_path).resolve()
+        return (base_path.parent / path).resolve()
+    return (ROOT / path).resolve()
+
+
 def _update_detection_hysteresis(
     candidates: set[str],
     detect_counts: dict[str, int],
@@ -258,11 +324,6 @@ def _detect_isotopes_from_counts(
     return detected
 
 
-def _detect_isotopes_from_expected(counts: dict[str, float]) -> set[str]:
-    """Return isotopes detected from expected counts (any positive count)."""
-    return {iso for iso, val in counts.items() if val > 0.0}
-
-
 def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
     """Return a consistent color mapping for isotope-specific plots."""
     cmap = plt.get_cmap("tab10")
@@ -286,6 +347,81 @@ def _fmt_counts(counts: dict[str, float] | None) -> str:
         return "{}"
     items = ", ".join(f"{iso}: {float(val):.1f}" for iso, val in sorted(counts.items()))
     return "{" + items + "}"
+
+
+def _thin_spectrum_for_notification(
+    energy_keV: NDArray[np.float64],
+    counts: NDArray[np.float64],
+    max_bins: int,
+) -> tuple[list[float], list[float]]:
+    """Return spectrum arrays thinned to a notification-friendly size."""
+    energy = np.asarray(energy_keV, dtype=float).reshape(-1)
+    values = np.asarray(counts, dtype=float).reshape(-1)
+    if energy.size != values.size:
+        size = min(energy.size, values.size)
+        energy = energy[:size]
+        values = values[:size]
+    limit = int(max_bins)
+    if limit > 0 and values.size > limit:
+        nonzero = np.flatnonzero(values > 0.0)
+        if nonzero.size >= limit:
+            ranked = nonzero[np.argsort(values[nonzero])[-limit:]]
+            indices = np.sort(ranked)
+        else:
+            base = np.linspace(0, values.size - 1, limit, dtype=int)
+            indices = np.unique(np.concatenate([base, nonzero]))
+            if indices.size > limit:
+                ranked = indices[np.argsort(values[indices])[-limit:]]
+                indices = np.sort(ranked)
+        energy = energy[indices]
+        values = values[indices]
+    return (
+        [round(float(value), 3) for value in energy],
+        [round(float(value), 6) for value in values],
+    )
+
+
+def _build_spectrum_notification_payload(
+    *,
+    decomposer: SpectralDecomposer,
+    spectrum: NDArray[np.float64],
+    step_index: int,
+    pose_xyz: NDArray[np.float64],
+    fe_index: int,
+    pb_index: int,
+    live_time_s: float,
+    counts_by_isotope: dict[str, float],
+    detected_isotopes: set[str],
+    count_method: str,
+    max_bins: int,
+) -> dict[str, object]:
+    """Build a compact spectrum payload for piplup/Railway display."""
+    spectrum_values = np.asarray(spectrum, dtype=float)
+    energy_keV, spectrum_counts = _thin_spectrum_for_notification(
+        np.asarray(decomposer.energy_axis, dtype=float),
+        spectrum_values,
+        max_bins,
+    )
+    return {
+        "step_index": int(step_index),
+        "pose_xyz": [float(v) for v in np.asarray(pose_xyz, dtype=float)],
+        "fe_index": int(fe_index),
+        "pb_index": int(pb_index),
+        "live_time_s": float(live_time_s),
+        "count_method": str(count_method),
+        "counts_by_isotope": {
+            iso: float(value) for iso, value in sorted(counts_by_isotope.items())
+        },
+        "count_variance_by_isotope": {
+            iso: float(value)
+            for iso, value in sorted(decomposer.last_count_variances.items())
+        },
+        "detected_isotopes": sorted(detected_isotopes),
+        "total_spectrum_counts": float(np.sum(spectrum_values)),
+        "max_bin_count": float(np.max(spectrum_values)) if spectrum_values.size else 0.0,
+        "energy_keV": energy_keV,
+        "spectrum_counts": spectrum_counts,
+    }
 
 
 def _fmt_sources(positions: NDArray[np.float64], strengths: NDArray[np.float64]) -> str:
@@ -418,6 +554,17 @@ def _resolve_ig_workers(ig_workers: int | None) -> int:
     return workers
 
 
+def _coerce_live_visualization(live: bool) -> bool:
+    """Return whether live Matplotlib updates can run in this process."""
+    if not live:
+        return False
+    backend = str(matplotlib.get_backend()).lower()
+    if "agg" in backend or not _has_display():
+        print("GUI display unavailable; running in CUI/headless mode.")
+        return False
+    return True
+
+
 def _compute_ig_grid(
     estimator: RotatingShieldPFEstimator,
     rot_mats: Sequence[np.ndarray],
@@ -530,6 +677,7 @@ def _save_spectrum_plot(
     use_detection_lines: bool = True,
     window_keV: float | None = None,
     window_sigma: float = 3.0,
+    title: str = "Final measurement spectrum",
 ) -> None:
     """Save the measurement spectrum with nuclide lines and colored count windows."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -621,7 +769,7 @@ def _save_spectrum_plot(
         ax.scatter(energy_axis[unassigned], spectrum[unassigned], color="gray", s=20, zorder=3, alpha=0.6)
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
-    ax.set_title("Final measurement spectrum")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
     if library:
         ax.legend(loc="upper right", fontsize=8, title="Nuclide lines")
@@ -630,70 +778,354 @@ def _save_spectrum_plot(
     plt.close(fig)
 
 
-def _expected_counts(
-    kernel: ContinuousKernel,
-    sources: list[PointSource],
-    isotopes: list[str],
-    detector_pos: NDArray[np.float64],
-    fe_index: int,
-    pb_index: int,
+def _validate_measurement_timing(
+    *,
+    measurement_time_s: float,
+    adaptive_dwell: bool,
+    adaptive_dwell_chunk_s: float,
+    adaptive_min_dwell_s: float,
+    adaptive_ready_min_counts: float,
+    adaptive_ready_min_isotopes: int,
+) -> None:
+    """Validate fixed and adaptive dwell-time settings."""
+    if measurement_time_s <= 0.0:
+        raise ValueError("measurement_time_s must be positive.")
+    if not adaptive_dwell:
+        return
+    if adaptive_dwell_chunk_s <= 0.0:
+        raise ValueError("adaptive_dwell_chunk_s must be positive.")
+    if adaptive_min_dwell_s <= 0.0:
+        raise ValueError("adaptive_min_dwell_s must be positive.")
+    if adaptive_min_dwell_s > measurement_time_s:
+        raise ValueError("adaptive_min_dwell_s cannot exceed measurement_time_s.")
+    if adaptive_ready_min_counts < 0.0:
+        raise ValueError("adaptive_ready_min_counts cannot be negative.")
+    if adaptive_ready_min_isotopes < 0:
+        raise ValueError("adaptive_ready_min_isotopes cannot be negative.")
+
+
+def _observation_spectrum_array(
+    observation: SimulationObservation,
+    decomposer: SpectralDecomposer,
+) -> NDArray[np.float64]:
+    """Return a validated spectrum array from a simulator observation."""
+    spectrum = np.asarray(observation.spectrum_counts, dtype=float)
+    if spectrum.shape != decomposer.energy_axis.shape:
+        raise ValueError(
+            "Simulator returned an unexpected spectrum shape: "
+            f"{spectrum.shape} != {decomposer.energy_axis.shape}"
+        )
+    return spectrum
+
+
+def _metadata_spectrum_variance(
+    metadata: dict[str, object],
+    expected_shape: tuple[int, ...],
+) -> NDArray[np.float64] | None:
+    """Return a validated per-bin spectrum variance array from metadata."""
+    raw = metadata.get("spectrum_count_variance")
+    if raw is None:
+        return None
+    variance = np.asarray(raw, dtype=float)
+    if variance.shape != expected_shape:
+        return None
+    return np.clip(variance, a_min=0.0, a_max=None)
+
+
+def _evaluate_spectrum_counts(
+    decomposer: SpectralDecomposer,
+    spectrum: NDArray[np.float64],
+    *,
     live_time_s: float,
-) -> dict[str, float]:
-    """Compute inverse-square + shield-attenuated expected counts per isotope."""
-    counts: dict[str, float] = {}
-    for iso in isotopes:
-        iso_sources = [src for src in sources if src.isotope == iso]
-        if not iso_sources:
-            counts[iso] = 0.0
-            continue
-        positions = np.vstack([src.position_array() for src in iso_sources])
-        strengths = np.array([src.intensity_cps_1m for src in iso_sources], dtype=float)
-        counts[iso] = float(
-            kernel.expected_counts_pair(
-                isotope=iso,
-                detector_pos=detector_pos,
-                sources=positions,
-                strengths=strengths,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-                background=0.0,
+    spectrum_count_method: str,
+    detect_threshold_abs: float,
+    detect_threshold_rel: float,
+    detect_threshold_rel_by_isotope: dict[str, float],
+    min_peaks_by_isotope: dict[str, int] | None,
+    spectrum_variance: NDArray[np.float64] | None = None,
+) -> tuple[dict[str, float], dict[str, float], set[str]]:
+    """Extract isotope counts, count variances, and detected labels."""
+    counts, detected = decomposer.isotope_counts_with_detection(
+        spectrum,
+        live_time_s=live_time_s,
+        count_method=spectrum_count_method,
+        active_isotopes=None,
+        detect_threshold_abs=detect_threshold_abs,
+        detect_threshold_rel=detect_threshold_rel,
+        detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+        min_peaks_by_isotope=min_peaks_by_isotope,
+    )
+    counts_out = {iso: float(val) for iso, val in counts.items()}
+    variances = {
+        iso: float(max(decomposer.last_count_variances.get(iso, max(val, 1.0)), 1.0))
+        for iso, val in counts_out.items()
+    }
+    if spectrum_variance is not None:
+        variance_floor = decomposer.estimate_count_variances_from_spectrum_variance(
+            spectrum_variance,
+            isotopes=list(counts_out.keys()),
+        )
+        variances = {
+            iso: float(max(variances.get(iso, 1.0), variance_floor.get(iso, 1.0)))
+            for iso in counts_out
+        }
+    return counts_out, variances, set(detected)
+
+
+def _is_adaptive_spectrum_ready(
+    counts_by_isotope: dict[str, float],
+    detected_isotopes: set[str],
+    *,
+    live_time_s: float,
+    min_live_time_s: float,
+    min_counts_per_detected_isotope: float,
+    min_detected_isotopes: int,
+) -> tuple[bool, str]:
+    """Return whether an accumulated spectrum is usable for isotope counts."""
+    if live_time_s + 1e-12 < min_live_time_s:
+        return False, "below_min_live_time"
+    if min_detected_isotopes <= 0:
+        return True, "min_live_time_reached"
+    usable = [
+        iso
+        for iso in detected_isotopes
+        if float(counts_by_isotope.get(iso, 0.0)) >= min_counts_per_detected_isotope
+    ]
+    if len(usable) >= min_detected_isotopes:
+        return True, "detected_isotope_counts_ready"
+    return (
+        False,
+        "insufficient_detected_isotope_counts:"
+        f"{len(usable)}/{int(min_detected_isotopes)}",
+    )
+
+
+def _merge_adaptive_observation_chunks(
+    *,
+    logical_step_id: int,
+    observations: list[SimulationObservation],
+    chunk_live_times_s: list[float],
+    ready_reason: str,
+    counts_by_isotope: dict[str, float],
+    count_variance_by_isotope: dict[str, float],
+    detected_isotopes: set[str],
+) -> SimulationObservation:
+    """Combine multiple simulator observations into one logical measurement."""
+    if not observations:
+        raise ValueError("At least one observation chunk is required.")
+    first = observations[0]
+    edge_ref = np.asarray(first.energy_bin_edges_keV, dtype=float)
+    spectrum_total = np.zeros_like(np.asarray(first.spectrum_counts, dtype=float))
+    spectrum_variance_total = np.zeros_like(spectrum_total, dtype=float)
+    has_spectrum_variance = False
+    for observation in observations:
+        edges = np.asarray(observation.energy_bin_edges_keV, dtype=float)
+        if edges.shape != edge_ref.shape or not np.allclose(edges, edge_ref):
+            raise ValueError("Adaptive dwell chunks returned inconsistent energy bins.")
+        spectrum_chunk = np.asarray(observation.spectrum_counts, dtype=float)
+        spectrum_total += spectrum_chunk
+        chunk_variance = _metadata_spectrum_variance(
+            observation.metadata,
+            spectrum_chunk.shape,
+        )
+        if chunk_variance is not None:
+            spectrum_variance_total += chunk_variance
+            has_spectrum_variance = True
+    metadata = dict(observations[-1].metadata)
+    metadata.update(
+        {
+            "adaptive_dwell": True,
+            "adaptive_dwell_chunks": int(len(observations)),
+            "adaptive_dwell_child_step_ids": [
+                int(observation.step_id) for observation in observations
+            ],
+            "adaptive_dwell_chunk_live_times_s": [
+                float(value) for value in chunk_live_times_s
+            ],
+            "adaptive_dwell_live_time_s": float(sum(chunk_live_times_s)),
+            "adaptive_dwell_ready_reason": str(ready_reason),
+            "adaptive_dwell_detected_isotopes": sorted(detected_isotopes),
+            "adaptive_dwell_counts_by_isotope": {
+                iso: float(value) for iso, value in counts_by_isotope.items()
+            },
+            "adaptive_dwell_count_variance_by_isotope": {
+                iso: float(value) for iso, value in count_variance_by_isotope.items()
+            },
+        }
+    )
+    if has_spectrum_variance:
+        metadata["spectrum_count_variance"] = spectrum_variance_total.tolist()
+        metadata["spectrum_count_variance_total"] = float(np.sum(spectrum_variance_total))
+    return SimulationObservation(
+        step_id=int(logical_step_id),
+        detector_pose_xyz=first.detector_pose_xyz,
+        detector_quat_wxyz=first.detector_quat_wxyz,
+        fe_orientation_index=first.fe_orientation_index,
+        pb_orientation_index=first.pb_orientation_index,
+        spectrum_counts=spectrum_total.tolist(),
+        energy_bin_edges_keV=edge_ref.tolist(),
+        metadata=metadata,
+    )
+
+
+def _acquire_spectrum_observation(
+    *,
+    simulation_runtime: SimulationRuntime,
+    decomposer: SpectralDecomposer,
+    step_id: int,
+    pose_xyz: NDArray[np.float64],
+    fe_idx: int,
+    pb_idx: int,
+    live_time_s: float,
+    travel_time_s: float,
+    shield_actuation_time_s: float,
+    adaptive_dwell: bool,
+    adaptive_dwell_chunk_s: float,
+    adaptive_min_dwell_s: float,
+    adaptive_ready_min_counts: float,
+    adaptive_ready_min_isotopes: int,
+    spectrum_count_method: str,
+    detect_threshold_abs: float,
+    detect_threshold_rel: float,
+    detect_threshold_rel_by_isotope: dict[str, float],
+    min_peaks_by_isotope: dict[str, int] | None,
+) -> tuple[
+    SimulationObservation,
+    float,
+    dict[str, float],
+    dict[str, float],
+    set[str],
+    str,
+    int,
+]:
+    """Acquire one logical spectrum, optionally stopping adaptive dwell early."""
+    target_pose = tuple(float(v) for v in pose_xyz)
+    if not adaptive_dwell:
+        observation = simulation_runtime.step(
+            SimulationCommand(
+                step_id=int(step_id),
+                target_pose_xyz=target_pose,
+                target_base_yaw_rad=0.0,
+                fe_orientation_index=int(fe_idx),
+                pb_orientation_index=int(pb_idx),
+                dwell_time_s=float(live_time_s),
+                travel_time_s=float(travel_time_s),
+                shield_actuation_time_s=float(shield_actuation_time_s),
             )
         )
-    return counts
+        spectrum = _observation_spectrum_array(observation, decomposer)
+        spectrum_variance = _metadata_spectrum_variance(
+            observation.metadata,
+            spectrum.shape,
+        )
+        counts, variances, detected = _evaluate_spectrum_counts(
+            decomposer,
+            spectrum,
+            live_time_s=float(live_time_s),
+            spectrum_count_method=spectrum_count_method,
+            detect_threshold_abs=detect_threshold_abs,
+            detect_threshold_rel=detect_threshold_rel,
+            detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+            min_peaks_by_isotope=min_peaks_by_isotope,
+            spectrum_variance=spectrum_variance,
+        )
+        return (
+            observation,
+            float(live_time_s),
+            counts,
+            variances,
+            detected,
+            "fixed_dwell",
+            1,
+        )
 
-
-def _resolve_runtime_path(path_value: str, runtime_config_path: str | None) -> Path:
-    """Resolve a runtime-config path relative to the config file or repository root."""
-    path = Path(path_value)
-    if path.is_absolute():
-        return path
-    bases: list[Path] = []
-    if runtime_config_path:
-        bases.append(Path(runtime_config_path).expanduser().resolve().parent)
-    bases.append(ROOT)
-    for base in bases:
-        candidate = (base / path).resolve()
-        if candidate.exists():
-            return candidate
-    return (bases[0] / path).resolve()
-
-
-def _load_net_response_calibration(
-    runtime_config: dict[str, object],
-    runtime_config_path: str | None,
-) -> NetResponseCalibration | None:
-    """Load optional Geant4 net-response calibration from runtime config."""
-    inline_payload = runtime_config.get("net_response_calibration")
-    if isinstance(inline_payload, dict):
-        return NetResponseCalibration.from_dict(inline_payload)
-    path_value = runtime_config.get("net_response_calibration_path")
-    if path_value in (None, ""):
-        return None
-    calibration_path = _resolve_runtime_path(str(path_value), runtime_config_path)
-    return NetResponseCalibration.load(calibration_path)
-
-
+    observations: list[SimulationObservation] = []
+    chunk_live_times_s: list[float] = []
+    accumulated_spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    accumulated_spectrum_variance = np.zeros_like(decomposer.energy_axis, dtype=float)
+    has_spectrum_variance = False
+    accumulated_live_time_s = 0.0
+    last_counts: dict[str, float] = {}
+    last_variances: dict[str, float] = {}
+    last_detected: set[str] = set()
+    ready_reason = "max_dwell_reached"
+    chunk_index = 0
+    while accumulated_live_time_s + 1e-12 < live_time_s:
+        remaining_s = float(live_time_s) - accumulated_live_time_s
+        chunk_live_time_s = min(float(adaptive_dwell_chunk_s), remaining_s)
+        internal_step_id = int(step_id) * ADAPTIVE_STEP_ID_STRIDE + int(chunk_index)
+        observation = simulation_runtime.step(
+            SimulationCommand(
+                step_id=internal_step_id,
+                target_pose_xyz=target_pose,
+                target_base_yaw_rad=0.0,
+                fe_orientation_index=int(fe_idx),
+                pb_orientation_index=int(pb_idx),
+                dwell_time_s=chunk_live_time_s,
+                travel_time_s=float(travel_time_s) if chunk_index == 0 else 0.0,
+                shield_actuation_time_s=(
+                    float(shield_actuation_time_s) if chunk_index == 0 else 0.0
+                ),
+            )
+        )
+        spectrum = _observation_spectrum_array(observation, decomposer)
+        spectrum_variance = _metadata_spectrum_variance(
+            observation.metadata,
+            spectrum.shape,
+        )
+        observations.append(observation)
+        chunk_live_times_s.append(chunk_live_time_s)
+        accumulated_spectrum += spectrum
+        if spectrum_variance is not None:
+            accumulated_spectrum_variance += spectrum_variance
+            has_spectrum_variance = True
+        accumulated_live_time_s += chunk_live_time_s
+        last_counts, last_variances, last_detected = _evaluate_spectrum_counts(
+            decomposer,
+            accumulated_spectrum,
+            live_time_s=accumulated_live_time_s,
+            spectrum_count_method=spectrum_count_method,
+            detect_threshold_abs=detect_threshold_abs,
+            detect_threshold_rel=detect_threshold_rel,
+            detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+            min_peaks_by_isotope=min_peaks_by_isotope,
+            spectrum_variance=(
+                accumulated_spectrum_variance if has_spectrum_variance else None
+            ),
+        )
+        ready, reason = _is_adaptive_spectrum_ready(
+            last_counts,
+            last_detected,
+            live_time_s=accumulated_live_time_s,
+            min_live_time_s=float(adaptive_min_dwell_s),
+            min_counts_per_detected_isotope=float(adaptive_ready_min_counts),
+            min_detected_isotopes=int(adaptive_ready_min_isotopes),
+        )
+        ready_reason = reason
+        if ready:
+            break
+        chunk_index += 1
+    reached_dwell_cap = accumulated_live_time_s + 1e-12 >= live_time_s
+    if reached_dwell_cap and not ready_reason.startswith("detected_"):
+        ready_reason = f"max_dwell_reached:{ready_reason}"
+    observation = _merge_adaptive_observation_chunks(
+        logical_step_id=int(step_id),
+        observations=observations,
+        chunk_live_times_s=chunk_live_times_s,
+        ready_reason=ready_reason,
+        counts_by_isotope=last_counts,
+        count_variance_by_isotope=last_variances,
+        detected_isotopes=last_detected,
+    )
+    return (
+        observation,
+        float(accumulated_live_time_s),
+        last_counts,
+        last_variances,
+        last_detected,
+        ready_reason,
+        len(observations),
+    )
 
 
 def run_live_pf(
@@ -715,8 +1147,8 @@ def run_live_pf(
     eval_match_radius_m: float = 0.5,
     candidate_grid_spacing: tuple[float, float, float] | None = None,
     candidate_grid_margin: float = CANDIDATE_GRID_MARGIN,
-    count_mode: str = "spectrum",
     birth_enabled: bool = False,
+    num_particles: int = 2000,
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
     output_tag: str | None = None,
@@ -729,8 +1161,27 @@ def run_live_pf(
     blender_executable: str | None = None,
     blender_output_path: str | None = None,
     blender_timeout_s: float = 120.0,
+    passage_width_m: float = 1.0,
+    robot_radius_m: float = 0.35,
     nominal_motion_speed_m_s: float = 0.5,
     rotation_overhead_s: float = 0.5,
+    measurement_time_s: float = 30.0,
+    adaptive_dwell: bool = False,
+    adaptive_dwell_chunk_s: float = 2.0,
+    adaptive_min_dwell_s: float = 2.0,
+    adaptive_ready_min_counts: float = 100.0,
+    adaptive_ready_min_isotopes: int = 1,
+    adaptive_strength_prior: bool = True,
+    adaptive_strength_prior_steps: int = 3,
+    adaptive_strength_prior_min_counts: float = 3.0,
+    adaptive_strength_prior_log_sigma: float = 0.7,
+    pose_min_observation_counts: float | None = None,
+    pose_min_observation_penalty_scale: float = 1.0,
+    pose_min_observation_aggregate: str = "max",
+    notification_config: PiplupNotificationConfig | None = None,
+    notify_spectrum: bool = False,
+    notify_spectrum_every: int = 1,
+    notify_spectrum_max_bins: int = 800,
 ) -> RotatingShieldPFEstimator | None:
     """
     Run a simple PF loop with live visualization (active pose/orientation selection).
@@ -739,9 +1190,6 @@ def run_live_pf(
     If max_poses is None, run without a pose-count limit.
     If obstacle_layout_path is provided, blocked grid cells are excluded and shown
     in black.
-    count_mode controls the per-isotope counts passed to the PF:
-    - "spectrum": use spectrum-derived counts (default).
-    - "expected": use expected counts from the kernel.
 
     Args:
         pf_config_overrides: Optional overrides applied to the PF configuration.
@@ -753,6 +1201,7 @@ def run_live_pf(
         candidate_grid_spacing: Optional (x, y, z) spacing for birth candidate grid.
         candidate_grid_margin: Margin from the environment bounds for candidate sources.
         birth_enabled: Enable birth/death/split/merge moves.
+        num_particles: Particle count used by each isotope filter.
         converge: Enable per-isotope convergence gating.
         environment_mode: Obstacle environment mode ("fixed" or "random").
         sim_backend: Simulation backend name ("analytic", "isaacsim", or "geant4").
@@ -760,24 +1209,56 @@ def run_live_pf(
         blender_executable: Optional Blender executable path for random mode.
         blender_output_path: Optional USD path written by Blender in random mode.
         blender_timeout_s: Timeout for Blender environment generation.
+        passage_width_m: Minimum reserved corridor width in random mode.
+        robot_radius_m: Robot footprint radius used for 2D traversability maps.
         nominal_motion_speed_m_s: Nominal robot speed used for mission-time estimates.
         rotation_overhead_s: Fixed shield-actuation overhead per measurement.
+        measurement_time_s: Fixed dwell time or adaptive maximum dwell time.
+        adaptive_dwell: Stop each measurement once isotope counts are reliable enough.
+        adaptive_dwell_chunk_s: Geant4 dwell duration for each adaptive chunk.
+        adaptive_min_dwell_s: Minimum accumulated dwell before early stopping.
+        adaptive_ready_min_counts: Minimum count estimate per detected isotope.
+        adaptive_ready_min_isotopes: Required number of detected isotopes for readiness.
+        adaptive_strength_prior: Rescale early PF strengths from observed counts.
+        adaptive_strength_prior_steps: Number of first measurements used for strength rescaling.
+        adaptive_strength_prior_min_counts: Count floor for zero/weak observations.
+        adaptive_strength_prior_log_sigma: Proposal spread around count-matched strengths.
+        pose_min_observation_counts: Minimum posterior-predicted counts per isotope
+            used as a soft pose-selection constraint; None uses runtime config
+            or adaptive_strength_prior_min_counts.
+        pose_min_observation_penalty_scale: Relative weight of the pose
+            observability soft constraint.
+        pose_min_observation_aggregate: Orientation aggregation for pose
+            observability ("max" or "mean").
+        notification_config: Optional piplup-notify delivery settings.
+        notify_spectrum: Send per-measurement spectrum events through piplup.
+        notify_spectrum_every: Send one spectrum event every N measurements.
+        notify_spectrum_max_bins: Maximum number of spectrum bins per event.
     """
-    count_mode = count_mode.strip().lower()
-    if count_mode not in {"spectrum", "expected"}:
-        raise ValueError(f"Unknown count_mode: {count_mode}")
+    _validate_measurement_timing(
+        measurement_time_s=float(measurement_time_s),
+        adaptive_dwell=bool(adaptive_dwell),
+        adaptive_dwell_chunk_s=float(adaptive_dwell_chunk_s),
+        adaptive_min_dwell_s=float(adaptive_min_dwell_s),
+        adaptive_ready_min_counts=float(adaptive_ready_min_counts),
+        adaptive_ready_min_isotopes=int(adaptive_ready_min_isotopes),
+    )
+    notifier = PiplupNotifier(notification_config)
+    live = _coerce_live_visualization(live)
     runtime_config = load_runtime_config(sim_config_path)
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0, detector_position=(1.0, 1.0, 0.5))
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
-    default_count_method = (
-        "peak_window"
-        if str(runtime_config.get("engine_mode", "")).strip().lower() == "external"
-        else "response_matrix"
-    )
-    spectrum_count_method = str(runtime_config.get("spectrum_count_method", default_count_method)).strip().lower()
-    if spectrum_count_method not in {"peak_window", "response_matrix"}:
-        raise ValueError(f"Unknown spectrum_count_method: {spectrum_count_method}")
+    default_count_method = "photopeak_nnls"
+    spectrum_count_method = str(
+        runtime_config.get("spectrum_count_method", default_count_method)
+    ).strip().lower()
+    allowed_runtime_count_methods = {"photopeak_nnls", "response_poisson"}
+    if spectrum_count_method not in allowed_runtime_count_methods:
+        raise ValueError(
+            "spectrum_count_method must be 'photopeak_nnls' or "
+            "'response_poisson' for runtime simulations."
+        )
     if min_peaks_by_isotope is None:
         min_peaks_by_isotope = dict(DETECT_MIN_PEAKS_BY_ISOTOPE)
     detect_threshold_rel_by_isotope = dict(DETECT_REL_THRESH_BY_ISOTOPE)
@@ -803,12 +1284,19 @@ def run_live_pf(
             blocked_fraction=0.4,
             rng_seed=obstacle_seed,
             keep_free_points=keep_free,
+            passage_width_m=(
+                float(passage_width_m)
+                if normalized_environment_mode == "random"
+                else 0.0
+            ),
         )
         mode_message = f"Obstacle environment mode: {normalized_environment_mode}"
         if normalized_environment_mode == "fixed" and obstacle_path is not None:
             mode_message += f" ({obstacle_path})"
         if obstacle_seed is not None:
             mode_message += f", seed={int(obstacle_seed)}"
+        if normalized_environment_mode == "random":
+            mode_message += f", passage_width_m={float(passage_width_m):.2f}"
         mode_message += f", blocked_fraction={obstacle_grid.blocked_fraction:.3f}"
         print(mode_message)
     normals = generate_octant_orientations()
@@ -825,6 +1313,9 @@ def run_live_pf(
         if cleaned_tag:
             output_suffix = f"_{cleaned_tag}"
     generated_blender_usd_path: Path | None = None
+    traversability_map: TraversabilityMap | None = None
+    traversability_map_path: Path | None = None
+    traversability_map_png_path: Path | None = None
     if obstacle_grid is not None and normalized_environment_mode == "random":
         if blender_output_path:
             generated_output_path = Path(blender_output_path)
@@ -838,16 +1329,53 @@ def run_live_pf(
             if cleaned_tag:
                 path_token = f"{path_token}_{cleaned_tag}"
             generated_output_path = BLENDER_ENV_DIR / f"{path_token}.usda"
+        base_usd_path = _resolve_config_relative_path(
+            runtime_config.get(
+                "random_environment_base_usd_path",
+                runtime_config.get("usd_path"),
+            ),
+            sim_config_path,
+        )
+        traversability_map_path = generated_output_path.with_suffix(
+            ".traversability.json"
+        )
+        traversability_map_png_path = generated_output_path.with_suffix(
+            ".traversability.png"
+        )
         generated_blender_usd_path = generate_blender_environment_usd(
             grid=obstacle_grid,
             output_path=generated_output_path,
             room_size_xyz=(env.size_x, env.size_y, env.size_z),
             obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
             obstacle_material="concrete",
+            base_usd_path=base_usd_path,
+            traversability_output_path=traversability_map_path,
+            robot_radius_m=float(robot_radius_m),
+            traversability_reachable_from_xy=(
+                float(env.detector_position[0]),
+                float(env.detector_position[1]),
+            ),
             blender_executable=blender_executable,
             timeout_s=blender_timeout_s,
         )
         print(f"Generated Blender random environment: {generated_blender_usd_path}")
+        if traversability_map_path.exists():
+            traversability_map = TraversabilityMap.load(traversability_map_path)
+        else:
+            traversability_map = build_traversability_map_from_obstacle_grid(
+                obstacle_grid,
+                robot_radius_m=float(robot_radius_m),
+                reachable_from=env.detector_position,
+            )
+            traversability_map.save(traversability_map_path)
+        render_traversability_map(traversability_map, traversability_map_png_path)
+        print(
+            "Generated 2D robot traversability map: "
+            f"{traversability_map_path} "
+            f"(free_fraction={traversability_map.traversable_fraction:.3f}, "
+            f"robot_radius_m={float(robot_radius_m):.2f})"
+        )
+    planning_map = traversability_map if traversability_map is not None else obstacle_grid
 
     # Candidate sources: dense grid inside environment (used by birth proposals).
     spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
@@ -861,39 +1389,92 @@ def run_live_pf(
     detect_counts = {iso: 0 for iso in isotopes}
     miss_counts = {iso: 0 for iso in isotopes}
     detected_isotopes: set[str] = set()
-    detection_locked = False
-    locked_isotopes_for_planning: set[str] = set()
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
-    # Use a moderate particle count for the demo (previous default was 200)
-    num_particles = 2000
+    num_particles = max(1, int(num_particles))
     shield_params = ShieldParams()
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
     if not mu_by_isotope:
         mu_by_isotope = {
             iso: {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb} for iso in isotopes
         }
-    net_response_calibration = _load_net_response_calibration(runtime_config, sim_config_path)
-    measurement_scale_by_isotope = (
-        {
-            iso: net_response_calibration.response_scale(iso)
-            for iso in isotopes
-            if net_response_calibration.response_scale(iso) != 1.0
-        }
-        if net_response_calibration is not None
-        else None
-    )
-    if measurement_scale_by_isotope:
-        print(f"Loaded net-response calibration: {_fmt_counts(measurement_scale_by_isotope)}")
     use_gpu = _default_use_gpu()
-    expected_kernel = ContinuousKernel(
-        mu_by_isotope=mu_by_isotope,
-        shield_params=shield_params,
-        use_gpu=use_gpu,
-        gpu_device="cuda",
-        gpu_dtype="float64",
-    )
     background_by_isotope = {iso: 5.0 for iso in isotopes}
+    live_time = float(measurement_time_s)
+    if pose_min_observation_counts is None:
+        pose_min_observation_counts_resolved = runtime_config.get(
+            "pose_min_observation_counts",
+            adaptive_strength_prior_min_counts,
+        )
+    else:
+        pose_min_observation_counts_resolved = pose_min_observation_counts
+    pose_min_observation_counts_resolved = max(
+        float(pose_min_observation_counts_resolved),
+        0.0,
+    )
+    pose_min_observation_penalty_scale = max(
+        float(
+            runtime_config.get(
+                "pose_min_observation_penalty_scale",
+                pose_min_observation_penalty_scale,
+            )
+        ),
+        0.0,
+    )
+    pose_min_observation_aggregate = str(
+        runtime_config.get(
+            "pose_min_observation_aggregate",
+            pose_min_observation_aggregate,
+        )
+    ).strip().lower()
+    pose_min_observation_max_particles = runtime_config.get(
+        "pose_min_observation_max_particles",
+        None,
+    )
+    if pose_min_observation_max_particles is not None:
+        pose_min_observation_max_particles = int(pose_min_observation_max_particles)
+    likelihood_runtime = runtime_config.get("pf_count_likelihood", {})
+    if not isinstance(likelihood_runtime, dict):
+        likelihood_runtime = {}
+    geant4_likelihood_defaults = sim_backend.strip().lower() == "geant4"
+    spectrum_estimate_likelihood_defaults = spectrum_count_method in {
+        "photopeak_nnls",
+        "response_poisson",
+    }
+
+    def _likelihood_config_value(key: str, default: object) -> object:
+        """Read a PF likelihood setting from nested or legacy runtime config keys."""
+        legacy_key = f"pf_{key}"
+        if key in likelihood_runtime:
+            return likelihood_runtime[key]
+        return runtime_config.get(legacy_key, default)
+
+    count_likelihood_model = str(
+        _likelihood_config_value(
+            "count_likelihood_model",
+            "student_t"
+            if geant4_likelihood_defaults or spectrum_estimate_likelihood_defaults
+            else "poisson",
+        )
+    )
+    transport_model_rel_sigma = _likelihood_config_value(
+        "transport_model_rel_sigma",
+        0.30 if geant4_likelihood_defaults else 0.0,
+    )
+    spectrum_count_rel_sigma = _likelihood_config_value(
+        "spectrum_count_rel_sigma",
+        0.15 if geant4_likelihood_defaults else 0.0,
+    )
+    spectrum_count_abs_sigma = _likelihood_config_value(
+        "spectrum_count_abs_sigma",
+        3.0 if geant4_likelihood_defaults else 0.0,
+    )
+    count_likelihood_df = float(
+        _likelihood_config_value(
+            "count_likelihood_df",
+            5.0,
+        )
+    )
     simulation_runtime = create_simulation_runtime(
         sim_backend,
         sources=sources,
@@ -911,16 +1492,28 @@ def run_live_pf(
         resample_threshold=0.7,
         position_sigma=0.5,
         background_level=background_by_isotope,
-        measurement_scale_by_isotope=measurement_scale_by_isotope,
+        count_likelihood_model=count_likelihood_model,
+        transport_model_rel_sigma=transport_model_rel_sigma,
+        spectrum_count_rel_sigma=spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+        count_likelihood_df=count_likelihood_df,
         min_strength=5.0,
         p_birth=0.05,
         p_kill=0.1,
-        short_time_s=30.0,
+        short_time_s=live_time,
         max_dwell_time_s=10000.0,
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
         init_num_sources=(1, 1),
         init_grid_spacing_m=1.0,
+        adaptive_strength_prior=bool(adaptive_strength_prior),
+        adaptive_strength_prior_steps=int(adaptive_strength_prior_steps),
+        adaptive_strength_prior_min_counts=float(adaptive_strength_prior_min_counts),
+        adaptive_strength_prior_log_sigma=float(adaptive_strength_prior_log_sigma),
+        pose_min_observation_counts=pose_min_observation_counts_resolved,
+        pose_min_observation_penalty_scale=pose_min_observation_penalty_scale,
+        pose_min_observation_aggregate=pose_min_observation_aggregate,
+        pose_min_observation_max_particles=pose_min_observation_max_particles,
         split_prob=0.05,
         merge_prob=0.05,
         orientation_k=2,
@@ -967,14 +1560,12 @@ def run_live_pf(
             pf_conf.init_num_sources = (1, 1)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
-    init_pf = PFConfig()
-    init_pf.init_num_sources = pf_conf.init_num_sources
     init_support_prob = _initial_particle_nearby_probability(
         num_particles=int(pf_conf.num_particles),
         position_min=pf_conf.position_min,
         position_max=pf_conf.position_max,
         radius_m=float(eval_match_radius_m),
-        init_num_sources=init_pf.init_num_sources,
+        init_num_sources=pf_conf.init_num_sources,
     )
 
     # Build true sources dict for visualization
@@ -994,11 +1585,11 @@ def run_live_pf(
         estimate_min_strength,
         FINAL_ESTIMATE_MIN_STRENGTH_ABS,
     )
-    live_time = 30.0
     prune_min_obs_count = PRUNE_MIN_OBS_COUNT
     if background_by_isotope:
         background_level = float(np.median(list(background_by_isotope.values())))
-        prune_min_obs_count = max(prune_min_obs_count, background_level * live_time)
+        prune_live_time = float(adaptive_min_dwell_s) if adaptive_dwell else live_time
+        prune_min_obs_count = max(prune_min_obs_count, background_level * prune_live_time)
 
     def _build_estimator() -> tuple[RotatingShieldPFEstimator, NDArray[np.float64], int]:
         """Create a fresh estimator and register the initial pose."""
@@ -1008,6 +1599,8 @@ def run_live_pf(
             shield_normals=normals,
             mu_by_isotope=mu_by_isotope,
             pf_config=pf_conf,
+            obstacle_grid=obstacle_grid,
+            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
         )
         pose_local = np.array(env.detector_position, dtype=float)
         estimator_local.add_measurement_pose(pose_local)
@@ -1196,6 +1789,11 @@ def run_live_pf(
     visited_poses: list[NDArray[np.float64]] = []
     last_spectrum: np.ndarray | None = None
     last_counts: dict[str, float] | None = None
+    representative_spectrum: np.ndarray | None = None
+    representative_counts: dict[str, float] | None = None
+    representative_candidates: set[str] = set()
+    representative_step_index: int | None = None
+    representative_total_counts = -np.inf
     last_max_ig: float | None = None
     total_motion_distance_m = 0.0
     total_motion_time_s = 0.0
@@ -1204,6 +1802,7 @@ def run_live_pf(
     pending_motion_time_s = 0.0
     pending_path_segment: dict[str, object] | None = None
     path_segments: list[dict[str, object]] = []
+    measurement_live_times_s: list[float] = []
     total_ig_wall_s = 0.0
     total_pf_wall_s = 0.0
     total_prune_wall_s = 0.0
@@ -1228,6 +1827,36 @@ def run_live_pf(
         f"peak_window_sigma={cfg.peak_window_sigma}, dead_time_tau_s={cfg.dead_time_tau_s}"
     )
     print(
+        "Dwell control: "
+        f"adaptive={bool(adaptive_dwell)} "
+        f"cap_s={live_time:.3f} "
+        f"chunk_s={float(adaptive_dwell_chunk_s):.3f} "
+        f"min_s={float(adaptive_min_dwell_s):.3f} "
+        f"ready_min_counts={float(adaptive_ready_min_counts):.3f} "
+        f"ready_min_isotopes={int(adaptive_ready_min_isotopes)}"
+    )
+    print(
+        "Strength prior adaptation: "
+        f"enabled={bool(pf_conf.adaptive_strength_prior)} "
+        f"steps={int(pf_conf.adaptive_strength_prior_steps)} "
+        f"min_counts={float(pf_conf.adaptive_strength_prior_min_counts):.3f} "
+        f"log_sigma={float(pf_conf.adaptive_strength_prior_log_sigma):.3f}"
+    )
+    print(
+        "Pose observability constraint: "
+        f"min_counts={float(pf_conf.pose_min_observation_counts):.3f} "
+        f"penalty_scale={float(pf_conf.pose_min_observation_penalty_scale):.3f} "
+        f"aggregate={pf_conf.pose_min_observation_aggregate}"
+    )
+    print(
+        "PF count likelihood: "
+        f"model={pf_conf.count_likelihood_model} "
+        f"transport_rel_sigma={pf_conf.transport_model_rel_sigma} "
+        f"spectrum_rel_sigma={pf_conf.spectrum_count_rel_sigma} "
+        f"spectrum_abs_sigma={pf_conf.spectrum_count_abs_sigma} "
+        f"df={float(pf_conf.count_likelihood_df):.2f}"
+    )
+    print(
         "Rotation IG threshold: "
         f"mode={ig_threshold_mode}, floor={estimator.pf_config.ig_threshold:.6g}, "
         f"rel={ig_threshold_rel:.6g}"
@@ -1243,13 +1872,13 @@ def run_live_pf(
         "Init support probability: "
         f"radius={float(eval_match_radius_m):.2f}m "
         f"prob≈{init_support_prob:.3f} "
-        f"(init_num_sources={init_pf.init_num_sources})"
+        f"(init_num_sources={pf_conf.init_num_sources})"
     )
     print(
         "PF init prior: "
-        f"init_num_sources={init_pf.init_num_sources}, "
-        f"init_strength_log_mean={init_pf.init_strength_log_mean:.2f}, "
-        f"init_strength_log_sigma={init_pf.init_strength_log_sigma:.2f}, "
+        f"init_num_sources={pf_conf.init_num_sources}, "
+        f"init_strength_log_mean={pf_conf.init_strength_log_mean:.2f}, "
+        f"init_strength_log_sigma={pf_conf.init_strength_log_sigma:.2f}, "
         f"max_sources={pf_conf.max_sources}"
     )
     print(
@@ -1330,7 +1959,62 @@ def run_live_pf(
             if obstacle_grid is None
             else list(obstacle_grid.grid_shape),
             "obstacle_cells": [] if obstacle_grid is None else list(obstacle_grid.blocked_cells),
+            "traversability_map_path": None
+            if traversability_map_path is None
+            else traversability_map_path.as_posix(),
+            "traversability_map_png_path": None
+            if traversability_map_png_path is None
+            else traversability_map_png_path.as_posix(),
+            "robot_radius_m": float(robot_radius_m),
             "author_obstacle_prims": generated_blender_usd_path is None,
+        }
+    )
+    notifier.notify_started(
+        {
+            "backend": sim_backend,
+            "sim_config_path": sim_config_path,
+            "max_steps": max_steps,
+            "max_poses": max_poses,
+            "environment_mode": normalized_environment_mode,
+            "obstacle_layout_path": obstacle_layout_path,
+            "obstacle_seed": obstacle_seed,
+            "obstacle_blocked_fraction": (
+                None if obstacle_grid is None else float(obstacle_grid.blocked_fraction)
+            ),
+            "source_count": len(sources),
+            "sources": [
+                {
+                    "isotope": source.isotope,
+                    "position": [
+                        float(source.position[0]),
+                        float(source.position[1]),
+                        float(source.position[2]),
+                    ],
+                    "intensity_cps_1m": float(source.intensity_cps_1m),
+                }
+                for source in sources
+            ],
+            "isotopes": isotopes,
+            "birth_enabled": birth_enabled,
+            "converge": converge,
+            "pose_candidates": int(pose_candidates),
+            "pose_min_dist_m": float(pose_min_dist),
+            "candidate_grid_points": int(grid.shape[0]),
+            "pf_num_particles": int(pf_conf.num_particles),
+            "pf_max_sources": int(pf_conf.max_sources),
+            "robot_speed_m_s": float(nominal_motion_speed_m_s),
+            "rotation_overhead_s": float(rotation_overhead_s),
+            "measurement_time_s": float(live_time),
+            "adaptive_dwell": bool(adaptive_dwell),
+            "adaptive_dwell_chunk_s": float(adaptive_dwell_chunk_s),
+            "adaptive_min_dwell_s": float(adaptive_min_dwell_s),
+            "adaptive_ready_min_counts": float(adaptive_ready_min_counts),
+            "adaptive_ready_min_isotopes": int(adaptive_ready_min_isotopes),
+            "pose_min_observation_counts": float(pf_conf.pose_min_observation_counts),
+            "pose_min_observation_penalty_scale": float(
+                pf_conf.pose_min_observation_penalty_scale
+            ),
+            "pose_min_observation_aggregate": pf_conf.pose_min_observation_aggregate,
         }
     )
     ig_max_global = 0.0
@@ -1343,6 +2027,10 @@ def run_live_pf(
             zero_ig_override = False
             remaining_orientations = set(range(total_pairs))
             rotation_limit = max(1, int(estimator.pf_config.orientation_k))
+            min_rotations_this_pose = min(
+                rotation_limit,
+                max(0, int(estimator.pf_config.min_rotations_per_pose)),
+            )
             rotation_count = 0
             ig_max_pose = 0.0
             ig_threshold_current = estimator.pf_config.ig_threshold
@@ -1356,16 +2044,13 @@ def run_live_pf(
                 if not remaining_orientations:
                     print("All orientation pairs exhausted; moving to the next pose.")
                     break
-                planning_isotopes = None
-                if detection_locked and locked_isotopes_for_planning:
-                    planning_isotopes = sorted(locked_isotopes_for_planning)
                 ig_start = time.perf_counter()
                 ig_scores = _compute_ig_grid(
                     estimator,
                     rot_mats,
                     pose_idx=current_pose_idx,
                     live_time_s=live_time,
-                    planning_isotopes=planning_isotopes,
+                    planning_isotopes=None,
                 )
                 ig_elapsed = time.perf_counter() - ig_start
                 total_ig_wall_s += ig_elapsed
@@ -1393,7 +2078,10 @@ def run_live_pf(
                         print("IG grid returned zero; forcing rotation despite threshold.")
                         zero_ig_override = True
                     ig_threshold_current = 0.0
-                if ig_val < ig_threshold_current:
+                if (
+                    ig_val < ig_threshold_current
+                    and rotation_count >= min_rotations_this_pose
+                ):
                     print(
                         "Stopping rotation at this pose "
                         f"(max IG {ig_val:.6g} < threshold {ig_threshold_current:.6g})."
@@ -1415,17 +2103,34 @@ def run_live_pf(
                 step_motion_distance_m = float(pending_motion_distance_m)
                 step_motion_time_s = float(pending_motion_time_s)
                 step_rotation_time_s = float(rotation_overhead_s)
-                observation = simulation_runtime.step(
-                    SimulationCommand(
-                        step_id=step_counter,
-                        target_pose_xyz=tuple(float(v) for v in pose),
-                        target_base_yaw_rad=0.0,
-                        fe_orientation_index=fe_idx,
-                        pb_orientation_index=pb_idx,
-                        dwell_time_s=live_time,
-                        travel_time_s=step_motion_time_s,
-                        shield_actuation_time_s=step_rotation_time_s,
-                    )
+                (
+                    observation,
+                    actual_live_time_s,
+                    z_detected,
+                    z_detected_variance,
+                    detected,
+                    dwell_ready_reason,
+                    dwell_chunks,
+                ) = _acquire_spectrum_observation(
+                    simulation_runtime=simulation_runtime,
+                    decomposer=decomposer,
+                    step_id=step_counter,
+                    pose_xyz=pose,
+                    fe_idx=fe_idx,
+                    pb_idx=pb_idx,
+                    live_time_s=live_time,
+                    travel_time_s=step_motion_time_s,
+                    shield_actuation_time_s=step_rotation_time_s,
+                    adaptive_dwell=bool(adaptive_dwell),
+                    adaptive_dwell_chunk_s=float(adaptive_dwell_chunk_s),
+                    adaptive_min_dwell_s=float(adaptive_min_dwell_s),
+                    adaptive_ready_min_counts=float(adaptive_ready_min_counts),
+                    adaptive_ready_min_isotopes=int(adaptive_ready_min_isotopes),
+                    spectrum_count_method=spectrum_count_method,
+                    detect_threshold_abs=detect_threshold_abs,
+                    detect_threshold_rel=detect_threshold_rel,
+                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
+                    min_peaks_by_isotope=min_peaks_by_isotope,
                 )
                 pending_motion_distance_m = 0.0
                 pending_motion_time_s = 0.0
@@ -1437,105 +2142,78 @@ def run_live_pf(
                 if step_path_segment is not None:
                     path_segments.append(step_path_segment)
                 elapsed += step_motion_time_s + step_rotation_time_s
-                spectrum = np.asarray(observation.spectrum_counts, dtype=float)
-                if spectrum.shape != decomposer.energy_axis.shape:
-                    raise ValueError(
-                        "Simulator returned an unexpected spectrum shape: "
-                        f"{spectrum.shape} != {decomposer.energy_axis.shape}"
-                    )
+                spectrum = _observation_spectrum_array(observation, decomposer)
                 last_spectrum = spectrum.copy()
-                z_detected, detected = decomposer.isotope_counts_with_detection(
-                    spectrum,
-                    live_time_s=live_time,
-                    count_method=spectrum_count_method,
-                    # Always detect across the full library so the lock can expand.
-                    active_isotopes=None,
-                    detect_threshold_abs=detect_threshold_abs,
-                    detect_threshold_rel=detect_threshold_rel,
-                    detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
-                    min_peaks_by_isotope=min_peaks_by_isotope,
-                )
-                expected_counts = None
-                if count_mode == "expected":
-                    ideal_expected_counts = _expected_counts(
-                        expected_kernel,
-                        sources,
-                        isotopes,
-                        detector_pos=np.asarray(observation.detector_pose_xyz, dtype=float),
-                        fe_index=fe_idx,
-                        pb_index=pb_idx,
-                        live_time_s=live_time,
-                    )
-                    expected_counts = (
-                        net_response_calibration.apply_expected_counts(ideal_expected_counts)
-                        if net_response_calibration is not None
-                        else ideal_expected_counts
-                    )
-                    z_detected = expected_counts
-                    detected = _detect_isotopes_from_expected(expected_counts)
                 last_counts = {iso: float(val) for iso, val in z_detected.items()}
                 last_candidates = set(detected)
-                if count_mode == "expected":
-                    detected_isotopes = set(detected)
-                    active_isotopes = set(detected_isotopes)
-                    last_candidates = set(detected_isotopes)
-                elif detect_consecutive > 0:
-                    miss_required = DETECT_MISS_AFTER_LOCK if detection_locked else detect_consecutive
+                spectrum_total_counts = float(np.sum(spectrum))
+                if spectrum_total_counts > representative_total_counts:
+                    representative_total_counts = spectrum_total_counts
+                    representative_spectrum = spectrum.copy()
+                    representative_counts = dict(last_counts)
+                    representative_candidates = set(last_candidates)
+                    representative_step_index = int(step_counter)
+                spectrum_notify_every = max(1, int(notify_spectrum_every))
+                if notify_spectrum and step_counter % spectrum_notify_every == 0:
+                    notifier.notify_spectrum(
+                        step_counter,
+                        _build_spectrum_notification_payload(
+                            decomposer=decomposer,
+                            spectrum=spectrum,
+                            step_index=step_counter,
+                            pose_xyz=np.asarray(observation.detector_pose_xyz, dtype=float),
+                            fe_index=fe_idx,
+                            pb_index=pb_idx,
+                            live_time_s=actual_live_time_s,
+                            counts_by_isotope=last_counts,
+                            detected_isotopes=set(detected),
+                            count_method=spectrum_count_method,
+                            max_bins=int(notify_spectrum_max_bins),
+                        ),
+                    )
+                if detect_consecutive > 0:
+                    previous_active_isotopes = set(active_isotopes)
                     active_isotopes = _update_detection_hysteresis(
                         set(detected),
                         detect_counts,
                         miss_counts,
                         active_isotopes,
                         consecutive=detect_consecutive,
-                        miss_consecutive=miss_required,
+                        miss_consecutive=DETECT_MISS_AFTER_LOCK,
                         consecutive_by_isotope=DETECT_CONSECUTIVE_BY_ISOTOPE,
                     )
                     detected_isotopes = set(active_isotopes)
                     last_candidates = set(detected_isotopes)
-                    if not detection_locked:
-                        should_lock = step_counter + 1 >= detect_min_steps and detected_isotopes
-                        allow_lock = any(iso != "Eu-154" for iso in detected_isotopes)
-                        if should_lock and allow_lock:
-                            locked_isotopes_for_planning |= set(detected_isotopes)
-                            detection_locked = True
-                            print(
-                                "Detected isotopes locked to: "
-                                f"{sorted(locked_isotopes_for_planning)}"
-                            )
-                    else:
-                        new_locked = locked_isotopes_for_planning | set(detected_isotopes)
-                        if new_locked != locked_isotopes_for_planning:
-                            added = set(new_locked) - set(estimator.isotopes)
-                            if added:
-                                estimator.add_isotopes(sorted(added))
-                            locked_isotopes_for_planning = new_locked
-                            print(
-                                "pes expanded to: "
-                                f"{sorted(locked_isotopes_for_planning)}"
-                            )
-                target_isotopes: set[str] = set()
-                if detection_locked and locked_isotopes_for_planning:
-                    target_isotopes = set(locked_isotopes_for_planning)
-                elif detected_isotopes:
-                    target_isotopes = set(detected_isotopes)
-                if target_isotopes:
-                    current_isotopes = set(estimator.isotopes)
-                    if target_isotopes != current_isotopes:
-                        to_add = target_isotopes - current_isotopes
-                        if to_add:
-                            estimator.add_isotopes(sorted(to_add))
-                        estimator.restrict_isotopes(sorted(target_isotopes))
-                counts_for_pf = expected_counts if count_mode == "expected" else z_detected
+                    should_report_detection = (
+                        step_counter + 1 >= detect_min_steps
+                        and active_isotopes != previous_active_isotopes
+                    )
+                    if should_report_detection:
+                        print(
+                            "Detected isotope diagnostics active: "
+                            f"{sorted(active_isotopes)} "
+                            "(PF and planning still keep all candidate isotopes)."
+                        )
                 pf_isotopes = list(estimator.isotopes)
-                z_k_full = {iso: float(counts_for_pf.get(iso, 0.0)) for iso in pf_isotopes}
+                z_k_full = {iso: float(z_detected.get(iso, 0.0)) for iso in pf_isotopes}
+                z_variance_full = {
+                    iso: float(
+                        max(
+                            z_detected_variance.get(iso, max(z_k_full[iso], 1.0)),
+                            1.0,
+                        )
+                    )
+                    for iso in pf_isotopes
+                }
                 z_counts = z_k_full
                 z_k = z_k_full
                 pose_for_pf = np.asarray(observation.detector_pose_xyz, dtype=float)
                 meas = Measurement(
                     counts_by_isotope=z_k,
+                    count_variance_by_isotope=z_variance_full,
                     pose_idx=current_pose_idx,
                     orient_idx=best_pair_idx,
-                    live_time_s=live_time,
+                    live_time_s=actual_live_time_s,
                     fe_index=fe_idx,
                     pb_index=pb_idx,
                     RFe=RFe_sel,
@@ -1548,12 +2226,24 @@ def run_live_pf(
                     pose_idx=current_pose_idx,
                     fe_index=fe_idx,
                     pb_index=pb_idx,
-                    live_time_s=live_time,
+                    live_time_s=actual_live_time_s,
+                    z_variance_k=z_variance_full,
                 )
+                if estimator.last_strength_prior_diagnostics:
+                    for iso, stats in sorted(estimator.last_strength_prior_diagnostics.items()):
+                        print(
+                            f"[step {step_counter}] strength_prior[{iso}] "
+                            f"z={stats['observed_counts']:.2f} "
+                            f"target={stats['target_counts']:.2f} "
+                            f"median_before={stats['before_median_strength']:.2f} "
+                            f"median_after={stats['after_median_strength']:.2f} "
+                            f"particles={int(stats['particles_changed'])}"
+                        )
                 pf_elapsed = time.perf_counter() - pf_start
                 total_pf_wall_s += pf_elapsed
                 pf_wall_samples_s.append(float(pf_elapsed))
-                elapsed += live_time
+                measurement_live_times_s.append(float(actual_live_time_s))
+                elapsed += actual_live_time_s
                 viz_elapsed = 0.0
                 viz_start = time.perf_counter()
                 frame = build_frame_from_pf(
@@ -1597,10 +2287,12 @@ def run_live_pf(
                     f"travel_distance_m={step_motion_distance_m:.3f} "
                     f"travel_time_s={step_motion_time_s:.1f} "
                     f"shield_time_s={step_rotation_time_s:.1f} "
-                    f"live_time_s={live_time:.1f} mission_time_s={elapsed:.1f} "
+                    f"live_time_s={actual_live_time_s:.1f}/{live_time:.1f} "
+                    f"dwell_chunks={dwell_chunks} "
+                    f"dwell_reason={dwell_ready_reason} "
+                    f"mission_time_s={elapsed:.1f} "
                     f"z_keys={sorted(z_k.keys())} "
-                    f"z_obs={_fmt_counts(z_counts)} "
-                    f"expected={_fmt_counts(expected_counts)}"
+                    f"z_obs={_fmt_counts(z_counts)}"
                 )
                 if live:
                     plt.pause(0.05)
@@ -1610,17 +2302,15 @@ def run_live_pf(
                 print(
                     f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
                     f"prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s "
-                    f"travel={step_motion_time_s:.1f}s shield={step_rotation_time_s:.1f}s"
+                    f"travel={step_motion_time_s:.1f}s "
+                    f"shield={step_rotation_time_s:.1f}s "
+                    f"live={actual_live_time_s:.1f}s"
                 )
                 step_counter += 1
                 rotation_count += 1
                 remaining_orientations.discard(best_pair_idx)
                 if save_outputs and last_spectrum is not None and step_counter % 10 == 0:
-                    highlight = (
-                        set(locked_isotopes_for_planning)
-                        if detection_locked
-                        else last_candidates
-                    )
+                    highlight = set(last_candidates)
                     spectrum_path = SPECTRUM_DIR / f"spectrum_step_{step_counter:04d}.png"
                     _save_spectrum_plot(
                         decomposer,
@@ -1632,7 +2322,7 @@ def run_live_pf(
                 if max_steps is not None and step_counter >= max_steps:
                     stop_run = True
                     break
-                pose_elapsed += live_time + step_rotation_time_s
+                pose_elapsed += actual_live_time_s + step_rotation_time_s
                 if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
                     break
             if (
@@ -1665,7 +2355,7 @@ def run_live_pf(
             print("Generating candidate poses for next measurement point...")
             candidates = generate_candidate_poses(
                 current_pose_xyz=pose,
-                map_api=obstacle_grid,
+                map_api=planning_map,
                 n_candidates=pose_candidates,
                 strategy="free_space_sobol",
                 min_dist_from_visited=pose_min_dist,
@@ -1680,7 +2370,7 @@ def run_live_pf(
                 )
                 candidates = generate_candidate_poses(
                     current_pose_xyz=pose,
-                    map_api=obstacle_grid,
+                    map_api=planning_map,
                     n_candidates=max(pose_candidates * 2, pose_candidates),
                     strategy="free_space_sobol",
                     min_dist_from_visited=relaxed_dist,
@@ -1696,10 +2386,17 @@ def run_live_pf(
                 candidate_poses_xyz=candidates,
                 current_pose_xyz=pose,
                 criterion="after_rotation",
+                t_max_s=float(rotation_limit) * float(live_time),
                 verbose=True,
                 progress_every=0,
                 auto_lambda_cost=True,
                 num_rollouts=DEFAULT_PLANNING_ROLLOUTS,
+                min_observation_counts=float(pf_conf.pose_min_observation_counts),
+                min_observation_penalty_scale=float(
+                    pf_conf.pose_min_observation_penalty_scale
+                ),
+                min_observation_aggregate=pf_conf.pose_min_observation_aggregate,
+                min_observation_max_particles=pf_conf.pose_min_observation_max_particles,
             )
             next_pose = candidates[next_idx]
             motion_distance_m = float(np.linalg.norm(next_pose - pose))
@@ -1722,19 +2419,39 @@ def run_live_pf(
             current_pose = next_pose
             estimator.add_measurement_pose(current_pose, reset_filters=False)
             current_pose_idx = len(estimator.poses) - 1
+    except Exception as exc:
+        notifier.notify_failed(
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "measurements_completed": int(step_counter),
+                "mission_time_s": float(elapsed),
+                "last_counts": last_counts,
+                "last_max_ig": last_max_ig,
+            }
+        )
+        raise
     finally:
         simulation_runtime.close()
 
     # Save final snapshots
+    result_paths: dict[str, str] = {}
     if save_outputs:
         pf_out_path = RESULTS_DIR / f"result_pf{output_suffix}.png"
         spectrum_out_path = RESULTS_DIR / f"result_spectrum{output_suffix}.png"
+        last_spectrum_out_path = RESULTS_DIR / f"result_spectrum_last{output_suffix}.png"
         estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
+        result_paths = {
+            "pf_plot": pf_out_path.as_posix(),
+            "estimates_plot": estimates_out_path.as_posix(),
+            "spectrum_plot": spectrum_out_path.as_posix(),
+            "last_spectrum_plot": last_spectrum_out_path.as_posix(),
+        }
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
         raw_estimates = None
         if last_frame is not None:
-            last_frame.step_index = 79
-            last_frame.time = 2400.0
+            last_frame.step_index = max(0, int(step_counter) - 1)
+            last_frame.time = float(elapsed)
             final_estimates = _build_final_estimates(
                 estimator,
                 isotopes,
@@ -1771,21 +2488,42 @@ def run_live_pf(
                 pf_step = len(estimator.poses)
                 estimates_step_path = PF_DIR / f"estimates_step_{pf_step:03d}.png"
                 viz.save_estimates_only(estimates_step_path.as_posix())
-        if last_spectrum is not None:
-            highlight = (
-                set(locked_isotopes_for_planning)
-                if detection_locked
-                else last_candidates
+        if representative_spectrum is not None:
+            highlight = set(representative_candidates)
+            title = "Representative measurement spectrum"
+            if representative_step_index is not None:
+                title = f"{title} (step {representative_step_index})"
+            _save_spectrum_plot(
+                decomposer,
+                representative_spectrum,
+                spectrum_out_path,
+                highlight_isotopes=highlight,
+                counts_by_isotope=representative_counts,
+                title=title,
             )
+        if last_spectrum is not None:
+            highlight = set(last_candidates)
             _save_spectrum_plot(
                 decomposer,
                 last_spectrum,
-                spectrum_out_path,
+                last_spectrum_out_path,
                 highlight_isotopes=highlight,
                 counts_by_isotope=last_counts,
+                title="Last measurement spectrum",
             )
-    total_meas_time = step_counter * live_time
-    total_mission_time_s = float(total_meas_time + total_motion_time_s + total_rotation_time_s)
+    total_meas_time = float(sum(measurement_live_times_s))
+    total_mission_time_s = float(
+        total_meas_time + total_motion_time_s + total_rotation_time_s
+    )
+    mean_live_time_s = (
+        float(np.mean(measurement_live_times_s)) if measurement_live_times_s else 0.0
+    )
+    min_live_time_s = (
+        float(np.min(measurement_live_times_s)) if measurement_live_times_s else 0.0
+    )
+    max_live_time_s = (
+        float(np.max(measurement_live_times_s)) if measurement_live_times_s else 0.0
+    )
     mean_ig_wall_s = float(np.mean(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
     max_ig_wall_s = float(np.max(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
     mean_pf_wall_s = float(np.mean(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
@@ -1800,6 +2538,18 @@ def run_live_pf(
     mission_metrics = {
         "total_measurements": int(step_counter),
         "total_live_time_s": float(total_meas_time),
+        "measurement_live_times_s": [
+            float(value) for value in measurement_live_times_s
+        ],
+        "mean_live_time_s": mean_live_time_s,
+        "min_live_time_s": min_live_time_s,
+        "max_live_time_s": max_live_time_s,
+        "measurement_time_cap_s": float(live_time),
+        "adaptive_dwell_enabled": bool(adaptive_dwell),
+        "adaptive_dwell_chunk_s": float(adaptive_dwell_chunk_s),
+        "adaptive_min_dwell_s": float(adaptive_min_dwell_s),
+        "adaptive_ready_min_counts": float(adaptive_ready_min_counts),
+        "adaptive_ready_min_isotopes": int(adaptive_ready_min_isotopes),
         "total_motion_distance_m": float(total_motion_distance_m),
         "nominal_motion_speed_m_s": float(nominal_motion_speed_m_s),
         "total_travel_time_s": float(total_motion_time_s),
@@ -1827,8 +2577,10 @@ def run_live_pf(
     if save_outputs:
         print(f"Final PF visualization saved to: {pf_out_path}")
         print(f"Final estimates-only visualization saved to: {estimates_out_path}")
+        if representative_spectrum is not None:
+            print(f"Representative spectrum saved to: {spectrum_out_path}")
         if last_spectrum is not None:
-            print(f"Final spectrum saved to: {spectrum_out_path}")
+            print(f"Last spectrum saved to: {last_spectrum_out_path}")
     print(
         f"Total measurements: {step_counter}, "
         f"live={total_meas_time:.1f}s, "
@@ -1885,6 +2637,29 @@ def run_live_pf(
         match_radius_m=eval_match_radius_m,
     )
     print_metrics_report(metrics)
+    notifier.notify_finished(
+        {
+            "summary": (
+                f"{step_counter} measurements, "
+                f"mission_time_s={total_mission_time_s:.1f}, "
+                f"wall_clock_s={wall_clock_runtime_s:.2f}"
+            ),
+            "measurements_completed": int(step_counter),
+            "mission_metrics": {
+                key: value
+                for key, value in mission_metrics.items()
+                if key != "path_segments"
+            },
+            "match_metrics": metrics,
+            "estimated_sources": est_by_iso,
+            "ground_truth_sources": gt_by_iso,
+            "last_counts": last_counts,
+            "output_paths": result_paths,
+            "backend": sim_backend,
+            "sim_config_path": sim_config_path,
+            "environment_mode": normalized_environment_mode,
+        }
+    )
     if live:
         plt.ioff()
         plt.pause(0.1)

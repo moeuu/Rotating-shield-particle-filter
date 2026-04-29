@@ -15,11 +15,14 @@ from numpy.typing import NDArray
 from measurement.shielding import (
     CS137_TVL_FE_MM,
     CS137_TVL_PB_MM,
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     OctantShield,
+    SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     mu_from_tvl_mm,
     octant_index_from_normal,
-    path_length_cm,
     resolve_mu_values,
+    spherical_shell_path_length_cm_torch,
 )
 
 CS137_TVL_PB_CM = CS137_TVL_PB_MM / 10.0
@@ -74,7 +77,10 @@ class ShieldParams:
     mu_fe: float = CS137_MU_FE_CM_INV  # 1/cm based on Cs-137 TVL.
     thickness_pb_cm: float = CS137_TVL_PB_CM
     thickness_fe_cm: float = CS137_TVL_FE_CM
-    use_angle_attenuation: bool = False  # When True, scale thickness by 1/cos(theta).
+    inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM
+    inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+    shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT
+    use_angle_attenuation: bool = False  # Legacy planar-slab mode; spherical shells use exact radial length.
 
 
 class KernelPrecomputer:
@@ -169,7 +175,23 @@ class KernelPrecomputer:
 
         normal = torch.as_tensor(self.orientations[orient_idx], device=device, dtype=dtype)
         cos_theta = torch.clamp(torch.sum(dir_unit * normal, dim=1), 0.0, 1.0)
-        if self.shield_params.use_angle_attenuation:
+        if (
+            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+            and not self.shield_params.use_angle_attenuation
+        ):
+            L_fe = spherical_shell_path_length_cm_torch(
+                direction,
+                self.shield_params.inner_radius_fe_cm,
+                self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
+                blocked,
+            )
+            L_pb = spherical_shell_path_length_cm_torch(
+                direction,
+                self.shield_params.inner_radius_pb_cm,
+                self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
+                blocked,
+            )
+        elif self.shield_params.use_angle_attenuation:
             L_fe = torch.where(
                 blocked & (cos_theta > tol),
                 torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_theta,

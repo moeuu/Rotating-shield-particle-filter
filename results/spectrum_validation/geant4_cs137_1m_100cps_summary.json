@@ -1,0 +1,10 @@
+{
+  "case": "Cs-137 at 1 m, 100 cps @ 1 m, 1 s, native Geant4 fixed detector response",
+  "emission_model": "isotropic",
+  "expected_physical_primaries": 941828.254848,
+  "num_primaries": 941199,
+  "photo_window_620_705_counts": 31.999985862768,
+  "run_time_s": 5.194276,
+  "total_counts": 75.999966424084,
+  "weighted_transport": false
+}

@@ -20,6 +20,10 @@ from sim.shield_geometry import (
     SHIELD_SHAPE_SPHERICAL_OCTANT,
 )
 
+DEFAULT_DETECTOR_CRYSTAL_RADIUS_M = 0.038
+DEFAULT_DETECTOR_CRYSTAL_LENGTH_M = 0.076
+DEFAULT_DETECTOR_HOUSING_THICKNESS_M = 0.0015
+
 
 @dataclass(frozen=True)
 class ExportedGeant4Material:
@@ -75,6 +79,8 @@ class ExportedGeant4Volume:
         ...,
     ] | None = None
     material: ExportedGeant4Material | None = None
+    transport_group: str | None = None
+    transport_mode: str = "geant4"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable volume payload."""
@@ -87,6 +93,8 @@ class ExportedGeant4Volume:
             "radius_m": self.radius_m,
             "triangles_xyz": None if self.triangles_xyz is None else self.triangles_xyz,
             "material": None if self.material is None else self.material.to_dict(),
+            "transport_group": self.transport_group,
+            "transport_mode": self.transport_mode,
         }
 
 
@@ -111,9 +119,10 @@ class ExportedGeant4Source:
 class ExportedDetectorModel:
     """Describe the detector assembly used by the Geant4 engine."""
 
-    crystal_radius_m: float = 0.019
-    crystal_length_m: float = 0.038
-    housing_thickness_m: float = 0.0015
+    crystal_radius_m: float = DEFAULT_DETECTOR_CRYSTAL_RADIUS_M
+    crystal_length_m: float = DEFAULT_DETECTOR_CRYSTAL_LENGTH_M
+    housing_thickness_m: float = DEFAULT_DETECTOR_HOUSING_THICKNESS_M
+    crystal_shape: str = "sphere"
     crystal_material: str = "cebr3"
     housing_material: str = "aluminum"
 
@@ -123,6 +132,7 @@ class ExportedDetectorModel:
             "crystal_radius_m": float(self.crystal_radius_m),
             "crystal_length_m": float(self.crystal_length_m),
             "housing_thickness_m": float(self.housing_thickness_m),
+            "crystal_shape": self.crystal_shape,
             "crystal_material": self.crystal_material,
             "housing_material": self.housing_material,
         }
@@ -132,6 +142,8 @@ class ExportedDetectorModel:
         """Return the active crystal volume in cubic meters."""
         radius_m = max(0.0, float(self.crystal_radius_m))
         length_m = max(0.0, float(self.crystal_length_m))
+        if self.crystal_shape.strip().lower() == "sphere":
+            return float((4.0 / 3.0) * 3.141592653589793 * radius_m**3)
         return float(3.141592653589793 * radius_m * radius_m * length_m)
 
 
@@ -208,6 +220,8 @@ def export_scene_for_geant4(
     asset_geometry: IsaacAssetGeometry,
     detector_model: ExportedDetectorModel,
     stage_material_rules: tuple[object, ...] = (),
+    absorbing_transport_groups: tuple[str, ...] = (),
+    absorbing_path_prefixes: tuple[str, ...] = (),
 ) -> ExportedGeant4Scene:
     """Export the loaded stage and dynamic assets into a Geant4-ready scene."""
     prefixes = tuple(
@@ -235,6 +249,13 @@ def export_scene_for_geant4(
             scene=scene,
             stage_material_rules=stage_material_rules,
         )
+        transport_group = _normalize_transport_group(solid_prim.transport_group)
+        transport_mode = _resolve_transport_mode(
+            solid_prim.path,
+            transport_group=transport_group,
+            absorbing_transport_groups=absorbing_transport_groups,
+            absorbing_path_prefixes=absorbing_path_prefixes,
+        )
         static_volumes.append(
             ExportedGeant4Volume(
                 path=solid_prim.path,
@@ -245,6 +266,8 @@ def export_scene_for_geant4(
                 radius_m=None if solid_prim.radius_m is None else float(solid_prim.radius_m),
                 triangles_xyz=solid_prim.triangles_xyz,
                 material=None if material is None else ExportedGeant4Material.from_stage_material(material),
+                transport_group=transport_group,
+                transport_mode=transport_mode,
             )
         )
     static_volumes.sort(key=lambda volume: volume.path)
@@ -325,3 +348,31 @@ def _resolve_material_for_export(
     if matched_material is None:
         return None
     return StageMaterialInfo(name=matched_material)
+
+
+def _normalize_transport_group(value: str | None) -> str | None:
+    """Normalize an optional semantic transport group."""
+    if value in (None, ""):
+        return None
+    return str(value).strip().replace("-", "_").replace(" ", "_").lower()
+
+
+def _resolve_transport_mode(
+    path: str,
+    *,
+    transport_group: str | None,
+    absorbing_transport_groups: tuple[str, ...],
+    absorbing_path_prefixes: tuple[str, ...],
+) -> str:
+    """Return the Geant4 transport mode for an exported static volume."""
+    absorbing_groups = {
+        normalized
+        for normalized in (_normalize_transport_group(group) for group in absorbing_transport_groups)
+        if normalized not in (None, "")
+    }
+    if transport_group is not None and transport_group in absorbing_groups:
+        return "absorber"
+    prefixes = tuple(str(prefix).rstrip("/") for prefix in absorbing_path_prefixes if str(prefix).strip())
+    if any(path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes):
+        return "absorber"
+    return "geant4"

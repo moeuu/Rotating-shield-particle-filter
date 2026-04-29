@@ -67,6 +67,7 @@ class SceneDescription:
     obstacle_material: str = "concrete"
     obstacle_cells: list[tuple[int, int]] = field(default_factory=list)
     author_obstacle_prims: bool = True
+    author_room_boundary_prims: bool = False
     sources: list[SourceDescription] = field(default_factory=list)
     usd_path: str | None = None
     prim_paths: StagePrimPaths = field(default_factory=StagePrimPaths)
@@ -143,6 +144,7 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         obstacle_material=str(payload.get("obstacle_material", "concrete")),
         obstacle_cells=obstacle_cells,
         author_obstacle_prims=bool(payload.get("author_obstacle_prims", True)),
+        author_room_boundary_prims=bool(payload.get("author_room_boundary_prims", False)),
         sources=sources,
         usd_path=None if payload.get("usd_path") in (None, "") else str(payload["usd_path"]),
         prim_paths=prim_paths,
@@ -181,6 +183,7 @@ class SceneBuilder:
         else:
             self._clear_scene_content(scene.prim_paths)
         self._ensure_base_hierarchy(scene.prim_paths)
+        self._author_room_boundaries(scene)
         self._author_obstacles(scene)
         self._author_sources(scene)
         self._author_robot(scene.prim_paths)
@@ -217,6 +220,54 @@ class SceneBuilder:
                 translation_xyz=center,
                 color_rgb=(0.2, 0.2, 0.2),
                 material=scene.obstacle_material,
+                transport_group="obstacle",
+            )
+
+    def _author_room_boundaries(self, scene: SceneDescription) -> None:
+        """Create optional room boundary solids for CUI Geant4 scenes."""
+        if not scene.author_room_boundary_prims:
+            return
+        size_x, size_y, size_z = (float(value) for value in scene.room_size_xyz)
+        wall_height = min(3.0, max(0.1, size_z))
+        wall_thickness = 0.1
+        environment_root = "/World/Environment"
+        wall_root = f"{environment_root}/Wall"
+        self.stage_backend.ensure_xform(environment_root)
+        self.stage_backend.ensure_xform(wall_root)
+        for name, size_xyz, center_xyz in (
+            (
+                "Floor",
+                (size_x, size_y, wall_thickness),
+                (0.5 * size_x, 0.5 * size_y, -0.5 * wall_thickness),
+            ),
+            (
+                "NorthWall",
+                (size_x, wall_thickness, wall_height),
+                (0.5 * size_x, size_y + 0.5 * wall_thickness, 0.5 * wall_height),
+            ),
+            (
+                "SouthWall",
+                (size_x, wall_thickness, wall_height),
+                (0.5 * size_x, -0.5 * wall_thickness, 0.5 * wall_height),
+            ),
+            (
+                "EastWall",
+                (wall_thickness, size_y, wall_height),
+                (size_x + 0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
+            ),
+            (
+                "WestWall",
+                (wall_thickness, size_y, wall_height),
+                (-0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
+            ),
+        ):
+            self.stage_backend.ensure_box(
+                f"{wall_root}/{name}",
+                size_xyz=size_xyz,
+                translation_xyz=center_xyz,
+                color_rgb=(0.75, 0.78, 0.82),
+                material="concrete",
+                transport_group="wall",
             )
 
     def _author_sources(self, scene: SceneDescription) -> None:

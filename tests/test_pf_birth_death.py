@@ -56,6 +56,7 @@ def test_birth_adds_source_when_particle_empty() -> None:
     ]
     birth_data = MeasurementData(
         z_k=np.array([5.0], dtype=float),
+        observation_variances=np.array([5.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),
@@ -67,6 +68,42 @@ def test_birth_adds_source_when_particle_empty() -> None:
         candidate_positions=filt.kernel.sources,
     )
     assert all(p.state.num_sources > 0 for p in filt.continuous_particles)
+
+
+def test_birth_excludes_candidates_near_detector_poses() -> None:
+    """Birth proposals should not place sources on measured detector poses."""
+    np.random.seed(0)
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=3,
+        birth_detector_min_sep_m=1.0,
+        birth_num_local_jitter=0,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(num_sources=0, positions=np.zeros((0, 3)), strengths=np.zeros(0), background=0.1),
+            log_weight=float(np.log(1.0 / filt.N)),
+        )
+        for _ in range(filt.N)
+    ]
+    birth_data = MeasurementData(
+        z_k=np.array([5.0], dtype=float),
+        observation_variances=np.array([5.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([7], dtype=int),
+        pb_indices=np.array([7], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    filt.apply_birth_death(
+        support_data=None,
+        birth_data=birth_data,
+        candidate_positions=filt.kernel.sources,
+    )
+    for particle in filt.continuous_particles:
+        assert particle.state.num_sources == 1
+        assert np.allclose(particle.state.positions[0], np.array([2.0, 0.0, 0.0]))
 
 
 def test_death_removes_weak_sources() -> None:
@@ -96,6 +133,7 @@ def test_death_removes_weak_sources() -> None:
     ]
     support_data = MeasurementData(
         z_k=np.array([0.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),
@@ -174,6 +212,7 @@ def test_weak_source_survives_with_support() -> None:
     z_k = np.array([lam1 + lam2], dtype=float)
     support_data = MeasurementData(
         z_k=z_k,
+        observation_variances=np.maximum(z_k, 1.0),
         detector_positions=np.array([det_pos], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),
@@ -211,6 +250,7 @@ def test_birth_disabled_skips_moves() -> None:
     ]
     support_data = MeasurementData(
         z_k=np.array([0.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),
@@ -218,6 +258,7 @@ def test_birth_disabled_skips_moves() -> None:
     )
     birth_data = MeasurementData(
         z_k=np.array([5.0], dtype=float),
+        observation_variances=np.array([5.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),
@@ -258,6 +299,7 @@ def test_birth_enabled_adds_sources() -> None:
     ]
     birth_data = MeasurementData(
         z_k=np.array([100.0], dtype=float),
+        observation_variances=np.array([100.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([7], dtype=int),
         pb_indices=np.array([7], dtype=int),

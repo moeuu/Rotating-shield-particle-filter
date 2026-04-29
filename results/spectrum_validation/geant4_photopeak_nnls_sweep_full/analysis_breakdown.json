@@ -1,0 +1,89 @@
+{
+  "free_no_obstacle": {
+    "peak_window": {
+      "max_abs_relative_error": 0.7079426637014818,
+      "max_absent_isotope_counts": 1068.0564648506258,
+      "mean_abs_relative_error": 0.18830514855145486,
+      "mean_absent_isotope_counts": 297.2569053436427,
+      "median_abs_relative_error": 0.11437797349328944,
+      "num_absent_isotope_points": 11,
+      "num_accuracy_points": 16
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 0.18650186160440146,
+      "max_absent_isotope_counts": 30.453465607568663,
+      "mean_abs_relative_error": 0.0905717819049877,
+      "mean_absent_isotope_counts": 7.482110881254072,
+      "median_abs_relative_error": 0.08280880520704478,
+      "num_absent_isotope_points": 11,
+      "num_accuracy_points": 16
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 1.0,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.2574745694360383,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.13533074177941767,
+      "num_absent_isotope_points": 11,
+      "num_accuracy_points": 16
+    }
+  },
+  "obstacle_excluded": {
+    "peak_window": {
+      "max_abs_relative_error": 0.9999830637095665,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.9964589200231742,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.9949937347642607,
+      "num_absent_isotope_points": 0,
+      "num_accuracy_points": 3
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 1.0,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 1.0,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 1.0,
+      "num_absent_isotope_points": 0,
+      "num_accuracy_points": 3
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 0.99895222840695,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.9895880300543979,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.9899939478181012,
+      "num_absent_isotope_points": 0,
+      "num_accuracy_points": 3
+    }
+  },
+  "shielded": {
+    "peak_window": {
+      "max_abs_relative_error": 2.8564574518519836,
+      "max_absent_isotope_counts": 40.45316958461167,
+      "mean_abs_relative_error": 0.9156526388338537,
+      "mean_absent_isotope_counts": 21.597185329496995,
+      "median_abs_relative_error": 0.3929640888410738,
+      "num_absent_isotope_points": 2,
+      "num_accuracy_points": 4
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 0.70067596907657,
+      "max_absent_isotope_counts": 2.047338984110647,
+      "mean_abs_relative_error": 0.44234022610974477,
+      "mean_absent_isotope_counts": 1.0236694920553235,
+      "median_abs_relative_error": 0.4654757300233181,
+      "num_absent_isotope_points": 2,
+      "num_accuracy_points": 4
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 0.7832836021098991,
+      "max_absent_isotope_counts": 0.0,
+      "mean_abs_relative_error": 0.48733470695748804,
+      "mean_absent_isotope_counts": 0.0,
+      "median_abs_relative_error": 0.48262722137825403,
+      "num_absent_isotope_points": 2,
+      "num_accuracy_points": 4
+    }
+  }
+}

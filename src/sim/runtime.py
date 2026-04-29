@@ -358,6 +358,31 @@ def _resolve_executable_path(path_value: str) -> str:
     return Path(os.path.expandvars(path_value)).expanduser().as_posix()
 
 
+def _local_isaacsim_python_candidates() -> list[Path]:
+    """Return likely Isaac Sim Python launchers installed on this machine."""
+    candidates: list[Path] = []
+    home = Path.home()
+    local_root = home / ".local" / "isaacsim"
+    if local_root.exists():
+        candidates.extend(sorted(local_root.glob("*/python.sh"), reverse=True))
+    candidates.extend(
+        [
+            home / ".local" / "isaacsim" / "python.sh",
+            home / "isaacsim" / "python.sh",
+            Path("/opt/isaacsim/python.sh"),
+        ]
+    )
+    return candidates
+
+
+def _resolve_local_isaacsim_python() -> str | None:
+    """Return a local Isaac Sim Python launcher if one exists."""
+    for candidate in _local_isaacsim_python_candidates():
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate.as_posix()
+    return None
+
+
 def _config_requires_isaacsim_python(config: dict[str, Any]) -> bool:
     """Return True when a sidecar must be launched with Isaac Sim's Python."""
     if bool(config.get("requires_isaacsim_python", False)):
@@ -388,6 +413,9 @@ def _resolve_sidecar_python(config: dict[str, Any], sidecar_name: str) -> str:
             return _resolve_executable_path(env_value)
 
     if _config_requires_isaacsim_python(config):
+        local_python = _resolve_local_isaacsim_python()
+        if local_python is not None:
+            return local_python
         raise RuntimeError(
             f"{sidecar_name} sidecar requires Isaac Sim Python. Set "
             "ISAACSIM_PYTHON=/path/to/isaacsim/python.sh or set "
@@ -519,9 +547,18 @@ def _start_geant4_sidecar(
 
 def _resolve_isaacsim_sidecar_config_path(
     config: dict[str, Any],
+    runtime_config_path: str | Path | None = None,
+    *,
+    direct_config: bool = False,
 ) -> tuple[Path, Path | None, dict[str, Any]]:
     """Return an Isaac Sim sidecar config path and loaded config."""
     root = _repo_root()
+    if direct_config:
+        loaded = dict(config)
+        if runtime_config_path is not None:
+            return Path(runtime_config_path).expanduser().resolve(), None, loaded
+        temp_path = _write_temp_sidecar_config(loaded)
+        return temp_path, temp_path, loaded
     configured = config.get("isaacsim_sidecar_config_path")
     config_path = (
         Path(str(configured)).expanduser().resolve()
@@ -540,15 +577,30 @@ def _resolve_isaacsim_sidecar_config_path(
     ):
         if src_key in config:
             loaded[dst_key] = config[src_key]
-    if overrides or any(key in config for key in ("isaacsim_host", "isaacsim_port", "isaacsim_timeout_s", "isaacsim_mode")):
+    override_keys = (
+        "isaacsim_host",
+        "isaacsim_port",
+        "isaacsim_timeout_s",
+        "isaacsim_mode",
+    )
+    if overrides or any(key in config for key in override_keys):
         temp_path = _write_temp_sidecar_config(loaded)
         return temp_path, temp_path, loaded
     return config_path, None, loaded
 
 
-def _start_isaacsim_sidecar(config: dict[str, Any]) -> IsaacSimTCPClientRuntime:
+def _start_isaacsim_sidecar(
+    config: dict[str, Any],
+    runtime_config_path: str | Path | None = None,
+    *,
+    direct_config: bool = False,
+) -> IsaacSimTCPClientRuntime:
     """Start or reuse an Isaac Sim bridge sidecar for Geant4 companion motion."""
-    config_path, temp_config_path, isaac_config = _resolve_isaacsim_sidecar_config_path(config)
+    config_path, temp_config_path, isaac_config = _resolve_isaacsim_sidecar_config_path(
+        config,
+        runtime_config_path=runtime_config_path,
+        direct_config=direct_config,
+    )
     host = str(isaac_config.get("host", "127.0.0.1"))
     port = int(isaac_config.get("port", 5555))
     timeout_s = float(isaac_config.get("timeout_s", 10.0))
@@ -557,6 +609,8 @@ def _start_isaacsim_sidecar(config: dict[str, Any]) -> IsaacSimTCPClientRuntime:
         or config.get("isaacsim_keep_sidecar_alive", False)
     )
     if _tcp_server_available(host, port):
+        if temp_config_path is not None:
+            temp_config_path.unlink(missing_ok=True)
         return IsaacSimTCPClientRuntime(
             host=host,
             port=port,
@@ -565,14 +619,18 @@ def _start_isaacsim_sidecar(config: dict[str, Any]) -> IsaacSimTCPClientRuntime:
         )
     root = _repo_root()
     script_path = root / "scripts" / "run_isaacsim_bridge.py"
+    default_log_path = root / "results" / "sidecars" / f"isaacsim_bridge_{port}.log"
     log_path = Path(
-        str(config.get("isaacsim_sidecar_log_path", root / "results" / "sidecars" / f"isaacsim_bridge_{port}.log"))
+        str(config.get("isaacsim_sidecar_log_path", default_log_path))
     ).expanduser()
     if not log_path.is_absolute():
         log_path = (root / log_path).resolve()
     startup_timeout_s = float(config.get("isaacsim_sidecar_startup_timeout_s", 60.0))
     process_config = dict(isaac_config)
-    isaac_python = config.get("isaacsim_sidecar_python", isaac_config.get("sidecar_python"))
+    isaac_python = config.get(
+        "isaacsim_sidecar_python",
+        isaac_config.get("sidecar_python"),
+    )
     if isaac_python not in (None, ""):
         process_config["sidecar_python"] = str(isaac_python)
     isaac_python_env = config.get(
@@ -591,7 +649,9 @@ def _start_isaacsim_sidecar(config: dict[str, Any]) -> IsaacSimTCPClientRuntime:
             timeout_s=startup_timeout_s,
             log_path=log_path,
             sidecar_name="Isaac Sim",
-            extra_args=["--mock"] if bool(config.get("isaacsim_sidecar_mock", False)) else None,
+            extra_args=(
+                ["--mock"] if bool(config.get("isaacsim_sidecar_mock", False)) else None
+            ),
         )
     except Exception:
         if temp_config_path is not None:
@@ -653,6 +713,13 @@ def create_simulation_runtime(
         port = int(config.get("port", 5555))
         timeout_s = float(config.get("timeout_s", 10.0))
         keep_alive = bool(config.get("keep_sidecar_alive", False))
+        auto_start = bool(config.get("auto_start_sidecar", True))
+        if auto_start and not _tcp_server_available(host, port):
+            return _start_isaacsim_sidecar(
+                config,
+                runtime_config_path=runtime_config_path,
+                direct_config=True,
+            )
         return IsaacSimTCPClientRuntime(
             host=host,
             port=port,

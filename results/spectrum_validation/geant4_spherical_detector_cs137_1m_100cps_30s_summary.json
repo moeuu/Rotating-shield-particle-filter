@@ -1,0 +1,14 @@
+{
+  "dwell_time_s": 30.0,
+  "input_cps_1m": 100.0,
+  "num_primaries": 7069262.0,
+  "response_counts": {
+    "Co-60": 0.0,
+    "Cs-137": 3634.144382020966,
+    "Eu-154": 0.0
+  },
+  "response_ratio_cs137": 1.2113814606736553,
+  "run_time_s": 42.453463,
+  "source_equivalent_counts_Cs-137": 3000.0,
+  "total_counts": 3691.9973587955
+}

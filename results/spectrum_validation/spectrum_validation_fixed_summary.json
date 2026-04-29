@@ -1,0 +1,536 @@
+{
+  "geant4_native_fixed": [
+    {
+      "isotope": "Cs-137",
+      "label": "geant4_native_fixed_close_source_100cps_1s",
+      "lines": [
+        {
+          "backscatter_keV": 184.34986376021797,
+          "centroid_keV": 660.8571937956845,
+          "compton_edge_keV": 477.650136239782,
+          "fwhm_keV": 24.0,
+          "intensity": 0.85,
+          "line_keV": 662.0,
+          "max_keV": 660.0,
+          "peak_counts": 870.8419326751
+        }
+      ],
+      "metadata": {
+        "background_cps": 0.0,
+        "emission_model": "isotropic",
+        "expected_physical_primaries": 941828.254848,
+        "multithreaded_run_manager": true,
+        "num_primaries": 943946,
+        "physics_profile": "balanced",
+        "run_time_s": 5.058698,
+        "weighted_transport": false
+      },
+      "nonzero_bins": 353,
+      "top_bins": [
+        {
+          "counts": 931.830862518,
+          "energy_keV": 660.0
+        },
+        {
+          "counts": 924.832132864,
+          "energy_keV": 658.0
+        },
+        {
+          "counts": 920.832858776,
+          "energy_keV": 662.0
+        },
+        {
+          "counts": 872.841569719,
+          "energy_keV": 664.0
+        },
+        {
+          "counts": 860.843747455,
+          "energy_keV": 656.0
+        },
+        {
+          "counts": 776.858991606,
+          "energy_keV": 654.0
+        },
+        {
+          "counts": 769.860261952,
+          "energy_keV": 666.0
+        },
+        {
+          "counts": 731.867158115,
+          "energy_keV": 668.0
+        },
+        {
+          "counts": 650.881857832,
+          "energy_keV": 652.0
+        },
+        {
+          "counts": 645.882765222,
+          "energy_keV": 670.0
+        }
+      ],
+      "total_counts": 31219.333349925375
+    },
+    {
+      "isotope": "Co-60",
+      "label": "geant4_native_fixed_close_source_100cps_1s",
+      "lines": [
+        {
+          "backscatter_keV": 209.80154007700384,
+          "centroid_keV": 1171.3660656793375,
+          "compton_edge_keV": 963.1984599229962,
+          "fwhm_keV": 28.0,
+          "intensity": 0.5,
+          "line_keV": 1173.0,
+          "max_keV": 1172.0,
+          "peak_counts": 186.36834966051998
+        },
+        {
+          "backscatter_keV": 214.37858267716535,
+          "centroid_keV": 1331.4081632653097,
+          "compton_edge_keV": 1117.6214173228348,
+          "fwhm_keV": 26.0,
+          "intensity": 0.5,
+          "line_keV": 1332.0,
+          "max_keV": 1328.0,
+          "peak_counts": 144.975379296
+        }
+      ],
+      "metadata": {
+        "background_cps": 0.0,
+        "emission_model": "isotropic",
+        "expected_physical_primaries": 1108033.240997,
+        "multithreaded_run_manager": true,
+        "num_primaries": 1107883,
+        "physics_profile": "balanced",
+        "run_time_s": 7.58434,
+        "weighted_transport": false
+      },
+      "nonzero_bins": 683,
+      "top_bins": [
+        {
+          "counts": 241.958908894,
+          "energy_keV": 1172.0
+        },
+        {
+          "counts": 230.960776672,
+          "energy_keV": 1174.0
+        },
+        {
+          "counts": 229.960946469,
+          "energy_keV": 1168.0
+        },
+        {
+          "counts": 222.962135055,
+          "energy_keV": 1170.0
+        },
+        {
+          "counts": 209.964342429,
+          "energy_keV": 1166.0
+        },
+        {
+          "counts": 192.967228994,
+          "energy_keV": 1328.0
+        },
+        {
+          "counts": 186.968247782,
+          "energy_keV": 1182.0
+        },
+        {
+          "counts": 184.968587378,
+          "energy_keV": 1176.0
+        },
+        {
+          "counts": 178.969606165,
+          "energy_keV": 1180.0
+        },
+        {
+          "counts": 175.970115559,
+          "energy_keV": 1162.0
+        }
+      ],
+      "total_counts": 29210.039352636013
+    },
+    {
+      "isotope": "Eu-154",
+      "label": "geant4_native_fixed_close_source_100cps_1s",
+      "lines": [
+        {
+          "backscatter_keV": 188.80583367388638,
+          "centroid_keV": 721.9483966089219,
+          "compton_edge_keV": 534.4941663261136,
+          "fwhm_keV": 26.0,
+          "intensity": 0.25,
+          "line_keV": 723.3,
+          "max_keV": 726.0,
+          "peak_counts": 212.96086866800002
+        },
+        {
+          "backscatter_keV": 197.6633294941083,
+          "centroid_keV": 872.1154174168466,
+          "compton_edge_keV": 675.5366705058918,
+          "fwhm_keV": 22.0,
+          "intensity": 0.14,
+          "line_keV": 873.2,
+          "max_keV": 870.0,
+          "peak_counts": 94.88256543055
+        },
+        {
+          "backscatter_keV": 203.35089471161527,
+          "centroid_keV": 995.4468515893963,
+          "compton_edge_keV": 792.9491052883847,
+          "fwhm_keV": 28.0,
+          "intensity": 0.14,
+          "line_keV": 996.3,
+          "max_keV": 998.0,
+          "peak_counts": 74.38633159153
+        },
+        {
+          "backscatter_keV": 212.83316993464052,
+          "centroid_keV": 1273.499217865044,
+          "compton_edge_keV": 1061.6668300653596,
+          "fwhm_keV": 26.0,
+          "intensity": 0.45,
+          "line_keV": 1274.5,
+          "max_keV": 1278.0,
+          "peak_counts": 134.67525356586998
+        },
+        {
+          "backscatter_keV": 218.18633895398685,
+          "centroid_keV": 1484.8947368421072,
+          "compton_edge_keV": 1275.8136610460133,
+          "fwhm_keV": 26.0,
+          "intensity": 0.01,
+          "line_keV": 1494.0,
+          "max_keV": 1488.0,
+          "peak_counts": 5.99889770896
+        },
+        {
+          "backscatter_keV": 220.2514848812095,
+          "centroid_keV": null,
+          "compton_edge_keV": 1376.2485151187905,
+          "fwhm_keV": null,
+          "intensity": 0.02,
+          "line_keV": 1596.5,
+          "max_keV": null,
+          "peak_counts": 0.0
+        }
+      ],
+      "metadata": {
+        "background_cps": 0.0,
+        "emission_model": "isotropic",
+        "expected_physical_primaries": 1119113.573407,
+        "multithreaded_run_manager": true,
+        "num_primaries": 1116530,
+        "physics_profile": "balanced",
+        "run_time_s": 7.076553,
+        "weighted_transport": false
+      },
+      "nonzero_bins": 707,
+      "top_bins": [
+        {
+          "counts": 264.951315479,
+          "energy_keV": 726.0
+        },
+        {
+          "counts": 255.952968916,
+          "energy_keV": 724.0
+        },
+        {
+          "counts": 245.954806068,
+          "energy_keV": 720.0
+        },
+        {
+          "counts": 240.955724643,
+          "energy_keV": 722.0
+        },
+        {
+          "counts": 235.956643219,
+          "energy_keV": 716.0
+        },
+        {
+          "counts": 235.956643219,
+          "energy_keV": 730.0
+        },
+        {
+          "counts": 217.959950092,
+          "energy_keV": 718.0
+        },
+        {
+          "counts": 216.960133808,
+          "energy_keV": 728.0
+        },
+        {
+          "counts": 213.960684953,
+          "energy_keV": 714.0
+        },
+        {
+          "counts": 211.961052383,
+          "energy_keV": 732.0
+        }
+      ],
+      "total_counts": 31604.192763394683
+    }
+  ],
+  "notes": {
+    "bin_width_keV": 2.0,
+    "geant4_case": "Native Geant4 after detector-response fix, close source 5 cm, 100 cps @ 1 m, 1 s; no artificial history cap/weighting.",
+    "python_case": "Expected response-matrix spectra after detector-response fix at 30000 cps @ 1 m, 1 s; no Poisson noise."
+  },
+  "python_response_matrix_fixed": [
+    {
+      "effective_strengths": {
+        "Co-60": 0.0,
+        "Cs-137": 30000.0,
+        "Eu-154": 0.0
+      },
+      "isotope": "Cs-137",
+      "label": "python_response_matrix_fixed_30000cps_1m_1s",
+      "lines": [
+        {
+          "backscatter_keV": 184.34986376021797,
+          "centroid_keV": 661.9999950738493,
+          "compton_edge_keV": 477.650136239782,
+          "fwhm_keV": 26.0,
+          "intensity": 0.85,
+          "line_keV": 662.0,
+          "max_keV": 662.0,
+          "peak_counts": 699.3067501870886
+        }
+      ],
+      "nonzero_bins": 751,
+      "top_bins": [
+        {
+          "counts": 734.6231959605692,
+          "energy_keV": 662.0
+        },
+        {
+          "counts": 723.3351240776229,
+          "energy_keV": 660.0
+        },
+        {
+          "counts": 723.3350960358757,
+          "energy_keV": 664.0
+        },
+        {
+          "counts": 690.5009683957078,
+          "energy_keV": 658.0
+        },
+        {
+          "counts": 690.5009123115123,
+          "energy_keV": 666.0
+        },
+        {
+          "counts": 639.0559149918356,
+          "energy_keV": 656.0
+        },
+        {
+          "counts": 639.0558308637898,
+          "energy_keV": 668.0
+        },
+        {
+          "counts": 573.4073701060696,
+          "energy_keV": 654.0
+        },
+        {
+          "counts": 573.4072579320701,
+          "energy_keV": 670.0
+        },
+        {
+          "counts": 498.8127573963735,
+          "energy_keV": 652.0
+        }
+      ],
+      "total_counts": 31731.716054375942
+    },
+    {
+      "effective_strengths": {
+        "Co-60": 30000.0,
+        "Cs-137": 0.0,
+        "Eu-154": 0.0
+      },
+      "isotope": "Co-60",
+      "label": "python_response_matrix_fixed_30000cps_1m_1s",
+      "lines": [
+        {
+          "backscatter_keV": 209.80154007700384,
+          "centroid_keV": 1172.9999955694243,
+          "compton_edge_keV": 963.1984599229962,
+          "fwhm_keV": 32.0,
+          "intensity": 0.5,
+          "line_keV": 1173.0,
+          "max_keV": 1172.0,
+          "peak_counts": 172.43814715506528
+        },
+        {
+          "backscatter_keV": 214.37858267716535,
+          "centroid_keV": 1331.9999963021398,
+          "compton_edge_keV": 1117.6214173228348,
+          "fwhm_keV": 34.0,
+          "intensity": 0.5,
+          "line_keV": 1332.0,
+          "max_keV": 1332.0,
+          "peak_counts": 145.10467505124433
+        }
+      ],
+      "nonzero_bins": 751,
+      "top_bins": [
+        {
+          "counts": 222.54198899469435,
+          "energy_keV": 1172.0
+        },
+        {
+          "counts": 222.5419850866227,
+          "energy_keV": 1174.0
+        },
+        {
+          "counts": 218.92537486543264,
+          "energy_keV": 1170.0
+        },
+        {
+          "counts": 218.92536314112002,
+          "energy_keV": 1176.0
+        },
+        {
+          "counts": 211.8675134156634,
+          "energy_keV": 1168.0
+        },
+        {
+          "counts": 211.8674938748167,
+          "energy_keV": 1178.0
+        },
+        {
+          "counts": 201.70504965543242,
+          "energy_keV": 1166.0
+        },
+        {
+          "counts": 201.70502229756306,
+          "energy_keV": 1180.0
+        },
+        {
+          "counts": 192.7588447296858,
+          "energy_keV": 1332.0
+        },
+        {
+          "counts": 191.38936964928774,
+          "energy_keV": 1330.0
+        }
+      ],
+      "total_counts": 25607.58716221454
+    },
+    {
+      "effective_strengths": {
+        "Co-60": 0.0,
+        "Cs-137": 0.0,
+        "Eu-154": 30000.0
+      },
+      "isotope": "Eu-154",
+      "label": "python_response_matrix_fixed_30000cps_1m_1s",
+      "lines": [
+        {
+          "backscatter_keV": 188.80583367388638,
+          "centroid_keV": 723.2393392725224,
+          "compton_edge_keV": 534.4941663261136,
+          "fwhm_keV": 28.0,
+          "intensity": 0.25,
+          "line_keV": 723.3,
+          "max_keV": 724.0,
+          "peak_counts": 179.1153810839473
+        },
+        {
+          "backscatter_keV": 197.6633294941083,
+          "centroid_keV": 873.1344525314084,
+          "compton_edge_keV": 675.5366705058918,
+          "fwhm_keV": 28.0,
+          "intensity": 0.14,
+          "line_keV": 873.2,
+          "max_keV": 874.0,
+          "peak_counts": 76.41706336632146
+        },
+        {
+          "backscatter_keV": 203.35089471161527,
+          "centroid_keV": 996.2546478306109,
+          "compton_edge_keV": 792.9491052883847,
+          "fwhm_keV": 30.0,
+          "intensity": 0.14,
+          "line_keV": 996.3,
+          "max_keV": 996.0,
+          "peak_counts": 61.56601271030992
+        },
+        {
+          "backscatter_keV": 212.83316993464052,
+          "centroid_keV": 1274.5103913482685,
+          "compton_edge_keV": 1061.6668300653596,
+          "fwhm_keV": 32.0,
+          "intensity": 0.45,
+          "line_keV": 1274.5,
+          "max_keV": 1274.0,
+          "peak_counts": 133.7980747476314
+        },
+        {
+          "backscatter_keV": 218.18633895398685,
+          "centroid_keV": 1488.6466561450707,
+          "compton_edge_keV": 1275.8136610460133,
+          "fwhm_keV": 24.0,
+          "intensity": 0.01,
+          "line_keV": 1494.0,
+          "max_keV": 1494.0,
+          "peak_counts": 2.2503804689428977
+        },
+        {
+          "backscatter_keV": 220.2514848812095,
+          "centroid_keV": null,
+          "compton_edge_keV": 1376.2485151187905,
+          "fwhm_keV": null,
+          "intensity": 0.02,
+          "line_keV": 1596.5,
+          "max_keV": null,
+          "peak_counts": 0.0
+        }
+      ],
+      "nonzero_bins": 751,
+      "top_bins": [
+        {
+          "counts": 201.76827361067208,
+          "energy_keV": 724.0
+        },
+        {
+          "counts": 200.9955506687073,
+          "energy_keV": 722.0
+        },
+        {
+          "counts": 197.14531199435933,
+          "energy_keV": 726.0
+        },
+        {
+          "counts": 194.89479398776857,
+          "energy_keV": 720.0
+        },
+        {
+          "counts": 187.50382823603533,
+          "energy_keV": 728.0
+        },
+        {
+          "counts": 183.9692081424223,
+          "energy_keV": 718.0
+        },
+        {
+          "counts": 182.41536080118152,
+          "energy_keV": 1274.0
+        },
+        {
+          "counts": 181.71000453818397,
+          "energy_keV": 1276.0
+        },
+        {
+          "counts": 180.38008036610756,
+          "energy_keV": 1272.0
+        },
+        {
+          "counts": 178.34292483150455,
+          "energy_keV": 1278.0
+        }
+      ],
+      "total_counts": 28918.35224627182
+    }
+  ]
+}

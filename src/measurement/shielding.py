@@ -49,8 +49,17 @@ HVL_TVL_TABLE_MM: dict[str, dict[str, dict[str, float]]] = {
     "Co-60": {"pb": {"hvl": 12.0, "tvl": 40.0}, "fe": {"hvl": 20.0, "tvl": 67.0}},
     "Eu-154": {"pb": {"hvl": 7.4, "tvl": 24.6}, "fe": {"hvl": 13.8, "tvl": 45.8}},
 }
+CONCRETE_MU_CM_INV: dict[str, float] = {
+    "Cs-137": 0.17,
+    "Co-60": 0.11,
+    "Eu-154": 0.18,
+}
 CS137_TVL_PB_MM = float(HVL_TVL_TABLE_MM["Cs-137"]["pb"]["tvl"])
 CS137_TVL_FE_MM = float(HVL_TVL_TABLE_MM["Cs-137"]["fe"]["tvl"])
+SHIELD_GEOMETRY_SPHERICAL_OCTANT = "spherical_octant_shell"
+SHIELD_GEOMETRY_NOMINAL_TVL = "nominal_tvl"
+DEFAULT_FE_SHIELD_INNER_RADIUS_CM = 19.0
+DEFAULT_PB_SHIELD_INNER_RADIUS_CM = 26.0
 
 
 def mu_from_tvl_mm(tvl_mm: float) -> float:
@@ -152,6 +161,50 @@ def path_length_cm_torch(
     if use_angle_attenuation:
         return torch.where(blocked_mask & (cos_theta > tol_t), thickness / cos_theta, torch.zeros_like(cos_theta))
     return torch.where(blocked_mask, thickness, torch.zeros_like(cos_theta))
+
+
+def spherical_shell_path_length_cm(
+    direction_m: NDArray[np.float64],
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    blocked: bool,
+) -> float:
+    """
+    Return exact radial path length through a spherical shell in centimeters.
+
+    The shield is modeled as a spherical octant shell centered on the detector.
+    For a source-detector ray ending at the detector center, the intersection
+    length is the radial overlap of the segment with [inner_radius, outer_radius].
+    """
+    if not blocked:
+        return 0.0
+    inner = max(0.0, float(inner_radius_cm))
+    outer = max(inner, float(outer_radius_cm))
+    if outer <= inner:
+        return 0.0
+    distance_cm = 100.0 * float(np.linalg.norm(direction_m))
+    if distance_cm <= inner:
+        return 0.0
+    return float(np.clip(min(distance_cm, outer) - inner, 0.0, outer - inner))
+
+
+def spherical_shell_path_length_cm_torch(
+    direction_m: "torch.Tensor",
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    blocked_mask: "torch.Tensor",
+) -> "torch.Tensor":
+    """Return exact radial path length through a spherical shell for torch tensors."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    inner_value = max(0.0, float(inner_radius_cm))
+    outer_value = max(inner_value, float(outer_radius_cm))
+    inner = torch.as_tensor(inner_value, device=direction_m.device, dtype=direction_m.dtype)
+    outer = torch.as_tensor(outer_value, device=direction_m.device, dtype=direction_m.dtype)
+    distance_cm = 100.0 * torch.linalg.norm(direction_m, dim=-1)
+    shell_length = torch.clamp(torch.minimum(distance_cm, outer) - inner, min=0.0)
+    shell_length = torch.clamp(shell_length, max=torch.clamp(outer - inner, min=0.0))
+    return torch.where(blocked_mask, shell_length, torch.zeros_like(shell_length))
 
 
 def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArray[np.float64], tol: float = 1e-6) -> bool:

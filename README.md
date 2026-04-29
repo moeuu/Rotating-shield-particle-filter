@@ -42,7 +42,7 @@ where observations come from:
 | --- | --- | --- |
 | `analytic` | In-process Python spectrum simulator. | None beyond `uv sync`. |
 | `isaacsim` | TCP client that talks to `scripts/run_isaacsim_bridge.py`. | Isaac Sim only for real mode; mock mode works without it. |
-| `geant4` | TCP client that talks to `scripts/run_geant4_bridge.py`. | Surrogate mode needs no native Geant4; external mode needs a built Geant4 executable. |
+| `geant4` | TCP client that talks to `scripts/run_geant4_bridge.py`. | Requires the native Geant4 sidecar executable. |
 
 All runs write final plots under `results/` by default:
 `results/result_pf*.png`, `results/result_estimates*.png`, and
@@ -52,16 +52,80 @@ different runs separate.
 Common options:
 
 ```bash
---headless                 # disable the interactive Matplotlib window
+--mode python-gui          # Python spectrum model + Isaac Sim GUI
+--mode geant4-isaacsim-gui # Geant4 spectrum model + Isaac Sim GUI
+--mode python-cui          # Python spectrum model, no simulator GUI
+--mode geant4-cui          # Geant4 spectrum model, no Isaac Sim GUI
+--headless                 # force a non-GUI simulator mode
+--matplotlib-live          # optional Matplotlib live plot
 --max-steps 5              # stop after a fixed number of measurements
 --max-poses 3              # stop after a fixed number of robot poses
---source-config PATH       # load sources from JSON, default source_layouts/Ex1.json
---obstacle-config PATH     # load blocked cells from JSON, default obstacle_layouts/Ex1_obstacles.json
+--source-config PATH       # load sources from JSON, default source_layouts/demo_sources.json
+--obstacle-config PATH     # load blocked cells from JSON, default obstacle_layouts/demo_obstacles.json
 --environment-mode random  # generate a fresh obstacle map for this run
 --obstacle-seed 7          # make fixed generation or random mode reproducible
+--passage-width-m 1.0      # reserve a robot-passable corridor in random maps
+--robot-radius-m 0.35      # clearance radius used for 2D traversability maps
 --robot-speed 0.5          # nominal travel speed used in mission-time accounting
 --rotation-overhead-s 0.5  # fixed shield actuation overhead per measurement
 ```
+
+## Optional piplup notifications
+
+Simulation notifications are opt-in and use the existing piplup-notify
+`/api/events` endpoint. If no token is configured, simulations run normally and
+only print a short warning when `--notify` or `--notify-spectrum` was requested.
+
+The implementation sends only start, final, and failure events by default.
+Add `--notify-spectrum` to enable notifications and send per-measurement
+spectrum payloads that can be plotted by the Railway app. Spectrum events
+include bin energies, counts, isotope-wise extracted counts, pose, and
+shield-orientation indices.
+
+```bash
+export PIPLUP_NOTIFY_TOKEN=...  # same token as piplup EVENT_API_TOKEN
+
+uv run python main.py \
+  --mode geant4-cui \
+  --sim-config configs/geant4/random_external_no_isaac.json \
+  --max-poses 10 \
+  --rotations-per-pose 4 \
+  --max-steps 40 \
+  --notify-spectrum
+```
+
+Useful overrides:
+
+```bash
+--notify-url https://piplup-notify-production.up.railway.app
+--notify-account lab_rdp
+--notify-run-id demo-001
+--notify-spectrum
+--notify-spectrum-every 1
+--notify-spectrum-max-bins 800
+--no-notify
+```
+
+For longer Geant4 runs, `--rotations-per-pose 4 --max-poses 10 --max-steps 40`
+forces four shield measurements at each of ten robot poses before IG early
+stopping can move to the next pose. Add `--min-rotations-per-pose 1` if you
+want the old early-stop behavior under a four-rotation cap. Add
+`--init-grid-spacing-m 0` when `--num-particles` should control the PF size
+instead of the default 1 m grid initialization.
+
+The `configs/geant4/random_external_no_isaac.json` external sidecar config uses
+the balanced Geant4 physics profile with explicit shield and obstacle geometry.
+It does not cap histories or use deterministic background smoothing. For a pure
+source-only high-fidelity run, use
+`configs/geant4/high_fidelity_external_no_isaac.json`. The main
+`result_spectrum*.png` output uses the highest-count measurement as the
+representative spectrum; the last measurement is also saved as
+`result_spectrum_last*.png`.
+
+Environment variables are also supported:
+`PIPLUP_NOTIFY_ENABLED=1`, `PIPLUP_NOTIFY_TOKEN`, `PIPLUP_NOTIFY_URL`,
+`PIPLUP_NOTIFY_ACCOUNT`, `PIPLUP_NOTIFY_RUN_ID`, and
+`PIPLUP_NOTIFY_TIMEOUT_S`.
 
 ### Analytic backend
 
@@ -69,25 +133,38 @@ Use this for the fastest smoke tests and for development that does not need a
 live simulator process.
 
 ```bash
-uv run python main.py --sim-backend analytic --headless --max-steps 3
+uv run python main.py --mode python-cui --max-steps 3
 ```
 
-Interactive visualization is enabled by default when `--headless` is omitted:
+The Python GUI mode uses the same PF loop, but asks an Isaac Sim sidecar to show
+the scene and generate observations with the Python observation model:
 
 ```bash
-uv run python main.py --sim-backend analytic
+uv run python main.py --mode python-gui --max-steps 3
 ```
 
 Random obstacle layouts can also be generated at startup. If Blender is
 available, a matching USD environment is written under
-`results/blender_environments/`.
+`results/blender_environments/`. Random layouts reserve a connected corridor
+from the initial robot cell toward a far corner, so the generated obstacle cells
+cannot fully block robot motion. The startup order is:
+
+1. Generate the random 3D USD environment.
+2. Project its obstacle volumes onto the floor and write a 2D robot traversable map.
+3. Start/reset the selected simulator with the USD and map paths.
+
+The traversability JSON and PNG are written next to the generated USD as
+`*.traversability.json` and `*.traversability.png`. The JSON can be loaded with
+`planning.traversability.TraversabilityMap.load(...)` and passed as `map_api`
+to future path-planning code. When a base USD such as Manchester Drum_Store is
+used, Blender extracts occupancy from the imported USD meshes and the generated
+obstacle boxes before the simulator is reset.
 
 ```bash
 uv run python main.py \
-  --sim-backend analytic \
+  --mode python-cui \
   --environment-mode random \
   --obstacle-seed 7 \
-  --headless \
   --max-steps 3
 ```
 
@@ -103,9 +180,8 @@ uv run python scripts/run_isaacsim_bridge.py --mock
 
 # Terminal 2: PF loop using that sidecar.
 uv run python main.py \
-  --sim-backend isaacsim \
+  --mode python-gui \
   --sim-config configs/isaacsim/default_scene.json \
-  --headless \
   --max-steps 3
 ```
 
@@ -123,9 +199,8 @@ export ISAACSIM_PYTHON=/path/to/isaacsim/python.sh
 
 # Terminal 2: PF loop using the same host/port/timeouts.
 uv run python main.py \
-  --sim-backend isaacsim \
+  --mode python-gui \
   --sim-config configs/isaacsim/real_scene.json \
-  --headless \
   --max-steps 5
 ```
 
@@ -140,9 +215,8 @@ robot motion, shields, sources, and radiation visualization:
 
 # Terminal 2: drive it from the PF loop.
 uv run python main.py \
-  --sim-backend isaacsim \
+  --mode python-gui \
   --sim-config configs/isaacsim/gui_scene.json \
-  --headless \
   --max-steps 10
 ```
 
@@ -185,9 +259,24 @@ Run the converted Manchester scene like this:
 
 # Terminal 2
 uv run python main.py \
-  --sim-backend isaacsim \
+  --mode python-gui \
   --sim-config configs/isaacsim/manchester_drum_store.json \
-  --headless \
+  --max-steps 5
+```
+
+The same Manchester USD can be used as the base for random layouts. In random
+mode, `main.py` reads `usd_path` from the simulation config, imports that USD in
+Blender, adds the generated obstacle layout, writes a 2D traversability map
+from the combined 3D scene, and only then starts/resets the simulator:
+
+```bash
+uv run python main.py \
+  --mode python-gui \
+  --sim-config configs/isaacsim/manchester_drum_store.json \
+  --environment-mode random \
+  --obstacle-seed 7 \
+  --passage-width-m 1.0 \
+  --robot-radius-m 0.35 \
   --max-steps 5
 ```
 
@@ -197,21 +286,19 @@ The Geant4 backend uses the same sidecar protocol as Isaac Sim. `main.py`
 auto-starts the Geant4 sidecar when no server is already listening on the
 configured port. Sidecar logs go to `results/sidecars/`.
 
-For a pure headless smoke test, use the surrogate engine with a mock stage and
-no Isaac Sim companion:
+For a headless/no-GUI Geant4 run, use `geant4-cui`. This still uses the native
+Geant4 executable; it only avoids starting the Isaac Sim GUI companion:
 
 ```bash
 uv run python main.py \
-  --sim-backend geant4 \
-  --sim-config configs/geant4/surrogate_no_isaac.json \
-  --headless \
+  --mode geant4-cui \
   --max-steps 3
 ```
 
-Use `configs/geant4/default_scene.json` when you want the surrogate Geant4
-observation model paired with an Isaac Sim sidecar for robot motion and
-visualization. Start the Isaac sidecar with Isaac Sim Python first, then let
-`main.py` auto-start the Geant4 sidecar and reuse the running Isaac sidecar.
+Use `configs/geant4/external_gui_scene.json` when you want native Geant4
+transport paired with an Isaac Sim sidecar for robot motion and visualization.
+Start the Isaac sidecar with Isaac Sim Python first, then let `main.py`
+auto-start the Geant4 sidecar and reuse the running Isaac sidecar.
 
 ```bash
 # Terminal 1
@@ -221,27 +308,25 @@ visualization. Start the Isaac sidecar with Isaac Sim Python first, then let
 
 # Terminal 2
 uv run python main.py \
-  --sim-backend geant4 \
-  --sim-config configs/geant4/default_scene.json \
-  --headless \
+  --mode geant4-isaacsim-gui \
+  --sim-config configs/geant4/external_gui_scene.json \
   --max-steps 5
 ```
 
-For a real USD-backed surrogate run against the Manchester Drum_Store mesh,
+For a real USD-backed native Geant4 run against the Manchester Drum_Store mesh,
 prepare the Manchester assets first, then use:
 
 ```bash
 uv run python main.py \
-  --sim-backend geant4 \
+  --mode geant4-cui \
   --sim-config configs/geant4/real_scene.json \
-  --headless \
   --max-steps 5
 ```
 
-`configs/geant4/real_scene.json` uses the surrogate Geant4 engine while reading
-scene geometry from the USD stage. It includes Poisson source emission,
-stage/shield attenuation, scatter-continuum synthesis, detector-volume scaling,
-and dead-time scaling.
+`configs/geant4/real_scene.json` uses the native external Geant4 engine while
+reading scene geometry from the USD stage. It includes Poisson source emission,
+explicit stage/shield geometry, Geant4 EM interactions, detector response
+smearing, and dead-time scaling.
 
 ### Native Geant4 executable
 
@@ -258,9 +343,8 @@ Run the PF loop with the external engine:
 export ISAACSIM_PYTHON=/path/to/isaacsim/python.sh
 
 uv run python main.py \
-  --sim-backend geant4 \
+  --mode geant4-cui \
   --sim-config configs/geant4/external_scene.json \
-  --headless \
   --max-steps 5
 ```
 
@@ -271,16 +355,20 @@ are available as `configs/geant4/external_gui_scene.json`,
 `configs/geant4/demo_room_external_gui.json`, and
 `configs/geant4/demo_room_scatter_attenuation_external_gui.json`.
 
-### Geant4 net-response calibration
+The native sidecar emits gamma rays isotropically and uses Geant4 geometry for
+shield, obstacle, and stage attenuation. When Geant4 is built with
+multithreading support, `thread_count` selects the worker count.
 
-The PF likelihood expects isotope-wise counts in the same measurement space as
-the spectrum unfolding output. Analytic Python and surrogate Geant4 runs use
-`spectrum_count_method: "response_matrix"` so mixed-isotope spectra are unfolded
-with the same detector response matrix that generated them. Native external
-Geant4 configs use `configs/geant4/net_response_calibration.json` to map ideal
-inverse-square/shield counts into spectrum-net counts.
+### Geant4 spectrum-count validation
 
-Regenerate the calibration and validation report with:
+The PF likelihood consumes isotope-wise source-equivalent counts extracted from
+measured spectra. Geant4 runtime configs use
+`spectrum_count_method: "photopeak_nnls"`: local full-energy peak ROIs are
+fitted with nonnegative isotope peak columns and nuisance continuum terms, so
+Compton scatter and room background are not converted into source strength.
+
+Run the validation report after changing detector geometry, materials, transport
+settings, or peak-efficiency calibration:
 
 ```bash
 PYTHONPATH=src uv run python scripts/calibrate_geant4_net_response.py --dwell-time-s 30.0
@@ -288,8 +376,9 @@ PYTHONPATH=src uv run python scripts/calibrate_geant4_net_response.py --dwell-ti
 
 The validation layout is `source_layouts/shield_validation.json`, and the
 validation config is `configs/geant4/shield_validation_scene.json`. The script
-writes diagnostics to `results/geant4_net_response_validation.csv` and updates
-the JSON calibration payload.
+writes diagnostics to `results/geant4_net_response_validation.csv` and a
+diagnostic count-extraction check under `results/`; runtime PF configs do not
+load a net-response calibration JSON.
 
 ## Birth move smoke test
 
@@ -302,6 +391,4 @@ uv run python main.py --max-steps 20
 # Birth enabled: with max_sources=3, births should become >0 within a few steps.
 uv run python main.py --birth --max-sources 3 --max-steps 20
 
-# Stabilized expected-count run (reduce tempering resamples, skip roughening on temper-resample).
-uv run python main.py --count expected --temper-max-resamples 0 --no-roughen-on-temper-resample
 ```

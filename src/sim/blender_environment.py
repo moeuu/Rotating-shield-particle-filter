@@ -38,6 +38,11 @@ def write_blender_environment_manifest(
     room_size_xyz: tuple[float, float, float],
     obstacle_height_m: float,
     obstacle_material: str,
+    base_usd_path: Path | None = None,
+    traversability_output_path: Path | None = None,
+    robot_radius_m: float = 0.35,
+    traversability_reachable_from_xy: tuple[float, float] | None = None,
+    traversability_blocking_z_range_m: tuple[float, float] = (0.05, 2.0),
 ) -> dict[str, Any]:
     """Write the Blender environment manifest consumed by the generator script."""
     payload: dict[str, Any] = {
@@ -49,6 +54,23 @@ def write_blender_environment_manifest(
         "obstacle_height_m": float(obstacle_height_m),
         "obstacle_material": str(obstacle_material),
     }
+    if base_usd_path is not None:
+        payload["base_usd_path"] = base_usd_path.expanduser().resolve().as_posix()
+    if traversability_output_path is not None:
+        payload["traversability_output_path"] = (
+            traversability_output_path.expanduser().resolve().as_posix()
+        )
+        payload["traversability_robot_radius_m"] = float(robot_radius_m)
+        payload["traversability_cell_size_m"] = float(grid.cell_size)
+        payload["traversability_blocking_z_range_m"] = [
+            float(traversability_blocking_z_range_m[0]),
+            float(traversability_blocking_z_range_m[1]),
+        ]
+        if traversability_reachable_from_xy is not None:
+            payload["traversability_reachable_from_xy"] = [
+                float(traversability_reachable_from_xy[0]),
+                float(traversability_reachable_from_xy[1]),
+            ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -62,6 +84,11 @@ def generate_blender_environment_usd(
     room_size_xyz: tuple[float, float, float],
     obstacle_height_m: float = 2.0,
     obstacle_material: str = "concrete",
+    base_usd_path: Path | None = None,
+    traversability_output_path: Path | None = None,
+    robot_radius_m: float = 0.35,
+    traversability_reachable_from_xy: tuple[float, float] | None = None,
+    traversability_blocking_z_range_m: tuple[float, float] = (0.05, 2.0),
     blender_executable: str | None = None,
     script_path: Path = DEFAULT_BLENDER_SCRIPT,
     timeout_s: float = 120.0,
@@ -75,6 +102,11 @@ def generate_blender_environment_usd(
         room_size_xyz=room_size_xyz,
         obstacle_height_m=obstacle_height_m,
         obstacle_material=obstacle_material,
+        base_usd_path=base_usd_path,
+        traversability_output_path=traversability_output_path,
+        robot_radius_m=robot_radius_m,
+        traversability_reachable_from_xy=traversability_reachable_from_xy,
+        traversability_blocking_z_range_m=traversability_blocking_z_range_m,
     )
     executable = resolve_blender_executable(blender_executable)
     command = [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import socket
 import subprocess
@@ -18,6 +19,7 @@ from pf.estimator import MeasurementRecord, RotatingShieldPFEstimator
 from realtime_demo import run_live_pf
 from sim.geant4_app.app import Geant4Application
 from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever as serve_geant4_forever
+from sim.geant4_app.io_format import read_response_file
 from sim.geant4_app.scene_export import ExportedDetectorModel, export_scene_for_geant4
 from sim.isaacsim_app.app import IsaacSimAppConfig, IsaacSimApplication
 from sim.isaacsim_app.geometry import (
@@ -64,6 +66,93 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _write_fake_external_geant4(path: Path) -> Path:
+    """Write a fake external Geant4 executable for protocol-level tests."""
+    path.write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                "RESPONSE=''",
+                "while [[ $# -gt 0 ]]; do",
+                "  case \"$1\" in",
+                "    --response) RESPONSE=\"$2\"; shift 2 ;;",
+                "    *) shift ;;",
+                "  esac",
+                "done",
+                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _write_fake_persistent_geant4(path: Path) -> Path:
+    """Write a fake persistent Geant4 executable for engine lifecycle tests."""
+    path.write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                "PERSISTENT=0",
+                "for arg in \"$@\"; do",
+                "  if [[ \"$arg\" == \"--persistent\" ]]; then PERSISTENT=1; fi",
+                "done",
+                "if [[ \"$PERSISTENT\" != \"1\" ]]; then",
+                "  echo 'expected --persistent' >&2",
+                "  exit 2",
+                "fi",
+                "RUN_INDEX=0",
+                "while IFS= read -r LINE; do",
+                "  if [[ \"$LINE\" == \"SHUTDOWN\"* ]]; then",
+                "    echo 'SIMBRIDGE_OK shutdown'",
+                "    exit 0",
+                "  fi",
+                "  RESPONSE=''",
+                "  for TOKEN in $LINE; do",
+                "    case \"$TOKEN\" in",
+                "      response=*) RESPONSE=\"${TOKEN#response=}\" ;;",
+                "    esac",
+                "  done",
+                "  RESPONSE=\"${RESPONSE//%20/ }\"",
+                "  RUN_INDEX=$((RUN_INDEX + 1))",
+                "  printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' \"$RUN_INDEX\" > \"$RESPONSE\"",
+                "  echo \"SIMBRIDGE_OK response=$RESPONSE\"",
+                "done",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_geant4_response_reader_parses_spectrum_variance(tmp_path: Path) -> None:
+    """Response files should preserve weighted spectrum variance for PF likelihoods."""
+    response_path = tmp_path / "response.txt"
+    response_path.write_text(
+        "\n".join(
+            [
+                "META backend=geant4",
+                "META weighted_transport=true",
+                "SPECTRUM 1.5,0.0,2.0",
+                "SPECTRUM_VARIANCE 0.25,0.0,4.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    spectrum, metadata = read_response_file(response_path)
+
+    assert spectrum.tolist() == pytest.approx([1.5, 0.0, 2.0])
+    assert metadata["weighted_transport"] is True
+    assert metadata["spectrum_count_variance"] == pytest.approx([0.25, 0.0, 4.0])
+    assert metadata["spectrum_count_variance_total"] == pytest.approx(4.25)
 
 
 def test_protocol_round_trip() -> None:
@@ -227,16 +316,21 @@ def test_apply_camera_gesture_bindings_to_module_updates_defaults() -> None:
     }
 
 
-def test_geant4_bridge_server_round_trip() -> None:
+def test_geant4_bridge_server_round_trip(tmp_path: Path) -> None:
     """The Geant4 sidecar should accept reset and step commands."""
     port = _free_port()
+    executable = _write_fake_external_geant4(tmp_path / "fake_geant4.py")
     thread = threading.Thread(
         target=serve_geant4_forever,
         args=(
             Geant4BridgeServerConfig(
                 host="127.0.0.1",
                 port=port,
-                app_config={"use_mock_stage": True, "engine_mode": "surrogate"},
+                app_config={
+                    "use_mock_stage": True,
+                    "engine_mode": "external",
+                    "executable_path": executable.as_posix(),
+                },
             ),
         ),
         daemon=True,
@@ -809,6 +903,24 @@ def test_scene_builder_can_skip_python_obstacle_authoring() -> None:
     assert "/World/SimBridge/Obstacles/Obstacle_0000" not in backend.prims
 
 
+def test_scene_builder_can_author_room_boundaries_as_wall_group() -> None:
+    """CUI scenes should be able to author grouped room boundary geometry."""
+    backend = FakeStageBackend()
+    builder = SceneBuilder(backend)
+    scene = SceneDescription(
+        room_size_xyz=(4.0, 5.0, 3.0),
+        author_obstacle_prims=False,
+        author_room_boundary_prims=True,
+    )
+
+    builder.load_scene(scene)
+
+    assert "/World/Environment/Wall/NorthWall" in backend.prims
+    wall = backend.prims["/World/Environment/Wall/NorthWall"]
+    assert wall.metadata["transport_group"] == "wall"
+    assert wall.metadata["material"] == "concrete"
+
+
 def test_application_prefers_scene_usd_over_config_default() -> None:
     """A generated scene USD in the reset payload should override config defaults."""
     backend = FakeStageBackend()
@@ -870,11 +982,104 @@ def test_geant4_scene_export_is_stable() -> None:
     assert export_one.fe_shield.thickness_cm == pytest.approx(FE_SHIELD_THICKNESS_CM)
 
 
-def test_geant4_application_reuses_geometry_cache_on_same_scene() -> None:
-    """Resetting the same scene twice should report a geometry cache hit."""
+def test_geant4_scene_export_groups_walls_without_name_list() -> None:
+    """Wall-like environment prims should carry one semantic transport group."""
     backend = FakeStageBackend()
     app = Geant4Application(
         app_config={"usd_path": "demo_room.usda", "use_mock_stage": True},
+        stage_backend=backend,
+    )
+    scene = SceneDescription(usd_path="demo_room.usda")
+
+    app.reset(scene)
+    exported = export_scene_for_geant4(
+        scene,
+        stage_backend=backend,
+        asset_geometry=app.asset_geometry,
+        detector_model=ExportedDetectorModel(),
+        stage_material_rules=app.config.stage_material_rules,
+    )
+    app.close()
+
+    groups_by_path = {volume.path: volume.transport_group for volume in exported.static_volumes}
+    assert groups_by_path["/World/Environment/NorthWall"] == "wall"
+    assert groups_by_path["/World/Environment/SouthWall"] == "wall"
+    assert groups_by_path["/World/Environment/EastWall"] == "wall"
+    assert groups_by_path["/World/Environment/WestWall"] == "wall"
+    assert groups_by_path["/World/Environment/Floor"] == "wall"
+    assert groups_by_path["/World/Environment/PillarMesh"] is None
+
+
+def test_geant4_scene_export_can_mark_wall_group_as_absorber(tmp_path: Path) -> None:
+    """Explicit absorber config should only change wall-group transport mode."""
+    from sim.geant4_app.io_format import write_scene_file
+
+    backend = FakeStageBackend()
+    app = Geant4Application(
+        app_config={
+            "usd_path": "demo_room.usda",
+            "use_mock_stage": True,
+            "absorbing_transport_groups": ["wall"],
+        },
+        stage_backend=backend,
+    )
+    scene = SceneDescription(
+        usd_path="demo_room.usda",
+        obstacle_cells=[(0, 0)],
+        obstacle_grid_shape=(1, 1),
+    )
+
+    app.reset(scene)
+    exported = export_scene_for_geant4(
+        scene,
+        stage_backend=backend,
+        asset_geometry=app.asset_geometry,
+        detector_model=ExportedDetectorModel(),
+        stage_material_rules=app.config.stage_material_rules,
+        absorbing_transport_groups=app.config.absorbing_transport_groups,
+    )
+    app.close()
+
+    modes_by_path = {volume.path: volume.transport_mode for volume in exported.static_volumes}
+    assert modes_by_path["/World/Environment/NorthWall"] == "absorber"
+    assert modes_by_path["/World/Environment/PillarMesh"] == "geant4"
+    assert modes_by_path["/World/SimBridge/Obstacles/Obstacle_0000"] == "geant4"
+
+    scene_path = tmp_path / "scene.txt"
+    write_scene_file(exported, scene_path)
+    scene_text = scene_path.read_text(encoding="utf-8")
+    assert "path=/World/Environment/NorthWall" in scene_text
+    assert "transport_group=wall transport_mode=absorber" in scene_text
+
+
+def test_stage_backend_exports_cuboid_mesh_as_box_for_geant4() -> None:
+    """Axis-aligned cuboid meshes should avoid tessellated Geant4 solids."""
+    backend = FakeStageBackend()
+    backend.open_stage("demo_room.usda")
+
+    solids = {
+        solid.path: solid
+        for solid in backend.list_solid_prims(path_prefixes=("/World/Environment/PillarMesh",))
+    }
+
+    pillar = solids["/World/Environment/PillarMesh"]
+    assert pillar.shape == "box"
+    assert pillar.size_xyz == pytest.approx((0.4, 0.4, 2.0))
+    assert pillar.pose.translation_xyz == pytest.approx((7.0, 11.0, 1.0))
+    assert pillar.triangles_xyz is None
+
+
+def test_geant4_application_reuses_geometry_cache_on_same_scene(tmp_path: Path) -> None:
+    """Resetting the same scene twice should report a geometry cache hit."""
+    backend = FakeStageBackend()
+    executable = _write_fake_external_geant4(tmp_path / "fake_geant4.py")
+    app = Geant4Application(
+        app_config={
+            "usd_path": "demo_room.usda",
+            "use_mock_stage": True,
+            "engine_mode": "external",
+            "executable_path": executable.as_posix(),
+        },
         stage_backend=backend,
     )
     scene = SceneDescription(
@@ -916,6 +1121,50 @@ def test_geant4_application_reuses_geometry_cache_on_same_scene() -> None:
     visualization = second_observation.metadata["radiation_visualization"]
     assert visualization["playback_duration_s"] == pytest.approx(1.0)
     assert "emission_time_s" in second_observation.metadata["radiation_tracks"][0]
+
+
+def test_geant4_application_can_keep_native_process_persistent(tmp_path: Path) -> None:
+    """Persistent native mode should reuse one executable across step requests."""
+    backend = FakeStageBackend()
+    executable = _write_fake_persistent_geant4(tmp_path / "fake_persistent_geant4.sh")
+    app = Geant4Application(
+        app_config={
+            "usd_path": "demo_room.usda",
+            "use_mock_stage": True,
+            "engine_mode": "external",
+            "persistent_process": True,
+            "executable_path": executable.as_posix(),
+        },
+        stage_backend=backend,
+    )
+    scene = SceneDescription(usd_path="demo_room.usda")
+    command = SimulationCommand(
+        step_id=2,
+        target_pose_xyz=(2.0, 3.0, 0.5),
+        target_base_yaw_rad=0.3,
+        fe_orientation_index=1,
+        pb_orientation_index=2,
+        dwell_time_s=1.0,
+    )
+
+    app.reset(scene)
+    first_observation = app.step(command)
+    second_observation = app.step(
+        SimulationCommand(
+            step_id=3,
+            target_pose_xyz=(2.0, 3.0, 0.5),
+            target_base_yaw_rad=0.3,
+            fe_orientation_index=1,
+            pb_orientation_index=2,
+            dwell_time_s=1.0,
+        )
+    )
+    app.close()
+
+    assert first_observation.metadata["persistent_process"] is True
+    assert second_observation.metadata["persistent_process"] is True
+    assert int(first_observation.metadata["run_index"]) == 1
+    assert int(second_observation.metadata["run_index"]) == 2
 
 
 def test_create_simulation_runtime_supports_geant4() -> None:
@@ -971,15 +1220,40 @@ def test_sidecar_python_does_not_use_isaac_env_for_mock_configs(
 
 def test_sidecar_python_requires_env_for_real_isaac_configs(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Real Isaac sidecars should fail early without a portable Python setting."""
+    """Real Isaac sidecars should fail when no configured or local Python exists."""
     import sim.runtime as runtime_module
 
     monkeypatch.delenv("ISAACSIM_PYTHON", raising=False)
     monkeypatch.delenv("SIMBRIDGE_SIDECAR_PYTHON", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     with pytest.raises(RuntimeError, match="ISAACSIM_PYTHON"):
         runtime_module._resolve_sidecar_python({"mode": "real"}, "Isaac Sim")
+
+
+def test_sidecar_python_auto_detects_local_isaacsim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Real Isaac sidecars should use a local Isaac Sim install when available."""
+    import sim.runtime as runtime_module
+
+    python_sh = tmp_path / ".local" / "isaacsim" / "5.1.0" / "python.sh"
+    python_sh.parent.mkdir(parents=True)
+    python_sh.write_text("#!/bin/sh\n", encoding="utf-8")
+    python_sh.chmod(0o755)
+    monkeypatch.delenv("ISAACSIM_PYTHON", raising=False)
+    monkeypatch.delenv("SIMBRIDGE_SIDECAR_PYTHON", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    resolved = runtime_module._resolve_sidecar_python(
+        {"mode": "real"},
+        "Isaac Sim",
+    )
+
+    assert resolved == python_sh.as_posix()
 
 
 def test_create_simulation_runtime_auto_starts_geant4_sidecar(
@@ -1041,6 +1315,88 @@ def test_create_simulation_runtime_auto_starts_geant4_sidecar(
     assert started["port"] == 5556
     assert started["runtime_config_path"] == "configs/geant4/default_scene.json"
     runtime.process.wait(timeout=5.0)
+
+
+def test_create_simulation_runtime_auto_starts_isaacsim_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime factory should auto-start Isaac Sim when requested."""
+    import sim.runtime as runtime_module
+
+    started: dict[str, object] = {}
+
+    def _fake_tcp_available(host: str, port: int, timeout_s: float = 0.25) -> bool:
+        """Pretend no sidecar is already listening."""
+        return False
+
+    def _fake_start_isaacsim_sidecar(
+        config: dict[str, object],
+        runtime_config_path: str | Path | None = None,
+        *,
+        direct_config: bool = False,
+    ) -> ManagedIsaacSimTCPClientRuntime:
+        """Capture auto-start inputs and return a managed runtime shell."""
+        started.update(
+            {
+                "config": dict(config),
+                "runtime_config_path": runtime_config_path,
+                "direct_config": direct_config,
+            }
+        )
+        return ManagedIsaacSimTCPClientRuntime(
+            host="127.0.0.1",
+            port=5555,
+            timeout_s=12.0,
+            process=subprocess.Popen(["true"]),
+        )
+
+    monkeypatch.setattr(runtime_module, "_tcp_server_available", _fake_tcp_available)
+    monkeypatch.setattr(runtime_module, "_start_isaacsim_sidecar", _fake_start_isaacsim_sidecar)
+
+    runtime = create_simulation_runtime(
+        "isaacsim",
+        sources=[],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        runtime_config={"host": "127.0.0.1", "port": 5555, "timeout_s": 12.0},
+        runtime_config_path="configs/isaacsim/demo_room_gui.json",
+    )
+
+    assert isinstance(runtime, ManagedIsaacSimTCPClientRuntime)
+    assert started["runtime_config_path"] == "configs/isaacsim/demo_room_gui.json"
+    assert started["direct_config"] is True
+    runtime.process.wait(timeout=5.0)
+
+
+def test_create_simulation_runtime_reuses_running_isaacsim_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-running Isaac Sim sidecar should be reused instead of spawned."""
+    import sim.runtime as runtime_module
+
+    def _fake_tcp_available(host: str, port: int, timeout_s: float = 0.25) -> bool:
+        """Pretend the sidecar is already listening."""
+        return True
+
+    def _fail_start(*args: object, **kwargs: object) -> None:
+        """Fail if auto-start is attempted."""
+        raise AssertionError("sidecar should not be auto-started")
+
+    monkeypatch.setattr(runtime_module, "_tcp_server_available", _fake_tcp_available)
+    monkeypatch.setattr(runtime_module, "_start_isaacsim_sidecar", _fail_start)
+
+    runtime = create_simulation_runtime(
+        "isaacsim",
+        sources=[],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        runtime_config={"host": "127.0.0.1", "port": 5555, "timeout_s": 12.0},
+    )
+
+    assert isinstance(runtime, IsaacSimTCPClientRuntime)
+    assert not isinstance(runtime, ManagedIsaacSimTCPClientRuntime)
 
 
 def test_create_simulation_runtime_reuses_running_geant4_sidecar(
@@ -1893,6 +2249,7 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        z_variance_k: dict[str, float] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
         self.measurements.append(
@@ -1903,6 +2260,7 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
                 live_time_s=live_time_s,
                 fe_index=fe_index,
                 pb_index=pb_index,
+                z_variance_k=z_variance_k,
             )
         )
 
@@ -1927,10 +2285,6 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         """Return a zero IG grid to bypass heavy IG evaluation."""
         return np.zeros((8, 8), dtype=float)
 
-    def _fake_expected_counts(*args: object, **kwargs: object) -> dict[str, float]:
-        """Return deterministic expected counts for all analysis isotopes."""
-        return {iso: 5.0 for iso in ANALYSIS_ISOTOPES}
-
     def _fake_frame(*args: object, **kwargs: object) -> dict[str, object]:
         """Return an empty frame placeholder."""
         return {}
@@ -1951,7 +2305,6 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
-    monkeypatch.setattr(realtime_demo, "_expected_counts", _fake_expected_counts)
     monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
     monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
     monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
@@ -1963,7 +2316,6 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         live=False,
         max_steps=1,
         max_poses=1,
-        count_mode="expected",
         detect_threshold_abs=0.0,
         detect_threshold_rel=0.0,
         detect_consecutive=1,
@@ -2053,6 +2405,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         fe_index: int,
         pb_index: int,
         live_time_s: float,
+        z_variance_k: dict[str, float] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
         self.measurements.append(
@@ -2063,6 +2416,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
                 live_time_s=live_time_s,
                 fe_index=fe_index,
                 pb_index=pb_index,
+                z_variance_k=z_variance_k,
             )
         )
 
@@ -2089,10 +2443,6 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         """Return a zero IG grid to bypass heavy IG evaluation."""
         return np.zeros((8, 8), dtype=float)
 
-    def _fake_expected_counts(*args: object, **kwargs: object) -> dict[str, float]:
-        """Return deterministic expected counts for all analysis isotopes."""
-        return {iso: 5.0 for iso in ANALYSIS_ISOTOPES}
-
     def _fake_frame(*args: object, **kwargs: object) -> dict[str, object]:
         """Return an empty frame placeholder."""
         return {}
@@ -2111,10 +2461,30 @@ def test_run_live_pf_random_environment_uses_blender_usd(
 
     blender_calls: list[dict[str, object]] = []
     generated_usd = tmp_path / "generated.usda"
+    config_path = tmp_path / "configs" / "isaacsim" / "manchester_random.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('{"usd_path": "../../base_manchester.usda"}\n', encoding="utf-8")
+    expected_base_usd = (tmp_path / "base_manchester.usda").resolve()
 
     def _fake_generate_blender_environment_usd(**kwargs: object) -> Path:
         """Capture the Blender generation call and return a fake USD path."""
         blender_calls.append(dict(kwargs))
+        map_path = Path(str(kwargs["traversability_output_path"]))
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": "blender_projected_3d_environment",
+                    "origin": [0.0, 0.0],
+                    "cell_size": 1.0,
+                    "grid_shape": [10, 20],
+                    "robot_radius_m": 0.35,
+                    "traversable_cells": [[1, 1], [2, 2]],
+                }
+            ),
+            encoding="utf-8",
+        )
         generated_usd.write_text("#usda 1.0\n", encoding="utf-8")
         return generated_usd
 
@@ -2124,7 +2494,6 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
-    monkeypatch.setattr(realtime_demo, "_expected_counts", _fake_expected_counts)
     monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
     monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
     monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
@@ -2136,7 +2505,6 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         live=False,
         max_steps=1,
         max_poses=1,
-        count_mode="expected",
         detect_threshold_abs=0.0,
         detect_threshold_rel=0.0,
         detect_consecutive=1,
@@ -2151,12 +2519,26 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         save_outputs=False,
         return_state=True,
         sim_backend="isaacsim",
+        sim_config_path=config_path.as_posix(),
+        blender_output_path=generated_usd.as_posix(),
     )
 
     assert estimator is not None
     assert blender_calls
+    assert blender_calls[0]["base_usd_path"] == expected_base_usd
+    assert blender_calls[0]["traversability_output_path"] == generated_usd.with_suffix(
+        ".traversability.json"
+    )
     assert runtime.reset_payload is not None
     assert runtime.reset_payload["usd_path"] == generated_usd.as_posix()
     assert runtime.reset_payload["author_obstacle_prims"] is False
     assert runtime.reset_payload["obstacle_cells"]
+    map_path = Path(str(runtime.reset_payload["traversability_map_path"]))
+    map_png_path = Path(str(runtime.reset_payload["traversability_map_png_path"]))
+    assert map_path.exists()
+    assert map_png_path.exists()
+    assert json.loads(map_path.read_text(encoding="utf-8"))["source"] == (
+        "blender_projected_3d_environment"
+    )
+    assert runtime.reset_payload["robot_radius_m"] == pytest.approx(0.35)
     assert runtime.close_called

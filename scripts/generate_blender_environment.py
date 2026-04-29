@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 from pathlib import Path
 import sys
 
 import bpy
+from mathutils import Vector
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -40,11 +42,35 @@ def _clear_scene() -> None:
     bpy.ops.object.delete()
 
 
+def _import_base_usd(payload: dict) -> bool:
+    """Import the optional base USD environment and return whether it was used."""
+    base_usd = payload.get("base_usd_path")
+    if base_usd in (None, ""):
+        return False
+    base_path = Path(str(base_usd)).expanduser().resolve()
+    if not base_path.exists():
+        raise FileNotFoundError(f"Base USD environment not found: {base_path}")
+    bpy.ops.wm.usd_import(filepath=base_path.as_posix())
+    return True
+
+
 def _material(name: str, color: tuple[float, float, float, float]) -> bpy.types.Material:
     """Create a simple diffuse material."""
     mat = bpy.data.materials.new(name)
     mat.diffuse_color = color
     return mat
+
+
+def _ensure_empty(name: str, *, transport_group: str | None = None) -> bpy.types.Object:
+    """Create or reuse an empty object used as a semantic USD group."""
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        obj = bpy.data.objects.new(name, None)
+        bpy.context.collection.objects.link(obj)
+    if transport_group not in (None, ""):
+        obj["simbridge_transport_group"] = str(transport_group)
+        obj["simbridge_category"] = str(transport_group)
+    return obj
 
 
 def _add_cube(
@@ -53,6 +79,8 @@ def _add_cube(
     size_xyz: tuple[float, float, float],
     center_xyz: tuple[float, float, float],
     material: bpy.types.Material,
+    parent: bpy.types.Object | None = None,
+    transport_group: str | None = None,
 ) -> bpy.types.Object:
     """Add a cube with the requested dimensions and center."""
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=center_xyz)
@@ -62,6 +90,11 @@ def _add_cube(
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     obj.data.materials.append(material)
     obj["simbridge_material"] = material.name
+    if parent is not None:
+        obj.parent = parent
+    if transport_group not in (None, ""):
+        obj["simbridge_transport_group"] = str(transport_group)
+        obj["simbridge_category"] = str(transport_group)
     return obj
 
 
@@ -70,35 +103,46 @@ def _author_room(payload: dict, concrete: bpy.types.Material) -> None:
     size_x, size_y, size_z = (float(value) for value in payload["room_size_xyz"])
     wall_height = min(3.0, size_z)
     wall_thickness = 0.1
+    wall_group = _ensure_empty("Wall", transport_group="wall")
     _add_cube(
         "Floor",
         size_xyz=(size_x, size_y, 0.1),
         center_xyz=(0.5 * size_x, 0.5 * size_y, -0.05),
         material=concrete,
+        parent=wall_group,
+        transport_group="wall",
     )
     _add_cube(
         "NorthWall",
         size_xyz=(size_x, wall_thickness, wall_height),
         center_xyz=(0.5 * size_x, size_y + 0.5 * wall_thickness, 0.5 * wall_height),
         material=concrete,
+        parent=wall_group,
+        transport_group="wall",
     )
     _add_cube(
         "SouthWall",
         size_xyz=(size_x, wall_thickness, wall_height),
         center_xyz=(0.5 * size_x, -0.5 * wall_thickness, 0.5 * wall_height),
         material=concrete,
+        parent=wall_group,
+        transport_group="wall",
     )
     _add_cube(
         "EastWall",
         size_xyz=(wall_thickness, size_y, wall_height),
         center_xyz=(size_x + 0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
         material=concrete,
+        parent=wall_group,
+        transport_group="wall",
     )
     _add_cube(
         "WestWall",
         size_xyz=(wall_thickness, size_y, wall_height),
         center_xyz=(-0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
         material=concrete,
+        parent=wall_group,
+        transport_group="wall",
     )
 
 
@@ -107,6 +151,7 @@ def _author_obstacles(payload: dict, concrete: bpy.types.Material) -> None:
     origin_x, origin_y = (float(value) for value in payload["obstacle_origin_xy"])
     cell_size = float(payload["obstacle_cell_size_m"])
     height = float(payload.get("obstacle_height_m", 2.0))
+    obstacle_group = _ensure_empty("Obstacles", transport_group="obstacle")
     for index, cell in enumerate(payload.get("obstacle_cells", [])):
         ix, iy = (int(value) for value in cell)
         x0 = origin_x + float(ix) * cell_size
@@ -116,6 +161,8 @@ def _author_obstacles(payload: dict, concrete: bpy.types.Material) -> None:
             size_xyz=(cell_size, cell_size, height),
             center_xyz=(x0 + 0.5 * cell_size, y0 + 0.5 * cell_size, 0.5 * height),
             material=concrete,
+            parent=obstacle_group,
+            transport_group="obstacle",
         )
 
 
@@ -137,6 +184,132 @@ def _export_usd(output_path: Path) -> None:
         )
 
 
+def _object_world_bounds(
+    obj: bpy.types.Object,
+) -> tuple[float, float, float, float, float, float] | None:
+    """Return the world-space axis-aligned bounds for a mesh object."""
+    if obj.type != "MESH" or not obj.bound_box:
+        return None
+    points = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    xs = [float(point.x) for point in points]
+    ys = [float(point.y) for point in points]
+    zs = [float(point.z) for point in points]
+    return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+
+def _disk_intersects_rect(
+    center_xy: tuple[float, float],
+    radius_m: float,
+    rect: tuple[float, float, float, float],
+) -> bool:
+    """Return True when a disk intersects an axis-aligned rectangle."""
+    x, y = center_xy
+    x0, x1, y0, y1 = rect
+    dx = max(x0 - x, 0.0, x - x1)
+    dy = max(y0 - y, 0.0, y - y1)
+    return dx * dx + dy * dy <= radius_m * radius_m
+
+
+def _point_to_cell(
+    point_xy: tuple[float, float],
+    origin_xy: tuple[float, float],
+    cell_size: float,
+    grid_shape: tuple[int, int],
+) -> tuple[int, int] | None:
+    """Return the grid cell containing a point, or None outside the grid."""
+    rel_x = float(point_xy[0]) - origin_xy[0]
+    rel_y = float(point_xy[1]) - origin_xy[1]
+    if rel_x < 0.0 or rel_y < 0.0:
+        return None
+    ix = int(rel_x // cell_size)
+    iy = int(rel_y // cell_size)
+    if ix < 0 or iy < 0 or ix >= grid_shape[0] or iy >= grid_shape[1]:
+        return None
+    return ix, iy
+
+
+def _reachable_cells(
+    free_cells: set[tuple[int, int]],
+    start: tuple[int, int],
+    grid_shape: tuple[int, int],
+) -> set[tuple[int, int]]:
+    """Return the connected free component reachable from start."""
+    if start not in free_cells:
+        return set()
+    visited = {start}
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        ix, iy = queue.popleft()
+        for neighbor in ((ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1)):
+            if neighbor in visited:
+                continue
+            if neighbor[0] < 0 or neighbor[1] < 0:
+                continue
+            if neighbor[0] >= grid_shape[0] or neighbor[1] >= grid_shape[1]:
+                continue
+            if neighbor not in free_cells:
+                continue
+            visited.add(neighbor)
+            queue.append(neighbor)
+    return visited
+
+
+def _write_traversability_map(payload: dict) -> None:
+    """Write a 2D robot traversability map from the generated 3D scene."""
+    output_value = payload.get("traversability_output_path")
+    if output_value in (None, ""):
+        return
+    output_path = Path(str(output_value)).expanduser().resolve()
+    origin_x, origin_y = (float(value) for value in payload["obstacle_origin_xy"])
+    cell_size = float(payload.get("traversability_cell_size_m", payload["obstacle_cell_size_m"]))
+    nx, ny = (int(value) for value in payload["obstacle_grid_shape"])
+    radius = max(0.0, float(payload.get("traversability_robot_radius_m", 0.35)))
+    z_min, z_max = (
+        float(value)
+        for value in payload.get("traversability_blocking_z_range_m", (0.05, 2.0))
+    )
+    obstacle_rects: list[tuple[float, float, float, float]] = []
+    for obj in bpy.context.scene.objects:
+        bounds = _object_world_bounds(obj)
+        if bounds is None:
+            continue
+        x0, x1, y0, y1, obj_z0, obj_z1 = bounds
+        if obj_z1 < z_min or obj_z0 > z_max:
+            continue
+        obstacle_rects.append((x0, x1, y0, y1))
+    free_cells: set[tuple[int, int]] = set()
+    for ix in range(nx):
+        for iy in range(ny):
+            center = (origin_x + (ix + 0.5) * cell_size, origin_y + (iy + 0.5) * cell_size)
+            blocked = any(_disk_intersects_rect(center, radius, rect) for rect in obstacle_rects)
+            if not blocked:
+                free_cells.add((ix, iy))
+    reachable = payload.get("traversability_reachable_from_xy")
+    if reachable not in (None, ""):
+        start = _point_to_cell(
+            (float(reachable[0]), float(reachable[1])),
+            (origin_x, origin_y),
+            cell_size,
+            (nx, ny),
+        )
+        free_cells = set() if start is None else _reachable_cells(free_cells, start, (nx, ny))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    map_payload = {
+        "version": 1,
+        "source": "blender_projected_3d_environment",
+        "origin": [origin_x, origin_y],
+        "cell_size": cell_size,
+        "grid_shape": [nx, ny],
+        "robot_radius_m": radius,
+        "blocking_z_range_m": [z_min, z_max],
+        "traversable_fraction": float(len(free_cells)) / float(max(nx * ny, 1)),
+        "traversable_cells": [list(cell) for cell in sorted(free_cells)],
+    }
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(map_payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def main() -> None:
     """Generate the Blender scene and export it to USD."""
     args = _parse_blender_args()
@@ -144,8 +317,11 @@ def main() -> None:
     output_path = Path(args.output).expanduser().resolve()
     _clear_scene()
     concrete = _material("ConcreteMaterial", (0.55, 0.58, 0.60, 1.0))
-    _author_room(payload, concrete)
+    base_imported = _import_base_usd(payload)
+    if not base_imported:
+        _author_room(payload, concrete)
     _author_obstacles(payload, concrete)
+    _write_traversability_map(payload)
     _export_usd(output_path)
 
 

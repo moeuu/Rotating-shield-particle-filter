@@ -40,11 +40,14 @@ def test_generate_blender_environment_usd_invokes_blender(
         blocked_cells=((0, 1),),
     )
     output_path = tmp_path / "generated.usda"
+    base_usd_path = tmp_path / "manchester_base.usda"
+    base_usd_path.write_text("#usda 1.0\n", encoding="utf-8")
 
     result = generate_blender_environment_usd(
         grid=grid,
         output_path=output_path,
         room_size_xyz=(2.0, 2.0, 3.0),
+        base_usd_path=base_usd_path,
     )
 
     assert result == output_path.resolve()
@@ -52,4 +55,19 @@ def test_generate_blender_environment_usd_invokes_blender(
     assert commands[0][:3] == ["/usr/bin/blender", "--background", "--python"]
     manifest_path = output_path.with_suffix(".manifest.json")
     assert manifest_path.exists()
-    assert '"obstacle_cells":' in manifest_path.read_text(encoding="utf-8")
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert '"obstacle_cells":' in manifest_text
+    assert base_usd_path.as_posix() in manifest_text
+
+
+def test_blender_generator_uses_semantic_wall_group() -> None:
+    """Generated USD environments should group room boundaries under Wall."""
+    root = Path(__file__).resolve().parents[1]
+    generator_source = (root / "scripts" / "generate_blender_environment.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '_ensure_empty("Wall", transport_group="wall")' in generator_source
+    assert 'parent=wall_group' in generator_source
+    assert 'transport_group="wall"' in generator_source
+    assert '_ensure_empty("Obstacles", transport_group="obstacle")' in generator_source

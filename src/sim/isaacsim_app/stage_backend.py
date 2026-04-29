@@ -53,6 +53,79 @@ class StageSolidPrim:
         ...,
     ] | None = None
     material_info: StageMaterialInfo | None = None
+    transport_group: str | None = None
+
+
+def _normalize_transport_group(value: str) -> str:
+    """Normalize semantic transport group labels for stable downstream use."""
+    return str(value).strip().replace("-", "_").replace(" ", "_").lower()
+
+
+def _infer_transport_group_from_path(path: str) -> str | None:
+    """Infer broad transport grouping from generic USD path tokens."""
+    tokens = [
+        _normalize_transport_group(token)
+        for token in str(path).strip("/").split("/")
+        if token
+    ]
+    for token in tokens:
+        if token in {"floor", "ceiling", "roof", "wall", "walls"}:
+            return "wall"
+        if token.endswith("wall") or token.endswith("walls"):
+            return "wall"
+        if "_wall" in token or "_walls" in token:
+            return "wall"
+    if any(token in {"obstacle", "obstacles"} or token.startswith("obstacle_") for token in tokens):
+        return "obstacle"
+    return None
+
+
+def _axis_aligned_box_from_triangles(
+    triangles_xyz: tuple[
+        tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]],
+        ...,
+    ],
+    *,
+    tolerance: float = 1.0e-6,
+) -> tuple[PrimPose, tuple[float, float, float]] | None:
+    """Return an equivalent axis-aligned box for cuboid triangle meshes."""
+    if not triangles_xyz:
+        return None
+    points = np.asarray(
+        [point for triangle in triangles_xyz for point in triangle],
+        dtype=float,
+    )
+    if points.size == 0 or points.shape[1] != 3:
+        return None
+    lower = np.min(points, axis=0)
+    upper = np.max(points, axis=0)
+    size = upper - lower
+    if np.any(size <= tolerance):
+        return None
+    rounded_unique = np.unique(np.round(points / tolerance).astype(np.int64), axis=0)
+    unique_points = rounded_unique.astype(float) * float(tolerance)
+    if unique_points.shape[0] != 8:
+        return None
+    expected_corners = np.asarray(
+        [
+            (x, y, z)
+            for x in (lower[0], upper[0])
+            for y in (lower[1], upper[1])
+            for z in (lower[2], upper[2])
+        ],
+        dtype=float,
+    )
+    for point in unique_points:
+        if not np.any(np.all(np.isclose(expected_corners, point, atol=tolerance), axis=1)):
+            return None
+    center = 0.5 * (lower + upper)
+    return (
+        PrimPose(
+            translation_xyz=(float(center[0]), float(center[1]), float(center[2])),
+            orientation_wxyz=(1.0, 0.0, 0.0, 0.0),
+        ),
+        (float(size[0]), float(size[1]), float(size[2])),
+    )
 
 
 class StageBackend(ABC):
@@ -75,6 +148,7 @@ class StageBackend(ABC):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a box prim exists with the requested geometry and pose."""
 
@@ -87,6 +161,7 @@ class StageBackend(ABC):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a sphere prim exists with the requested geometry and pose."""
 
@@ -101,6 +176,7 @@ class StageBackend(ABC):
         translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a mesh prim exists with the requested geometry and pose."""
 
@@ -231,13 +307,18 @@ class FakeStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Create or update a box prim."""
         self.prims[path] = FakeStagePrim(
             prim_type="Cube",
             pose=PrimPose(translation_xyz=translation_xyz),
             scale_xyz=size_xyz,
-            metadata={"color_rgb": color_rgb, "material": material},
+            metadata={
+                "color_rgb": color_rgb,
+                "material": material,
+                "transport_group": transport_group,
+            },
         )
 
     def ensure_sphere(
@@ -248,6 +329,7 @@ class FakeStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Create or update a sphere prim."""
         diameter = float(radius_m) * 2.0
@@ -255,7 +337,11 @@ class FakeStageBackend(StageBackend):
             prim_type="Sphere",
             pose=PrimPose(translation_xyz=translation_xyz),
             scale_xyz=(diameter, diameter, diameter),
-            metadata={"color_rgb": color_rgb, "material": material},
+            metadata={
+                "color_rgb": color_rgb,
+                "material": material,
+                "transport_group": transport_group,
+            },
         )
 
     def ensure_mesh(
@@ -268,6 +354,7 @@ class FakeStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Create or update a mesh prim."""
         self.prims[path] = FakeStagePrim(
@@ -276,6 +363,7 @@ class FakeStageBackend(StageBackend):
             metadata={
                 "color_rgb": color_rgb,
                 "material": material,
+                "transport_group": transport_group,
                 "points_xyz": tuple(tuple(float(v) for v in point) for point in points_xyz),
                 "face_vertex_counts": tuple(int(v) for v in face_vertex_counts),
                 "face_vertex_indices": tuple(int(v) for v in face_vertex_indices),
@@ -440,17 +528,34 @@ class FakeStageBackend(StageBackend):
                         pose=self.get_world_pose(path),
                         size_xyz=tuple(float(v) for v in prim.scale_xyz),
                         material_info=self._fake_material_info_from_prim(path, prim),
+                        transport_group=self._fake_transport_group_from_prim(path, prim),
                     )
                 )
                 continue
             if prim.prim_type == "Mesh":
+                triangles = self._fake_mesh_triangles(path)
+                box_geometry = _axis_aligned_box_from_triangles(triangles)
+                if box_geometry is not None:
+                    box_pose, box_size = box_geometry
+                    result.append(
+                        StageSolidPrim(
+                            path=path,
+                            shape="box",
+                            pose=box_pose,
+                            size_xyz=box_size,
+                            material_info=self._fake_material_info_from_prim(path, prim),
+                            transport_group=self._fake_transport_group_from_prim(path, prim),
+                        )
+                    )
+                    continue
                 result.append(
                     StageSolidPrim(
                         path=path,
                         shape="mesh",
                         pose=self.get_world_pose(path),
-                        triangles_xyz=self._fake_mesh_triangles(path),
+                        triangles_xyz=triangles,
                         material_info=self._fake_material_info_from_prim(path, prim),
+                        transport_group=self._fake_transport_group_from_prim(path, prim),
                     )
                 )
                 continue
@@ -461,6 +566,7 @@ class FakeStageBackend(StageBackend):
                     pose=self.get_world_pose(path),
                     radius_m=0.5 * float(prim.scale_xyz[0]),
                     material_info=self._fake_material_info_from_prim(path, prim),
+                    transport_group=self._fake_transport_group_from_prim(path, prim),
                 )
             )
         return result
@@ -623,6 +729,20 @@ class FakeStageBackend(StageBackend):
             preset_name=self._fake_preset_name_from_prim(target),
             composition_by_mass=self._fake_composition_by_mass_from_prim(target),
         )
+
+    def _fake_transport_group_from_prim(self, path: str, prim: FakeStagePrim) -> str | None:
+        """Resolve semantic transport grouping from fake metadata or path tokens."""
+        for key in (
+            "transport_group",
+            "simbridge_transport_group",
+            "simbridge:transport_group",
+            "simbridge_category",
+            "simbridge:category",
+        ):
+            value = prim.metadata.get(key)
+            if value not in (None, ""):
+                return _normalize_transport_group(str(value))
+        return _infer_transport_group_from_path(path)
 
     def _fake_mu_by_isotope_from_prim(self, prim: FakeStagePrim) -> dict[str, float]:
         """Extract fake attenuation overrides from prim metadata."""
@@ -1002,6 +1122,7 @@ class IsaacSimStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a cube prim exists and scale it into a box."""
         self._require_stage()
@@ -1009,6 +1130,7 @@ class IsaacSimStageBackend(StageBackend):
         cube.CreateSizeAttr(1.0)
         self._set_display_color(cube, color_rgb)
         self._set_material_attr(cube.GetPrim(), material)
+        self._set_transport_group_attr(cube.GetPrim(), transport_group)
         self.set_local_pose(
             path,
             translation_xyz=translation_xyz,
@@ -1023,6 +1145,7 @@ class IsaacSimStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float],
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a sphere prim exists with the requested radius."""
         self._require_stage()
@@ -1030,6 +1153,7 @@ class IsaacSimStageBackend(StageBackend):
         sphere.CreateRadiusAttr(float(radius_m))
         self._set_display_color(sphere, color_rgb)
         self._set_material_attr(sphere.GetPrim(), material)
+        self._set_transport_group_attr(sphere.GetPrim(), transport_group)
         self.set_local_pose(path, translation_xyz=translation_xyz)
 
     def ensure_mesh(
@@ -1042,6 +1166,7 @@ class IsaacSimStageBackend(StageBackend):
         translation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
         color_rgb: tuple[float, float, float] | None = None,
         material: str | None = None,
+        transport_group: str | None = None,
     ) -> None:
         """Ensure a mesh prim exists with the requested topology."""
         self._require_stage()
@@ -1051,6 +1176,7 @@ class IsaacSimStageBackend(StageBackend):
         mesh.GetFaceVertexIndicesAttr().Set([int(v) for v in face_vertex_indices])
         self._set_display_color(mesh, color_rgb)
         self._set_material_attr(mesh.GetPrim(), material)
+        self._set_transport_group_attr(mesh.GetPrim(), transport_group)
         self.set_local_pose(path, translation_xyz=translation_xyz)
 
     def ensure_polyline(
@@ -1235,17 +1361,34 @@ class IsaacSimStageBackend(StageBackend):
                             size * float(scale_xyz[2]),
                         ),
                         material_info=material,
+                        transport_group=self._transport_group_from_prim(prim),
                     )
                 )
                 continue
             if prim_type == "Mesh":
+                triangles = self._mesh_triangles_world(prim)
+                box_geometry = _axis_aligned_box_from_triangles(triangles)
+                if box_geometry is not None:
+                    box_pose, box_size = box_geometry
+                    result.append(
+                        StageSolidPrim(
+                            path=path,
+                            shape="box",
+                            pose=box_pose,
+                            size_xyz=box_size,
+                            material_info=material,
+                            transport_group=self._transport_group_from_prim(prim),
+                        )
+                    )
+                    continue
                 result.append(
                     StageSolidPrim(
                         path=path,
                         shape="mesh",
                         pose=pose,
-                        triangles_xyz=self._mesh_triangles_world(prim),
+                        triangles_xyz=triangles,
                         material_info=material,
+                        transport_group=self._transport_group_from_prim(prim),
                     )
                 )
                 continue
@@ -1260,6 +1403,7 @@ class IsaacSimStageBackend(StageBackend):
                     pose=pose,
                     radius_m=radius * float(max(scale_xyz)),
                     material_info=material,
+                    transport_group=self._transport_group_from_prim(prim),
                 )
             )
         return result
@@ -1391,6 +1535,34 @@ class IsaacSimStageBackend(StageBackend):
             return
         attr = prim.CreateAttribute("simbridge:material", self._Sdf.ValueTypeNames.String, custom=True)
         attr.Set(str(material))
+
+    def _set_transport_group_attr(self, prim: Any, transport_group: str | None) -> None:
+        """Author a lightweight semantic transport group attribute on a prim."""
+        if transport_group in (None, ""):
+            return
+        attr = prim.CreateAttribute("simbridge:transport_group", self._Sdf.ValueTypeNames.String, custom=True)
+        attr.Set(_normalize_transport_group(str(transport_group)))
+
+    def _transport_group_from_prim(self, prim: Any) -> str | None:
+        """Resolve semantic transport grouping from USD attributes or path tokens."""
+        for name in (
+            "simbridge:transport_group",
+            "simbridge_transport_group",
+            "simbridge:category",
+            "simbridge_category",
+        ):
+            attr = prim.GetAttribute(name)
+            if attr and attr.HasAuthoredValue():
+                value = attr.Get()
+                if value not in (None, ""):
+                    return _normalize_transport_group(str(value))
+            try:
+                custom_value = prim.GetCustomDataByKey(name)
+            except Exception:
+                custom_value = None
+            if custom_value not in (None, ""):
+                return _normalize_transport_group(str(custom_value))
+        return _infer_transport_group_from_path(str(prim.GetPath()))
 
     def _material_from_prim(self, prim: Any) -> StageMaterialInfo | None:
         """Resolve a material name and attenuation overrides from a prim."""
