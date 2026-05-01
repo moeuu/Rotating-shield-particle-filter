@@ -35,6 +35,61 @@ def _resolve_free_space_checker(map_api: object | None) -> Callable[[NDArray[np.
     return lambda _: True
 
 
+def _cell_center_from_map(
+    map_api: object,
+    cell: tuple[int, int],
+    z_value: float,
+) -> NDArray[np.float64]:
+    """Return a 3D cell-center point for a map cell."""
+    center_fn = getattr(map_api, "cell_center", None)
+    if callable(center_fn):
+        x_value, y_value = center_fn(cell)
+        return np.array([float(x_value), float(y_value), float(z_value)], dtype=float)
+    origin = getattr(map_api, "origin", (0.0, 0.0))
+    cell_size = float(getattr(map_api, "cell_size", 1.0))
+    return np.array(
+        [
+            float(origin[0]) + (float(cell[0]) + 0.5) * cell_size,
+            float(origin[1]) + (float(cell[1]) + 0.5) * cell_size,
+            float(z_value),
+        ],
+        dtype=float,
+    )
+
+
+def _map_free_cell_centers(
+    map_api: object | None,
+    *,
+    z_value: float,
+) -> NDArray[np.float64]:
+    """Return deterministic free-cell centers from the planning map."""
+    if map_api is None:
+        return np.zeros((0, 3), dtype=float)
+    grid_shape = getattr(map_api, "grid_shape", None)
+    if grid_shape is None:
+        return np.zeros((0, 3), dtype=float)
+    traversable_cells = getattr(map_api, "traversable_cells", None)
+    if traversable_cells is not None:
+        cells = [tuple(cell) for cell in traversable_cells]
+    else:
+        is_free_cell = getattr(map_api, "is_free_cell", None)
+        if not callable(is_free_cell):
+            is_free_cell = getattr(map_api, "is_cell_free", None)
+        if not callable(is_free_cell):
+            return np.zeros((0, 3), dtype=float)
+        cells = [
+            (ix, iy)
+            for ix in range(int(grid_shape[0]))
+            for iy in range(int(grid_shape[1]))
+            if bool(is_free_cell((ix, iy)))
+        ]
+    if not cells:
+        return np.zeros((0, 3), dtype=float)
+    return np.vstack(
+        [_cell_center_from_map(map_api, tuple(cell), z_value) for cell in cells]
+    ).astype(float)
+
+
 def _filter_candidates(
     candidates: NDArray[np.float64],
     visited_poses_xyz: NDArray[np.float64] | None,
@@ -173,6 +228,27 @@ def generate_candidate_poses(
         raise ValueError(f"Unknown candidate generation strategy: {strategy}")
 
     filtered = _filter_candidates(raw, visited, min_dist_from_visited, is_free_fn)
+    if filtered.shape[0] < n_candidates:
+        map_centers = _map_free_cell_centers(
+            map_api,
+            z_value=float(current_pose_xyz[2]),
+        )
+        if map_centers.size:
+            if visited is not None and visited.size:
+                distances = np.linalg.norm(
+                    map_centers[:, None, :2] - visited[None, :, :2],
+                    axis=2,
+                )
+                order = np.argsort(np.min(distances, axis=1))[::-1]
+                map_centers = map_centers[order]
+            map_centers = _filter_candidates(
+                map_centers,
+                visited,
+                min_dist_from_visited,
+                is_free_fn,
+            )
+            if map_centers.size:
+                filtered = np.vstack([filtered, map_centers])
     if filtered.shape[0] < n_candidates:
         extra = _sample_uniform(rng, lo, hi, max(n_candidates, 1))
         extra = _filter_candidates(extra, visited, min_dist_from_visited, is_free_fn)

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import numpy as np
+
 from measurement.obstacles import ObstacleGrid
 from planning.traversability import (
     TraversabilityMap,
@@ -33,6 +35,52 @@ def test_traversability_map_projects_obstacle_footprints() -> None:
     assert not narrow_robot.is_free((1.5, 1.5))
     assert narrow_robot.is_free((0.5, 1.5))
     assert not wide_robot.is_free((0.5, 1.5))
+
+
+def test_traversability_shortest_path_avoids_blocked_cells() -> None:
+    """Shortest paths should route around obstacle cells instead of drawing a chord."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 3),
+        blocked_cells=((2, 0), (2, 1)),
+    )
+    traversable = build_traversability_map_from_obstacle_grid(
+        grid,
+        robot_radius_m=0.0,
+    )
+
+    path = traversable.shortest_path_points(
+        (0.5, 0.5, 0.0),
+        (4.5, 0.5, 0.0),
+    )
+
+    assert path is not None
+    assert np.max(path[:, 1]) > 2.0
+    assert sum(np.linalg.norm(delta) for delta in np.diff(path, axis=0)) > 4.0
+    for waypoint in path:
+        assert traversable.is_free(waypoint)
+
+
+def test_traversability_shortest_path_reports_disconnected_cells() -> None:
+    """Disconnected free components should return no path."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 3),
+        blocked_cells=((2, 0), (2, 1), (2, 2)),
+    )
+    traversable = build_traversability_map_from_obstacle_grid(
+        grid,
+        robot_radius_m=0.0,
+    )
+
+    path = traversable.shortest_path_points(
+        (0.5, 0.5, 0.0),
+        (4.5, 0.5, 0.0),
+    )
+
+    assert path is None
 
 
 def test_traversability_map_keeps_reachable_component_only() -> None:

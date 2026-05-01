@@ -64,9 +64,13 @@ class Geant4EngineConfig:
     executable_args: tuple[str, ...] = ()
     timeout_s: float = 120.0
     persistent_process: bool = False
-    source_bias_mode: str = "mixture_cone_isotropic"
+    source_rate_model: str = "detector_cps_1m"
+    source_bias_mode: str = "detector_cone"
     source_bias_cone_half_angle_deg: float = 0.0
     source_bias_isotropic_fraction: float = 0.1
+    detector_scoring_mode: str = "full_transport"
+    secondary_transport_mode: str = "full_transport"
+    primary_sampling_fraction: float = 1.0
     radiation_visualization: RadiationVisualizationConfig = field(default_factory=RadiationVisualizationConfig)
 
 
@@ -358,12 +362,20 @@ class ExternalCommandGeant4Engine(Geant4Engine):
     def _source_bias_args(self) -> list[str]:
         """Return native executable arguments for the configured source bias mode."""
         return [
+            "--source-rate-model",
+            str(self.config.source_rate_model),
             "--source-bias-mode",
             str(self.config.source_bias_mode),
             "--source-bias-cone-half-angle-deg",
             str(float(self.config.source_bias_cone_half_angle_deg)),
             "--source-bias-isotropic-fraction",
             str(float(self.config.source_bias_isotropic_fraction)),
+            "--detector-scoring-mode",
+            str(self.config.detector_scoring_mode),
+            "--secondary-transport-mode",
+            str(self.config.secondary_transport_mode),
+            "--primary-sampling-fraction",
+            str(float(self.config.primary_sampling_fraction)),
         ]
 
 

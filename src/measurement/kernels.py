@@ -17,11 +17,13 @@ from measurement.shielding import (
     CS137_TVL_PB_MM,
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    LOCAL_POSITIVE_OCTANT_CENTER,
     OctantShield,
     SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     mu_from_tvl_mm,
     octant_index_from_normal,
     resolve_mu_values,
+    rotation_matrix_between_vectors,
     spherical_shell_path_length_cm_torch,
 )
 
@@ -79,6 +81,8 @@ class ShieldParams:
     thickness_fe_cm: float = CS137_TVL_FE_CM
     inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM
     inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM
+    buildup_fe_coeff: float = 0.0
+    buildup_pb_coeff: float = 0.0
     shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT
     use_angle_attenuation: bool = False  # Legacy planar-slab mode; spherical shells use exact radial length.
 
@@ -162,16 +166,14 @@ class KernelPrecomputer:
         dir_unit = direction / dist.unsqueeze(-1)
         geom = 1.0 / (dist**2)
 
-        oct_idx = octant_index_from_normal(self.orientations[orient_idx])
-        (theta_low, theta_high), (phi_low, phi_high) = self._theta_phi_ranges[oct_idx]
-        theta = torch.acos(torch.clamp(dir_unit[:, 2], -1.0, 1.0))
-        phi = torch.remainder(torch.atan2(dir_unit[:, 1], dir_unit[:, 0]), 2.0 * np.pi)
-        blocked = (
-            (theta + tol >= theta_low)
-            & (theta - tol < theta_high)
-            & (phi + tol >= phi_low)
-            & (phi - tol < phi_high)
+        physical_normal = -np.asarray(self.orientations[orient_idx], dtype=float)
+        rotation_np = rotation_matrix_between_vectors(
+            LOCAL_POSITIVE_OCTANT_CENTER,
+            physical_normal,
         )
+        rotation = torch.as_tensor(rotation_np, device=device, dtype=dtype)
+        detector_to_source_unit = -dir_unit
+        blocked = torch.all(detector_to_source_unit @ rotation >= -float(tol), dim=-1)
 
         normal = torch.as_tensor(self.orientations[orient_idx], device=device, dtype=dtype)
         cos_theta = torch.clamp(torch.sum(dir_unit * normal, dim=1), 0.0, 1.0)
@@ -216,7 +218,14 @@ class KernelPrecomputer:
         mu_fe, mu_pb = resolve_mu_values(
             self.mu_by_isotope, isotope, default_fe=self.shield_params.mu_fe, default_pb=self.shield_params.mu_pb
         )
-        att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+        tau_fe = mu_fe * L_fe
+        tau_pb = mu_pb * L_pb
+        buildup = (
+            1.0
+            + max(float(self.shield_params.buildup_fe_coeff), 0.0) * (1.0 - torch.exp(-tau_fe))
+            + max(float(self.shield_params.buildup_pb_coeff), 0.0) * (1.0 - torch.exp(-tau_pb))
+        )
+        att = torch.clamp(torch.exp(-(tau_fe + tau_pb)) * buildup, max=1.0)
         kernels = geom * att
         return kernels.detach().cpu().numpy()
 

@@ -13,9 +13,9 @@ from measurement.model import PointSource
 from sim.isaacsim_app.stage_backend import StageBackend
 from sim.shield_geometry import (
     FE_SHIELD_INNER_RADIUS_M,
-    FE_SHIELD_OUTER_RADIUS_M,
     PB_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_OUTER_RADIUS_M,
+    ShieldThicknessConfig,
+    resolve_shield_thickness_config,
 )
 
 
@@ -70,6 +70,7 @@ class SceneDescription:
     author_room_boundary_prims: bool = False
     sources: list[SourceDescription] = field(default_factory=list)
     usd_path: str | None = None
+    use_config_usd_fallback: bool = True
     prim_paths: StagePrimPaths = field(default_factory=StagePrimPaths)
 
     @property
@@ -147,6 +148,7 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         author_room_boundary_prims=bool(payload.get("author_room_boundary_prims", False)),
         sources=sources,
         usd_path=None if payload.get("usd_path") in (None, "") else str(payload["usd_path"]),
+        use_config_usd_fallback=bool(payload.get("use_config_usd_fallback", True)),
         prim_paths=prim_paths,
     )
 
@@ -162,6 +164,7 @@ class SceneBuilder:
         obstacle_height_m: float = 2.0,
         fe_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25),
         pb_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25),
+        shield_thickness: ShieldThicknessConfig | None = None,
     ) -> None:
         """Store scene authoring defaults."""
         self.stage_backend = stage_backend
@@ -169,6 +172,7 @@ class SceneBuilder:
         self.obstacle_height_m = float(obstacle_height_m)
         self.fe_shield_size_xyz = tuple(float(v) for v in fe_shield_size_xyz)
         self.pb_shield_size_xyz = tuple(float(v) for v in pb_shield_size_xyz)
+        self.shield_thickness = shield_thickness or resolve_shield_thickness_config()
 
     def load_scene(
         self,
@@ -320,7 +324,7 @@ class SceneBuilder:
         )
         fe_points, fe_counts, fe_indices = _octant_shell_mesh(
             inner_radius_m=FE_SHIELD_INNER_RADIUS_M,
-            outer_radius_m=FE_SHIELD_OUTER_RADIUS_M,
+            outer_radius_m=FE_SHIELD_INNER_RADIUS_M + float(self.shield_thickness.thickness_fe_cm) / 100.0,
             theta_steps=8,
             phi_steps=8,
         )
@@ -335,7 +339,7 @@ class SceneBuilder:
         )
         pb_points, pb_counts, pb_indices = _octant_shell_mesh(
             inner_radius_m=PB_SHIELD_INNER_RADIUS_M,
-            outer_radius_m=PB_SHIELD_OUTER_RADIUS_M,
+            outer_radius_m=PB_SHIELD_INNER_RADIUS_M + float(self.shield_thickness.thickness_pb_cm) / 100.0,
             theta_steps=8,
             phi_steps=8,
         )

@@ -21,6 +21,7 @@ from sim.isaacsim_app.scene_builder import SceneBuilder, SceneDescription
 from sim.isaacsim_app.stage_backend import FakeStageBackend, IsaacSimStageBackend, StageBackend
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.radiation_visualization import RadiationVisualizationConfig
+from sim.shield_geometry import ShieldThicknessConfig, resolve_shield_thickness_config
 from spectrum.pipeline import SpectralDecomposer
 
 
@@ -50,10 +51,15 @@ class Geant4AppConfig:
     executable_args: tuple[str, ...] = field(default_factory=tuple)
     timeout_s: float = 120.0
     persistent_process: bool = False
-    source_bias_mode: str = "mixture_cone_isotropic"
+    source_rate_model: str = "detector_cps_1m"
+    source_bias_mode: str = "detector_cone"
     source_bias_cone_half_angle_deg: float = 0.0
     source_bias_isotropic_fraction: float = 0.1
+    detector_scoring_mode: str = "full_transport"
+    secondary_transport_mode: str = "full_transport"
+    primary_sampling_fraction: float = 1.0
     detector_model: ExportedDetectorModel = field(default_factory=ExportedDetectorModel)
+    shield_thickness: ShieldThicknessConfig = field(default_factory=resolve_shield_thickness_config)
     absorbing_transport_groups: tuple[str, ...] = field(default_factory=tuple)
     absorbing_path_prefixes: tuple[str, ...] = field(default_factory=tuple)
     radiation_visualization: RadiationVisualizationConfig = field(default_factory=RadiationVisualizationConfig)
@@ -121,13 +127,17 @@ class Geant4AppConfig:
             executable_args=tuple(str(v) for v in executable_args),
             timeout_s=float(payload.get("timeout_s", 120.0)),
             persistent_process=bool(payload.get("persistent_process", False)),
-            source_bias_mode=str(payload.get("source_bias_mode", "mixture_cone_isotropic")),
+            source_rate_model=str(payload.get("source_rate_model", "detector_cps_1m")),
+            source_bias_mode=str(payload.get("source_bias_mode", "detector_cone")),
             source_bias_cone_half_angle_deg=float(
                 payload.get("source_bias_cone_half_angle_deg", 0.0)
             ),
             source_bias_isotropic_fraction=float(
                 payload.get("source_bias_isotropic_fraction", 0.1)
             ),
+            detector_scoring_mode=str(payload.get("detector_scoring_mode", "full_transport")),
+            secondary_transport_mode=str(payload.get("secondary_transport_mode", "full_transport")),
+            primary_sampling_fraction=float(payload.get("primary_sampling_fraction", 1.0)),
             detector_model=ExportedDetectorModel(
                 crystal_radius_m=float(
                     detector_payload.get("crystal_radius_m", DEFAULT_DETECTOR_CRYSTAL_RADIUS_M)
@@ -145,6 +155,7 @@ class Geant4AppConfig:
                 crystal_material=str(detector_payload.get("crystal_material", "cebr3")),
                 housing_material=str(detector_payload.get("housing_material", "aluminum")),
             ),
+            shield_thickness=resolve_shield_thickness_config(payload),
             absorbing_transport_groups=tuple(str(v) for v in absorbing_transport_groups),
             absorbing_path_prefixes=tuple(str(v) for v in absorbing_path_prefixes),
             radiation_visualization=RadiationVisualizationConfig.from_dict(visualization_payload),
@@ -212,9 +223,13 @@ class Geant4Application:
                 executable_args=self.config.executable_args,
                 timeout_s=self.config.timeout_s,
                 persistent_process=self.config.persistent_process,
+                source_rate_model=self.config.source_rate_model,
                 source_bias_mode=self.config.source_bias_mode,
                 source_bias_cone_half_angle_deg=self.config.source_bias_cone_half_angle_deg,
                 source_bias_isotropic_fraction=self.config.source_bias_isotropic_fraction,
+                detector_scoring_mode=self.config.detector_scoring_mode,
+                secondary_transport_mode=self.config.secondary_transport_mode,
+                primary_sampling_fraction=self.config.primary_sampling_fraction,
                 radiation_visualization=self.config.radiation_visualization,
             ),
             engine_mode=self.config.engine_mode,
@@ -224,7 +239,11 @@ class Geant4Application:
 
     def reset(self, scene: SceneDescription) -> None:
         """Load a new scene description and rebuild or reuse the Geant4 world."""
-        if scene.usd_path is None and self.config.usd_path is not None:
+        if (
+            scene.usd_path is None
+            and scene.use_config_usd_fallback
+            and self.config.usd_path is not None
+        ):
             scene.usd_path = self.config.usd_path
         if self.config.author_obstacle_prims is not None:
             scene.author_obstacle_prims = self.config.author_obstacle_prims
@@ -246,6 +265,7 @@ class Geant4Application:
             stage_backend=self._stage_backend,
             asset_geometry=self.asset_geometry,
             detector_model=self.config.detector_model,
+            shield_thickness=self.config.shield_thickness,
             stage_material_rules=self.config.stage_material_rules,
             absorbing_transport_groups=self.config.absorbing_transport_groups,
             absorbing_path_prefixes=self.config.absorbing_path_prefixes,

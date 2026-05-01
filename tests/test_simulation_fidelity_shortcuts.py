@@ -107,6 +107,6 @@ def test_wall_absorber_is_explicit_native_transport_mode() -> None:
     )
 
     assert 'transport_mode) != "absorber"' in source
-    assert "AbsorbingBoundarySteppingAction" in source
+    assert "TransportSteppingAction" in source
     assert "SetTrackStatus(fStopAndKill)" in source
     assert 'result.metadata["absorbing_volume_count"]' in source

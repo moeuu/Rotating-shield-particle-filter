@@ -41,13 +41,15 @@ RUN_MODE_DEFAULTS = {
     },
     "python-cui": {
         "sim_backend": "analytic",
-        "sim_config": None,
+        "sim_config": (
+            ROOT / "configs" / "python" / "high_fidelity_no_isaac.json"
+        ).as_posix(),
         "matplotlib_live": False,
     },
     "geant4-cui": {
         "sim_backend": "geant4",
         "sim_config": (
-            ROOT / "configs" / "geant4" / "high_fidelity_external_no_isaac.json"
+            ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
         ).as_posix(),
         "matplotlib_live": False,
     },
@@ -427,7 +429,10 @@ def main() -> None:
         "--measurement-time-s",
         type=float,
         default=30.0,
-        help="Fixed dwell time, or adaptive dwell cap, per measurement in seconds.",
+        help=(
+            "Fixed dwell time, or adaptive dwell cap, per measurement in seconds. "
+            "Use <=0 with --adaptive-dwell for no dwell cap."
+        ),
     )
     parser.add_argument(
         "--adaptive-dwell",
@@ -457,6 +462,15 @@ def main() -> None:
         type=int,
         default=1,
         help="Required detected isotope count for adaptive dwell readiness.",
+    )
+    parser.add_argument(
+        "--adaptive-ready-min-snr",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional minimum isotope-count SNR for adaptive dwell readiness; "
+            "0 uses the count threshold only."
+        ),
     )
     parser.add_argument(
         "--no-adaptive-strength-prior",
@@ -504,6 +518,48 @@ def main() -> None:
         choices=("max", "mean"),
         default="max",
         help="Aggregate shield-orientation predicted counts for pose observability.",
+    )
+    parser.add_argument(
+        "--path-planner",
+        choices=("one_step", "dss_pp"),
+        default=None,
+        help="Next-pose planner: original one-step selector or DSS-PP.",
+    )
+    parser.add_argument(
+        "--dss-horizon",
+        type=int,
+        default=None,
+        help="DSS-PP receding-horizon length.",
+    )
+    parser.add_argument(
+        "--dss-beam-width",
+        type=int,
+        default=None,
+        help="DSS-PP beam width.",
+    )
+    parser.add_argument(
+        "--dss-program-length",
+        type=int,
+        default=None,
+        help="Number of shield postures in each DSS-PP measurement program.",
+    )
+    parser.add_argument(
+        "--dss-signature-weight",
+        type=float,
+        default=None,
+        help="DSS-PP shield-signature separation weight.",
+    )
+    parser.add_argument(
+        "--dss-differential-weight",
+        type=float,
+        default=None,
+        help="DSS-PP differential-observability penalty weight.",
+    )
+    parser.add_argument(
+        "--dss-rotation-weight",
+        type=float,
+        default=None,
+        help="DSS-PP shield-transition penalty weight.",
     )
     parser.add_argument(
         "--rotations-per-pose",
@@ -725,6 +781,7 @@ def main() -> None:
         adaptive_min_dwell_s=args.adaptive_min_dwell_s,
         adaptive_ready_min_counts=args.adaptive_ready_min_counts,
         adaptive_ready_min_isotopes=args.adaptive_ready_min_isotopes,
+        adaptive_ready_min_snr=args.adaptive_ready_min_snr,
         adaptive_strength_prior=args.adaptive_strength_prior,
         adaptive_strength_prior_steps=args.adaptive_strength_prior_steps,
         adaptive_strength_prior_min_counts=args.adaptive_strength_prior_min_counts,
@@ -732,6 +789,13 @@ def main() -> None:
         pose_min_observation_counts=args.pose_min_observation_counts,
         pose_min_observation_penalty_scale=args.pose_min_observation_penalty_scale,
         pose_min_observation_aggregate=args.pose_min_observation_aggregate,
+        path_planner=args.path_planner,
+        dss_horizon=args.dss_horizon,
+        dss_beam_width=args.dss_beam_width,
+        dss_program_length=args.dss_program_length,
+        dss_signature_weight=args.dss_signature_weight,
+        dss_differential_weight=args.dss_differential_weight,
+        dss_rotation_weight=args.dss_rotation_weight,
         notification_config=notification_config,
         notify_spectrum=args.notify_spectrum,
         notify_spectrum_every=args.notify_spectrum_every,

@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+import planning.dss_pp as dss_pp
 from measurement.kernels import ShieldParams
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.state import IsotopeState
@@ -14,8 +15,15 @@ from planning.pose_selection import (
     select_next_pose_from_candidates,
     select_next_pose_after_rotation,
 )
+from planning.dss_pp import (
+    DSSPPConfig,
+    _count_balance_penalty,
+    build_shield_program_library,
+    select_dss_pp_next_station,
+)
 from planning.candidate_generation import generate_candidate_poses
 from planning.shield_rotation import rotation_policy_step, select_best_orientation
+from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_rotation_matrices
 
@@ -175,6 +183,32 @@ def test_select_next_pose_after_rotation_prefers_lower_score() -> None:
     assert len(est.calls) == candidates.shape[0]
 
 
+def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
+    """Candidate generation should include deterministic free-cell centers."""
+    traversable = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 10),
+        traversable_cells=((8, 8),),
+    )
+
+    candidates = generate_candidate_poses(
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+        map_api=traversable,
+        n_candidates=4,
+        strategy="free_space_sobol",
+        min_dist_from_visited=1.0,
+        visited_poses_xyz=np.array([[0.5, 0.5, 0.5]], dtype=float),
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 0.5], dtype=float),
+        ),
+        rng=np.random.default_rng(7),
+    )
+
+    assert any(np.allclose(candidate, [8.5, 8.5, 0.5]) for candidate in candidates)
+
+
 def test_estimate_lambda_cost_range_scales_motion() -> None:
     """Range-based lambda should match uncertainty and motion-cost ranges."""
     uncertainties = np.array([1.0, 2.0, 4.0], dtype=float)
@@ -226,6 +260,45 @@ def test_pose_selection_prefers_all_isotope_observability() -> None:
         lambda_cost=0.0,
         min_observation_counts=5.0,
         min_observation_penalty_scale=1.0,
+        num_rollouts=1,
+    )
+
+    assert selected == 1
+
+
+def test_pose_selection_enforces_observability_when_feasible() -> None:
+    """Feasible all-isotope candidates should dominate even with zero penalty scale."""
+
+    class _FairnessEstimator:
+        """Minimal estimator exposing candidate-dependent predictions."""
+
+        pf_config = None
+
+        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
+            """Return a lower uncertainty for the infeasible candidate."""
+            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
+            return 0.0 if float(pose[0]) < 0.5 else 100.0
+
+        def expected_observation_counts_by_isotope_at_pose(
+            self,
+            pose_xyz: np.ndarray,
+            **kwargs: object,
+        ) -> dict[str, float]:
+            """Return one single-isotope-biased and one all-isotope-visible pose."""
+            if float(pose_xyz[0]) < 0.5:
+                return {"Cs-137": 100.0, "Co-60": 0.0}
+            return {"Cs-137": 5.0, "Co-60": 5.0}
+
+    selected = select_next_pose_from_candidates(
+        estimator=_FairnessEstimator(),
+        candidate_poses_xyz=np.array(
+            [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]],
+            dtype=float,
+        ),
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        lambda_cost=0.0,
+        min_observation_counts=5.0,
+        min_observation_penalty_scale=0.0,
         num_rollouts=1,
     )
 
@@ -452,3 +525,666 @@ def test_expected_uncertainty_after_pose_is_finite() -> None:
     U = est.expected_uncertainty_after_pose(pose_idx=0, orient_idx=0, live_time_s=1.0, num_samples=10)
     assert np.isfinite(U)
     assert U >= 0.0
+
+
+def test_dss_pp_program_library_contains_differential_primitives() -> None:
+    """DSS-PP should expose bearing, material, and occlusion shield programs."""
+    mats = generate_octant_rotation_matrices()
+    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
+    programs = build_shield_program_library(normals, program_length=2, max_programs=32)
+    kinds = {program.kind for program in programs}
+
+    assert "bearing_split" in kinds
+    assert "material_split" in kinds
+    assert "occlusion_test" in kinds
+    assert all(len(program.pair_ids) == 2 for program in programs)
+
+
+def test_dss_pp_selects_station_and_shield_program() -> None:
+    """DSS-PP should jointly return a pose and executable shield program."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        use_gpu=False,
+        planning_particles=None,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    filt = est.filters["Cs-137"]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
+    candidates = np.array(
+        [[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]],
+        dtype=float,
+    )
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
+        config=DSSPPConfig(
+            horizon=2,
+            beam_width=2,
+            max_programs=8,
+            program_length=2,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=1.0,
+            lambda_distance=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            lambda_rotation=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert result.next_pose.shape == (3,)
+    assert result.shield_program.pair_ids
+    assert result.diagnostics["node_count"] > 0
+    assert np.allclose(result.next_pose, candidates[result.next_pose_index])
+
+
+def test_dss_pp_enforces_all_isotope_observability_when_feasible() -> None:
+    """DSS-PP should filter station-program nodes that miss an isotope."""
+    isotopes = ["Cs-137", "Co-60"]
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.5], [10.0, 0.0, 0.5]],
+        dtype=float,
+    )
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=1,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={
+            "Cs-137": {"fe": 0.0, "pb": 0.0},
+            "Co-60": {"fe": 0.0, "pb": 0.0},
+        },
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([0.0, 5.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    for isotope, position in zip(isotopes, candidate_sources):
+        est.filters[isotope].continuous_particles = [
+            IsotopeParticle(
+                state=IsotopeState(
+                    num_sources=1,
+                    positions=position.reshape(1, 3),
+                    strengths=np.array([1000.0], dtype=float),
+                    background=0.0,
+                ),
+                log_weight=0.0,
+            )
+        ]
+    candidates = np.array(
+        [[0.5, 0.0, 0.5], [5.0, 0.0, 0.5]],
+        dtype=float,
+    )
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 5.0, 0.5], dtype=float),
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=4,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            min_observation_counts=30.0,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert result.next_pose_index == 1
+    assert np.allclose(result.next_pose, candidates[1])
+
+
+def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
+    """DSS-PP should move toward uncovered traversable cells when weighted."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=1,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([1.0, 1.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    est.filters["Cs-137"].continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    traversable = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 10),
+        traversable_cells=tuple((ix, iy) for ix in range(10) for iy in range(10)),
+    )
+    candidates = np.array(
+        [[1.5, 1.5, 0.5], [8.5, 8.5, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
+        visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
+        map_api=traversable,
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            lambda_coverage=1.0,
+            eta_revisit=1.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            eta_count_balance=0.0,
+            min_station_separation_m=3.0,
+            coverage_radius_m=2.0,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert result.diagnostics["first_coverage_gain"] > 0.0
+    assert np.allclose(result.next_pose, candidates[1])
+
+
+def test_dss_pp_coverage_floor_rejects_low_coverage_candidates() -> None:
+    """Coverage-floor scoring should keep exploration from collapsing locally."""
+    est = _build_simple_estimator()
+    traversable = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 10),
+        traversable_cells=tuple((ix, iy) for ix in range(10) for iy in range(10)),
+    )
+    candidates = np.array(
+        [[1.5, 1.5, 0.5], [8.5, 8.5, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
+        visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
+        map_api=traversable,
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            lambda_coverage=0.0,
+            coverage_floor_quantile=1.0,
+            coverage_floor_weight=100.0,
+            eta_revisit=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            eta_count_balance=0.0,
+            min_station_separation_m=0.0,
+            coverage_radius_m=2.0,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[1])
+
+
+def test_dss_pp_falls_back_to_reachable_base_candidates() -> None:
+    """DSS-PP should not fail when augmented candidates are disconnected."""
+    est = _build_simple_estimator()
+    traversable = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 1),
+        traversable_cells=((0, 0), (1, 0), (3, 0), (4, 0)),
+    )
+    current = np.array([0.5, 0.5, 0.0], dtype=float)
+    candidates = np.array([[1.5, 0.5, 0.0]], dtype=float)
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=np.array([current], dtype=float),
+        map_api=traversable,
+        config=DSSPPConfig(
+            horizon=1,
+            max_programs=1,
+            program_length=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            min_station_separation_m=2.0,
+            signature_std_min_counts=0.0,
+            augment_candidates=True,
+            max_augmented_candidates=8,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[0])
+    assert result.diagnostics["path_fallback_used"] == 1
+    assert result.diagnostics["path_filtered_candidates"] > 0
+
+
+def test_dss_pp_limits_expensive_eig_candidate_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSS-PP should only run EIG rollouts on the configured top candidates."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=1,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([0.0, 0.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    est.filters["Cs-137"].continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    calls: list[tuple[float, float, float]] = []
+
+    def _fake_information_gain(
+        estimator: RotatingShieldPFEstimator,
+        pose_xyz: np.ndarray,
+        *,
+        config: DSSPPConfig,
+        rng_seed: int | None,
+    ) -> float:
+        """Record expensive EIG calls and return a deterministic value."""
+        calls.append(tuple(float(value) for value in pose_xyz))
+        return 1.0
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_candidate_information_gain",
+        _fake_information_gain,
+    )
+    candidates = np.array(
+        [
+            [1.0, 0.0, 0.5],
+            [2.0, 0.0, 0.5],
+            [3.0, 0.0, 0.5],
+            [4.0, 0.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=1.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            eta_count_balance=0.0,
+            signature_std_min_counts=0.0,
+            eig_candidate_limit=2,
+            augment_candidates=False,
+        ),
+    )
+
+    assert result.next_pose.shape == (3,)
+    assert len(calls) == 2
+
+
+def test_dss_pp_uses_bounds_coverage_without_map() -> None:
+    """Bounds-based coverage should drive exploration when no map is active."""
+    est = _build_simple_estimator()
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [
+            [2.0, 1.0, 0.5],
+            [8.0, 18.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.0], dtype=float),
+            np.array([10.0, 20.0, 1.0], dtype=float),
+        ),
+        config=DSSPPConfig(
+            augment_candidates=False,
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=10.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            coverage_radius_m=3.0,
+            min_station_separation_m=0.0,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[1])
+
+
+def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
+    """Station separation should remove near revisits after augmentation."""
+    est = _build_simple_estimator()
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [
+            [1.5, 1.0, 0.5],
+            [5.5, 1.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.0], dtype=float),
+            np.array([10.0, 10.0, 1.0], dtype=float),
+        ),
+        config=DSSPPConfig(
+            augment_candidates=False,
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            min_station_separation_m=3.0,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[1])
+    assert int(result.diagnostics["separation_filtered_candidates"]) == 1
+
+
+def test_dss_pp_augments_with_global_unvisited_coverage_candidates() -> None:
+    """DSS-PP should add global coverage candidates when base candidates revisit."""
+    est = _build_simple_estimator()
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array([[1.2, 1.0, 0.5]], dtype=float)
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 0.5], dtype=float),
+        ),
+        config=DSSPPConfig(
+            augment_candidates=True,
+            max_augmented_candidates=32,
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=10.0,
+            lambda_rotation=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            min_station_separation_m=3.0,
+            coverage_radius_m=2.0,
+            signature_std_min_counts=0.0,
+        ),
+    )
+
+    assert not np.allclose(result.next_pose, candidates[0])
+    assert result.diagnostics["candidate_count"] > 1
+
+
+def test_dss_pp_count_balance_penalty_is_isotope_agnostic() -> None:
+    """DSS-PP balance penalty should reject any single-isotope dominated program."""
+    balanced = {"Cs-137": 12.0, "Co-60": 12.0, "Eu-154": 12.0}
+    co_dominated = {"Cs-137": 1.0, "Co-60": 98.0, "Eu-154": 1.0}
+    eu_dominated = {"Cs-137": 1.0, "Co-60": 1.0, "Eu-154": 98.0}
+
+    assert _count_balance_penalty(balanced) == pytest.approx(0.0)
+    assert _count_balance_penalty(co_dominated) == pytest.approx(
+        _count_balance_penalty(eu_dominated)
+    )
+    assert _count_balance_penalty(co_dominated) > 0.5
+
+
+def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
+    """Bearing diversity should favor angularly separating any same-isotope modes."""
+    isotopes = ["Co-60"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Co-60": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([2.0, 3.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    est.filters["Co-60"].continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([1000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([1000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
+    candidates = np.array(
+        [[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([2.0, 3.0, 0.5], dtype=float),
+        config=DSSPPConfig(
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=0.0,
+            lambda_bearing_diversity=10.0,
+            lambda_rotation=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[0])
+    assert result.diagnostics["first_bearing_diversity_gain"] > 0.0
+
+
+def test_dss_pp_turn_smoothness_discourages_backtracking() -> None:
+    """Turn smoothness should prefer continuing outward over reversing course."""
+    est = _build_simple_estimator()
+    current = np.array([1.0, 0.0, 0.0], dtype=float)
+    visited = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    candidates = np.array(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        config=DSSPPConfig(
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=0.0,
+            lambda_turn_smoothness=5.0,
+            lambda_rotation=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            min_station_separation_m=0.0,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[1])
+    assert result.diagnostics["first_turn_penalty"] == pytest.approx(0.0)

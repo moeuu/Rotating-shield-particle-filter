@@ -33,6 +33,9 @@ class PFFrame:
     - particle_weights: isotope -> (N_points,)
     - estimated_sources: isotope -> (N_est, 3)
     - estimated_strengths: isotope -> (N_est,)
+    - path_waypoints_xyz: optional obstacle-aware robot path segment (M, 3)
+    - spectrum_energy_keV/spectrum_counts: optional processed spectrum display data
+    - spectrum_components_by_isotope: isotope -> per-bin fitted isotope contribution
     """
 
     step_index: int
@@ -47,6 +50,10 @@ class PFFrame:
     particle_weights: Dict[str, NDArray[np.float64]]
     estimated_sources: Dict[str, NDArray[np.float64]]
     estimated_strengths: Dict[str, NDArray[np.float64]]
+    path_waypoints_xyz: Optional[NDArray[np.float64]] = None
+    spectrum_energy_keV: Optional[NDArray[np.float64]] = None
+    spectrum_counts: Optional[NDArray[np.float64]] = None
+    spectrum_components_by_isotope: Optional[Dict[str, NDArray[np.float64]]] = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,32 @@ def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
     if total <= 0.0:
         return np.ones_like(w) / w.size
     return w / total
+
+
+def _coerce_path_waypoints(frame: PFFrame) -> NDArray[np.float64]:
+    """Return a valid path waypoint array from a PFFrame."""
+    waypoints = getattr(frame, "path_waypoints_xyz", None)
+    if waypoints is None:
+        return np.zeros((0, 3), dtype=float)
+    arr = np.asarray(waypoints, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return np.zeros((0, 3), dtype=float)
+    return arr
+
+
+def _extend_trajectory_history(
+    history: list[NDArray[np.float64]],
+    frame: PFFrame,
+) -> None:
+    """Append obstacle-aware waypoints or the current robot pose to history."""
+    waypoints = _coerce_path_waypoints(frame)
+    if waypoints.size == 0:
+        waypoints = np.asarray(frame.robot_position, dtype=float).reshape(1, 3)
+    for waypoint in waypoints:
+        point = np.asarray(waypoint, dtype=float).reshape(3)
+        if history and float(np.linalg.norm(point - history[-1])) <= 1e-9:
+            continue
+        history.append(point.copy())
 
 
 def _existence_probabilities(states: Sequence[Any], weights: NDArray[np.float64], max_r: int) -> NDArray[np.float64]:
@@ -957,7 +990,7 @@ class RealTimePFVisualizer:
             self.ax3d.computed_zorder = False
         init_frame = frame.step_index < 0
         # maintain trajectory history
-        self._traj_history.append(frame.robot_position)
+        _extend_trajectory_history(self._traj_history, frame)
         # Robot and trajectory
         traj_arr = np.vstack(self._traj_history)
         if self._traj_line is None:
@@ -1161,6 +1194,586 @@ class RealTimePFVisualizer:
         if self._last_frame is not None:
             self._update_labels(self._last_frame)
         self.fig.canvas.draw_idle()
+
+
+class CUISplitPFVisualizer:
+    """
+    Save CUI-friendly split visualizations as independent image files.
+
+    The renderer writes a 2D robot/trajectory panel and a 3D PF particle panel
+    after every update. It also writes a small auto-refresh HTML page so the
+    latest CUI state can be inspected in a browser without starting Isaac Sim
+    or an interactive matplotlib window.
+    """
+
+    def __init__(
+        self,
+        isotopes: List[str],
+        output_dir: str | Path,
+        *,
+        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
+        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
+        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
+        obstacle_grid: ObstacleGrid | None = None,
+        max_particles_per_isotope: int | None = None,
+    ) -> None:
+        """Initialize output paths and static scene metadata."""
+        self.isotopes = list(isotopes)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.world_bounds = world_bounds or (0.0, 10.0, 0.0, 10.0, 0.0, 3.0)
+        self.true_sources = true_sources or {}
+        self.true_strengths = true_strengths or {}
+        self.obstacle_grid = obstacle_grid
+        self.max_particles_per_isotope = (
+            None
+            if max_particles_per_isotope is None
+            else max(1, int(max_particles_per_isotope))
+        )
+        self.trajectory: list[NDArray[np.float64]] = []
+        self.path_segments: list[NDArray[np.float64]] = []
+        self.measurement_points: list[NDArray[np.float64]] = []
+        self.measurement_steps: list[int] = []
+        self.measurement_visit_counts: list[int] = []
+        cmap = plt.get_cmap("tab10")
+        self.colors = {
+            iso: DEFAULT_ISOTOPE_COLORS.get(iso, cmap(i % 10))
+            for i, iso in enumerate(self.isotopes)
+        }
+        self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
+        self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
+        self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
+        self.index_path = self.output_dir / "index.html"
+        self._write_index_html()
+        if not self.latest_spectrum_path.exists():
+            self._save_spectrum_placeholder(self.latest_spectrum_path)
+
+    def update(self, frame: PFFrame) -> None:
+        """Render and save the split CUI views for one PF frame."""
+        _extend_trajectory_history(self.trajectory, frame)
+        self._record_path_segment(frame)
+        self._record_measurement_point(frame)
+        step = max(0, int(frame.step_index))
+        robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
+        pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
+        spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
+        self._save_robot_2d(frame, robot_step_path)
+        self._save_robot_2d(frame, self.latest_robot_path)
+        self._save_pf_3d(frame, pf_step_path)
+        self._save_pf_3d(frame, self.latest_pf_path)
+        self._save_spectrum(frame, spectrum_step_path)
+        self._save_spectrum(frame, self.latest_spectrum_path)
+
+    def _record_path_segment(self, frame: PFFrame) -> None:
+        """Store the obstacle-aware segment associated with this frame, if any."""
+        waypoints = _coerce_path_waypoints(frame)
+        if waypoints.shape[0] < 2:
+            return
+        if self.path_segments:
+            prev = self.path_segments[-1]
+            if prev.shape == waypoints.shape and np.allclose(prev, waypoints):
+                return
+        self.path_segments.append(waypoints.copy())
+
+    def _record_measurement_point(self, frame: PFFrame) -> None:
+        """Store measurement stations and repeated shield visits for display."""
+        point = np.asarray(frame.robot_position, dtype=float).reshape(3)
+        if self.measurement_points:
+            if float(np.linalg.norm(point - self.measurement_points[-1])) <= 1e-6:
+                self.measurement_visit_counts[-1] += 1
+                return
+        self.measurement_points.append(point.copy())
+        self.measurement_steps.append(int(frame.step_index))
+        self.measurement_visit_counts.append(1)
+
+    def _unique_path_waypoints(self) -> NDArray[np.float64]:
+        """Return traversed path waypoints that are not measurement stations."""
+        waypoints: list[NDArray[np.float64]] = []
+        station_arr = (
+            np.vstack(self.measurement_points)
+            if self.measurement_points
+            else np.zeros((0, 3), dtype=float)
+        )
+        for segment in self.path_segments:
+            if segment.shape[0] <= 2:
+                continue
+            for point in segment[1:-1]:
+                if station_arr.size:
+                    distances = np.linalg.norm(station_arr - point[None, :], axis=1)
+                    if float(np.min(distances)) <= 1e-6:
+                        continue
+                if any(float(np.linalg.norm(point - existing)) <= 1e-6 for existing in waypoints):
+                    continue
+                waypoints.append(np.asarray(point, dtype=float).reshape(3).copy())
+        if not waypoints:
+            return np.zeros((0, 3), dtype=float)
+        return np.vstack(waypoints).astype(float)
+
+    def _station_label_offsets(self, points: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return small deterministic xy offsets for overlapping station labels."""
+        point_arr = np.asarray(points, dtype=float)
+        if point_arr.size == 0:
+            return np.zeros((0, 2), dtype=float)
+        offsets = np.zeros((point_arr.shape[0], 2), dtype=float)
+        used_counts: dict[tuple[float, float], int] = {}
+        radius = 0.16
+        for idx, point in enumerate(point_arr):
+            key = tuple(float(v) for v in np.round(point[:2], 3))
+            repeat_idx = used_counts.get(key, 0)
+            used_counts[key] = repeat_idx + 1
+            if repeat_idx == 0:
+                continue
+            angle = 2.0 * np.pi * float(repeat_idx - 1) / 6.0
+            offsets[idx, 0] = radius * np.cos(angle)
+            offsets[idx, 1] = radius * np.sin(angle)
+        return offsets
+
+    def _station_label(self, station_index: int) -> str:
+        """Return a compact station label including repeated shield visits."""
+        visits = (
+            self.measurement_visit_counts[station_index]
+            if station_index < len(self.measurement_visit_counts)
+            else 1
+        )
+        if visits <= 1:
+            return str(station_index)
+        return f"{station_index}({visits})"
+
+    def _write_index_html(self) -> None:
+        """Write the browser page that auto-refreshes the latest PNG files."""
+        html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Rotating Shield PF CUI View</title>
+  <style>
+    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+    header { padding: 10px 16px; background: #1d1d1d; border-bottom: 1px solid #333; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
+    section { background: #181818; border: 1px solid #333; padding: 8px; }
+    h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+    img { width: 100%; height: calc(50vh - 70px); object-fit: contain; background: #fff; }
+    .wide { grid-column: 1 / span 2; }
+  </style>
+</head>
+<body>
+  <header>Rotating Shield PF CUI View - auto refresh every 2 s</header>
+  <main>
+    <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
+    <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
+    <section class="wide"><h2>Processed spectrum decomposition</h2><img id="spectrum" src="latest_spectrum.png"></section>
+  </main>
+  <script>
+    function refresh() {
+      const t = Date.now();
+      document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
+      document.getElementById("pf").src = "latest_pf_3d.png?t=" + t;
+      document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
+    }
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+"""
+        self.index_path.write_text(html, encoding="utf-8")
+
+    def _save_spectrum_placeholder(self, output_path: Path) -> None:
+        """Save a placeholder spectrum panel until the first measurement arrives."""
+        fig, ax = plt.subplots(figsize=(10.0, 4.8))
+        ax.text(
+            0.5,
+            0.5,
+            "Spectrum will appear after the first measurement",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
+
+    def _draw_obstacles_2d(self, ax: plt.Axes) -> None:
+        """Draw the obstacle grid as 2D filled rectangles."""
+        if self.obstacle_grid is None:
+            return
+        from matplotlib.patches import Rectangle
+
+        for x0, x1, y0, y1 in self.obstacle_grid.blocked_bounds():
+            ax.add_patch(
+                Rectangle(
+                    (x0, y0),
+                    x1 - x0,
+                    y1 - y0,
+                    facecolor="black",
+                    edgecolor="none",
+                    alpha=0.75,
+                )
+            )
+
+    def _draw_obstacles_3d(self, ax: plt.Axes) -> None:
+        """Draw obstacle cells as flat dark floor patches in the 3D PF view."""
+        if self.obstacle_grid is None:
+            return
+        patches = []
+        z0 = float(self.world_bounds[4])
+        for x0, x1, y0, y1 in self.obstacle_grid.blocked_bounds():
+            patches.append(
+                [
+                    (x0, y0, z0),
+                    (x1, y0, z0),
+                    (x1, y1, z0),
+                    (x0, y1, z0),
+                ]
+            )
+        if not patches:
+            return
+        collection = Poly3DCollection(
+            patches,
+            facecolor="black",
+            edgecolor="none",
+            alpha=0.25,
+        )
+        ax.add_collection3d(collection)
+
+    def _plot_true_sources_2d(self, ax: plt.Axes) -> None:
+        """Plot true source positions on the 2D robot view when available."""
+        for iso, positions in self.true_sources.items():
+            pos = np.asarray(positions, dtype=float)
+            if pos.size == 0:
+                continue
+            pos = pos.reshape((-1, 3))
+            ax.scatter(
+                pos[:, 0],
+                pos[:, 1],
+                marker="*",
+                s=90,
+                color=self.colors.get(iso, "black"),
+                edgecolor="white",
+                linewidth=0.6,
+                label=f"true {iso}",
+            )
+
+    def _plot_true_sources_3d(self, ax: plt.Axes) -> None:
+        """Plot true source positions on the 3D PF view when available."""
+        for iso, positions in self.true_sources.items():
+            pos = np.asarray(positions, dtype=float)
+            if pos.size == 0:
+                continue
+            pos = pos.reshape((-1, 3))
+            ax.scatter(
+                pos[:, 0],
+                pos[:, 1],
+                pos[:, 2],
+                marker="*",
+                s=100,
+                color=self.colors.get(iso, "black"),
+                edgecolor="white",
+                linewidth=0.7,
+                depthshade=False,
+                label=f"true {iso}",
+            )
+
+    def _save_robot_2d(self, frame: PFFrame, output_path: Path) -> None:
+        """Save the current robot position and trajectory as a 2D PNG."""
+        xmin, xmax, ymin, ymax, _, _ = self.world_bounds
+        fig, ax = plt.subplots(figsize=(7.0, 6.0))
+        self._draw_obstacles_2d(ax)
+        self._plot_true_sources_2d(ax)
+        for idx, segment in enumerate(self.path_segments):
+            if segment.shape[0] < 2:
+                continue
+            ax.plot(
+                segment[:, 0],
+                segment[:, 1],
+                "-",
+                color="cyan",
+                linewidth=2.0,
+                alpha=0.75,
+                label="traversed path" if idx == 0 else None,
+            )
+        path_waypoints = self._unique_path_waypoints()
+        if path_waypoints.size:
+            ax.scatter(
+                path_waypoints[:, 0],
+                path_waypoints[:, 1],
+                s=18,
+                color="cyan",
+                edgecolor="black",
+                linewidth=0.3,
+                alpha=0.55,
+                marker=".",
+                label="path waypoint",
+                zorder=6,
+            )
+        if self.measurement_points:
+            points = np.vstack(self.measurement_points)
+            ax.scatter(
+                points[:, 0],
+                points[:, 1],
+                s=55,
+                color="white",
+                edgecolor="cyan",
+                linewidth=1.0,
+                label="measurement station",
+                zorder=9,
+            )
+            offsets = self._station_label_offsets(points)
+            for idx, point in enumerate(points):
+                label = self._station_label(idx)
+                text = ax.text(
+                    point[0] + offsets[idx, 0],
+                    point[1] + offsets[idx, 1],
+                    label,
+                    color="black",
+                    fontsize=8,
+                    ha="center",
+                    va="center",
+                    zorder=10,
+                )
+                text.set_path_effects(
+                    [
+                        path_effects.withStroke(
+                            linewidth=1.8,
+                            foreground="white",
+                        )
+                    ]
+                )
+        robot = np.asarray(frame.robot_position, dtype=float)
+        ax.scatter(
+            [robot[0]],
+            [robot[1]],
+            s=130,
+            color="cyan",
+            edgecolor="black",
+            linewidth=1.0,
+            label="robot",
+            zorder=10,
+        )
+        ax.set_xlim(float(xmin), float(xmax))
+        ax.set_ylim(float(ymin), float(ymax))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_title(
+            f"Robot 2D position - step {frame.step_index} "
+            f"t={frame.time:.1f}s stations={len(self.measurement_points)}"
+        )
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8)
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
+
+    def _particle_subset(
+        self,
+        positions: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return a deterministic particle subset for display if a cap is set."""
+        pts = np.asarray(positions, dtype=float)
+        w = np.asarray(weights, dtype=float)
+        if pts.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        if self.max_particles_per_isotope is None or pts.shape[0] <= self.max_particles_per_isotope:
+            return pts, w
+        if w.size != pts.shape[0]:
+            indices = np.linspace(0, pts.shape[0] - 1, self.max_particles_per_isotope, dtype=int)
+        else:
+            indices = np.argsort(w)[::-1][: self.max_particles_per_isotope]
+        return pts[indices], w[indices] if w.size == pts.shape[0] else np.zeros(indices.size)
+
+    def _particle_style(
+        self,
+        weights: NDArray[np.float64],
+        color: object,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Map display particle weights to marker sizes and RGBA colors."""
+        w = np.asarray(weights, dtype=float)
+        if w.size == 0:
+            return np.full(0, 6.0), np.zeros((0, 4), dtype=float)
+        w_norm = _normalize_weights(w)
+        if float(np.max(w_norm) - np.min(w_norm)) > 1e-12:
+            w_norm = (w_norm - np.min(w_norm)) / (np.max(w_norm) - np.min(w_norm))
+        else:
+            w_norm = np.ones_like(w_norm)
+        sizes = 8.0 + 36.0 * w_norm
+        rgba = np.tile(mcolors.to_rgba(color), (w_norm.size, 1))
+        rgba[:, 3] = 0.18 + 0.62 * w_norm
+        return sizes, rgba
+
+    def _save_pf_3d(self, frame: PFFrame, output_path: Path) -> None:
+        """Save the current PF particles and estimates as a 3D PNG."""
+        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
+        fig = plt.figure(figsize=(8.0, 7.0))
+        ax = fig.add_subplot(111, projection="3d")
+        self._draw_obstacles_3d(ax)
+        for idx, segment in enumerate(self.path_segments):
+            if segment.shape[0] < 2:
+                continue
+            ax.plot(
+                segment[:, 0],
+                segment[:, 1],
+                segment[:, 2],
+                "-",
+                color="cyan",
+                linewidth=2.0,
+                alpha=0.75,
+                label="traversed path" if idx == 0 else None,
+            )
+        path_waypoints = self._unique_path_waypoints()
+        if path_waypoints.size:
+            ax.scatter(
+                path_waypoints[:, 0],
+                path_waypoints[:, 1],
+                path_waypoints[:, 2],
+                s=16,
+                color="cyan",
+                edgecolor="black",
+                linewidth=0.3,
+                alpha=0.45,
+                marker=".",
+                depthshade=False,
+                label="path waypoint",
+            )
+        if self.measurement_points:
+            points = np.vstack(self.measurement_points)
+            ax.scatter(
+                points[:, 0],
+                points[:, 1],
+                points[:, 2],
+                s=55,
+                color="white",
+                edgecolor="cyan",
+                linewidth=1.0,
+                depthshade=False,
+                label="measurement station",
+            )
+        robot = np.asarray(frame.robot_position, dtype=float)
+        ax.scatter(
+            [robot[0]],
+            [robot[1]],
+            [robot[2]],
+            s=90,
+            color="cyan",
+            edgecolor="black",
+            linewidth=0.8,
+            depthshade=False,
+            label="robot",
+        )
+        self._plot_true_sources_3d(ax)
+        for iso in self.isotopes:
+            color = self.colors.get(iso, "gray")
+            pts, weights = self._particle_subset(
+                frame.particle_positions.get(iso, np.zeros((0, 3), dtype=float)),
+                frame.particle_weights.get(iso, np.zeros(0, dtype=float)),
+            )
+            if pts.size:
+                sizes, rgba = self._particle_style(weights, color)
+                ax.scatter(
+                    pts[:, 0],
+                    pts[:, 1],
+                    pts[:, 2],
+                    s=sizes,
+                    c=rgba,
+                    marker=".",
+                    depthshade=False,
+                    label=f"{iso} particles",
+                )
+            est = frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float))
+            strengths = frame.estimated_strengths.get(iso, np.zeros(0, dtype=float))
+            if est.size:
+                est = np.asarray(est, dtype=float).reshape((-1, 3))
+                sizes = 120.0 + 0.02 * np.clip(np.asarray(strengths, dtype=float), 0.0, 5000.0)
+                if sizes.size != est.shape[0]:
+                    sizes = np.full(est.shape[0], 140.0, dtype=float)
+                ax.scatter(
+                    est[:, 0],
+                    est[:, 1],
+                    est[:, 2],
+                    marker="x",
+                    s=sizes,
+                    color=color,
+                    linewidths=2.0,
+                    depthshade=False,
+                    label=f"{iso} estimate",
+                )
+        ax.set_xlim(float(xmin), float(xmax))
+        ax.set_ylim(float(ymin), float(ymax))
+        ax.set_zlim(float(zmin), float(zmax))
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_zlabel("z [m]")
+        ax.set_title(
+            f"Particle filter 3D - step {frame.step_index} "
+            f"t={frame.time:.1f}s stations={len(self.measurement_points)}"
+        )
+        ax.view_init(elev=26.0, azim=-58.0)
+        ax.legend(loc="upper left", fontsize=7)
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
+
+    def _save_spectrum(self, frame: PFFrame, output_path: Path) -> None:
+        """Save the current processed spectrum with fitted isotope areas."""
+        energy = getattr(frame, "spectrum_energy_keV", None)
+        counts = getattr(frame, "spectrum_counts", None)
+        if energy is None or counts is None:
+            return
+        energy_arr = np.asarray(energy, dtype=float)
+        counts_arr = np.asarray(counts, dtype=float)
+        if energy_arr.size == 0 or counts_arr.size == 0:
+            return
+        size = min(energy_arr.size, counts_arr.size)
+        energy_arr = energy_arr[:size]
+        counts_arr = np.clip(counts_arr[:size], a_min=0.0, a_max=None)
+        components = getattr(frame, "spectrum_components_by_isotope", None) or {}
+        fig, ax = plt.subplots(figsize=(10.0, 4.8))
+        stack_values: list[NDArray[np.float64]] = []
+        stack_labels: list[str] = []
+        stack_colors: list[object] = []
+        for iso in self.isotopes:
+            comp_raw = components.get(iso)
+            if comp_raw is None:
+                continue
+            comp = np.clip(
+                np.asarray(comp_raw, dtype=float)[:size],
+                a_min=0.0,
+                a_max=None,
+            )
+            if comp.size != size or float(np.sum(comp)) <= 0.0:
+                continue
+            stack_values.append(comp)
+            stack_labels.append(f"{iso} photopeak={float(np.sum(comp)):.1f}")
+            stack_colors.append(self.colors.get(iso, "gray"))
+        if stack_values:
+            ax.stackplot(
+                energy_arr,
+                stack_values,
+                labels=stack_labels,
+                colors=stack_colors,
+                alpha=0.45,
+            )
+        ax.plot(
+            energy_arr,
+            counts_arr,
+            color="black",
+            linewidth=1.0,
+            label="processed spectrum",
+        )
+        ax.set_xlabel("Energy [keV]")
+        ax.set_ylabel("Counts / bin")
+        ax.set_title(f"Spectrum decomposition - step {frame.step_index} t={frame.time:.1f}s")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8)
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
 
 
 def build_frame_from_pf(

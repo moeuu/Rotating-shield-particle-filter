@@ -242,6 +242,27 @@ def expected_counts_per_source(
     num_meas = int(len(live_times))
     num_sources = int(sources.shape[0])
     lambda_m = np.zeros((num_meas, num_sources), dtype=float)
+    if getattr(kernel, "use_gpu", False) and hasattr(kernel, "kernel_values_pair"):
+        if fe_indices is None or pb_indices is None:
+            if orient_indices is None:
+                raise ValueError("Either fe_indices/pb_indices or orient_indices must be provided.")
+            fe_indices_use = np.asarray(orient_indices, dtype=int)
+            pb_indices_use = fe_indices_use
+        else:
+            fe_indices_use = np.asarray(fe_indices, dtype=int)
+            pb_indices_use = np.asarray(pb_indices, dtype=int)
+        scale = np.asarray(live_times, dtype=float) * max(float(source_scale), 0.0)
+        strengths_arr = np.asarray(strengths, dtype=float)
+        for k in range(num_meas):
+            values = kernel.kernel_values_pair(
+                isotope=isotope,
+                detector_pos=detector_positions[k],
+                sources=sources,
+                fe_index=int(fe_indices_use[k]),
+                pb_index=int(pb_indices_use[k]),
+            )
+            lambda_m[k, :] = scale[k] * values * strengths_arr
+        return lambda_m
     for k in range(num_meas):
         det = detector_positions[k]
         live_time = float(live_times[k])

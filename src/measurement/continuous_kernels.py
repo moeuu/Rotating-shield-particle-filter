@@ -17,12 +17,15 @@ from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import (
     CONCRETE_MU_CM_INV,
+    LOCAL_POSITIVE_OCTANT_CENTER,
     OctantShield,
     SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     generate_octant_orientations,
     octant_index_from_normal,
     path_length_cm,
+    rotated_positive_octant_blocks_direction,
     resolve_mu_values,
+    rotation_matrix_between_vectors,
     spherical_shell_path_length_cm,
     spherical_shell_path_length_cm_torch,
 )
@@ -36,12 +39,67 @@ except ImportError:  # pragma: no cover - optional dependency
     _TORCH_AVAILABLE = False
 
 
+def _finite_sphere_geometric_term_torch(
+    distance: "torch.Tensor",
+    *,
+    detector_radius_m: float,
+    tol: "torch.Tensor",
+) -> "torch.Tensor":
+    """Return finite-sphere detector-cps@1m scaling for torch distances."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    radius = max(float(detector_radius_m), 0.0)
+    if radius <= 0.0:
+        dist = torch.clamp(distance, min=tol)
+        return 1.0 / (dist**2)
+    radius_t = torch.as_tensor(radius, device=distance.device, dtype=distance.dtype)
+    d_eff = torch.maximum(torch.clamp(distance, min=tol), radius_t)
+    ratio = torch.clamp(radius_t / torch.clamp(d_eff, min=tol), max=1.0)
+    fraction = 0.5 * (1.0 - torch.sqrt(torch.clamp(1.0 - ratio * ratio, min=0.0)))
+    reference = max(1.0, radius)
+    ref_ratio = min(radius / reference, 1.0)
+    ref_fraction = max(0.5 * (1.0 - float(np.sqrt(max(1.0 - ref_ratio * ref_ratio, 0.0)))), 1.0e-12)
+    return fraction / ref_fraction
+
+
 def geometric_term(detector: NDArray[np.float64], source: NDArray[np.float64]) -> float:
-    """Inverse-square geometric term 1/d^2 (cps@1m scaling)."""
+    """Inverse-square geometric term 1/d^2 for detector cps@1m scaling."""
     d = float(np.linalg.norm(detector - source))
     if d == 0.0:
         d = 1e-6
     return float(1.0 / (d**2))
+
+
+def finite_sphere_geometric_term(
+    detector: NDArray[np.float64],
+    source: NDArray[np.float64],
+    detector_radius_m: float,
+) -> float:
+    """
+    Return detector-cps@1m scaling for a finite spherical detector.
+
+    For a configured spherical detector, ``intensity_cps_1m`` is defined as the
+    expected detector count rate at 1 m.  The near-field scaling should
+    therefore use the sphere solid angle relative to the 1 m solid angle, not a
+    point-detector singularity.  When no detector radius is configured this
+    falls back to the inverse-square term.
+    """
+    radius = max(float(detector_radius_m), 0.0)
+    if radius <= 0.0:
+        return geometric_term(detector, source)
+    d = float(np.linalg.norm(np.asarray(detector, dtype=float) - np.asarray(source, dtype=float)))
+    d_eff = max(d, radius)
+    reference = max(1.0, radius)
+
+    def _sphere_fraction(distance: float) -> float:
+        """Return the external point-source solid-angle fraction of a sphere."""
+        if distance <= radius:
+            return 0.5
+        ratio = min(radius / max(distance, 1.0e-12), 1.0)
+        return 0.5 * (1.0 - float(np.sqrt(max(1.0 - ratio * ratio, 0.0))))
+
+    ref_fraction = max(_sphere_fraction(reference), 1.0e-12)
+    return float(_sphere_fraction(d_eff) / ref_fraction)
 
 
 def _normalize_isotope_key(isotope: str) -> str:
@@ -124,6 +182,206 @@ def obstacle_path_length_cm(
     return float(100.0 * path_m)
 
 
+def segment_sphere_intersection_length_m(
+    source_pos: NDArray[np.float64],
+    target_pos: NDArray[np.float64],
+    center_pos: NDArray[np.float64],
+    radius_m: float,
+    tol: float = 1e-12,
+) -> float:
+    """Return segment length inside a sphere in meters."""
+    source = np.asarray(source_pos, dtype=float)
+    target = np.asarray(target_pos, dtype=float)
+    center = np.asarray(center_pos, dtype=float)
+    radius = max(float(radius_m), 0.0)
+    direction = target - source
+    segment_length = float(np.linalg.norm(direction))
+    if radius <= 0.0 or segment_length <= tol:
+        return 0.0
+    rel_source = source - center
+    a = float(np.dot(direction, direction))
+    b = 2.0 * float(np.dot(rel_source, direction))
+    c = float(np.dot(rel_source, rel_source)) - radius * radius
+    rel_target = target - center
+    source_inside = c <= 0.0
+    target_inside = float(np.dot(rel_target, rel_target)) <= radius * radius
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < 0.0:
+        return segment_length if source_inside and target_inside else 0.0
+    sqrt_disc = float(np.sqrt(max(discriminant, 0.0)))
+    t0 = (-b - sqrt_disc) / (2.0 * a)
+    t1 = (-b + sqrt_disc) / (2.0 * a)
+    enter = max(0.0, min(t0, t1))
+    exit_ = min(1.0, max(t0, t1))
+    if exit_ <= enter:
+        return segment_length if source_inside and target_inside else 0.0
+    return max(0.0, exit_ - enter) * segment_length
+
+
+def segment_spherical_shell_path_length_cm(
+    source_pos: NDArray[np.float64],
+    target_pos: NDArray[np.float64],
+    center_pos: NDArray[np.float64],
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    blocked: bool,
+) -> float:
+    """Return segment length through a spherical shell centered at center_pos."""
+    if not blocked:
+        return 0.0
+    inner_m = max(0.0, float(inner_radius_cm) / 100.0)
+    outer_m = max(inner_m, float(outer_radius_cm) / 100.0)
+    if outer_m <= inner_m:
+        return 0.0
+    outer_length = segment_sphere_intersection_length_m(
+        source_pos,
+        target_pos,
+        center_pos,
+        outer_m,
+    )
+    inner_length = segment_sphere_intersection_length_m(
+        source_pos,
+        target_pos,
+        center_pos,
+        inner_m,
+    )
+    return float(100.0 * max(outer_length - inner_length, 0.0))
+
+
+def segment_rotated_octant_shell_path_length_cm(
+    source_pos: NDArray[np.float64],
+    target_pos: NDArray[np.float64],
+    center_pos: NDArray[np.float64],
+    shield_normal: NDArray[np.float64],
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    tol: float = 1.0e-12,
+) -> float:
+    """Return exact segment length inside a rotated local +X/+Y/+Z octant shell."""
+    source = np.asarray(source_pos, dtype=float)
+    target = np.asarray(target_pos, dtype=float)
+    center = np.asarray(center_pos, dtype=float)
+    rotation = rotation_matrix_between_vectors(
+        LOCAL_POSITIVE_OCTANT_CENTER,
+        np.asarray(shield_normal, dtype=float),
+    )
+    source_local = rotation.T @ (source - center)
+    target_local = rotation.T @ (target - center)
+    delta = target_local - source_local
+    segment_length = float(np.linalg.norm(delta))
+    if segment_length <= tol:
+        return 0.0
+    inner_m = max(0.0, float(inner_radius_cm) / 100.0)
+    outer_m = max(inner_m, float(outer_radius_cm) / 100.0)
+    if outer_m <= inner_m:
+        return 0.0
+    breakpoints: list[float] = [0.0, 1.0]
+    a = float(np.dot(delta, delta))
+    b = 2.0 * float(np.dot(source_local, delta))
+    for radius in (inner_m, outer_m):
+        c = float(np.dot(source_local, source_local)) - radius * radius
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            continue
+        root = float(np.sqrt(max(discriminant, 0.0)))
+        breakpoints.extend(
+            value
+            for value in (
+                (-b - root) / (2.0 * a),
+                (-b + root) / (2.0 * a),
+            )
+            if -tol <= value <= 1.0 + tol
+        )
+    for axis in range(3):
+        if abs(float(delta[axis])) <= tol:
+            continue
+        value = -float(source_local[axis]) / float(delta[axis])
+        if -tol <= value <= 1.0 + tol:
+            breakpoints.append(value)
+    clipped = sorted({float(np.clip(value, 0.0, 1.0)) for value in breakpoints})
+    length = 0.0
+    for left, right in zip(clipped[:-1], clipped[1:]):
+        if right - left <= tol:
+            continue
+        mid = 0.5 * (left + right)
+        point = source_local + mid * delta
+        radius_sq = float(np.dot(point, point))
+        inside_shell = (inner_m * inner_m - tol) <= radius_sq <= (outer_m * outer_m + tol)
+        inside_octant = bool(np.all(point >= -tol))
+        if inside_shell and inside_octant:
+            length += (right - left) * segment_length
+    return float(100.0 * length)
+
+
+def segment_rotated_octant_shell_path_length_cm_torch(
+    source_pos: "torch.Tensor",
+    target_pos: "torch.Tensor",
+    center_pos: "torch.Tensor",
+    shield_normal: NDArray[np.float64],
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    tol: float = 1.0e-9,
+) -> "torch.Tensor":
+    """Return exact segment length inside a rotated octant shell for torch tensors."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    rotation_np = rotation_matrix_between_vectors(
+        LOCAL_POSITIVE_OCTANT_CENTER,
+        np.asarray(shield_normal, dtype=float),
+    )
+    rotation = torch.as_tensor(rotation_np, device=source_pos.device, dtype=source_pos.dtype)
+    source_local = (source_pos - center_pos) @ rotation
+    target_local = (target_pos - center_pos) @ rotation
+    delta = target_local - source_local
+    segment_length = torch.linalg.norm(delta, dim=-1)
+    inner_m = max(0.0, float(inner_radius_cm) / 100.0)
+    outer_m = max(inner_m, float(outer_radius_cm) / 100.0)
+    if outer_m <= inner_m:
+        return torch.zeros_like(segment_length)
+    a = torch.sum(delta * delta, dim=-1)
+    b = 2.0 * torch.sum(source_local * delta, dim=-1)
+    breakpoints = [
+        torch.zeros_like(segment_length),
+        torch.ones_like(segment_length),
+    ]
+    for radius in (inner_m, outer_m):
+        c = torch.sum(source_local * source_local, dim=-1) - float(radius * radius)
+        discriminant = b * b - 4.0 * a * c
+        root = torch.sqrt(torch.clamp(discriminant, min=0.0))
+        denom = torch.clamp(2.0 * a, min=float(tol))
+        valid = discriminant >= 0.0
+        for sign in (-1.0, 1.0):
+            value = (-b + sign * root) / denom
+            value = torch.where(valid, value, torch.zeros_like(value))
+            breakpoints.append(torch.clamp(value, 0.0, 1.0))
+    for axis in range(3):
+        axis_delta = delta[..., axis]
+        valid = torch.abs(axis_delta) > float(tol)
+        value = -source_local[..., axis] / torch.where(
+            valid,
+            axis_delta,
+            torch.ones_like(axis_delta),
+        )
+        value = torch.where(valid, value, torch.zeros_like(value))
+        breakpoints.append(torch.clamp(value, 0.0, 1.0))
+    ordered = torch.sort(torch.stack(breakpoints, dim=-1), dim=-1).values
+    left = ordered[..., :-1]
+    right = ordered[..., 1:]
+    width = torch.clamp(right - left, min=0.0)
+    mid = 0.5 * (left + right)
+    point = source_local.unsqueeze(-2) + mid.unsqueeze(-1) * delta.unsqueeze(-2)
+    radius_sq = torch.sum(point * point, dim=-1)
+    inside_shell = (radius_sq >= inner_m * inner_m - float(tol)) & (
+        radius_sq <= outer_m * outer_m + float(tol)
+    )
+    inside_octant = torch.all(point >= -float(tol), dim=-1)
+    length_m = torch.sum(
+        torch.where(inside_shell & inside_octant, width, torch.zeros_like(width)),
+        dim=-1,
+    ) * segment_length
+    return torch.where(segment_length > float(tol), 100.0 * length_m, torch.zeros_like(length_m))
+
+
 def obstacle_path_lengths_cm_torch(
     positions: "torch.Tensor",
     detector_pos: "torch.Tensor",
@@ -171,6 +429,63 @@ def obstacle_path_lengths_cm_torch(
     t_enter = torch.maximum(torch.stack(t_min_axes, dim=-1).amax(dim=-1), torch.zeros_like(distance).unsqueeze(-1))
     t_exit = torch.minimum(torch.stack(t_max_axes, dim=-1).amin(dim=-1), torch.ones_like(distance).unsqueeze(-1))
     length_m = torch.where(t_exit > t_enter, (t_exit - t_enter) * distance.unsqueeze(-1), torch.zeros_like(t_exit))
+    return 100.0 * torch.sum(length_m, dim=-1)
+
+
+def obstacle_path_lengths_between_points_cm_torch(
+    source_pos: "torch.Tensor",
+    target_pos: "torch.Tensor",
+    obstacle_boxes_m: "torch.Tensor",
+    tol: float = 1e-9,
+) -> "torch.Tensor":
+    """Return path lengths through axis-aligned boxes for source-target segments."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    if obstacle_boxes_m.numel() == 0:
+        return torch.zeros(source_pos.shape[:-1], device=source_pos.device, dtype=source_pos.dtype)
+    if obstacle_boxes_m.ndim != 2 or obstacle_boxes_m.shape[1] != 6:
+        raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
+    p0 = source_pos.unsqueeze(-2)
+    delta = (target_pos - source_pos).unsqueeze(-2)
+    distance = torch.linalg.norm(target_pos - source_pos, dim=-1)
+    lower = obstacle_boxes_m[:, :3].to(device=source_pos.device, dtype=source_pos.dtype)
+    upper = obstacle_boxes_m[:, 3:].to(device=source_pos.device, dtype=source_pos.dtype)
+    tol_t = torch.as_tensor(tol, device=source_pos.device, dtype=source_pos.dtype)
+    t_min_axes = []
+    t_max_axes = []
+    for axis in range(3):
+        value = p0[..., axis]
+        step = delta[..., axis]
+        lo = lower[:, axis]
+        hi = upper[:, axis]
+        parallel = torch.abs(step) <= tol_t
+        inside = (value >= lo) & (value <= hi)
+        safe_step = torch.where(parallel, torch.ones_like(step), step)
+        t0 = (lo - value) / safe_step
+        t1 = (hi - value) / safe_step
+        axis_min = torch.minimum(t0, t1)
+        axis_max = torch.maximum(t0, t1)
+        neg_inf = torch.full_like(axis_min, -float("inf"))
+        pos_inf = torch.full_like(axis_max, float("inf"))
+        axis_min = torch.where(parallel & inside, neg_inf, axis_min)
+        axis_max = torch.where(parallel & inside, pos_inf, axis_max)
+        axis_min = torch.where(parallel & ~inside, pos_inf, axis_min)
+        axis_max = torch.where(parallel & ~inside, neg_inf, axis_max)
+        t_min_axes.append(axis_min)
+        t_max_axes.append(axis_max)
+    t_enter = torch.maximum(
+        torch.stack(t_min_axes, dim=-1).amax(dim=-1),
+        torch.zeros_like(distance).unsqueeze(-1),
+    )
+    t_exit = torch.minimum(
+        torch.stack(t_max_axes, dim=-1).amin(dim=-1),
+        torch.ones_like(distance).unsqueeze(-1),
+    )
+    length_m = torch.where(
+        t_exit > t_enter,
+        (t_exit - t_enter) * distance.unsqueeze(-1),
+        torch.zeros_like(t_exit),
+    )
     return 100.0 * torch.sum(length_m, dim=-1)
 
 
@@ -225,6 +540,9 @@ class ContinuousKernel:
     obstacle_grid: ObstacleGrid | None = None
     obstacle_height_m: float = 2.0
     obstacle_mu_by_isotope: Dict[str, float] | None = None
+    obstacle_buildup_coeff: float = 0.0
+    detector_radius_m: float = 0.0
+    detector_aperture_samples: int = 1
     _obstacle_boxes_cache: NDArray[np.float64] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -232,6 +550,21 @@ class ContinuousKernel:
         self.obstacle_height_m = float(self.obstacle_height_m)
         if self.obstacle_height_m < 0.0:
             raise ValueError("obstacle_height_m must be non-negative.")
+        self.obstacle_buildup_coeff = max(float(self.obstacle_buildup_coeff), 0.0)
+        self.shield_params = ShieldParams(
+            mu_pb=float(self.shield_params.mu_pb),
+            mu_fe=float(self.shield_params.mu_fe),
+            thickness_pb_cm=float(self.shield_params.thickness_pb_cm),
+            thickness_fe_cm=float(self.shield_params.thickness_fe_cm),
+            inner_radius_fe_cm=float(self.shield_params.inner_radius_fe_cm),
+            inner_radius_pb_cm=float(self.shield_params.inner_radius_pb_cm),
+            buildup_fe_coeff=max(float(self.shield_params.buildup_fe_coeff), 0.0),
+            buildup_pb_coeff=max(float(self.shield_params.buildup_pb_coeff), 0.0),
+            shield_geometry_model=self.shield_params.shield_geometry_model,
+            use_angle_attenuation=bool(self.shield_params.use_angle_attenuation),
+        )
+        self.detector_radius_m = max(float(self.detector_radius_m), 0.0)
+        self.detector_aperture_samples = max(int(self.detector_aperture_samples), 1)
 
     def _mu_values(self, isotope: str) -> tuple[float, float]:
         """Return (mu_fe, mu_pb) for the given isotope with fallbacks."""
@@ -297,7 +630,38 @@ class ContinuousKernel:
         return {
             "obstacle_boxes_m": boxes,
             "obstacle_mu_cm_inv": self.obstacle_mu_cm_inv(isotope),
+            "obstacle_buildup_coeff": self.obstacle_buildup_coeff,
         }
+
+    def _buildup_factor(
+        self,
+        tau_fe: float,
+        tau_pb: float,
+        tau_obstacle: float,
+    ) -> float:
+        """Return a bounded broad-beam build-up factor from optical depths."""
+        factor = 1.0
+        factor += self.shield_params.buildup_fe_coeff * (1.0 - float(np.exp(-max(tau_fe, 0.0))))
+        factor += self.shield_params.buildup_pb_coeff * (1.0 - float(np.exp(-max(tau_pb, 0.0))))
+        factor += self.obstacle_buildup_coeff * (1.0 - float(np.exp(-max(tau_obstacle, 0.0))))
+        return max(1.0, float(factor))
+
+    def _buildup_factor_torch(
+        self,
+        tau_fe: "torch.Tensor",
+        tau_pb: "torch.Tensor",
+        tau_obstacle: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return a broad-beam build-up factor for torch optical depths."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        factor = torch.ones_like(tau_fe)
+        factor = factor + self.shield_params.buildup_fe_coeff * (1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0)))
+        factor = factor + self.shield_params.buildup_pb_coeff * (1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0)))
+        factor = factor + self.obstacle_buildup_coeff * (
+            1.0 - torch.exp(-torch.clamp(tau_obstacle, min=0.0))
+        )
+        return torch.clamp(factor, min=1.0)
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
@@ -325,6 +689,28 @@ class ContinuousKernel:
             & (phi - tol_t < phi_high)
         )
 
+    def _rotated_octant_blocked_mask_torch(
+        self,
+        detector_to_source_unit: "torch.Tensor",
+        octant_index: int,
+        tol: float,
+    ) -> "torch.Tensor":
+        """Return a mask for the rotated local +X/+Y/+Z shield octant."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        physical_normal = -np.asarray(self.orientations[octant_index], dtype=float)
+        rotation_np = rotation_matrix_between_vectors(
+            LOCAL_POSITIVE_OCTANT_CENTER,
+            physical_normal,
+        )
+        rotation = torch.as_tensor(
+            rotation_np,
+            device=detector_to_source_unit.device,
+            dtype=detector_to_source_unit.dtype,
+        )
+        local_direction = detector_to_source_unit @ rotation
+        return torch.all(local_direction >= -float(tol), dim=-1)
+
     def _shield_path_length_cm(
         self,
         direction_m: NDArray[np.float64],
@@ -351,6 +737,138 @@ class ContinuousKernel:
             blocked=blocked,
             use_angle_attenuation=self.shield_params.use_angle_attenuation,
         )
+
+    def _shield_segment_path_length_cm(
+        self,
+        source_pos: NDArray[np.float64],
+        target_pos: NDArray[np.float64],
+        detector_center: NDArray[np.float64],
+        incoming_normal: NDArray[np.float64],
+        physical_normal: NDArray[np.float64],
+        thickness_cm: float,
+        inner_radius_cm: float,
+        blocked: bool,
+    ) -> float:
+        """Return shield path length for a source-to-detector-aperture segment."""
+        if (
+            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+            and not self.shield_params.use_angle_attenuation
+        ):
+            return segment_rotated_octant_shell_path_length_cm(
+                source_pos=source_pos,
+                target_pos=target_pos,
+                center_pos=detector_center,
+                shield_normal=physical_normal,
+                inner_radius_cm=inner_radius_cm,
+                outer_radius_cm=inner_radius_cm + thickness_cm,
+            )
+        return self._shield_path_length_cm(
+            direction_m=np.asarray(target_pos, dtype=float) - np.asarray(source_pos, dtype=float),
+            normal=incoming_normal,
+            thickness_cm=thickness_cm,
+            inner_radius_cm=inner_radius_cm,
+            blocked=blocked,
+        )
+
+    def _detector_aperture_targets(
+        self,
+        source_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return deterministic target points on the detector aperture disk."""
+        detector = np.asarray(detector_pos, dtype=float)
+        source = np.asarray(source_pos, dtype=float)
+        if self.detector_radius_m <= 0.0 or self.detector_aperture_samples <= 1:
+            return detector.reshape(1, 3)
+        axis = detector - source
+        distance = float(np.linalg.norm(axis))
+        if distance <= 1.0e-12:
+            return detector.reshape(1, 3)
+        axis /= distance
+        helper = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(axis, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0], dtype=float)
+        basis_u = np.cross(axis, helper)
+        basis_u_norm = float(np.linalg.norm(basis_u))
+        if basis_u_norm <= 1.0e-12:
+            return detector.reshape(1, 3)
+        basis_u /= basis_u_norm
+        basis_v = np.cross(axis, basis_u)
+        radius = min(self.detector_radius_m, 0.95 * distance)
+        count = int(self.detector_aperture_samples)
+        targets = np.empty((count, 3), dtype=float)
+        targets[0] = detector
+        if count == 1:
+            return targets
+        golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+        for index in range(1, count):
+            fraction = (float(index) - 0.5) / float(count - 1)
+            sample_radius = radius * float(np.sqrt(np.clip(fraction, 0.0, 1.0)))
+            angle = golden_angle * float(index)
+            offset = sample_radius * (
+                float(np.cos(angle)) * basis_u + float(np.sin(angle)) * basis_v
+            )
+            targets[index] = detector + offset
+        return targets
+
+    def _attenuation_factor_for_target(
+        self,
+        isotope: str,
+        source_pos: NDArray[np.float64],
+        target_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+    ) -> float:
+        """Return attenuation for one source-to-aperture ray."""
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        normal_fe = self.orientations[fe_index]
+        normal_pb = self.orientations[pb_index]
+        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(target_pos, dtype=float)
+        blocked_fe = rotated_positive_octant_blocks_direction(
+            detector_to_source,
+            -normal_fe,
+        )
+        blocked_pb = rotated_positive_octant_blocks_direction(
+            detector_to_source,
+            -normal_pb,
+        )
+        l_fe = self._shield_segment_path_length_cm(
+            source_pos=source_pos,
+            target_pos=target_pos,
+            detector_center=detector_pos,
+            incoming_normal=normal_fe,
+            physical_normal=-normal_fe,
+            thickness_cm=self.shield_params.thickness_fe_cm,
+            inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+            blocked=blocked_fe,
+        )
+        l_pb = self._shield_segment_path_length_cm(
+            source_pos=source_pos,
+            target_pos=target_pos,
+            detector_center=detector_pos,
+            incoming_normal=normal_pb,
+            physical_normal=-normal_pb,
+            thickness_cm=self.shield_params.thickness_pb_cm,
+            inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+            blocked=blocked_pb,
+        )
+        tau_fe = float(mu_fe * l_fe)
+        tau_pb = float(mu_pb * l_pb)
+        tau_obstacle = 0.0
+        if self.obstacle_grid is None:
+            buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
+            return float(min(1.0, np.exp(-(tau_fe + tau_pb)) * buildup))
+        obstacle_path_cm = obstacle_path_length_cm(
+            source_pos=source_pos,
+            detector_pos=target_pos,
+            obstacle_boxes_m=self.obstacle_boxes_m(),
+        )
+        if obstacle_path_cm > 0.0:
+            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope) * obstacle_path_cm)
+        total_tau = tau_fe + tau_pb + tau_obstacle
+        buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
+        return float(min(1.0, np.exp(-total_tau) * buildup))
 
     def _shield_path_lengths_torch(
         self,
@@ -405,6 +923,47 @@ class ContinuousKernel:
         )
         return l_fe, l_pb
 
+    def _detector_aperture_targets_torch(
+        self,
+        sources: "torch.Tensor",
+        detector: "torch.Tensor",
+        dist: "torch.Tensor",
+        tol: float,
+    ) -> tuple["torch.Tensor", int]:
+        """Return deterministic detector-aperture targets for torch sources."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        if self.detector_radius_m <= 0.0 or self.detector_aperture_samples <= 1:
+            return detector.expand_as(sources).unsqueeze(-2), 1
+        sample_count = max(int(self.detector_aperture_samples), 1)
+        axis = (detector - sources) / dist.unsqueeze(-1)
+        helper_z = torch.zeros_like(axis)
+        helper_z[..., 2] = 1.0
+        helper_y = torch.zeros_like(axis)
+        helper_y[..., 1] = 1.0
+        helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
+        basis_u = torch.linalg.cross(axis, helper, dim=-1)
+        basis_u = basis_u / torch.clamp(torch.linalg.norm(basis_u, dim=-1, keepdim=True), min=tol)
+        basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
+        indices = torch.arange(sample_count, device=sources.device, dtype=sources.dtype)
+        fractions = torch.clamp((indices - 0.5) / float(sample_count - 1), min=0.0, max=1.0)
+        radii = torch.sqrt(fractions)
+        radii[0] = 0.0
+        max_radius = torch.minimum(
+            torch.as_tensor(self.detector_radius_m, device=sources.device, dtype=sources.dtype),
+            0.95 * dist,
+        )
+        angles = indices * torch.as_tensor(np.pi * (3.0 - np.sqrt(5.0)), device=sources.device, dtype=sources.dtype)
+        offsets = (
+            max_radius.unsqueeze(-1).unsqueeze(-1)
+            * radii.view(1, sample_count, 1)
+            * (
+                torch.cos(angles).view(1, sample_count, 1) * basis_u.unsqueeze(-2)
+                + torch.sin(angles).view(1, sample_count, 1) * basis_v.unsqueeze(-2)
+            )
+        )
+        return detector.expand_as(sources).unsqueeze(-2) + offsets, sample_count
+
     def _expected_rate_pair_torch(
         self,
         isotope: str,
@@ -430,38 +989,244 @@ class ContinuousKernel:
         dist = torch.linalg.norm(direction, dim=1)
         tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
         dist = torch.where(dist <= tol_t, tol_t, dist)
-        dir_unit = direction / dist.unsqueeze(-1)
-        geom = 1.0 / (dist**2)
+        geom = _finite_sphere_geometric_term_torch(
+            dist,
+            detector_radius_m=self.detector_radius_m,
+            tol=tol_t,
+        )
+        targets, sample_count = self._detector_aperture_targets_torch(
+            sources=sources_t,
+            detector=detector_t,
+            dist=dist,
+            tol=tol,
+        )
+        sampled_sources = sources_t.unsqueeze(-2).expand_as(targets)
+        sampled_direction = targets - sampled_sources
+        sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+        sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
 
-        blocked_fe = self._blocked_mask_torch(dir_unit, fe_index, tol)
-        blocked_pb = self._blocked_mask_torch(dir_unit, pb_index, tol)
+        detector_to_source_unit = -dir_unit
+        blocked_fe = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, fe_index, tol)
+        blocked_pb = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, pb_index, tol)
         normal_fe = torch.as_tensor(self.orientations[fe_index], device=device, dtype=dtype)
         normal_pb = torch.as_tensor(self.orientations[pb_index], device=device, dtype=dtype)
-        cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=1), 0.0, 1.0)
-        cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=1), 0.0, 1.0)
-        L_fe, L_pb = self._shield_path_lengths_torch(
-            direction=direction,
-            blocked_fe=blocked_fe,
-            blocked_pb=blocked_pb,
-            cos_fe=cos_fe,
-            cos_pb=cos_pb,
-            tol_t=tol_t,
-            device=device,
-            dtype=dtype,
-        )
+        cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=-1), 0.0, 1.0)
+        cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
+        if (
+            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+            and not self.shield_params.use_angle_attenuation
+        ):
+            center = detector_t.expand_as(sources_t).unsqueeze(-2)
+            L_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=-np.asarray(self.orientations[fe_index], dtype=float),
+                inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                outer_radius_cm=self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
+                tol=tol,
+            )
+            L_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=-np.asarray(self.orientations[pb_index], dtype=float),
+                inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                outer_radius_cm=self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
+                tol=tol,
+            )
+        else:
+            L_fe, L_pb = self._shield_path_lengths_torch(
+                direction=sampled_direction,
+                blocked_fe=blocked_fe,
+                blocked_pb=blocked_pb,
+                cos_fe=cos_fe,
+                cos_pb=cos_pb,
+                tol_t=tol_t,
+                device=device,
+                dtype=dtype,
+            )
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+        tau_fe = float(mu_fe) * L_fe
+        tau_pb = float(mu_pb) * L_pb
+        tau_obstacle = torch.zeros_like(tau_fe)
         boxes_np = self.obstacle_boxes_m()
         if boxes_np.size:
             boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
-            obstacle_path_cm = obstacle_path_lengths_cm_torch(
-                positions=sources_t,
-                detector_pos=detector_t.reshape(3),
-                obstacle_boxes_m=boxes_t,
-            )
-            att = att * torch.exp(-self.obstacle_mu_cm_inv(isotope) * obstacle_path_cm)
+            if sample_count > 1:
+                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    obstacle_boxes_m=boxes_t,
+                    tol=tol,
+                )
+            else:
+                obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                    positions=sources_t,
+                    detector_pos=detector_t.reshape(3),
+                    obstacle_boxes_m=boxes_t,
+                ).unsqueeze(-1)
+            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope)) * obstacle_path_cm
+        total_tau = tau_fe + tau_pb + tau_obstacle
+        buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
+        att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
+        att = torch.mean(att, dim=-1)
         rate = torch.sum(geom * att * strengths_t) + float(background)
         return float(rate.detach().cpu().item())
+
+    def _kernel_values_pair_torch_chunk(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        tol: float = 1e-6,
+    ) -> NDArray[np.float64]:
+        """Return per-source kernel values for one GPU chunk."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
+        if sources_t.numel() == 0:
+            return np.zeros(0, dtype=float)
+        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 3)
+        direction = detector_t - sources_t
+        dist = torch.linalg.norm(direction, dim=1)
+        tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
+        dist = torch.where(dist <= tol_t, tol_t, dist)
+        geom = _finite_sphere_geometric_term_torch(
+            dist,
+            detector_radius_m=self.detector_radius_m,
+            tol=tol_t,
+        )
+        targets, sample_count = self._detector_aperture_targets_torch(
+            sources=sources_t,
+            detector=detector_t,
+            dist=dist,
+            tol=tol,
+        )
+        sampled_sources = sources_t.unsqueeze(-2).expand_as(targets)
+        sampled_direction = targets - sampled_sources
+        sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+        sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+
+        detector_to_source_unit = -dir_unit
+        blocked_fe = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, fe_index, tol)
+        blocked_pb = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, pb_index, tol)
+        normal_fe = torch.as_tensor(self.orientations[fe_index], device=device, dtype=dtype)
+        normal_pb = torch.as_tensor(self.orientations[pb_index], device=device, dtype=dtype)
+        cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=-1), 0.0, 1.0)
+        cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
+        if (
+            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+            and not self.shield_params.use_angle_attenuation
+        ):
+            center = detector_t.expand_as(sources_t).unsqueeze(-2)
+            L_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=-np.asarray(self.orientations[fe_index], dtype=float),
+                inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                outer_radius_cm=self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
+                tol=tol,
+            )
+            L_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=-np.asarray(self.orientations[pb_index], dtype=float),
+                inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                outer_radius_cm=self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
+                tol=tol,
+            )
+        else:
+            L_fe, L_pb = self._shield_path_lengths_torch(
+                direction=sampled_direction,
+                blocked_fe=blocked_fe,
+                blocked_pb=blocked_pb,
+                cos_fe=cos_fe,
+                cos_pb=cos_pb,
+                tol_t=tol_t,
+                device=device,
+                dtype=dtype,
+            )
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        tau_fe = float(mu_fe) * L_fe
+        tau_pb = float(mu_pb) * L_pb
+        tau_obstacle = torch.zeros_like(tau_fe)
+        boxes_np = self.obstacle_boxes_m()
+        if boxes_np.size:
+            boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
+            if sample_count > 1:
+                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    obstacle_boxes_m=boxes_t,
+                    tol=tol,
+                )
+            else:
+                obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                    positions=sources_t,
+                    detector_pos=detector_t.reshape(3),
+                    obstacle_boxes_m=boxes_t,
+                ).unsqueeze(-1)
+            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope)) * obstacle_path_cm
+        total_tau = tau_fe + tau_pb + tau_obstacle
+        buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
+        att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
+        att = torch.mean(att, dim=-1)
+        values = geom * att
+        return values.detach().cpu().numpy().astype(float, copy=False)
+
+    def kernel_values_pair(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        chunk_size: int = 8192,
+    ) -> NDArray[np.float64]:
+        """Evaluate K values for many sources at one detector pose."""
+        sources_arr = np.asarray(sources, dtype=float)
+        if sources_arr.size == 0:
+            return np.zeros(0, dtype=float)
+        if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if not self.use_gpu:
+            return np.asarray(
+                [
+                    self.kernel_value_pair(
+                        isotope=isotope,
+                        detector_pos=detector_pos,
+                        source_pos=source,
+                        fe_index=fe_index,
+                        pb_index=pb_index,
+                    )
+                    for source in sources_arr
+                ],
+                dtype=float,
+            )
+        self._gpu_enabled()
+        chunk = max(1, int(chunk_size))
+        parts: list[NDArray[np.float64]] = []
+        for start in range(0, sources_arr.shape[0], chunk):
+            stop = min(start + chunk, sources_arr.shape[0])
+            parts.append(
+                self._kernel_values_pair_torch_chunk(
+                    isotope=isotope,
+                    detector_pos=detector_pos,
+                    sources=sources_arr[start:stop],
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                )
+            )
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=float)
 
     def attenuation_factor(
         self,
@@ -475,30 +1240,13 @@ class ContinuousKernel:
 
         This treats Fe and Pb shells as sharing the same orientation index.
         """
-        normal = self.orientations[orient_idx]
-        blocked = self.octant_shield.blocks_ray(
-            detector_position=detector_pos,
-            source_position=source_pos,
-            octant_index=orient_idx,
+        return self.attenuation_factor_pair(
+            isotope=isotope,
+            source_pos=source_pos,
+            detector_pos=detector_pos,
+            fe_index=orient_idx,
+            pb_index=orient_idx,
         )
-        direction = detector_pos - source_pos
-        mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        L_fe = self._shield_path_length_cm(
-            direction_m=direction,
-            normal=normal,
-            thickness_cm=self.shield_params.thickness_fe_cm,
-            inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-            blocked=blocked,
-        )
-        L_pb = self._shield_path_length_cm(
-            direction_m=direction,
-            normal=normal,
-            thickness_cm=self.shield_params.thickness_pb_cm,
-            inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-            blocked=blocked,
-        )
-        shield_att = float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
-        return shield_att * self._obstacle_attenuation_factor(isotope, source_pos, detector_pos)
 
     def attenuation_factor_pair(
         self,
@@ -509,36 +1257,28 @@ class ContinuousKernel:
         pb_index: int,
     ) -> float:
         """Return combined Fe/Pb attenuation factor A^{sh} (Sec. 3.2)."""
-        direction = detector_pos - source_pos
-        mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        normal_fe = self.orientations[fe_index]
-        normal_pb = self.orientations[pb_index]
-        blocked_fe = self.octant_shield.blocks_ray(
-            detector_position=detector_pos,
-            source_position=source_pos,
-            octant_index=fe_index,
+        if self.detector_radius_m > 0.0 and self.detector_aperture_samples > 1:
+            targets = self._detector_aperture_targets(source_pos, detector_pos)
+            values = [
+                self._attenuation_factor_for_target(
+                    isotope=isotope,
+                    source_pos=source_pos,
+                    target_pos=target,
+                    detector_pos=detector_pos,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                )
+                for target in targets
+            ]
+            return float(np.mean(values)) if values else 1.0
+        return self._attenuation_factor_for_target(
+            isotope=isotope,
+            source_pos=source_pos,
+            target_pos=detector_pos,
+            detector_pos=detector_pos,
+            fe_index=fe_index,
+            pb_index=pb_index,
         )
-        blocked_pb = self.octant_shield.blocks_ray(
-            detector_position=detector_pos,
-            source_position=source_pos,
-            octant_index=pb_index,
-        )
-        L_fe = self._shield_path_length_cm(
-            direction_m=direction,
-            normal=normal_fe,
-            thickness_cm=self.shield_params.thickness_fe_cm,
-            inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-            blocked=blocked_fe,
-        )
-        L_pb = self._shield_path_length_cm(
-            direction_m=direction,
-            normal=normal_pb,
-            thickness_cm=self.shield_params.thickness_pb_cm,
-            inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-            blocked=blocked_pb,
-        )
-        shield_att = float(np.exp(-(mu_fe * L_fe + mu_pb * L_pb)))
-        return shield_att * self._obstacle_attenuation_factor(isotope, source_pos, detector_pos)
 
     def kernel_value(
         self,
@@ -550,7 +1290,11 @@ class ContinuousKernel:
         """
         Evaluate K_{k,j,h} = G_{k,j} * A^{sh}_{k,j,h} (Eq. 3.11).
         """
-        geom = geometric_term(detector_pos, source_pos)
+        geom = finite_sphere_geometric_term(
+            detector_pos,
+            source_pos,
+            self.detector_radius_m,
+        )
         att = self.attenuation_factor(isotope, source_pos, detector_pos, orient_idx)
         return geom * att
 
@@ -563,7 +1307,11 @@ class ContinuousKernel:
         pb_index: int,
     ) -> float:
         """Evaluate K_{k,j,h}(R_Fe, R_Pb) for a Fe/Pb orientation pair."""
-        geom = geometric_term(detector_pos, source_pos)
+        geom = finite_sphere_geometric_term(
+            detector_pos,
+            source_pos,
+            self.detector_radius_m,
+        )
         att = self.attenuation_factor_pair(isotope, source_pos, detector_pos, fe_index, pb_index)
         return geom * att
 
@@ -702,7 +1450,7 @@ def expected_counts_single_isotope(
         k = ContinuousKernel(
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params or ShieldParams(),
-            use_gpu=bool(use_gpu) if use_gpu is not None else True,
+            use_gpu=bool(use_gpu) if use_gpu is not None else False,
             gpu_device=gpu_device,
             gpu_dtype=gpu_dtype,
         )

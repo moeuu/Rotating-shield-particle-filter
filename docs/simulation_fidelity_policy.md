@@ -1,17 +1,21 @@
 # Simulation Fidelity Policy
 
 Runtime simulation must preserve physical fidelity by default. Performance
-work is acceptable only when it keeps the same physics, geometry, emission
-statistics, and observation path.
+work is acceptable only when it keeps the same physics, geometry, source-rate
+definition, statistics, and observation path.
 
 ## Prohibited Runtime Shortcuts
 
 - Do not use surrogate transport in Geant4 runtime modes.
 - Do not bypass spectrum generation with expected-count observations.
 - Do not cap, downsample, or weight Geant4 histories to shorten runtime.
-- Do not emit gammas only toward the detector; source emission must remain
-  isotropic unless a validated physical source model explicitly requires
-  anisotropy.
+- Do not silently reinterpret `intensity_cps_1m` as total isotropic source
+  emission. Runtime defaults use the explicit `detector_cps_1m` source-rate
+  model: `intensity_cps_1m` is the expected net detector count rate at 1 m for
+  the configured detector and spectral processing.
+- Do not use detector-directed transport when a configuration explicitly asks
+  for an isotropic total-emission source model. Detector-directed transport is
+  allowed only under the explicit `detector_cps_1m` source-rate model.
 - Do not use deterministic background smoothing in runtime observations.
 - Do not use `theory_tvl` attenuation or synthetic scatter gain in runtime
   Geant4 configurations.
@@ -31,6 +35,9 @@ statistics, and observation path.
 - CPU multithreading inside Geant4.
 - GPU acceleration for PF or planning math when it preserves the same model.
 - Geometry caching that does not change exported geometry or materials.
+- Detector-equivalent Geant4 source sampling under `source_rate_model =
+  detector_cps_1m`, where primary histories represent detector-count-rate
+  histories rather than total gamma/s activity.
 - Visualization sampling, as long as it affects only rendered tracks and not
   spectra, counts, or PF observations.
 - Separate planning heuristics, if they do not replace the runtime spectrum or

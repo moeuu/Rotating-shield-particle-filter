@@ -18,6 +18,7 @@ from sim.isaacsim_app.radiation_visualizer import RadiationSceneVisualizer
 from sim.isaacsim_app.scene_builder import SceneBuilder, SceneDescription
 from sim.isaacsim_app.stage_backend import IsaacSimStageBackend, StageBackend
 from sim.protocol import SimulationCommand, SimulationObservation
+from sim.shield_geometry import ShieldThicknessConfig, resolve_shield_thickness_config
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,9 @@ class IsaacSimAppConfig:
     obstacle_height_m: float = 2.0
     fe_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25)
     pb_shield_size_xyz: tuple[float, float, float] = (0.25, 0.08, 0.25)
+    scatter_gain: float = 0.03
+    detector_model: dict[str, Any] = field(default_factory=dict)
+    shield_thickness: ShieldThicknessConfig = field(default_factory=resolve_shield_thickness_config)
     robot_motion_speed_m_s: float = 0.5
     robot_ground_z_m: float = 0.0
     robot_animation_dt_s: float = 0.2
@@ -99,6 +103,11 @@ class IsaacSimAppConfig:
         stage_material_rules_payload = payload.get("stage_material_rules", ())
         if not isinstance(stage_material_rules_payload, (list, tuple)):
             raise ValueError("stage_material_rules must be a list of objects.")
+        detector_model_payload = payload.get("detector_model", {})
+        if detector_model_payload is None:
+            detector_model_payload = {}
+        if not isinstance(detector_model_payload, Mapping):
+            raise ValueError("detector_model must be an object.")
         stage_material_rules = tuple(
             StageMaterialRule(
                 path_prefix=str(entry["path_prefix"]),
@@ -114,6 +123,9 @@ class IsaacSimAppConfig:
             obstacle_height_m=float(payload.get("obstacle_height_m", 2.0)),
             fe_shield_size_xyz=tuple(float(value) for value in fe_shield_size),
             pb_shield_size_xyz=tuple(float(value) for value in pb_shield_size),
+            scatter_gain=float(payload.get("scatter_gain", 0.03)),
+            detector_model=dict(detector_model_payload),
+            shield_thickness=resolve_shield_thickness_config(payload),
             robot_motion_speed_m_s=float(payload.get("robot_motion_speed_m_s", 0.5)),
             robot_ground_z_m=float(payload.get("robot_ground_z_m", 0.0)),
             robot_animation_dt_s=float(payload.get("robot_animation_dt_s", 0.2)),
@@ -277,7 +289,12 @@ class IsaacSimApplication:
         )
         self.stage_material_rules = self.config.stage_material_rules
         if self.use_mock:
-            self.observation_model = MockObservationModel()
+            self.observation_model = MockObservationModel(
+            asset_geometry=self.asset_geometry,
+            scatter_gain=self.config.scatter_gain,
+            detector_model=self.config.detector_model,
+            shield_thickness=self.config.shield_thickness,
+        )
             return
         backend = stage_backend
         if backend is None:
@@ -294,6 +311,7 @@ class IsaacSimApplication:
             obstacle_height_m=self.config.obstacle_height_m,
             fe_shield_size_xyz=self.config.fe_shield_size_xyz,
             pb_shield_size_xyz=self.config.pb_shield_size_xyz,
+            shield_thickness=self.config.shield_thickness,
         )
         self.robot_controller = RobotController(
             backend,
@@ -312,11 +330,18 @@ class IsaacSimApplication:
             usd_path=self.config.usd_path,
             asset_geometry=self.asset_geometry,
             stage_material_rules=self.stage_material_rules,
+            scatter_gain=self.config.scatter_gain,
+            detector_model=self.config.detector_model,
+            shield_thickness=self.config.shield_thickness,
         )
 
     def reset(self, scene: SceneDescription) -> None:
         """Load a new scene description and reset robot state."""
-        if scene.usd_path is None and self.config.usd_path is not None:
+        if (
+            scene.usd_path is None
+            and scene.use_config_usd_fallback
+            and self.config.usd_path is not None
+        ):
             scene.usd_path = self.config.usd_path
         if self.config.author_obstacle_prims is not None:
             scene.author_obstacle_prims = self.config.author_obstacle_prims
@@ -356,6 +381,8 @@ class IsaacSimApplication:
             usd_path=scene.usd_path,
             asset_geometry=self.asset_geometry,
             stage_material_rules=self.stage_material_rules,
+            scatter_gain=self.config.scatter_gain,
+            detector_model=self.config.detector_model,
         )
         self.observation_model.reset(scene)
         self._configure_stage_view_helpers()

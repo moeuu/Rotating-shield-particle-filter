@@ -109,6 +109,18 @@ def minimum_observation_shortfall(
     return float(np.mean(shortfalls)) if shortfalls else 0.0
 
 
+def _minimum_observation_feasible_mask(
+    penalties: NDArray[np.float64],
+    min_counts: float,
+    eps: float = 1e-12,
+) -> NDArray[np.bool_]:
+    """Return candidates satisfying the all-isotope minimum observation target."""
+    penalty_arr = np.asarray(penalties, dtype=float).ravel()
+    if float(min_counts) <= 0.0:
+        return np.ones(penalty_arr.shape, dtype=bool)
+    return penalty_arr <= float(eps)
+
+
 def _auto_scale_observation_penalty(
     base_scores: NDArray[np.float64],
     penalties: NDArray[np.float64],
@@ -333,10 +345,11 @@ def select_next_pose_from_candidates(
     """
     Select the next pose from explicit candidate coordinates using an uncertainty criterion.
 
-    Score_k = E[U | q_k] + lambda_cost * C_move + eta * G(q_k)
-    where U is either after-rotation or after-pose uncertainty depending on criterion.
-    G(q_k) is a soft constraint penalizing poses whose posterior-predicted
-    isotope counts fall below ``min_observation_counts`` for any isotope.
+    Score_k = E[U | q_k] + lambda_cost * C_move + eta * G(q_k), where U is
+    either after-rotation or after-pose uncertainty depending on criterion.
+    If any candidate satisfies the all-isotope ``min_observation_counts``
+    target, infeasible candidates are excluded. If none do, G(q_k) remains a
+    soft fallback penalty so planning does not deadlock.
 
     GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
     When verbose is True, top_k and ig_breakdown_k control extra diagnostics.
@@ -500,6 +513,14 @@ def select_next_pose_from_candidates(
             scale=float(min_observation_penalty_scale),
         )
         scores = base_scores + observation_penalty_weight * observation_penalties_arr
+        feasible_mask = _minimum_observation_feasible_mask(
+            observation_penalties_arr,
+            float(min_observation_counts),
+        )
+        feasible_count = int(np.count_nonzero(feasible_mask))
+        if 0 < feasible_count < int(scores.size):
+            scores = scores.copy()
+            scores[~feasible_mask] = np.inf
         best_idx = int(np.argmin(scores))
         if verbose and best_idx >= 0:
             best_pose = candidate_poses_xyz[best_idx]
@@ -528,6 +549,7 @@ def select_next_pose_from_candidates(
                     "Observation guarantee: "
                     f"min_counts={float(min_observation_counts):.6g}, "
                     f"aggregate={min_observation_aggregate}, "
+                    f"feasible_candidates={feasible_count}/{len(scores)}, "
                     f"counts={observation_counts_by_candidate[best_idx]}"
                 )
             if len(scores) > 1:

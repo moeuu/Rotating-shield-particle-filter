@@ -13,16 +13,14 @@ import tempfile
 import time
 from typing import Any
 
-import numpy as np
-
-from measurement.model import EnvironmentConfig, PointSource
-from measurement.shielding import generate_octant_orientations
+from measurement.model import PointSource
 from sim.protocol import (
     SimulationCommand,
     SimulationObservation,
     decode_message,
     encode_message,
 )
+from sim.python_transport import PythonTransportSpectrumModel
 from spectrum.pipeline import SpectralDecomposer
 
 
@@ -43,7 +41,7 @@ class SimulationRuntime(ABC):
 
 
 class AnalyticSimulationRuntime(SimulationRuntime):
-    """Provide observations using the existing analytic spectrum simulator."""
+    """Provide observations using the shared Python transport spectrum model."""
 
     def __init__(
         self,
@@ -53,47 +51,37 @@ class AnalyticSimulationRuntime(SimulationRuntime):
         mu_by_isotope: dict[str, object],
         shield_params: Any,
         rng_seed: int = 123,
+        obstacle_height_m: float = 2.0,
+        obstacle_material: str = "concrete",
+        scatter_gain: float = 0.03,
+        dead_time_s: float = 0.0,
+        detector_model: dict[str, Any] | None = None,
     ) -> None:
         """Store simulator inputs for analytic observation generation."""
-        self.sources = list(sources)
-        self.decomposer = decomposer
-        self.mu_by_isotope = dict(mu_by_isotope)
-        self.shield_params = shield_params
-        self.rng_seed = int(rng_seed)
-        self.normals = generate_octant_orientations()
+        self.transport_model = PythonTransportSpectrumModel(
+            sources=sources,
+            decomposer=decomposer,
+            mu_by_isotope=mu_by_isotope,
+            shield_params=shield_params,
+            obstacle_height_m=float(obstacle_height_m),
+            obstacle_material=str(obstacle_material),
+            scatter_gain=float(scatter_gain),
+            rng_seed=int(rng_seed),
+            dead_time_s=float(dead_time_s),
+            detector_model=detector_model,
+        )
 
     def reset(self, payload: dict[str, Any] | None = None) -> None:
-        """Resetting the analytic runtime is a no-op."""
-        return None
+        """Reset sources and static scene geometry from the episode payload."""
+        self.transport_model.reset_from_payload(payload)
 
     def step(self, command: SimulationCommand) -> SimulationObservation:
         """Generate a spectrum at the requested pose and shield orientation."""
-        env = EnvironmentConfig(detector_position=command.target_pose_xyz)
-        spectrum, _ = self.decomposer.simulate_spectrum(
-            sources=self.sources,
-            environment=env,
-            acquisition_time=command.dwell_time_s,
-            rng=np.random.default_rng(self.rng_seed + int(command.step_id)),
-            fe_shield_orientation=self.normals[command.fe_orientation_index],
-            pb_shield_orientation=self.normals[command.pb_orientation_index],
-            mu_by_isotope=self.mu_by_isotope,
-            shield_params=self.shield_params,
-        )
-        energy = np.asarray(self.decomposer.energy_axis, dtype=float)
-        if energy.size <= 1:
-            edges = energy
-        else:
-            step = float(np.median(np.diff(energy)))
-            edges = np.concatenate([energy, [energy[-1] + step]])
-        return SimulationObservation(
-            step_id=command.step_id,
-            detector_pose_xyz=tuple(float(v) for v in command.target_pose_xyz),
+        return self.transport_model.observe(
+            command,
+            detector_pose_xyz=command.target_pose_xyz,
             detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
-            fe_orientation_index=command.fe_orientation_index,
-            pb_orientation_index=command.pb_orientation_index,
-            spectrum_counts=np.asarray(spectrum, dtype=float).tolist(),
-            energy_bin_edges_keV=np.asarray(edges, dtype=float).tolist(),
-            metadata={"backend": "analytic"},
+            backend_label="analytic",
         )
 
     def close(self) -> None:
@@ -707,6 +695,15 @@ def create_simulation_runtime(
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
             rng_seed=rng_seed,
+            obstacle_height_m=float(config.get("obstacle_height_m", 2.0)),
+            obstacle_material=str(config.get("obstacle_material", "concrete")),
+            scatter_gain=float(config.get("scatter_gain", 0.03)),
+            dead_time_s=float(config.get("dead_time_tau_s", config.get("dead_time_s", 0.0))),
+            detector_model=(
+                dict(config["detector_model"])
+                if isinstance(config.get("detector_model"), dict)
+                else None
+            ),
         )
     if normalized == "isaacsim":
         host = str(config.get("host", "127.0.0.1"))

@@ -5,12 +5,13 @@ from collections import Counter
 from dataclasses import fields
 import inspect
 import textwrap
+import types
 
 import numpy as np
 import pytest
 
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
-from pf.particle_filter import PFConfig
+from pf.particle_filter import IsotopeParticleFilter, PFConfig
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from spectrum.pipeline import SpectralDecomposer
@@ -44,6 +45,142 @@ def test_pf_estimator_runs_one_step():
     positions, strengths = estimates["Cs-137"]
     assert positions.shape == (1, 3)
     assert strengths.shape == (1,)
+
+
+def test_estimator_uses_clustered_output_when_birth_is_enabled():
+    """Final PF estimates should honor the clustered-output configuration."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            min_particles=2,
+            max_particles=2,
+            max_sources=2,
+            birth_enable=True,
+            use_clustered_output=True,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    est._ensure_kernel_cache()
+    filt = est.filters["Cs-137"]
+
+    def _fake_clustered(self):
+        """Return a distinctive clustered estimate."""
+        return (
+            np.array([[1.0, 2.0, 3.0]], dtype=float),
+            np.array([42.0], dtype=float),
+        )
+
+    def _fake_mmse(self):
+        """Return a fallback estimate that should not be used."""
+        return (
+            np.array([[9.0, 9.0, 9.0]], dtype=float),
+            np.array([9.0], dtype=float),
+        )
+
+    filt.estimate_clustered = types.MethodType(_fake_clustered, filt)
+    filt.estimate = types.MethodType(_fake_mmse, filt)
+
+    positions, strengths = est.estimates()["Cs-137"]
+
+    assert positions == pytest.approx(np.array([[1.0, 2.0, 3.0]], dtype=float))
+    assert strengths == pytest.approx(np.array([42.0], dtype=float))
+
+
+def test_deferred_pose_update_delays_resample_and_birth(monkeypatch):
+    """Deferred pose updates should postpone resampling and birth/death."""
+    update_defer_flags = []
+    finalize_calls = []
+    birth_calls = []
+
+    def _fake_update_continuous_pair(
+        self,
+        z_obs,
+        pose_idx,
+        fe_index,
+        pb_index,
+        live_time_s,
+        observation_count_variance=0.0,
+        step_idx=None,
+        defer_resample=False,
+    ):
+        """Record whether the estimator requested a deferred update."""
+        update_defer_flags.append(bool(defer_resample))
+        self.last_ess_pre = 3.0
+        self.last_ess = 3.0
+        self.last_resample_ess = False
+
+    def _fake_finalize_deferred_update(self):
+        """Record station-level finalization calls."""
+        finalize_calls.append(self.isotope)
+        self.last_resample_ess = True
+        self.last_ess_post = float(len(self.continuous_particles))
+
+    def _fake_apply_birth_death(self, birth_window_override=None):
+        """Record birth/death applications."""
+        _ = birth_window_override
+        birth_calls.append(len(self.measurements))
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair",
+        _fake_update_continuous_pair,
+    )
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "finalize_deferred_update",
+        _fake_finalize_deferred_update,
+    )
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "_apply_birth_death",
+        _fake_apply_birth_death,
+    )
+
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            adaptive_strength_prior=False,
+        ),
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
+
+    est.begin_deferred_pose_update()
+    est.update_pair(
+        z_k={"Cs-137": 4.0},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+    est.update_pair(
+        z_k={"Cs-137": 5.0},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+
+    assert update_defer_flags == [True, True]
+    assert birth_calls == []
+    assert len(est.measurements) == 2
+
+    finalized = est.finalize_deferred_pose_update()
+
+    assert finalized == 2
+    assert finalize_calls == ["Cs-137"]
+    assert birth_calls == [2]
 
 
 def test_estimator_passes_obstacle_attenuation_to_filters():
@@ -209,3 +346,49 @@ def test_adaptive_strength_prior_matches_observed_count_scale():
 
     assert uncertain_diagnostics["Cs-137"]["observation_count_variance"] == pytest.approx(4200.0)
     assert uncertain_diagnostics["Cs-137"]["effective_log_sigma"] > 0.0
+
+
+def test_adaptive_strength_prior_floor_does_not_increase_strength():
+    """The weak-count floor should only downscale, never create high-strength outliers."""
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        min_particles=1,
+        max_particles=1,
+        max_sources=1,
+        use_gpu=False,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(1.0, 1.0, 1.0),
+        init_num_sources=(1, 1),
+        init_grid_spacing_m=1.0,
+        init_strength_log_mean=float(np.log(1.0)),
+        init_strength_log_sigma=0.0,
+        adaptive_strength_prior=True,
+        adaptive_strength_prior_steps=1,
+        adaptive_strength_prior_min_counts=3.0,
+        adaptive_strength_prior_log_sigma=0.0,
+        adaptive_strength_prior_max_upscale=10.0,
+        background_level=0.0,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.5, 0.5, 0.5]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([1.5, 0.5, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    before = float(est.filters["Cs-137"].continuous_particles[0].state.strengths[0])
+
+    diagnostics = est.adapt_strength_prior_to_observation(
+        z_k={"Cs-137": 0.0},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=2.0,
+    )
+
+    after = float(est.filters["Cs-137"].continuous_particles[0].state.strengths[0])
+    assert after <= before
+    assert diagnostics["Cs-137"]["floor_only_target"] == pytest.approx(1.0)

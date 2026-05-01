@@ -15,6 +15,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
+from measurement.model import PointSource
 from pf.estimator import MeasurementRecord, RotatingShieldPFEstimator
 from realtime_demo import run_live_pf
 from sim.geant4_app.app import Geant4Application
@@ -45,6 +46,7 @@ from sim.protocol import (
     encode_message,
 )
 from sim.runtime import (
+    AnalyticSimulationRuntime,
     Geant4WithIsaacSimRuntime,
     Geant4TCPClientRuntime,
     IsaacSimTCPClientRuntime,
@@ -56,7 +58,13 @@ from sim.radiation_visualization import (
     RadiationVisualizationConfig,
     build_visualization_metadata_from_scene,
 )
-from sim.shield_geometry import FE_SHIELD_THICKNESS_CM, SHIELD_SHAPE_SPHERICAL_OCTANT
+from sim.shield_geometry import (
+    FE_SHIELD_THICKNESS_CM,
+    PB_SHIELD_THICKNESS_CM,
+    SHIELD_SHAPE_SPHERICAL_OCTANT,
+    resolve_shield_thickness_config,
+    shield_thickness_scale_for_transmission,
+)
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer
 
@@ -217,6 +225,144 @@ def test_mock_bridge_server_round_trip() -> None:
     assert observation.metadata["backend"] == "isaacsim-mock"
     assert len(observation.spectrum_counts) > 0
     assert not thread.is_alive()
+
+
+def test_analytic_runtime_uses_python_transport_obstacle_attenuation() -> None:
+    """Python CUI mode should attenuate spectra through reset-payload obstacles."""
+    source = PointSource(
+        isotope="Cs-137",
+        position=(0.5, 3.5, 0.5),
+        intensity_cps_1m=5.0e6,
+    )
+    command = SimulationCommand(
+        step_id=7,
+        target_pose_xyz=(0.5, 0.5, 0.5),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=20.0,
+    )
+    common_payload = {
+        "sources": [
+            {
+                "isotope": source.isotope,
+                "position": list(source.position),
+                "intensity_cps_1m": source.intensity_cps_1m,
+            }
+        ],
+        "obstacle_origin_xy": [0.0, 0.0],
+        "obstacle_cell_size_m": 1.0,
+        "obstacle_grid_shape": [2, 5],
+        "obstacle_material": "concrete",
+    }
+    clear_runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=99,
+    )
+    clear_runtime.reset({**common_payload, "obstacle_cells": []})
+    clear_observation = clear_runtime.step(command)
+
+    blocked_runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=99,
+    )
+    blocked_runtime.reset({**common_payload, "obstacle_cells": [[0, 1], [0, 2]]})
+    blocked_observation = blocked_runtime.step(command)
+
+    assert blocked_observation.metadata["backend"] == "analytic"
+    assert blocked_observation.metadata["transport_backend"] == "python"
+    assert float(blocked_observation.metadata["total_obstacle_path_cm"]) > 0.0
+    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+
+
+def test_analytic_runtime_uses_python_transport_spherical_shield() -> None:
+    """Python CUI mode should apply Fe/Pb spherical-octant shield paths."""
+    source = PointSource(
+        isotope="Cs-137",
+        position=(0.0, 0.0, 0.0),
+        intensity_cps_1m=5.0e6,
+    )
+    clear_command = SimulationCommand(
+        step_id=9,
+        target_pose_xyz=(1.0, 1.0, 1.0),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=7,
+        pb_orientation_index=7,
+        dwell_time_s=20.0,
+    )
+    blocked_command = SimulationCommand(
+        step_id=9,
+        target_pose_xyz=(1.0, 1.0, 1.0),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=20.0,
+    )
+    runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=101,
+    )
+
+    clear_observation = runtime.step(clear_command)
+    blocked_observation = runtime.step(blocked_command)
+
+    assert float(blocked_observation.metadata["total_fe_path_cm"]) > 0.0
+    assert float(blocked_observation.metadata["total_pb_path_cm"]) > 0.0
+    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+
+
+def test_mock_gui_uses_shared_python_transport_obstacles() -> None:
+    """Python GUI mock mode should use the same obstacle attenuation path as CUI."""
+    scene_kwargs = dict(
+        room_size_xyz=(3.0, 5.0, 3.0),
+        obstacle_origin_xy=(0.0, 0.0),
+        obstacle_cell_size_m=1.0,
+        obstacle_grid_shape=(2, 5),
+        sources=[
+            SourceDescription(
+                isotope="Cs-137",
+                position_xyz=(0.5, 3.5, 0.5),
+                intensity_cps_1m=5.0e6,
+            )
+        ],
+    )
+    command = SimulationCommand(
+        step_id=11,
+        target_pose_xyz=(0.5, 0.5, 0.5),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=20.0,
+    )
+    clear_app = IsaacSimApplication(
+        use_mock=True,
+        app_config={"detector_height_m": 0.5, "obstacle_height_m": 2.0},
+    )
+    clear_app.reset(SceneDescription(obstacle_cells=[], **scene_kwargs))
+    clear_observation = clear_app.step(command)
+    clear_app.close()
+
+    blocked_app = IsaacSimApplication(
+        use_mock=True,
+        app_config={"detector_height_m": 0.5, "obstacle_height_m": 2.0},
+    )
+    blocked_app.reset(SceneDescription(obstacle_cells=[(0, 1), (0, 2)], **scene_kwargs))
+    blocked_observation = blocked_app.step(command)
+    blocked_app.close()
+
+    assert blocked_observation.metadata["backend"] == "isaacsim-mock"
+    assert blocked_observation.metadata["transport_backend"] == "python"
+    assert float(blocked_observation.metadata["total_obstacle_path_cm"]) > 0.0
+    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
 
 
 def test_isaacsim_config_parses_camera_gesture_bindings() -> None:
@@ -937,6 +1083,29 @@ def test_application_prefers_scene_usd_over_config_default() -> None:
     assert backend.opened_usd_path == "generated_random.usda"
 
 
+def test_geant4_empty_scene_suppresses_config_demo_room() -> None:
+    """An explicit no-fallback scene should prevent no-obstacle CUI runs from loading demo obstacles."""
+    backend = FakeStageBackend()
+    app = Geant4Application(
+        app_config={"usd_path": "demo_room.usda", "use_mock_stage": True},
+        stage_backend=backend,
+    )
+    scene = SceneDescription(
+        usd_path=None,
+        use_config_usd_fallback=False,
+        room_size_xyz=(10.0, 20.0, 3.0),
+        author_obstacle_prims=True,
+        author_room_boundary_prims=True,
+    )
+
+    app.reset(scene)
+    app.close()
+
+    assert backend.opened_usd_path is None
+    assert "/World/Environment/PillarMesh" not in backend.prims
+    assert "/World/Environment/Wall/NorthWall" in backend.prims
+
+
 def test_geant4_scene_export_is_stable() -> None:
     """Exporting the same stage twice should produce the same scene hash."""
     backend = FakeStageBackend()
@@ -980,6 +1149,42 @@ def test_geant4_scene_export_is_stable() -> None:
     assert export_one.to_dict() == export_two.to_dict()
     assert export_one.fe_shield.shape == SHIELD_SHAPE_SPHERICAL_OCTANT
     assert export_one.fe_shield.thickness_cm == pytest.approx(FE_SHIELD_THICKNESS_CM)
+
+
+def test_shield_transmission_target_scales_geant4_export() -> None:
+    """Shared shield transmission targets should scale exported Geant4 geometry."""
+    backend = FakeStageBackend()
+    app = Geant4Application(
+        app_config={
+            "usd_path": "demo_room.usda",
+            "use_mock_stage": True,
+            "shield_transmission_target": 0.5,
+        },
+        stage_backend=backend,
+    )
+    scene = SceneDescription(usd_path="demo_room.usda")
+    shield_thickness = resolve_shield_thickness_config({"shield_transmission_target": 0.5})
+
+    app.reset(scene)
+    exported = export_scene_for_geant4(
+        scene,
+        stage_backend=backend,
+        asset_geometry=app.asset_geometry,
+        detector_model=ExportedDetectorModel(),
+        shield_thickness=app.config.shield_thickness,
+        stage_material_rules=app.config.stage_material_rules,
+    )
+    app.close()
+
+    assert shield_thickness.thickness_scale == pytest.approx(
+        shield_thickness_scale_for_transmission(0.5)
+    )
+    assert exported.fe_shield.thickness_cm == pytest.approx(
+        FE_SHIELD_THICKNESS_CM * shield_thickness.thickness_scale
+    )
+    assert exported.pb_shield.thickness_cm == pytest.approx(
+        PB_SHIELD_THICKNESS_CM * shield_thickness.thickness_scale
+    )
 
 
 def test_geant4_scene_export_groups_walls_without_name_list() -> None:
@@ -2195,10 +2400,12 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         reset_called: bool = False
         close_called: bool = False
         step_calls: int = 0
+        reset_payload: dict | None = None
 
         def reset(self, payload: dict | None = None) -> None:
             """Record reset calls."""
             self.reset_called = True
+            self.reset_payload = payload
 
         def step(self, command: SimulationCommand) -> SimulationObservation:
             """Return a zero spectrum with the requested pose."""
@@ -2332,6 +2539,10 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
 
     assert estimator is not None
     assert runtime.reset_called
+    assert runtime.reset_payload is not None
+    assert runtime.reset_payload["usd_path"] == ""
+    assert runtime.reset_payload["use_config_usd_fallback"] is False
+    assert runtime.reset_payload["obstacle_cells"] == []
     assert runtime.close_called
     assert runtime.step_calls == 1
     assert estimator.mission_metrics["total_measurements"] == 1

@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 
-from measurement.continuous_kernels import ContinuousKernel, geometric_term
+from measurement.continuous_kernels import (
+    ContinuousKernel,
+    finite_sphere_geometric_term,
+    geometric_term,
+)
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
@@ -21,10 +25,33 @@ def test_geometric_term_inverse_square() -> None:
     assert np.isclose(g1 / g2, 4.0, rtol=1e-6)
 
 
+def test_finite_sphere_geometric_term_preserves_one_meter_definition() -> None:
+    """Finite detector geometry should remove the near-field point singularity."""
+    det = np.array([0.0, 0.0, 0.0], dtype=float)
+    radius = 0.04
+
+    at_one_meter = finite_sphere_geometric_term(
+        det,
+        np.array([1.0, 0.0, 0.0], dtype=float),
+        radius,
+    )
+    at_two_meters = finite_sphere_geometric_term(
+        det,
+        np.array([2.0, 0.0, 0.0], dtype=float),
+        radius,
+    )
+    at_center = finite_sphere_geometric_term(det, det, radius)
+
+    assert at_one_meter == pytest.approx(1.0)
+    assert at_two_meters == pytest.approx(0.25, rel=1.0e-3)
+    assert np.isfinite(at_center)
+    assert at_center < 1.0e4
+
+
 def test_attenuation_applies_blocking_factor() -> None:
     """Blocked orientation should reduce expected counts by exp(-mu*L)."""
     shield_params = ShieldParams()
-    kernel = ContinuousKernel(shield_params=shield_params)
+    kernel = ContinuousKernel(shield_params=shield_params, use_gpu=False)
     orientations = generate_octant_orientations()
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([1.0, 1.0, 1.0])
@@ -89,6 +116,7 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
         background=0.0,
         duration=1.0,
         isotope_id="Cs-137",
+        use_gpu=False,
     )
     shield_params = ShieldParams()
     expected_fe_ratio = np.exp(-(shield_params.mu_fe * shield_params.thickness_fe_cm))
@@ -104,6 +132,7 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
         background=0.0,
         duration=1.0,
         isotope_id="Cs-137",
+        use_gpu=False,
     )
     both = expected_counts_single_isotope(
         detector_position=det,
@@ -114,6 +143,7 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
         background=0.0,
         duration=1.0,
         isotope_id="Cs-137",
+        use_gpu=False,
     )
     assert np.isclose(fe_only, expected_fe_ratio * base, rtol=1e-6)
     assert np.isclose(both, expected_both_ratio * base, rtol=1e-6)
@@ -183,6 +213,41 @@ def test_concrete_obstacle_path_reduces_kernel_value() -> None:
     blocked = kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
     unblocked = free_kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
     assert blocked == pytest.approx(unblocked * np.exp(-1.0), rel=1e-12)
+
+
+def test_broad_beam_buildup_increases_but_bounds_attenuated_counts() -> None:
+    """Build-up should increase attenuated broad-beam counts without exceeding unattenuated counts."""
+    detector = np.zeros(3, dtype=float)
+    source = np.array([1.0, 1.0, 1.0], dtype=float)
+    base_params = ShieldParams(mu_fe=0.1, mu_pb=0.0, thickness_fe_cm=5.0, thickness_pb_cm=0.0)
+    narrow_kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.0}},
+        shield_params=base_params,
+        use_gpu=False,
+    )
+    buildup_kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.1,
+            mu_pb=0.0,
+            thickness_fe_cm=5.0,
+            thickness_pb_cm=0.0,
+            buildup_fe_coeff=0.5,
+        ),
+        use_gpu=False,
+    )
+    free_kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        use_gpu=False,
+    )
+
+    narrow = narrow_kernel.kernel_value_pair("Cs-137", detector, source, 7, 0)
+    buildup = buildup_kernel.kernel_value_pair("Cs-137", detector, source, 7, 0)
+    free = free_kernel.kernel_value_pair("Cs-137", detector, source, 7, 0)
+
+    assert buildup > narrow
+    assert buildup <= free
 
 
 def test_spherical_shell_path_uses_radial_overlap_near_detector() -> None:
@@ -303,3 +368,121 @@ def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
     )
     expected = (1.0 / (0.205**2)) * np.exp(-0.15)
     assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
+
+
+def test_continuous_kernel_cuda_matches_cpu_with_detector_aperture() -> None:
+    """ContinuousKernel CUDA path should match the CPU finite-aperture geometry."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    rng = np.random.default_rng(77)
+    detector = np.array([0.2, -0.3, 1.0], dtype=float)
+    directions = rng.normal(size=(16, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    distances = rng.uniform(0.8, 3.5, size=(16, 1))
+    sources = detector + directions * distances
+    strengths = rng.uniform(500.0, 30000.0, size=16)
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    cpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=31,
+    )
+    gpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        detector_radius_m=0.038,
+        detector_aperture_samples=31,
+    )
+
+    for fe_index in range(8):
+        for pb_index in range(8):
+            cpu_counts = cpu_kernel.expected_counts_pair(
+                "Cs-137",
+                detector,
+                sources,
+                strengths,
+                fe_index,
+                pb_index,
+                live_time_s=1.0,
+            )
+            gpu_counts = gpu_kernel.expected_counts_pair(
+                "Cs-137",
+                detector,
+                sources,
+                strengths,
+                fe_index,
+                pb_index,
+                live_time_s=1.0,
+            )
+            assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)
+
+
+def test_continuous_kernel_cuda_matches_cpu_with_obstacles_and_aperture() -> None:
+    """ContinuousKernel CUDA path should match CPU obstacle attenuation over aperture rays."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detector = np.array([2.2, 2.2, 1.0], dtype=float)
+    sources = np.array(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    strengths = np.array([10000.0, 20000.0, 15000.0, 12000.0], dtype=float)
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    cpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=31,
+    )
+    gpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        detector_radius_m=0.038,
+        detector_aperture_samples=31,
+    )
+
+    for fe_index in range(8):
+        for pb_index in range(8):
+            cpu_counts = cpu_kernel.expected_counts_pair(
+                "Cs-137",
+                detector,
+                sources,
+                strengths,
+                fe_index,
+                pb_index,
+            )
+            gpu_counts = gpu_kernel.expected_counts_pair(
+                "Cs-137",
+                detector,
+                sources,
+                strengths,
+                fe_index,
+                pb_index,
+            )
+            assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)

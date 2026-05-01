@@ -100,9 +100,8 @@ def _expected_intensity_at_points(
     intensities_t = torch.zeros(grid_t.shape[0], device=device, dtype=dtype)
     if orient_idx is not None:
         normal = torch.as_tensor(kernel.orientations[orient_idx], device=device, dtype=dtype)
-        thickness_fe = float(kernel.shield_params.thickness_fe_cm)
-        thickness_pb = float(kernel.shield_params.thickness_pb_cm)
     tol = 1e-6
+    tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
     for iso, est in estimates.items():
         pos3d = est.get("positions", np.zeros((0, 3)))
         strengths = est.get("strengths", np.zeros(0))
@@ -120,12 +119,24 @@ def _expected_intensity_at_points(
             if orient_idx is None:
                 att = torch.ones_like(dist)
             else:
-                blocked = kernel._blocked_mask_torch(dir_unit, orient_idx, tol)
+                detector_to_source_unit = -dir_unit
+                blocked = kernel._rotated_octant_blocked_mask_torch(detector_to_source_unit, orient_idx, tol)
                 cos_val = torch.clamp(torch.sum(dir_unit * normal, dim=1), 0.0, 1.0)
-                mask = blocked & (cos_val > tol)
-                L_fe = torch.where(mask, thickness_fe / cos_val, torch.zeros_like(cos_val))
-                L_pb = torch.where(mask, thickness_pb / cos_val, torch.zeros_like(cos_val))
-                att = torch.exp(-(mu_fe * L_fe + mu_pb * L_pb))
+                L_fe, L_pb = kernel._shield_path_lengths_torch(
+                    direction=direction,
+                    blocked_fe=blocked,
+                    blocked_pb=blocked,
+                    cos_fe=cos_val,
+                    cos_pb=cos_val,
+                    tol_t=tol_t,
+                    device=device,
+                    dtype=dtype,
+                )
+                tau_fe = float(mu_fe) * L_fe
+                tau_pb = float(mu_pb) * L_pb
+                tau_obstacle = torch.zeros_like(tau_fe)
+                buildup = kernel._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
+                att = torch.clamp(torch.exp(-(tau_fe + tau_pb)) * buildup, max=1.0)
             intensities_t = intensities_t + geom * att * strength
     return intensities_t.detach().cpu().numpy()
 

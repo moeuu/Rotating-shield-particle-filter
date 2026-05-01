@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import math
+from typing import Any, Mapping
+
 import numpy as np
 
 from measurement.shielding import (
@@ -33,6 +37,53 @@ PB_SHIELD_THICKNESS_M = PB_SHIELD_THICKNESS_CM / 100.0
 PB_SHIELD_OUTER_RADIUS_M = PB_SHIELD_INNER_RADIUS_M + PB_SHIELD_THICKNESS_M
 
 
+@dataclass(frozen=True)
+class ShieldThicknessConfig:
+    """Store Fe/Pb spherical-octant shield thickness overrides."""
+
+    thickness_fe_cm: float = FE_SHIELD_THICKNESS_CM
+    thickness_pb_cm: float = PB_SHIELD_THICKNESS_CM
+    thickness_scale: float = 1.0
+    transmission_target: float | None = None
+
+
+def shield_thickness_scale_for_transmission(transmission_target: float) -> float:
+    """Return the one-TVL thickness scale for a target single-shell transmission."""
+    transmission = float(transmission_target)
+    if not 0.0 < transmission <= 1.0:
+        raise ValueError("shield_transmission_target must be in (0, 1].")
+    if transmission == 1.0:
+        return 0.0
+    return float(math.log(1.0 / transmission) / math.log(10.0))
+
+
+def resolve_shield_thickness_config(
+    payload: Mapping[str, Any] | None = None,
+) -> ShieldThicknessConfig:
+    """Resolve shared shield thickness settings from a runtime config payload."""
+    config = {} if payload is None else dict(payload)
+    target_raw = config.get("shield_transmission_target")
+    if target_raw in (None, ""):
+        transmission_target = None
+        default_scale = 1.0
+    else:
+        transmission_target = float(target_raw)
+        default_scale = shield_thickness_scale_for_transmission(transmission_target)
+    scale = float(config.get("shield_thickness_scale", default_scale))
+    if scale < 0.0:
+        raise ValueError("shield_thickness_scale must be non-negative.")
+    thickness_fe_cm = float(config.get("fe_shield_thickness_cm", FE_SHIELD_THICKNESS_CM * scale))
+    thickness_pb_cm = float(config.get("pb_shield_thickness_cm", PB_SHIELD_THICKNESS_CM * scale))
+    if thickness_fe_cm < 0.0 or thickness_pb_cm < 0.0:
+        raise ValueError("shield thickness values must be non-negative.")
+    return ShieldThicknessConfig(
+        thickness_fe_cm=thickness_fe_cm,
+        thickness_pb_cm=thickness_pb_cm,
+        thickness_scale=scale,
+        transmission_target=transmission_target,
+    )
+
+
 def shield_normal_from_quaternion_wxyz(
     quaternion_wxyz: tuple[float, float, float, float],
 ) -> tuple[float, float, float]:
@@ -55,10 +106,15 @@ def spherical_octant_path_length_cm(
     inner_radius_cm: float = 0.0,
     use_angle_attenuation: bool = False,
 ) -> float:
-    """Return the Python reference path length for a spherical octant shell."""
+    """Return the path length for a rotated local +X/+Y/+Z spherical-octant shell."""
     direction = np.asarray(source_xyz, dtype=float) - np.asarray(detector_xyz, dtype=float)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1.0e-12:
+        return 0.0
+    rotation = quaternion_wxyz_to_matrix(shield_quat_wxyz)
+    local_direction = rotation.T @ (direction / direction_norm)
+    blocked = bool(np.all(local_direction >= -1.0e-9))
     shield_normal = np.asarray(shield_normal_from_quaternion_wxyz(shield_quat_wxyz), dtype=float)
-    blocked = shield_blocks_radiation(direction, shield_normal)
     if not use_angle_attenuation:
         return spherical_shell_path_length_cm(
             direction_m=direction,

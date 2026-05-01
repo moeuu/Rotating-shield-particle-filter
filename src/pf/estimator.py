@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import re
 from typing import Dict, List, Sequence, Tuple, Any
 import copy
+import os
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,6 +22,35 @@ from pf.likelihood import expected_counts_per_source
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.resampling import systematic_resample
 from pf.state import IsotopeState
+
+
+def _weighted_quantile(
+    values: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    quantile: float,
+) -> float:
+    """Return a weighted quantile for non-negative planning statistics."""
+    values = np.asarray(values, dtype=float).ravel()
+    weights = np.asarray(weights, dtype=float).ravel()
+    if values.size == 0:
+        return 0.0
+    if weights.size != values.size:
+        raise ValueError("weights must have the same size as values.")
+    finite = np.isfinite(values) & np.isfinite(weights) & (weights >= 0.0)
+    if not np.any(finite):
+        return 0.0
+    values = values[finite]
+    weights = weights[finite]
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        return float(np.quantile(values, np.clip(float(quantile), 0.0, 1.0)))
+    order = np.argsort(values)
+    values = values[order]
+    weights = weights[order] / total
+    cdf = np.cumsum(weights)
+    idx = int(np.searchsorted(cdf, np.clip(float(quantile), 0.0, 1.0), side="left"))
+    idx = min(max(idx, 0), values.size - 1)
+    return float(values[idx])
 
 
 @dataclass
@@ -47,15 +78,39 @@ class RotatingShieldPFConfig:
         - birth_use_weighted_topk: weight residual mix by particle weights
         - birth_min_sep_m: minimum separation between sources during birth
         - birth_detector_min_sep_m: minimum separation from measured detector poses
+        - source_detector_exclusion_m: hard exclusion around measured detector poses
         - birth_candidate_jitter_sigma: position jitter (m) for birth candidates
         - birth_num_local_jitter: local jitter samples per candidate
         - birth_alpha: damping factor for new source strength
         - birth_q_max: clamp max for new source strength
         - birth_q_min: clamp min for new source strength
+        - birth_max_per_update: cap accepted birth proposals per structural update
         - birth_residual_clip_quantile: clip residuals at this quantile
+        - birth_residual_gate_p_value: chi-square p-value for residual birth evidence
+        - birth_residual_min_support: minimum independent residual-supported measurements
+        - birth_residual_support_sigma: per-measurement residual z-score support floor
+        - birth_min_distinct_stations: minimum robot stations with residual birth evidence
+        - birth_candidate_support_fraction: per-candidate residual overlap floor
+        - birth_refit_residual_gate: require residuals to survive fixed-position strength refit
+        - birth_refit_residual_min_fraction: residual fraction retained after refit for birth
+        - birth_jitter_topk_candidates: base residual-supported candidates jittered for birth
         - refit_after_moves: refit strengths after birth/kill/split/merge
         - refit_iters: iterations for strength refit
         - refit_eps: epsilon for refit stability
+        - weak_source_prune_min_expected_count: prune floor-strength sources below this support
+        - weak_source_prune_min_fraction: prune floor-strength sources below this source fraction
+        - conditional_strength_refit: refit strengths at station finalization
+        - conditional_strength_refit_window: recent measurements used for strength refit
+        - conditional_strength_refit_iters: iterations for conditional strength refit
+        - conditional_strength_refit_reweight: reweight particles by profile-likelihood gain
+        - conditional_strength_refit_reweight_clip: robust clip for profile-likelihood correction
+        - conditional_strength_refit_min_count: minimum positive count for strength refit
+        - conditional_strength_refit_min_snr: minimum count SNR for strength refit
+        - conditional_strength_refit_prior_weight: MAP strength-prior weight
+        - conditional_strength_refit_prior_rel_sigma: relative strength-prior sigma
+        - report_strength_refit: refit reported strengths conditioned on reported positions
+        - report_strength_refit_iters: multiplicative Poisson regression iterations
+        - report_strength_refit_eps: numerical floor for reported-strength regression
         - min_age_to_split: minimum age before split proposals
         - use_clustered_output: use clustered estimate when birth is enabled
         - cluster_eps_m: clustering radius in meters
@@ -66,11 +121,17 @@ class RotatingShieldPFConfig:
         - split_strength_min_frac: min split fraction for q1/q2
         - split_strength_max_frac: max split fraction for q1/q2
         - split_delta_ll_threshold: ΔLL threshold for split acceptance
+        - split_residual_guided: use posterior residual candidates for split moves
+        - split_residual_candidate_count: residual candidates evaluated per split
         - merge_prob: probability of merge proposals per particle
         - merge_distance_max: max distance for merge candidates
         - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
+        - merge_response_corr_min: response-correlation floor for merge candidates
+        - merge_search_topk_pairs: max response-redundant pairs tested per merge move
+        - structural_proposal_topk_particles: posterior-support cap for split/merge proposals
         - init_num_sources: inclusive range for initial source count per particle
         - init_grid_spacing_m: grid spacing for deterministic particle initialization
+        - init_grid_repeats: repeated strength samples per deterministic grid point
         - roughening_k: roughening coefficient for post-resample position jitter
         - min_sigma_pos: minimum roughening sigma (meters)
         - max_sigma_pos: maximum roughening sigma (meters)
@@ -83,6 +144,8 @@ class RotatingShieldPFConfig:
         - adaptive_strength_prior_steps: number of first measurements allowed to rescale strengths
         - adaptive_strength_prior_min_counts: Poisson upper-count floor for zero/weak observations
         - adaptive_strength_prior_log_sigma: log-normal proposal spread around count-matched strength
+        - adaptive_strength_prior_max_upscale: per-update upper strength multiplier
+        - pose_min_observation_quantile: posterior quantile used for observability guarantees
         - orientation_k: maximum number of orientations to execute per pose
         - min_rotations_per_pose: minimum orientations before IG early stopping
         - orientation_selection_mode: "eig"
@@ -114,6 +177,8 @@ class RotatingShieldPFConfig:
         - spectrum_count_rel_sigma: relative spectrum-decomposition count uncertainty
         - spectrum_count_abs_sigma: additive spectrum-decomposition count uncertainty
         - count_likelihood_df: Student-t degrees of freedom for robust count likelihood
+        - parallel_isotope_updates: run independent isotope structural updates in parallel
+        - parallel_isotope_workers: worker count for parallel isotope structural updates
         - label_enable: enable label alignment for continuous particles
         - label_alignment_iters: iterations for label alignment refinement
         - label_pos_weight: position cost weight for label alignment
@@ -162,15 +227,41 @@ class RotatingShieldPFConfig:
     birth_use_weighted_topk: bool = True
     birth_min_sep_m: float = 0.8
     birth_detector_min_sep_m: float = 1.0
+    source_detector_exclusion_m: float = 0.0
     birth_candidate_jitter_sigma: float = 0.5
     birth_num_local_jitter: int = 8
     birth_alpha: float = 0.2
     birth_q_max: float = 3e5
     birth_q_min: float = 1e2
+    birth_max_per_update: int | None = None
+    structural_update_min_counts: float = 0.0
+    birth_min_distinct_poses: int = 1
     birth_residual_clip_quantile: float = 0.95
+    birth_residual_gate_p_value: float = 0.05
+    birth_residual_min_support: int = 2
+    birth_residual_support_sigma: float = 1.0
+    birth_min_distinct_stations: int = 1
+    birth_candidate_support_fraction: float = 0.05
+    birth_refit_residual_gate: bool = True
+    birth_refit_residual_min_fraction: float = 0.5
+    birth_jitter_topk_candidates: int | None = 512
     refit_after_moves: bool = True
     refit_iters: int = 3
     refit_eps: float = 1e-12
+    weak_source_prune_min_expected_count: float = 0.0
+    weak_source_prune_min_fraction: float = 0.0
+    conditional_strength_refit: bool = True
+    conditional_strength_refit_window: int = 10
+    conditional_strength_refit_iters: int = 3
+    conditional_strength_refit_reweight: bool = False
+    conditional_strength_refit_reweight_clip: float = 50.0
+    conditional_strength_refit_min_count: float = 5.0
+    conditional_strength_refit_min_snr: float = 1.0
+    conditional_strength_refit_prior_weight: float = 0.0
+    conditional_strength_refit_prior_rel_sigma: float = 2.0
+    report_strength_refit: bool = False
+    report_strength_refit_iters: int = 64
+    report_strength_refit_eps: float = 1.0e-9
     min_age_to_split: int = 5
     use_clustered_output: bool = True
     cluster_eps_m: float = 0.8
@@ -181,9 +272,14 @@ class RotatingShieldPFConfig:
     split_strength_min_frac: float = 0.3
     split_strength_max_frac: float = 0.7
     split_delta_ll_threshold: float = 0.0
+    split_residual_guided: bool = True
+    split_residual_candidate_count: int = 8
     merge_prob: float = 0.0
     merge_distance_max: float = 0.5
     merge_delta_ll_threshold: float = 0.0
+    merge_response_corr_min: float = 0.995
+    merge_search_topk_pairs: int = 8
+    structural_proposal_topk_particles: int | None = None
     short_time_s: float = 0.5  # Recommended short-time measurement (Sec. 3.4.3).
     ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
@@ -203,6 +299,7 @@ class RotatingShieldPFConfig:
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (0, 3)
     init_grid_spacing_m: float | None = None
+    init_grid_repeats: int = 1
     roughening_k: float = 0.5
     min_sigma_pos: float = 0.05
     max_sigma_pos: float = 1.5
@@ -215,10 +312,12 @@ class RotatingShieldPFConfig:
     adaptive_strength_prior_steps: int = 3
     adaptive_strength_prior_min_counts: float = 3.0
     adaptive_strength_prior_log_sigma: float = 0.7
+    adaptive_strength_prior_max_upscale: float = 10.0
     pose_min_observation_counts: float = 0.0
     pose_min_observation_penalty_scale: float = 1.0
     pose_min_observation_aggregate: str = "max"
     pose_min_observation_max_particles: int | None = None
+    pose_min_observation_quantile: float = 0.25
     orientation_k: int = 8
     min_rotations_per_pose: int = 0
     orientation_selection_mode: str = "eig"
@@ -238,6 +337,8 @@ class RotatingShieldPFConfig:
     preselect_k_max: int = 16
     use_fast_gpu_rollout: bool = False
     ig_workers: int = 0
+    parallel_isotope_updates: bool = True
+    parallel_isotope_workers: int | None = None
     label_enable: bool = True
     label_alignment_iters: int = 2
     label_pos_weight: float = 1.0
@@ -262,6 +363,7 @@ class RotatingShieldPFConfig:
         self.ess_high = float(self.ess_high)
         if not 0.0 < self.ess_low < self.ess_high < 1.0:
             raise ValueError("ess_low and ess_high must satisfy 0 < ess_low < ess_high < 1.")
+        self.init_grid_repeats = max(1, int(self.init_grid_repeats))
         self.ig_workers = int(self.ig_workers)
         if self.ig_workers < 0:
             raise ValueError("ig_workers must be >= 0.")
@@ -274,6 +376,11 @@ class RotatingShieldPFConfig:
         self.adaptive_strength_prior_log_sigma = float(self.adaptive_strength_prior_log_sigma)
         if self.adaptive_strength_prior_log_sigma < 0.0:
             raise ValueError("adaptive_strength_prior_log_sigma must be >= 0.")
+        self.adaptive_strength_prior_max_upscale = float(
+            self.adaptive_strength_prior_max_upscale
+        )
+        if self.adaptive_strength_prior_max_upscale < 1.0:
+            raise ValueError("adaptive_strength_prior_max_upscale must be >= 1.")
         self.pose_min_observation_counts = float(self.pose_min_observation_counts)
         if self.pose_min_observation_counts < 0.0:
             raise ValueError("pose_min_observation_counts must be >= 0.")
@@ -293,6 +400,9 @@ class RotatingShieldPFConfig:
             )
             if self.pose_min_observation_max_particles < 0:
                 raise ValueError("pose_min_observation_max_particles must be >= 0.")
+        self.pose_min_observation_quantile = float(self.pose_min_observation_quantile)
+        if not 0.0 <= self.pose_min_observation_quantile <= 1.0:
+            raise ValueError("pose_min_observation_quantile must be in [0, 1].")
         normalized_likelihood = str(self.count_likelihood_model).strip().lower()
         if normalized_likelihood in {"normal"}:
             normalized_likelihood = "gaussian"
@@ -302,6 +412,86 @@ class RotatingShieldPFConfig:
             raise ValueError("count_likelihood_model must be poisson, gaussian, or student_t.")
         self.count_likelihood_model = normalized_likelihood
         self.count_likelihood_df = max(float(self.count_likelihood_df), 1.0)
+        self.birth_residual_gate_p_value = float(self.birth_residual_gate_p_value)
+        if self.birth_residual_gate_p_value < 0.0:
+            raise ValueError("birth_residual_gate_p_value must be >= 0.")
+        self.birth_residual_gate_p_value = min(self.birth_residual_gate_p_value, 1.0)
+        self.birth_residual_min_support = max(1, int(self.birth_residual_min_support))
+        self.birth_residual_support_sigma = max(
+            0.0,
+            float(self.birth_residual_support_sigma),
+        )
+        self.birth_candidate_support_fraction = float(
+            np.clip(float(self.birth_candidate_support_fraction), 0.0, 1.0)
+        )
+        self.source_detector_exclusion_m = max(
+            0.0,
+            float(self.source_detector_exclusion_m),
+        )
+        self.birth_refit_residual_min_fraction = max(
+            0.0,
+            float(self.birth_refit_residual_min_fraction),
+        )
+        if self.birth_jitter_topk_candidates is not None:
+            self.birth_jitter_topk_candidates = max(
+                1,
+                int(self.birth_jitter_topk_candidates),
+            )
+        self.weak_source_prune_min_expected_count = max(
+            0.0,
+            float(self.weak_source_prune_min_expected_count),
+        )
+        self.weak_source_prune_min_fraction = max(
+            0.0,
+            float(self.weak_source_prune_min_fraction),
+        )
+        if self.birth_max_per_update is not None:
+            self.birth_max_per_update = max(0, int(self.birth_max_per_update))
+        self.conditional_strength_refit_window = max(
+            1,
+            int(self.conditional_strength_refit_window),
+        )
+        self.conditional_strength_refit_iters = max(
+            1,
+            int(self.conditional_strength_refit_iters),
+        )
+        self.conditional_strength_refit_reweight_clip = max(
+            0.0,
+            float(self.conditional_strength_refit_reweight_clip),
+        )
+        self.conditional_strength_refit_min_count = max(
+            0.0,
+            float(self.conditional_strength_refit_min_count),
+        )
+        self.conditional_strength_refit_min_snr = max(
+            0.0,
+            float(self.conditional_strength_refit_min_snr),
+        )
+        self.conditional_strength_refit_prior_weight = max(
+            0.0,
+            float(self.conditional_strength_refit_prior_weight),
+        )
+        self.conditional_strength_refit_prior_rel_sigma = max(
+            1.0e-6,
+            float(self.conditional_strength_refit_prior_rel_sigma),
+        )
+        self.report_strength_refit_iters = max(1, int(self.report_strength_refit_iters))
+        self.report_strength_refit_eps = max(
+            1.0e-15,
+            float(self.report_strength_refit_eps),
+        )
+        self.split_residual_guided = bool(self.split_residual_guided)
+        self.split_residual_candidate_count = max(
+            1,
+            int(self.split_residual_candidate_count),
+        )
+        self.merge_response_corr_min = float(
+            np.clip(float(self.merge_response_corr_min), 0.0, 1.0)
+        )
+        self.merge_search_topk_pairs = max(1, int(self.merge_search_topk_pairs))
+        self.parallel_isotope_updates = bool(self.parallel_isotope_updates)
+        if self.parallel_isotope_workers is not None:
+            self.parallel_isotope_workers = max(1, int(self.parallel_isotope_workers))
 
 
 @dataclass(frozen=True)
@@ -337,6 +527,9 @@ class RotatingShieldPFEstimator:
         obstacle_grid: ObstacleGrid | None = None,
         obstacle_height_m: float = 2.0,
         obstacle_mu_by_isotope: Dict[str, float] | None = None,
+        obstacle_buildup_coeff: float = 0.0,
+        detector_radius_m: float = 0.0,
+        detector_aperture_samples: int = 1,
     ) -> None:
         self.isotopes = list(isotopes)
         self.pf_config = pf_config or RotatingShieldPFConfig()
@@ -344,6 +537,9 @@ class RotatingShieldPFEstimator:
         self.obstacle_grid = obstacle_grid
         self.obstacle_height_m = float(obstacle_height_m)
         self.obstacle_mu_by_isotope = obstacle_mu_by_isotope
+        self.obstacle_buildup_coeff = max(float(obstacle_buildup_coeff), 0.0)
+        self.detector_radius_m = max(float(detector_radius_m), 0.0)
+        self.detector_aperture_samples = max(int(detector_aperture_samples), 1)
         # Measurement poses are appended incrementally.
         self.poses: List[NDArray[np.float64]] = []
         if shield_normals is None:
@@ -360,6 +556,9 @@ class RotatingShieldPFEstimator:
         self.history_scores: List[float] = []
         self.measurements: List[MeasurementRecord] = []
         self.last_strength_prior_diagnostics: Dict[str, Dict[str, float]] = {}
+        self._defer_resample_birth = False
+        self._deferred_measurement_count = 0
+        self._previous_deferred_measurement_count = 0
 
     def _resolve_mu_by_isotope(self, mu_by_isotope: Dict[str, object] | None) -> Dict[str, object]:
         """
@@ -447,6 +646,9 @@ class RotatingShieldPFEstimator:
             obstacle_grid=self.obstacle_grid,
             obstacle_height_m=self.obstacle_height_m,
             obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+            obstacle_buildup_coeff=self.obstacle_buildup_coeff,
+            detector_radius_m=self.detector_radius_m,
+            detector_aperture_samples=self.detector_aperture_samples,
         )
 
     def _build_pf_config(self) -> PFConfig:
@@ -484,15 +686,38 @@ class RotatingShieldPFEstimator:
             birth_use_weighted_topk=self.pf_config.birth_use_weighted_topk,
             birth_min_sep_m=self.pf_config.birth_min_sep_m,
             birth_detector_min_sep_m=self.pf_config.birth_detector_min_sep_m,
+            source_detector_exclusion_m=self.pf_config.source_detector_exclusion_m,
             birth_candidate_jitter_sigma=self.pf_config.birth_candidate_jitter_sigma,
             birth_num_local_jitter=self.pf_config.birth_num_local_jitter,
             birth_alpha=self.pf_config.birth_alpha,
             birth_q_max=self.pf_config.birth_q_max,
             birth_q_min=self.pf_config.birth_q_min,
+            birth_max_per_update=self.pf_config.birth_max_per_update,
+            structural_update_min_counts=self.pf_config.structural_update_min_counts,
+            birth_min_distinct_poses=self.pf_config.birth_min_distinct_poses,
             birth_residual_clip_quantile=self.pf_config.birth_residual_clip_quantile,
+            birth_residual_gate_p_value=self.pf_config.birth_residual_gate_p_value,
+            birth_residual_min_support=self.pf_config.birth_residual_min_support,
+            birth_residual_support_sigma=self.pf_config.birth_residual_support_sigma,
+            birth_min_distinct_stations=self.pf_config.birth_min_distinct_stations,
+            birth_candidate_support_fraction=self.pf_config.birth_candidate_support_fraction,
+            birth_refit_residual_gate=self.pf_config.birth_refit_residual_gate,
+            birth_refit_residual_min_fraction=self.pf_config.birth_refit_residual_min_fraction,
+            birth_jitter_topk_candidates=self.pf_config.birth_jitter_topk_candidates,
             refit_after_moves=self.pf_config.refit_after_moves,
             refit_iters=self.pf_config.refit_iters,
             refit_eps=self.pf_config.refit_eps,
+            weak_source_prune_min_expected_count=self.pf_config.weak_source_prune_min_expected_count,
+            weak_source_prune_min_fraction=self.pf_config.weak_source_prune_min_fraction,
+            conditional_strength_refit=self.pf_config.conditional_strength_refit,
+            conditional_strength_refit_window=self.pf_config.conditional_strength_refit_window,
+            conditional_strength_refit_iters=self.pf_config.conditional_strength_refit_iters,
+            conditional_strength_refit_reweight=self.pf_config.conditional_strength_refit_reweight,
+            conditional_strength_refit_reweight_clip=self.pf_config.conditional_strength_refit_reweight_clip,
+            conditional_strength_refit_min_count=self.pf_config.conditional_strength_refit_min_count,
+            conditional_strength_refit_min_snr=self.pf_config.conditional_strength_refit_min_snr,
+            conditional_strength_refit_prior_weight=self.pf_config.conditional_strength_refit_prior_weight,
+            conditional_strength_refit_prior_rel_sigma=self.pf_config.conditional_strength_refit_prior_rel_sigma,
             min_age_to_split=self.pf_config.min_age_to_split,
             use_clustered_output=self.pf_config.use_clustered_output,
             cluster_eps_m=self.pf_config.cluster_eps_m,
@@ -503,9 +728,16 @@ class RotatingShieldPFEstimator:
             split_strength_min_frac=self.pf_config.split_strength_min_frac,
             split_strength_max_frac=self.pf_config.split_strength_max_frac,
             split_delta_ll_threshold=self.pf_config.split_delta_ll_threshold,
+            split_residual_guided=self.pf_config.split_residual_guided,
+            split_residual_candidate_count=self.pf_config.split_residual_candidate_count,
             merge_prob=self.pf_config.merge_prob,
             merge_distance_max=self.pf_config.merge_distance_max,
             merge_delta_ll_threshold=self.pf_config.merge_delta_ll_threshold,
+            merge_response_corr_min=self.pf_config.merge_response_corr_min,
+            merge_search_topk_pairs=self.pf_config.merge_search_topk_pairs,
+            structural_proposal_topk_particles=(
+                self.pf_config.structural_proposal_topk_particles
+            ),
             target_ess_ratio=self.pf_config.target_ess_ratio,
             max_temper_steps=self.pf_config.max_temper_steps,
             min_delta_beta=self.pf_config.min_delta_beta,
@@ -518,6 +750,7 @@ class RotatingShieldPFEstimator:
             position_max=self.pf_config.position_max,
             init_num_sources=self.pf_config.init_num_sources,
             init_grid_spacing_m=self.pf_config.init_grid_spacing_m,
+            init_grid_repeats=self.pf_config.init_grid_repeats,
             roughening_k=self.pf_config.roughening_k,
             min_sigma_pos=self.pf_config.min_sigma_pos,
             max_sigma_pos=self.pf_config.max_sigma_pos,
@@ -618,6 +851,7 @@ class RotatingShieldPFEstimator:
         kernel = self._continuous_kernel()
         min_counts = float(self.pf_config.adaptive_strength_prior_min_counts)
         log_sigma = float(self.pf_config.adaptive_strength_prior_log_sigma)
+        max_upscale = float(self.pf_config.adaptive_strength_prior_max_upscale)
         min_strength = max(float(self.pf_config.min_strength), 0.0)
         eps = 1e-12
         diagnostics: Dict[str, Dict[str, float]] = {}
@@ -626,6 +860,7 @@ class RotatingShieldPFEstimator:
                 continue
             observed_counts = max(float(z_k.get(iso, 0.0)), 0.0)
             target_counts = max(observed_counts, min_counts)
+            floor_only_target = observed_counts < min_counts
             obs_variance = (
                 0.0
                 if z_variance_k is None
@@ -673,6 +908,14 @@ class RotatingShieldPFEstimator:
                     proposed_total *= float(
                         np.random.lognormal(mean=0.0, sigma=effective_log_sigma)
                     )
+                if total_strength > eps:
+                    if floor_only_target:
+                        proposed_total = min(proposed_total, total_strength)
+                    else:
+                        proposed_total = min(
+                            proposed_total,
+                            total_strength * max_upscale,
+                        )
                 proposed_total = max(float(proposed_total), min_strength * num_sources)
                 if not np.isfinite(proposed_total):
                     continue
@@ -685,6 +928,8 @@ class RotatingShieldPFEstimator:
                     "target_counts": float(target_counts),
                     "observation_count_variance": float(obs_variance),
                     "effective_log_sigma": float(effective_log_sigma),
+                    "floor_only_target": float(floor_only_target),
+                    "max_upscale": float(max_upscale),
                     "before_median_strength": float(np.median(before_totals)),
                     "after_median_strength": float(np.median(after_totals)),
                     "particles_changed": float(len(after_totals)),
@@ -700,6 +945,9 @@ class RotatingShieldPFEstimator:
             obstacle_grid=self.obstacle_grid,
             obstacle_height_m=self.obstacle_height_m,
             obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+            obstacle_buildup_coeff=self.obstacle_buildup_coeff,
+            detector_radius_m=self.detector_radius_m,
+            detector_aperture_samples=self.detector_aperture_samples,
         )
 
     def expected_counts_pair_for_states(
@@ -716,18 +964,53 @@ class RotatingShieldPFEstimator:
 
         Uses torch acceleration when enabled; otherwise falls back to CPU kernels.
         """
-        if not states:
-            return np.zeros(0, dtype=float)
         if pose_idx < 0 or pose_idx >= len(self.poses):
             raise IndexError("pose_idx out of range")
-        kernel = self._continuous_kernel()
         detector_pos = np.asarray(self.poses[pose_idx], dtype=float)
-        if not self.pf_config.use_gpu:
+        return self.expected_counts_pair_for_states_at_detector(
+            isotope=isotope,
+            detector_pos=detector_pos,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+            states=states,
+        )
+
+    def expected_counts_pair_for_states_at_detector(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+        live_time_s: float,
+        states: Sequence[IsotopeState],
+    ) -> NDArray[np.float64]:
+        """
+        Compute Λ for a state subset at an arbitrary detector position.
+
+        This helper keeps candidate-pose and shield-selection scoring on the
+        same GPU-accelerated transport approximation as normal PF updates,
+        even when a planning particle subset is used.
+        """
+        if not states:
+            return np.zeros(0, dtype=float)
+        kernel = self._continuous_kernel()
+        detector_pos = np.asarray(detector_pos, dtype=float)
+        use_gpu = False
+        if self.pf_config.use_gpu:
+            try:
+                use_gpu = bool(self._gpu_enabled())
+            except RuntimeError:
+                use_gpu = False
+        if not use_gpu:
             values = np.zeros(len(states), dtype=float)
             source_scale = self.response_scale_for_isotope(isotope)
             for idx, state in enumerate(states):
                 rate = float(state.background)
-                for pos, strength in zip(state.positions[: state.num_sources], state.strengths[: state.num_sources]):
+                for pos, strength in zip(
+                    state.positions[: state.num_sources],
+                    state.strengths[: state.num_sources],
+                ):
                     rate += source_scale * float(strength) * kernel.kernel_value_pair(
                         isotope=isotope,
                         detector_pos=detector_pos,
@@ -737,12 +1020,15 @@ class RotatingShieldPFEstimator:
                     )
                 values[idx] = float(live_time_s) * rate
             return values
-        self._gpu_enabled()
         from pf import gpu_utils
 
         device = gpu_utils.resolve_device(self.pf_config.gpu_device)
         dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
+            states,
+            device=device,
+            dtype=dtype,
+        )
         mu_fe, mu_pb = kernel._mu_values(isotope=isotope)
         shield_params = kernel.shield_params
         lam_t = gpu_utils.expected_counts_pair_torch(
@@ -765,6 +1051,10 @@ class RotatingShieldPFEstimator:
             device=device,
             dtype=dtype,
             source_scale=self.response_scale_for_isotope(isotope),
+            detector_radius_m=kernel.detector_radius_m,
+            detector_aperture_samples=kernel.detector_aperture_samples,
+            buildup_fe_coeff=shield_params.buildup_fe_coeff,
+            buildup_pb_coeff=shield_params.buildup_pb_coeff,
             **kernel.obstacle_gpu_kwargs(isotope),
         )
         return lam_t.detach().cpu().numpy()
@@ -785,7 +1075,9 @@ class RotatingShieldPFEstimator:
         spherical shield, and obstacle attenuation model used by PF updates.
         Across shield pairs, ``aggregate="max"`` returns the best achievable
         expected count at that pose, while ``aggregate="mean"`` returns the
-        orientation-average expected count.
+        orientation-average expected count. Each pair uses a weighted posterior
+        quantile rather than the posterior mean, so a few high-strength outlier
+        particles cannot make the pose look observable for every isotope.
         """
         detector = np.asarray(pose_xyz, dtype=float)
         if detector.shape != (3,):
@@ -808,16 +1100,23 @@ class RotatingShieldPFEstimator:
         if not pairs:
             return {iso: 0.0 for iso in self.isotopes}
         particles = self.planning_particles(max_particles=max_particles)
-        kernel = self._continuous_kernel()
         counts_by_isotope: Dict[str, float] = {}
         eps = 1e-12
         for iso in self.isotopes:
             filt = self.filters.get(iso)
+            use_gpu_quantile = False
             if (
                 max_particles is None
                 and filt is not None
                 and filt.continuous_particles
                 and self.pf_config.use_gpu
+            ):
+                try:
+                    use_gpu_quantile = bool(self._gpu_enabled())
+                except RuntimeError:
+                    use_gpu_quantile = False
+            if (
+                use_gpu_quantile
             ):
                 weights_arr = np.asarray(filt.continuous_weights, dtype=float)
                 weight_sum = float(np.sum(weights_arr))
@@ -836,7 +1135,13 @@ class RotatingShieldPFEstimator:
                         pb_index=pb_index,
                         live_time_s=live_time,
                     )
-                    pair_means.append(float(np.sum(weights_arr * lambdas)))
+                    pair_means.append(
+                        _weighted_quantile(
+                            lambdas,
+                            weights_arr,
+                            self.pf_config.pose_min_observation_quantile,
+                        )
+                    )
                 if aggregate == "mean":
                     counts_by_isotope[iso] = float(np.mean(pair_means))
                 else:
@@ -855,31 +1160,106 @@ class RotatingShieldPFEstimator:
                 weights_arr = np.ones(len(states), dtype=float) / max(len(states), 1)
             else:
                 weights_arr = weights_arr / weight_sum
-            source_scale = self.response_scale_for_isotope(iso)
             pair_means: list[float] = []
             for fe_index, pb_index in pairs:
-                lambdas = np.zeros(len(states), dtype=float)
-                for state_idx, state in enumerate(states):
-                    rate = float(state.background)
-                    for pos, strength in zip(
-                        state.positions[: state.num_sources],
-                        state.strengths[: state.num_sources],
-                    ):
-                        kernel_value = kernel.kernel_value_pair(
-                            isotope=iso,
-                            detector_pos=detector,
-                            source_pos=np.asarray(pos, dtype=float),
-                            fe_index=fe_index,
-                            pb_index=pb_index,
-                        )
-                        rate += source_scale * float(strength) * float(kernel_value)
-                    lambdas[state_idx] = max(live_time * rate, 0.0)
-                pair_means.append(float(np.sum(weights_arr * lambdas)))
+                lambdas = self.expected_counts_pair_for_states_at_detector(
+                    isotope=iso,
+                    detector_pos=detector,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    live_time_s=live_time,
+                    states=states,
+                )
+                pair_means.append(
+                    _weighted_quantile(
+                        lambdas,
+                        weights_arr,
+                        self.pf_config.pose_min_observation_quantile,
+                    )
+                )
             if aggregate == "mean":
                 counts_by_isotope[iso] = float(np.mean(pair_means))
             else:
                 counts_by_isotope[iso] = float(np.max(pair_means))
         return counts_by_isotope
+
+    def expected_observation_counts_by_isotope_at_pair(
+        self,
+        pose_idx: int,
+        fe_index: int,
+        pb_index: int,
+        *,
+        live_time_s: float,
+        max_particles: int | None = None,
+    ) -> Dict[str, float]:
+        """Return posterior-quantile expected counts for one Fe/Pb pair."""
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        pose = np.asarray(self.poses[int(pose_idx)], dtype=float)
+        return self.expected_observation_counts_by_isotope_at_pose(
+            pose,
+            live_time_s=float(live_time_s),
+            fe_pb_pairs=[(int(fe_index), int(pb_index))],
+            aggregate="max",
+            max_particles=max_particles,
+        )
+
+    def orientation_signature_separation_score(
+        self,
+        pose_idx: int,
+        fe_index: int,
+        pb_index: int,
+        *,
+        live_time_s: float,
+        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None = None,
+        alpha_by_isotope: Dict[str, float] | None = None,
+        variance_floor: float = 1.0,
+    ) -> float:
+        """
+        Return a shield-signature separation score for one orientation pair.
+
+        The score is a weighted posterior variance of predicted counts,
+        normalized by the mean count scale. It favors shield postures whose
+        response differs across currently plausible source hypotheses.
+        """
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        eps = 1e-12
+        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
+        alpha_sum = sum(float(v) for v in alphas.values()) or 1.0
+        score = 0.0
+        floor = max(float(variance_floor), eps)
+        for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
+            if particles_by_isotope is not None and iso in particles_by_isotope:
+                states, weights = particles_by_isotope[iso]
+            else:
+                states = [p.state for p in filt.continuous_particles]
+                weights = filt.continuous_weights
+            if not states:
+                continue
+            weights_arr = np.asarray(weights, dtype=float)
+            weights_arr = weights_arr / max(float(np.sum(weights_arr)), eps)
+            lambdas = self.expected_counts_pair_for_states(
+                isotope=iso,
+                pose_idx=int(pose_idx),
+                fe_index=int(fe_index),
+                pb_index=int(pb_index),
+                live_time_s=float(live_time_s),
+                states=states,
+            )
+            if lambdas.size == 0:
+                continue
+            mean = float(np.sum(weights_arr * lambdas))
+            var = float(np.sum(weights_arr * (lambdas - mean) ** 2))
+            score += (
+                float(alphas.get(iso, 1.0))
+                / alpha_sum
+                * max(var, 0.0)
+                / max(mean, floor)
+            )
+        return float(max(score, 0.0))
 
     def planning_particles(
         self,
@@ -1003,7 +1383,7 @@ class RotatingShieldPFEstimator:
         pf_conf = self._build_pf_config()
         for iso in to_add:
             if iso not in self.filters:
-                self.filters[iso] = IsotopeParticleFilter(iso, kernel=self.kernel_cache, config=pf_conf)
+                self.filters[iso] = self._build_filter(iso, pf_conf)
 
     def update(
         self,
@@ -1064,14 +1444,17 @@ class RotatingShieldPFEstimator:
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
-        self.adapt_strength_prior_to_observation(
-            z_k=z_k,
-            pose_idx=pose_idx,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            live_time_s=live_time_s,
-            z_variance_k=z_variance_k,
-        )
+        if self._defer_resample_birth:
+            self.last_strength_prior_diagnostics = {}
+        else:
+            self.adapt_strength_prior_to_observation(
+                z_k=z_k,
+                pose_idx=pose_idx,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                z_variance_k=z_variance_k,
+            )
         for iso, val in z_k.items():
             if iso not in self.filters:
                 continue
@@ -1088,6 +1471,7 @@ class RotatingShieldPFEstimator:
                     else float(z_variance_k.get(iso, 0.0))
                 ),
                 step_idx=len(self.measurements),
+                defer_resample=bool(self._defer_resample_birth),
             )
         self.history_estimates.append(self.estimates())
         self.measurements.append(
@@ -1104,6 +1488,120 @@ class RotatingShieldPFEstimator:
                 ig_value=None,
             )
         )
+        if self._defer_resample_birth:
+            self._deferred_measurement_count += 1
+        else:
+            self._apply_birth_death()
+
+    def begin_deferred_pose_update(self) -> None:
+        """Start a station-level update that delays resampling and birth/death."""
+        self._defer_resample_birth = True
+        self._deferred_measurement_count = 0
+
+    def finalize_deferred_pose_update(self) -> int:
+        """
+        Finish a station-level delayed update and return finalized measurements.
+
+        During a delayed update, each shield posture updates particle weights
+        immediately. This method then performs the station-level resampling,
+        particle adaptation, label alignment, and residual-gated birth/death once.
+        """
+        count = int(self._deferred_measurement_count)
+        self._defer_resample_birth = False
+        self._deferred_measurement_count = 0
+        if count <= 0:
+            return 0
+        for filt in self.filters.values():
+            filt.finalize_deferred_update()
+        birth_context_count = count + max(
+            0,
+            int(self._previous_deferred_measurement_count),
+        )
+        self._apply_birth_death(birth_window_override=birth_context_count)
+        self._previous_deferred_measurement_count = count
+        self.history_estimates.append(self.estimates())
+        return count
+
+    def update_pair_sequence(
+        self,
+        records: Sequence[
+            tuple[Dict[str, float], int, int, float, Dict[str, float] | None]
+        ],
+        *,
+        pose_idx: int,
+    ) -> None:
+        """
+        Jointly update PFs from a same-pose shield-orientation sequence.
+
+        Each record is ``(z_k, fe_index, pb_index, live_time_s, z_variance_k)``.
+        The joint update uses the product likelihood over all postures and only
+        applies birth/death after the full shield program is observed.
+        """
+        if not records:
+            return
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        for z_k, fe_index, pb_index, live_time_s, z_variance_k in records:
+            self.adapt_strength_prior_to_observation(
+                z_k=z_k,
+                pose_idx=pose_idx,
+                fe_index=int(fe_index),
+                pb_index=int(pb_index),
+                live_time_s=float(live_time_s),
+                z_variance_k=z_variance_k,
+            )
+        step_idx = len(self.measurements)
+        for iso, filt in self.filters.items():
+            z_arr = np.asarray(
+                [float(z_k.get(iso, 0.0)) for z_k, _, _, _, _ in records],
+                dtype=float,
+            )
+            var_arr = np.asarray(
+                [
+                    0.0
+                    if z_variance_k is None
+                    else float(z_variance_k.get(iso, 0.0))
+                    for _, _, _, _, z_variance_k in records
+                ],
+                dtype=float,
+            )
+            fe_arr = np.asarray(
+                [int(fe_index) for _, fe_index, _, _, _ in records],
+                dtype=int,
+            )
+            pb_arr = np.asarray(
+                [int(pb_index) for _, _, pb_index, _, _ in records],
+                dtype=int,
+            )
+            live_arr = np.asarray(
+                [float(live_time_s) for _, _, _, live_time_s, _ in records],
+                dtype=float,
+            )
+            filt.update_continuous_pair_sequence(
+                z_obs=z_arr,
+                pose_idx=pose_idx,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+                live_times_s=live_arr,
+                observation_count_variances=var_arr,
+                step_idx=step_idx,
+            )
+        self.history_estimates.append(self.estimates())
+        for z_k, fe_index, pb_index, live_time_s, z_variance_k in records:
+            self.measurements.append(
+                MeasurementRecord(
+                    z_k={iso: float(v) for iso, v in z_k.items()},
+                    pose_idx=pose_idx,
+                    orient_idx=int(fe_index),
+                    live_time_s=float(live_time_s),
+                    fe_index=int(fe_index),
+                    pb_index=int(pb_index),
+                    z_variance_k=None
+                    if z_variance_k is None
+                    else {iso: float(v) for iso, v in z_variance_k.items()},
+                    ig_value=None,
+                )
+            )
         self._apply_birth_death()
 
     def update_pair_at_pose(
@@ -1127,7 +1625,17 @@ class RotatingShieldPFEstimator:
         if not self.filters:
             pf_conf = self._build_pf_config()
             for iso in self.isotopes:
-                self.filters[iso] = IsotopeParticleFilter(iso, kernel=None, config=pf_conf)
+                self.filters[iso] = IsotopeParticleFilter(
+                    iso,
+                    kernel=None,
+                    config=pf_conf,
+                    obstacle_grid=self.obstacle_grid,
+                    obstacle_height_m=self.obstacle_height_m,
+                    obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
+                    obstacle_buildup_coeff=self.obstacle_buildup_coeff,
+                    detector_radius_m=self.detector_radius_m,
+                    detector_aperture_samples=self.detector_aperture_samples,
+                )
         self._adapt_strength_prior_at_detector(
             z_k=z_k,
             detector_pos=detector_pos,
@@ -1214,22 +1722,227 @@ class RotatingShieldPFEstimator:
             live_times=np.asarray(live_times, dtype=float),
         )
 
-    def _apply_birth_death(self) -> None:
+    def _background_counts_for_report_refit(
+        self,
+        isotope: str,
+        live_times: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return background counts used by reported-strength refitting."""
+        background_rate = 0.0
+        filt = self.filters.get(isotope)
+        if filt is not None and filt.continuous_particles:
+            background_rate = float(filt.best_particle().state.background)
+        elif filt is not None:
+            level = filt.config.background_level
+            if isinstance(level, dict):
+                background_rate = float(level.get(isotope, 0.0))
+            else:
+                background_rate = float(level)
+        return np.maximum(background_rate, 0.0) * np.asarray(live_times, dtype=float)
+
+    def _refit_reported_strengths(
+        self,
+        isotope: str,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """
+        Refit reported source strengths with non-negative Poisson regression.
+
+        PF particles estimate source existence and position.  Conditioned on the
+        reported positions, the intensity parameters are linear in the expected
+        counts, so a multiplicative Poisson regression update gives a
+        Rao-Blackwellized strength estimate without changing the transport model
+        or inventing source-specific thresholds.
+        """
+        pos_arr = np.asarray(positions, dtype=float)
+        str_arr = np.asarray(strengths, dtype=float).reshape(-1)
+        if not bool(self.pf_config.report_strength_refit):
+            return pos_arr, str_arr
+        if pos_arr.size == 0 or str_arr.size == 0:
+            return pos_arr, str_arr
+        if pos_arr.shape[0] != str_arr.size:
+            return pos_arr, str_arr
+        data = self._measurement_data_for_iso(isotope, None)
+        if data is None or data.z_k.size == 0:
+            return pos_arr, str_arr
+        filt = self.filters.get(isotope)
+        if filt is None:
+            return pos_arr, str_arr
+        refit_data = filt._signal_bearing_refit_data(data)
+        if refit_data is None or refit_data.z_k.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        data = refit_data
+        unit_strengths = np.ones(str_arr.size, dtype=float)
+        design = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=data.detector_positions,
+            sources=pos_arr,
+            strengths=unit_strengths,
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=self.response_scale_for_isotope(isotope),
+        )
+        design = np.maximum(np.asarray(design, dtype=float), 0.0)
+        if design.ndim != 2 or design.shape[1] != str_arr.size:
+            return pos_arr, str_arr
+        column_sum = np.sum(design, axis=0)
+        observable = column_sum > float(self.pf_config.report_strength_refit_eps)
+        if not np.any(observable):
+            return pos_arr, np.zeros_like(str_arr, dtype=float)
+        z_obs = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
+        background = self._background_counts_for_report_refit(isotope, data.live_times)
+        if background.size != z_obs.size:
+            background = np.resize(background, z_obs.size)
+        eps = float(self.pf_config.report_strength_refit_eps)
+        q = np.maximum(str_arr, eps)
+        if not np.any(np.isfinite(q)):
+            q = np.full(str_arr.size, eps, dtype=float)
+        signal_total = max(float(np.sum(z_obs - background)), 0.0)
+        weak_or_invalid = ~np.isfinite(q) | (q <= eps)
+        if np.any(weak_or_invalid) and signal_total > 0.0:
+            denom = max(float(np.sum(column_sum[observable])), eps)
+            q[weak_or_invalid & observable] = signal_total / denom
+        q[~observable] = 0.0
+        obs_weights = 1.0 / np.maximum(data.observation_variances, 1.0)
+        gram = (design.T * obs_weights[None, :]) @ design
+        rhs = (design.T * obs_weights[None, :]) @ (z_obs - background)
+        try:
+            direct = np.linalg.solve(
+                gram + np.eye(str_arr.size, dtype=float) * eps,
+                rhs,
+            )
+            direct = np.where(np.isfinite(direct), direct, 0.0)
+            if np.any(direct > 0.0):
+                q = np.maximum(direct, 0.0)
+                q[~observable] = 0.0
+        except np.linalg.LinAlgError:
+            pass
+        q_max = float(getattr(self.pf_config, "birth_q_max", 0.0))
+        for _ in range(int(self.pf_config.report_strength_refit_iters)):
+            lam = background + design @ q
+            lam = np.maximum(lam, eps)
+            ratio = np.divide(z_obs, lam, out=np.zeros_like(z_obs), where=lam > 0.0)
+            numerator = design.T @ ratio
+            denominator = np.maximum(column_sum, eps)
+            update = numerator / denominator
+            q = q * np.clip(update, 0.0, np.inf)
+            q[~observable] = 0.0
+            if q_max > 0.0:
+                q = np.minimum(q, q_max)
+            q = np.where(np.isfinite(q), q, 0.0)
+        q = np.maximum(q, 0.0)
+        support_floor = max(float(self.pf_config.min_strength), 0.0) * (
+            1.0 + 1.0e-6
+        )
+        keep = observable & (q > support_floor)
+        if not np.any(keep):
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        return pos_arr[keep], q[keep]
+
+    def _run_isotope_structural_update(
+        self,
+        task: tuple[
+            str,
+            IsotopeParticleFilter,
+            MeasurementData | None,
+            MeasurementData | None,
+            MeasurementData | None,
+        ],
+    ) -> None:
+        """Run one isotope's deferred strength refit and birth/death update."""
+        _, filt, refit_data, support_data, birth_data = task
+        if bool(self.pf_config.conditional_strength_refit):
+            filt.refit_strengths_for_particles(
+                refit_data,
+                iters=self.pf_config.conditional_strength_refit_iters,
+                eps=self.pf_config.refit_eps,
+            )
+        filt.apply_birth_death(
+            support_data=support_data,
+            birth_data=birth_data,
+            candidate_positions=self.candidate_sources,
+        )
+
+    def _structural_update_worker_count(self, task_count: int) -> int:
+        """Return the worker count for independent per-isotope structural updates."""
+        if task_count <= 1 or not bool(self.pf_config.parallel_isotope_updates):
+            return 1
+        configured = self.pf_config.parallel_isotope_workers
+        if configured is None:
+            configured = os.cpu_count() or 1
+        return max(1, min(int(configured), int(task_count)))
+
+    def _apply_birth_death(self, birth_window_override: int | None = None) -> None:
         """Apply per-isotope birth/death updates using recent measurements."""
+        tasks: list[
+            tuple[
+                str,
+                IsotopeParticleFilter,
+                MeasurementData | None,
+                MeasurementData | None,
+                MeasurementData | None,
+            ]
+        ] = []
+        birth_window = (
+            self.pf_config.birth_window
+            if birth_window_override is None
+            else max(1, int(birth_window_override))
+        )
         for iso, filt in self.filters.items():
             if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
                 continue
-            support_data = self._measurement_data_for_iso(iso, self.pf_config.support_window)
-            birth_data = self._measurement_data_for_iso(iso, self.pf_config.birth_window)
-            filt.apply_birth_death(
-                support_data=support_data,
-                birth_data=birth_data,
-                candidate_positions=self.candidate_sources,
+            refit_data = (
+                self._measurement_data_for_iso(
+                    iso,
+                    self.pf_config.conditional_strength_refit_window,
+                )
+                if bool(self.pf_config.conditional_strength_refit)
+                else None
             )
+            support_data = self._measurement_data_for_iso(iso, self.pf_config.support_window)
+            birth_data = self._measurement_data_for_iso(iso, birth_window)
+            tasks.append((iso, filt, refit_data, support_data, birth_data))
+        worker_count = self._structural_update_worker_count(len(tasks))
+        if worker_count <= 1:
+            for task in tasks:
+                self._run_isotope_structural_update(task)
+            return
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(self._run_isotope_structural_update, tasks))
 
     def estimates(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return per-isotope position/strength estimates (MMSE over continuous particles)."""
-        return {iso: f.estimate() for iso, f in self.filters.items()}
+        """Return per-isotope position/strength estimates for reporting."""
+        estimates: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
+        for isotope, filt in self.filters.items():
+            use_clustered = bool(
+                filt.config.birth_enable and filt.config.use_clustered_output
+            )
+            if use_clustered and hasattr(filt, "estimate_clustered"):
+                try:
+                    clustered = filt.estimate_clustered()
+                    if clustered[0].shape[0] > 0:
+                        estimates[isotope] = self._refit_reported_strengths(
+                            isotope,
+                            clustered[0],
+                            clustered[1],
+                        )
+                        continue
+                except RuntimeError:
+                    estimates[isotope] = (
+                        np.zeros((0, 3), dtype=float),
+                        np.zeros(0, dtype=float),
+                    )
+                    continue
+            raw_positions, raw_strengths = filt.estimate()
+            estimates[isotope] = self._refit_reported_strengths(
+                isotope,
+                raw_positions,
+                raw_strengths,
+            )
+        return estimates
 
     def estimate_all(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Alias for estimates() to align with visualization helpers."""
@@ -1255,6 +1968,24 @@ class RotatingShieldPFEstimator:
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
                     "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                    "birth_residual_chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
+                    "birth_residual_p_value": float(getattr(filt, "last_birth_residual_p_value", 1.0)),
+                    "birth_residual_support": int(getattr(filt, "last_birth_residual_support", 0)),
+                    "birth_residual_distinct_poses": int(
+                        getattr(filt, "last_birth_residual_distinct_poses", 0)
+                    ),
+                    "birth_residual_distinct_stations": int(
+                        getattr(filt, "last_birth_residual_distinct_stations", 0)
+                    ),
+                    "birth_residual_gate_passed": bool(
+                        getattr(filt, "last_birth_residual_gate_passed", False)
+                    ),
+                    "birth_residual_refit_fraction": float(
+                        getattr(filt, "last_birth_residual_refit_fraction", 1.0)
+                    ),
+                    "birth_residual_refit_gate_passed": bool(
+                        getattr(filt, "last_birth_residual_refit_gate_passed", True)
+                    ),
                     "temper_steps": [],
                     "temper_resamples": 0,
                     "r_mean": 0.0,
@@ -1317,6 +2048,24 @@ class RotatingShieldPFEstimator:
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
                 "kill_count": int(getattr(filt, "last_kill_count", 0)),
+                "birth_residual_chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
+                "birth_residual_p_value": float(getattr(filt, "last_birth_residual_p_value", 1.0)),
+                "birth_residual_support": int(getattr(filt, "last_birth_residual_support", 0)),
+                "birth_residual_distinct_poses": int(
+                    getattr(filt, "last_birth_residual_distinct_poses", 0)
+                ),
+                "birth_residual_distinct_stations": int(
+                    getattr(filt, "last_birth_residual_distinct_stations", 0)
+                ),
+                "birth_residual_gate_passed": bool(
+                    getattr(filt, "last_birth_residual_gate_passed", False)
+                ),
+                "birth_residual_refit_fraction": float(
+                    getattr(filt, "last_birth_residual_refit_fraction", 1.0)
+                ),
+                "birth_residual_refit_gate_passed": bool(
+                    getattr(filt, "last_birth_residual_refit_gate_passed", True)
+                ),
                 "temper_steps": list(getattr(filt, "last_temper_steps", [])),
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "r_mean": r_mean,
@@ -1492,6 +2241,10 @@ class RotatingShieldPFEstimator:
                 device=device,
                 dtype=dtype,
                 source_scale=self.response_scale_for_isotope(isotope),
+                detector_radius_m=kernel.detector_radius_m,
+                detector_aperture_samples=kernel.detector_aperture_samples,
+                buildup_fe_coeff=shield_params.buildup_fe_coeff,
+                buildup_pb_coeff=shield_params.buildup_pb_coeff,
                 **kernel.obstacle_gpu_kwargs(isotope),
             )
 
@@ -1864,16 +2617,25 @@ class RotatingShieldPFEstimator:
         alphas = {k: v / alpha_sum for k, v in alphas.items()}
         device = gpu_utils.resolve_device(self.pf_config.gpu_device)
         dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
+        planning_subset = self.planning_particles(
+            max_particles=rollout_particles,
+            method=rollout_method,
+            rng=rng,
+        )
 
         iso_data: Dict[str, Dict[str, Any]] = {}
         for iso, filt in self.filters.items():
             if not filt.continuous_particles:
                 continue
-            weights = np.asarray(filt.continuous_weights, dtype=float)
-            if weights.size == 0:
+            if iso in planning_subset and planning_subset[iso][0]:
+                states, weights = planning_subset[iso]
+            else:
+                states = [p.state for p in filt.continuous_particles]
+                weights = np.asarray(filt.continuous_weights, dtype=float)
+            weights = np.asarray(weights, dtype=float)
+            if weights.size == 0 or not states:
                 continue
             weights = weights / max(np.sum(weights), eps)
-            states = [p.state for p in filt.continuous_particles]
             positions, strengths, backgrounds, mask = gpu_utils.pack_states(
                 states, device=device, dtype=dtype
             )
@@ -1901,6 +2663,10 @@ class RotatingShieldPFEstimator:
                     device=device,
                     dtype=dtype,
                     source_scale=self.response_scale_for_isotope(iso),
+                    detector_radius_m=filt.continuous_kernel.detector_radius_m,
+                    detector_aperture_samples=filt.continuous_kernel.detector_aperture_samples,
+                    buildup_fe_coeff=shield_params.buildup_fe_coeff,
+                    buildup_pb_coeff=shield_params.buildup_pb_coeff,
                     **filt.continuous_kernel.obstacle_gpu_kwargs(iso),
                 )
                 lam_list.append(lam_t)

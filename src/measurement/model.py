@@ -34,7 +34,13 @@ class EnvironmentConfig:
 
 @dataclass(frozen=True)
 class PointSource:
-    """Represent a point radiation source."""
+    """
+    Represent a point radiation source on the detector-count-rate scale.
+
+    ``intensity_cps_1m`` is the expected net detector count rate at a 1 m
+    source-detector distance for the configured detector and spectrum
+    processing pipeline. It is not total isotropic gamma/s activity.
+    """
 
     isotope: str
     position: Tuple[float, float, float]
@@ -46,7 +52,7 @@ class PointSource:
 
     @property
     def strength(self) -> float:
-        """Backward-compatible strength accessor (cps at 1 m)."""
+        """Backward-compatible strength accessor (detector cps at 1 m)."""
         return self.intensity_cps_1m
 
 
@@ -54,7 +60,7 @@ def inverse_square_scale(detector: np.ndarray, source: PointSource) -> float:
     """
     Return the inverse-square geometric scale for a point source.
 
-    Computes 1/d^2 based on the detector distance (cps@1m scaling).
+    Computes 1/d^2 based on detector distance for detector cps@1m scaling.
     """
     distance = np.linalg.norm(detector - source.position_array())
     if distance == 0:

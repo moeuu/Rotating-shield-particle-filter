@@ -26,9 +26,11 @@
 #include <G4Track.hh>
 #include <G4Types.hh>
 #include <G4UserEventAction.hh>
+#include <G4UserStackingAction.hh>
 #include <G4UserSteppingAction.hh>
 #include <G4VModularPhysicsList.hh>
 #include <G4VPhysicalVolume.hh>
+#include <G4VProcess.hh>
 #include <G4VSensitiveDetector.hh>
 #include <G4VUserActionInitialization.hh>
 #include <G4VUserDetectorConstruction.hh>
@@ -170,9 +172,13 @@ struct SimulationResult {
 
 struct TransportOptions {
     double background_cps = 0.0;
-    std::string source_bias_mode = "mixture_cone_isotropic";
+    std::string source_rate_model = "detector_cps_1m";
+    std::string source_bias_mode = "detector_cone";
     double source_bias_cone_half_angle_deg = 0.0;
     double source_bias_isotropic_fraction = 0.1;
+    std::string detector_scoring_mode = "full_transport";
+    std::string secondary_transport_mode = "full_transport";
+    double primary_sampling_fraction = 1.0;
 };
 
 struct EnergyDeposit {
@@ -202,6 +208,16 @@ std::string ToLower(std::string value) {
     return value;
 }
 
+std::string NormalizeModeToken(std::string value) {
+    value = ToLower(std::move(value));
+    for (char& ch : value) {
+        if (ch == '-') {
+            ch = '_';
+        }
+    }
+    return value;
+}
+
 std::string JoinSet(const std::set<std::string>& values, const std::string& separator) {
     std::ostringstream stream;
     bool first = true;
@@ -213,6 +229,49 @@ std::string JoinSet(const std::set<std::string>& values, const std::string& sepa
         first = false;
     }
     return stream.str();
+}
+
+std::string SanitizeMetadataToken(std::string value) {
+    for (char& ch : value) {
+        if (std::isspace(static_cast<unsigned char>(ch)) || ch == ',' || ch == '=') {
+            ch = '_';
+        }
+    }
+    return value.empty() ? "unknown" : value;
+}
+
+std::string SerializeCounterMap(const std::map<std::string, long long>& values) {
+    if (values.empty()) {
+        return "-";
+    }
+    std::ostringstream stream;
+    bool first = true;
+    for (const auto& item : values) {
+        if (!first) {
+            stream << ",";
+        }
+        first = false;
+        stream << SanitizeMetadataToken(item.first) << ":" << item.second;
+    }
+    return stream.str();
+}
+
+std::string SerializeTopCounterMap(
+    const std::map<std::string, long long>& values,
+    const std::size_t limit
+) {
+    std::vector<std::pair<std::string, long long>> sorted(values.begin(), values.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.second != rhs.second) {
+            return lhs.second > rhs.second;
+        }
+        return lhs.first < rhs.first;
+    });
+    if (sorted.size() > limit) {
+        sorted.resize(limit);
+    }
+    std::map<std::string, long long> top(sorted.begin(), sorted.end());
+    return SerializeCounterMap(top);
 }
 
 std::map<std::string, std::string> ParseFields(const std::vector<std::string>& tokens, std::size_t start_index = 1) {
@@ -355,19 +414,93 @@ double DetectorReferenceAcceptance(const DetectorSpec& detector) {
 }
 
 std::string NormalizeSourceBiasMode(const std::string& mode) {
-    auto normalized = ToLower(mode);
-    std::replace(normalized.begin(), normalized.end(), '-', '_');
+    auto normalized = NormalizeModeToken(mode);
     if (normalized.empty() || normalized == "none" || normalized == "isotropic") {
         return "analog";
     }
     if (normalized == "mixture_cone" || normalized == "cone_isotropic") {
         return "mixture_cone_isotropic";
     }
+    if (normalized == "detector" || normalized == "detector_directed" || normalized == "detector_cone") {
+        return "detector_cone";
+    }
     return normalized;
 }
 
 bool UsesSourceBias(const TransportOptions& options) {
     return NormalizeSourceBiasMode(options.source_bias_mode) == "mixture_cone_isotropic";
+}
+
+std::string NormalizeSourceRateModel(const std::string& mode) {
+    auto normalized = NormalizeModeToken(mode);
+    if (
+        normalized.empty()
+        || normalized == "detector"
+        || normalized == "detector_cps"
+        || normalized == "detector_cps_1m"
+        || normalized == "detector_count_rate"
+    ) {
+        return "detector_cps_1m";
+    }
+    if (
+        normalized == "isotropic"
+        || normalized == "isotropic_emission"
+        || normalized == "isotropic_emission_equivalent"
+        || normalized == "emission_equivalent"
+    ) {
+        return "isotropic_emission_equivalent";
+    }
+    return normalized;
+}
+
+std::string NormalizeDetectorScoringMode(const std::string& mode) {
+    const auto normalized = NormalizeModeToken(mode);
+    if (
+        normalized.empty()
+        || normalized == "full"
+        || normalized == "full_transport"
+        || normalized == "energy_deposit"
+    ) {
+        return "full_transport";
+    }
+    if (
+        normalized == "fast"
+        || normalized == "incident_energy"
+        || normalized == "incident_gamma_energy"
+        || normalized == "perfect_absorption"
+    ) {
+        return "incident_gamma_energy";
+    }
+    return normalized;
+}
+
+bool UsesFastDetectorScoring(const TransportOptions& options) {
+    return NormalizeDetectorScoringMode(options.detector_scoring_mode) == "incident_gamma_energy";
+}
+
+std::string NormalizeSecondaryTransportMode(const std::string& mode) {
+    const auto normalized = NormalizeModeToken(mode);
+    if (
+        normalized.empty()
+        || normalized == "full"
+        || normalized == "full_transport"
+        || normalized == "all_particles"
+    ) {
+        return "full_transport";
+    }
+    if (
+        normalized == "gamma_only"
+        || normalized == "photon_only"
+        || normalized == "kill_charged"
+        || normalized == "kill_charged_secondaries"
+    ) {
+        return "gamma_only";
+    }
+    return normalized;
+}
+
+bool UsesGammaOnlySecondaryTransport(const TransportOptions& options) {
+    return NormalizeSecondaryTransportMode(options.secondary_transport_mode) == "gamma_only";
 }
 
 double DetectorTargetRadiusM(const DetectorSpec& detector) {
@@ -565,6 +698,99 @@ std::string NormalizeMaterialName(std::string value) {
     return value;
 }
 
+class TransportDiagnostics {
+public:
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        total_track_steps_ = 0;
+        detector_hit_steps_ = 0;
+        secondary_count_ = 0;
+        killed_non_gamma_secondary_count_ = 0;
+        process_counts_.clear();
+        volume_step_counts_.clear();
+    }
+
+    void AddStep(const G4Step* step) {
+        if (step == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        total_track_steps_ += 1;
+        const auto* pre_point = step->GetPreStepPoint();
+        const auto* post_point = step->GetPostStepPoint();
+        const auto* volume = pre_point == nullptr ? nullptr : pre_point->GetPhysicalVolume();
+        const std::string volume_name = volume == nullptr ? "WorldBoundary" : volume->GetName();
+        volume_step_counts_[volume_name] += 1;
+        const auto* process = post_point == nullptr ? nullptr : post_point->GetProcessDefinedStep();
+        const std::string process_name = process == nullptr ? "unknown" : process->GetProcessName();
+        process_counts_[process_name] += 1;
+        const auto* secondaries = step->GetSecondaryInCurrentStep();
+        if (secondaries != nullptr) {
+            secondary_count_ += static_cast<long long>(secondaries->size());
+        }
+    }
+
+    void AddDetectorHitStep() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        detector_hit_steps_ += 1;
+    }
+
+    void AddKilledNonGammaSecondary() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        killed_non_gamma_secondary_count_ += 1;
+    }
+
+    long long TotalTrackSteps() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return total_track_steps_;
+    }
+
+    long long DetectorHitSteps() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return detector_hit_steps_;
+    }
+
+    long long SecondaryCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return secondary_count_;
+    }
+
+    long long KilledNonGammaSecondaryCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return killed_non_gamma_secondary_count_;
+    }
+
+    std::map<std::string, long long> ProcessCounts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return process_counts_;
+    }
+
+    std::map<std::string, long long> VolumeStepCounts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return volume_step_counts_;
+    }
+
+    long long ProcessCountForAliases(const std::set<std::string>& aliases) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        long long total = 0;
+        for (const auto& item : process_counts_) {
+            if (aliases.count(ToLower(item.first)) > 0) {
+                total += item.second;
+            }
+        }
+        return total;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    long long total_track_steps_ = 0;
+    long long detector_hit_steps_ = 0;
+    long long secondary_count_ = 0;
+    long long killed_non_gamma_secondary_count_ = 0;
+    std::map<std::string, long long> process_counts_;
+    std::map<std::string, long long> volume_step_counts_;
+};
+
 class EventStore {
 public:
     void BeginEvent() {
@@ -621,8 +847,14 @@ private:
 
 class CrystalSensitiveDetector : public G4VSensitiveDetector {
 public:
-    explicit CrystalSensitiveDetector(EventStore* store)
-        : G4VSensitiveDetector("CrystalSD"), store_(store) {}
+    CrystalSensitiveDetector(
+        EventStore* store,
+        TransportDiagnostics* diagnostics,
+        const std::string& detector_scoring_mode
+    ) : G4VSensitiveDetector("CrystalSD"),
+        store_(store),
+        diagnostics_(diagnostics),
+        score_energy_deposits_(NormalizeDetectorScoringMode(detector_scoring_mode) == "full_transport") {}
 
     void Initialize(G4HCofThisEvent*) override {
         store_->BeginEvent();
@@ -632,9 +864,16 @@ public:
         if (step == nullptr) {
             return false;
         }
+        if (!score_energy_deposits_) {
+            return false;
+        }
         const auto* track = step->GetTrack();
         const double weight = track == nullptr ? 1.0 : track->GetWeight();
-        store_->AddEnergyDeposit(step->GetTotalEnergyDeposit() / MeV, weight);
+        const double edep_mev = step->GetTotalEnergyDeposit() / MeV;
+        if (edep_mev > 0.0 && diagnostics_ != nullptr) {
+            diagnostics_->AddDetectorHitStep();
+        }
+        store_->AddEnergyDeposit(edep_mev, weight);
         return true;
     }
 
@@ -644,6 +883,8 @@ public:
 
 private:
     EventStore* store_ = nullptr;
+    TransportDiagnostics* diagnostics_ = nullptr;
+    bool score_energy_deposits_ = true;
 };
 
 class Geant4SceneConstruction : public G4VUserDetectorConstruction {
@@ -652,8 +893,15 @@ public:
         const SceneSpec* scene,
         const RequestSpec* request,
         EventStore* event_store,
+        TransportDiagnostics* diagnostics,
+        std::string detector_scoring_mode,
         const bool place_shields
-    ) : scene_(scene), request_(request), event_store_(event_store), place_shields_(place_shields) {}
+    ) : scene_(scene),
+        request_(request),
+        event_store_(event_store),
+        diagnostics_(diagnostics),
+        detector_scoring_mode_(std::move(detector_scoring_mode)),
+        place_shields_(place_shields) {}
 
     G4VPhysicalVolume* Construct() override {
         auto* nist = G4NistManager::Instance();
@@ -684,7 +932,7 @@ public:
             auto* solid = BuildSolid(volume, "StaticSolid_" + std::to_string(index));
             auto* logic = new G4LogicalVolume(solid, material, "StaticLV_" + std::to_string(index));
             logic->SetVisAttributes(G4VisAttributes::GetInvisible());
-            auto rotation = QuaternionToRotation(volume.qw, volume.qx, volume.qy, volume.qz);
+            auto rotation = QuaternionToPlacementRotation(volume.qw, volume.qx, volume.qy, volume.qz);
             G4ThreeVector placement(volume.tx * m, volume.ty * m, volume.tz * m);
             if (volume.shape == "mesh") {
                 rotation = std::make_unique<G4RotationMatrix>();
@@ -702,16 +950,28 @@ public:
             );
         }
         if (place_shields_) {
-            BuildShield(scene_->fe_shield, request_->fe_pose, world_logic, 1001);
-            BuildShield(scene_->pb_shield, request_->pb_pose, world_logic, 1002);
+            fe_shield_physical_ = BuildShield(scene_->fe_shield, request_->fe_pose, world_logic, 1001);
+            pb_shield_physical_ = BuildShield(scene_->pb_shield, request_->pb_pose, world_logic, 1002);
         }
         BuildDetector(world_logic, nist);
         return world_physical;
     }
 
+    void UpdateShieldPoses(const RequestSpec& request) {
+        if (!place_shields_) {
+            return;
+        }
+        UpdatePhysicalPose(fe_shield_physical_, request.fe_pose);
+        UpdatePhysicalPose(pb_shield_physical_, request.pb_pose);
+    }
+
     void ConstructSDandField() override {
         auto* sd_manager = G4SDManager::GetSDMpointer();
-        auto* crystal_sd = new CrystalSensitiveDetector(event_store_);
+        auto* crystal_sd = new CrystalSensitiveDetector(
+            event_store_,
+            diagnostics_,
+            detector_scoring_mode_
+        );
         sd_manager->AddNewDetector(crystal_sd);
         SetSensitiveDetector("DetectorCrystalLV", crystal_sd);
     }
@@ -741,7 +1001,12 @@ private:
         throw std::runtime_error("Unsupported volume shape: " + volume.shape);
     }
 
-    void BuildShield(const ShieldSpec& shield, const PoseSpec& pose, G4LogicalVolume* parent_logic, int copy_number) {
+    G4VPhysicalVolume* BuildShield(
+        const ShieldSpec& shield,
+        const PoseSpec& pose,
+        G4LogicalVolume* parent_logic,
+        int copy_number
+    ) {
         auto* material = ResolveMaterial(
             shield.material.name,
             shield.material.density_g_cm3,
@@ -770,8 +1035,8 @@ private:
             );
         }
         auto* logic = new G4LogicalVolume(solid, material, shield.kind + "_ShieldLV");
-        auto rotation = QuaternionToRotation(pose.qw, pose.qx, pose.qy, pose.qz);
-        new G4PVPlacement(
+        auto rotation = QuaternionToPlacementRotation(pose.qw, pose.qx, pose.qy, pose.qz);
+        return new G4PVPlacement(
             rotation.release(),
             G4ThreeVector(pose.x * m, pose.y * m, pose.z * m),
             logic,
@@ -781,6 +1046,15 @@ private:
             copy_number,
             true
         );
+    }
+
+    void UpdatePhysicalPose(G4VPhysicalVolume* physical, const PoseSpec& pose) const {
+        if (physical == nullptr) {
+            return;
+        }
+        auto rotation = QuaternionToPlacementRotation(pose.qw, pose.qx, pose.qy, pose.qz);
+        physical->SetTranslation(G4ThreeVector(pose.x * m, pose.y * m, pose.z * m));
+        physical->SetRotation(rotation.release());
     }
 
     void BuildDetector(G4LogicalVolume* parent_logic, G4NistManager*) {
@@ -798,7 +1072,7 @@ private:
             180.0 * deg
         );
         auto* housing_logic = new G4LogicalVolume(housing_solid, housing_material, "DetectorHousingLV");
-        auto housing_rotation = QuaternionToRotation(
+        auto housing_rotation = QuaternionToPlacementRotation(
             request_->detector_pose.qw,
             request_->detector_pose.qx,
             request_->detector_pose.qy,
@@ -920,10 +1194,27 @@ private:
         return rotation;
     }
 
+    std::unique_ptr<G4RotationMatrix> QuaternionToPlacementRotation(
+        const double qw,
+        const double qx,
+        const double qy,
+        const double qz
+    ) const {
+        auto rotation = QuaternionToRotation(qw, qx, qy, qz);
+        // G4PVPlacement expects the daughter-to-mother transform inverse of the
+        // active quaternion exported from Isaac/PF geometry.
+        rotation->invert();
+        return rotation;
+    }
+
     const SceneSpec* scene_ = nullptr;
     const RequestSpec* request_ = nullptr;
     EventStore* event_store_ = nullptr;
+    TransportDiagnostics* diagnostics_ = nullptr;
+    std::string detector_scoring_mode_ = "full_transport";
     bool place_shields_ = true;
+    G4VPhysicalVolume* fe_shield_physical_ = nullptr;
+    G4VPhysicalVolume* pb_shield_physical_ = nullptr;
     mutable int material_counter_ = 0;
 };
 
@@ -931,9 +1222,11 @@ struct PrimarySourceSnapshot {
     G4ThreeVector position;
     double energy_keV = 662.0;
     std::string source_bias_mode = "analog";
+    std::string source_rate_model = "detector_cps_1m";
     G4ThreeVector detector_center;
     double cone_half_angle_rad = CLHEP::pi;
     double isotropic_fraction = 1.0;
+    double history_weight = 1.0;
 };
 
 struct PrimaryDirectionSample {
@@ -947,17 +1240,21 @@ public:
         const G4ThreeVector& position,
         const double energy_keV,
         const std::string& source_bias_mode,
+        const std::string& source_rate_model,
         const G4ThreeVector& detector_center,
         const double cone_half_angle_rad,
-        const double isotropic_fraction
+        const double isotropic_fraction,
+        const double history_weight
     ) {
         std::lock_guard<std::mutex> lock(mutex_);
         position_ = position;
         energy_keV_ = energy_keV;
         source_bias_mode_ = NormalizeSourceBiasMode(source_bias_mode);
+        source_rate_model_ = NormalizeSourceRateModel(source_rate_model);
         detector_center_ = detector_center;
         cone_half_angle_rad_ = std::clamp(cone_half_angle_rad, 1.0e-9, CLHEP::pi);
         isotropic_fraction_ = std::clamp(isotropic_fraction, 1.0e-6, 1.0);
+        history_weight_ = std::isfinite(history_weight) && history_weight > 0.0 ? history_weight : 1.0;
     }
 
     PrimarySourceSnapshot Snapshot() const {
@@ -966,9 +1263,11 @@ public:
             position_,
             energy_keV_,
             source_bias_mode_,
+            source_rate_model_,
             detector_center_,
             cone_half_angle_rad_,
-            isotropic_fraction_
+            isotropic_fraction_,
+            history_weight_
         };
     }
 
@@ -977,9 +1276,11 @@ private:
     G4ThreeVector position_ = G4ThreeVector();
     double energy_keV_ = 662.0;
     std::string source_bias_mode_ = "analog";
+    std::string source_rate_model_ = "detector_cps_1m";
     G4ThreeVector detector_center_ = G4ThreeVector();
     double cone_half_angle_rad_ = CLHEP::pi;
     double isotropic_fraction_ = 1.0;
+    double history_weight_ = 1.0;
 };
 
 class PrimaryGeneratorAction : public G4VUserPrimaryGeneratorAction {
@@ -997,7 +1298,7 @@ public:
         particle_gun_->SetParticleEnergy(source.energy_keV * keV);
         particle_gun_->SetParticleMomentumDirection(sample.direction);
         particle_gun_->GeneratePrimaryVertex(event);
-        ApplyPrimaryWeight(event, sample.weight);
+        ApplyPrimaryWeight(event, sample.weight * source.history_weight);
     }
 
 private:
@@ -1021,6 +1322,15 @@ private:
     }
 
     PrimaryDirectionSample SampleDirection(const PrimarySourceSnapshot& source) const {
+        if (NormalizeSourceBiasMode(source.source_bias_mode) == "detector_cone") {
+            const G4ThreeVector axis_vector = source.detector_center - source.position;
+            if (axis_vector.mag2() <= 1.0e-18) {
+                return {RandomIsotropicDirection(), 1.0};
+            }
+            const G4ThreeVector axis = axis_vector.unit();
+            const double theta = std::clamp(source.cone_half_angle_rad, 1.0e-9, CLHEP::pi);
+            return {RandomConeDirection(axis, std::cos(theta)), 1.0};
+        }
         if (NormalizeSourceBiasMode(source.source_bias_mode) != "mixture_cone_isotropic") {
             return {RandomIsotropicDirection(), 1.0};
         }
@@ -1067,13 +1377,83 @@ private:
     const PrimarySourceState* state_ = nullptr;
 };
 
-class AbsorbingBoundarySteppingAction : public G4UserSteppingAction {
+class SecondaryTransportStackingAction : public G4UserStackingAction {
 public:
-    explicit AbsorbingBoundarySteppingAction(std::set<std::string> absorbing_volume_names)
-        : absorbing_volume_names_(std::move(absorbing_volume_names)) {}
+    SecondaryTransportStackingAction(
+        std::string secondary_transport_mode,
+        std::string detector_scoring_mode,
+        TransportDiagnostics* diagnostics,
+        const G4ThreeVector& detector_center,
+        const double detector_radius
+    ) : secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)),
+        detector_scoring_mode_(NormalizeDetectorScoringMode(detector_scoring_mode)),
+        diagnostics_(diagnostics),
+        detector_center_(detector_center),
+        detector_radius_(std::max(0.0, detector_radius)) {}
+
+    G4ClassificationOfNewTrack ClassifyNewTrack(const G4Track* track) override {
+        if (secondary_transport_mode_ != "gamma_only" || track == nullptr) {
+            return fUrgent;
+        }
+        if (track->GetParentID() <= 0) {
+            return fUrgent;
+        }
+        if (track->GetDefinition() == G4Gamma::Definition()) {
+            return fUrgent;
+        }
+        if (
+            detector_scoring_mode_ != "incident_gamma_energy"
+            && IsInsideDetectorAssembly(track->GetPosition())
+        ) {
+            return fUrgent;
+        }
+        if (diagnostics_ != nullptr) {
+            diagnostics_->AddKilledNonGammaSecondary();
+        }
+        return fKill;
+    }
+
+private:
+    bool IsInsideDetectorAssembly(const G4ThreeVector& position) const {
+        constexpr double kTolerance = 1.0 * mm;
+        return (position - detector_center_).mag() <= detector_radius_ + kTolerance;
+    }
+
+    std::string secondary_transport_mode_ = "full_transport";
+    std::string detector_scoring_mode_ = "full_transport";
+    TransportDiagnostics* diagnostics_ = nullptr;
+    G4ThreeVector detector_center_;
+    double detector_radius_ = 0.0;
+};
+
+class TransportSteppingAction : public G4UserSteppingAction {
+public:
+    TransportSteppingAction(
+        std::set<std::string> absorbing_volume_names,
+        TransportDiagnostics* diagnostics,
+        EventStore* event_store,
+        const std::string& detector_scoring_mode,
+        const std::string& secondary_transport_mode
+    ) : absorbing_volume_names_(std::move(absorbing_volume_names)),
+        diagnostics_(diagnostics),
+        event_store_(event_store),
+        detector_scoring_mode_(NormalizeDetectorScoringMode(detector_scoring_mode)),
+        secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)) {}
 
     void UserSteppingAction(const G4Step* step) override {
-        if (step == nullptr || absorbing_volume_names_.empty()) {
+        if (step == nullptr) {
+            return;
+        }
+        if (diagnostics_ != nullptr) {
+            diagnostics_->AddStep(step);
+        }
+        if (ScoreFastDetectorEntry(step)) {
+            return;
+        }
+        if (KillNonGammaOutsideDetector(step)) {
+            return;
+        }
+        if (absorbing_volume_names_.empty()) {
             return;
         }
         auto* track = step->GetTrack();
@@ -1090,6 +1470,83 @@ public:
     }
 
 private:
+    bool IsDetectorCrystalVolume(const G4VPhysicalVolume* volume) const {
+        if (volume == nullptr) {
+            return false;
+        }
+        return volume->GetName() == "DetectorCrystalPV";
+    }
+
+    bool IsDetectorVolume(const G4VPhysicalVolume* volume) const {
+        if (volume == nullptr) {
+            return false;
+        }
+        const auto name = volume->GetName();
+        return name == "DetectorCrystalPV" || name == "DetectorHousingPV";
+    }
+
+    bool ScoreFastDetectorEntry(const G4Step* step) const {
+        if (detector_scoring_mode_ != "incident_gamma_energy") {
+            return false;
+        }
+        auto* track = step->GetTrack();
+        if (track == nullptr) {
+            return false;
+        }
+        const auto* pre_point = step->GetPreStepPoint();
+        const auto* post_point = step->GetPostStepPoint();
+        if (pre_point == nullptr || post_point == nullptr) {
+            return false;
+        }
+        if (IsDetectorVolume(pre_point->GetPhysicalVolume())) {
+            track->SetTrackStatus(fStopAndKill);
+            return true;
+        }
+        if (!IsDetectorVolume(post_point->GetPhysicalVolume())) {
+            return false;
+        }
+        if (track->GetDefinition() == G4Gamma::Definition()) {
+            double energy_mev = post_point->GetKineticEnergy() / MeV;
+            if (!(std::isfinite(energy_mev) && energy_mev > 0.0)) {
+                energy_mev = track->GetKineticEnergy() / MeV;
+            }
+            if (std::isfinite(energy_mev) && energy_mev > 0.0 && event_store_ != nullptr) {
+                event_store_->AddEnergyDeposit(energy_mev, std::max(0.0, track->GetWeight()));
+                if (diagnostics_ != nullptr) {
+                    diagnostics_->AddDetectorHitStep();
+                }
+            }
+        }
+        track->SetTrackStatus(fStopAndKill);
+        return true;
+    }
+
+    bool KillNonGammaOutsideDetector(const G4Step* step) const {
+        if (secondary_transport_mode_ != "gamma_only") {
+            return false;
+        }
+        auto* track = step->GetTrack();
+        if (track == nullptr || track->GetParentID() <= 0) {
+            return false;
+        }
+        if (track->GetDefinition() == G4Gamma::Definition()) {
+            return false;
+        }
+        const auto* pre_point = step->GetPreStepPoint();
+        if (
+            detector_scoring_mode_ != "incident_gamma_energy"
+            && pre_point != nullptr
+            && IsDetectorVolume(pre_point->GetPhysicalVolume())
+        ) {
+            return false;
+        }
+        if (diagnostics_ != nullptr) {
+            diagnostics_->AddKilledNonGammaSecondary();
+        }
+        track->SetTrackStatus(fStopAndKill);
+        return true;
+    }
+
     bool IsAbsorbingVolume(const G4VPhysicalVolume* volume) const {
         if (volume == nullptr) {
             return false;
@@ -1098,26 +1555,59 @@ private:
     }
 
     std::set<std::string> absorbing_volume_names_;
+    TransportDiagnostics* diagnostics_ = nullptr;
+    EventStore* event_store_ = nullptr;
+    std::string detector_scoring_mode_ = "full_transport";
+    std::string secondary_transport_mode_ = "full_transport";
 };
 
 class SidecarActionInitialization : public G4VUserActionInitialization {
 public:
     SidecarActionInitialization(
         const PrimarySourceState* source_state,
-        std::set<std::string> absorbing_volume_names
+        std::set<std::string> absorbing_volume_names,
+        TransportDiagnostics* diagnostics,
+        EventStore* event_store,
+        std::string detector_scoring_mode,
+        std::string secondary_transport_mode,
+        G4ThreeVector detector_center,
+        double detector_radius
     ) : source_state_(source_state),
-        absorbing_volume_names_(std::move(absorbing_volume_names)) {}
+        absorbing_volume_names_(std::move(absorbing_volume_names)),
+        diagnostics_(diagnostics),
+        event_store_(event_store),
+        detector_scoring_mode_(std::move(detector_scoring_mode)),
+        secondary_transport_mode_(std::move(secondary_transport_mode)),
+        detector_center_(detector_center),
+        detector_radius_(std::max(0.0, detector_radius)) {}
 
     void Build() const override {
         SetUserAction(new PrimaryGeneratorAction(source_state_));
-        if (!absorbing_volume_names_.empty()) {
-            SetUserAction(new AbsorbingBoundarySteppingAction(absorbing_volume_names_));
-        }
+        SetUserAction(new SecondaryTransportStackingAction(
+            secondary_transport_mode_,
+            detector_scoring_mode_,
+            diagnostics_,
+            detector_center_,
+            detector_radius_
+        ));
+        SetUserAction(new TransportSteppingAction(
+            absorbing_volume_names_,
+            diagnostics_,
+            event_store_,
+            detector_scoring_mode_,
+            secondary_transport_mode_
+        ));
     }
 
 private:
     const PrimarySourceState* source_state_ = nullptr;
     std::set<std::string> absorbing_volume_names_;
+    TransportDiagnostics* diagnostics_ = nullptr;
+    EventStore* event_store_ = nullptr;
+    std::string detector_scoring_mode_ = "full_transport";
+    std::string secondary_transport_mode_ = "full_transport";
+    G4ThreeVector detector_center_;
+    double detector_radius_ = 0.0;
 };
 
 G4RunManager* CreateConfiguredRunManager(const int thread_count, bool* use_multithreaded) {
@@ -1334,22 +1824,22 @@ std::string GeometryCacheKey(
     const SceneSpec& scene,
     const RequestSpec& request,
     const std::string& physics_profile,
-    const int thread_count
+    const int thread_count,
+    const std::string& detector_scoring_mode,
+    const std::string& secondary_transport_mode
 ) {
     std::ostringstream stream;
     stream << std::setprecision(17)
            << scene.scene_hash << "|"
            << physics_profile << "|"
            << std::max(1, thread_count) << "|"
+           << NormalizeDetectorScoringMode(detector_scoring_mode) << "|"
+           << NormalizeSecondaryTransportMode(secondary_transport_mode) << "|"
            << request.detector_pose.x << "," << request.detector_pose.y << "," << request.detector_pose.z << ","
            << request.detector_pose.qw << "," << request.detector_pose.qx << ","
            << request.detector_pose.qy << "," << request.detector_pose.qz << "|"
-           << request.fe_pose.x << "," << request.fe_pose.y << "," << request.fe_pose.z << ","
-           << request.fe_pose.qw << "," << request.fe_pose.qx << ","
-           << request.fe_pose.qy << "," << request.fe_pose.qz << "|"
-           << request.pb_pose.x << "," << request.pb_pose.y << "," << request.pb_pose.z << ","
-           << request.pb_pose.qw << "," << request.pb_pose.qx << ","
-           << request.pb_pose.qy << "," << request.pb_pose.qz;
+           << request.fe_pose.x << "," << request.fe_pose.y << "," << request.fe_pose.z << "|"
+           << request.pb_pose.x << "," << request.pb_pose.y << "," << request.pb_pose.z;
     return stream.str();
 }
 
@@ -1359,10 +1849,14 @@ public:
         SceneSpec scene,
         RequestSpec geometry_request,
         std::string physics_profile,
-        const int thread_count
+        const int thread_count,
+        std::string detector_scoring_mode,
+        std::string secondary_transport_mode
     ) : scene_(std::move(scene)),
         geometry_request_(geometry_request),
         physics_profile_(std::move(physics_profile)),
+        detector_scoring_mode_(NormalizeDetectorScoringMode(detector_scoring_mode)),
+        secondary_transport_mode_(NormalizeSecondaryTransportMode(secondary_transport_mode)),
         thread_count_(std::max(1, thread_count)),
         use_theory_tvl_(UseTheoryTvlProfile(physics_profile_)) {
         for (const auto& volume : scene_.volumes) {
@@ -1379,16 +1873,31 @@ public:
             &scene_,
             &geometry_request_,
             &event_store_,
+            &diagnostics_,
+            detector_scoring_mode_,
             !use_theory_tvl_
         );
+        detector_construction_ = detector.get();
         run_manager_->SetUserInitialization(detector.release());
         G4PhysListFactory factory;
         auto* physics_list = factory.GetReferencePhysList("FTFP_BERT");
         physics_list->ReplacePhysics(new G4EmStandardPhysics_option4());
         run_manager_->SetUserInitialization(physics_list);
+        const G4ThreeVector detector_center(
+            geometry_request_.detector_pose.x * m,
+            geometry_request_.detector_pose.y * m,
+            geometry_request_.detector_pose.z * m
+        );
+        const double detector_radius = DetectorTargetRadiusM(scene_.detector) * m;
         auto action_initialization = std::make_unique<SidecarActionInitialization>(
             &primary_state_,
-            absorbing_volume_names_
+            absorbing_volume_names_,
+            &diagnostics_,
+            &event_store_,
+            detector_scoring_mode_,
+            secondary_transport_mode_,
+            detector_center,
+            detector_radius
         );
         run_manager_->SetUserInitialization(action_initialization.release());
         run_manager_->Initialize();
@@ -1409,15 +1918,36 @@ public:
         const bool persistent_process
     ) {
         CLHEP::HepRandom::setTheSeed(request.seed);
+        if (detector_construction_ != nullptr) {
+            detector_construction_->UpdateShieldPoses(request);
+        }
+        event_store_.ClearDeposits();
+        diagnostics_.Clear();
         std::mt19937_64 rng(static_cast<std::uint64_t>(request.seed));
         std::vector<EnergyDeposit> energy_deposits;
         const auto start_time = std::chrono::steady_clock::now();
         long total_primaries = 0;
         double expected_physical_primaries = 0.0;
+        double expected_sampled_primaries = 0.0;
         std::map<std::string, double> source_equivalent_counts;
+        std::map<std::string, double> transport_detected_counts;
         const double reference_acceptance = DetectorReferenceAcceptance(scene_.detector);
-        const bool weighted_transport = UsesSourceBias(options);
+        const std::string source_rate_model = NormalizeSourceRateModel(options.source_rate_model);
+        const bool detector_cps_rate_model = source_rate_model == "detector_cps_1m";
+        const bool weighted_transport = !detector_cps_rate_model && UsesSourceBias(options);
         const std::string source_bias_mode = NormalizeSourceBiasMode(options.source_bias_mode);
+        const std::string effective_source_bias_mode = detector_cps_rate_model
+            ? "detector_cone"
+            : source_bias_mode;
+        const bool cone_sampled_transport = (
+            weighted_transport || effective_source_bias_mode == "detector_cone"
+        );
+        const double primary_sampling_fraction = std::clamp(
+            options.primary_sampling_fraction,
+            1.0e-6,
+            1.0
+        );
+        const double primary_history_weight = 1.0 / primary_sampling_fraction;
         double effective_cone_min_deg = std::numeric_limits<double>::infinity();
         double effective_cone_max_deg = 0.0;
         const G4ThreeVector detector_center(
@@ -1442,17 +1972,31 @@ public:
                 * request.dwell_time_s
                 * geom_scale
                 * shield_transmission;
+            double total_line_intensity = 0.0;
             for (const auto& line : lines) {
+                total_line_intensity += std::max(0.0, line.intensity);
+            }
+            for (const auto& line : lines) {
+                const double source_rate_scale = detector_cps_rate_model
+                    ? geom_scale
+                    : 1.0 / reference_acceptance;
+                const double line_weight = (
+                    detector_cps_rate_model && total_line_intensity > 0.0
+                )
+                    ? line.intensity / total_line_intensity
+                    : line.intensity;
                 const double mean_events = source.intensity_cps_1m
                     * request.dwell_time_s
                     * shield_transmission
-                    * line.intensity
-                    / reference_acceptance;
+                    * line_weight
+                    * source_rate_scale;
                 if (mean_events <= 0.0) {
                     continue;
                 }
                 expected_physical_primaries += mean_events;
-                std::poisson_distribution<long> distribution(mean_events);
+                const double sampled_mean_events = mean_events * primary_sampling_fraction;
+                expected_sampled_primaries += sampled_mean_events;
+                std::poisson_distribution<long> distribution(sampled_mean_events);
                 const long histories = std::max(0L, distribution(rng));
                 if (histories <= 0) {
                     continue;
@@ -1464,7 +2008,7 @@ public:
                     request,
                     options
                 );
-                if (weighted_transport) {
+                if (cone_sampled_transport) {
                     const double cone_half_angle_deg = cone_half_angle_rad * 180.0 / CLHEP::pi;
                     effective_cone_min_deg = std::min(effective_cone_min_deg, cone_half_angle_deg);
                     effective_cone_max_deg = std::max(effective_cone_max_deg, cone_half_angle_deg);
@@ -1472,10 +2016,12 @@ public:
                 primary_state_.Configure(
                     G4ThreeVector(source.x * m, source.y * m, source.z * m),
                     line.energy_keV,
-                    source_bias_mode,
+                    effective_source_bias_mode,
+                    source_rate_model,
                     detector_center,
                     cone_half_angle_rad,
-                    weighted_transport ? options.source_bias_isotropic_fraction : 1.0
+                    weighted_transport ? options.source_bias_isotropic_fraction : 1.0,
+                    primary_history_weight
                 );
                 const auto deposit_start = event_store_.EventDepositsMeV().size();
                 BeamOnHistories(run_manager_, histories);
@@ -1485,6 +2031,7 @@ public:
                     if (deposits[index].edep_mev <= 0.0) {
                         continue;
                     }
+                    transport_detected_counts[source.isotope] += std::max(0.0, deposits[index].weight);
                     energy_deposits.push_back({
                         deposits[index].edep_mev * 1000.0,
                         std::max(0.0, deposits[index].weight)
@@ -1498,9 +2045,12 @@ public:
         std::vector<double> spectrum(num_bins, 0.0);
         std::vector<double> spectrum_variance(num_bins, 0.0);
         std::normal_distribution<double> gaussian(0.0, 1.0);
+        const bool incident_gamma_scoring = detector_scoring_mode_ == "incident_gamma_energy";
         for (const auto& deposit : energy_deposits) {
             const double energy_keV = deposit.energy_keV;
-            const double smeared = energy_keV + SigmaEnergyKeV(energy_keV) * gaussian(rng);
+            const double smeared = incident_gamma_scoring
+                ? energy_keV
+                : energy_keV + SigmaEnergyKeV(energy_keV) * gaussian(rng);
             if (smeared < 0.0 || smeared > kEnergyMaxKeV) {
                 continue;
             }
@@ -1519,6 +2069,9 @@ public:
             spectrum[index] *= observed_scale;
             spectrum_variance[index] *= observed_scale * observed_scale;
         }
+        for (auto& item : transport_detected_counts) {
+            item.second *= observed_scale;
+        }
         const double total_variance = std::accumulate(
             spectrum_variance.begin(),
             spectrum_variance.end(),
@@ -1530,6 +2083,12 @@ public:
             : 0.0;
         const auto end_time = std::chrono::steady_clock::now();
         const auto runtime_s = std::chrono::duration<double>(end_time - start_time).count();
+        const double safe_runtime_s = std::max(1.0e-12, runtime_s);
+        const auto process_counts = diagnostics_.ProcessCounts();
+        const auto volume_step_counts = diagnostics_.VolumeStepCounts();
+        const long long compton_count = diagnostics_.ProcessCountForAliases({"compt", "compton"});
+        const long long rayleigh_count = diagnostics_.ProcessCountForAliases({"rayl", "rayleigh"});
+        const long long photoelectric_count = diagnostics_.ProcessCountForAliases({"phot", "photoelectric"});
         event_store_.ClearDeposits();
 
         SimulationResult result;
@@ -1537,20 +2096,55 @@ public:
         result.spectrum_count_variance = std::move(spectrum_variance);
         result.metadata["backend"] = "geant4";
         result.metadata["engine_mode"] = "external";
-        result.metadata["emission_model"] = weighted_transport ? "weighted_isotropic" : "isotropic";
+        result.metadata["emission_model"] = detector_cps_rate_model
+            ? "detector_equivalent_cone"
+            : (weighted_transport ? "weighted_isotropic" : "isotropic");
+        result.metadata["source_rate_model"] = source_rate_model;
+        result.metadata["intensity_cps_1m_definition"] = "net_detector_count_rate_at_1m";
+        result.metadata["line_intensities_normalized"] = detector_cps_rate_model ? "true" : "false";
         result.metadata["physics_profile"] = physics_profile_;
+        result.metadata["detector_scoring_mode"] = detector_scoring_mode_;
+        result.metadata["detector_fast_scoring"] = detector_scoring_mode_ == "incident_gamma_energy" ? "true" : "false";
+        result.metadata["detector_fast_scoring_volume"] = detector_scoring_mode_ == "incident_gamma_energy"
+            ? "detector_assembly_entry"
+            : "";
+        result.metadata["detector_response_applied_in_native"] = detector_scoring_mode_ == "incident_gamma_energy" ? "false" : "true";
+        result.metadata["secondary_transport_mode"] = secondary_transport_mode_;
+        result.metadata["gamma_only_secondary_transport"] = secondary_transport_mode_ == "gamma_only" ? "true" : "false";
         result.metadata["theory_tvl_attenuation"] = use_theory_tvl_ ? "true" : "false";
         result.metadata["scene_hash"] = scene_.scene_hash;
         result.metadata["num_primaries"] = std::to_string(total_primaries);
         result.metadata["expected_physical_primaries"] = std::to_string(expected_physical_primaries);
+        result.metadata["expected_detector_equivalent_primaries"] = std::to_string(
+            expected_physical_primaries
+        );
+        result.metadata["expected_sampled_primaries"] = std::to_string(expected_sampled_primaries);
+        result.metadata["primary_sampling_fraction"] = std::to_string(primary_sampling_fraction);
+        result.metadata["primary_history_weight"] = std::to_string(primary_history_weight);
         result.metadata["reference_detector_acceptance"] = std::to_string(reference_acceptance);
+        result.metadata["total_spectrum_counts"] = std::to_string(observed_total_counts);
+        result.metadata["primaries_per_sec"] = std::to_string(static_cast<double>(total_primaries) / safe_runtime_s);
+        result.metadata["effective_entries_per_sec"] = std::to_string(effective_spectrum_entries / safe_runtime_s);
+        result.metadata["total_track_steps"] = std::to_string(diagnostics_.TotalTrackSteps());
+        result.metadata["detector_hit_events"] = std::to_string(energy_deposits.size());
+        result.metadata["detector_hit_steps"] = std::to_string(diagnostics_.DetectorHitSteps());
+        result.metadata["secondary_count"] = std::to_string(diagnostics_.SecondaryCount());
+        result.metadata["killed_non_gamma_secondary_count"] = std::to_string(
+            diagnostics_.KilledNonGammaSecondaryCount()
+        );
+        result.metadata["process_count_compton"] = std::to_string(compton_count);
+        result.metadata["process_count_rayleigh"] = std::to_string(rayleigh_count);
+        result.metadata["process_count_photoelectric"] = std::to_string(photoelectric_count);
+        result.metadata["transport_process_counts"] = SerializeCounterMap(process_counts);
+        result.metadata["volume_step_counts"] = SerializeCounterMap(volume_step_counts);
+        result.metadata["volume_step_counts_top"] = SerializeTopCounterMap(volume_step_counts, 20);
         result.metadata["requested_threads"] = std::to_string(thread_count_);
         result.metadata["multithreaded_run_manager"] = run_manager_multithreaded_ ? "true" : "false";
         result.metadata["background_cps"] = std::to_string(options.background_cps);
         result.metadata["poisson_background"] = "true";
         result.metadata["weighted_transport"] = weighted_transport ? "true" : "false";
-        result.metadata["source_bias"] = weighted_transport ? source_bias_mode : "analog";
-        result.metadata["source_bias_mode"] = weighted_transport ? source_bias_mode : "analog";
+        result.metadata["source_bias"] = effective_source_bias_mode;
+        result.metadata["source_bias_mode"] = effective_source_bias_mode;
         result.metadata["source_bias_isotropic_fraction"] = std::to_string(
             weighted_transport ? std::clamp(options.source_bias_isotropic_fraction, 1.0e-6, 1.0) : 1.0
         );
@@ -1558,15 +2152,15 @@ public:
             std::max(0.0, options.source_bias_cone_half_angle_deg)
         );
         result.metadata["source_bias_cone_half_angle_deg"] = std::to_string(
-            weighted_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
+            cone_sampled_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
         );
         result.metadata["cone_half_angle_deg"] = result.metadata["source_bias_cone_half_angle_deg"];
         result.metadata["isotropic_mixture_fraction"] = result.metadata["source_bias_isotropic_fraction"];
         result.metadata["source_bias_effective_cone_half_angle_deg_min"] = std::to_string(
-            weighted_transport && std::isfinite(effective_cone_min_deg) ? effective_cone_min_deg : 0.0
+            cone_sampled_transport && std::isfinite(effective_cone_min_deg) ? effective_cone_min_deg : 0.0
         );
         result.metadata["source_bias_effective_cone_half_angle_deg_max"] = std::to_string(
-            weighted_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
+            cone_sampled_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
         );
         result.metadata["weighted_spectrum_sumw2"] = std::to_string(total_variance);
         result.metadata["weighted_spectrum_effective_entries"] = std::to_string(effective_spectrum_entries);
@@ -1578,6 +2172,9 @@ public:
         for (const auto& item : source_equivalent_counts) {
             result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
         }
+        for (const auto& item : transport_detected_counts) {
+            result.metadata["transport_detected_counts_" + item.first] = std::to_string(item.second);
+        }
         if (!scene_.usd_path.empty()) {
             result.metadata["usd_path"] = scene_.usd_path;
         }
@@ -1588,11 +2185,15 @@ private:
     SceneSpec scene_;
     RequestSpec geometry_request_;
     std::string physics_profile_;
+    std::string detector_scoring_mode_ = "full_transport";
+    std::string secondary_transport_mode_ = "full_transport";
     int thread_count_ = 1;
     bool use_theory_tvl_ = false;
     bool run_manager_multithreaded_ = false;
     EventStore event_store_;
+    TransportDiagnostics diagnostics_;
     PrimarySourceState primary_state_;
+    Geant4SceneConstruction* detector_construction_ = nullptr;
     G4RunManager* run_manager_ = nullptr;
     std::set<std::string> absorbing_volume_names_;
     std::set<std::string> absorbing_transport_groups_;
@@ -1606,7 +2207,14 @@ SimulationResult RunTransport(
     const double dead_time_tau_s,
     const TransportOptions& options
 ) {
-    TransportSession session(scene, request, physics_profile, thread_count);
+    TransportSession session(
+        scene,
+        request,
+        physics_profile,
+        thread_count,
+        options.detector_scoring_mode,
+        options.secondary_transport_mode
+    );
     return session.Run(request, dead_time_tau_s, options, false, false);
 }
 
@@ -1673,10 +2281,24 @@ void RunPersistentServer(
             }
             const auto scene = ReadSceneFile(scene_path);
             const auto request = ReadRequestFile(request_path);
-            const auto key = GeometryCacheKey(scene, request, physics_profile, thread_count);
+            const auto key = GeometryCacheKey(
+                scene,
+                request,
+                physics_profile,
+                thread_count,
+                options.detector_scoring_mode,
+                options.secondary_transport_mode
+            );
             const bool geometry_cache_hit = session != nullptr && key == session_key;
             if (!geometry_cache_hit) {
-                session = std::make_unique<TransportSession>(scene, request, physics_profile, thread_count);
+                session = std::make_unique<TransportSession>(
+                    scene,
+                    request,
+                    physics_profile,
+                    thread_count,
+                    options.detector_scoring_mode,
+                    options.secondary_transport_mode
+                );
                 session_key = key;
             }
             auto result = session->Run(
@@ -1722,12 +2344,24 @@ int main(int argc, char** argv) {
                 dead_time_tau_s = std::stod(argv[++index]);
             } else if (arg == "--background-cps" && index + 1 < argc) {
                 transport_options.background_cps = std::max(0.0, std::stod(argv[++index]));
+            } else if (arg == "--source-rate-model" && index + 1 < argc) {
+                transport_options.source_rate_model = NormalizeSourceRateModel(argv[++index]);
             } else if (arg == "--source-bias-mode" && index + 1 < argc) {
                 transport_options.source_bias_mode = NormalizeSourceBiasMode(argv[++index]);
             } else if (arg == "--source-bias-cone-half-angle-deg" && index + 1 < argc) {
                 transport_options.source_bias_cone_half_angle_deg = std::max(0.0, std::stod(argv[++index]));
             } else if (arg == "--source-bias-isotropic-fraction" && index + 1 < argc) {
                 transport_options.source_bias_isotropic_fraction = std::clamp(std::stod(argv[++index]), 1.0e-6, 1.0);
+            } else if (arg == "--detector-scoring-mode" && index + 1 < argc) {
+                transport_options.detector_scoring_mode = NormalizeDetectorScoringMode(argv[++index]);
+            } else if (arg == "--secondary-transport-mode" && index + 1 < argc) {
+                transport_options.secondary_transport_mode = NormalizeSecondaryTransportMode(argv[++index]);
+            } else if (arg == "--primary-sampling-fraction" && index + 1 < argc) {
+                transport_options.primary_sampling_fraction = std::clamp(
+                    std::stod(argv[++index]),
+                    1.0e-6,
+                    1.0
+                );
             } else if (arg == "--persistent") {
                 persistent = true;
             }
@@ -1736,10 +2370,45 @@ int main(int argc, char** argv) {
         if (
             normalized_source_bias_mode != "analog"
             && normalized_source_bias_mode != "mixture_cone_isotropic"
+            && normalized_source_bias_mode != "detector_cone"
         ) {
             throw std::runtime_error("Unsupported source bias mode: " + transport_options.source_bias_mode);
         }
         transport_options.source_bias_mode = normalized_source_bias_mode;
+        const auto normalized_source_rate_model = NormalizeSourceRateModel(transport_options.source_rate_model);
+        if (
+            normalized_source_rate_model != "detector_cps_1m"
+            && normalized_source_rate_model != "isotropic_emission_equivalent"
+        ) {
+            throw std::runtime_error("Unsupported source rate model: " + transport_options.source_rate_model);
+        }
+        transport_options.source_rate_model = normalized_source_rate_model;
+        const auto normalized_detector_scoring_mode = NormalizeDetectorScoringMode(
+            transport_options.detector_scoring_mode
+        );
+        if (
+            normalized_detector_scoring_mode != "full_transport"
+            && normalized_detector_scoring_mode != "incident_gamma_energy"
+        ) {
+            throw std::runtime_error(
+                "Unsupported detector scoring mode: "
+                + transport_options.detector_scoring_mode
+            );
+        }
+        transport_options.detector_scoring_mode = normalized_detector_scoring_mode;
+        const auto normalized_secondary_transport_mode = NormalizeSecondaryTransportMode(
+            transport_options.secondary_transport_mode
+        );
+        if (
+            normalized_secondary_transport_mode != "full_transport"
+            && normalized_secondary_transport_mode != "gamma_only"
+        ) {
+            throw std::runtime_error(
+                "Unsupported secondary transport mode: "
+                + transport_options.secondary_transport_mode
+            );
+        }
+        transport_options.secondary_transport_mode = normalized_secondary_transport_mode;
         if (persistent) {
             RunPersistentServer(
                 physics_profile,

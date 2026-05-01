@@ -244,6 +244,9 @@ def build_response_matrix(
     use_gpu: bool | None = None,
     gpu_device: str = "cuda",
     gpu_dtype: str = "float32",
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+    normalize_line_intensities: bool = False,
 ) -> NDArray[np.float64]:
     """
     Build a response matrix from the nuclide library.
@@ -264,7 +267,14 @@ def build_response_matrix(
     for col_idx, nuclide in enumerate(library.values()):
         if ctx is None:
             matrix[:, col_idx] = _nuclide_response(
-                energy_axis, nuclide.lines, resolution_fn, efficiency_fn, bin_width_keV
+                energy_axis,
+                nuclide.lines,
+                resolution_fn,
+                efficiency_fn,
+                bin_width_keV,
+                continuum_to_peak=continuum_to_peak,
+                backscatter_fraction=backscatter_fraction,
+                normalize_line_intensities=normalize_line_intensities,
             )
         else:
             matrix[:, col_idx] = _nuclide_response_torch(
@@ -274,8 +284,88 @@ def build_response_matrix(
                 efficiency_fn,
                 bin_width_keV,
                 ctx,
+                continuum_to_peak=continuum_to_peak,
+                backscatter_fraction=backscatter_fraction,
+                normalize_line_intensities=normalize_line_intensities,
             )
     return matrix
+
+
+def detector_response_kernel_for_incident_gamma(
+    energy_axis: NDArray[np.float64],
+    incident_energy_keV: float,
+    resolution_fn: Callable[[float], float],
+    efficiency_fn: Callable[[float], float],
+    bin_width_keV: float,
+    *,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+) -> NDArray[np.float64]:
+    """Return a unit-area pulse-height kernel for one incident gamma energy."""
+    energy = float(incident_energy_keV)
+    if not np.isfinite(energy) or energy <= 0.0:
+        return np.zeros_like(energy_axis, dtype=float)
+
+    sigma = max(float(resolution_fn(energy)), 1e-6)
+    peak = gaussian_peak(energy_axis, center=energy, sigma=sigma) * float(bin_width_keV)
+    peak_sum = float(np.sum(peak))
+    if peak_sum > 0.0:
+        peak = peak / peak_sum
+
+    peak_weight = max(float(efficiency_fn(energy)), 0.0)
+    continuum_weight = max(float(continuum_to_peak), 0.0) * peak_weight
+    kernel = peak_weight * peak
+
+    if continuum_weight > 0.0:
+        continuum = compton_continuum_shape(energy_axis, energy, shape="exponential")
+        continuum_sum = float(np.sum(continuum))
+        if continuum_sum > 0.0:
+            kernel += continuum_weight * continuum / continuum_sum
+
+    if energy > 200.0 and float(backscatter_fraction) > 0.0:
+        e_back = backscatter_energy(energy)
+        sigma_back = max(float(resolution_fn(e_back)), 1e-6)
+        back = gaussian_peak(energy_axis, center=e_back, sigma=sigma_back) * float(bin_width_keV)
+        back_sum = float(np.sum(back))
+        if back_sum > 0.0:
+            back_weight = max(float(backscatter_fraction), 0.0) * max(
+                float(efficiency_fn(e_back)),
+                0.0,
+            )
+            kernel += back_weight * back / back_sum
+
+    total = float(np.sum(kernel))
+    if total <= 0.0:
+        return np.zeros_like(energy_axis, dtype=float)
+    return kernel / total
+
+
+def build_incident_gamma_response_matrix(
+    energy_axis: NDArray[np.float64],
+    resolution_fn: Callable[[float], float],
+    efficiency_fn: Callable[[float], float],
+    bin_width_keV: float | None = None,
+    *,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+) -> NDArray[np.float64]:
+    """Build a linear operator that folds incident-gamma spectra to pulse-height spectra."""
+    if bin_width_keV is None:
+        if energy_axis.size < 2:
+            raise ValueError("energy_axis must contain at least two points to infer bin width")
+        bin_width_keV = float(energy_axis[1] - energy_axis[0])
+    operator = np.zeros((energy_axis.size, energy_axis.size), dtype=float)
+    for input_index, incident_energy_keV in enumerate(np.asarray(energy_axis, dtype=float)):
+        operator[:, input_index] = detector_response_kernel_for_incident_gamma(
+            energy_axis,
+            float(incident_energy_keV),
+            resolution_fn,
+            efficiency_fn,
+            float(bin_width_keV),
+            continuum_to_peak=continuum_to_peak,
+            backscatter_fraction=backscatter_fraction,
+        )
+    return operator
 
 
 def _nuclide_response(
@@ -284,10 +374,19 @@ def _nuclide_response(
     resolution_fn: Callable[[float], float],
     efficiency_fn: Callable[[float], float],
     bin_width_keV: float,
+    *,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+    normalize_line_intensities: bool = False,
 ) -> NDArray[np.float64]:
     """Compute the response for a single nuclide by summing its lines."""
     response = np.zeros_like(energy_axis, dtype=float)
+    lines = tuple(lines)
+    total_intensity = sum(max(float(line.intensity), 0.0) for line in lines)
     for line in lines:
+        line_weight = float(line.intensity)
+        if normalize_line_intensities and total_intensity > 0.0:
+            line_weight = line_weight / total_intensity
         sigma = resolution_fn(line.energy_keV)
         peak = gaussian_peak(energy_axis, center=line.energy_keV, sigma=sigma)
         peak_area = peak.sum() * bin_width_keV
@@ -295,23 +394,23 @@ def _nuclide_response(
         cont_shape = compton_continuum_shape(energy_axis, line.energy_keV, shape="exponential")
         if cont_shape.sum() > 0:
             cont_shape = cont_shape / cont_shape.sum()
-        cont = COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape
+        cont = max(float(continuum_to_peak), 0.0) * peak_area * cont_shape
         eff = efficiency_fn(line.energy_keV)
         peak *= eff
         cont *= eff
-        response += line.intensity * peak * bin_width_keV
-        response += line.intensity * cont
+        response += line_weight * peak * bin_width_keV
+        response += line_weight * cont
         # Add a backscatter peak for higher-energy lines.
-        if line.energy_keV > 200.0:
+        if line.energy_keV > 200.0 and float(backscatter_fraction) > 0.0:
             e_back = backscatter_energy(line.energy_keV)
             sigma_back = resolution_fn(e_back)
             back = gaussian_peak(energy_axis, center=e_back, sigma=sigma_back)
             back_norm = back.sum() * bin_width_keV
             if back_norm > 0:
-                area_back = BACKSCATTER_FRACTION * peak_area
+                area_back = max(float(backscatter_fraction), 0.0) * peak_area
                 back *= area_back / back_norm
                 back *= efficiency_fn(e_back)
-                response += line.intensity * back
+                response += line_weight * back
     return response
 
 
@@ -322,6 +421,10 @@ def _nuclide_response_torch(
     efficiency_fn: Callable[[float], float],
     bin_width_keV: float,
     ctx: tuple["torch.device", "torch.dtype"],
+    *,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+    normalize_line_intensities: bool = False,
 ) -> NDArray[np.float64]:
     """Compute the response for a single nuclide using torch for vector ops."""
     if torch is None:
@@ -329,7 +432,12 @@ def _nuclide_response_torch(
     device, dtype = ctx
     energy_t = torch.as_tensor(energy_axis, device=device, dtype=dtype)
     response_t = torch.zeros_like(energy_t)
+    lines = tuple(lines)
+    total_intensity = sum(max(float(line.intensity), 0.0) for line in lines)
     for line in lines:
+        line_weight = float(line.intensity)
+        if normalize_line_intensities and total_intensity > 0.0:
+            line_weight = line_weight / total_intensity
         sigma = float(resolution_fn(line.energy_keV))
         peak_t = _gaussian_peak_torch(energy_t, center=float(line.energy_keV), sigma=sigma)
         peak_area = torch.sum(peak_t) * float(bin_width_keV)
@@ -337,20 +445,20 @@ def _nuclide_response_torch(
         cont_sum = torch.sum(cont_shape)
         if float(cont_sum) > 0.0:
             cont_shape = cont_shape / cont_sum
-        cont_t = COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape
+        cont_t = max(float(continuum_to_peak), 0.0) * peak_area * cont_shape
         eff = float(efficiency_fn(line.energy_keV))
         peak_t = peak_t * eff
         cont_t = cont_t * eff
-        response_t = response_t + line.intensity * peak_t * float(bin_width_keV)
-        response_t = response_t + line.intensity * cont_t
-        if line.energy_keV > 200.0:
+        response_t = response_t + line_weight * peak_t * float(bin_width_keV)
+        response_t = response_t + line_weight * cont_t
+        if line.energy_keV > 200.0 and float(backscatter_fraction) > 0.0:
             e_back = backscatter_energy(line.energy_keV)
             sigma_back = float(resolution_fn(e_back))
             back_t = _gaussian_peak_torch(energy_t, center=float(e_back), sigma=sigma_back)
             back_norm = torch.sum(back_t) * float(bin_width_keV)
             if float(back_norm) > 0.0:
-                area_back = BACKSCATTER_FRACTION * peak_area
+                area_back = max(float(backscatter_fraction), 0.0) * peak_area
                 back_t = back_t * (area_back / back_norm)
                 back_t = back_t * float(efficiency_fn(e_back))
-                response_t = response_t + line.intensity * back_t
+                response_t = response_t + line_weight * back_t
     return response_t.detach().cpu().numpy()

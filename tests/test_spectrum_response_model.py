@@ -13,7 +13,7 @@ from measurement.shielding import (
 )
 from spectrum.library import get_analysis_lines_with_intensity
 from spectrum.pipeline import PhotopeakRoiEstimate, SpectralDecomposer, SpectrumConfig
-from spectrum.response_matrix import gaussian_peak
+from spectrum.response_matrix import build_incident_gamma_response_matrix, gaussian_peak
 
 
 def test_photopeak_nnls_counts_recover_calibrated_peak_counts() -> None:
@@ -93,7 +93,7 @@ def test_photopeak_nnls_estimates_report_variance() -> None:
 
 
 def test_response_poisson_counts_recover_full_response_mixture() -> None:
-    """Full-spectrum Poisson regression should unmix overlapping response columns."""
+    """Full-spectrum Poisson regression should return source-equivalent photopeak counts."""
     decomposer = SpectralDecomposer(SpectrumConfig(dead_time_tau_s=0.0))
     isotopes = ["Cs-137", "Co-60", "Eu-154"]
     truth = {"Cs-137": 1800.0, "Co-60": 1200.0, "Eu-154": 900.0}
@@ -109,8 +109,80 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
     )
 
     for isotope, expected in truth.items():
+        index = decomposer.isotope_names.index(isotope)
+        photopeak_integral = float(np.sum(decomposer._get_photopeak_response_matrix()[:, index]))
         assert estimates[isotope].counts == pytest.approx(expected, rel=1e-4)
+        assert np.sum(decomposer.last_response_poisson_components[isotope]) == pytest.approx(
+            expected * photopeak_integral,
+            rel=1e-4,
+        )
         assert estimates[isotope].variance > 0.0
+        assert estimates[isotope].method == "response_poisson_source_equivalent"
+    assert float(np.sum(decomposer.last_response_poisson_fit)) == pytest.approx(
+        float(np.sum(spectrum)),
+        rel=1e-4,
+    )
+
+
+def test_incident_gamma_response_folding_adds_continuum_and_preserves_counts() -> None:
+    """Incident-gamma folding should make detector-like spectra without changing total entries."""
+    config = SpectrumConfig(
+        dead_time_tau_s=0.0,
+        response_efficiency_model="unit",
+        response_continuum_to_peak=2.0,
+        response_backscatter_fraction=0.03,
+    )
+    decomposer = SpectralDecomposer(config)
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    cs_index = int(np.argmin(np.abs(decomposer.energy_axis - 662.0)))
+    spectrum[cs_index] = 1000.0
+
+    folded = decomposer.fold_incident_gamma_spectrum(spectrum)
+    folded_variance = decomposer.fold_incident_gamma_spectrum_variance(spectrum)
+    low_energy_mask = (decomposer.energy_axis > 50.0) & (decomposer.energy_axis < 450.0)
+
+    assert float(np.sum(folded)) == pytest.approx(1000.0, rel=1e-6)
+    assert float(np.sum(folded[low_energy_mask])) > 100.0
+    assert float(np.max(folded)) < 1000.0
+    assert float(np.sum(folded_variance)) > 0.0
+    assert float(np.sum(folded_variance)) < 1000.0
+
+
+def test_incident_gamma_response_folding_preserves_binned_spectrum_counts() -> None:
+    """Incident-gamma response columns should conserve arbitrary weighted bin counts."""
+    config = SpectrumConfig(
+        dead_time_tau_s=0.0,
+        response_efficiency_model="unit",
+        response_continuum_to_peak=2.0,
+        response_backscatter_fraction=0.03,
+    )
+    decomposer = SpectralDecomposer(config)
+    operator = build_incident_gamma_response_matrix(
+        decomposer.energy_axis,
+        decomposer.resolution_fn,
+        decomposer.efficiency_fn,
+        decomposer.config.bin_width_keV,
+        continuum_to_peak=decomposer.config.response_continuum_to_peak,
+        backscatter_fraction=decomposer.config.response_backscatter_fraction,
+    )
+    active = decomposer.energy_axis > 0.0
+    assert np.allclose(np.sum(operator[:, active], axis=0), 1.0, rtol=0.0, atol=1.0e-10)
+
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for energy_kev, count in (
+        (88.0, 17.0),
+        (212.0, 43.0),
+        (662.0, 1000.0),
+        (1174.0, 2500.0),
+        (1332.0, 3500.0),
+    ):
+        index = int(np.argmin(np.abs(decomposer.energy_axis - energy_kev)))
+        spectrum[index] += count
+
+    folded = decomposer.fold_incident_gamma_spectrum(spectrum)
+
+    assert float(np.sum(folded)) == pytest.approx(float(np.sum(spectrum)), rel=1.0e-10)
+    assert float(np.sum(folded[decomposer.energy_axis < 500.0])) > 0.0
 
 
 def test_photopeak_combiner_downweights_low_snr_zero_outlier() -> None:

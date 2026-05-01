@@ -162,6 +162,9 @@ def prune_spurious_sources_continuous(
         obstacle_grid=getattr(estimator, "obstacle_grid", None),
         obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
         obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
+        obstacle_buildup_coeff=float(getattr(estimator, "obstacle_buildup_coeff", 0.0)),
+        detector_radius_m=float(getattr(estimator, "detector_radius_m", 0.0)),
+        detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
     )
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
     estimates = estimator.estimates()

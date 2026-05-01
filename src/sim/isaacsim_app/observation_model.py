@@ -5,9 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-import numpy as np
-
-from measurement.model import EnvironmentConfig
+from measurement.kernels import ShieldParams
+from measurement.obstacles import ObstacleGrid
 from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
 from sim.isaacsim_app.geometry import (
     OrientedBox,
@@ -21,28 +20,20 @@ from sim.isaacsim_app.geometry import (
 from sim.isaacsim_app.robot_controller import RobotController
 from sim.isaacsim_app.scene_builder import SceneDescription
 from sim.isaacsim_app.stage_backend import StageMaterialInfo
+from sim.python_transport import PythonTransportSpectrumModel
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.transport import (
-    SourceTransportResult,
     TransportSegment,
-    build_source_transport_result,
     make_transport_segment,
 )
 from sim.shield_geometry import (
     FE_SHIELD_INNER_RADIUS_M,
-    FE_SHIELD_THICKNESS_CM,
     PB_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_THICKNESS_CM,
+    ShieldThicknessConfig,
+    resolve_shield_thickness_config,
     spherical_octant_path_length_cm,
 )
-from spectrum.pipeline import BACKGROUND_COUNTS_PER_SECOND, BACKGROUND_RATE_CPS, SpectralDecomposer
-from spectrum.response_matrix import (
-    BACKSCATTER_FRACTION,
-    COMPTON_CONTINUUM_TO_PEAK,
-    backscatter_energy,
-    compton_continuum_shape,
-    gaussian_peak,
-)
+from spectrum.pipeline import SpectralDecomposer
 
 
 @dataclass(frozen=True)
@@ -75,44 +66,70 @@ class ObservationModel(ABC):
         """Return an observation for the requested command."""
 
 
+def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
+    """Build an obstacle grid from the scene description when cells exist."""
+    if scene.obstacle_grid_shape[0] <= 0 or scene.obstacle_grid_shape[1] <= 0:
+        return None
+    return ObstacleGrid(
+        origin=scene.obstacle_origin_xy,
+        cell_size=scene.obstacle_cell_size_m,
+        grid_shape=scene.obstacle_grid_shape,
+        blocked_cells=tuple(scene.obstacle_cells),
+    )
+
+
 class MockObservationModel(ObservationModel):
     """Generate bridge observations without requiring Isaac Sim installation."""
 
-    def __init__(self) -> None:
-        """Create the analytic spectrum simulator used in mock mode."""
-        self.decomposer = SpectralDecomposer()
+    def __init__(
+        self,
+        *,
+        asset_geometry: IsaacAssetGeometry | None = None,
+        rng_seed: int = 123,
+        scatter_gain: float = 0.03,
+        detector_model: dict[str, object] | None = None,
+        shield_thickness: ShieldThicknessConfig | None = None,
+    ) -> None:
+        """Create the shared Python transport simulator used in mock mode."""
+        geometry = asset_geometry or IsaacAssetGeometry()
+        decomposer = SpectralDecomposer()
         self.scene = SceneDescription()
+        shield_thickness = shield_thickness or resolve_shield_thickness_config()
         self._mu_by_isotope = mu_by_isotope_from_tvl_mm(
             HVL_TVL_TABLE_MM,
-            isotopes=list(self.decomposer.isotope_names),
+            isotopes=list(decomposer.isotope_names),
+        )
+        self.transport_model = PythonTransportSpectrumModel(
+            sources=(),
+            decomposer=decomposer,
+            mu_by_isotope=self._mu_by_isotope,
+            shield_params=ShieldParams(
+                thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
+                thickness_pb_cm=float(shield_thickness.thickness_pb_cm),
+            ),
+            obstacle_height_m=geometry.obstacle_height_m,
+            scatter_gain=scatter_gain,
+            rng_seed=rng_seed,
+            detector_model=detector_model,
         )
 
     def reset(self, scene: SceneDescription) -> None:
         """Store the active scene for the mock backend."""
         self.scene = scene
+        self.transport_model.reset_scene(
+            sources=scene.to_point_sources(),
+            obstacle_grid=_obstacle_grid_from_scene(scene),
+            obstacle_material=scene.obstacle_material,
+        )
 
     def observe(self, command: SimulationCommand) -> SimulationObservation:
         """Return an analytic observation anchored to the commanded detector pose."""
         detector_pose = tuple(float(v) for v in command.target_pose_xyz)
-        spectrum, _ = self.decomposer.simulate_spectrum(
-            sources=self.scene.to_point_sources(),
-            environment=EnvironmentConfig(detector_position=detector_pose),
-            acquisition_time=command.dwell_time_s,
-            rng=np.random.default_rng(123 + int(command.step_id)),
-            mu_by_isotope=self._mu_by_isotope,
-        )
-        energy = np.asarray(self.decomposer.energy_axis, dtype=float)
-        step = float(np.median(np.diff(energy))) if energy.size > 1 else 1.0
-        metadata = {"backend": "isaacsim-mock"}
-        return SimulationObservation(
-            step_id=command.step_id,
+        return self.transport_model.observe(
+            command,
             detector_pose_xyz=detector_pose,
             detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
-            fe_orientation_index=command.fe_orientation_index,
-            pb_orientation_index=command.pb_orientation_index,
-            spectrum_counts=np.asarray(spectrum, dtype=float).tolist(),
-            energy_bin_edges_keV=np.concatenate([energy, [energy[-1] + step]]).tolist(),
-            metadata=metadata,
+            backend_label="isaacsim-mock",
         )
 
 
@@ -128,6 +145,8 @@ class IsaacSimObservationModel(ObservationModel):
         stage_material_rules: tuple[StageMaterialRule, ...] = (),
         rng_seed: int = 123,
         scatter_gain: float = 0.03,
+        detector_model: dict[str, object] | None = None,
+        shield_thickness: ShieldThicknessConfig | None = None,
     ) -> None:
         """Store stage-backed handles and spectrum simulation helpers."""
         self.robot_controller = robot_controller
@@ -138,89 +157,69 @@ class IsaacSimObservationModel(ObservationModel):
         self.scatter_gain = float(scatter_gain)
         self.decomposer = SpectralDecomposer()
         self.scene = SceneDescription()
-        self._line_response_cache: dict[float, np.ndarray] = {}
-        self._scatter_response_cache: dict[float, np.ndarray] = {}
+        self.shield_thickness = shield_thickness or resolve_shield_thickness_config()
+        self._mu_by_isotope = mu_by_isotope_from_tvl_mm(
+            HVL_TVL_TABLE_MM,
+            isotopes=list(self.decomposer.isotope_names),
+        )
+        self.transport_model = PythonTransportSpectrumModel(
+            sources=(),
+            decomposer=self.decomposer,
+            mu_by_isotope=self._mu_by_isotope,
+            shield_params=ShieldParams(
+                thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
+                thickness_pb_cm=float(self.shield_thickness.thickness_pb_cm),
+            ),
+            obstacle_height_m=self.asset_geometry.obstacle_height_m,
+            scatter_gain=self.scatter_gain,
+            rng_seed=self.rng_seed,
+            detector_model=detector_model,
+        )
 
     def reset(self, scene: SceneDescription) -> None:
         """Store the loaded scene description for subsequent observations."""
         self.scene = scene
+        self.transport_model.reset_scene(
+            sources=scene.to_point_sources(),
+            obstacle_grid=_obstacle_grid_from_scene(scene),
+            obstacle_material=scene.obstacle_material,
+        )
 
     def observe(self, command: SimulationCommand) -> SimulationObservation:
         """Return a spectrum attenuated by stage-authored obstacles and shields."""
         detector_pose = self.robot_controller.detector_world_pose()
-        total_obstacle_path_cm = 0.0
-        total_stage_path_cm = 0.0
-        total_fe_path_cm = 0.0
-        total_pb_path_cm = 0.0
-        expected = np.zeros_like(self.decomposer.energy_axis, dtype=float)
-        num_sources = 0
-
-        for transport_result in self._build_source_transport_results(command):
-            total_obstacle_path_cm += transport_result.total_obstacle_path_cm
-            total_stage_path_cm += transport_result.total_stage_path_cm
-            total_fe_path_cm += transport_result.total_fe_path_cm
-            total_pb_path_cm += transport_result.total_pb_path_cm
-            expected += self._source_expected_spectrum(transport_result)
-            num_sources += 1
-
-        background_rate = BACKGROUND_RATE_CPS
-        if BACKGROUND_COUNTS_PER_SECOND != BACKGROUND_RATE_CPS:
-            background_rate = BACKGROUND_COUNTS_PER_SECOND
-        if background_rate > 0.0:
-            expected += self.decomposer._background_shape * float(background_rate) * float(command.dwell_time_s)
-        rng = np.random.default_rng(self.rng_seed + int(command.step_id))
-        spectrum = rng.poisson(expected)
-        energy = np.asarray(self.decomposer.energy_axis, dtype=float)
-        step = float(np.median(np.diff(energy))) if energy.size > 1 else 1.0
-        metadata: dict[str, float | int | str] = {
-            "backend": "isaacsim",
-            "transport_backend": "python",
-            "num_sources": num_sources,
-            "total_obstacle_path_cm": float(total_obstacle_path_cm),
-            "total_stage_path_cm": float(total_stage_path_cm),
-            "total_fe_path_cm": float(total_fe_path_cm),
-            "total_pb_path_cm": float(total_pb_path_cm),
-        }
+        metadata: dict[str, object] = {}
         if self.usd_path:
             metadata["usd_path"] = self.usd_path
-        return SimulationObservation(
-            step_id=command.step_id,
+        return self.transport_model.observe(
+            command,
             detector_pose_xyz=detector_pose.translation_xyz,
             detector_quat_wxyz=detector_pose.orientation_wxyz,
-            fe_orientation_index=command.fe_orientation_index,
-            pb_orientation_index=command.pb_orientation_index,
-            spectrum_counts=np.asarray(spectrum, dtype=float).tolist(),
-            energy_bin_edges_keV=np.concatenate([energy, [energy[-1] + step]]).tolist(),
-            metadata=metadata,
+            backend_label="isaacsim",
+            stage_segments_provider=self._stage_geometry_segments_for_source,
+            shield_path_provider=self._shield_path_lengths_for_command,
+            extra_metadata=metadata,
         )
 
-    def _build_source_transport_results(
+    def _stage_geometry_segments_for_source(
         self,
+        source: object,
+        detector_xyz: tuple[float, float, float],
+    ) -> tuple[TransportSegment, ...]:
+        """Return static stage material crossings for one point source."""
+        source_position = tuple(float(value) for value in getattr(source, "position"))
+        return self._stage_geometry_segments(source_position, detector_xyz)
+
+    def _shield_path_lengths_for_command(
+        self,
+        source: object,
+        detector_xyz: tuple[float, float, float],
         command: SimulationCommand,
-    ) -> tuple[SourceTransportResult, ...]:
-        """Build shared pre-spectrum transport results for all scene sources."""
-        detector_pose = self.robot_controller.detector_world_pose()
-        results: list[SourceTransportResult] = []
-        for source in self.scene.to_point_sources():
-            stage_segments = self._stage_geometry_segments(source.position, detector_pose.translation_xyz)
-            fe_path_cm, pb_path_cm = self._shield_path_lengths_cm(source.position)
-            nuclide = self.decomposer.library.get(source.isotope)
-            nuclide_lines = ()
-            if nuclide is not None:
-                nuclide_lines = tuple((float(line.energy_keV), float(line.intensity)) for line in nuclide.lines)
-            results.append(
-                build_source_transport_result(
-                    source=source,
-                    detector_position_xyz=detector_pose.translation_xyz,
-                    dwell_time_s=float(command.dwell_time_s),
-                    stage_segments=stage_segments,
-                    fe_segment=make_transport_segment(StageMaterialInfo(name="fe"), fe_path_cm),
-                    pb_segment=make_transport_segment(StageMaterialInfo(name="pb"), pb_path_cm),
-                    nuclide_lines=nuclide_lines,
-                    scatter_gain=self.scatter_gain,
-                )
-            )
-        return tuple(results)
+    ) -> tuple[float, float]:
+        """Return shield path lengths from the current stage-authored shield poses."""
+        del detector_xyz, command
+        source_position = tuple(float(value) for value in getattr(source, "position"))
+        return self._shield_path_lengths_cm(source_position)
 
     def _stage_geometry_segments(
         self,
@@ -278,82 +277,17 @@ class IsaacSimObservationModel(ObservationModel):
             source_xyz,
             detector_pose.translation_xyz,
             fe_pose.orientation_wxyz,
-            thickness_cm=FE_SHIELD_THICKNESS_CM,
+            thickness_cm=float(self.shield_thickness.thickness_fe_cm),
             inner_radius_cm=FE_SHIELD_INNER_RADIUS_M * 100.0,
         )
         pb_length_cm = spherical_octant_path_length_cm(
             source_xyz,
             detector_pose.translation_xyz,
             pb_pose.orientation_wxyz,
-            thickness_cm=PB_SHIELD_THICKNESS_CM,
+            thickness_cm=float(self.shield_thickness.thickness_pb_cm),
             inner_radius_cm=PB_SHIELD_INNER_RADIUS_M * 100.0,
         )
         return float(fe_length_cm), float(pb_length_cm)
-
-    def _source_expected_spectrum(
-        self,
-        transport_result: SourceTransportResult,
-    ) -> np.ndarray:
-        """Return the expected spectrum contribution for one transported source."""
-        if not transport_result.lines or transport_result.base_source_counts <= 0.0:
-            return np.zeros_like(self.decomposer.energy_axis, dtype=float)
-        expected = np.zeros_like(self.decomposer.energy_axis, dtype=float)
-        for line in transport_result.lines:
-            expected += float(line.primary_counts) * self._line_response_template(line.energy_keV)
-            if line.scatter_counts > 0.0:
-                expected += float(line.scatter_counts) * self._scatter_response_template(line.energy_keV)
-        return expected
-
-    def _line_response_template(self, line_energy_keV: float) -> np.ndarray:
-        """Return the detector response template for a unit-intensity gamma line."""
-        cache_key = float(line_energy_keV)
-        cached = self._line_response_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        energy_axis = np.asarray(self.decomposer.energy_axis, dtype=float)
-        bin_width_keV = float(self.decomposer.config.bin_width_keV)
-        sigma = float(self.decomposer.resolution_fn(cache_key))
-        peak = gaussian_peak(energy_axis, center=cache_key, sigma=sigma)
-        peak_area = float(peak.sum() * bin_width_keV)
-        efficiency = (
-            float(self.decomposer.efficiency_fn(cache_key))
-            if self.decomposer.efficiency_fn is not None
-            else 1.0
-        )
-        response = peak * efficiency * bin_width_keV
-        cont_shape = compton_continuum_shape(energy_axis, cache_key, shape="exponential")
-        if cont_shape.sum() > 0.0:
-            cont_shape = cont_shape / float(cont_shape.sum())
-            response += COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape * efficiency
-        if cache_key > 200.0:
-            e_back = backscatter_energy(cache_key)
-            sigma_back = float(self.decomposer.resolution_fn(e_back))
-            back = gaussian_peak(energy_axis, center=e_back, sigma=sigma_back)
-            back_norm = float(back.sum() * bin_width_keV)
-            if back_norm > 0.0:
-                area_back = BACKSCATTER_FRACTION * peak_area
-                response += back * (area_back / back_norm) * float(self.decomposer.efficiency_fn(e_back))
-        self._line_response_cache[cache_key] = response
-        return response
-
-    def _scatter_response_template(self, line_energy_keV: float) -> np.ndarray:
-        """Return a scatter-dominated low-energy response for one gamma line."""
-        cache_key = float(line_energy_keV)
-        cached = self._scatter_response_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        energy_axis = np.asarray(self.decomposer.energy_axis, dtype=float)
-        response = compton_continuum_shape(energy_axis, cache_key, shape="exponential")
-        if float(np.sum(response)) > 0.0:
-            response = response / float(np.sum(response))
-        if cache_key > 200.0:
-            e_back = backscatter_energy(cache_key)
-            sigma_back = float(self.decomposer.resolution_fn(e_back))
-            response += 0.25 * gaussian_peak(energy_axis, center=e_back, sigma=sigma_back)
-        if float(np.sum(response)) > 0.0:
-            response = response / float(np.sum(response))
-        self._scatter_response_cache[cache_key] = response
-        return response
 
     def _material_for_prim(
         self,

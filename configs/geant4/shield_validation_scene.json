@@ -13,16 +13,19 @@
   "obstacle_height_m": 2.0,
   "author_obstacle_prims": false,
   "engine_mode": "external",
-  "spectrum_count_method": "photopeak_nnls",
+  "spectrum_count_method": "response_poisson",
   "calibration_count_method": "photopeak_nnls",
   "calibration_template_intensity_scale": 5.0,
   "calibration_measurement_replicates": 1,
   "physics_profile": "balanced",
   "thread_count": 8,
   "random_seed_base": 9001,
-  "dead_time_tau_s": 5.813e-9,
+  "dead_time_tau_s": 5.813E-9,
   "scatter_gain": 0.0,
   "persistent_process": true,
+  "source_rate_model": "detector_cps_1m",
+  "source_bias_mode": "detector_cone",
+  "detector_scoring_mode": "incident_gamma_energy",
   "executable_path": "build/geant4_sidecar",
   "detector_model": {
     "crystal_radius_m": 0.038,
@@ -32,5 +35,7 @@
     "crystal_material": "cebr3",
     "housing_material": "aluminum"
   },
-  "stage_material_rules": []
+  "stage_material_rules": [],
+  "secondary_transport_mode": "gamma_only",
+  "primary_sampling_fraction": 0.02
 }

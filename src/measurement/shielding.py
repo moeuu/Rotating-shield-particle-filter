@@ -31,6 +31,11 @@ OCTANT_NORMALS: NDArray[np.float64] = np.array(
     dtype=float,
 )
 OCTANT_NORMALS /= np.linalg.norm(OCTANT_NORMALS, axis=1, keepdims=True)
+LOCAL_POSITIVE_OCTANT_CENTER: NDArray[np.float64] = np.array(
+    [1.0, 1.0, 1.0],
+    dtype=float,
+)
+LOCAL_POSITIVE_OCTANT_CENTER /= np.linalg.norm(LOCAL_POSITIVE_OCTANT_CENTER)
 
 OCTANT_THETA_PHI_RANGES: list[tuple[tuple[float, float], tuple[float, float]]] = [
     ((0.0, np.pi / 2.0), (0.0, np.pi / 2.0)),
@@ -221,6 +226,62 @@ def shield_blocks_radiation(direction: NDArray[np.float64], shield_normal: NDArr
     sign_dir = np.sign(np.where(np.abs(dir_unit) < tol, 0.0, dir_unit))
     sign_shield = np.sign(shield_normal)
     return bool(np.all(sign_dir == sign_shield))
+
+
+def rotation_matrix_between_vectors(
+    source_direction: NDArray[np.float64],
+    target_direction: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return an active rotation matrix that maps source_direction to target_direction."""
+    source = np.asarray(source_direction, dtype=float)
+    target = np.asarray(target_direction, dtype=float)
+    source_norm = float(np.linalg.norm(source))
+    target_norm = float(np.linalg.norm(target))
+    if source_norm <= 1.0e-12 or target_norm <= 1.0e-12:
+        return np.eye(3, dtype=float)
+    source = source / source_norm
+    target = target / target_norm
+    dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    if dot > 1.0 - 1.0e-12:
+        return np.eye(3, dtype=float)
+    if dot < -1.0 + 1.0e-12:
+        helper = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(source, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0], dtype=float)
+        axis = np.cross(source, helper)
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+        angle = np.pi
+    else:
+        axis = np.cross(source, target)
+        axis /= max(float(np.linalg.norm(axis)), 1.0e-12)
+        angle = float(np.arccos(dot))
+    skew = np.array(
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ],
+        dtype=float,
+    )
+    return np.eye(3, dtype=float) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+
+
+def rotated_positive_octant_blocks_direction(
+    direction: NDArray[np.float64],
+    shield_normal: NDArray[np.float64],
+    tol: float = 1.0e-9,
+) -> bool:
+    """Return True when a direction lies inside a rotated local +X/+Y/+Z octant."""
+    direction_arr = np.asarray(direction, dtype=float)
+    direction_norm = float(np.linalg.norm(direction_arr))
+    if direction_norm <= 1.0e-12:
+        return False
+    rotation = rotation_matrix_between_vectors(
+        LOCAL_POSITIVE_OCTANT_CENTER,
+        np.asarray(shield_normal, dtype=float),
+    )
+    local_direction = rotation.T @ (direction_arr / direction_norm)
+    return bool(np.all(local_direction >= -float(tol)))
 
 
 def resolve_mu_values(

@@ -90,6 +90,9 @@ def _continuous_kernel_for_estimator(estimator: RotatingShieldPFEstimator):
         obstacle_grid=getattr(estimator, "obstacle_grid", None),
         obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
         obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
+        obstacle_buildup_coeff=float(getattr(estimator, "obstacle_buildup_coeff", 0.0)),
+        detector_radius_m=float(getattr(estimator, "detector_radius_m", 0.0)),
+        detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
     )
 
 
@@ -191,6 +194,10 @@ def _surrogate_scores_gpu(
                     device=device,
                     dtype=dtype,
                     source_scale=estimator.response_scale_for_isotope(iso),
+                    detector_radius_m=kernel.detector_radius_m,
+                    detector_aperture_samples=kernel.detector_aperture_samples,
+                    buildup_fe_coeff=shield_params.buildup_fe_coeff,
+                    buildup_pb_coeff=shield_params.buildup_pb_coeff,
                     **kernel.obstacle_gpu_kwargs(iso),
                 )
                 if metric == "var_log_lambda":
@@ -335,6 +342,10 @@ def _eig_scores_gpu(
                 device=device,
                 dtype=dtype,
                 source_scale=estimator.response_scale_for_isotope(iso),
+                detector_radius_m=kernel.detector_radius_m,
+                detector_aperture_samples=kernel.detector_aperture_samples,
+                buildup_fe_coeff=shield_params.buildup_fe_coeff,
+                buildup_pb_coeff=shield_params.buildup_pb_coeff,
                 **kernel.obstacle_gpu_kwargs(iso),
             )
             if num_samples <= 0:

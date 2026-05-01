@@ -57,6 +57,8 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
             "250",
             "--adaptive-ready-min-isotopes",
             "2",
+            "--adaptive-ready-min-snr",
+            "1.5",
             "--no-adaptive-strength-prior",
             "--adaptive-strength-prior-steps",
             "5",
@@ -102,6 +104,7 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
     assert captured["adaptive_min_dwell_s"] == 3.0
     assert captured["adaptive_ready_min_counts"] == 250.0
     assert captured["adaptive_ready_min_isotopes"] == 2
+    assert captured["adaptive_ready_min_snr"] == 1.5
     assert captured["adaptive_strength_prior"] is False
     assert captured["adaptive_strength_prior_steps"] == 5
     assert captured["adaptive_strength_prior_min_counts"] == 4.5
@@ -184,11 +187,11 @@ def test_main_allows_min_rotations_override(monkeypatch) -> None:
             "geant4",
             "configs/geant4/external_gui_scene.json",
         ),
-        ("python-cui", "analytic", None),
+        ("python-cui", "analytic", "configs/python/high_fidelity_no_isaac.json"),
         (
             "geant4-cui",
             "geant4",
-            "configs/geant4/high_fidelity_external_no_isaac.json",
+            "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
         ),
     ],
 )

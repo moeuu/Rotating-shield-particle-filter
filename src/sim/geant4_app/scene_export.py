@@ -12,12 +12,10 @@ from sim.isaacsim_app.scene_builder import SceneDescription, StagePrimPaths
 from sim.isaacsim_app.stage_backend import StageBackend, StageMaterialInfo, StageSolidPrim
 from sim.shield_geometry import (
     FE_SHIELD_INNER_RADIUS_M,
-    FE_SHIELD_OUTER_RADIUS_M,
-    FE_SHIELD_THICKNESS_CM,
     PB_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_OUTER_RADIUS_M,
-    PB_SHIELD_THICKNESS_CM,
     SHIELD_SHAPE_SPHERICAL_OCTANT,
+    ShieldThicknessConfig,
+    resolve_shield_thickness_config,
 )
 
 DEFAULT_DETECTOR_CRYSTAL_RADIUS_M = 0.038
@@ -219,11 +217,13 @@ def export_scene_for_geant4(
     stage_backend: StageBackend,
     asset_geometry: IsaacAssetGeometry,
     detector_model: ExportedDetectorModel,
+    shield_thickness: ShieldThicknessConfig | None = None,
     stage_material_rules: tuple[object, ...] = (),
     absorbing_transport_groups: tuple[str, ...] = (),
     absorbing_path_prefixes: tuple[str, ...] = (),
 ) -> ExportedGeant4Scene:
     """Export the loaded stage and dynamic assets into a Geant4-ready scene."""
+    shield_thickness = shield_thickness or resolve_shield_thickness_config()
     prefixes = tuple(
         sorted(
             {
@@ -283,8 +283,8 @@ def export_scene_for_geant4(
         path=scene.prim_paths.fe_shield_path,
         shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
         inner_radius_m=FE_SHIELD_INNER_RADIUS_M,
-        outer_radius_m=FE_SHIELD_OUTER_RADIUS_M,
-        thickness_cm=FE_SHIELD_THICKNESS_CM,
+        outer_radius_m=FE_SHIELD_INNER_RADIUS_M + float(shield_thickness.thickness_fe_cm) / 100.0,
+        thickness_cm=float(shield_thickness.thickness_fe_cm),
         size_xyz=None,
         material=ExportedGeant4Material(name="fe", preset_name="iron"),
     )
@@ -292,8 +292,8 @@ def export_scene_for_geant4(
         path=scene.prim_paths.pb_shield_path,
         shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
         inner_radius_m=PB_SHIELD_INNER_RADIUS_M,
-        outer_radius_m=PB_SHIELD_OUTER_RADIUS_M,
-        thickness_cm=PB_SHIELD_THICKNESS_CM,
+        outer_radius_m=PB_SHIELD_INNER_RADIUS_M + float(shield_thickness.thickness_pb_cm) / 100.0,
+        thickness_cm=float(shield_thickness.thickness_pb_cm),
         size_xyz=None,
         material=ExportedGeant4Material(name="pb", preset_name="lead"),
     )

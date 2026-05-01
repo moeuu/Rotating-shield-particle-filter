@@ -13,13 +13,16 @@
   "detector_height_m": 0.5,
   "obstacle_height_m": 2.0,
   "engine_mode": "external",
-  "spectrum_count_method": "photopeak_nnls",
+  "spectrum_count_method": "response_poisson",
   "physics_profile": "balanced",
   "thread_count": 8,
   "random_seed_base": 123,
-  "dead_time_tau_s": 5.813e-9,
+  "dead_time_tau_s": 5.813E-9,
   "scatter_gain": 0.0,
   "persistent_process": true,
+  "source_rate_model": "detector_cps_1m",
+  "source_bias_mode": "detector_cone",
+  "detector_scoring_mode": "incident_gamma_energy",
   "executable_path": "build/geant4_sidecar",
   "radiation_visualization": {
     "enabled": true,
@@ -43,5 +46,7 @@
       "path_prefix": "/World/Environment",
       "material": "concrete"
     }
-  ]
+  ],
+  "secondary_transport_mode": "gamma_only",
+  "primary_sampling_fraction": 0.02
 }

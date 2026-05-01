@@ -28,9 +28,13 @@
   ingestion code, read `docs/simulation_fidelity_policy.md`.
 - Do not introduce runtime shortcuts that lower physical fidelity for speed:
   surrogate transport, expected-count observations, weighted or capped Geant4
-  histories, deterministic background smoothing, detector-directed emissions,
-  `theory_tvl` runtime attenuation, non-Geant4 scatter synthesis, or
-  peak-window or full-spectrum-continuum runtime count extraction.
+  histories, deterministic background smoothing, unlabelled source-rate
+  reinterpretation, `theory_tvl` runtime attenuation, non-Geant4 scatter
+  synthesis, or peak-window or full-spectrum-continuum runtime count extraction.
+- `intensity_cps_1m` means expected net detector count rate at 1 m for the
+  configured detector and spectral processing, not total isotropic gamma/s
+  source emission. Detector-directed Geant4 histories are allowed only under the
+  explicit `source_rate_model = detector_cps_1m` source-rate model.
 - A calibrated full-spectrum Poisson response regression is acceptable when it
   uses the detector response model directly and propagates count covariance to
   the PF likelihood; do not replace it with unconstrained continuum fitting.

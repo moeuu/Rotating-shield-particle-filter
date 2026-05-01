@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import heapq
 import json
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -100,6 +101,51 @@ class TraversabilityMap:
             return False
         return idx in self._traversable_set
 
+    def shortest_path_cells(
+        self,
+        start_point: Sequence[float],
+        goal_point: Sequence[float],
+        *,
+        allow_diagonal: bool = True,
+    ) -> tuple[tuple[int, int], ...] | None:
+        """Return the shortest free-cell path between two world points."""
+        return shortest_grid_path_cells(
+            self,
+            start_point,
+            goal_point,
+            allow_diagonal=allow_diagonal,
+        )
+
+    def shortest_path_points(
+        self,
+        start_point: Sequence[float],
+        goal_point: Sequence[float],
+        *,
+        allow_diagonal: bool = True,
+    ) -> np.ndarray | None:
+        """Return world-space waypoints for the shortest traversable path."""
+        return shortest_grid_path_points(
+            self,
+            start_point,
+            goal_point,
+            allow_diagonal=allow_diagonal,
+        )
+
+    def shortest_path_length(
+        self,
+        start_point: Sequence[float],
+        goal_point: Sequence[float],
+        *,
+        allow_diagonal: bool = True,
+    ) -> float:
+        """Return the shortest traversable path length, or inf when disconnected."""
+        path = self.shortest_path_points(
+            start_point,
+            goal_point,
+            allow_diagonal=allow_diagonal,
+        )
+        return _polyline_length(path)
+
     def to_dict(self) -> dict:
         """Return a JSON-serializable representation of the map."""
         return {
@@ -184,6 +230,226 @@ def _neighbors(
     for neighbor in ((ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1)):
         if 0 <= neighbor[0] < nx and 0 <= neighbor[1] < ny:
             yield neighbor
+
+
+def _map_cell_center(map_api: object, cell: tuple[int, int]) -> tuple[float, float]:
+    """Return a map cell center for any grid-like map API."""
+    fn = getattr(map_api, "cell_center", None)
+    if callable(fn):
+        center = fn(cell)
+        return float(center[0]), float(center[1])
+    origin = getattr(map_api, "origin", (0.0, 0.0))
+    cell_size = float(getattr(map_api, "cell_size", 1.0))
+    return (
+        float(origin[0]) + (float(cell[0]) + 0.5) * cell_size,
+        float(origin[1]) + (float(cell[1]) + 0.5) * cell_size,
+    )
+
+
+def _free_cell_fn(map_api: object):
+    """Return the free-cell predicate for a grid-like map API."""
+    for attr in ("is_free_cell", "is_cell_free"):
+        fn = getattr(map_api, attr, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _path_neighbors(
+    map_api: object,
+    cell: tuple[int, int],
+    *,
+    allow_diagonal: bool,
+) -> Iterable[tuple[tuple[int, int], float]]:
+    """Yield free neighbor cells and step lengths for A* path planning."""
+    grid_shape = getattr(map_api, "grid_shape", None)
+    if grid_shape is None:
+        return
+    is_free_cell = _free_cell_fn(map_api)
+    if is_free_cell is None:
+        return
+    nx, ny = int(grid_shape[0]), int(grid_shape[1])
+    cell_size = float(getattr(map_api, "cell_size", 1.0))
+    ix, iy = int(cell[0]), int(cell[1])
+    moves = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0)]
+    if allow_diagonal:
+        moves.extend(
+            [
+                (-1, -1, np.sqrt(2.0)),
+                (-1, 1, np.sqrt(2.0)),
+                (1, -1, np.sqrt(2.0)),
+                (1, 1, np.sqrt(2.0)),
+            ]
+        )
+    for dx, dy, multiplier in moves:
+        neighbor = (ix + dx, iy + dy)
+        if neighbor[0] < 0 or neighbor[1] < 0:
+            continue
+        if neighbor[0] >= nx or neighbor[1] >= ny:
+            continue
+        if not bool(is_free_cell(neighbor)):
+            continue
+        if dx != 0 and dy != 0:
+            side_a = (ix + dx, iy)
+            side_b = (ix, iy + dy)
+            if not bool(is_free_cell(side_a)) or not bool(is_free_cell(side_b)):
+                continue
+        yield neighbor, float(multiplier) * cell_size
+
+
+def _cell_heuristic(
+    map_api: object,
+    cell: tuple[int, int],
+    goal_cell: tuple[int, int],
+) -> float:
+    """Return the Euclidean grid heuristic for A*."""
+    x0, y0 = _map_cell_center(map_api, cell)
+    x1, y1 = _map_cell_center(map_api, goal_cell)
+    return float(np.hypot(x1 - x0, y1 - y0))
+
+
+def _reconstruct_path(
+    came_from: dict[tuple[int, int], tuple[int, int]],
+    goal_cell: tuple[int, int],
+) -> tuple[tuple[int, int], ...]:
+    """Return an ordered cell path from an A* predecessor map."""
+    path = [goal_cell]
+    current = goal_cell
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    path.reverse()
+    return tuple(path)
+
+
+def shortest_grid_path_cells(
+    map_api: object,
+    start_point: Sequence[float],
+    goal_point: Sequence[float],
+    *,
+    allow_diagonal: bool = True,
+) -> tuple[tuple[int, int], ...] | None:
+    """Return an obstacle-aware shortest path over a grid-like map API."""
+    cell_index = getattr(map_api, "cell_index", None)
+    is_free_cell = _free_cell_fn(map_api)
+    grid_shape = getattr(map_api, "grid_shape", None)
+    if not callable(cell_index) or is_free_cell is None or grid_shape is None:
+        return None
+    start_cell = cell_index(start_point)
+    goal_cell = cell_index(goal_point)
+    if start_cell is None or goal_cell is None:
+        return None
+    start_cell = (int(start_cell[0]), int(start_cell[1]))
+    goal_cell = (int(goal_cell[0]), int(goal_cell[1]))
+    if not bool(is_free_cell(start_cell)) or not bool(is_free_cell(goal_cell)):
+        return None
+    if start_cell == goal_cell:
+        return (start_cell,)
+
+    frontier: list[tuple[float, float, tuple[int, int]]] = []
+    heapq.heappush(frontier, (0.0, 0.0, start_cell))
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    cost_so_far: dict[tuple[int, int], float] = {start_cell: 0.0}
+    while frontier:
+        _, current_cost, current = heapq.heappop(frontier)
+        if current == goal_cell:
+            return _reconstruct_path(came_from, goal_cell)
+        if current_cost > cost_so_far.get(current, float("inf")):
+            continue
+        for neighbor, step_cost in _path_neighbors(
+            map_api,
+            current,
+            allow_diagonal=allow_diagonal,
+        ):
+            new_cost = current_cost + float(step_cost)
+            if new_cost >= cost_so_far.get(neighbor, float("inf")):
+                continue
+            cost_so_far[neighbor] = new_cost
+            came_from[neighbor] = current
+            priority = new_cost + _cell_heuristic(map_api, neighbor, goal_cell)
+            heapq.heappush(frontier, (priority, new_cost, neighbor))
+    return None
+
+
+def _coerce_xyz(point: Sequence[float], z_default: float = 0.0) -> np.ndarray:
+    """Return a 3D point array, filling z when only xy is provided."""
+    arr = np.asarray(point, dtype=float).ravel()
+    if arr.size < 2:
+        raise ValueError("point must have at least two coordinates.")
+    if arr.size >= 3:
+        return arr[:3].astype(float)
+    return np.array([arr[0], arr[1], float(z_default)], dtype=float)
+
+
+def shortest_grid_path_points(
+    map_api: object,
+    start_point: Sequence[float],
+    goal_point: Sequence[float],
+    *,
+    allow_diagonal: bool = True,
+) -> np.ndarray | None:
+    """Return world-space waypoints for an obstacle-aware grid path."""
+    start = _coerce_xyz(start_point)
+    goal = _coerce_xyz(goal_point, z_default=float(start[2]))
+    cells = shortest_grid_path_cells(
+        map_api,
+        start,
+        goal,
+        allow_diagonal=allow_diagonal,
+    )
+    if cells is None:
+        return None
+    if len(cells) <= 1:
+        return np.vstack([start, goal]).astype(float)
+    z_center = float(start[2])
+    centers = []
+    for cell in cells[1:-1]:
+        x_val, y_val = _map_cell_center(map_api, cell)
+        centers.append(np.array([x_val, y_val, z_center], dtype=float))
+    points = [start]
+    points.extend(centers)
+    points.append(goal)
+    return _dedupe_path_points(np.vstack(points).astype(float))
+
+
+def _dedupe_path_points(points: np.ndarray) -> np.ndarray:
+    """Remove consecutive duplicate points from a path polyline."""
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return np.zeros((0, 3), dtype=float)
+    keep = [0]
+    for idx in range(1, arr.shape[0]):
+        if float(np.linalg.norm(arr[idx] - arr[keep[-1]])) > 1e-9:
+            keep.append(idx)
+    return arr[keep].astype(float)
+
+
+def _polyline_length(points: np.ndarray | None) -> float:
+    """Return the length of a 3D polyline, or inf for a missing path."""
+    if points is None:
+        return float("inf")
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] != 3:
+        return 0.0
+    deltas = np.diff(arr, axis=0)
+    return float(np.sum(np.linalg.norm(deltas, axis=1)))
+
+
+def shortest_grid_path_length(
+    map_api: object,
+    start_point: Sequence[float],
+    goal_point: Sequence[float],
+    *,
+    allow_diagonal: bool = True,
+) -> float:
+    """Return the obstacle-aware path length over a grid-like map API."""
+    points = shortest_grid_path_points(
+        map_api,
+        start_point,
+        goal_point,
+        allow_diagonal=allow_diagonal,
+    )
+    return _polyline_length(points)
 
 
 def _reachable_cells(
