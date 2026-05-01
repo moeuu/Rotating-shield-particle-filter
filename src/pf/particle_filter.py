@@ -65,6 +65,8 @@ class PFConfig:
     birth_q_max: float = 3e5
     birth_q_min: float = 1e2
     birth_max_per_update: int | None = None
+    birth_delta_ll_threshold: float = 0.0
+    birth_complexity_penalty: float = 0.0
     structural_update_min_counts: float = 0.0
     birth_min_distinct_poses: int = 1
     birth_residual_clip_quantile: float = 0.95
@@ -100,7 +102,9 @@ class PFConfig:
     split_strength_min_frac: float = 0.3
     split_strength_max_frac: float = 0.7
     split_delta_ll_threshold: float = 0.0
+    split_complexity_penalty: float = 0.0
     split_residual_guided: bool = True
+    split_residual_always_try: bool = False
     split_residual_candidate_count: int = 8
     merge_prob: float = 0.0
     merge_distance_max: float = 0.5
@@ -2160,6 +2164,10 @@ class IsotopeParticleFilter:
         scores = np.asarray(residual_mix @ candidate_counts, dtype=float)
         if np.max(scores) <= 0.0:
             return None
+        order = np.argsort(scores)[::-1]
+        scores = scores[order]
+        kernel_sums = kernel_sums[order]
+        candidates = candidates[order]
         scores = np.maximum(scores, float(self.config.birth_min_score))
         temp = max(float(self.config.birth_softmax_temp), 1e-6)
         scaled = scores / temp
@@ -3013,6 +3021,15 @@ class IsotopeParticleFilter:
             observation_count_variance=data.observation_variances,
         )
 
+    def _structural_acceptance_threshold(
+        self,
+        *,
+        base_threshold: float,
+        complexity_penalty: float,
+    ) -> float:
+        """Return the likelihood-gain threshold for one structural parameter jump."""
+        return float(base_threshold) + max(float(complexity_penalty), 0.0)
+
     def _candidate_initial_strengths(
         self,
         *,
@@ -3615,29 +3632,41 @@ class IsotopeParticleFilter:
                         st.num_sources = st.positions.shape[0]
                         moved = True
 
-            if (
+            can_try_split = (
                 allow_structural_proposal
                 and st.num_sources > 0
                 and proposal_data is not None
                 and proposal_data.z_k.size
-                and np.random.rand() < float(self.config.split_prob)
-            ):
+            )
+            if can_try_split:
                 split_moved = False
                 if self.config.max_sources is None or st.num_sources < self.config.max_sources:
-                    split_trial, split_delta = self._best_residual_guided_split_trial(
-                        st,
-                        proposal_data,
-                        birth_candidates,
-                        split_candidate_strengths,
+                    try_residual_split = bool(self.config.split_residual_always_try) or (
+                        np.random.rand() < float(self.config.split_prob)
                     )
-                    if (
-                        split_trial is not None
-                        and split_delta >= float(self.config.split_delta_ll_threshold)
-                    ):
-                        self._replace_particle_state_from_trial(st, split_trial)
-                        split_moved = True
-                        moved = True
-                    if not split_moved:
+                    if try_residual_split:
+                        split_trial, split_delta = self._best_residual_guided_split_trial(
+                            st,
+                            proposal_data,
+                            birth_candidates,
+                            split_candidate_strengths,
+                        )
+                        if (
+                            split_trial is not None
+                            and split_delta
+                            >= self._structural_acceptance_threshold(
+                                base_threshold=float(
+                                    self.config.split_delta_ll_threshold
+                                ),
+                                complexity_penalty=float(
+                                    self.config.split_complexity_penalty
+                                ),
+                            )
+                        ):
+                            self._replace_particle_state_from_trial(st, split_trial)
+                            split_moved = True
+                            moved = True
+                    if not split_moved and np.random.rand() < float(self.config.split_prob):
                         candidates = np.where(
                             st.strengths >= float(self.config.split_strength_min)
                         )[0]
@@ -3693,10 +3722,17 @@ class IsotopeParticleFilter:
                                             proposal_data.observation_variances
                                         ),
                                     )
-                                    if (
-                                        delta_ll >= float(self.config.split_delta_ll_threshold)
-                                        and np.log(np.random.rand()) < delta_ll
-                                    ):
+                                    split_threshold = self._structural_acceptance_threshold(
+                                        base_threshold=float(
+                                            self.config.split_delta_ll_threshold
+                                        ),
+                                        complexity_penalty=float(
+                                            self.config.split_complexity_penalty
+                                        ),
+                                    )
+                                    if delta_ll >= split_threshold and np.log(
+                                        np.random.rand()
+                                    ) < delta_ll:
                                         st.positions = np.vstack(
                                             [
                                                 st.positions[:idx],
@@ -3706,7 +3742,11 @@ class IsotopeParticleFilter:
                                             ]
                                         )
                                         st.strengths = np.concatenate(
-                                            [st.strengths[:idx], st.strengths[idx + 1 :], [q1, q2]]
+                                            [
+                                                st.strengths[:idx],
+                                                st.strengths[idx + 1 :],
+                                                [q1, q2],
+                                            ]
                                         )
                                         st.ages = np.concatenate(
                                             [st.ages[:idx], st.ages[idx + 1 :], [0, 0]]
@@ -3773,12 +3813,42 @@ class IsotopeParticleFilter:
                     dist = np.linalg.norm(st.positions - pos_new[None, :], axis=1)
                     if np.any(dist < float(self.config.birth_min_sep_m)):
                         continue
-                st.positions = np.vstack([st.positions, pos_new])
-                st.strengths = np.append(st.strengths, q_new)
-                st.ages = np.append(st.ages, 0)
-                st.low_q_streaks = np.append(st.low_q_streaks, 0)
-                st.support_scores = np.append(st.support_scores, 0.0)
-                st.num_sources = st.positions.shape[0]
+                trial = st.copy()
+                self._ensure_source_metadata(trial)
+                trial.positions = np.vstack(
+                    [trial.positions[: trial.num_sources], pos_new]
+                )
+                trial.strengths = np.append(trial.strengths[: trial.num_sources], q_new)
+                trial.ages = np.append(trial.ages[: trial.num_sources], 0)
+                trial.low_q_streaks = np.append(
+                    trial.low_q_streaks[: trial.num_sources],
+                    0,
+                )
+                trial.support_scores = np.append(
+                    trial.support_scores[: trial.num_sources],
+                    0.0,
+                )
+                trial.num_sources = int(trial.positions.shape[0])
+                base_ll = self._trial_log_likelihood(st, proposal_data)
+                self._refit_strengths_for_particle(
+                    trial,
+                    proposal_data,
+                    iters=max(1, int(self.config.refit_iters)),
+                    eps=float(self.config.refit_eps),
+                )
+                self._prune_floor_sources_after_refit(trial, proposal_data)
+                if trial.num_sources <= st.num_sources:
+                    continue
+                delta_ll = float(
+                    self._trial_log_likelihood(trial, proposal_data) - base_ll
+                )
+                birth_threshold = self._structural_acceptance_threshold(
+                    base_threshold=float(self.config.birth_delta_ll_threshold),
+                    complexity_penalty=float(self.config.birth_complexity_penalty),
+                )
+                if not np.isfinite(delta_ll) or delta_ll < birth_threshold:
+                    continue
+                self._replace_particle_state_from_trial(st, trial)
                 self.last_birth_count += 1
                 if births_remaining is not None:
                     births_remaining -= 1

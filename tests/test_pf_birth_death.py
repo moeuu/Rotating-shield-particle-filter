@@ -1469,6 +1469,92 @@ def test_residual_guided_split_separates_same_isotope_sources() -> None:
     assert np.min(np.linalg.norm(state.positions - true_positions[1][None, :], axis=1)) < 0.5
 
 
+def test_residual_split_ranks_candidates_by_residual_support() -> None:
+    """Residual split should test the strongest residual candidate first."""
+    np.random.seed(11)
+    filt = _build_filter(
+        p_birth=0.0,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        split_prob=0.0,
+        split_residual_guided=True,
+        split_residual_always_try=True,
+        split_residual_candidate_count=1,
+        split_delta_ll_threshold=0.0,
+        min_age_to_split=0,
+        birth_num_local_jitter=0,
+        birth_min_sep_m=0.4,
+        birth_detector_min_sep_m=0.0,
+        birth_residual_min_support=1,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        birth_residual_support_sigma=0.1,
+        birth_residual_gate_p_value=1.0,
+        birth_candidate_support_fraction=0.0,
+        birth_refit_residual_gate=False,
+        merge_prob=0.0,
+        conditional_strength_refit_prior_weight=0.0,
+    )
+    initial_state = IsotopeState(
+        num_sources=1,
+        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([90.0], dtype=float),
+        background=0.0,
+        ages=np.array([2], dtype=int),
+        low_q_streaks=np.zeros(1, dtype=int),
+        support_scores=np.zeros(1, dtype=float),
+    )
+    filt.continuous_particles = [IsotopeParticle(state=initial_state, log_weight=0.0)]
+    true_positions = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float)
+    true_strengths = np.array([90.0, 150.0], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [2.5, 2.0, 0.0]],
+        dtype=float,
+    )
+    expected = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_positions,
+        strengths=true_strengths,
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        source_scale=1.0,
+    )
+    counts = np.sum(expected, axis=1)
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+    candidate_positions = np.array(
+        [[4.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=float,
+    )
+
+    proposal = filt._compute_birth_proposal(data, candidate_positions)
+
+    assert proposal is not None
+    _, _, _, ranked_candidates = proposal
+    assert np.allclose(ranked_candidates[0], true_positions[1])
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=data,
+        candidate_positions=candidate_positions,
+    )
+
+    state = filt.continuous_particles[0].state
+    assert state.num_sources == 2
+    assert np.min(np.linalg.norm(state.positions - true_positions[1][None, :], axis=1)) < 0.5
+
+
 def test_report_strength_refit_prunes_unsupported_component() -> None:
     """Reported Poisson strength refit should remove zero-supported components."""
     np.random.seed(5)

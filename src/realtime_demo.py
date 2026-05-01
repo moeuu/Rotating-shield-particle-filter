@@ -3029,6 +3029,13 @@ def run_live_pf(
         split_residual_guided=bool(
             runtime_config.get("split_residual_guided", True)
         ),
+        split_residual_always_try=bool(
+            runtime_config.get("split_residual_always_try", False)
+        ),
+        split_complexity_penalty=max(
+            0.0,
+            float(runtime_config.get("split_complexity_penalty", 0.0)),
+        ),
         split_residual_candidate_count=max(
             1,
             int(runtime_config.get("split_residual_candidate_count", 8)),
@@ -3055,6 +3062,13 @@ def run_live_pf(
         structural_proposal_topk_particles=structural_proposal_topk_particles,
         structural_update_min_counts=float(
             runtime_config.get("structural_update_min_counts", 0.0)
+        ),
+        birth_delta_ll_threshold=float(
+            runtime_config.get("birth_delta_ll_threshold", 0.0)
+        ),
+        birth_complexity_penalty=max(
+            0.0,
+            float(runtime_config.get("birth_complexity_penalty", 0.0)),
         ),
         birth_max_per_update=(
             None
@@ -3720,6 +3734,10 @@ def run_live_pf(
         f"p_birth={pf_conf.p_birth:.3f} p_kill={pf_conf.p_kill:.3f} "
         f"split_prob={pf_conf.split_prob:.3f} merge_prob={pf_conf.merge_prob:.3f} "
         f"split_residual_guided={bool(pf_conf.split_residual_guided)} "
+        f"split_residual_always_try={bool(pf_conf.split_residual_always_try)} "
+        f"birth_ll_threshold={float(pf_conf.birth_delta_ll_threshold):.3f} "
+        f"birth_complexity={float(pf_conf.birth_complexity_penalty):.3f} "
+        f"split_complexity={float(pf_conf.split_complexity_penalty):.3f} "
         f"split_candidates={int(pf_conf.split_residual_candidate_count)} "
         f"merge_corr_min={float(pf_conf.merge_response_corr_min):.3f} "
         f"merge_pairs={int(pf_conf.merge_search_topk_pairs)} "

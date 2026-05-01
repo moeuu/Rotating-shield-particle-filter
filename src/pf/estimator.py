@@ -85,6 +85,8 @@ class RotatingShieldPFConfig:
         - birth_q_max: clamp max for new source strength
         - birth_q_min: clamp min for new source strength
         - birth_max_per_update: cap accepted birth proposals per structural update
+        - birth_delta_ll_threshold: likelihood-gain floor for accepting birth
+        - birth_complexity_penalty: extra model-complexity penalty for birth
         - birth_residual_clip_quantile: clip residuals at this quantile
         - birth_residual_gate_p_value: chi-square p-value for residual birth evidence
         - birth_residual_min_support: minimum independent residual-supported measurements
@@ -121,7 +123,9 @@ class RotatingShieldPFConfig:
         - split_strength_min_frac: min split fraction for q1/q2
         - split_strength_max_frac: max split fraction for q1/q2
         - split_delta_ll_threshold: ΔLL threshold for split acceptance
+        - split_complexity_penalty: extra model-complexity penalty for split
         - split_residual_guided: use posterior residual candidates for split moves
+        - split_residual_always_try: always test residual split on selected particles
         - split_residual_candidate_count: residual candidates evaluated per split
         - merge_prob: probability of merge proposals per particle
         - merge_distance_max: max distance for merge candidates
@@ -234,6 +238,8 @@ class RotatingShieldPFConfig:
     birth_q_max: float = 3e5
     birth_q_min: float = 1e2
     birth_max_per_update: int | None = None
+    birth_delta_ll_threshold: float = 0.0
+    birth_complexity_penalty: float = 0.0
     structural_update_min_counts: float = 0.0
     birth_min_distinct_poses: int = 1
     birth_residual_clip_quantile: float = 0.95
@@ -272,7 +278,9 @@ class RotatingShieldPFConfig:
     split_strength_min_frac: float = 0.3
     split_strength_max_frac: float = 0.7
     split_delta_ll_threshold: float = 0.0
+    split_complexity_penalty: float = 0.0
     split_residual_guided: bool = True
+    split_residual_always_try: bool = False
     split_residual_candidate_count: int = 8
     merge_prob: float = 0.0
     merge_distance_max: float = 0.5
@@ -447,6 +455,8 @@ class RotatingShieldPFConfig:
         )
         if self.birth_max_per_update is not None:
             self.birth_max_per_update = max(0, int(self.birth_max_per_update))
+        self.birth_delta_ll_threshold = float(self.birth_delta_ll_threshold)
+        self.birth_complexity_penalty = max(0.0, float(self.birth_complexity_penalty))
         self.conditional_strength_refit_window = max(
             1,
             int(self.conditional_strength_refit_window),
@@ -481,6 +491,8 @@ class RotatingShieldPFConfig:
             float(self.report_strength_refit_eps),
         )
         self.split_residual_guided = bool(self.split_residual_guided)
+        self.split_complexity_penalty = max(0.0, float(self.split_complexity_penalty))
+        self.split_residual_always_try = bool(self.split_residual_always_try)
         self.split_residual_candidate_count = max(
             1,
             int(self.split_residual_candidate_count),
@@ -693,6 +705,8 @@ class RotatingShieldPFEstimator:
             birth_q_max=self.pf_config.birth_q_max,
             birth_q_min=self.pf_config.birth_q_min,
             birth_max_per_update=self.pf_config.birth_max_per_update,
+            birth_delta_ll_threshold=self.pf_config.birth_delta_ll_threshold,
+            birth_complexity_penalty=self.pf_config.birth_complexity_penalty,
             structural_update_min_counts=self.pf_config.structural_update_min_counts,
             birth_min_distinct_poses=self.pf_config.birth_min_distinct_poses,
             birth_residual_clip_quantile=self.pf_config.birth_residual_clip_quantile,
@@ -728,7 +742,9 @@ class RotatingShieldPFEstimator:
             split_strength_min_frac=self.pf_config.split_strength_min_frac,
             split_strength_max_frac=self.pf_config.split_strength_max_frac,
             split_delta_ll_threshold=self.pf_config.split_delta_ll_threshold,
+            split_complexity_penalty=self.pf_config.split_complexity_penalty,
             split_residual_guided=self.pf_config.split_residual_guided,
+            split_residual_always_try=self.pf_config.split_residual_always_try,
             split_residual_candidate_count=self.pf_config.split_residual_candidate_count,
             merge_prob=self.pf_config.merge_prob,
             merge_distance_max=self.pf_config.merge_distance_max,
