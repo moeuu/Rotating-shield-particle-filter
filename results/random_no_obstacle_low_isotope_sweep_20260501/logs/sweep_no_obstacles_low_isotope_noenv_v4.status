@@ -1,0 +1,14 @@
+[low-isotope-no-obstacles-noenv-v4] case 01 start 2026-05-01 21:45:42 ready_isotopes=1
+[low-isotope-no-obstacles-noenv-v4] case 01 done 2026-05-01 21:49:33
+Total measurements: 20, live=80.0s, travel=188.9s, shield=10.0s, mission=278.9s
+Mission timing summary: distance=94.43m motion=188.9s rotation=10.0s end_to_end=278.9s compute=79.022s ig_mean=0.558s pf_mean=0.854s wall_clock=226.68s
+  GT=0, EST=0, Assigned=0, TP=0, FP=0, FN=0
+  Position error [m]: mean=n/a, median=n/a, rmse=n/a, max=n/a
+  Intensity rel error [%]: mean=n/a, median=n/a, max=n/a
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.4858, median=0.4858, rmse=0.4858, max=0.4858
+  Intensity rel error [%]: mean=43.76, median=43.76, max=43.76
+  GT=0, EST=0, Assigned=0, TP=0, FP=0, FN=0
+  Position error [m]: mean=n/a, median=n/a, rmse=n/a, max=n/a
+  Intensity rel error [%]: mean=n/a, median=n/a, max=n/a
+[low-isotope-no-obstacles-noenv-v4] case 02 start 2026-05-01 21:49:33 ready_isotopes=1

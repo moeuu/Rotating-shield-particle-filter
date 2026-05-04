@@ -1,0 +1,10 @@
+case,description,include_in_accuracy_summary,isotope,method,target_pf_counts,source_tally_counts,estimated_counts,relative_error,abs_relative_error,total_spectrum_counts,num_primaries,runtime_s,fe_index,pb_index,dwell_time_s
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Cs-137,photopeak_nnls,3000.0,3000.0,6826.324082705971,1.2754413609019903,1.2754413609019903,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Cs-137,response_matrix,3000.0,3000.0,4468.399447932968,0.4894664826443225,0.4894664826443225,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Cs-137,peak_window,3000.0,3000.0,6732.4925420935015,1.2441641806978339,1.2441641806978339,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Co-60,photopeak_nnls,0.0,0.0,8.044388021890308,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Co-60,response_matrix,0.0,0.0,0.0,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Co-60,peak_window,0.0,0.0,56.12429091089578,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Eu-154,photopeak_nnls,0.0,0.0,19.289284317223125,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Eu-154,response_matrix,0.0,0.0,0.0,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0
+single_cs_free,Single Cs-137 source at 1 m without shield blocking.,True,Eu-154,peak_window,0.0,0.0,338.79606543225975,,,2844.4107584214416,141726.0,1.6673974990844727,0,0,30.0

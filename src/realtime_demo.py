@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import socket
+import subprocess
 import sys
+import threading
 import time
 
 import matplotlib
@@ -126,7 +132,7 @@ from sim import (
     load_runtime_config,
 )
 from sim.blender_environment import generate_blender_environment_usd
-from sim.shield_geometry import resolve_shield_thickness_config
+from sim.shield_geometry import nested_shield_inner_radii_cm, resolve_shield_thickness_config
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
@@ -135,6 +141,8 @@ PF_DIR = RESULTS_DIR / "pf"
 IG_DIR = RESULTS_DIR / "IG"
 CUI_VIEW_DIR = RESULTS_DIR / "cui_view"
 BLENDER_ENV_DIR = RESULTS_DIR / "blender_environments"
+_CUI_HTTP_SERVER: ThreadingHTTPServer | None = None
+_CUI_HTTP_THREAD: threading.Thread | None = None
 SAVE_IG_GRIDS = False
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
 PRUNE_MIN_STRENGTH_ABS = 5.0
@@ -155,8 +163,13 @@ DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = OBSTACLE_LAYOUT_DIR / "demo_obstacles.json"
 CANDIDATE_GRID_SPACING = (0.5, 0.5, 0.5)
 CANDIDATE_GRID_MARGIN = 0.5
-HEALTH_LOG_TOP_K = 3
+HEALTH_LOG_TOP_K = 0
 ADAPTIVE_STEP_ID_STRIDE = 100000
+
+
+def _has_environment_obstacles(obstacle_grid: ObstacleGrid | None) -> bool:
+    """Return whether an obstacle grid contains transport-relevant obstacles."""
+    return obstacle_grid is not None and len(obstacle_grid.blocked_cells) > 0
 
 
 def _build_demo_sources() -> list[PointSource]:
@@ -488,6 +501,9 @@ def _fmt_sources(positions: NDArray[np.float64], strengths: NDArray[np.float64])
     strengths = np.asarray(strengths, dtype=float)
     if positions.size == 0 or strengths.size == 0:
         return "[]"
+    count = min(int(positions.shape[0]), int(strengths.size), 8)
+    positions = positions[:count]
+    strengths = strengths[:count]
     chunks = []
     for pos, strength in zip(positions, strengths):
         pos_str = np.array2string(pos, precision=2, floatmode="fixed", separator=", ")
@@ -655,6 +671,7 @@ def _log_pf_diagnostics(
         ess_post = stats["ess_post"]
         n_after_adapt = int(stats["n_after_adapt"])
         resamples = int(stats["resample_count"])
+        mode_preserved = int(stats.get("mode_preserved_count", 0))
         births = int(stats["birth_count"])
         kills = int(stats["kill_count"])
         birth_gate_passed = bool(stats.get("birth_residual_gate_passed", False))
@@ -665,6 +682,12 @@ def _log_pf_diagnostics(
         birth_gate_p = float(stats.get("birth_residual_p_value", 1.0))
         birth_refit_fraction = float(stats.get("birth_residual_refit_fraction", 1.0))
         birth_refit_gate = bool(stats.get("birth_residual_refit_gate_passed", True))
+        birth_layer = str(stats.get("birth_residual_layer", "none"))
+        pseudo_verified = int(stats.get("pseudo_source_verified", 0))
+        pseudo_failed = int(stats.get("pseudo_source_failed", 0))
+        pseudo_pruned = int(stats.get("pseudo_source_pruned", 0))
+        pseudo_quarantined = int(stats.get("pseudo_source_quarantined", 0))
+        pseudo_reasons = stats.get("pseudo_source_fail_reasons", {})
         temper_steps = stats.get("temper_steps", [])
         temper_resamples = int(stats.get("temper_resamples", 0))
         r_mean = float(stats["r_mean"])
@@ -680,7 +703,8 @@ def _log_pf_diagnostics(
         print(
             f"[step {step_index}] pf[{iso}] ess_pre={ess_pre:.2f} resampled={resampled} "
             f"ess_post={_fmt_optional_float(ess_post)} n_after={n_after_adapt} "
-            f"resamples={resamples} births={births} kills={kills} "
+            f"resamples={resamples} mode_preserved={mode_preserved} "
+            f"births={births} kills={kills} "
             f"r_mean={r_mean:.2f} r_var={r_var:.2f} "
             f"converged={converged} skipped={updates_skipped} "
             f"birth_enabled={birth_enabled} max_sources={max_sources} p_birth={p_birth:.3f} "
@@ -691,8 +715,19 @@ def _log_pf_diagnostics(
             f"birth_residual_chi2={birth_gate_chi2:.2f} "
             f"birth_residual_p={birth_gate_p:.3g} "
             f"birth_refit_gate={birth_refit_gate} "
-            f"birth_refit_fraction={birth_refit_fraction:.3f}"
+            f"birth_refit_fraction={birth_refit_fraction:.3f} "
+            f"birth_layer={birth_layer} "
+            f"pseudo_verified={pseudo_verified} "
+            f"pseudo_failed={pseudo_failed} "
+            f"pseudo_pruned={pseudo_pruned} "
+            f"pseudo_quarantined={pseudo_quarantined}"
         )
+        if pseudo_reasons:
+            reason_str = ", ".join(
+                f"{key}={int(value)}"
+                for key, value in sorted(dict(pseudo_reasons).items())
+            )
+            print(f"[step {step_index}] pf[{iso}] pseudo_fail_reasons={reason_str}")
         if temper_steps:
             temper_str = ", ".join(
                 f"(beta={s['beta_total']:.3f},db={s['delta_beta']:.3f},ess={s['ess']:.1f})"
@@ -737,15 +772,20 @@ def _default_use_gpu() -> bool:
     return gpu_utils.torch_available()
 
 
-def _resolve_ig_workers(ig_workers: int | None) -> int:
-    """Return a worker count for IG evaluation (0 or None means auto)."""
-    if ig_workers is None:
-        return 1
-    workers = int(ig_workers)
+def _resolve_python_worker_count(worker_count: object | None) -> int:
+    """Return a Python CPU worker count, using all logical CPUs for auto."""
+    if worker_count is None:
+        return max(1, os.cpu_count() or 1)
+    workers = int(worker_count)
     if workers <= 0:
         cpu_count = os.cpu_count() or 1
-        return max(1, min(4, cpu_count))
-    return workers
+        return max(1, cpu_count)
+    return max(1, workers)
+
+
+def _resolve_ig_workers(ig_workers: int | None) -> int:
+    """Return a worker count for IG evaluation (0 or None means all CPUs)."""
+    return _resolve_python_worker_count(ig_workers)
 
 
 def _coerce_live_visualization(live: bool) -> bool:
@@ -757,6 +797,105 @@ def _coerce_live_visualization(live: bool) -> bool:
         print("GUI display unavailable; running in CUI/headless mode.")
         return False
     return True
+
+
+def _cui_view_relative_url(output_dir: Path) -> str:
+    """Return the CUI split-view URL path relative to the static root."""
+    try:
+        relative = output_dir.resolve().relative_to(CUI_VIEW_DIR.resolve())
+    except ValueError:
+        return "index.html"
+    if str(relative) == ".":
+        return "index.html"
+    return f"{relative.as_posix()}/index.html"
+
+
+def _tcp_port_is_open(host: str, port: int) -> bool:
+    """Return whether a TCP port already accepts local connections."""
+    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    try:
+        with socket.create_connection((connect_host, int(port)), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _default_cui_public_host() -> str:
+    """Return a likely browser-reachable host for local CUI visualization."""
+    env_host = os.environ.get("CUI_SPLIT_VIEW_PUBLIC_HOST")
+    if env_host:
+        return env_host
+    try:
+        raw_hosts = subprocess.check_output(
+            ["hostname", "-I"],
+            text=True,
+            timeout=0.2,
+        )
+        hosts = [host.strip() for host in raw_hosts.split() if host.strip()]
+        for candidate in hosts:
+            if candidate.startswith("100."):
+                return candidate
+        for candidate in hosts:
+            if candidate and not candidate.startswith(("127.", "172.")):
+                return candidate
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            candidate = str(info[4][0])
+            if candidate.startswith("100."):
+                return candidate
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.2)
+            sock.connect(("8.8.8.8", 80))
+            host = str(sock.getsockname()[0])
+            if host and not host.startswith("127."):
+                return host
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def _ensure_cui_view_server(
+    output_dir: Path,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8877,
+    public_host: str | None = None,
+) -> str:
+    """Start or reuse an HTTP server for CUI split visualization."""
+    global _CUI_HTTP_SERVER, _CUI_HTTP_THREAD
+    CUI_VIEW_DIR.mkdir(parents=True, exist_ok=True)
+    port = int(port)
+    relative_url = _cui_view_relative_url(output_dir)
+    display_host = (
+        _default_cui_public_host()
+        if public_host is None and host in {"0.0.0.0", "::"}
+        else str(public_host or host)
+    )
+    url = f"http://{display_host}:{port}/{relative_url}"
+    if _CUI_HTTP_SERVER is not None:
+        return url
+    if _tcp_port_is_open(host, port):
+        return url
+    handler = partial(SimpleHTTPRequestHandler, directory=CUI_VIEW_DIR.as_posix())
+    try:
+        server = ThreadingHTTPServer((host, port), handler)
+    except OSError as exc:
+        print(f"CUI split visualization URL unavailable on {host}:{port}: {exc}")
+        return output_dir.as_posix()
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="cui-view-http-server",
+        daemon=True,
+    )
+    thread.start()
+    _CUI_HTTP_SERVER = server
+    _CUI_HTTP_THREAD = thread
+    return url
 
 
 def _spectrum_config_from_runtime_config(
@@ -2592,13 +2731,26 @@ def run_live_pf(
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
     num_particles = max(1, int(num_particles))
+    detector_model_payload = runtime_config.get("detector_model", {})
+    if not isinstance(detector_model_payload, dict):
+        detector_model_payload = {}
+    detector_outer_radius_cm = 100.0 * (
+        float(detector_model_payload.get("crystal_radius_m", 0.038))
+        + float(detector_model_payload.get("housing_thickness_m", 0.0015))
+    )
     shield_thickness = resolve_shield_thickness_config(runtime_config)
     buildup_runtime = runtime_config.get("pf_buildup", {})
     if not isinstance(buildup_runtime, dict):
         buildup_runtime = {}
+    inner_radius_fe_cm, inner_radius_pb_cm = nested_shield_inner_radii_cm(
+        thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
+        detector_outer_radius_cm=detector_outer_radius_cm,
+    )
     shield_params = ShieldParams(
         thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
         thickness_pb_cm=float(shield_thickness.thickness_pb_cm),
+        inner_radius_fe_cm=inner_radius_fe_cm,
+        inner_radius_pb_cm=inner_radius_pb_cm,
         buildup_fe_coeff=float(
             buildup_runtime.get(
                 "fe_coeff",
@@ -2624,6 +2776,8 @@ def run_live_pf(
         f"target_transmission={shield_thickness.transmission_target} "
         f"Fe={float(shield_params.thickness_fe_cm):.4f}cm "
         f"Pb={float(shield_params.thickness_pb_cm):.4f}cm "
+        f"inner_radii=(Fe {shield_params.inner_radius_fe_cm:.4f}cm, "
+        f"Pb {shield_params.inner_radius_pb_cm:.4f}cm) "
         f"buildup=(Fe {shield_params.buildup_fe_coeff:.3g}, "
         f"Pb {shield_params.buildup_pb_coeff:.3g}, "
         f"obstacle {obstacle_buildup_coeff:.3g})"
@@ -2694,6 +2848,12 @@ def run_live_pf(
     dss_runtime = runtime_config.get("dss_pp", {})
     if not isinstance(dss_runtime, dict):
         dss_runtime = {}
+    python_worker_count_resolved = _resolve_python_worker_count(
+        runtime_config.get(
+            "python_worker_count",
+            runtime_config.get("cpu_worker_count", 0),
+        )
+    )
 
     def _dss_value(key: str, default: object) -> object:
         """Read a DSS-PP setting from CLI override or runtime config."""
@@ -2713,6 +2873,10 @@ def run_live_pf(
         dss_program_length
         if dss_program_length is not None
         else _dss_value("program_length", 2)
+    )
+    dss_residual_program_length_resolved = max(
+        dss_program_length_resolved,
+        int(_dss_value("residual_program_length", 16)),
     )
     dss_signature_weight_resolved = float(
         dss_signature_weight
@@ -2777,6 +2941,26 @@ def run_live_pf(
         lambda_turn_smoothness=max(
             0.0,
             float(_dss_value("turn_smoothness_weight", 0.0)),
+        ),
+        lambda_temporal_separation=max(
+            0.0,
+            float(_dss_value("temporal_separation_weight", 0.0)),
+        ),
+        lambda_count_utility=max(
+            0.0,
+            float(_dss_value("count_utility_weight", 0.75)),
+        ),
+        lambda_local_orbit=max(
+            0.0,
+            float(_dss_value("local_orbit_weight", 0.75)),
+        ),
+        lambda_station_condition=max(
+            0.0,
+            float(_dss_value("station_condition_weight", 0.75)),
+        ),
+        residual_signature_weight=max(
+            0.0,
+            float(_dss_value("residual_signature_weight", 1.0)),
         ),
         eta_observation=max(
             0.0,
@@ -2843,10 +3027,56 @@ def run_live_pf(
             pose_candidates,
             int(_dss_value("max_augmented_candidates", 256)),
         ),
+        count_utility_saturation_counts=max(
+            1.0e-12,
+            float(
+                _dss_value(
+                    "count_utility_saturation_counts",
+                    max(100.0, 5.0 * float(pose_min_observation_counts_resolved)),
+                )
+            ),
+        ),
+        local_orbit_sigma_m=max(
+            1.0e-6,
+            float(_dss_value("local_orbit_sigma_m", 0.75)),
+        ),
+        station_condition_ridge=max(
+            1.0e-12,
+            float(_dss_value("station_condition_ridge", 1.0e-3)),
+        ),
         eig_candidate_limit=(
             None
             if _dss_value("eig_candidate_limit", 64) is None
             else int(_dss_value("eig_candidate_limit", 64))
+        ),
+        temporal_cover_weight=max(
+            0.0,
+            float(_dss_value("temporal_cover_weight", 1.0)),
+        ),
+        temporal_logdet_weight=max(
+            0.0,
+            float(_dss_value("temporal_logdet_weight", 0.25)),
+        ),
+        temporal_decorrelation_weight=max(
+            0.0,
+            float(_dss_value("temporal_decorrelation_weight", 0.5)),
+        ),
+        temporal_pair_contrast_threshold=max(
+            1.0e-12,
+            float(_dss_value("temporal_pair_contrast_threshold", 0.25)),
+        ),
+        temporal_logdet_ridge=max(
+            1.0e-12,
+            float(_dss_value("temporal_logdet_ridge", 1.0e-3)),
+        ),
+        temporal_cover_programs=max(
+            0,
+            int(_dss_value("temporal_cover_programs", 1)),
+        ),
+        program_eval_workers=(
+            python_worker_count_resolved
+            if _dss_value("program_eval_workers", None) is None
+            else max(1, int(_dss_value("program_eval_workers", 1)))
         ),
         rng_seed=obstacle_seed,
     )
@@ -2972,7 +3202,10 @@ def run_live_pf(
         )
     if init_num_sources[1] <= 0 and not birth_enabled:
         init_num_sources = (1, 1)
-    parallel_isotope_workers_raw = runtime_config.get("parallel_isotope_workers", None)
+    parallel_isotope_workers_raw = runtime_config.get(
+        "parallel_isotope_workers",
+        python_worker_count_resolved,
+    )
     parallel_isotope_workers = (
         None
         if parallel_isotope_workers_raw is None
@@ -3016,6 +3249,29 @@ def run_live_pf(
         init_num_sources=init_num_sources,
         init_grid_spacing_m=1.0,
         init_grid_repeats=max(1, int(runtime_config.get("init_grid_repeats", 1))),
+        mode_preserving_resample=bool(
+            runtime_config.get("mode_preserving_resample", True)
+        ),
+        mode_preserving_max_modes=max(
+            0,
+            int(runtime_config.get("mode_preserving_max_modes", 6)),
+        ),
+        mode_preserving_particles_per_mode=max(
+            0,
+            int(runtime_config.get("mode_preserving_particles_per_mode", 3)),
+        ),
+        mode_preserving_radius_m=max(
+            0.05,
+            float(runtime_config.get("mode_preserving_radius_m", 1.5)),
+        ),
+        mode_preserving_min_weight_fraction=max(
+            0.0,
+            float(runtime_config.get("mode_preserving_min_weight_fraction", 1e-4)),
+        ),
+        deferred_resample_roughening_scale=max(
+            0.0,
+            float(runtime_config.get("deferred_resample_roughening_scale", 0.15)),
+        ),
         adaptive_strength_prior=bool(adaptive_strength_prior),
         adaptive_strength_prior_steps=int(adaptive_strength_prior_steps),
         adaptive_strength_prior_min_counts=float(adaptive_strength_prior_min_counts),
@@ -3070,6 +3326,10 @@ def run_live_pf(
             0.0,
             float(runtime_config.get("birth_complexity_penalty", 0.0)),
         ),
+        birth_bic_penalty_params=max(
+            0,
+            int(runtime_config.get("birth_bic_penalty_params", 4)),
+        ),
         birth_max_per_update=(
             None
             if runtime_config.get("birth_max_per_update", None) is None
@@ -3108,7 +3368,137 @@ def run_live_pf(
             0.0,
             float(runtime_config.get("birth_refit_residual_min_fraction", 0.5)),
         ),
+        birth_use_shield_coded_residual=bool(
+            runtime_config.get("birth_use_shield_coded_residual", True)
+        ),
+        birth_existing_response_corr_max=float(
+            runtime_config.get("birth_existing_response_corr_max", 1.0)
+        ),
+        birth_count_distance_prior_weight=max(
+            0.0,
+            float(runtime_config.get("birth_count_distance_prior_weight", 0.5)),
+        ),
+        birth_count_distance_strength_weight=max(
+            0.0,
+            float(runtime_config.get("birth_count_distance_strength_weight", 0.25)),
+        ),
+        birth_count_distance_log_clip=max(
+            0.0,
+            float(runtime_config.get("birth_count_distance_log_clip", 3.0)),
+        ),
+        birth_count_distance_strength_sigma=max(
+            1.0e-12,
+            float(runtime_config.get("birth_count_distance_strength_sigma", 2.0)),
+        ),
+        birth_residual_always_try=bool(
+            runtime_config.get("birth_residual_always_try", True)
+        ),
+        birth_residual_expand_structural_particles=bool(
+            runtime_config.get("birth_residual_expand_structural_particles", True)
+        ),
+        birth_residual_expanded_structural_topk_particles=(
+            None
+            if runtime_config.get(
+                "birth_residual_expanded_structural_topk_particles",
+                256,
+            )
+            is None
+            else max(
+                1,
+                int(
+                    runtime_config.get(
+                        "birth_residual_expanded_structural_topk_particles",
+                        256,
+                    )
+                ),
+            )
+        ),
+        birth_residual_acceptance_complexity_scale=float(
+            np.clip(
+                float(
+                    runtime_config.get(
+                        "birth_residual_acceptance_complexity_scale",
+                        0.0,
+                    )
+                ),
+                0.0,
+                1.0,
+            )
+        ),
+        birth_residual_suppress_death=bool(
+            runtime_config.get("birth_residual_suppress_death", True)
+        ),
+        birth_matching_pursuit_max_new_sources=max(
+            1,
+            int(runtime_config.get("birth_matching_pursuit_max_new_sources", 3)),
+        ),
+        birth_matching_pursuit_topk_candidates=max(
+            1,
+            int(runtime_config.get("birth_matching_pursuit_topk_candidates", 16)),
+        ),
         birth_jitter_topk_candidates=birth_jitter_topk_candidates,
+        residual_decomposition_enable=bool(
+            runtime_config.get("residual_decomposition_enable", True)
+        ),
+        peak_suppression_enable=bool(
+            runtime_config.get("peak_suppression_enable", True)
+        ),
+        peak_suppression_min_source_fraction=float(
+            np.clip(
+                float(runtime_config.get("peak_suppression_min_source_fraction", 0.25)),
+                0.0,
+                1.0,
+            )
+        ),
+        peak_suppression_factor=float(
+            np.clip(float(runtime_config.get("peak_suppression_factor", 1.0)), 0.0, 1.0)
+        ),
+        residual_decomposition_max_layers=max(
+            1,
+            int(runtime_config.get("residual_decomposition_max_layers", 4)),
+        ),
+        pseudo_source_verification_enable=bool(
+            runtime_config.get("pseudo_source_verification_enable", True)
+        ),
+        pseudo_source_min_delta_ll=float(
+            runtime_config.get("pseudo_source_min_delta_ll", 0.0)
+        ),
+        pseudo_source_min_distinct_views=max(
+            1,
+            int(runtime_config.get("pseudo_source_min_distinct_views", 2)),
+        ),
+        pseudo_source_fail_grace_stations=max(
+            0,
+            int(runtime_config.get("pseudo_source_fail_grace_stations", 2)),
+        ),
+        pseudo_source_corr_max=float(
+            np.clip(float(runtime_config.get("pseudo_source_corr_max", 0.995)), 0.0, 1.0)
+        ),
+        pseudo_source_quarantine_on_suppress=bool(
+            runtime_config.get("pseudo_source_quarantine_on_suppress", True)
+        ),
+        source_prune_min_distinct_stations=max(
+            1,
+            int(runtime_config.get("source_prune_min_distinct_stations", 2)),
+        ),
+        source_prune_min_distinct_views=max(
+            1,
+            int(runtime_config.get("source_prune_min_distinct_views", 2)),
+        ),
+        source_prune_fail_grace_stations=max(
+            1,
+            int(runtime_config.get("source_prune_fail_grace_stations", 2)),
+        ),
+        source_prune_delta_ll_threshold=float(
+            runtime_config.get("source_prune_delta_ll_threshold", 0.0)
+        ),
+        source_prune_refit_after_remove=bool(
+            runtime_config.get("source_prune_refit_after_remove", True)
+        ),
+        source_prune_bic_penalty_params=max(
+            0,
+            int(runtime_config.get("source_prune_bic_penalty_params", 4)),
+        ),
         weak_source_prune_min_expected_count=max(
             0.0,
             float(runtime_config.get("weak_source_prune_min_expected_count", 3.0)),
@@ -3116,6 +3506,10 @@ def run_live_pf(
         weak_source_prune_min_fraction=max(
             0.0,
             float(runtime_config.get("weak_source_prune_min_fraction", 0.001)),
+        ),
+        weak_source_prune_min_age=max(
+            0,
+            int(runtime_config.get("weak_source_prune_min_age", 0)),
         ),
         conditional_strength_refit=bool(
             runtime_config.get("conditional_strength_refit", True)
@@ -3162,6 +3556,12 @@ def run_live_pf(
             1.0e-15,
             float(runtime_config.get("report_strength_refit_eps", 1.0e-9)),
         ),
+        report_strength_refit_preserve_cardinality=bool(
+            runtime_config.get("report_strength_refit_preserve_cardinality", False)
+        ),
+        report_pre_finalize_guard=bool(
+            runtime_config.get("report_pre_finalize_guard", True)
+        ),
         orientation_k=orientation_limit_resolved,
         min_rotations_per_pose=min_rotations_resolved,
         planning_eig_samples=int(runtime_config.get("planning_eig_samples", 50)),
@@ -3177,7 +3577,9 @@ def run_live_pf(
         use_gpu=use_gpu,
         gpu_device="cuda",
         gpu_dtype="float64",
-        ig_workers=1,
+        ig_workers=_resolve_ig_workers(
+            runtime_config.get("ig_workers", python_worker_count_resolved)
+        ),
         parallel_isotope_updates=bool(
             runtime_config.get("parallel_isotope_updates", True)
         ),
@@ -3191,6 +3593,13 @@ def run_live_pf(
         converge
         or runtime_config.get("converge_enable", False)
         or adaptive_mission_stop
+    )
+    pf_conf.converge_cardinality_var_max = max(
+        0.0,
+        float(runtime_config.get("converge_cardinality_var_max", 0.05)),
+    )
+    pf_conf.converge_require_no_tentative = bool(
+        runtime_config.get("converge_require_no_tentative", True)
     )
     if pf_config_overrides:
         for key, value in pf_config_overrides.items():
@@ -3318,9 +3727,6 @@ def run_live_pf(
         background_level = float(np.median(list(background_by_isotope.values())))
         prune_live_time = float(adaptive_min_dwell_s) if adaptive_dwell else live_time
         prune_min_obs_count = max(prune_min_obs_count, background_level * prune_live_time)
-    detector_model_payload = runtime_config.get("detector_model", {})
-    if not isinstance(detector_model_payload, dict):
-        detector_model_payload = {}
     pf_detector_radius_m = float(detector_model_payload.get("crystal_radius_m", 0.0)) + float(
         detector_model_payload.get("housing_thickness_m", 0.0)
     )
@@ -3369,11 +3775,26 @@ def run_live_pf(
             obstacle_grid=obstacle_grid,
             max_particles_per_isotope=cui_split_max_particles,
         )
+        serve_cui = bool(runtime_config.get("cui_split_view_serve", True))
+        split_url = None
+        if serve_cui:
+            split_url = _ensure_cui_view_server(
+                split_viz.output_dir,
+                host=str(runtime_config.get("cui_split_view_host", "0.0.0.0")),
+                port=int(runtime_config.get("cui_split_view_port", 8877)),
+                public_host=(
+                    None
+                    if runtime_config.get("cui_split_view_public_host") is None
+                    else str(runtime_config.get("cui_split_view_public_host"))
+                ),
+            )
         print(
             "CUI split visualization enabled: "
             f"{split_viz.index_path.as_posix()} "
             "(latest_robot_2d.png, latest_pf_3d.png)"
         )
+        if split_url is not None:
+            print(f"CUI split visualization URL: {split_url}")
         return split_viz
 
     def _grid_centers() -> NDArray[np.float64]:
@@ -3485,10 +3906,23 @@ def run_live_pf(
             if pos.size == 0:
                 pos, strg = legacy_pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
                 pos, strg = _apply_display_thresholds(pos, strg, min_strength)
+            raw_pos, raw_strg = raw_estimates.get(
+                iso, (np.zeros((0, 3)), np.zeros(0))
+            )
+            raw_pos, raw_strg = _apply_display_thresholds(
+                np.asarray(raw_pos, dtype=float),
+                np.asarray(raw_strg, dtype=float),
+                min_strength,
+            )
+            filt = estimator_final.filters.get(iso)
+            unresolved_birth_residual = bool(
+                filt is not None
+                and getattr(filt, "last_birth_residual_gate_passed", False)
+                and int(getattr(filt, "last_birth_residual_support", 0)) >= PRUNE_MIN_SUPPORT
+            )
+            if unresolved_birth_residual and raw_pos.shape[0] > np.asarray(pos).shape[0]:
+                pos, strg = raw_pos, raw_strg
             if pos.size == 0:
-                raw_pos, raw_strg = raw_estimates.get(
-                    iso, (np.zeros((0, 3)), np.zeros(0))
-                )
                 if raw_strg.size:
                     best_idx = int(np.argmax(raw_strg))
                     pos = raw_pos[[best_idx]]
@@ -3630,12 +4064,17 @@ def run_live_pf(
         f"dss_beam={int(dss_config.beam_width)} "
         f"dss_program_len={int(dss_config.program_length)} "
         f"signature_w={float(dss_config.lambda_signature):.3f} "
+        f"temporal_sep_w={float(dss_config.lambda_temporal_separation):.3f} "
+        f"residual_signature_w={float(dss_config.residual_signature_weight):.3f} "
         f"differential_w={float(dss_config.eta_differential):.3f} "
         f"count_balance_w={float(dss_config.eta_count_balance):.3f} "
         f"rotation_w={float(dss_config.lambda_rotation):.3f} "
         f"coverage_w={float(dss_config.lambda_coverage):.3f} "
         f"bearing_w={float(dss_config.lambda_bearing_diversity):.3f} "
         f"frontier_w={float(dss_config.lambda_frontier):.3f} "
+        f"count_util_w={float(dss_config.lambda_count_utility):.3f} "
+        f"local_orbit_w={float(dss_config.lambda_local_orbit):.3f} "
+        f"station_cond_w={float(dss_config.lambda_station_condition):.3f} "
         f"turn_w={float(dss_config.lambda_turn_smoothness):.3f} "
         f"revisit_w={float(dss_config.eta_revisit):.3f} "
         f"min_station_sep={float(dss_config.min_station_separation_m):.2f}m "
@@ -3660,8 +4099,24 @@ def run_live_pf(
         f"candidate_support_fraction={float(pf_conf.birth_candidate_support_fraction):.2f} "
         f"refit_gate={bool(pf_conf.birth_refit_residual_gate)} "
         f"refit_min_fraction={float(pf_conf.birth_refit_residual_min_fraction):.2f} "
+        f"shield_coded={bool(pf_conf.birth_use_shield_coded_residual)} "
+        f"existing_corr_max={float(pf_conf.birth_existing_response_corr_max):.3f} "
+        f"count_distance_w={float(pf_conf.birth_count_distance_prior_weight):.2f} "
+        f"count_distance_strength_w={float(pf_conf.birth_count_distance_strength_weight):.2f} "
+        f"always_try={bool(pf_conf.birth_residual_always_try)} "
+        f"expand_particles={bool(pf_conf.birth_residual_expand_structural_particles)} "
+        f"expanded_topk={pf_conf.birth_residual_expanded_structural_topk_particles} "
+        f"residual_complexity_scale={float(pf_conf.birth_residual_acceptance_complexity_scale):.2f} "
+        f"suppress_death={bool(pf_conf.birth_residual_suppress_death)} "
+        f"mp_max_new={int(pf_conf.birth_matching_pursuit_max_new_sources)} "
+        f"mp_topk={int(pf_conf.birth_matching_pursuit_topk_candidates)} "
         f"jitter_topk={pf_conf.birth_jitter_topk_candidates} "
-        f"max_per_update={pf_conf.birth_max_per_update}"
+        f"max_per_update={pf_conf.birth_max_per_update} "
+        f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
+        f"residual_layers={bool(pf_conf.residual_decomposition_enable)} "
+        f"peak_suppression={bool(pf_conf.peak_suppression_enable)} "
+        f"pseudo_verify={bool(pf_conf.pseudo_source_verification_enable)} "
+        f"pseudo_grace={int(pf_conf.pseudo_source_fail_grace_stations)}"
     )
     print(
         "PF conditional strength refit: "
@@ -3677,7 +4132,9 @@ def run_live_pf(
         f"report_refit={bool(pf_conf.report_strength_refit)} "
         f"report_refit_iters={int(pf_conf.report_strength_refit_iters)} "
         f"weak_prune_min_counts={float(pf_conf.weak_source_prune_min_expected_count):.3f} "
-        f"weak_prune_min_fraction={float(pf_conf.weak_source_prune_min_fraction):.4f}"
+        f"weak_prune_min_fraction={float(pf_conf.weak_source_prune_min_fraction):.4f} "
+        f"weak_prune_min_age={int(pf_conf.weak_source_prune_min_age)} "
+        f"report_preserve_cardinality={bool(pf_conf.report_strength_refit_preserve_cardinality)}"
     )
     print(
         "PF shield-program update: "
@@ -3702,7 +4159,12 @@ def run_live_pf(
         f"rel={ig_threshold_rel:.6g}"
     )
     ig_workers = _resolve_ig_workers(estimator.pf_config.ig_workers)
-    print(f"IG grid workers: {ig_workers}")
+    print(
+        "Python CPU workers: "
+        f"general={python_worker_count_resolved} "
+        f"ig_grid={ig_workers} "
+        f"dss_program_eval={dss_config.program_eval_workers}"
+    )
     print(
         "Candidate grid: "
         f"spacing={spacing} margin={float(candidate_grid_margin):.2f} "
@@ -3737,6 +4199,7 @@ def run_live_pf(
         f"split_residual_always_try={bool(pf_conf.split_residual_always_try)} "
         f"birth_ll_threshold={float(pf_conf.birth_delta_ll_threshold):.3f} "
         f"birth_complexity={float(pf_conf.birth_complexity_penalty):.3f} "
+        f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
         f"split_complexity={float(pf_conf.split_complexity_penalty):.3f} "
         f"split_candidates={int(pf_conf.split_residual_candidate_count)} "
         f"merge_corr_min={float(pf_conf.merge_response_corr_min):.3f} "
@@ -3746,13 +4209,22 @@ def run_live_pf(
     print(
         "Tempering settings: "
         f"max_resamples_per_observation={pf_conf.max_resamples_per_observation} "
-        f"disable_regularize_on_temper_resample={pf_conf.disable_regularize_on_temper_resample}"
+        f"disable_regularize_on_temper_resample={pf_conf.disable_regularize_on_temper_resample} "
+        f"deferred_resample_roughening_scale={pf_conf.deferred_resample_roughening_scale:.3f}"
     )
     print(
         "Roughening settings: "
         f"k={pf_conf.roughening_k:.3f} "
         f"min_sigma_pos={pf_conf.min_sigma_pos:.3f} "
         f"max_sigma_pos={pf_conf.max_sigma_pos:.3f}"
+    )
+    print(
+        "Mode-preserving resampling: "
+        f"enabled={bool(pf_conf.mode_preserving_resample)} "
+        f"max_modes={int(pf_conf.mode_preserving_max_modes)} "
+        f"per_mode={int(pf_conf.mode_preserving_particles_per_mode)} "
+        f"radius_m={float(pf_conf.mode_preserving_radius_m):.2f} "
+        f"min_weight_fraction={float(pf_conf.mode_preserving_min_weight_fraction):.3g}"
     )
     print(
         "Planning rollout settings: "
@@ -3798,10 +4270,11 @@ def run_live_pf(
         f"{mission_stop_require_pf_convergence_for_coverage} "
         f"birth_residual_min_support={mission_stop_birth_residual_min_support}"
     )
+    has_environment_obstacles = _has_environment_obstacles(obstacle_grid)
     reset_usd_path = (
         generated_blender_usd_path.as_posix()
         if generated_blender_usd_path is not None
-        else ("" if obstacle_grid is None else None)
+        else (None if has_environment_obstacles else "")
     )
     simulation_runtime.reset(
         {
@@ -3841,8 +4314,8 @@ def run_live_pf(
             else traversability_map_png_path.as_posix(),
             "robot_radius_m": float(robot_radius_m),
             "author_obstacle_prims": generated_blender_usd_path is None,
-            "use_config_usd_fallback": not (
-                generated_blender_usd_path is None and obstacle_grid is None
+            "use_config_usd_fallback": bool(
+                generated_blender_usd_path is not None or has_environment_obstacles
             ),
         }
     )
@@ -3880,6 +4353,9 @@ def run_live_pf(
             "candidate_grid_points": int(grid.shape[0]),
             "pf_num_particles": int(pf_conf.num_particles),
             "pf_max_sources": int(pf_conf.max_sources),
+            "python_worker_count": int(python_worker_count_resolved),
+            "ig_workers": int(ig_workers),
+            "dss_program_eval_workers": int(dss_config.program_eval_workers or 1),
             "robot_speed_m_s": float(nominal_motion_speed_m_s),
             "rotation_overhead_s": float(rotation_overhead_s),
             "measurement_time_s": float(live_time),
@@ -3937,9 +4413,21 @@ def run_live_pf(
             "dss_beam_width": int(dss_config.beam_width),
             "dss_program_length": int(dss_config.program_length),
             "dss_signature_weight": float(dss_config.lambda_signature),
+            "dss_temporal_separation_weight": float(
+                dss_config.lambda_temporal_separation
+            ),
+            "dss_temporal_cover_programs": int(dss_config.temporal_cover_programs),
             "dss_differential_weight": float(dss_config.eta_differential),
             "dss_rotation_weight": float(dss_config.lambda_rotation),
             "dss_coverage_weight": float(dss_config.lambda_coverage),
+            "dss_count_utility_weight": float(dss_config.lambda_count_utility),
+            "dss_count_utility_saturation_counts": float(
+                dss_config.count_utility_saturation_counts
+            ),
+            "dss_local_orbit_weight": float(dss_config.lambda_local_orbit),
+            "dss_station_condition_weight": float(
+                dss_config.lambda_station_condition
+            ),
             "dss_revisit_penalty_weight": float(dss_config.eta_revisit),
             "dss_min_station_separation_m": float(
                 dss_config.min_station_separation_m
@@ -3965,6 +4453,8 @@ def run_live_pf(
                 )
             remaining_orientations = set(range(total_pairs))
             rotation_limit = max(1, int(estimator.pf_config.orientation_k))
+            if strict_planned_shield_program and active_shield_program:
+                rotation_limit = max(rotation_limit, len(active_shield_program))
             joint_update_records: list[
                 tuple[dict[str, float], int, int, float, dict[str, float] | None]
             ] = []
@@ -4666,6 +5156,28 @@ def run_live_pf(
             planned_program_for_next: tuple[int, ...] | None = None
             dss_diagnostics: dict[str, float | int | str] | None = None
             if path_planner_resolved == "dss_pp":
+                dss_selection_config = dss_config
+                residual_burst_active = _has_birth_residual_evidence(
+                    estimator,
+                    min_support=max(
+                        1,
+                        int(estimator.pf_config.birth_residual_min_support),
+                    ),
+                )
+                if (
+                    residual_burst_active
+                    and dss_residual_program_length_resolved
+                    > int(dss_config.program_length)
+                ):
+                    dss_selection_config = replace(
+                        dss_config,
+                        program_length=int(dss_residual_program_length_resolved),
+                    )
+                    print(
+                        "DSS-PP residual separation burst: "
+                        f"program_length={int(dss_selection_config.program_length)} "
+                        f"(base={int(dss_config.program_length)})"
+                    )
                 dss_start = time.perf_counter()
                 dss_result = select_dss_pp_next_station(
                     estimator=estimator,
@@ -4675,7 +5187,7 @@ def run_live_pf(
                     visited_poses_xyz=visited_arr,
                     map_api=planning_map,
                     bounds_xyz=(bounds_lo, bounds_hi),
-                    config=dss_config,
+                    config=dss_selection_config,
                 )
                 dss_elapsed = time.perf_counter() - dss_start
                 next_pose = dss_result.next_pose
@@ -4690,13 +5202,18 @@ def run_live_pf(
                     f"pairs={list(planned_program_for_next)} "
                     f"score={float(dss_result.score):.6g} "
                     f"signature={float(dss_result.sequence[0].signature_score):.6g} "
+                    f"temporal_sep={float(dss_result.sequence[0].temporal_separation_score):.6g} "
                     f"obs_penalty={float(dss_result.sequence[0].observation_penalty):.6g} "
                     f"diff_penalty={float(dss_result.sequence[0].differential_penalty):.6g} "
+                    f"count_util={float(dss_result.sequence[0].count_utility):.6g} "
                     f"coverage_gain={float(dss_result.sequence[0].coverage_gain):.6g} "
                     f"revisit_penalty={float(dss_result.sequence[0].revisit_penalty):.6g} "
                     f"bearing_gain={float(dss_result.sequence[0].bearing_diversity_gain):.6g} "
                     f"frontier_gain={float(dss_result.sequence[0].frontier_gain):.6g} "
+                    f"local_orbit={float(dss_result.sequence[0].local_orbit_gain):.6g} "
+                    f"station_cond={float(dss_result.sequence[0].station_condition_gain):.6g} "
                     f"turn_penalty={float(dss_result.sequence[0].turn_penalty):.6g} "
+                    f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
                     f"compute={dss_elapsed:.3f}s"
                 )
             else:
@@ -4760,16 +5277,19 @@ def run_live_pf(
 
     # Save final snapshots
     result_paths: dict[str, str] = {}
+    summary_out_path: Path | None = None
     if save_outputs:
         pf_out_path = RESULTS_DIR / f"result_pf{output_suffix}.png"
         spectrum_out_path = RESULTS_DIR / f"result_spectrum{output_suffix}.png"
         last_spectrum_out_path = RESULTS_DIR / f"result_spectrum_last{output_suffix}.png"
         estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
+        summary_out_path = RESULTS_DIR / f"result_summary{output_suffix}.json"
         result_paths = {
             "pf_plot": pf_out_path.as_posix(),
             "estimates_plot": estimates_out_path.as_posix(),
             "spectrum_plot": spectrum_out_path.as_posix(),
             "last_spectrum_plot": last_spectrum_out_path.as_posix(),
+            "summary_json": summary_out_path.as_posix(),
         }
         if cui_split_viz is not None:
             result_paths.update(
@@ -4983,6 +5503,28 @@ def run_live_pf(
         match_radius_m=eval_match_radius_m,
     )
     print_metrics_report(metrics)
+    final_payload = {
+        "measurements_completed": int(step_counter),
+        "mission_metrics": {
+            key: value
+            for key, value in mission_metrics.items()
+            if key != "path_segments"
+        },
+        "match_metrics": metrics,
+        "estimated_sources": est_by_iso,
+        "ground_truth_sources": gt_by_iso,
+        "last_counts": last_counts,
+        "output_paths": result_paths,
+        "backend": sim_backend,
+        "sim_config_path": sim_config_path,
+        "environment_mode": normalized_environment_mode,
+    }
+    setattr(estimator, "final_run_summary", final_payload)
+    if save_outputs and summary_out_path is not None:
+        summary_out_path.write_text(
+            json.dumps(final_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     notifier.notify_finished(
         {
             "summary": (
@@ -4990,20 +5532,7 @@ def run_live_pf(
                 f"mission_time_s={total_mission_time_s:.1f}, "
                 f"wall_clock_s={wall_clock_runtime_s:.2f}"
             ),
-            "measurements_completed": int(step_counter),
-            "mission_metrics": {
-                key: value
-                for key, value in mission_metrics.items()
-                if key != "path_segments"
-            },
-            "match_metrics": metrics,
-            "estimated_sources": est_by_iso,
-            "ground_truth_sources": gt_by_iso,
-            "last_counts": last_counts,
-            "output_paths": result_paths,
-            "backend": sim_backend,
-            "sim_config_path": sim_config_path,
-            "environment_mode": normalized_environment_mode,
+            **final_payload,
         }
     )
     if live:

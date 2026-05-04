@@ -1,0 +1,14 @@
+[sweep-v10] case 01 start 2026-05-01 18:16:16
+[sweep-v10] case 01 done 2026-05-01 18:29:28
+Total measurements: 24, live=580.0s, travel=184.9s, shield=12.0s, mission=776.9s
+Mission timing summary: distance=92.45m motion=184.9s rotation=12.0s end_to_end=776.9s compute=194.693s ig_mean=2.055s pf_mean=0.812s wall_clock=780.30s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=10.75, median=10.75, rmse=10.75, max=10.75
+  Intensity rel error [%]: mean=97.79, median=97.79, max=97.79
+  GT=2, EST=2, Assigned=2, TP=2, FP=0, FN=0
+  Position error [m]: mean=2.941, median=2.941, rmse=3.364, max=4.574
+  Intensity rel error [%]: mean=89.72, median=89.72, max=124.7
+  GT=1, EST=0, Assigned=0, TP=0, FP=0, FN=1
+  Position error [m]: mean=n/a, median=n/a, rmse=n/a, max=n/a
+  Intensity rel error [%]: mean=n/a, median=n/a, max=n/a
+[sweep-v10] case 02 start 2026-05-01 18:29:28

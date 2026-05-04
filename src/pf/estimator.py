@@ -87,6 +87,7 @@ class RotatingShieldPFConfig:
         - birth_max_per_update: cap accepted birth proposals per structural update
         - birth_delta_ll_threshold: likelihood-gain floor for accepting birth
         - birth_complexity_penalty: extra model-complexity penalty for birth
+        - birth_bic_penalty_params: source parameter count for BIC birth penalty
         - birth_residual_clip_quantile: clip residuals at this quantile
         - birth_residual_gate_p_value: chi-square p-value for residual birth evidence
         - birth_residual_min_support: minimum independent residual-supported measurements
@@ -95,12 +96,38 @@ class RotatingShieldPFConfig:
         - birth_candidate_support_fraction: per-candidate residual overlap floor
         - birth_refit_residual_gate: require residuals to survive fixed-position strength refit
         - birth_refit_residual_min_fraction: residual fraction retained after refit for birth
+        - birth_use_shield_coded_residual: rank birth candidates by full shield-coded residual response
+        - birth_existing_response_corr_max: reject birth candidates collinear with existing responses
+        - birth_count_distance_prior_weight: soft proposal weight for high unit-response candidates
+        - birth_count_distance_strength_weight: soft penalty for candidates needing high fitted strength
+        - birth_count_distance_log_clip: robust log-ratio clip for count-distance proposal terms
+        - birth_count_distance_strength_sigma: log-strength scale for the high-strength penalty
+        - birth_residual_always_try: try residual birth when the statistical gate passes
+        - birth_residual_expand_structural_particles: expand residual birth proposals beyond normal top-k
+        - birth_residual_expanded_structural_topk_particles: cap residual-gated structural proposals
+        - birth_residual_acceptance_complexity_scale: scale complexity penalty after residual gate
+        - birth_residual_suppress_death: delay death while positive residual birth evidence remains
+        - birth_matching_pursuit_max_new_sources: max sequential residual births per particle
+        - birth_matching_pursuit_topk_candidates: candidates evaluated per matching-pursuit birth
         - birth_jitter_topk_candidates: base residual-supported candidates jittered for birth
+        - residual_decomposition_enable: enable raw/peak-suppressed residual layers
+        - peak_suppression_enable: use strong-source leave-one-out residual layers
+        - peak_suppression_min_source_fraction: source fraction defining suppressible peaks
+        - peak_suppression_factor: fraction of a strong source contribution added back
+        - residual_decomposition_max_layers: max residual layers used for birth proposals
+        - pseudo_source_verification_enable: verify tentative birth sources before pruning
+        - pseudo_source_min_delta_ll: leave-one-out ΔLL floor for confirming sources
+        - pseudo_source_min_distinct_views: distinct shield views needed to confirm sources
+        - pseudo_source_fail_grace_stations: failed verifications before pruning tentative sources
+        - pseudo_source_corr_max: response-correlation ceiling against stronger sources
+        - source_prune_refit_after_remove: refit remaining strengths before pruning
+        - source_prune_bic_penalty_params: source parameter count for BIC prune gain
         - refit_after_moves: refit strengths after birth/kill/split/merge
         - refit_iters: iterations for strength refit
         - refit_eps: epsilon for refit stability
         - weak_source_prune_min_expected_count: prune floor-strength sources below this support
         - weak_source_prune_min_fraction: prune floor-strength sources below this source fraction
+        - weak_source_prune_min_age: source age before weak-source pruning is allowed
         - conditional_strength_refit: refit strengths at station finalization
         - conditional_strength_refit_window: recent measurements used for strength refit
         - conditional_strength_refit_iters: iterations for conditional strength refit
@@ -113,6 +140,7 @@ class RotatingShieldPFConfig:
         - report_strength_refit: refit reported strengths conditioned on reported positions
         - report_strength_refit_iters: multiplicative Poisson regression iterations
         - report_strength_refit_eps: numerical floor for reported-strength regression
+        - report_strength_refit_preserve_cardinality: keep posterior clusters during report refit
         - min_age_to_split: minimum age before split proposals
         - use_clustered_output: use clustered estimate when birth is enabled
         - cluster_eps_m: clustering radius in meters
@@ -166,6 +194,12 @@ class RotatingShieldPFConfig:
         - temper_resample_cooldown_steps: substeps to skip resampling after resample
         - temper_resample_force_ratio: ESS/N ratio forcing resample despite cooldown
         - disable_regularize_on_temper_resample: skip roughening on temper resamples
+        - deferred_resample_roughening_scale: roughening scale during station-burst resampling
+        - mode_preserving_resample: keep distinct source modes during resampling
+        - mode_preserving_max_modes: max spatial source modes protected per resample
+        - mode_preserving_particles_per_mode: particles retained per protected mode
+        - mode_preserving_radius_m: spatial clustering radius for protected source modes
+        - mode_preserving_min_weight_fraction: minimum mode support fraction to protect
         - adapt_cooldown_steps: block particle-count shrink steps after resampling
         - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
         - planning_eig_samples: Monte-Carlo samples for EIG inside planning rollouts
@@ -240,6 +274,7 @@ class RotatingShieldPFConfig:
     birth_max_per_update: int | None = None
     birth_delta_ll_threshold: float = 0.0
     birth_complexity_penalty: float = 0.0
+    birth_bic_penalty_params: int = 4
     structural_update_min_counts: float = 0.0
     birth_min_distinct_poses: int = 1
     birth_residual_clip_quantile: float = 0.95
@@ -250,12 +285,43 @@ class RotatingShieldPFConfig:
     birth_candidate_support_fraction: float = 0.05
     birth_refit_residual_gate: bool = True
     birth_refit_residual_min_fraction: float = 0.5
+    birth_use_shield_coded_residual: bool = True
+    birth_existing_response_corr_max: float = 1.0
+    birth_count_distance_prior_weight: float = 0.5
+    birth_count_distance_strength_weight: float = 0.25
+    birth_count_distance_log_clip: float = 3.0
+    birth_count_distance_strength_sigma: float = 2.0
+    birth_residual_always_try: bool = True
+    birth_residual_expand_structural_particles: bool = True
+    birth_residual_expanded_structural_topk_particles: int | None = 256
+    birth_residual_acceptance_complexity_scale: float = 0.0
+    birth_residual_suppress_death: bool = True
+    birth_matching_pursuit_max_new_sources: int = 3
+    birth_matching_pursuit_topk_candidates: int = 16
     birth_jitter_topk_candidates: int | None = 512
+    residual_decomposition_enable: bool = True
+    peak_suppression_enable: bool = True
+    peak_suppression_min_source_fraction: float = 0.25
+    peak_suppression_factor: float = 1.0
+    residual_decomposition_max_layers: int = 4
+    pseudo_source_verification_enable: bool = True
+    pseudo_source_min_delta_ll: float = 0.0
+    pseudo_source_min_distinct_views: int = 2
+    pseudo_source_fail_grace_stations: int = 2
+    pseudo_source_corr_max: float = 0.995
+    pseudo_source_quarantine_on_suppress: bool = True
+    source_prune_min_distinct_stations: int = 2
+    source_prune_min_distinct_views: int = 2
+    source_prune_fail_grace_stations: int = 2
+    source_prune_delta_ll_threshold: float = 0.0
+    source_prune_refit_after_remove: bool = True
+    source_prune_bic_penalty_params: int = 4
     refit_after_moves: bool = True
     refit_iters: int = 3
     refit_eps: float = 1e-12
     weak_source_prune_min_expected_count: float = 0.0
     weak_source_prune_min_fraction: float = 0.0
+    weak_source_prune_min_age: int = 0
     conditional_strength_refit: bool = True
     conditional_strength_refit_window: int = 10
     conditional_strength_refit_iters: int = 3
@@ -268,6 +334,8 @@ class RotatingShieldPFConfig:
     report_strength_refit: bool = False
     report_strength_refit_iters: int = 64
     report_strength_refit_eps: float = 1.0e-9
+    report_strength_refit_preserve_cardinality: bool = False
+    report_pre_finalize_guard: bool = True
     min_age_to_split: int = 5
     use_clustered_output: bool = True
     cluster_eps_m: float = 0.8
@@ -302,6 +370,12 @@ class RotatingShieldPFConfig:
     temper_resample_cooldown_steps: int = 2
     temper_resample_force_ratio: float = 0.1
     disable_regularize_on_temper_resample: bool = False
+    deferred_resample_roughening_scale: float = 0.15
+    mode_preserving_resample: bool = True
+    mode_preserving_max_modes: int = 6
+    mode_preserving_particles_per_mode: int = 3
+    mode_preserving_radius_m: float = 1.5
+    mode_preserving_min_weight_fraction: float = 1e-4
     adapt_cooldown_steps: int = 0
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
@@ -361,6 +435,8 @@ class RotatingShieldPFConfig:
     converge_ll_improve_eps: float = 1e5
     converge_min_steps: int = 30
     converge_require_all: bool = True
+    converge_cardinality_var_max: float = 0.05
+    converge_require_no_tentative: bool = True
 
     def __post_init__(self) -> None:
         if self.min_particles is None:
@@ -440,11 +516,117 @@ class RotatingShieldPFConfig:
             0.0,
             float(self.birth_refit_residual_min_fraction),
         )
+        self.birth_existing_response_corr_max = float(
+            np.clip(float(self.birth_existing_response_corr_max), 0.0, 1.0)
+        )
+        self.birth_count_distance_prior_weight = max(
+            0.0,
+            float(self.birth_count_distance_prior_weight),
+        )
+        self.birth_count_distance_strength_weight = max(
+            0.0,
+            float(self.birth_count_distance_strength_weight),
+        )
+        self.birth_count_distance_log_clip = max(
+            0.0,
+            float(self.birth_count_distance_log_clip),
+        )
+        self.birth_count_distance_strength_sigma = max(
+            1.0e-12,
+            float(self.birth_count_distance_strength_sigma),
+        )
+        self.birth_matching_pursuit_max_new_sources = max(
+            1,
+            int(self.birth_matching_pursuit_max_new_sources),
+        )
+        self.birth_matching_pursuit_topk_candidates = max(
+            1,
+            int(self.birth_matching_pursuit_topk_candidates),
+        )
+        if self.birth_residual_expanded_structural_topk_particles is not None:
+            expanded_topk = int(self.birth_residual_expanded_structural_topk_particles)
+            self.birth_residual_expanded_structural_topk_particles = (
+                None if expanded_topk <= 0 else expanded_topk
+            )
+        self.mode_preserving_max_modes = max(
+            0,
+            int(self.mode_preserving_max_modes),
+        )
+        self.deferred_resample_roughening_scale = max(
+            0.0,
+            float(self.deferred_resample_roughening_scale),
+        )
+        self.mode_preserving_particles_per_mode = max(
+            0,
+            int(self.mode_preserving_particles_per_mode),
+        )
+        self.mode_preserving_radius_m = max(
+            1.0e-6,
+            float(self.mode_preserving_radius_m),
+        )
+        self.mode_preserving_min_weight_fraction = max(
+            0.0,
+            float(self.mode_preserving_min_weight_fraction),
+        )
+        if bool(self.birth_enable) and self.max_sources is not None and int(self.max_sources) > 1:
+            self.use_clustered_output = True
         if self.birth_jitter_topk_candidates is not None:
             self.birth_jitter_topk_candidates = max(
                 1,
                 int(self.birth_jitter_topk_candidates),
             )
+        self.residual_decomposition_enable = bool(self.residual_decomposition_enable)
+        self.peak_suppression_enable = bool(self.peak_suppression_enable)
+        self.peak_suppression_min_source_fraction = float(
+            np.clip(float(self.peak_suppression_min_source_fraction), 0.0, 1.0)
+        )
+        self.peak_suppression_factor = float(
+            np.clip(float(self.peak_suppression_factor), 0.0, 1.0)
+        )
+        self.residual_decomposition_max_layers = max(
+            1,
+            int(self.residual_decomposition_max_layers),
+        )
+        self.pseudo_source_verification_enable = bool(
+            self.pseudo_source_verification_enable
+        )
+        self.pseudo_source_min_delta_ll = float(self.pseudo_source_min_delta_ll)
+        self.pseudo_source_min_distinct_views = max(
+            1,
+            int(self.pseudo_source_min_distinct_views),
+        )
+        self.pseudo_source_fail_grace_stations = max(
+            0,
+            int(self.pseudo_source_fail_grace_stations),
+        )
+        self.pseudo_source_corr_max = float(
+            np.clip(float(self.pseudo_source_corr_max), 0.0, 1.0)
+        )
+        self.pseudo_source_quarantine_on_suppress = bool(
+            self.pseudo_source_quarantine_on_suppress
+        )
+        self.source_prune_min_distinct_stations = max(
+            1,
+            int(self.source_prune_min_distinct_stations),
+        )
+        self.source_prune_min_distinct_views = max(
+            1,
+            int(self.source_prune_min_distinct_views),
+        )
+        self.source_prune_fail_grace_stations = max(
+            1,
+            int(self.source_prune_fail_grace_stations),
+        )
+        self.source_prune_delta_ll_threshold = float(
+            self.source_prune_delta_ll_threshold
+        )
+        self.source_prune_refit_after_remove = bool(
+            self.source_prune_refit_after_remove
+        )
+        self.source_prune_bic_penalty_params = max(
+            0,
+            int(self.source_prune_bic_penalty_params),
+        )
         self.weak_source_prune_min_expected_count = max(
             0.0,
             float(self.weak_source_prune_min_expected_count),
@@ -453,10 +635,24 @@ class RotatingShieldPFConfig:
             0.0,
             float(self.weak_source_prune_min_fraction),
         )
+        self.weak_source_prune_min_age = max(0, int(self.weak_source_prune_min_age))
+        self.birth_residual_always_try = bool(self.birth_residual_always_try)
+        self.birth_residual_expand_structural_particles = bool(
+            self.birth_residual_expand_structural_particles
+        )
+        self.birth_residual_acceptance_complexity_scale = float(
+            np.clip(
+                float(self.birth_residual_acceptance_complexity_scale),
+                0.0,
+                1.0,
+            )
+        )
+        self.birth_residual_suppress_death = bool(self.birth_residual_suppress_death)
         if self.birth_max_per_update is not None:
             self.birth_max_per_update = max(0, int(self.birth_max_per_update))
         self.birth_delta_ll_threshold = float(self.birth_delta_ll_threshold)
         self.birth_complexity_penalty = max(0.0, float(self.birth_complexity_penalty))
+        self.birth_bic_penalty_params = max(0, int(self.birth_bic_penalty_params))
         self.conditional_strength_refit_window = max(
             1,
             int(self.conditional_strength_refit_window),
@@ -490,6 +686,15 @@ class RotatingShieldPFConfig:
             1.0e-15,
             float(self.report_strength_refit_eps),
         )
+        self.report_strength_refit_preserve_cardinality = bool(
+            self.report_strength_refit_preserve_cardinality
+        )
+        self.report_pre_finalize_guard = bool(self.report_pre_finalize_guard)
+        self.converge_cardinality_var_max = max(
+            0.0,
+            float(self.converge_cardinality_var_max),
+        )
+        self.converge_require_no_tentative = bool(self.converge_require_no_tentative)
         self.split_residual_guided = bool(self.split_residual_guided)
         self.split_complexity_penalty = max(0.0, float(self.split_complexity_penalty))
         self.split_residual_always_try = bool(self.split_residual_always_try)
@@ -571,6 +776,10 @@ class RotatingShieldPFEstimator:
         self._defer_resample_birth = False
         self._deferred_measurement_count = 0
         self._previous_deferred_measurement_count = 0
+        self._pre_finalize_guard_estimates: Dict[
+            str,
+            Tuple[NDArray[np.float64], NDArray[np.float64]],
+        ] = {}
 
     def _resolve_mu_by_isotope(self, mu_by_isotope: Dict[str, object] | None) -> Dict[str, object]:
         """
@@ -707,6 +916,7 @@ class RotatingShieldPFEstimator:
             birth_max_per_update=self.pf_config.birth_max_per_update,
             birth_delta_ll_threshold=self.pf_config.birth_delta_ll_threshold,
             birth_complexity_penalty=self.pf_config.birth_complexity_penalty,
+            birth_bic_penalty_params=self.pf_config.birth_bic_penalty_params,
             structural_update_min_counts=self.pf_config.structural_update_min_counts,
             birth_min_distinct_poses=self.pf_config.birth_min_distinct_poses,
             birth_residual_clip_quantile=self.pf_config.birth_residual_clip_quantile,
@@ -717,12 +927,85 @@ class RotatingShieldPFEstimator:
             birth_candidate_support_fraction=self.pf_config.birth_candidate_support_fraction,
             birth_refit_residual_gate=self.pf_config.birth_refit_residual_gate,
             birth_refit_residual_min_fraction=self.pf_config.birth_refit_residual_min_fraction,
+            birth_use_shield_coded_residual=self.pf_config.birth_use_shield_coded_residual,
+            birth_existing_response_corr_max=self.pf_config.birth_existing_response_corr_max,
+            birth_count_distance_prior_weight=(
+                self.pf_config.birth_count_distance_prior_weight
+            ),
+            birth_count_distance_strength_weight=(
+                self.pf_config.birth_count_distance_strength_weight
+            ),
+            birth_count_distance_log_clip=self.pf_config.birth_count_distance_log_clip,
+            birth_count_distance_strength_sigma=(
+                self.pf_config.birth_count_distance_strength_sigma
+            ),
+            birth_residual_always_try=self.pf_config.birth_residual_always_try,
+            birth_residual_expand_structural_particles=(
+                self.pf_config.birth_residual_expand_structural_particles
+            ),
+            birth_residual_expanded_structural_topk_particles=(
+                self.pf_config.birth_residual_expanded_structural_topk_particles
+            ),
+            birth_residual_acceptance_complexity_scale=(
+                self.pf_config.birth_residual_acceptance_complexity_scale
+            ),
+            birth_residual_suppress_death=self.pf_config.birth_residual_suppress_death,
+            birth_matching_pursuit_max_new_sources=(
+                self.pf_config.birth_matching_pursuit_max_new_sources
+            ),
+            birth_matching_pursuit_topk_candidates=(
+                self.pf_config.birth_matching_pursuit_topk_candidates
+            ),
             birth_jitter_topk_candidates=self.pf_config.birth_jitter_topk_candidates,
+            residual_decomposition_enable=(
+                self.pf_config.residual_decomposition_enable
+            ),
+            peak_suppression_enable=self.pf_config.peak_suppression_enable,
+            peak_suppression_min_source_fraction=(
+                self.pf_config.peak_suppression_min_source_fraction
+            ),
+            peak_suppression_factor=self.pf_config.peak_suppression_factor,
+            residual_decomposition_max_layers=(
+                self.pf_config.residual_decomposition_max_layers
+            ),
+            pseudo_source_verification_enable=(
+                self.pf_config.pseudo_source_verification_enable
+            ),
+            pseudo_source_min_delta_ll=self.pf_config.pseudo_source_min_delta_ll,
+            pseudo_source_min_distinct_views=(
+                self.pf_config.pseudo_source_min_distinct_views
+            ),
+            pseudo_source_fail_grace_stations=(
+                self.pf_config.pseudo_source_fail_grace_stations
+            ),
+            pseudo_source_corr_max=self.pf_config.pseudo_source_corr_max,
+            pseudo_source_quarantine_on_suppress=(
+                self.pf_config.pseudo_source_quarantine_on_suppress
+            ),
+            source_prune_min_distinct_stations=(
+                self.pf_config.source_prune_min_distinct_stations
+            ),
+            source_prune_min_distinct_views=(
+                self.pf_config.source_prune_min_distinct_views
+            ),
+            source_prune_fail_grace_stations=(
+                self.pf_config.source_prune_fail_grace_stations
+            ),
+            source_prune_delta_ll_threshold=(
+                self.pf_config.source_prune_delta_ll_threshold
+            ),
+            source_prune_refit_after_remove=(
+                self.pf_config.source_prune_refit_after_remove
+            ),
+            source_prune_bic_penalty_params=(
+                self.pf_config.source_prune_bic_penalty_params
+            ),
             refit_after_moves=self.pf_config.refit_after_moves,
             refit_iters=self.pf_config.refit_iters,
             refit_eps=self.pf_config.refit_eps,
             weak_source_prune_min_expected_count=self.pf_config.weak_source_prune_min_expected_count,
             weak_source_prune_min_fraction=self.pf_config.weak_source_prune_min_fraction,
+            weak_source_prune_min_age=self.pf_config.weak_source_prune_min_age,
             conditional_strength_refit=self.pf_config.conditional_strength_refit,
             conditional_strength_refit_window=self.pf_config.conditional_strength_refit_window,
             conditional_strength_refit_iters=self.pf_config.conditional_strength_refit_iters,
@@ -761,6 +1044,18 @@ class RotatingShieldPFEstimator:
             temper_resample_cooldown_steps=self.pf_config.temper_resample_cooldown_steps,
             temper_resample_force_ratio=self.pf_config.temper_resample_force_ratio,
             disable_regularize_on_temper_resample=self.pf_config.disable_regularize_on_temper_resample,
+            deferred_resample_roughening_scale=(
+                self.pf_config.deferred_resample_roughening_scale
+            ),
+            mode_preserving_resample=self.pf_config.mode_preserving_resample,
+            mode_preserving_max_modes=self.pf_config.mode_preserving_max_modes,
+            mode_preserving_particles_per_mode=(
+                self.pf_config.mode_preserving_particles_per_mode
+            ),
+            mode_preserving_radius_m=self.pf_config.mode_preserving_radius_m,
+            mode_preserving_min_weight_fraction=(
+                self.pf_config.mode_preserving_min_weight_fraction
+            ),
             adapt_cooldown_steps=self.pf_config.adapt_cooldown_steps,
             position_min=self.pf_config.position_min,
             position_max=self.pf_config.position_max,
@@ -793,6 +1088,8 @@ class RotatingShieldPFEstimator:
             converge_ll_improve_eps=self.pf_config.converge_ll_improve_eps,
             converge_min_steps=self.pf_config.converge_min_steps,
             converge_require_all=self.pf_config.converge_require_all,
+            converge_cardinality_var_max=self.pf_config.converge_cardinality_var_max,
+            converge_require_no_tentative=self.pf_config.converge_require_no_tentative,
         )
 
     def _gpu_enabled(self) -> bool:
@@ -804,6 +1101,12 @@ class RotatingShieldPFEstimator:
         if not gpu_utils.torch_available():
             raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
         return True
+
+    def _can_use_gpu(self) -> bool:
+        """Return whether CUDA-backed estimator math is available."""
+        from pf import gpu_utils
+
+        return bool(self.pf_config.use_gpu and gpu_utils.torch_available())
 
     def response_scale_for_isotope(self, isotope: str) -> float:
         """Return the configured source response scale for one isotope."""
@@ -958,6 +1261,9 @@ class RotatingShieldPFEstimator:
         return ContinuousKernel(
             mu_by_isotope=self.mu_by_isotope,
             shield_params=self.shield_params,
+            use_gpu=bool(self.pf_config.use_gpu),
+            gpu_device=str(self.pf_config.gpu_device),
+            gpu_dtype=str(self.pf_config.gpu_dtype),
             obstacle_grid=self.obstacle_grid,
             obstacle_height_m=self.obstacle_height_m,
             obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
@@ -1310,7 +1616,10 @@ class RotatingShieldPFEstimator:
             weights = weights / total
             n_particles = len(weights)
             if max_particles is None or max_particles <= 0 or max_particles >= n_particles:
-                states = [p.state for p in filt.continuous_particles]
+                states = [
+                    filt.state_without_quarantined_sources(p.state)
+                    for p in filt.continuous_particles
+                ]
                 subsets[iso] = (states, weights)
                 continue
             if method == "top_weight":
@@ -1322,7 +1631,10 @@ class RotatingShieldPFEstimator:
                 sel_weights = np.ones(max_particles, dtype=float) / max_particles
             else:
                 raise ValueError(f"Unknown planning particle selection method: {method}")
-            states = [filt.continuous_particles[i].state for i in idx]
+            states = [
+                filt.state_without_quarantined_sources(filt.continuous_particles[i].state)
+                for i in idx
+            ]
             subsets[iso] = (states, sel_weights)
         return subsets
 
@@ -1510,7 +1822,7 @@ class RotatingShieldPFEstimator:
             self._apply_birth_death()
 
     def begin_deferred_pose_update(self) -> None:
-        """Start a station-level update that delays resampling and birth/death."""
+        """Start a station-level update that delays only structural moves."""
         self._defer_resample_birth = True
         self._deferred_measurement_count = 0
 
@@ -1519,14 +1831,16 @@ class RotatingShieldPFEstimator:
         Finish a station-level delayed update and return finalized measurements.
 
         During a delayed update, each shield posture updates particle weights
-        immediately. This method then performs the station-level resampling,
-        particle adaptation, label alignment, and residual-gated birth/death once.
+        immediately and may resample on ESS. This method then performs
+        station-level adaptation, label alignment, and residual-gated
+        birth/death once.
         """
         count = int(self._deferred_measurement_count)
         self._defer_resample_birth = False
         self._deferred_measurement_count = 0
         if count <= 0:
             return 0
+        pre_finalize_estimates = self.estimates(use_pre_finalize_guard=False)
         for filt in self.filters.values():
             filt.finalize_deferred_update()
         birth_context_count = count + max(
@@ -1534,6 +1848,11 @@ class RotatingShieldPFEstimator:
             int(self._previous_deferred_measurement_count),
         )
         self._apply_birth_death(birth_window_override=birth_context_count)
+        post_finalize_estimates = self.estimates(use_pre_finalize_guard=False)
+        self._update_pre_finalize_guard(
+            pre_finalize_estimates,
+            post_finalize_estimates,
+        )
         self._previous_deferred_measurement_count = count
         self.history_estimates.append(self.estimates())
         return count
@@ -1853,10 +2172,19 @@ class RotatingShieldPFEstimator:
         support_floor = max(float(self.pf_config.min_strength), 0.0) * (
             1.0 + 1.0e-6
         )
-        keep = observable & (q > support_floor)
+        preserve_cardinality = bool(self.pf_config.report_strength_refit_preserve_cardinality)
+        if preserve_cardinality:
+            original_supported = np.asarray(str_arr, dtype=float) > support_floor
+            keep = observable & (original_supported | (q > support_floor))
+            q_report = q.copy()
+            collapsed = keep & (q_report <= support_floor) & original_supported
+            q_report[collapsed] = np.asarray(str_arr, dtype=float)[collapsed]
+        else:
+            keep = observable & (q > support_floor)
+            q_report = q
         if not np.any(keep):
             return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
-        return pos_arr[keep], q[keep]
+        return pos_arr[keep], q_report[keep]
 
     def _run_isotope_structural_update(
         self,
@@ -1929,7 +2257,50 @@ class RotatingShieldPFEstimator:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             list(executor.map(self._run_isotope_structural_update, tasks))
 
-    def estimates(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    def _update_pre_finalize_guard(
+        self,
+        pre_finalize: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]],
+        post_finalize: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]],
+    ) -> None:
+        """
+        Preserve reporting candidates if station finalization collapses them.
+
+        The guard is non-destructive: it only affects reported estimates.  PF
+        particles remain governed by their likelihoods, but the final report can
+        compare pre/post finalize posterior modes and avoid losing a
+        multi-source hypothesis solely due to a late resample/refit/prune step.
+        """
+        if not bool(self.pf_config.report_pre_finalize_guard):
+            self._pre_finalize_guard_estimates.clear()
+            return
+        max_sources = self.pf_config.max_sources
+        for isotope in self.isotopes:
+            pre_pos, pre_q = pre_finalize.get(
+                isotope,
+                (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+            )
+            post_pos, _ = post_finalize.get(
+                isotope,
+                (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+            )
+            pre_count = int(np.asarray(pre_pos).shape[0])
+            post_count = int(np.asarray(post_pos).shape[0])
+            if max_sources is not None and pre_count > int(max_sources):
+                self._pre_finalize_guard_estimates.pop(isotope, None)
+                continue
+            if pre_count > post_count and pre_count > 0:
+                self._pre_finalize_guard_estimates[isotope] = (
+                    np.asarray(pre_pos, dtype=float).copy(),
+                    np.asarray(pre_q, dtype=float).copy(),
+                )
+            elif post_count >= pre_count:
+                self._pre_finalize_guard_estimates.pop(isotope, None)
+
+    def estimates(
+        self,
+        *,
+        use_pre_finalize_guard: bool = True,
+    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Return per-isotope position/strength estimates for reporting."""
         estimates: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
         for isotope, filt in self.filters.items():
@@ -1940,10 +2311,14 @@ class RotatingShieldPFEstimator:
                 try:
                     clustered = filt.estimate_clustered()
                     if clustered[0].shape[0] > 0:
-                        estimates[isotope] = self._refit_reported_strengths(
+                        estimates[isotope] = self._guarded_report_estimate(
                             isotope,
-                            clustered[0],
-                            clustered[1],
+                            *self._refit_reported_strengths(
+                                isotope,
+                                clustered[0],
+                                clustered[1],
+                            ),
+                            use_pre_finalize_guard=use_pre_finalize_guard,
                         )
                         continue
                 except RuntimeError:
@@ -1953,12 +2328,40 @@ class RotatingShieldPFEstimator:
                     )
                     continue
             raw_positions, raw_strengths = filt.estimate()
-            estimates[isotope] = self._refit_reported_strengths(
+            estimates[isotope] = self._guarded_report_estimate(
                 isotope,
-                raw_positions,
-                raw_strengths,
+                *self._refit_reported_strengths(isotope, raw_positions, raw_strengths),
+                use_pre_finalize_guard=use_pre_finalize_guard,
             )
         return estimates
+
+    def _guarded_report_estimate(
+        self,
+        isotope: str,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        *,
+        use_pre_finalize_guard: bool,
+    ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return protected pre-finalize estimates when post-finalize collapsed."""
+        pos_arr = np.asarray(positions, dtype=float)
+        q_arr = np.asarray(strengths, dtype=float)
+        if not use_pre_finalize_guard:
+            return pos_arr, q_arr
+        guarded = self._pre_finalize_guard_estimates.get(isotope)
+        if guarded is None:
+            return pos_arr, q_arr
+        guard_pos, guard_q = guarded
+        if guard_pos.shape[0] <= pos_arr.shape[0]:
+            return pos_arr, q_arr
+        refit_pos, refit_q = self._refit_reported_strengths(
+            isotope,
+            guard_pos,
+            guard_q,
+        )
+        if refit_pos.shape[0] >= guard_pos.shape[0]:
+            return refit_pos, refit_q
+        return guard_pos.copy(), guard_q.copy()
 
     def estimate_all(self) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Alias for estimates() to align with visualization helpers."""
@@ -1982,6 +2385,7 @@ class RotatingShieldPFEstimator:
                     "ess_post": None,
                     "n_after_adapt": 0,
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
+                    "mode_preserved_count": int(getattr(filt, "last_mode_preserved_count", 0)),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
                     "kill_count": int(getattr(filt, "last_kill_count", 0)),
                     "birth_residual_chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
@@ -2001,6 +2405,27 @@ class RotatingShieldPFEstimator:
                     ),
                     "birth_residual_refit_gate_passed": bool(
                         getattr(filt, "last_birth_residual_refit_gate_passed", True)
+                    ),
+                    "birth_residual_layer": str(
+                        getattr(filt, "last_birth_residual_layer", "none")
+                    ),
+                    "birth_residual_layer_count": int(
+                        getattr(filt, "last_birth_residual_layer_count", 0)
+                    ),
+                    "pseudo_source_verified": int(
+                        getattr(filt, "last_pseudo_source_verified", 0)
+                    ),
+                    "pseudo_source_failed": int(
+                        getattr(filt, "last_pseudo_source_failed", 0)
+                    ),
+                    "pseudo_source_pruned": int(
+                        getattr(filt, "last_pseudo_source_pruned", 0)
+                    ),
+                    "pseudo_source_quarantined": int(
+                        getattr(filt, "last_pseudo_source_quarantined", 0)
+                    ),
+                    "pseudo_source_fail_reasons": dict(
+                        getattr(filt, "last_pseudo_source_fail_reasons", {})
                     ),
                     "temper_steps": [],
                     "temper_resamples": 0,
@@ -2031,8 +2456,9 @@ class RotatingShieldPFEstimator:
             if n_after_adapt is None:
                 n_after_adapt = int(len(filt.continuous_particles))
             best_state = filt.best_particle().state
-            map_positions = best_state.positions.copy()
-            map_strengths = best_state.strengths.copy()
+            best_source_count = max(0, int(best_state.num_sources))
+            map_positions = best_state.positions[:best_source_count].copy()
+            map_strengths = best_state.strengths[:best_source_count].copy()
             try:
                 if bool(filt.config.birth_enable and filt.config.use_clustered_output) and hasattr(
                     filt, "estimate_clustered"
@@ -2048,12 +2474,13 @@ class RotatingShieldPFEstimator:
                 order = np.argsort(weights)[::-1][:k]
                 for idx in order:
                     state = filt.continuous_particles[int(idx)].state
+                    source_count = max(0, int(state.num_sources))
                     top_entries.append(
                         {
                             "weight": float(weights[idx]),
-                            "num_sources": int(state.num_sources),
-                            "positions": state.positions.copy(),
-                            "strengths": state.strengths.copy(),
+                            "num_sources": source_count,
+                            "positions": state.positions[:source_count].copy(),
+                            "strengths": state.strengths[:source_count].copy(),
                         }
                     )
             diagnostics[iso] = {
@@ -2062,6 +2489,7 @@ class RotatingShieldPFEstimator:
                 "ess_post": ess_post,
                 "n_after_adapt": int(n_after_adapt),
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
+                "mode_preserved_count": int(getattr(filt, "last_mode_preserved_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
                 "kill_count": int(getattr(filt, "last_kill_count", 0)),
                 "birth_residual_chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
@@ -2082,6 +2510,27 @@ class RotatingShieldPFEstimator:
                 "birth_residual_refit_gate_passed": bool(
                     getattr(filt, "last_birth_residual_refit_gate_passed", True)
                 ),
+                "birth_residual_layer": str(
+                    getattr(filt, "last_birth_residual_layer", "none")
+                ),
+                "birth_residual_layer_count": int(
+                    getattr(filt, "last_birth_residual_layer_count", 0)
+                ),
+                "pseudo_source_verified": int(
+                    getattr(filt, "last_pseudo_source_verified", 0)
+                ),
+                "pseudo_source_failed": int(
+                    getattr(filt, "last_pseudo_source_failed", 0)
+                ),
+                "pseudo_source_pruned": int(
+                    getattr(filt, "last_pseudo_source_pruned", 0)
+                ),
+                "pseudo_source_quarantined": int(
+                    getattr(filt, "last_pseudo_source_quarantined", 0)
+                ),
+                "pseudo_source_fail_reasons": dict(
+                    getattr(filt, "last_pseudo_source_fail_reasons", {})
+                ),
                 "temper_steps": list(getattr(filt, "last_temper_steps", [])),
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "r_mean": r_mean,
@@ -2100,7 +2549,7 @@ class RotatingShieldPFEstimator:
         """
         if not self.measurements:
             return {iso: 0.0 for iso in self.filters}
-        estimates = self.pruned_estimates(method="legacy")
+        estimates = self.pruned_estimates(method="deltall")
         gains: Dict[str, float] = {}
         for iso, filt in self.filters.items():
             data = self._measurement_data_for_iso(iso, window)
@@ -2217,6 +2666,19 @@ class RotatingShieldPFEstimator:
         eps = 1e-12
         fe_idx = octant_index_from_rotation(RFe)
         pb_idx = octant_index_from_rotation(RPb)
+        if not self._can_use_gpu():
+            return self._orientation_expected_information_gain_cpu(
+                pose_idx=pose_idx,
+                detector_pos=detector_pos,
+                fe_idx=fe_idx,
+                pb_idx=pb_idx,
+                live_time_s=live_time_s,
+                num_samples=int(num_samples),
+                alpha_by_isotope=alpha_by_isotope,
+                particles_by_isotope=particles_by_isotope,
+                rng=rng,
+                eps=eps,
+            )
         kernel = self._continuous_kernel()
         alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
         # normalize alphas
@@ -2299,6 +2761,72 @@ class RotatingShieldPFEstimator:
                 H_post_mean = torch.mean(H_post)
             ig_h = float((H_prior - H_post_mean).item())
             total_ig += alphas.get(iso, 0.0) * ig_h
+        return float(total_ig)
+
+    def _orientation_expected_information_gain_cpu(
+        self,
+        *,
+        pose_idx: int,
+        detector_pos: NDArray[np.float64],
+        fe_idx: int,
+        pb_idx: int,
+        live_time_s: float,
+        num_samples: int,
+        alpha_by_isotope: Dict[str, float] | None,
+        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] | None,
+        rng: np.random.Generator,
+        eps: float,
+    ) -> float:
+        """Compute orientation EIG on CPU using the same expected-count kernel."""
+        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
+        alpha_sum = sum(float(value) for value in alphas.values()) or 1.0
+        alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
+        total_ig = 0.0
+        for iso, filt in self.filters.items():
+            if getattr(filt, "is_converged", False) and getattr(filt.config, "converge_enable", False):
+                continue
+            if particles_by_isotope is not None and iso in particles_by_isotope:
+                states, weights = particles_by_isotope[iso]
+            else:
+                if not filt.continuous_particles:
+                    continue
+                states = [p.state for p in filt.continuous_particles]
+                weights = filt.continuous_weights
+            if not states:
+                continue
+            weights_arr = np.asarray(weights, dtype=float)
+            weights_arr = weights_arr / max(float(np.sum(weights_arr)), eps)
+            lam = self.expected_counts_pair_for_states_at_detector(
+                isotope=iso,
+                detector_pos=detector_pos,
+                fe_index=int(fe_idx),
+                pb_index=int(pb_idx),
+                live_time_s=float(live_time_s),
+                states=states,
+            )
+            lam = np.maximum(np.asarray(lam, dtype=float).reshape(-1), eps)
+            h_prior = -float(np.sum(weights_arr * np.log(weights_arr + eps)))
+            if num_samples <= 0:
+                h_post_mean = 0.0
+            else:
+                sample_indices = rng.choice(
+                    weights_arr.size,
+                    size=int(num_samples),
+                    replace=True,
+                    p=weights_arr,
+                )
+                z_samples = rng.poisson(lam[sample_indices])
+                logw = (
+                    np.log(weights_arr + eps)[None, :]
+                    + z_samples[:, None] * np.log(lam + eps)[None, :]
+                    - lam[None, :]
+                )
+                logw -= logw.max(axis=1, keepdims=True)
+                w_post = np.exp(logw)
+                w_post /= np.maximum(np.sum(w_post, axis=1, keepdims=True), eps)
+                h_post = -np.sum(w_post * np.log(w_post + eps), axis=1)
+                h_post_mean = float(np.mean(h_post))
+            total_ig += alphas.get(iso, 0.0) * (h_prior - h_post_mean)
         return float(total_ig)
 
 

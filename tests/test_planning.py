@@ -18,11 +18,16 @@ from planning.pose_selection import (
 from planning.dss_pp import (
     DSSPPConfig,
     _count_balance_penalty,
+    _continuous_kernel_for_estimator,
+    _saturated_count_utility,
+    _programs_for_pose,
+    _temporal_separation_score_from_signatures,
     build_shield_program_library,
     select_dss_pp_next_station,
 )
 from planning.candidate_generation import generate_candidate_poses
 from planning.shield_rotation import rotation_policy_step, select_best_orientation
+from planning.shield_rotation import select_separation_orientations
 from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_rotation_matrices
@@ -538,6 +543,225 @@ def test_dss_pp_program_library_contains_differential_primitives() -> None:
     assert "material_split" in kinds
     assert "occlusion_test" in kinds
     assert all(len(program.pair_ids) == 2 for program in programs)
+
+
+def test_dss_pp_program_library_can_build_separation_bursts() -> None:
+    """Shield programs should expand primitives into longer temporal bursts."""
+    mats = generate_octant_rotation_matrices()
+    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
+    programs = build_shield_program_library(normals, program_length=8, max_programs=8)
+
+    assert programs
+    assert all(len(program.pair_ids) == 8 for program in programs)
+
+
+def test_temporal_separation_uses_response_shape_not_strength_scale() -> None:
+    """Temporal-code scoring should not reward amplitude-only differences."""
+    config = DSSPPConfig(
+        temporal_cover_weight=1.0,
+        temporal_logdet_weight=0.5,
+        temporal_decorrelation_weight=1.0,
+        temporal_pair_contrast_threshold=0.2,
+    )
+    collinear = [
+        np.array([1.0, 2.0, 3.0], dtype=float),
+        np.array([10.0, 20.0, 30.0], dtype=float),
+    ]
+    separated = [
+        np.array([12.0, 0.1, 0.1], dtype=float),
+        np.array([0.1, 12.0, 0.1], dtype=float),
+        np.array([0.1, 0.1, 12.0], dtype=float),
+    ]
+
+    collinear_score = _temporal_separation_score_from_signatures(
+        collinear,
+        [0.5, 0.5],
+        config=config,
+    )
+    separated_score = _temporal_separation_score_from_signatures(
+        separated,
+        [1.0, 1.0, 1.0],
+        config=config,
+    )
+
+    assert collinear_score == pytest.approx(0.0, abs=1.0e-9)
+    assert separated_score > 1.0
+
+
+def test_extract_signature_modes_boosts_tentative_residual_sources() -> None:
+    """Residual-aware planning should prioritize tentative source signatures."""
+    est = _build_simple_estimator()
+    filt = est.filters["Cs-137"]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+                tentative_sources=np.array([False], dtype=bool),
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[5.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+                tentative_sources=np.array([True], dtype=bool),
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+
+    modes = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        tentative_weight_multiplier=5.0,
+    )["Cs-137"]
+
+    assert len(modes) == 2
+    assert np.allclose(modes[0].position_xyz, np.array([5.0, 0.0, 0.0]))
+    assert modes[0].weight > modes[1].weight
+
+
+def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
+    """Temporal separation should add a pose-specific pairwise cover program."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        use_gpu=False,
+        planning_particles=None,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    modes = {
+        "Cs-137": [
+            dss_pp.SignatureMode(
+                isotope="Cs-137",
+                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+                strength_cps_1m=1000.0,
+                weight=0.5,
+                spread_m=0.1,
+            ),
+            dss_pp.SignatureMode(
+                isotope="Cs-137",
+                position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
+                strength_cps_1m=1000.0,
+                weight=0.5,
+                spread_m=0.1,
+            ),
+        ]
+    }
+    dss_config = DSSPPConfig(
+        program_length=3,
+        lambda_temporal_separation=1.0,
+        temporal_cover_programs=1,
+    )
+    base_programs = build_shield_program_library(
+        est.normals,
+        program_length=3,
+        max_programs=4,
+    )
+
+    programs = _programs_for_pose(
+        estimator=est,
+        kernel=_continuous_kernel_for_estimator(est),
+        modes_by_isotope=modes,
+        pose_xyz=np.array([2.0, 1.0, 0.5], dtype=float),
+        base_programs=base_programs,
+        config=dss_config,
+    )
+
+    assert any(program.kind == "pairwise_contrast_cover" for program in programs)
+
+
+def test_select_separation_orientations_returns_fe_pb_pairs() -> None:
+    """Standalone temporal shield selection should return Fe/Pb pair tuples."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=2,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([2.0, 1.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+
+    pairs = select_separation_orientations(
+        est,
+        pose_idx=0,
+        candidate_positions=candidate_sources,
+        k=6,
+        isotope="Cs-137",
+    )
+
+    assert len(pairs) == 6
+    assert all(0 <= fe < est.num_orientations for fe, _ in pairs)
+    assert all(0 <= pb < est.num_orientations for _, pb in pairs)
+
+
+def test_select_best_orientation_preselect_supports_cpu_config() -> None:
+    """Orientation preselection should fall back to CPU when GPU is disabled."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    rot_mats = generate_octant_rotation_matrices()[:2]
+    shield_normals = np.asarray([mat[:, 2] for mat in rot_mats], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+        preselect_orientations=True,
+        eig_num_samples=1,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([2.0, 1.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+
+    best_idx, score = select_best_orientation(
+        est,
+        pose_idx=0,
+        RFe_candidates=rot_mats,
+        RPb_candidates=rot_mats,
+        eig_samples=1,
+    )
+
+    assert 0 <= best_idx < 4
+    assert np.isfinite(score)
 
 
 def test_dss_pp_selects_station_and_shield_program() -> None:
@@ -1074,6 +1298,66 @@ def test_dss_pp_count_balance_penalty_is_isotope_agnostic() -> None:
         _count_balance_penalty(eu_dominated)
     )
     assert _count_balance_penalty(co_dominated) > 0.5
+
+
+def test_dss_pp_count_utility_saturates_high_counts() -> None:
+    """Count utility should reward usability without unbounded proximity bias."""
+    low = _saturated_count_utility(
+        {"Cs-137": 10.0, "Co-60": 10.0},
+        saturation_counts=100.0,
+    )
+    useful = _saturated_count_utility(
+        {"Cs-137": 100.0, "Co-60": 100.0},
+        saturation_counts=100.0,
+    )
+    extreme = _saturated_count_utility(
+        {"Cs-137": 10000.0, "Co-60": 10000.0},
+        saturation_counts=100.0,
+    )
+
+    assert 0.0 < low < useful < extreme <= 1.0
+    assert extreme == pytest.approx(1.0)
+
+
+def test_dss_pp_local_orbit_prefers_informative_annulus() -> None:
+    """Local-orbit scoring should choose an offset station over source chasing."""
+    est = _build_simple_estimator()
+    candidates = np.array(
+        [
+            [0.1, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([5.0, 5.0, 0.0], dtype=float),
+        config=DSSPPConfig(
+            horizon=1,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            lambda_count_utility=0.0,
+            lambda_local_orbit=10.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            ring_radii_m=(3.0,),
+            local_orbit_sigma_m=0.5,
+            signature_std_min_counts=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert np.allclose(result.next_pose, candidates[1])
+    assert result.diagnostics["first_local_orbit_gain"] > 0.0
 
 
 def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:

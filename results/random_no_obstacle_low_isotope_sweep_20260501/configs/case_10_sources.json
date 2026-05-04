@@ -1,0 +1,53 @@
+{
+  "name": "random_no_obstacle_low_isotope_case_10",
+  "metadata": {
+    "source_seed": 2026052210,
+    "obstacle_seed": null,
+    "blocked_fraction_target": 0.0,
+    "blocked_fraction_actual": 0.0,
+    "pattern_kind": "two_isotope",
+    "isotopes_present": [
+      "Cs-137",
+      "Eu-154"
+    ],
+    "source_sampling": "full open room; single- or two-isotope stress cases; minimum xy source separation 2.0 m; minimum start-detector xy separation 2.0 m; intensities log-uniform 30000-90000 cps@1m"
+  },
+  "sources": [
+    {
+      "isotope": "Eu-154",
+      "position": [
+        3.741,
+        3.72,
+        0.976
+      ],
+      "intensity_cps_1m": 52451.9
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        6.057,
+        14.139,
+        1.625
+      ],
+      "intensity_cps_1m": 71114.9
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        0.792,
+        12.691,
+        1.489
+      ],
+      "intensity_cps_1m": 36815.8
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        2.51,
+        6.052,
+        0.868
+      ],
+      "intensity_cps_1m": 74903.9
+    }
+  ]
+}

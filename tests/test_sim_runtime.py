@@ -16,8 +16,9 @@ import numpy as np
 import pytest
 
 from measurement.model import PointSource
+from measurement.obstacles import ObstacleGrid
 from pf.estimator import MeasurementRecord, RotatingShieldPFEstimator
-from realtime_demo import run_live_pf
+from realtime_demo import _has_environment_obstacles, run_live_pf
 from sim.geant4_app.app import Geant4Application
 from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever as serve_geant4_forever
 from sim.geant4_app.io_format import read_response_file
@@ -59,8 +60,11 @@ from sim.radiation_visualization import (
     build_visualization_metadata_from_scene,
 )
 from sim.shield_geometry import (
+    FE_SHIELD_INNER_RADIUS_M,
     FE_SHIELD_THICKNESS_CM,
-    PB_SHIELD_THICKNESS_CM,
+    FE_SHIELD_TVL_THICKNESS_CM,
+    PB_SHIELD_INNER_RADIUS_M,
+    PB_SHIELD_TVL_THICKNESS_CM,
     SHIELD_SHAPE_SPHERICAL_OCTANT,
     resolve_shield_thickness_config,
     shield_thickness_scale_for_transmission,
@@ -1148,6 +1152,8 @@ def test_geant4_scene_export_is_stable() -> None:
     assert export_one.scene_hash == export_two.scene_hash
     assert export_one.to_dict() == export_two.to_dict()
     assert export_one.fe_shield.shape == SHIELD_SHAPE_SPHERICAL_OCTANT
+    assert export_one.fe_shield.inner_radius_m == pytest.approx(FE_SHIELD_INNER_RADIUS_M)
+    assert export_one.pb_shield.inner_radius_m == pytest.approx(PB_SHIELD_INNER_RADIUS_M)
     assert export_one.fe_shield.thickness_cm == pytest.approx(FE_SHIELD_THICKNESS_CM)
 
 
@@ -1180,10 +1186,14 @@ def test_shield_transmission_target_scales_geant4_export() -> None:
         shield_thickness_scale_for_transmission(0.5)
     )
     assert exported.fe_shield.thickness_cm == pytest.approx(
-        FE_SHIELD_THICKNESS_CM * shield_thickness.thickness_scale
+        FE_SHIELD_TVL_THICKNESS_CM * shield_thickness.thickness_scale
     )
     assert exported.pb_shield.thickness_cm == pytest.approx(
-        PB_SHIELD_THICKNESS_CM * shield_thickness.thickness_scale
+        PB_SHIELD_TVL_THICKNESS_CM * shield_thickness.thickness_scale
+    )
+    assert exported.fe_shield.inner_radius_m == pytest.approx(FE_SHIELD_INNER_RADIUS_M)
+    assert exported.pb_shield.inner_radius_m == pytest.approx(
+        FE_SHIELD_INNER_RADIUS_M + exported.fe_shield.thickness_cm / 100.0
     )
 
 
@@ -2550,6 +2560,26 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         estimator.mission_metrics["estimated_end_to_end_time_s"]
         >= estimator.mission_metrics["total_live_time_s"]
     )
+
+
+def test_empty_obstacle_grid_disables_config_usd_fallback() -> None:
+    """An empty obstacle grid must be treated like no environment obstacles."""
+    empty_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 20),
+        blocked_cells=(),
+    )
+    blocked_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 20),
+        blocked_cells=((1, 2),),
+    )
+
+    assert not _has_environment_obstacles(None)
+    assert not _has_environment_obstacles(empty_grid)
+    assert _has_environment_obstacles(blocked_grid)
 
 
 def test_run_live_pf_random_environment_uses_blender_usd(

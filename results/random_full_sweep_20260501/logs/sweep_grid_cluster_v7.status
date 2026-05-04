@@ -1,0 +1,27 @@
+[sweep-v7] case 01 start 2026-05-01 16:02:45
+[sweep-v7] case 01 done 2026-05-01 16:18:40
+Total measurements: 20, live=470.0s, travel=235.0s, shield=10.0s, mission=715.0s
+Mission timing summary: distance=117.48m motion=235.0s rotation=10.0s end_to_end=715.0s compute=475.530s ig_mean=2.183s pf_mean=8.906s wall_clock=947.10s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=2.829, median=2.829, rmse=2.829, max=2.829
+  Intensity rel error [%]: mean=179.3, median=179.3, max=179.3
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=2.082, median=2.082, rmse=2.082, max=2.082
+  Intensity rel error [%]: mean=53.21, median=53.21, max=53.21
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=5.102, median=5.102, rmse=5.102, max=5.102
+  Intensity rel error [%]: mean=91.57, median=91.57, max=91.57
+[sweep-v7] case 02 start 2026-05-01 16:18:40
+[sweep-v7] case 02 done 2026-05-01 16:53:31
+Total measurements: 23, live=310.0s, travel=186.1s, shield=11.5s, mission=507.6s
+Mission timing summary: distance=93.05m motion=186.1s rotation=11.5s end_to_end=507.6s compute=1475.379s ig_mean=3.176s pf_mean=27.665s wall_clock=2078.65s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.8769, median=0.8769, rmse=0.8769, max=0.8769
+  Intensity rel error [%]: mean=65.48, median=65.48, max=65.48
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=0.3217, median=0.3217, rmse=0.3217, max=0.3217
+  Intensity rel error [%]: mean=6.251, median=6.251, max=6.251
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=2.143, median=2.143, rmse=2.143, max=2.143
+  Intensity rel error [%]: mean=69.95, median=69.95, max=69.95
+[sweep-v7] case 03 start 2026-05-01 16:53:31

@@ -1,0 +1,48 @@
+{
+  "name": "random_full_sweep_case_06",
+  "metadata": {
+    "obstacle_seed": 2026050106,
+    "source_seed": 2026051106,
+    "blocked_fraction_target": 0.25,
+    "blocked_fraction_actual": 0.25,
+    "source_sampling": "reachable free cells; 3-5 sources; all isotopes present; intensities log-uniform 30000-90000 cps@1m"
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [
+        9.578,
+        11.348,
+        0.799
+      ],
+      "intensity_cps_1m": 58251.6
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        7.652,
+        19.398,
+        0.869
+      ],
+      "intensity_cps_1m": 81009.2
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        6.621,
+        9.695,
+        1.15
+      ],
+      "intensity_cps_1m": 36984.5
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        3.181,
+        3.647,
+        1.653
+      ],
+      "intensity_cps_1m": 35663.9
+    }
+  ]
+}

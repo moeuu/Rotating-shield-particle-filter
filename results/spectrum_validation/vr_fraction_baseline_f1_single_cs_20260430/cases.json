@@ -1,0 +1,84 @@
+[
+  {
+    "case": {
+      "description": "Single Cs-137 source at 1 m without shield blocking.",
+      "detector_pose_xyz": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "single_cs_free",
+      "obstacle_cells": [],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 100.0,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.0,
+            1.0,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "emission_model": "weighted_isotropic",
+      "engine_mode": "external",
+      "num_primaries": 7066892,
+      "physics_profile": "balanced",
+      "source_equivalent_counts_Cs-137": 3000.0
+    },
+    "num_primaries": 7066892.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 62.783213709002496,
+          "photopeak_nnls": 5.582497873816056e-13,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 6726.603827421033,
+          "photopeak_nnls": 6835.663774166137,
+          "response_matrix": 4519.652200615941
+        },
+        "relative_errors": {
+          "peak_window": 1.2422012758070111,
+          "photopeak_nnls": 1.2785545913887124,
+          "response_matrix": 0.5065507335386471
+        },
+        "source_tally_counts": 3000.0,
+        "target_pf_counts": 3000.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 363.41906762871525,
+          "photopeak_nnls": 11.223958648121501,
+          "response_matrix": 0.0
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null
+        },
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "runtime_s": 16.272566080093384,
+    "total_spectrum_counts": 2998.4919233167307
+  }
+]

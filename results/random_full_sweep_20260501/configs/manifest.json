@@ -1,0 +1,520 @@
+{
+  "cases": [
+    {
+      "case_id": 1,
+      "obstacle_seed": 2026050101,
+      "source_seed": 2026051101,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_01_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_01_sources.json",
+      "blocked_fraction": 0.25,
+      "reachable_cells": 148,
+      "source_count": 4,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            9.513,
+            13.351,
+            1.823
+          ],
+          "intensity_cps_1m": 37276.1
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            2.397,
+            18.618,
+            1.701
+          ],
+          "intensity_cps_1m": 53092.5
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            5.465,
+            18.634,
+            0.839
+          ],
+          "intensity_cps_1m": 40866.8
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            4.754,
+            15.671,
+            1.167
+          ],
+          "intensity_cps_1m": 61087.5
+        }
+      ]
+    },
+    {
+      "case_id": 2,
+      "obstacle_seed": 2026050102,
+      "source_seed": 2026051102,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_02_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_02_sources.json",
+      "blocked_fraction": 0.35,
+      "reachable_cells": 76,
+      "source_count": 4,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            8.732,
+            14.511,
+            1.676
+          ],
+          "intensity_cps_1m": 41786.1
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            3.647,
+            1.774,
+            1.187
+          ],
+          "intensity_cps_1m": 52696.3
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            7.497,
+            10.696,
+            1.383
+          ],
+          "intensity_cps_1m": 61886.8
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            7.814,
+            6.784,
+            1.496
+          ],
+          "intensity_cps_1m": 35452.6
+        }
+      ]
+    },
+    {
+      "case_id": 3,
+      "obstacle_seed": 2026050103,
+      "source_seed": 2026051103,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_03_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_03_sources.json",
+      "blocked_fraction": 0.4,
+      "reachable_cells": 98,
+      "source_count": 4,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            2.688,
+            9.327,
+            1.481
+          ],
+          "intensity_cps_1m": 45761.8
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            3.52,
+            5.295,
+            1.222
+          ],
+          "intensity_cps_1m": 57393.8
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            3.254,
+            3.236,
+            0.79
+          ],
+          "intensity_cps_1m": 73209.9
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            6.388,
+            6.444,
+            1.669
+          ],
+          "intensity_cps_1m": 37510.5
+        }
+      ]
+    },
+    {
+      "case_id": 4,
+      "obstacle_seed": 2026050104,
+      "source_seed": 2026051104,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_04_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_04_sources.json",
+      "blocked_fraction": 0.45,
+      "reachable_cells": 68,
+      "source_count": 3,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            7.357,
+            6.719,
+            0.981
+          ],
+          "intensity_cps_1m": 55411.4
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            2.485,
+            2.395,
+            0.995
+          ],
+          "intensity_cps_1m": 77064.2
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            2.592,
+            1.792,
+            1.245
+          ],
+          "intensity_cps_1m": 61899.0
+        }
+      ]
+    },
+    {
+      "case_id": 5,
+      "obstacle_seed": 2026050105,
+      "source_seed": 2026051105,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_05_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_05_sources.json",
+      "blocked_fraction": 0.3,
+      "reachable_cells": 129,
+      "source_count": 5,
+      "sources": [
+        {
+          "isotope": "Eu-154",
+          "position": [
+            4.211,
+            17.183,
+            0.821
+          ],
+          "intensity_cps_1m": 31941.5
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            8.211,
+            12.719,
+            1.661
+          ],
+          "intensity_cps_1m": 51259.7
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            1.518,
+            8.218,
+            0.824
+          ],
+          "intensity_cps_1m": 31064.9
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            5.489,
+            11.756,
+            0.739
+          ],
+          "intensity_cps_1m": 33805.3
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            6.51,
+            8.693,
+            0.788
+          ],
+          "intensity_cps_1m": 33876.8
+        }
+      ]
+    },
+    {
+      "case_id": 6,
+      "obstacle_seed": 2026050106,
+      "source_seed": 2026051106,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_06_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_06_sources.json",
+      "blocked_fraction": 0.25,
+      "reachable_cells": 146,
+      "source_count": 4,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            9.578,
+            11.348,
+            0.799
+          ],
+          "intensity_cps_1m": 58251.6
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            7.652,
+            19.398,
+            0.869
+          ],
+          "intensity_cps_1m": 81009.2
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            6.621,
+            9.695,
+            1.15
+          ],
+          "intensity_cps_1m": 36984.5
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            3.181,
+            3.647,
+            1.653
+          ],
+          "intensity_cps_1m": 35663.9
+        }
+      ]
+    },
+    {
+      "case_id": 7,
+      "obstacle_seed": 2026050107,
+      "source_seed": 2026051107,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_07_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_07_sources.json",
+      "blocked_fraction": 0.35,
+      "reachable_cells": 105,
+      "source_count": 5,
+      "sources": [
+        {
+          "isotope": "Eu-154",
+          "position": [
+            3.411,
+            10.432,
+            1.596
+          ],
+          "intensity_cps_1m": 50034.3
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            7.186,
+            9.326,
+            1.246
+          ],
+          "intensity_cps_1m": 58115.4
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            3.704,
+            18.555,
+            0.819
+          ],
+          "intensity_cps_1m": 59543.2
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            6.621,
+            16.674,
+            1.56
+          ],
+          "intensity_cps_1m": 73837.5
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            8.576,
+            18.539,
+            1.003
+          ],
+          "intensity_cps_1m": 66558.2
+        }
+      ]
+    },
+    {
+      "case_id": 8,
+      "obstacle_seed": 2026050108,
+      "source_seed": 2026051108,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_08_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_08_sources.json",
+      "blocked_fraction": 0.4,
+      "reachable_cells": 92,
+      "source_count": 5,
+      "sources": [
+        {
+          "isotope": "Cs-137",
+          "position": [
+            4.343,
+            14.735,
+            1.388
+          ],
+          "intensity_cps_1m": 79397.1
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            7.68,
+            18.732,
+            0.872
+          ],
+          "intensity_cps_1m": 49912.2
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            8.305,
+            7.401,
+            1.02
+          ],
+          "intensity_cps_1m": 53538.3
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            5.768,
+            7.599,
+            1.798
+          ],
+          "intensity_cps_1m": 88756.0
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            0.569,
+            3.706,
+            0.702
+          ],
+          "intensity_cps_1m": 33149.2
+        }
+      ]
+    },
+    {
+      "case_id": 9,
+      "obstacle_seed": 2026050109,
+      "source_seed": 2026051109,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_09_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_09_sources.json",
+      "blocked_fraction": 0.45,
+      "reachable_cells": 69,
+      "source_count": 5,
+      "sources": [
+        {
+          "isotope": "Co-60",
+          "position": [
+            9.346,
+            13.35,
+            0.721
+          ],
+          "intensity_cps_1m": 43692.0
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            7.532,
+            12.25,
+            1.693
+          ],
+          "intensity_cps_1m": 65964.1
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            5.804,
+            6.612,
+            1.429
+          ],
+          "intensity_cps_1m": 34715.1
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            4.608,
+            6.671,
+            1.702
+          ],
+          "intensity_cps_1m": 51525.8
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            3.605,
+            7.745,
+            1.055
+          ],
+          "intensity_cps_1m": 49360.4
+        }
+      ]
+    },
+    {
+      "case_id": 10,
+      "obstacle_seed": 2026050110,
+      "source_seed": 2026051110,
+      "obstacle_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_10_obstacles.json",
+      "source_config": "/home/moeu/research/Rotating-shield-particle-filter/results/random_full_sweep_20260501/configs/case_10_sources.json",
+      "blocked_fraction": 0.3,
+      "reachable_cells": 106,
+      "source_count": 5,
+      "sources": [
+        {
+          "isotope": "Eu-154",
+          "position": [
+            1.642,
+            3.355,
+            0.91
+          ],
+          "intensity_cps_1m": 41317.6
+        },
+        {
+          "isotope": "Cs-137",
+          "position": [
+            4.717,
+            2.411,
+            1.796
+          ],
+          "intensity_cps_1m": 37017.9
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            6.35,
+            10.413,
+            1.345
+          ],
+          "intensity_cps_1m": 48338.9
+        },
+        {
+          "isotope": "Co-60",
+          "position": [
+            1.202,
+            7.671,
+            0.737
+          ],
+          "intensity_cps_1m": 59057.5
+        },
+        {
+          "isotope": "Eu-154",
+          "position": [
+            3.638,
+            4.528,
+            0.764
+          ],
+          "intensity_cps_1m": 37882.8
+        }
+      ]
+    }
+  ]
+}

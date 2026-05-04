@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 
 from measurement.obstacles import ObstacleGrid
-from visualization.realtime_viz import CUISplitPFVisualizer, PFFrame
+from pf.parallel import Measurement, ParallelIsotopePF
+from pf.particle_filter import IsotopeParticle, PFConfig
+from pf.state import IsotopeState
+from visualization.realtime_viz import CUISplitPFVisualizer, PFFrame, build_frame_from_pf
 
 
 def test_cui_split_visualizer_writes_robot_and_pf_views(tmp_path) -> None:
@@ -102,3 +105,63 @@ def test_cui_split_visualizer_tracks_stations_and_path_waypoints(tmp_path) -> No
     assert len(visualizer.measurement_points) == 2
     assert visualizer.measurement_visit_counts == [2, 1]
     assert visualizer._unique_path_waypoints().shape[0] == 1
+
+
+def test_build_frame_from_pf_hides_inactive_particle_slots() -> None:
+    """PF screenshots should render only active source slots, not internal padding."""
+    config = PFConfig(
+        num_particles=2,
+        use_gpu=False,
+        birth_enable=False,
+        use_clustered_output=False,
+        pseudo_source_fail_grace_stations=1,
+        source_prune_fail_grace_stations=1,
+    )
+    pf = ParallelIsotopePF(isotope_names=["Cs-137"], config=config)
+    filt = pf.filters["Cs-137"]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array(
+                    [[1.0, 2.0, 3.0], [9.0, 9.0, 9.0]],
+                    dtype=float,
+                ),
+                strengths=np.array([100.0, 5.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=2,
+                positions=np.array(
+                    [[2.0, 3.0, 4.0], [8.0, 8.0, 8.0]],
+                    dtype=float,
+                ),
+                strengths=np.array([110.0, 10.0], dtype=float),
+                background=0.0,
+                tentative_sources=np.array([False, True], dtype=bool),
+                verification_fail_streaks=np.array([0, 1], dtype=int),
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
+
+    frame = build_frame_from_pf(
+        pf,
+        Measurement(
+            counts_by_isotope={"Cs-137": 1.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            detector_position=np.array([0.0, 0.0, 0.0], dtype=float),
+        ),
+        step_index=0,
+        time_sec=0.0,
+    )
+
+    displayed = frame.particle_positions["Cs-137"]
+    assert displayed.shape == (2, 3)
+    assert np.allclose(displayed, [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])
+    assert np.allclose(frame.particle_weights["Cs-137"], [0.5, 0.5])

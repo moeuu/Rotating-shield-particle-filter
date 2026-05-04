@@ -11,10 +11,9 @@ from sim.isaacsim_app.observation_model import IsaacAssetGeometry
 from sim.isaacsim_app.scene_builder import SceneDescription, StagePrimPaths
 from sim.isaacsim_app.stage_backend import StageBackend, StageMaterialInfo, StageSolidPrim
 from sim.shield_geometry import (
-    FE_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_INNER_RADIUS_M,
     SHIELD_SHAPE_SPHERICAL_OCTANT,
     ShieldThicknessConfig,
+    nested_shield_inner_radii_cm,
     resolve_shield_thickness_config,
 )
 
@@ -279,11 +278,18 @@ def export_scene_for_geant4(
         )
         for source in scene.sources
     )
+    detector_outer_radius_cm = 100.0 * (
+        float(detector_model.crystal_radius_m) + float(detector_model.housing_thickness_m)
+    )
+    fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
+        thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
+        detector_outer_radius_cm=detector_outer_radius_cm,
+    )
     fe_shield = ExportedShieldModel(
         path=scene.prim_paths.fe_shield_path,
         shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
-        inner_radius_m=FE_SHIELD_INNER_RADIUS_M,
-        outer_radius_m=FE_SHIELD_INNER_RADIUS_M + float(shield_thickness.thickness_fe_cm) / 100.0,
+        inner_radius_m=fe_inner_cm / 100.0,
+        outer_radius_m=(fe_inner_cm + float(shield_thickness.thickness_fe_cm)) / 100.0,
         thickness_cm=float(shield_thickness.thickness_fe_cm),
         size_xyz=None,
         material=ExportedGeant4Material(name="fe", preset_name="iron"),
@@ -291,8 +297,8 @@ def export_scene_for_geant4(
     pb_shield = ExportedShieldModel(
         path=scene.prim_paths.pb_shield_path,
         shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
-        inner_radius_m=PB_SHIELD_INNER_RADIUS_M,
-        outer_radius_m=PB_SHIELD_INNER_RADIUS_M + float(shield_thickness.thickness_pb_cm) / 100.0,
+        inner_radius_m=pb_inner_cm / 100.0,
+        outer_radius_m=(pb_inner_cm + float(shield_thickness.thickness_pb_cm)) / 100.0,
         thickness_cm=float(shield_thickness.thickness_pb_cm),
         size_xyz=None,
         material=ExportedGeant4Material(name="pb", preset_name="lead"),

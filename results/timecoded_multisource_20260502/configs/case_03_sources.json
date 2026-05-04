@@ -1,0 +1,55 @@
+{
+  "name": "timecoded_multisource_case_03_co3",
+  "metadata": {
+    "purpose": "Geant4/PF full run with multiple isotopes and three Co-60 sources.",
+    "obstacles": "none",
+    "same_isotope_stress": "Co-60 has 3 sources"
+  },
+  "sources": [
+    {
+      "isotope": "Co-60",
+      "position": [
+        2.3,
+        5.4,
+        1.1
+      ],
+      "intensity_cps_1m": 46000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        8.1,
+        7.8,
+        1.4
+      ],
+      "intensity_cps_1m": 64000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        4.4,
+        17.0,
+        1.3
+      ],
+      "intensity_cps_1m": 57000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        7.2,
+        15.0,
+        1.0
+      ],
+      "intensity_cps_1m": 49000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        3.3,
+        10.8,
+        1.7
+      ],
+      "intensity_cps_1m": 53000.0
+    }
+  ]
+}

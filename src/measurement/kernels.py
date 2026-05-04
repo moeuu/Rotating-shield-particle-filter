@@ -16,7 +16,9 @@ from measurement.shielding import (
     CS137_TVL_FE_MM,
     CS137_TVL_PB_MM,
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_FE_SHIELD_THICKNESS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_THICKNESS_CM,
     LOCAL_POSITIVE_OCTANT_CENTER,
     OctantShield,
     SHIELD_GEOMETRY_SPHERICAL_OCTANT,
@@ -27,8 +29,6 @@ from measurement.shielding import (
     spherical_shell_path_length_cm_torch,
 )
 
-CS137_TVL_PB_CM = CS137_TVL_PB_MM / 10.0
-CS137_TVL_FE_CM = CS137_TVL_FE_MM / 10.0
 CS137_MU_PB_CM_INV = mu_from_tvl_mm(CS137_TVL_PB_MM)
 CS137_MU_FE_CM_INV = mu_from_tvl_mm(CS137_TVL_FE_MM)
 
@@ -77,8 +77,8 @@ class ShieldParams:
 
     mu_pb: float = CS137_MU_PB_CM_INV  # 1/cm based on Cs-137 TVL.
     mu_fe: float = CS137_MU_FE_CM_INV  # 1/cm based on Cs-137 TVL.
-    thickness_pb_cm: float = CS137_TVL_PB_CM
-    thickness_fe_cm: float = CS137_TVL_FE_CM
+    thickness_pb_cm: float = DEFAULT_PB_SHIELD_THICKNESS_CM
+    thickness_fe_cm: float = DEFAULT_FE_SHIELD_THICKNESS_CM
     inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM
     inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM
     buildup_fe_coeff: float = 0.0

@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
-from pf.particle_filter import IsotopeParticleFilter, PFConfig
+from pf.particle_filter import IsotopeParticle, IsotopeParticleFilter, PFConfig
+from pf.state import IsotopeState
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from spectrum.pipeline import SpectralDecomposer
@@ -92,8 +93,44 @@ def test_estimator_uses_clustered_output_when_birth_is_enabled():
     assert strengths == pytest.approx(np.array([42.0], dtype=float))
 
 
-def test_deferred_pose_update_delays_resample_and_birth(monkeypatch):
-    """Deferred pose updates should postpone resampling and birth/death."""
+def test_continuous_pair_expected_counts_supports_cpu_config():
+    """Continuous expected counts should use the same model without CUDA."""
+    dummy_kernel = types.SimpleNamespace(
+        poses=[np.array([1.0, 0.0, 0.0], dtype=float)],
+        orientations=[np.array([1.0, 0.0, 0.0], dtype=float)],
+        num_sources=1,
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+    )
+    filt = IsotopeParticleFilter(
+        "Cs-137",
+        kernel=dummy_kernel,
+        config=PFConfig(num_particles=1, use_gpu=False),
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([5.0], dtype=float),
+                background=1.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+
+    lam = filt._continuous_expected_counts_pair(
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=2.0,
+    )
+
+    assert lam == pytest.approx(np.array([12.0], dtype=float))
+
+
+def test_deferred_pose_update_delays_structural_update(monkeypatch):
+    """Deferred pose updates should postpone only station-level structure moves."""
     update_defer_flags = []
     finalize_calls = []
     birth_calls = []
@@ -181,6 +218,66 @@ def test_deferred_pose_update_delays_resample_and_birth(monkeypatch):
     assert finalized == 2
     assert finalize_calls == ["Cs-137"]
     assert birth_calls == [2]
+
+
+def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
+    """Deferred station updates should still allow intra-station resampling."""
+    calls = []
+
+    def _fake_gpu_enabled(self):
+        """Bypass hardware availability for the branch test."""
+        return True
+
+    def _fake_tempered_update(
+        self,
+        lam_fn,
+        z_obs,
+        observation_count_variance=0.0,
+        disable_regularize_on_resample=None,
+        roughening_scale_on_resample=1.0,
+    ):
+        """Record the deferred tempered-update request."""
+        _ = lam_fn, z_obs, observation_count_variance
+        calls.append(
+            (
+                bool(disable_regularize_on_resample),
+                float(roughening_scale_on_resample),
+            )
+        )
+        self.last_resample_ess = True
+        self.last_ess_pre = 1.0
+        self.last_ess_post = float(len(self.continuous_particles))
+        return 1.0, True
+
+    monkeypatch.setattr(IsotopeParticleFilter, "_gpu_enabled", _fake_gpu_enabled)
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "_tempered_update",
+        _fake_tempered_update,
+    )
+
+    dummy_kernel = types.SimpleNamespace(
+        poses=[np.array([0.0, 0.0, 0.0], dtype=float)],
+        orientations=[np.array([1.0, 0.0, 0.0], dtype=float)],
+        num_sources=1,
+    )
+    filt = IsotopeParticleFilter(
+        "Cs-137",
+        kernel=dummy_kernel,
+        config=PFConfig(num_particles=2, use_tempering=True),
+    )
+
+    filt.update_continuous_pair(
+        z_obs=1.0,
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+        defer_resample=True,
+    )
+
+    assert calls == [(False, 0.15)]
+    assert filt._deferred_resampled_any
 
 
 def test_estimator_passes_obstacle_attenuation_to_filters():

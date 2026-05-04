@@ -1,0 +1,34 @@
+{
+  "name": "random_no_obstacle_low_isotope_case_02",
+  "metadata": {
+    "source_seed": 2026052202,
+    "obstacle_seed": null,
+    "blocked_fraction_target": 0.0,
+    "blocked_fraction_actual": 0.0,
+    "pattern_kind": "single_isotope",
+    "isotopes_present": [
+      "Co-60"
+    ],
+    "source_sampling": "full open room; single- or two-isotope stress cases; minimum xy source separation 2.0 m; minimum start-detector xy separation 2.0 m; intensities log-uniform 30000-90000 cps@1m"
+  },
+  "sources": [
+    {
+      "isotope": "Co-60",
+      "position": [
+        2.053,
+        11.02,
+        1.594
+      ],
+      "intensity_cps_1m": 57492.9
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        7.802,
+        8.823,
+        1.358
+      ],
+      "intensity_cps_1m": 33211.5
+    }
+  ]
+}

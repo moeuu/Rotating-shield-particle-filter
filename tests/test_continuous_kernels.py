@@ -10,7 +10,11 @@ from measurement.continuous_kernels import (
 )
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
-from measurement.shielding import generate_octant_orientations
+from measurement.shielding import (
+    DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    generate_octant_orientations,
+)
 from measurement.continuous_kernels import expected_counts_single_isotope
 from pf.gpu_utils import expected_counts_pair_torch
 
@@ -257,8 +261,8 @@ def test_spherical_shell_path_uses_radial_overlap_near_detector() -> None:
         mu_pb=0.0,
         thickness_fe_cm=5.0,
         thickness_pb_cm=0.0,
-        inner_radius_fe_cm=19.0,
-        inner_radius_pb_cm=26.0,
+        inner_radius_fe_cm=DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+        inner_radius_pb_cm=DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     )
     kernel = ContinuousKernel(
         mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.0}},
@@ -267,7 +271,8 @@ def test_spherical_shell_path_uses_radial_overlap_near_detector() -> None:
     )
     detector = np.zeros(3, dtype=float)
     direction = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
-    source = direction * 0.205
+    source_distance_m = (DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.55) / 100.0
+    source = direction * source_distance_m
 
     attenuation = kernel.attenuation_factor_pair(
         "Cs-137",
@@ -276,7 +281,7 @@ def test_spherical_shell_path_uses_radial_overlap_near_detector() -> None:
         fe_index=7,
         pb_index=0,
     )
-    assert attenuation == pytest.approx(np.exp(-0.1 * 1.5), rel=1e-12)
+    assert attenuation == pytest.approx(np.exp(-0.1 * 0.55), rel=1e-12)
 
 
 def test_concrete_obstacle_misses_off_axis_ray() -> None:
@@ -342,7 +347,8 @@ def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
     device = torch.device("cpu")
     dtype = torch.float64
     direction = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
-    source = direction * 0.205
+    source_distance_m = (DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.55) / 100.0
+    source = direction * source_distance_m
     positions = torch.as_tensor(source.reshape(1, 1, 3), device=device, dtype=dtype)
     strengths = torch.ones(1, 1, device=device, dtype=dtype)
     backgrounds = torch.zeros(1, device=device, dtype=dtype)
@@ -360,13 +366,13 @@ def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
         mu_pb=0.0,
         thickness_fe_cm=5.0,
         thickness_pb_cm=0.0,
-        inner_radius_fe_cm=19.0,
-        inner_radius_pb_cm=26.0,
+        inner_radius_fe_cm=DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+        inner_radius_pb_cm=DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
         live_time_s=1.0,
         device=device,
         dtype=dtype,
     )
-    expected = (1.0 / (0.205**2)) * np.exp(-0.15)
+    expected = (1.0 / (source_distance_m**2)) * np.exp(-0.055)
     assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
 
 
@@ -421,6 +427,203 @@ def test_continuous_kernel_cuda_matches_cpu_with_detector_aperture() -> None:
                 live_time_s=1.0,
             )
             assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)
+
+
+def test_kernel_values_all_pairs_matches_pair_values_cpu() -> None:
+    """All-pair kernel evaluation should match per-pair CPU evaluations."""
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    detector = np.array([0.1, -0.2, 0.8], dtype=float)
+    sources = np.array(
+        [
+            [1.0, 0.2, 0.8],
+            [-0.5, 1.4, 1.0],
+            [2.0, -1.0, 0.7],
+        ],
+        dtype=float,
+    )
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=5,
+    )
+
+    all_pair_values = kernel.kernel_values_all_pairs("Cs-137", detector, sources)
+    assert all_pair_values.shape == (64, sources.shape[0])
+
+    for fe_index in range(8):
+        for pb_index in range(8):
+            pair_id = fe_index * 8 + pb_index
+            pair_values = kernel.kernel_values_pair(
+                "Cs-137",
+                detector,
+                sources,
+                fe_index,
+                pb_index,
+            )
+            assert all_pair_values[pair_id] == pytest.approx(
+                pair_values,
+                rel=1.0e-12,
+                abs=1.0e-12,
+            )
+
+
+def test_kernel_values_all_pairs_for_detectors_matches_cpu_pairs() -> None:
+    """Batched detector all-pair evaluation should match scalar CPU calls."""
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    detectors = np.array(
+        [
+            [0.1, -0.2, 0.8],
+            [1.2, 0.4, 1.1],
+            [-0.6, 0.7, 0.9],
+        ],
+        dtype=float,
+    )
+    sources = np.array(
+        [
+            [1.0, 0.2, 0.8],
+            [-0.5, 1.4, 1.0],
+            [2.0, -1.0, 0.7],
+        ],
+        dtype=float,
+    )
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=5,
+    )
+
+    batched = kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+    )
+
+    assert batched.shape == (detectors.shape[0], 64, sources.shape[0])
+    for pose_idx, detector in enumerate(detectors):
+        expected = kernel.kernel_values_all_pairs("Cs-137", detector, sources)
+        assert batched[pose_idx] == pytest.approx(
+            expected,
+            rel=1.0e-12,
+            abs=1.0e-12,
+        )
+
+
+def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() -> None:
+    """All-pair CUDA kernel evaluation should match the CPU observation model."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detector = np.array([2.2, 2.2, 1.0], dtype=float)
+    sources = np.array(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    cpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+    )
+    gpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+    )
+
+    cpu_values = cpu_kernel.kernel_values_all_pairs("Cs-137", detector, sources)
+    gpu_values = gpu_kernel.kernel_values_all_pairs("Cs-137", detector, sources)
+
+    assert gpu_values == pytest.approx(cpu_values, rel=1.0e-10, abs=1.0e-10)
+
+
+def test_kernel_values_all_pairs_for_detectors_cuda_matches_cpu() -> None:
+    """Batched detector CUDA all-pair kernels should match CPU results."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detectors = np.array(
+        [
+            [2.2, 2.2, 1.0],
+            [3.2, 1.4, 1.1],
+        ],
+        dtype=float,
+    )
+    sources = np.array(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    cpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+    )
+    gpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+    )
+
+    cpu_values = cpu_kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+    )
+    gpu_values = gpu_kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+    )
+
+    assert gpu_values == pytest.approx(cpu_values, rel=1.0e-10, abs=1.0e-10)
 
 
 def test_continuous_kernel_cuda_matches_cpu_with_obstacles_and_aperture() -> None:

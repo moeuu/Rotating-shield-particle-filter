@@ -22,6 +22,8 @@ from realtime_demo import (
     _inflate_low_signal_variances,
     _is_adaptive_spectrum_ready,
     _isotope_count_balance_penalty,
+    _resolve_ig_workers,
+    _resolve_python_worker_count,
     _select_best_pair_from_scores,
     _signature_vector_is_dependent,
     _resolve_source_position_bounds,
@@ -59,6 +61,16 @@ def test_robot_path_segment_uses_obstacle_aware_grid_path() -> None:
     waypoints = np.asarray(segment["waypoints_xyz"], dtype=float)
     assert waypoints.ndim == 2
     assert np.max(waypoints[:, 1]) > 2.0
+
+
+def test_python_worker_auto_uses_all_logical_cpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Python planning worker auto mode should not be capped below CPU count."""
+    monkeypatch.setattr("realtime_demo.os.cpu_count", lambda: 32)
+
+    assert _resolve_python_worker_count(0) == 32
+    assert _resolve_python_worker_count(None) == 32
+    assert _resolve_ig_workers(0) == 32
+    assert _resolve_ig_workers(12) == 12
 
 
 def test_reachable_candidate_filter_removes_disconnected_free_cells() -> None:

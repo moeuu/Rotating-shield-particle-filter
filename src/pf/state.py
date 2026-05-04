@@ -22,8 +22,11 @@ class IsotopeState:
     ages: NDArray[np.int64] | None = None
     low_q_streaks: NDArray[np.int64] | None = None
     support_scores: NDArray[np.float64] | None = None
+    tentative_sources: NDArray[np.bool_] | None = None
+    verification_fail_streaks: NDArray[np.int64] | None = None
 
     def copy(self) -> "IsotopeState":
+        """Return a deep copy of the isotope state and per-source metadata."""
         return IsotopeState(
             num_sources=int(self.num_sources),
             positions=self.positions.copy(),
@@ -33,4 +36,12 @@ class IsotopeState:
             ages=None if self.ages is None else self.ages.copy(),
             low_q_streaks=None if self.low_q_streaks is None else self.low_q_streaks.copy(),
             support_scores=None if self.support_scores is None else self.support_scores.copy(),
+            tentative_sources=(
+                None if self.tentative_sources is None else self.tentative_sources.copy()
+            ),
+            verification_fail_streaks=(
+                None
+                if self.verification_fail_streaks is None
+                else self.verification_fail_streaks.copy()
+            ),
         )

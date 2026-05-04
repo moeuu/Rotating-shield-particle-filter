@@ -1,0 +1,109 @@
+[
+  {
+    "case": {
+      "description": "1 source(s), 1 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        1.5,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_00",
+      "obstacle_cells": [],
+      "pb_index": 1,
+      "sources": [
+        {
+          "intensity_cps_1m": 79901.73054081277,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.3881511651551426,
+            1.655089439547581,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 58802,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 59270,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 578,
+      "process_count_photoelectric": 32,
+      "process_count_rayleigh": 8,
+      "run_time_s": 0.124757,
+      "secondary_count": 610,
+      "source_equivalent_counts_Cs-137": 2948892.188149,
+      "total_spectrum_counts": 2938790.582624,
+      "total_track_steps": 59902,
+      "weighted_spectrum_effective_entries": 58816.456871,
+      "weighted_spectrum_sumw2": 146837986.305152,
+      "weighted_transport": false
+    },
+    "num_primaries": 59270.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1578.219376665541,
+          "photopeak_nnls": 2.5725986629943965e-14,
+          "response_matrix": 259.279199241715,
+          "response_poisson": 2.5725986629943965e-14
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 1003681071.4687364,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 951074.1822260091,
+          "photopeak_nnls": 2939712.946828564,
+          "response_matrix": 2938124.1416252768,
+          "response_poisson": 2938522.5355549734
+        },
+        "relative_errors": {
+          "peak_window": -0.6774808566931604,
+          "photopeak_nnls": -0.0031127761663201827,
+          "response_matrix": -0.003651556529221392,
+          "response_poisson": -0.003516457005645141
+        },
+        "response_poisson_variance": 3461808.03630953,
+        "source_tally_counts": 2948892.188149,
+        "target_pf_counts": 2948892.188148882
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 40076.39006118518,
+          "photopeak_nnls": 0.325543354602975,
+          "response_matrix": 554.9212393549307,
+          "response_poisson": 0.325543354602975
+        },
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 102294680.1542635,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 2938790.582628836,
+    "runtime_s": 1.4931509494781494,
+    "total_spectrum_counts": 2938788.5837677154
+  }
+]

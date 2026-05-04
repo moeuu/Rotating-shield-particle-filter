@@ -1,0 +1,86 @@
+{
+  "backend": "geant4",
+  "host": "127.0.0.1",
+  "port": 5561,
+  "timeout_s": 86400.0,
+  "auto_start_sidecar": true,
+  "start_isaacsim_sidecar_with_geant4": false,
+  "use_mock_stage": true,
+  "headless": true,
+  "renderer": "RayTracedLighting",
+  "usd_path": "/home/moeu/research/Rotating-shield-particle-filter/configs/isaacsim/demo_room.usda",
+  "random_environment_base_usd_path": "/home/moeu/research/Rotating-shield-particle-filter/configs/isaacsim/demo_room.usda",
+  "detector_height_m": 0.5,
+  "obstacle_height_m": 2.0,
+  "author_obstacle_prims": true,
+  "author_room_boundary_prims": true,
+  "engine_mode": "external",
+  "spectrum_count_method": "response_poisson",
+  "physics_profile": "balanced",
+  "thread_count": 32,
+  "random_seed_base": 2026043008,
+  "dead_time_tau_s": 5.813e-09,
+  "adaptive_ready_allow_informative_low": false,
+  "scatter_gain": 0.0,
+  "path_planner": "dss_pp",
+  "dss_pp": {
+    "horizon": 2,
+    "beam_width": 8,
+    "program_length": 2,
+    "max_programs": 24,
+    "signature_weight": 1.0,
+    "differential_weight": 1.0,
+    "count_balance_weight": 0.5,
+    "rotation_weight": 0.15,
+    "observation_weight": 1.0,
+    "enforce_min_observation": true,
+    "signature_std_min_counts": 1.0,
+    "augment_candidates": true,
+    "max_augmented_candidates": 256
+  },
+  "shield_signature_weight": 0.25,
+  "shield_low_count_penalty_weight": 1.0,
+  "shield_count_balance_weight": 0.25,
+  "shield_rotation_cost_weight": 0.05,
+  "response_poisson_photopeak_anchor": true,
+  "response_poisson_photopeak_anchor_min_snr": 0.25,
+  "response_poisson_photopeak_anchor_weight": 1.0,
+  "response_poisson_photopeak_anchor_variance_scale": 1.0,
+  "response_continuum_to_peak": 0.0,
+  "response_backscatter_fraction": 0.0,
+  "absorbing_transport_groups": [
+    "wall"
+  ],
+  "persistent_process": true,
+  "source_rate_model": "detector_cps_1m",
+  "source_bias_mode": "detector_cone",
+  "source_bias_cone_half_angle_deg": 0.0,
+  "source_bias_isotropic_fraction": 0.1,
+  "detector_scoring_mode": "incident_gamma_energy",
+  "executable_path": "build/geant4_sidecar",
+  "executable_args": [
+    "--background-cps",
+    "12.0"
+  ],
+  "detector_model": {
+    "crystal_radius_m": 0.038,
+    "crystal_length_m": 0.076,
+    "housing_thickness_m": 0.0015,
+    "crystal_shape": "sphere",
+    "crystal_material": "cebr3",
+    "housing_material": "aluminum"
+  },
+  "stage_material_rules": [
+    {
+      "path_prefix": "/World/SimBridge/Obstacles",
+      "material": "concrete"
+    },
+    {
+      "path_prefix": "/World/Environment",
+      "material": "concrete"
+    }
+  ],
+  "secondary_transport_mode": "gamma_only",
+  "primary_sampling_fraction": 1.0,
+  "shield_transmission_target": 0.2
+}

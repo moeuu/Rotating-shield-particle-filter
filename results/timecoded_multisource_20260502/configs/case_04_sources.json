@@ -1,0 +1,64 @@
+{
+  "name": "timecoded_multisource_case_04_cs4",
+  "metadata": {
+    "purpose": "Geant4/PF full run with multiple isotopes and four Cs-137 sources.",
+    "obstacles": "none",
+    "same_isotope_stress": "Cs-137 has 4 sources"
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [
+        1.5,
+        4.6,
+        1.2
+      ],
+      "intensity_cps_1m": 42000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        8.4,
+        4.0,
+        1.5
+      ],
+      "intensity_cps_1m": 58000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        2.6,
+        13.4,
+        1.0
+      ],
+      "intensity_cps_1m": 51000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        7.1,
+        17.2,
+        1.4
+      ],
+      "intensity_cps_1m": 65000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        5.5,
+        9.5,
+        1.6
+      ],
+      "intensity_cps_1m": 50000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        4.0,
+        18.8,
+        1.2
+      ],
+      "intensity_cps_1m": 44000.0
+    }
+  ]
+}

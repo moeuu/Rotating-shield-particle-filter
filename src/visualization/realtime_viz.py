@@ -197,6 +197,37 @@ def _filter_estimates(
     return positions[mask], strengths[mask]
 
 
+def _active_display_positions(filt: Any, state: Any) -> NDArray[np.float64]:
+    """Return source positions that should be rendered as active PF particles."""
+    num_sources = max(0, int(getattr(state, "num_sources", 0)))
+    raw_positions = np.asarray(
+        getattr(state, "positions", np.zeros((0, 3), dtype=float)),
+        dtype=float,
+    )
+    if num_sources <= 0 or raw_positions.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    positions = raw_positions.reshape((-1, 3))
+    count = min(num_sources, positions.shape[0])
+    if count <= 0:
+        return np.zeros((0, 3), dtype=float)
+    mask = np.ones(count, dtype=bool)
+    tentative = getattr(state, "tentative_sources", None)
+    failed = getattr(state, "verification_fail_streaks", None)
+    if tentative is not None and failed is not None:
+        tentative_arr = np.asarray(tentative, dtype=bool).ravel()[:count]
+        failed_arr = np.asarray(failed, dtype=int).ravel()[:count]
+        if tentative_arr.size == count and failed_arr.size == count:
+            config = getattr(filt, "config", None)
+            grace = max(
+                0,
+                int(getattr(config, "pseudo_source_fail_grace_stations", 0)),
+                int(getattr(config, "source_prune_fail_grace_stations", 0)),
+            )
+            quarantined = tentative_arr & (failed_arr > 0) & (failed_arr >= grace)
+            mask &= ~quarantined
+    return positions[:count][mask]
+
+
 class RealTimePFVisualizer:
     """
     Simple matplotlib-based 3D visualizer for the PF state.
@@ -1235,6 +1266,7 @@ class CUISplitPFVisualizer:
         self.measurement_points: list[NDArray[np.float64]] = []
         self.measurement_steps: list[int] = []
         self.measurement_visit_counts: list[int] = []
+        self.update_index = 0
         cmap = plt.get_cmap("tab10")
         self.colors = {
             iso: DEFAULT_ISOTOPE_COLORS.get(iso, cmap(i % 10))
@@ -1250,6 +1282,8 @@ class CUISplitPFVisualizer:
 
     def update(self, frame: PFFrame) -> None:
         """Render and save the split CUI views for one PF frame."""
+        self.update_index += 1
+        setattr(frame, "_cui_update_index", int(self.update_index))
         _extend_trajectory_history(self.trajectory, frame)
         self._record_path_segment(frame)
         self._record_measurement_point(frame)
@@ -1338,6 +1372,22 @@ class CUISplitPFVisualizer:
         if visits <= 1:
             return str(station_index)
         return f"{station_index}({visits})"
+
+    def _frame_progress_label(self, frame: PFFrame) -> str:
+        """Return a title suffix that separates measurement, render, and station progress."""
+        update_idx = int(getattr(frame, "_cui_update_index", 0))
+        station_idx = max(0, len(self.measurement_points) - 1)
+        visit_count = (
+            int(self.measurement_visit_counts[-1])
+            if self.measurement_visit_counts
+            else 0
+        )
+        return (
+            f"measurement={int(frame.step_index)} "
+            f"update={update_idx} "
+            f"station={station_idx} visit={visit_count} "
+            f"t={frame.time:.1f}s"
+        )
 
     def _write_index_html(self) -> None:
         """Write the browser page that auto-refreshes the latest PNG files."""
@@ -1557,15 +1607,17 @@ class CUISplitPFVisualizer:
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
-        ax.set_title(
-            f"Robot 2D position - step {frame.step_index} "
-            f"t={frame.time:.1f}s stations={len(self.measurement_points)}"
-        )
+        ax.set_title(f"Robot 2D position - {self._frame_progress_label(frame)}")
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper right", fontsize=8)
-        fig.tight_layout()
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+        )
+        fig.subplots_adjust(right=0.74)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_path, dpi=160)
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
 
     def _particle_subset(
@@ -1608,7 +1660,7 @@ class CUISplitPFVisualizer:
     def _save_pf_3d(self, frame: PFFrame, output_path: Path) -> None:
         """Save the current PF particles and estimates as a 3D PNG."""
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
-        fig = plt.figure(figsize=(8.0, 7.0))
+        fig = plt.figure(figsize=(9.4, 7.0))
         ax = fig.add_subplot(111, projection="3d")
         self._draw_obstacles_3d(ax)
         for idx, segment in enumerate(self.path_segments):
@@ -1707,15 +1759,17 @@ class CUISplitPFVisualizer:
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
-        ax.set_title(
-            f"Particle filter 3D - step {frame.step_index} "
-            f"t={frame.time:.1f}s stations={len(self.measurement_points)}"
-        )
+        ax.set_title(f"Particle filter 3D - {self._frame_progress_label(frame)}")
         ax.view_init(elev=26.0, azim=-58.0)
-        ax.legend(loc="upper left", fontsize=7)
-        fig.tight_layout()
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            fontsize=7,
+        )
+        fig.subplots_adjust(right=0.76)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_path, dpi=160)
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
 
     def _save_spectrum(self, frame: PFFrame, output_path: Path) -> None:
@@ -1767,7 +1821,7 @@ class CUISplitPFVisualizer:
         )
         ax.set_xlabel("Energy [keV]")
         ax.set_ylabel("Counts / bin")
-        ax.set_title(f"Spectrum decomposition - step {frame.step_index} t={frame.time:.1f}s")
+        ax.set_title(f"Spectrum decomposition - {self._frame_progress_label(frame)}")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper right", fontsize=8)
         fig.tight_layout()
@@ -1818,9 +1872,10 @@ def build_frame_from_pf(
         cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
         if cont_particles and len(cont_weights) == len(cont_particles):
             for p, w in zip(cont_particles, cont_weights):
-                if p.state.positions.size == 0:
+                active_positions = _active_display_positions(filt, p.state)
+                if active_positions.size == 0:
                     continue
-                for pos in p.state.positions:
+                for pos in active_positions:
                     positions.append(pos)
                     weights.append(float(w))
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))

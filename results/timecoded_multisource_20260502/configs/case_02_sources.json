@@ -1,0 +1,55 @@
+{
+  "name": "timecoded_multisource_case_02_eu3",
+  "metadata": {
+    "purpose": "Geant4/PF full run with multiple isotopes and three Eu-154 sources.",
+    "obstacles": "none",
+    "same_isotope_stress": "Eu-154 has 3 sources"
+  },
+  "sources": [
+    {
+      "isotope": "Eu-154",
+      "position": [
+        1.6,
+        7.2,
+        1.3
+      ],
+      "intensity_cps_1m": 50000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        6.8,
+        3.4,
+        1.0
+      ],
+      "intensity_cps_1m": 68000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        7.9,
+        14.8,
+        1.5
+      ],
+      "intensity_cps_1m": 59000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        3.4,
+        17.2,
+        1.1
+      ],
+      "intensity_cps_1m": 45000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        4.9,
+        10.0,
+        1.6
+      ],
+      "intensity_cps_1m": 52000.0
+    }
+  ]
+}

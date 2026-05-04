@@ -1,0 +1,72 @@
+{
+  "accuracy_summary": {
+    "peak_window": {
+      "max_abs_relative_error": 0.7166256255886974,
+      "max_absent_isotope_counts": 31338.055059014154,
+      "mean_abs_relative_error": 0.7166256255886974,
+      "mean_absent_isotope_counts": 16331.685861642402,
+      "median_abs_relative_error": 0.7166256255886974,
+      "num_absent_isotope_points": 2.0,
+      "num_accuracy_points": 1.0
+    },
+    "photopeak_nnls": {
+      "max_abs_relative_error": 0.12101178827599571,
+      "max_absent_isotope_counts": 0.341950100609946,
+      "mean_abs_relative_error": 0.12101178827599571,
+      "mean_absent_isotope_counts": 0.17097505030498586,
+      "median_abs_relative_error": 0.12101178827599571,
+      "num_absent_isotope_points": 2.0,
+      "num_accuracy_points": 1.0
+    },
+    "response_matrix": {
+      "max_abs_relative_error": 0.11583620349933971,
+      "max_absent_isotope_counts": 46977.34619084466,
+      "mean_abs_relative_error": 0.11583620349933971,
+      "mean_absent_isotope_counts": 34843.48164726933,
+      "median_abs_relative_error": 0.11583620349933971,
+      "num_absent_isotope_points": 2.0,
+      "num_accuracy_points": 1.0
+    },
+    "response_poisson": {
+      "max_abs_relative_error": 0.11797401481195018,
+      "max_absent_isotope_counts": 0.341950100609946,
+      "mean_abs_relative_error": 0.11797401481195018,
+      "mean_absent_isotope_counts": 0.17097505030498586,
+      "median_abs_relative_error": 0.11797401481195018,
+      "num_absent_isotope_points": 2.0,
+      "num_accuracy_points": 1.0
+    }
+  },
+  "cases": [
+    {
+      "description": "1 source(s), 1 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        1.5,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_00",
+      "obstacle_cells": [],
+      "pb_index": 1,
+      "sources": [
+        {
+          "intensity_cps_1m": 79901.73054081277,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.3881511651551426,
+            1.655089439547581,
+            0.5
+          ]
+        }
+      ]
+    }
+  ],
+  "config": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/variance_reduction_external_no_isaac_32threads.json",
+  "elapsed_s": 1.6482937335968018,
+  "min_target_counts": 25.0,
+  "num_cases": 1,
+  "output_dir": "/home/moeu/research/Rotating-shield-particle-filter/results/spectrum_validation/debug_one_case_after_incident_matrix"
+}

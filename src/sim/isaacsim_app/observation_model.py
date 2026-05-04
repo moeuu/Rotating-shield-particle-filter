@@ -27,9 +27,8 @@ from sim.transport import (
     make_transport_segment,
 )
 from sim.shield_geometry import (
-    FE_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_INNER_RADIUS_M,
     ShieldThicknessConfig,
+    nested_shield_inner_radii_cm,
     resolve_shield_thickness_config,
     spherical_octant_path_length_cm,
 )
@@ -78,6 +77,14 @@ def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
     )
 
 
+def _detector_outer_radius_cm(detector_model: dict[str, object] | None) -> float:
+    """Return detector housing outer radius from a detector-model payload."""
+    payload = {} if detector_model is None else dict(detector_model)
+    crystal_radius_m = float(payload.get("crystal_radius_m", 0.038))
+    housing_thickness_m = float(payload.get("housing_thickness_m", 0.0015))
+    return 100.0 * (crystal_radius_m + housing_thickness_m)
+
+
 class MockObservationModel(ObservationModel):
     """Generate bridge observations without requiring Isaac Sim installation."""
 
@@ -99,6 +106,11 @@ class MockObservationModel(ObservationModel):
             HVL_TVL_TABLE_MM,
             isotopes=list(decomposer.isotope_names),
         )
+        detector_outer_radius_cm = _detector_outer_radius_cm(detector_model)
+        fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
+            thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
+            detector_outer_radius_cm=detector_outer_radius_cm,
+        )
         self.transport_model = PythonTransportSpectrumModel(
             sources=(),
             decomposer=decomposer,
@@ -106,6 +118,8 @@ class MockObservationModel(ObservationModel):
             shield_params=ShieldParams(
                 thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
                 thickness_pb_cm=float(shield_thickness.thickness_pb_cm),
+                inner_radius_fe_cm=fe_inner_cm,
+                inner_radius_pb_cm=pb_inner_cm,
             ),
             obstacle_height_m=geometry.obstacle_height_m,
             scatter_gain=scatter_gain,
@@ -162,6 +176,11 @@ class IsaacSimObservationModel(ObservationModel):
             HVL_TVL_TABLE_MM,
             isotopes=list(self.decomposer.isotope_names),
         )
+        detector_outer_radius_cm = _detector_outer_radius_cm(detector_model)
+        fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
+            thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
+            detector_outer_radius_cm=detector_outer_radius_cm,
+        )
         self.transport_model = PythonTransportSpectrumModel(
             sources=(),
             decomposer=self.decomposer,
@@ -169,6 +188,8 @@ class IsaacSimObservationModel(ObservationModel):
             shield_params=ShieldParams(
                 thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
                 thickness_pb_cm=float(self.shield_thickness.thickness_pb_cm),
+                inner_radius_fe_cm=fe_inner_cm,
+                inner_radius_pb_cm=pb_inner_cm,
             ),
             obstacle_height_m=self.asset_geometry.obstacle_height_m,
             scatter_gain=self.scatter_gain,
@@ -278,14 +299,14 @@ class IsaacSimObservationModel(ObservationModel):
             detector_pose.translation_xyz,
             fe_pose.orientation_wxyz,
             thickness_cm=float(self.shield_thickness.thickness_fe_cm),
-            inner_radius_cm=FE_SHIELD_INNER_RADIUS_M * 100.0,
+            inner_radius_cm=self.transport_model.shield_params.inner_radius_fe_cm,
         )
         pb_length_cm = spherical_octant_path_length_cm(
             source_xyz,
             detector_pose.translation_xyz,
             pb_pose.orientation_wxyz,
             thickness_cm=float(self.shield_thickness.thickness_pb_cm),
-            inner_radius_cm=PB_SHIELD_INNER_RADIUS_M * 100.0,
+            inner_radius_cm=self.transport_model.shield_params.inner_radius_pb_cm,
         )
         return float(fe_length_cm), float(pb_length_cm)
 

@@ -14,6 +14,11 @@ from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
     ExportedDetectorModel,
 )
+from sim.shield_geometry import (
+    FE_SHIELD_INNER_RADIUS_M,
+    FE_SHIELD_THICKNESS_M,
+    PB_SHIELD_INNER_RADIUS_M,
+)
 
 
 def _geant4_runtime_config_paths() -> list[Path]:
@@ -74,6 +79,11 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["source_bias_isotropic_fraction"] == pytest.approx(1.0)
     assert payload["detector_scoring_mode"] == "full_transport"
     assert payload["secondary_transport_mode"] == "full_transport"
+    assert int(payload["thread_count"]) == 32
+    assert int(payload["python_worker_count"]) == 32
+    assert int(payload["ig_workers"]) == 32
+    assert int(payload["parallel_isotope_workers"]) == 32
+    assert int(payload["dss_pp"]["program_eval_workers"]) == 32
     assert "executable_args" not in payload
 
 
@@ -110,6 +120,10 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert config.detector_scoring_mode == "incident_gamma_energy"
     assert config.secondary_transport_mode == "gamma_only"
     assert config.primary_sampling_fraction == pytest.approx(0.02)
+    assert int(payload["python_worker_count"]) == 32
+    assert int(payload["ig_workers"]) == 32
+    assert int(payload["parallel_isotope_workers"]) == 32
+    assert int(payload["dss_pp"]["program_eval_workers"]) == 32
 
 
 def test_geant4_configs_use_large_detector_model() -> None:
@@ -146,6 +160,18 @@ def test_geant4_default_detector_model_matches_native_sidecar() -> None:
     assert "constexpr double kDefaultCrystalRadiusM = 0.038;" in source
     assert "constexpr double kDefaultCrystalLengthM = 0.076;" in source
     assert 'std::string crystal_shape = "sphere";' in source
+    assert "constexpr double kDefaultFeShieldInnerRadiusM = kDefaultShieldContactRadiusM;" in source
+    assert (
+        "constexpr double kDefaultPbShieldInnerRadiusM =\n"
+        "    kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;"
+        in source
+    )
+    assert FE_SHIELD_INNER_RADIUS_M == pytest.approx(
+        DEFAULT_DETECTOR_CRYSTAL_RADIUS_M + 0.0015
+    )
+    assert PB_SHIELD_INNER_RADIUS_M == pytest.approx(
+        FE_SHIELD_INNER_RADIUS_M + FE_SHIELD_THICKNESS_M
+    )
 
 
 def test_native_sidecar_detector_crystal_is_spherical() -> None:

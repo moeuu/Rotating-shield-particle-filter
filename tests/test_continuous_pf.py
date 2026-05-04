@@ -93,6 +93,47 @@ def test_poisson_weight_update_prefers_higher_lambda() -> None:
     assert weights[0] > weights[1]
 
 
+def test_deferred_pair_update_allows_scaled_roughening() -> None:
+    """Deferred station updates should resample with small roughening, not freeze positions."""
+    cfg = PFConfig(
+        num_particles=2,
+        use_tempering=True,
+        deferred_resample_roughening_scale=0.15,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    pf = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    captured: dict[str, float | bool] = {}
+
+    def fake_tempered_update(
+        *,
+        lam_fn,
+        z_obs,
+        observation_count_variance=0.0,
+        disable_regularize_on_resample=None,
+        roughening_scale_on_resample=1.0,
+    ):
+        """Capture resampling options passed by the deferred update path."""
+        captured["disable_regularize"] = bool(disable_regularize_on_resample)
+        captured["roughening_scale"] = float(roughening_scale_on_resample)
+        return 1.0, True
+
+    pf._tempered_update = fake_tempered_update
+    pf.update_continuous_pair(
+        z_obs=1.0,
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+        defer_resample=True,
+    )
+
+    assert captured["disable_regularize"] is False
+    assert captured["roughening_scale"] == 0.15
+
+
 def test_student_t_count_likelihood_softens_model_mismatch() -> None:
     """Robust count likelihood should not over-trust a simplified transport kernel."""
     z_obs = np.array([100.0], dtype=float)

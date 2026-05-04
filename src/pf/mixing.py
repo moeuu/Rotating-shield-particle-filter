@@ -155,10 +155,18 @@ def prune_spurious_sources_continuous(
     if not estimator.measurements:
         return {iso: np.ones(0, dtype=bool) for iso in estimator.filters}
 
+    use_gpu_kernel = False
+    pf_config = getattr(estimator, "pf_config", None)
+    if pf_config is not None and bool(getattr(pf_config, "use_gpu", False)):
+        from pf import gpu_utils
+
+        use_gpu_kernel = bool(gpu_utils.torch_available())
     kernel = ContinuousKernel(
         mu_by_isotope=estimator.mu_by_isotope,
         shield_params=estimator.shield_params,
-        use_gpu=False,
+        use_gpu=use_gpu_kernel,
+        gpu_device=str(getattr(pf_config, "gpu_device", "cuda")),
+        gpu_dtype=str(getattr(pf_config, "gpu_dtype", "float32")),
         obstacle_grid=getattr(estimator, "obstacle_grid", None),
         obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
         obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
@@ -193,8 +201,12 @@ def prune_spurious_sources_continuous(
             z_list.append(float(rec.z_k[iso]))
             live_times.append(float(rec.live_time_s))
             poses.append(estimator.poses[rec.pose_idx])
-            fe_indices.append(int(rec.fe_index) if rec.fe_index is not None else -1)
-            pb_indices.append(int(rec.pb_index) if rec.pb_index is not None else -1)
+            if rec.fe_index is not None and rec.pb_index is not None:
+                fe_indices.append(int(rec.fe_index))
+                pb_indices.append(int(rec.pb_index))
+            else:
+                fe_indices.append(int(rec.orient_idx))
+                pb_indices.append(int(rec.orient_idx))
         assert len(z_list) == len(live_times) == len(poses) == len(fe_indices) == len(pb_indices)
         if not z_list:
             keep_masks[iso] = np.ones(positions.shape[0], dtype=bool)

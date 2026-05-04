@@ -4,6 +4,9 @@ import numpy as np
 import pytest
 
 from measurement.shielding import (
+    DEFAULT_FE_SHIELD_THICKNESS_CM,
+    DEFAULT_PB_SHIELD_THICKNESS_CM,
+    DEFAULT_SHIELD_TRANSMISSION_TARGET,
     HVL_TVL_TABLE_MM,
     OCTANT_NORMALS,
     OctantShield,
@@ -160,3 +163,26 @@ def test_tvl_table_mu_and_attenuation_factors() -> None:
     assert eu_pb_factor == pytest.approx(10 ** (-(cs_pb_tvl / eu_pb_tvl)))
     assert co_fe_factor == pytest.approx(10 ** (-(cs_fe_tvl / co_fe_tvl)))
     assert eu_fe_factor == pytest.approx(10 ** (-(cs_fe_tvl / eu_fe_tvl)))
+
+
+def test_default_shield_thickness_targets_cs137_one_fifth() -> None:
+    """Default shield thicknesses should target one-fifth transmission for Cs-137 only."""
+    shield_params = ShieldParams()
+    mu_by_isotope = mu_by_isotope_from_tvl_mm(
+        HVL_TVL_TABLE_MM, isotopes=["Cs-137", "Co-60", "Eu-154"]
+    )
+
+    assert shield_params.thickness_fe_cm == pytest.approx(DEFAULT_FE_SHIELD_THICKNESS_CM)
+    assert shield_params.thickness_pb_cm == pytest.approx(DEFAULT_PB_SHIELD_THICKNESS_CM)
+    assert np.exp(-shield_params.mu_fe * shield_params.thickness_fe_cm) == pytest.approx(
+        DEFAULT_SHIELD_TRANSMISSION_TARGET
+    )
+    assert np.exp(-shield_params.mu_pb * shield_params.thickness_pb_cm) == pytest.approx(
+        DEFAULT_SHIELD_TRANSMISSION_TARGET
+    )
+    for isotope in ["Co-60", "Eu-154"]:
+        fe_factor = np.exp(-mu_by_isotope[isotope]["fe"] * shield_params.thickness_fe_cm)
+        pb_factor = np.exp(-mu_by_isotope[isotope]["pb"] * shield_params.thickness_pb_cm)
+
+        assert fe_factor != pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET)
+        assert pb_factor != pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET)

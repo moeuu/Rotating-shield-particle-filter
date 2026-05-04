@@ -1,0 +1,57 @@
+{
+  "name": "random_no_obstacle_sweep_case_09",
+  "metadata": {
+    "source_seed": 2026052109,
+    "obstacle_seed": null,
+    "blocked_fraction_target": 0.0,
+    "blocked_fraction_actual": 0.0,
+    "source_sampling": "full open room; 3-5 sources; all isotopes present; extra isotopes random; minimum xy source separation 2.0 m; minimum start-detector xy separation 2.0 m; intensities log-uniform 30000-90000 cps@1m"
+  },
+  "sources": [
+    {
+      "isotope": "Eu-154",
+      "position": [
+        3.877,
+        1.502,
+        1.658
+      ],
+      "intensity_cps_1m": 40817.7
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        7.377,
+        9.506,
+        1.039
+      ],
+      "intensity_cps_1m": 67109.9
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        9.074,
+        7.31,
+        1.044
+      ],
+      "intensity_cps_1m": 43876.7
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        2.68,
+        10.062,
+        1.707
+      ],
+      "intensity_cps_1m": 37238.6
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        5.677,
+        3.654,
+        1.488
+      ],
+      "intensity_cps_1m": 30055.5
+    }
+  ]
+}

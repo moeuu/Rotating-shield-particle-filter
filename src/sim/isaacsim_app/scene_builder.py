@@ -12,9 +12,9 @@ from measurement.model import PointSource
 
 from sim.isaacsim_app.stage_backend import StageBackend
 from sim.shield_geometry import (
-    FE_SHIELD_INNER_RADIUS_M,
-    PB_SHIELD_INNER_RADIUS_M,
+    SHIELD_CONTACT_RADIUS_M,
     ShieldThicknessConfig,
+    nested_shield_inner_radii_cm,
     resolve_shield_thickness_config,
 )
 
@@ -315,16 +315,21 @@ class SceneBuilder:
                 color_rgb=(0.02, 0.02, 0.02),
                 material="rubber",
             )
+        detector_visual_radius_m = SHIELD_CONTACT_RADIUS_M
         self.stage_backend.ensure_sphere(
             prim_paths.detector_path,
-            radius_m=0.16,
+            radius_m=detector_visual_radius_m,
             translation_xyz=(0.0, 0.0, self.detector_height_m),
             color_rgb=(0.0, 0.85, 1.0),
             material="air",
         )
+        fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
+            thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
+            detector_outer_radius_cm=100.0 * detector_visual_radius_m,
+        )
         fe_points, fe_counts, fe_indices = _octant_shell_mesh(
-            inner_radius_m=FE_SHIELD_INNER_RADIUS_M,
-            outer_radius_m=FE_SHIELD_INNER_RADIUS_M + float(self.shield_thickness.thickness_fe_cm) / 100.0,
+            inner_radius_m=fe_inner_cm / 100.0,
+            outer_radius_m=(fe_inner_cm + float(self.shield_thickness.thickness_fe_cm)) / 100.0,
             theta_steps=8,
             phi_steps=8,
         )
@@ -338,8 +343,8 @@ class SceneBuilder:
             material="fe",
         )
         pb_points, pb_counts, pb_indices = _octant_shell_mesh(
-            inner_radius_m=PB_SHIELD_INNER_RADIUS_M,
-            outer_radius_m=PB_SHIELD_INNER_RADIUS_M + float(self.shield_thickness.thickness_pb_cm) / 100.0,
+            inner_radius_m=pb_inner_cm / 100.0,
+            outer_radius_m=(pb_inner_cm + float(self.shield_thickness.thickness_pb_cm)) / 100.0,
             theta_steps=8,
             phi_steps=8,
         )

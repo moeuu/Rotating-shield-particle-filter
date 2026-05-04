@@ -14,12 +14,15 @@ import shutil
 import sys
 
 from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 LATEX_ROOT = ROOT.parent / "latex" / "projects" / "ieee-ra-l-letter"
 OUTPUT_ROOT = ROOT / "results" / "ral_isaac_figures"
+SERIF_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -187,37 +190,49 @@ def _backend(app: IsaacSimApplication):
     return backend
 
 
-def _author_context_prims(app: IsaacSimApplication) -> None:
-    """Add visual-only path, measurement, and ray guides for the captures."""
+def _author_context_prims(
+    app: IsaacSimApplication,
+    *,
+    include_robot_path: bool,
+) -> None:
+    """Add visual-only measurement path and source-ray guides for captures."""
     backend = _backend(app)
-    path_points = (
-        (1.2, 1.4, 0.08),
-        (2.4, 3.1, 0.08),
-        (4.3, 5.9, 0.08),
-        (5.5, 8.2, 0.08),
-        (7.1, 10.4, 0.08),
-        (8.0, 12.2, 0.08),
-    )
-    backend.ensure_polyline(
-        "/World/SimBridge/View/RobotPath",
-        points_xyz=path_points,
-        color_rgb=(0.05, 0.32, 1.0),
-        width_m=0.045,
-    )
-    for index, point in enumerate(path_points):
-        backend.ensure_sphere(
-            f"/World/SimBridge/View/Measurement_{index:02d}",
-            radius_m=0.085,
-            translation_xyz=point,
-            color_rgb=(0.05, 0.32, 1.0),
-            material="air",
+    if include_robot_path:
+        path_points = (
+            (1.2, 1.4, 0.08),
+            (2.4, 3.1, 0.08),
+            (4.3, 5.9, 0.08),
+            (5.5, 8.2, 0.08),
+            (7.1, 10.4, 0.08),
+            (8.0, 12.2, 0.08),
         )
+        backend.ensure_polyline(
+            "/World/SimBridge/View/RobotPath",
+            points_xyz=path_points,
+            color_rgb=(0.05, 0.32, 1.0),
+            width_m=0.045,
+        )
+        for index, point in enumerate(path_points):
+            backend.ensure_sphere(
+                f"/World/SimBridge/View/Measurement_{index:02d}",
+                radius_m=0.085,
+                translation_xyz=point,
+                color_rgb=(0.05, 0.32, 1.0),
+                material="air",
+            )
     detector = (4.3, 5.9, 0.72)
     for index, source in enumerate(_scene_description().sources):
-        end = source.position_xyz
+        source_marker = (source.position_xyz[0], source.position_xyz[1], 2.08)
+        backend.ensure_sphere(
+            f"/World/SimBridge/View/SourceMarker_{index:02d}",
+            radius_m=0.17,
+            translation_xyz=source_marker,
+            color_rgb=(1.0, 0.05, 0.02),
+            material="air",
+        )
         backend.ensure_polyline(
             f"/World/SimBridge/View/GammaRay_{index:02d}",
-            points_xyz=(end, detector),
+            points_xyz=(source_marker, detector),
             color_rgb=(1.0, 0.86, 0.05),
             width_m=0.026,
         )
@@ -281,13 +296,279 @@ def _save_pdf(image_path: Path, pdf_path: Path) -> None:
         image.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
 
 
+def _font(size_px: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Return a Times-compatible serif font for figure annotations."""
+    try:
+        return ImageFont.truetype(SERIF_FONT_REGULAR, size_px)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _text_box(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    *,
+    outline_rgb: tuple[int, int, int],
+) -> tuple[int, int, int, int]:
+    """Draw a compact in-figure label box and return its bounds."""
+    left, top = xy
+    bbox = draw.multiline_textbbox((left, top), text, font=font, spacing=4)
+    pad_x = 12
+    pad_y = 8
+    box = (
+        bbox[0] - pad_x,
+        bbox[1] - pad_y,
+        bbox[2] + pad_x,
+        bbox[3] + pad_y,
+    )
+    draw.rounded_rectangle(
+        box,
+        radius=4,
+        fill=(255, 255, 255, 232),
+        outline=outline_rgb + (255,),
+        width=3,
+    )
+    draw.multiline_text((left, top), text, fill=(15, 15, 15, 255), font=font, spacing=4)
+    return box
+
+
+def _callout(
+    draw: ImageDraw.ImageDraw,
+    *,
+    text: str,
+    label_xy: tuple[int, int],
+    target_xy: tuple[int, int],
+    color_rgb: tuple[int, int, int],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> None:
+    """Draw a label with a pointer line to the target feature."""
+    box = _text_box(draw, label_xy, text, font, outline_rgb=color_rgb)
+    start_x, start_y = _callout_anchor(box, target_xy)
+    draw.line(
+        (start_x, start_y, target_xy[0], target_xy[1]),
+        fill=color_rgb + (255,),
+        width=4,
+    )
+    radius = 8
+    draw.ellipse(
+        (
+            target_xy[0] - radius,
+            target_xy[1] - radius,
+            target_xy[0] + radius,
+            target_xy[1] + radius,
+        ),
+        fill=color_rgb + (255,),
+    )
+
+
+def _callout_many(
+    draw: ImageDraw.ImageDraw,
+    *,
+    text: str,
+    label_xy: tuple[int, int],
+    target_xys: tuple[tuple[int, int], ...],
+    color_rgb: tuple[int, int, int],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> None:
+    """Draw one label with pointer lines to several target features."""
+    box = _text_box(draw, label_xy, text, font, outline_rgb=color_rgb)
+    radius = 8
+    for target_xy in target_xys:
+        start_x, start_y = _callout_anchor(box, target_xy)
+        draw.line(
+            (start_x, start_y, target_xy[0], target_xy[1]),
+            fill=color_rgb + (255,),
+            width=4,
+        )
+        draw.ellipse(
+            (
+                target_xy[0] - radius,
+                target_xy[1] - radius,
+                target_xy[0] + radius,
+                target_xy[1] + radius,
+            ),
+            fill=color_rgb + (255,),
+        )
+
+
+def _callout_anchor(
+    box: tuple[int, int, int, int],
+    target_xy: tuple[int, int],
+) -> tuple[int, int]:
+    """Return the box-edge point nearest to the target without crossing text."""
+    left, top, right, bottom = box
+    target_x, target_y = target_xy
+    inset = 14
+    if target_y < top:
+        return min(max(target_x, left + inset), right - inset), top
+    if target_y > bottom:
+        return min(max(target_x, left + inset), right - inset), bottom
+    if target_x < left:
+        return left, min(max(target_y, top + inset), bottom - inset)
+    return right, min(max(target_y, top + inset), bottom - inset)
+
+
+def _legend(
+    draw: ImageDraw.ImageDraw,
+    *,
+    xy: tuple[int, int],
+    rows: tuple[tuple[str, tuple[int, int, int]], ...],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> None:
+    """Draw a small color legend inside a figure panel."""
+    left, top = xy
+    swatch_w = 68
+    pad_x = 22
+    pad_y = 18
+    text_sizes = [draw.textbbox((0, 0), label, font=font) for label, _ in rows]
+    text_width = max((bbox[2] - bbox[0] for bbox in text_sizes), default=0)
+    text_height = max((bbox[3] - bbox[1] for bbox in text_sizes), default=28)
+    row_h = max(56, text_height + 20)
+    width = pad_x * 3 + swatch_w + text_width
+    height = pad_y * 2 + row_h * len(rows)
+    draw.rounded_rectangle(
+        (left, top, left + width, top + height),
+        radius=4,
+        fill=(255, 255, 255, 228),
+        outline=(35, 35, 35, 255),
+        width=2,
+    )
+    for index, (label, color) in enumerate(rows):
+        y = top + pad_y + index * row_h
+        center_y = y + row_h // 2
+        draw.line(
+            (left + pad_x, center_y, left + pad_x + swatch_w, center_y),
+            fill=color + (255,),
+            width=5,
+        )
+        draw.text(
+            (left + pad_x * 2 + swatch_w, center_y - text_height // 2),
+            label,
+            fill=(15, 15, 15, 255),
+            font=font,
+        )
+
+
+def _annotate_capture(image_path: Path, kind: str) -> Path:
+    """Add publication-style component labels to one manuscript capture."""
+    with Image.open(image_path).convert("RGBA") as image:
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        label_font = _font(60)
+        legend_font = _font(58)
+        if kind == "detector":
+            _callout(
+                draw,
+                text="CeBr3\ndetector",
+                label_xy=(980, 210),
+                target_xy=(832, 566),
+                color_rgb=(0, 140, 165),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="Fe octant\nshield",
+                label_xy=(445, 735),
+                target_xy=(683, 712),
+                color_rgb=(210, 150, 0),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="Pb octant\nshield",
+                label_xy=(950, 670),
+                target_xy=(948, 520),
+                color_rgb=(95, 105, 130),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="mobile\nbase",
+                label_xy=(970, 880),
+                target_xy=(850, 930),
+                color_rgb=(65, 80, 90),
+                font=label_font,
+            )
+        elif kind == "problem":
+            _callout(
+                draw,
+                text="robot +\nNondirectional Detector\n+ Fe/Pb shields",
+                label_xy=(300, 720),
+                target_xy=(812, 675),
+                color_rgb=(0, 120, 150),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="cluttered 3-D environment",
+                label_xy=(1025, 805),
+                target_xy=(1210, 620),
+                color_rgb=(80, 80, 80),
+                font=label_font,
+            )
+            _callout_many(
+                draw,
+                text="radiation sources",
+                label_xy=(1255, 150),
+                target_xys=((1195, 88), (620, 158), (1205, 523)),
+                color_rgb=(190, 55, 45),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="gamma\nrays",
+                label_xy=(1265, 390),
+                target_xy=(1010, 565),
+                color_rgb=(210, 170, 0),
+                font=label_font,
+            )
+        elif kind == "environment":
+            _legend(
+                draw,
+                xy=(44, 44),
+                rows=(
+                    ("measurement path", (0, 88, 210)),
+                    ("gamma path", (220, 180, 0)),
+                    ("blocked cell", (85, 92, 96)),
+                ),
+                font=legend_font,
+            )
+            _callout(
+                draw,
+                text="traversable\ncorridor",
+                label_xy=(1120, 705),
+                target_xy=(890, 610),
+                color_rgb=(85, 85, 85),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="robot\nstation",
+                label_xy=(640, 800),
+                target_xy=(756, 710),
+                color_rgb=(0, 120, 150),
+                font=label_font,
+            )
+            _callout(
+                draw,
+                text="concrete\nobstacle",
+                label_xy=(1130, 250),
+                target_xy=(1220, 422),
+                color_rgb=(80, 80, 80),
+                font=label_font,
+            )
+        annotated = Image.alpha_composite(image, overlay).convert("RGB")
+        annotated.save(image_path)
+    return image_path
+
+
 def _copy_to_manuscript() -> None:
-    """Copy generated PDFs into the RA-L manuscript figure locations."""
+    """Copy generated PDFs into the current RA-L manuscript figure locations."""
     copies = {
-        "problem_setting.pdf": LATEX_ROOT / "sections/01_introduction/figures/ProblemSetting.pdf",
-        "detector_module.pdf": LATEX_ROOT / "sections/03_method/figures/Detector.pdf",
-        "simulation_environment.pdf": (
-            LATEX_ROOT / "sections/04_experiments/figures/Simulation_environment.pdf"
+        "problem_setting.pdf": (
+            LATEX_ROOT / "sections/01_introduction/figures/ProblemSetting.pdf"
         ),
     }
     for source_name, destination in copies.items():
@@ -315,15 +596,16 @@ def main() -> None:
             name="detector_module",
             resolution=(1600, 1050),
         )
+        _annotate_capture(detector, "detector")
 
         app.step(_command(step_id=20, pose_xy=(4.3, 5.9), yaw=1.05, fe=0, pb=6))
-        _author_context_prims(app)
+        _author_context_prims(app, include_robot_path=False)
         _set_camera(
             app,
             "/World/SimBridge/View/ProblemCamera",
-            eye=(5.3, -4.6, 6.4),
-            target=(5.2, 8.2, 0.7),
-            focal_length_mm=26.0,
+            eye=(5.1, -5.6, 11.7),
+            target=(5.0, 8.0, 0.2),
+            focal_length_mm=22.0,
         )
         problem = _capture(
             camera_path="/World/SimBridge/View/ProblemCamera",
@@ -331,6 +613,7 @@ def main() -> None:
             name="problem_setting",
             resolution=(1800, 1050),
         )
+        _annotate_capture(problem, "problem")
 
         _set_camera(
             app,
@@ -339,12 +622,14 @@ def main() -> None:
             target=(5.0, 8.0, 0.1),
             focal_length_mm=23.0,
         )
+        _author_context_prims(app, include_robot_path=True)
         environment = _capture(
             camera_path="/World/SimBridge/View/EnvironmentCamera",
             output_dir=OUTPUT_ROOT,
             name="simulation_environment",
             resolution=(1700, 1150),
         )
+        _annotate_capture(environment, "environment")
 
         for image_path in (problem, detector, environment):
             _save_pdf(image_path, image_path.with_suffix(".pdf"))

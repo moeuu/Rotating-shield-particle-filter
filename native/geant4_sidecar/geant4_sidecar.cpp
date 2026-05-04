@@ -69,6 +69,17 @@ namespace {
 constexpr double kDefaultCrystalRadiusM = 0.038;
 constexpr double kDefaultCrystalLengthM = 0.076;
 constexpr double kDefaultHousingThicknessM = 0.0015;
+constexpr double kDefaultShieldContactRadiusM = kDefaultCrystalRadiusM + kDefaultHousingThicknessM;
+constexpr double kDefaultShieldTransmissionScale = 0.6989700043360189;
+constexpr double kDefaultFeShieldTvlThicknessM = 0.05;
+constexpr double kDefaultPbShieldTvlThicknessM = 0.022;
+constexpr double kDefaultFeShieldThicknessM =
+    kDefaultFeShieldTvlThicknessM * kDefaultShieldTransmissionScale;
+constexpr double kDefaultPbShieldThicknessM =
+    kDefaultPbShieldTvlThicknessM * kDefaultShieldTransmissionScale;
+constexpr double kDefaultFeShieldInnerRadiusM = kDefaultShieldContactRadiusM;
+constexpr double kDefaultPbShieldInnerRadiusM =
+    kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;
 
 struct MaterialSpec {
     std::string name;
@@ -118,14 +129,38 @@ struct ShieldSpec {
     std::string kind;
     std::string path;
     std::string shape = "spherical_octant_shell";
-    double inner_radius_m = 0.19;
-    double outer_radius_m = 0.24;
-    double thickness_m = 0.05;
+    double inner_radius_m = kDefaultFeShieldInnerRadiusM;
+    double outer_radius_m = kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;
+    double thickness_m = kDefaultFeShieldThicknessM;
     double sx = 0.25;
     double sy = 0.08;
     double sz = 0.25;
     MaterialSpec material;
 };
+
+ShieldSpec DefaultFeShieldSpec() {
+    ShieldSpec shield;
+    shield.kind = "fe";
+    shield.shape = "spherical_octant_shell";
+    shield.inner_radius_m = kDefaultFeShieldInnerRadiusM;
+    shield.thickness_m = kDefaultFeShieldThicknessM;
+    shield.outer_radius_m = shield.inner_radius_m + shield.thickness_m;
+    shield.material.name = "fe";
+    shield.material.preset_name = "iron";
+    return shield;
+}
+
+ShieldSpec DefaultPbShieldSpec() {
+    ShieldSpec shield;
+    shield.kind = "pb";
+    shield.shape = "spherical_octant_shell";
+    shield.inner_radius_m = kDefaultPbShieldInnerRadiusM;
+    shield.thickness_m = kDefaultPbShieldThicknessM;
+    shield.outer_radius_m = shield.inner_radius_m + shield.thickness_m;
+    shield.material.name = "pb";
+    shield.material.preset_name = "lead";
+    return shield;
+}
 
 struct PoseSpec {
     double x = 0.0;
@@ -144,8 +179,8 @@ struct SceneSpec {
     double room_y = 20.0;
     double room_z = 10.0;
     DetectorSpec detector;
-    ShieldSpec fe_shield;
-    ShieldSpec pb_shield;
+    ShieldSpec fe_shield = DefaultFeShieldSpec();
+    ShieldSpec pb_shield = DefaultPbShieldSpec();
     std::vector<SourceSpec> sources;
     std::vector<VolumeSpec> volumes;
 };
@@ -1699,8 +1734,9 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
             scene.detector.crystal_material = ParseString(fields, "crystal_material", "cebr3");
             scene.detector.housing_material = ParseString(fields, "housing_material", "aluminum");
         } else if (tokens[0] == "SHIELD") {
-            ShieldSpec shield;
-            shield.kind = ParseString(fields, "kind");
+            const auto shield_kind = ParseString(fields, "kind");
+            ShieldSpec shield = shield_kind == "pb" ? DefaultPbShieldSpec() : DefaultFeShieldSpec();
+            shield.kind = shield_kind;
             shield.path = ParseString(fields, "path");
             shield.shape = ParseString(fields, "shape", "spherical_octant_shell");
             shield.inner_radius_m = ParseDouble(fields, "inner_radius_m", shield.inner_radius_m);

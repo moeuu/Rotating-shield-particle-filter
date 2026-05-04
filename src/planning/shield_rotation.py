@@ -21,10 +21,14 @@ def _resolve_gpu_context(
     estimator: RotatingShieldPFEstimator,
 ) -> Tuple[object, object, object, object] | None:
     """Return (torch, gpu_utils, device, dtype) for GPU evaluation if available."""
-    if not hasattr(estimator, "_gpu_enabled") or not estimator._gpu_enabled():
-        raise RuntimeError("GPU-only mode requires estimator GPU support.")
+    if not bool(getattr(estimator.pf_config, "use_gpu", False)):
+        return None
     from pf import gpu_utils
+
+    if not gpu_utils.torch_available():
+        return None
     import torch
+
     device = gpu_utils.resolve_device(estimator.pf_config.gpu_device)
     dtype = gpu_utils.resolve_dtype(estimator.pf_config.gpu_dtype)
     return torch, gpu_utils, device, dtype
@@ -93,6 +97,9 @@ def _continuous_kernel_for_estimator(estimator: RotatingShieldPFEstimator):
         obstacle_buildup_coeff=float(getattr(estimator, "obstacle_buildup_coeff", 0.0)),
         detector_radius_m=float(getattr(estimator, "detector_radius_m", 0.0)),
         detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
+        use_gpu=bool(getattr(estimator.pf_config, "use_gpu", False)),
+        gpu_device=str(getattr(estimator.pf_config, "gpu_device", "cuda")),
+        gpu_dtype=str(getattr(estimator.pf_config, "gpu_dtype", "float32")),
     )
 
 
@@ -121,6 +128,19 @@ def _surrogate_scores(
     alphas = {k: v / alpha_sum for k, v in alphas.items()}
     eps = 1e-12
     gpu_ctx = _resolve_gpu_context(estimator)
+    if gpu_ctx is None:
+        return _surrogate_scores_cpu(
+            estimator=estimator,
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+            particles_by_isotope=particles_by_isotope,
+            RFe_candidates=RFe_candidates,
+            RPb_candidates=RPb_candidates,
+            alphas=alphas,
+            allowed_indices=allowed_indices,
+            metric=metric,
+            eps=eps,
+        )
     return _surrogate_scores_gpu(
         estimator=estimator,
         pose_idx=pose_idx,
@@ -134,6 +154,56 @@ def _surrogate_scores(
         gpu_ctx=gpu_ctx,
         eps=eps,
     )
+
+
+def _surrogate_scores_cpu(
+    estimator: RotatingShieldPFEstimator,
+    pose_idx: int,
+    live_time_s: float,
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    RFe_candidates: np.ndarray,
+    RPb_candidates: np.ndarray,
+    alphas: Dict[str, float],
+    allowed_indices: set[int] | None,
+    metric: str,
+    eps: float,
+) -> Dict[int, float]:
+    """Compute surrogate orientation scores on CPU with the estimator kernel."""
+    from measurement.shielding import octant_index_from_rotation
+
+    fe_indices = [octant_index_from_rotation(R) for R in RFe_candidates]
+    pb_indices = [octant_index_from_rotation(R) for R in RPb_candidates]
+    scores: Dict[int, float] = {}
+    num_pb = len(RPb_candidates)
+    for fe_pos, fe_idx in enumerate(fe_indices):
+        for pb_pos, pb_idx in enumerate(pb_indices):
+            oid = fe_pos * num_pb + pb_pos
+            if allowed_indices is not None and oid not in allowed_indices:
+                continue
+            score = 0.0
+            for iso, (states, weights) in particles_by_isotope.items():
+                if not states:
+                    continue
+                weights_arr = _normalize_weights(np.asarray(weights, dtype=float))
+                lam = estimator.expected_counts_pair_for_states(
+                    isotope=iso,
+                    pose_idx=pose_idx,
+                    fe_index=int(fe_idx),
+                    pb_index=int(pb_idx),
+                    live_time_s=live_time_s,
+                    states=states,
+                )
+                if metric == "var_log_lambda":
+                    vals = np.log(np.asarray(lam, dtype=float) + eps)
+                elif metric == "var_lambda":
+                    vals = np.asarray(lam, dtype=float)
+                else:
+                    raise ValueError(f"Unknown surrogate metric: {metric}")
+                mean = float(np.sum(weights_arr * vals))
+                var = float(np.sum(weights_arr * (vals - mean) ** 2))
+                score += alphas.get(iso, 0.0) * var
+            scores[oid] = score
+    return scores
 
 
 def _surrogate_scores_gpu(
@@ -252,6 +322,18 @@ def _eig_scores(
     if not particles_by_isotope:
         raise RuntimeError("GPU-only mode requires particles_by_isotope for EIG scoring.")
     gpu_ctx = _resolve_gpu_context(estimator)
+    if gpu_ctx is None:
+        return _eig_scores_cpu(
+            estimator=estimator,
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+            candidate_ids=candidate_ids,
+            RFe_candidates=RFe_candidates,
+            RPb_candidates=RPb_candidates,
+            alpha_by_isotope=alpha_by_isotope,
+            particles_by_isotope=particles_by_isotope,
+            num_samples=num_samples,
+        )
     return _eig_scores_gpu(
         estimator=estimator,
         pose_idx=pose_idx,
@@ -264,6 +346,39 @@ def _eig_scores(
         num_samples=num_samples,
         gpu_ctx=gpu_ctx,
     )
+
+
+def _eig_scores_cpu(
+    estimator: RotatingShieldPFEstimator,
+    pose_idx: int,
+    live_time_s: float,
+    candidate_ids: List[int],
+    RFe_candidates: np.ndarray,
+    RPb_candidates: np.ndarray,
+    alpha_by_isotope: Dict[str, float] | None,
+    particles_by_isotope: Dict[str, Tuple[list, np.ndarray]],
+    num_samples: int | None,
+) -> Dict[int, float]:
+    """Compute EIG scores on CPU using the estimator EIG implementation."""
+    scores: Dict[int, float] = {}
+    num_pb = len(RPb_candidates)
+    rng = np.random.default_rng()
+    for oid in candidate_ids:
+        fe_idx = int(oid) // num_pb
+        pb_idx = int(oid) % num_pb
+        scores[int(oid)] = float(
+            estimator.orientation_expected_information_gain(
+                pose_idx=pose_idx,
+                RFe=RFe_candidates[fe_idx],
+                RPb=RPb_candidates[pb_idx],
+                live_time_s=live_time_s,
+                num_samples=num_samples,
+                alpha_by_isotope=alpha_by_isotope,
+                particles_by_isotope=particles_by_isotope,
+                rng=rng,
+            )
+        )
+    return scores
 
 
 def _eig_scores_gpu(
@@ -622,6 +737,101 @@ def select_top_k_orientations(
     order = np.argsort(scores)[::-1]
     top_ids = [candidate_ids[i] for i in order[:k]]
     return top_ids
+
+
+def select_separation_orientations(
+    estimator: RotatingShieldPFEstimator,
+    pose_idx: int,
+    candidate_positions: np.ndarray | None = None,
+    k: int = 8,
+    *,
+    method: str = "pairwise_contrast_cover",
+    isotope: str | None = None,
+    live_time_s: float = 1.0,
+) -> List[Tuple[int, int]]:
+    """
+    Select a temporal shield program for separating same-isotope source modes.
+
+    The returned values are ``(fe_index, pb_index)`` orientation pairs. This API
+    keeps the Fe/Pb 1/8 spherical-octant geometry fixed and only changes the
+    time order of material/orientation pairs.
+    """
+    if pose_idx < 0 or pose_idx >= len(estimator.poses):
+        raise IndexError("pose_idx out of range")
+    method_norm = str(method).strip().lower()
+    if method_norm not in {"pairwise_contrast_cover", "temporal_separation"}:
+        raise ValueError("method must be 'pairwise_contrast_cover' or 'temporal_separation'.")
+    from planning import dss_pp
+
+    program_length = max(1, int(k))
+    pose_xyz = np.asarray(estimator.poses[pose_idx], dtype=float)
+    if candidate_positions is None:
+        modes_by_isotope = dss_pp.extract_signature_modes(
+            estimator,
+            max_particles=getattr(estimator.pf_config, "planning_particles", None),
+            method=getattr(estimator.pf_config, "planning_method", None),
+            mode_cluster_radius_m=1.5,
+            max_modes_per_isotope=max(2, program_length),
+        )
+    else:
+        positions = np.asarray(candidate_positions, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError("candidate_positions must be shaped (N, 3).")
+        isotopes = [isotope] if isotope is not None else list(estimator.isotopes)
+        modes_by_isotope = {
+            iso: [
+                dss_pp.SignatureMode(
+                    isotope=iso,
+                    position_xyz=np.asarray(pos, dtype=float),
+                    strength_cps_1m=1.0,
+                    weight=1.0 / max(int(positions.shape[0]), 1),
+                    spread_m=0.0,
+                )
+                for pos in positions
+            ]
+            for iso in isotopes
+        }
+    cfg = dss_pp.DSSPPConfig(
+        program_length=program_length,
+        max_programs=max(1, program_length),
+        live_time_s=float(live_time_s),
+        lambda_eig=0.0,
+        lambda_signature=0.0,
+        lambda_temporal_separation=1.0,
+        temporal_cover_programs=1,
+    )
+    kernel = dss_pp._continuous_kernel_for_estimator(estimator)
+    program = dss_pp._greedy_pairwise_contrast_program(
+        estimator=estimator,
+        kernel=kernel,
+        modes_by_isotope=modes_by_isotope,
+        pose_xyz=pose_xyz,
+        config=cfg,
+    )
+    if program is None:
+        base_programs = dss_pp.build_shield_program_library(
+            estimator.normals,
+            program_length=program_length,
+            max_programs=max(1, program_length),
+        )
+        if not base_programs:
+            return []
+        program = max(
+            base_programs,
+            key=lambda candidate: dss_pp._score_program(
+                estimator=estimator,
+                kernel=kernel,
+                modes_by_isotope=modes_by_isotope,
+                pose_xyz=pose_xyz,
+                program=candidate,
+                config=cfg,
+            )[1],
+        )
+    num_orients = int(estimator.num_orientations)
+    return [
+        (int(pair_id) // num_orients, int(pair_id) % num_orients)
+        for pair_id in program.pair_ids[:program_length]
+    ]
 
 
 def rotation_policy_step(

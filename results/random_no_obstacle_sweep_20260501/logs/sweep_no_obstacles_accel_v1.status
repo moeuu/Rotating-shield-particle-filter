@@ -1,0 +1,130 @@
+[no-obstacles-v1] case 01 start 2026-05-01 19:06:21
+[no-obstacles-v1] case 01 done 2026-05-01 19:12:49
+Total measurements: 26, live=80.0s, travel=179.5s, shield=13.0s, mission=272.5s
+Mission timing summary: distance=89.77m motion=179.5s rotation=13.0s end_to_end=272.5s compute=161.080s ig_mean=0.733s pf_mean=1.228s wall_clock=378.34s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.5125, median=0.5125, rmse=0.5125, max=0.5125
+  Intensity rel error [%]: mean=38.82, median=38.82, max=38.82
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.668, median=0.668, rmse=0.668, max=0.668
+  Intensity rel error [%]: mean=34.21, median=34.21, max=34.21
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=1.416, median=1.416, rmse=1.416, max=1.416
+  Intensity rel error [%]: mean=52.33, median=52.33, max=52.33
+[no-obstacles-v1] case 02 start 2026-05-01 19:12:49
+[no-obstacles-v1] case 02 done 2026-05-01 19:21:35
+Total measurements: 30, live=108.0s, travel=188.7s, shield=15.0s, mission=311.7s
+Mission timing summary: distance=94.34m motion=188.7s rotation=15.0s end_to_end=311.7s compute=222.697s ig_mean=0.759s pf_mean=1.771s wall_clock=518.23s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.8117, median=0.8117, rmse=0.8117, max=0.8117
+  Intensity rel error [%]: mean=3.929, median=3.929, max=3.929
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.7645, median=0.7645, rmse=0.7645, max=0.7645
+  Intensity rel error [%]: mean=36.59, median=36.59, max=36.59
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=2.126, median=2.126, rmse=2.126, max=2.126
+  Intensity rel error [%]: mean=29.03, median=29.03, max=29.03
+[no-obstacles-v1] case 03 start 2026-05-01 19:21:35
+[no-obstacles-v1] case 03 done 2026-05-01 19:28:21
+Total measurements: 25, live=128.0s, travel=150.6s, shield=12.5s, mission=291.1s
+Mission timing summary: distance=75.29m motion=150.6s rotation=12.5s end_to_end=291.1s compute=157.252s ig_mean=0.675s pf_mean=1.499s wall_clock=397.48s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.4277, median=0.4277, rmse=0.4277, max=0.4277
+  Intensity rel error [%]: mean=41.32, median=41.32, max=41.32
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.8266, median=0.8266, rmse=0.8266, max=0.8266
+  Intensity rel error [%]: mean=38.79, median=38.79, max=38.79
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.7319, median=0.7319, rmse=0.7319, max=0.7319
+  Intensity rel error [%]: mean=8.098, median=8.098, max=8.098
+[no-obstacles-v1] case 04 start 2026-05-01 19:28:21
+[no-obstacles-v1] case 04 done 2026-05-01 19:35:33
+Total measurements: 28, live=172.0s, travel=146.7s, shield=14.0s, mission=332.7s
+Mission timing summary: distance=73.37m motion=146.7s rotation=14.0s end_to_end=332.7s compute=177.464s ig_mean=0.728s pf_mean=1.389s wall_clock=422.86s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=1.065, median=1.065, rmse=1.065, max=1.065
+  Intensity rel error [%]: mean=42.95, median=42.95, max=42.95
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.5662, median=0.5662, rmse=0.5662, max=0.5662
+  Intensity rel error [%]: mean=31.45, median=31.45, max=31.45
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=1.598, median=1.598, rmse=1.598, max=1.598
+  Intensity rel error [%]: mean=11.82, median=11.82, max=11.82
+[no-obstacles-v1] case 05 start 2026-05-01 19:35:33
+[no-obstacles-v1] case 05 done 2026-05-01 19:43:11
+Total measurements: 26, live=128.0s, travel=150.7s, shield=13.0s, mission=291.7s
+Mission timing summary: distance=75.34m motion=150.7s rotation=13.0s end_to_end=291.7s compute=177.704s ig_mean=0.751s pf_mean=1.639s wall_clock=447.63s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=1.46, median=1.46, rmse=1.46, max=1.46
+  Intensity rel error [%]: mean=54.03, median=54.03, max=54.03
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.5682, median=0.5682, rmse=0.5682, max=0.5682
+  Intensity rel error [%]: mean=38.66, median=38.66, max=38.66
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=1.402, median=1.402, rmse=1.402, max=1.402
+  Intensity rel error [%]: mean=2.482, median=2.482, max=2.482
+[no-obstacles-v1] case 06 start 2026-05-01 19:43:11
+[no-obstacles-v1] case 06 done 2026-05-01 19:51:02
+Total measurements: 28, live=58.0s, travel=154.2s, shield=14.0s, mission=226.2s
+Mission timing summary: distance=77.08m motion=154.2s rotation=14.0s end_to_end=226.2s compute=181.324s ig_mean=0.779s pf_mean=1.405s wall_clock=463.13s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.6947, median=0.6947, rmse=0.6947, max=0.6947
+  Intensity rel error [%]: mean=17.96, median=17.96, max=17.96
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=0.8068, median=0.8068, rmse=0.8068, max=0.8068
+  Intensity rel error [%]: mean=36.56, median=36.56, max=36.56
+  GT=2, EST=1, Assigned=1, TP=1, FP=0, FN=1
+  Position error [m]: mean=1.858, median=1.858, rmse=1.858, max=1.858
+  Intensity rel error [%]: mean=20.73, median=20.73, max=20.73
+[no-obstacles-v1] case 07 start 2026-05-01 19:51:02
+[no-obstacles-v1] case 07 done 2026-05-01 19:59:11
+Total measurements: 29, live=166.0s, travel=156.1s, shield=14.5s, mission=336.6s
+Mission timing summary: distance=78.03m motion=156.1s rotation=14.5s end_to_end=336.6s compute=175.272s ig_mean=0.735s pf_mean=1.266s wall_clock=482.24s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.5966, median=0.5966, rmse=0.5966, max=0.5966
+  Intensity rel error [%]: mean=18.5, median=18.5, max=18.5
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.4356, median=0.4356, rmse=0.4356, max=0.4356
+  Intensity rel error [%]: mean=27.61, median=27.61, max=27.61
+  GT=2, EST=2, Assigned=2, TP=2, FP=0, FN=0
+  Position error [m]: mean=0.7368, median=0.7368, rmse=0.8606, max=1.181
+  Intensity rel error [%]: mean=6.583, median=6.583, max=11.44
+[no-obstacles-v1] case 08 start 2026-05-01 19:59:11
+[no-obstacles-v1] case 08 done 2026-05-01 20:07:05
+Total measurements: 28, live=118.0s, travel=150.0s, shield=14.0s, mission=282.0s
+Mission timing summary: distance=75.00m motion=150.0s rotation=14.0s end_to_end=282.0s compute=191.112s ig_mean=0.760s pf_mean=1.375s wall_clock=465.43s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.2065, median=0.2065, rmse=0.2065, max=0.2065
+  Intensity rel error [%]: mean=19.07, median=19.07, max=19.07
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.7255, median=0.7255, rmse=0.7255, max=0.7255
+  Intensity rel error [%]: mean=42.65, median=42.65, max=42.65
+  GT=2, EST=2, Assigned=2, TP=2, FP=0, FN=0
+  Position error [m]: mean=2.839, median=2.839, rmse=2.938, max=3.593
+  Intensity rel error [%]: mean=50.99, median=50.99, max=98.22
+[no-obstacles-v1] case 09 start 2026-05-01 20:07:05
+[no-obstacles-v1] case 09 done 2026-05-01 20:14:49
+Total measurements: 27, live=62.0s, travel=169.7s, shield=13.5s, mission=245.2s
+Mission timing summary: distance=84.83m motion=169.7s rotation=13.5s end_to_end=245.2s compute=180.567s ig_mean=0.718s pf_mean=1.651s wall_clock=453.60s
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.7252, median=0.7252, rmse=0.7252, max=0.7252
+  Intensity rel error [%]: mean=33.88, median=33.88, max=33.88
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=1.039, median=1.039, rmse=1.039, max=1.039
+  Intensity rel error [%]: mean=4.163, median=4.163, max=4.163
+  GT=3, EST=2, Assigned=2, TP=2, FP=0, FN=1
+  Position error [m]: mean=1.086, median=1.086, rmse=1.133, max=1.407
+  Intensity rel error [%]: mean=66.57, median=66.57, max=73
+[no-obstacles-v1] case 10 start 2026-05-01 20:14:49
+[no-obstacles-v1] case 10 done 2026-05-01 20:22:24
+Total measurements: 26, live=104.0s, travel=144.1s, shield=13.0s, mission=261.1s
+Mission timing summary: distance=72.04m motion=144.1s rotation=13.0s end_to_end=261.1s compute=175.200s ig_mean=0.797s pf_mean=1.437s wall_clock=447.35s
+  GT=2, EST=2, Assigned=2, TP=2, FP=0, FN=0
+  Position error [m]: mean=3.87, median=3.87, rmse=4.627, max=6.406
+  Intensity rel error [%]: mean=38.22, median=38.22, max=56.57
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.8773, median=0.8773, rmse=0.8773, max=0.8773
+  Intensity rel error [%]: mean=41.66, median=41.66, max=41.66
+  GT=1, EST=1, Assigned=1, TP=1, FP=0, FN=0
+  Position error [m]: mean=0.5447, median=0.5447, rmse=0.5447, max=0.5447
+  Intensity rel error [%]: mean=41.92, median=41.92, max=41.92

@@ -120,31 +120,60 @@ class ParallelIsotopePF:
             strengths = np.zeros(num_sources) if num_sources > 0 else np.zeros(0)
             covs = np.zeros((num_sources, 4, 4)) if num_sources > 0 else None
             if max_r > 0 and num_sources > 0:
-                pf._gpu_enabled()
-                from pf import gpu_utils
-                import torch
+                use_gpu_estimate = False
+                if bool(pf.config.use_gpu):
+                    from pf import gpu_utils
 
-                device = gpu_utils.resolve_device(pf.config.gpu_device)
-                dtype = gpu_utils.resolve_dtype(pf.config.gpu_dtype)
-                states = [p.state for p in pf.continuous_particles]
-                pos_t, str_t, _, mask_t = gpu_utils.pack_states(states, device=device, dtype=dtype)
-                weights = torch.as_tensor(w, device=device, dtype=dtype)
-                weight_sum = torch.sum(weights)
-                if float(weight_sum) <= 0.0:
-                    weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
+                    use_gpu_estimate = bool(gpu_utils.torch_available())
+                if use_gpu_estimate:
+                    from pf import gpu_utils
+                    import torch
+
+                    device = gpu_utils.resolve_device(pf.config.gpu_device)
+                    dtype = gpu_utils.resolve_dtype(pf.config.gpu_dtype)
+                    states = [p.state for p in pf.continuous_particles]
+                    pos_t, str_t, _, mask_t = gpu_utils.pack_states(
+                        states,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    weights_t = torch.as_tensor(w, device=device, dtype=dtype)
+                    weight_sum = torch.sum(weights_t)
+                    if float(weight_sum) <= 0.0:
+                        weights_t = torch.full_like(
+                            weights_t,
+                            1.0 / max(weights_t.numel(), 1),
+                        )
+                    else:
+                        weights_t = weights_t / weight_sum
+                    w_mask = weights_t[:, None] * mask_t
+                    w_sum = torch.sum(w_mask, dim=0)
+                    w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
+                    pos_mean = torch.sum(w_mask[:, :, None] * pos_t, dim=0) / w_sum_safe[:, None]
+                    str_mean = torch.sum(w_mask * str_t, dim=0) / w_sum_safe
+                    pos_cpu = pos_mean.detach().cpu().numpy()
+                    str_cpu = str_mean.detach().cpu().numpy()
+                    for j in range(min(num_sources, max_r)):
+                        positions[j] = pos_cpu[j]
+                        strengths[j] = float(str_cpu[j])
                 else:
-                    weights = weights / weight_sum
-                w_mask = weights[:, None] * mask_t
-                w_sum = torch.sum(w_mask, dim=0)
-                w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
-                pos_mean = torch.sum(w_mask[:, :, None] * pos_t, dim=0) / w_sum_safe[:, None]
-                str_mean = torch.sum(w_mask * str_t, dim=0) / w_sum_safe
-                pos_cpu = pos_mean.detach().cpu().numpy()
-                str_cpu = str_mean.detach().cpu().numpy()
-                for j in range(min(num_sources, max_r)):
-                    positions[j] = pos_cpu[j]
-                    strengths[j] = float(str_cpu[j])
-                # covariance computation stays on CPU for clarity
+                    for j in range(num_sources):
+                        pos_stack = []
+                        str_stack = []
+                        weights_stack = []
+                        for wi, p in zip(w, pf.continuous_particles):
+                            if p.state.num_sources > j:
+                                pos_stack.append(p.state.positions[j])
+                                str_stack.append(p.state.strengths[j])
+                                weights_stack.append(wi)
+                        if not weights_stack:
+                            continue
+                        wj = np.array(weights_stack, dtype=float)
+                        wj = wj / max(np.sum(wj), 1e-12)
+                        pos_arr = np.vstack(pos_stack)
+                        str_arr = np.array(str_stack, dtype=float)
+                        positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
+                        strengths[j] = float(np.sum(wj * str_arr))
                 for j in range(num_sources):
                     pos_stack = []
                     str_stack = []
@@ -176,32 +205,6 @@ class ParallelIsotopePF:
                     covariances=covs,
                 )
                 continue
-                # Compute weighted mean per source index j up to num_sources
-                for j in range(num_sources):
-                    pos_stack = []
-                    str_stack = []
-                    weights_stack = []
-                    for wi, p in zip(w, pf.continuous_particles):
-                        if p.state.num_sources > j:
-                            pos_stack.append(p.state.positions[j])
-                            str_stack.append(p.state.strengths[j])
-                            weights_stack.append(wi)
-                    if not weights_stack:
-                        continue
-                    wj = np.array(weights_stack, dtype=float)
-                    wj = wj / max(np.sum(wj), 1e-12)
-                    pos_arr = np.vstack(pos_stack)
-                    str_arr = np.array(str_stack, dtype=float)
-                    pos_mean = np.sum(wj[:, None] * pos_arr, axis=0)
-                    str_mean = float(np.sum(wj * str_arr))
-                    positions[j] = pos_mean
-                    strengths[j] = str_mean
-                    # covariance of (x,y,z,q)
-                    centered_pos = pos_arr - pos_mean
-                    centered_q = str_arr - str_mean
-                    data = np.column_stack([centered_pos, centered_q])
-                    cov = data.T @ (data * wj[:, None])
-                    covs[j] = cov
             bg = float(np.sum([wi * p.state.background for p, wi in zip(pf.continuous_particles, w)]))
             estimates[iso] = IsotopeState(
                 num_sources=num_sources,

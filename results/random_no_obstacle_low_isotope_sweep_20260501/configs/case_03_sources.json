@@ -1,0 +1,34 @@
+{
+  "name": "random_no_obstacle_low_isotope_case_03",
+  "metadata": {
+    "source_seed": 2026052203,
+    "obstacle_seed": null,
+    "blocked_fraction_target": 0.0,
+    "blocked_fraction_actual": 0.0,
+    "pattern_kind": "single_isotope",
+    "isotopes_present": [
+      "Eu-154"
+    ],
+    "source_sampling": "full open room; single- or two-isotope stress cases; minimum xy source separation 2.0 m; minimum start-detector xy separation 2.0 m; intensities log-uniform 30000-90000 cps@1m"
+  },
+  "sources": [
+    {
+      "isotope": "Eu-154",
+      "position": [
+        6.039,
+        10.424,
+        1.104
+      ],
+      "intensity_cps_1m": 66134.2
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        2.898,
+        11.265,
+        1.413
+      ],
+      "intensity_cps_1m": 39447.3
+    }
+  ]
+}

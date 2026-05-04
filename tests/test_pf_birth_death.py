@@ -77,6 +77,1136 @@ def test_birth_adds_source_when_particle_empty() -> None:
     assert all(p.state.num_sources > 0 for p in filt.continuous_particles)
 
 
+def test_birth_scoring_prefers_shield_coded_residual_shape() -> None:
+    """Birth proposal scoring should prefer residual shape over raw count scale."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        birth_use_shield_coded_residual=True,
+    )
+    candidate_counts = np.array(
+        [
+            [10.0, 30.0],
+            [10.0, 0.0],
+            [0.0, 300.0],
+        ],
+        dtype=float,
+    )
+    residual = np.array([10.0, 10.0, 0.0], dtype=float)
+
+    scores, q_hat = filt._birth_residual_candidate_scores(
+        candidate_counts=candidate_counts,
+        residual_mix=residual,
+        observation_variances=np.ones(3, dtype=float),
+    )
+
+    assert scores[0] > scores[1]
+    assert q_hat[0] > q_hat[1]
+
+
+def test_birth_scoring_uses_count_distance_prior_for_single_view() -> None:
+    """Single-view residual birth should prefer high unit-response candidates."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        birth_use_shield_coded_residual=True,
+        birth_count_distance_prior_weight=1.0,
+        birth_count_distance_strength_weight=1.0,
+    )
+    candidate_counts = np.array([[10.0, 1.0]], dtype=float)
+    residual = np.array([100.0], dtype=float)
+
+    scores, q_hat = filt._birth_residual_candidate_scores(
+        candidate_counts=candidate_counts,
+        residual_mix=residual,
+        observation_variances=np.ones(1, dtype=float),
+    )
+
+    assert q_hat[0] < q_hat[1]
+    assert scores[0] > scores[1]
+
+
+def test_birth_scoring_can_disable_count_distance_prior() -> None:
+    """Disabling the proposal prior should preserve pure least-squares ties."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        birth_use_shield_coded_residual=True,
+        birth_count_distance_prior_weight=0.0,
+        birth_count_distance_strength_weight=0.0,
+    )
+    candidate_counts = np.array([[10.0, 1.0]], dtype=float)
+    residual = np.array([100.0], dtype=float)
+
+    scores, q_hat = filt._birth_residual_candidate_scores(
+        candidate_counts=candidate_counts,
+        residual_mix=residual,
+        observation_variances=np.ones(1, dtype=float),
+    )
+
+    assert q_hat[0] < q_hat[1]
+    assert np.isclose(scores[0], scores[1])
+
+
+def test_peak_suppressed_residual_birth_reveals_noncollinear_weak_source() -> None:
+    """Peak suppression should propose a weak candidate without rebirthing a strong source."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        birth_residual_min_support=1,
+        birth_residual_support_sigma=0.1,
+        birth_residual_gate_p_value=1.0,
+        birth_candidate_support_fraction=0.0,
+        birth_refit_residual_gate=False,
+        birth_existing_response_corr_max=0.95,
+        residual_decomposition_enable=True,
+        peak_suppression_enable=True,
+        residual_decomposition_max_layers=2,
+        peak_suppression_min_source_fraction=0.1,
+        birth_num_local_jitter=0,
+    )
+    strong_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    weak_pos = np.array([[4.0, 4.0, 0.0]], dtype=float)
+    detector_positions = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [4.0, 1.0, 0.0],
+            [1.0, 4.0, 0.0],
+        ],
+        dtype=float,
+    )
+    strong_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=strong_pos,
+        strengths=np.array([500.0], dtype=float),
+        live_times=np.ones(4, dtype=float),
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    weak_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=weak_pos,
+        strengths=np.array([80.0], dtype=float),
+        live_times=np.ones(4, dtype=float),
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    filt.continuous_particles[0].state = IsotopeState(
+        num_sources=1,
+        positions=strong_pos.copy(),
+        strengths=np.array([500.0], dtype=float),
+        background=0.0,
+    )
+    data = MeasurementData(
+        z_k=strong_counts + weak_counts,
+        observation_variances=np.maximum(strong_counts + weak_counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        live_times=np.ones(4, dtype=float),
+    )
+
+    proposal = filt._compute_birth_proposal(
+        data,
+        np.vstack([strong_pos, weak_pos]),
+    )
+
+    assert proposal is not None
+    _, _, _, candidates = proposal
+    assert filt.last_birth_residual_layer.startswith("strong_suppressed")
+    assert np.allclose(candidates[0], weak_pos[0])
+
+
+def test_birth_residual_layers_include_leave_one_cluster_out() -> None:
+    """Peak suppression should include cluster-level leave-one-out residuals."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=2,
+        residual_decomposition_enable=True,
+        peak_suppression_enable=True,
+        residual_decomposition_max_layers=4,
+        peak_suppression_min_source_fraction=0.1,
+        cluster_eps_m=0.8,
+    )
+    detector_positions = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [4.0, 1.0, 0.0],
+            [1.0, 4.0, 0.0],
+        ],
+        dtype=float,
+    )
+    strong_positions = [
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        np.array([[0.2, 0.1, 0.0]], dtype=float),
+    ]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=pos.copy(),
+                strengths=np.array([500.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        )
+        for pos in strong_positions
+    ]
+    weak_pos = np.array([[4.0, 4.0, 0.0]], dtype=float)
+    strong_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=strong_positions[0],
+        strengths=np.array([500.0], dtype=float),
+        live_times=np.ones(4, dtype=float),
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    weak_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=weak_pos,
+        strengths=np.array([80.0], dtype=float),
+        live_times=np.ones(4, dtype=float),
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    data = MeasurementData(
+        z_k=strong_counts + weak_counts,
+        observation_variances=np.maximum(strong_counts + weak_counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(4, dtype=int),
+        pb_indices=np.zeros(4, dtype=int),
+        live_times=np.ones(4, dtype=float),
+    )
+
+    layers = filt._compute_birth_residual_layers(
+        data=data,
+        particle_indices=np.array([0, 1], dtype=int),
+        particle_weights=np.array([0.5, 0.5], dtype=float),
+    )
+
+    assert any(layer.name.startswith("leave_one_cluster_out") for layer in layers)
+
+
+def test_matching_pursuit_birth_can_add_multiple_sources() -> None:
+    """Residual matching pursuit should add more than one supported source."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        birth_residual_min_support=1,
+        birth_residual_support_sigma=0.1,
+        birth_residual_gate_p_value=1.0,
+        birth_candidate_support_fraction=0.0,
+        birth_refit_residual_gate=False,
+        birth_matching_pursuit_max_new_sources=2,
+        birth_matching_pursuit_topk_candidates=3,
+        birth_min_sep_m=0.4,
+        birth_bic_penalty_params=0,
+        weak_source_prune_min_expected_count=0.0,
+        weak_source_prune_min_fraction=0.0,
+    )
+    state = IsotopeState(
+        num_sources=0,
+        positions=np.zeros((0, 3), dtype=float),
+        strengths=np.zeros(0, dtype=float),
+        background=0.0,
+    )
+    true_positions = np.array(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    true_strengths = np.array([120.0, 90.0], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    expected = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_positions,
+        strengths=true_strengths,
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        source_scale=1.0,
+    )
+    counts = np.sum(expected, axis=1)
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+
+    accepted = filt._apply_matching_pursuit_births_to_state(
+        state,
+        data,
+        true_positions,
+        max_new_sources=2,
+    )
+
+    assert accepted == 2
+    assert state.num_sources == 2
+
+
+def test_pseudo_source_verification_prunes_unsupported_tentative_source() -> None:
+    """Pseudo-source verification should quarantine before hard pruning."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        pseudo_source_verification_enable=True,
+        pseudo_source_min_distinct_views=1,
+        pseudo_source_fail_grace_stations=1,
+        pseudo_source_min_delta_ll=0.0,
+        source_prune_fail_grace_stations=1,
+    )
+    true_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    false_pos = np.array([[4.0, 0.0, 0.0]], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    true_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_pos,
+        strengths=np.array([200.0], dtype=float),
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.vstack([true_pos, false_pos]),
+        strengths=np.array([200.0, 200.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 3], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+        tentative_sources=np.array([False, True], dtype=bool),
+        verification_fail_streaks=np.zeros(2, dtype=int),
+    )
+    data = MeasurementData(
+        z_k=true_counts,
+        observation_variances=np.maximum(true_counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+
+    changed = filt._verify_pseudo_sources_for_state(
+        state,
+        data,
+        suppress_prune=False,
+    )
+
+    assert changed
+    assert state.num_sources == 2
+    assert filt.last_pseudo_source_quarantined == 1
+    assert filt.last_pseudo_source_pruned == 0
+
+    changed = filt._verify_pseudo_sources_for_state(
+        state,
+        data,
+        suppress_prune=False,
+    )
+
+    assert changed
+    assert state.num_sources == 1
+    assert filt.last_pseudo_source_pruned == 1
+
+
+def test_pseudo_source_verification_requires_multiple_stations_to_prune() -> None:
+    """A tentative source should quarantine when hard prune is not allowed."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        pseudo_source_verification_enable=True,
+        pseudo_source_min_distinct_views=1,
+        pseudo_source_fail_grace_stations=1,
+        pseudo_source_min_delta_ll=0.0,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=1,
+        source_prune_fail_grace_stations=1,
+    )
+    true_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    false_pos = np.array([[4.0, 0.0, 0.0]], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    true_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_pos,
+        strengths=np.array([200.0], dtype=float),
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.arange(3, dtype=int),
+        pb_indices=np.arange(3, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.vstack([true_pos, false_pos]),
+        strengths=np.array([200.0, 200.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 3], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+        tentative_sources=np.array([False, True], dtype=bool),
+        verification_fail_streaks=np.zeros(2, dtype=int),
+    )
+    data = MeasurementData(
+        z_k=true_counts,
+        observation_variances=np.maximum(true_counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.arange(3, dtype=int),
+        pb_indices=np.arange(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+
+    filt._verify_pseudo_sources_for_state(state, data, suppress_prune=False)
+
+    assert state.num_sources == 2
+    assert filt.last_pseudo_source_failed == 1
+    assert filt.last_pseudo_source_quarantined == 1
+    assert filt.last_pseudo_source_pruned == 0
+    assert filt._quarantined_source_mask(state).tolist() == [False, True]
+
+
+def test_pseudo_source_quarantine_does_not_require_prune_allowed() -> None:
+    """Suppressed pseudo-source failures should quarantine before hard pruning."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        pseudo_source_verification_enable=True,
+        pseudo_source_min_distinct_views=1,
+        pseudo_source_fail_grace_stations=1,
+        pseudo_source_min_delta_ll=0.0,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=1,
+        source_prune_fail_grace_stations=1,
+    )
+    true_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    false_pos = np.array([[4.0, 0.0, 0.0]], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    true_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_pos,
+        strengths=np.array([200.0], dtype=float),
+        live_times=np.ones(2, dtype=float),
+        fe_indices=np.arange(2, dtype=int),
+        pb_indices=np.arange(2, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.vstack([true_pos, false_pos]),
+        strengths=np.array([200.0, 200.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 3], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+        tentative_sources=np.array([False, True], dtype=bool),
+        verification_fail_streaks=np.zeros(2, dtype=int),
+    )
+    data = MeasurementData(
+        z_k=true_counts,
+        observation_variances=np.maximum(true_counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.arange(2, dtype=int),
+        pb_indices=np.arange(2, dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+
+    changed = filt._verify_pseudo_sources_for_state(
+        state,
+        data,
+        suppress_prune=True,
+    )
+
+    assert changed
+    assert state.num_sources == 2
+    assert filt.last_pseudo_source_quarantined == 1
+    assert filt.last_pseudo_source_pruned == 0
+    assert filt._quarantined_source_mask(state).tolist() == [False, True]
+
+
+def test_refit_after_remove_prune_allows_redundant_source_removal() -> None:
+    """Refit-after-remove pruning should catch collinear redundant components."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        source_prune_min_distinct_stations=1,
+        source_prune_min_distinct_views=1,
+        source_prune_refit_after_remove=True,
+        source_prune_bic_penalty_params=4,
+    )
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    source_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=source_pos,
+        strengths=np.array([100.0], dtype=float),
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        source_scale=1.0,
+    )[:, 0]
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.vstack([source_pos, source_pos]),
+        strengths=np.array([50.0, 50.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 3], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+    )
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+
+    allowed = filt._source_prune_allowed_mask(state, data)
+
+    assert np.all(allowed)
+
+
+def test_clustered_output_excludes_quarantined_sources() -> None:
+    """Quarantined tentative sources should not appear in reported clusters."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        cluster_min_samples=1,
+        use_clustered_output=True,
+    )
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([100.0, 50.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 3], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+        tentative_sources=np.array([False, True], dtype=bool),
+        verification_fail_streaks=np.array([0, 2], dtype=int),
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+
+    positions, strengths = filt.estimate_clustered()
+
+    assert positions.shape == (1, 3)
+    assert strengths.shape == (1,)
+    assert np.allclose(positions[0], np.array([0.0, 0.0, 0.0]))
+
+
+def test_convergence_does_not_skip_unverified_multisource_state() -> None:
+    """Convergence gating should not freeze an unresolved tentative source."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        converge_enable=True,
+        converge_require_no_tentative=True,
+    )
+    state = filt.continuous_particles[0].state
+    state.num_sources = 2
+    state.positions = np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=float)
+    state.strengths = np.array([100.0, 50.0], dtype=float)
+    state.ages = np.array([10, 1], dtype=int)
+    state.low_q_streaks = np.zeros(2, dtype=int)
+    state.support_scores = np.zeros(2, dtype=float)
+    state.tentative_sources = np.array([False, True], dtype=bool)
+    state.verification_fail_streaks = np.zeros(2, dtype=int)
+    filt.is_converged = True
+    filt.frozen_estimate = (state.positions[:1].copy(), state.strengths[:1].copy())
+
+    assert not filt._should_skip_converged_update()
+    assert not filt.is_converged
+
+
+def test_pre_finalize_guard_preserves_reported_cardinality() -> None:
+    """Reported estimates should prefer pre-finalize modes after collapse."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=3,
+        birth_enable=True,
+        report_pre_finalize_guard=True,
+        report_strength_refit=False,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.zeros((1, 3), dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    guard_pos = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
+    guard_q = np.array([100.0, 50.0], dtype=float)
+    estimator._pre_finalize_guard_estimates[isotope] = (guard_pos, guard_q)
+
+    positions, strengths = estimator._guarded_report_estimate(
+        isotope,
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        np.array([150.0], dtype=float),
+        use_pre_finalize_guard=True,
+    )
+
+    assert positions.shape == (2, 3)
+    assert strengths.shape == (2,)
+
+
+def test_residual_birth_always_try_avoids_stochastic_miss(monkeypatch) -> None:
+    """Residual-gated birth should not be skipped by the proposal probability."""
+    filt = _build_filter(
+        p_birth=0.01,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        birth_residual_always_try=True,
+        birth_matching_pursuit_max_new_sources=2,
+        birth_matching_pursuit_topk_candidates=3,
+        birth_num_local_jitter=0,
+        birth_min_sep_m=0.4,
+        birth_detector_min_sep_m=0.0,
+        birth_residual_min_support=1,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        birth_residual_support_sigma=0.1,
+        birth_residual_gate_p_value=1.0,
+        birth_candidate_support_fraction=0.0,
+        birth_refit_residual_gate=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+        conditional_strength_refit_prior_weight=0.0,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+                ages=np.array([3], dtype=int),
+                low_q_streaks=np.zeros(1, dtype=int),
+                support_scores=np.zeros(1, dtype=float),
+            ),
+            log_weight=0.0,
+        )
+    ]
+    true_positions = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float)
+    true_strengths = np.array([100.0, 120.0], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [1.0, 3.0, 0.0]],
+        dtype=float,
+    )
+    expected = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_positions,
+        strengths=true_strengths,
+        live_times=np.ones(3, dtype=float),
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        source_scale=1.0,
+    )
+    data = MeasurementData(
+        z_k=np.sum(expected, axis=1),
+        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(3, dtype=int),
+        pb_indices=np.zeros(3, dtype=int),
+        live_times=np.ones(3, dtype=float),
+    )
+    monkeypatch.setattr(np.random, "rand", lambda *args: 0.99)
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=data,
+        candidate_positions=true_positions,
+    )
+
+    state = filt.continuous_particles[0].state
+    assert filt.last_birth_count > 0
+    assert state.num_sources == 2
+
+
+def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) -> None:
+    """Residual-gated birth should not be limited to collapsed top-weight particles."""
+    filt = _build_filter(
+        p_birth=1.0,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=2,
+        structural_proposal_topk_particles=1,
+        birth_residual_expand_structural_particles=True,
+        birth_residual_always_try=True,
+        birth_matching_pursuit_max_new_sources=2,
+        refit_after_moves=False,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.99)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.01)),
+        ),
+    ]
+    data = MeasurementData(
+        z_k=np.array([20.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    def _proposal(
+        birth_data: MeasurementData | None,
+        candidate_positions: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Return a residual-gated proposal independent of top-k particles."""
+        filt.last_birth_residual_gate_passed = True
+        filt.last_birth_residual_refit_gate_passed = True
+        return (
+            np.array([1.0], dtype=float),
+            np.array([1.0], dtype=float),
+            20.0,
+            np.array([[2.0, 0.0, 0.0]], dtype=float),
+        )
+
+    def _matching_pursuit(
+        st: IsotopeState,
+        birth_data: MeasurementData,
+        candidate_positions: np.ndarray,
+        *,
+        max_new_sources: int,
+        residual_gate_forced: bool = False,
+    ) -> int:
+        """Accept a birth only for the non-top empty particle."""
+        assert residual_gate_forced
+        if st.num_sources > 0:
+            return 0
+        st.positions = np.array([[2.0, 0.0, 0.0]], dtype=float)
+        st.strengths = np.array([100.0], dtype=float)
+        st.ages = np.array([0], dtype=int)
+        st.low_q_streaks = np.array([0], dtype=int)
+        st.support_scores = np.array([0.0], dtype=float)
+        st.num_sources = 1
+        return 1
+
+    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
+    monkeypatch.setattr(
+        filt,
+        "_apply_matching_pursuit_births_to_state",
+        _matching_pursuit,
+    )
+    monkeypatch.setattr(filt, "refresh_weights_from_measurements", lambda data: None)
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=data,
+        candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
+    )
+
+    assert filt.last_birth_count == 1
+    assert filt.continuous_particles[1].state.num_sources == 1
+
+
+def test_residual_birth_expansion_is_capped_and_cardinality_diverse(monkeypatch) -> None:
+    """Residual-gated structural expansion should not evaluate every particle."""
+    filt = _build_filter(
+        p_birth=1.0,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=5,
+        structural_proposal_topk_particles=1,
+        birth_residual_expand_structural_particles=True,
+        birth_residual_expanded_structural_topk_particles=2,
+        birth_residual_always_try=True,
+        split_prob=0.0,
+        split_residual_guided=False,
+        merge_prob=0.0,
+        refit_after_moves=False,
+    )
+    filt.continuous_particles = []
+    weights = np.array([0.90, 0.05, 0.03, 0.01, 0.01], dtype=float)
+    for idx, weight in enumerate(weights):
+        if idx == 0:
+            state = IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=float(idx),
+            )
+        else:
+            state = IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=float(idx),
+            )
+        filt.continuous_particles.append(
+            IsotopeParticle(state=state, log_weight=float(np.log(weight)))
+        )
+    data = MeasurementData(
+        z_k=np.array([20.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    def _proposal(
+        birth_data: MeasurementData | None,
+        candidate_positions: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Return a residual-gated proposal for structural expansion."""
+        filt.last_birth_residual_gate_passed = True
+        filt.last_birth_residual_refit_gate_passed = True
+        return (
+            np.array([1.0], dtype=float),
+            np.array([1.0], dtype=float),
+            20.0,
+            np.array([[2.0, 0.0, 0.0]], dtype=float),
+        )
+
+    attempted: list[int] = []
+
+    def _matching_pursuit(
+        st: IsotopeState,
+        birth_data: MeasurementData,
+        candidate_positions: np.ndarray,
+        *,
+        max_new_sources: int,
+        residual_gate_forced: bool = False,
+    ) -> int:
+        """Record particles that receive exact structural birth evaluation."""
+        assert residual_gate_forced
+        attempted.append(int(st.background))
+        return 0
+
+    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
+    monkeypatch.setattr(
+        filt,
+        "_apply_matching_pursuit_births_to_state",
+        _matching_pursuit,
+    )
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=data,
+        candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
+    )
+
+    assert set(attempted) == {0, 1}
+
+
+def test_residual_birth_gate_suppresses_same_update_death(monkeypatch) -> None:
+    """Residual birth evidence should delay death in the same structural update."""
+    filt = _build_filter(
+        p_birth=1.0,
+        p_kill=1.0,
+        min_strength=5.0,
+        max_sources=1,
+        num_particles=1,
+        death_low_q_streak=1,
+        death_delta_ll_threshold=1.0e9,
+        support_ema_alpha=1.0,
+        birth_residual_always_try=True,
+        birth_residual_suppress_death=True,
+        refit_after_moves=False,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([1.0], dtype=float),
+                background=0.0,
+                ages=np.array([5], dtype=int),
+                low_q_streaks=np.array([1], dtype=int),
+                support_scores=np.array([-1.0], dtype=float),
+            ),
+            log_weight=0.0,
+        )
+    ]
+    data = MeasurementData(
+        z_k=np.array([50.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    def _proposal(
+        birth_data: MeasurementData | None,
+        candidate_positions: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Return a gate-passing proposal so death is delayed."""
+        filt.last_birth_residual_gate_passed = True
+        filt.last_birth_residual_refit_gate_passed = True
+        return (
+            np.array([1.0], dtype=float),
+            np.array([1.0], dtype=float),
+            50.0,
+            np.array([[2.0, 0.0, 0.0]], dtype=float),
+        )
+
+    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=data,
+        candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
+    )
+
+    assert filt.last_kill_count == 0
+    assert filt.continuous_particles[0].state.num_sources == 1
+
+
+def test_residual_gate_suppresses_refit_floor_prune() -> None:
+    """Residual-gated structural moves should delay weak-source refit pruning."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        weak_source_prune_min_expected_count=3.0,
+        weak_source_prune_min_fraction=0.0,
+        weak_source_prune_min_age=1,
+    )
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]], dtype=float),
+        strengths=np.array([5.0, 5.0], dtype=float),
+        background=0.0,
+        ages=np.array([5, 5], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+    )
+    data = MeasurementData(
+        z_k=np.array([100.0], dtype=float),
+        observation_variances=np.array([100.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    filt._prune_floor_sources_after_refit(
+        state,
+        data,
+        suppress_prune=True,
+    )
+
+    assert filt.last_kill_count == 0
+    assert state.num_sources == 2
+
+
+def test_residual_gate_scales_birth_complexity_penalty() -> None:
+    """Residual-gated matching pursuit should avoid double complexity charging."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        birth_residual_min_support=1,
+        birth_residual_support_sigma=0.1,
+        birth_candidate_support_fraction=0.0,
+        birth_complexity_penalty=1.0e12,
+        birth_residual_acceptance_complexity_scale=0.0,
+        birth_min_sep_m=0.4,
+        weak_source_prune_min_expected_count=0.0,
+        weak_source_prune_min_fraction=0.0,
+    )
+    state = IsotopeState(
+        num_sources=0,
+        positions=np.zeros((0, 3), dtype=float),
+        strengths=np.zeros(0, dtype=float),
+        background=0.0,
+    )
+    true_position = np.array([[0.0, 0.0, 0.0]], dtype=float)
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    expected = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=detector_positions,
+        sources=true_position,
+        strengths=np.array([100.0], dtype=float),
+        live_times=np.ones(2, dtype=float),
+        fe_indices=np.zeros(2, dtype=int),
+        pb_indices=np.zeros(2, dtype=int),
+        source_scale=1.0,
+    )
+    counts = np.sum(expected, axis=1)
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(2, dtype=int),
+        pb_indices=np.zeros(2, dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+
+    accepted = filt._apply_matching_pursuit_births_to_state(
+        state,
+        data,
+        true_position,
+        max_new_sources=1,
+        residual_gate_forced=True,
+    )
+
+    assert accepted == 1
+    assert state.num_sources == 1
+
+
+def test_birth_bic_penalty_survives_residual_gate_scaling() -> None:
+    """Residual-forced births should still pay a BIC model-order penalty."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        birth_complexity_penalty=1.0e12,
+        birth_residual_acceptance_complexity_scale=0.0,
+        birth_bic_penalty_params=4,
+    )
+
+    penalty = filt._birth_complexity_penalty(
+        residual_gate_forced=True,
+        measurement_count=16,
+    )
+
+    assert penalty == np.log(16.0) * 2.0
+
+
+def test_resampling_can_protect_distinct_low_weight_source_modes() -> None:
+    """Mode-preserving resampling should retain spatially distinct source modes."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=4,
+        mode_preserving_resample=True,
+        mode_preserving_max_modes=3,
+        mode_preserving_particles_per_mode=1,
+        mode_preserving_radius_m=0.5,
+        mode_preserving_min_weight_fraction=0.0,
+    )
+    positions = [
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        np.array([[0.1, 0.0, 0.0]], dtype=float),
+        np.array([[2.0, 0.0, 0.0]], dtype=float),
+        np.array([[4.0, 0.0, 0.0]], dtype=float),
+    ]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=pos,
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+        for pos in positions
+    ]
+    weights = np.array([0.94, 0.05, 0.006, 0.004], dtype=float)
+
+    protected = filt._source_mode_preserving_indices(weights)
+    injected = filt._inject_mode_preserving_indices(
+        np.array([0, 0, 0, 1], dtype=np.int64),
+        protected,
+    )
+
+    assert {0, 2, 3}.issubset(set(protected.tolist()))
+    assert 2 in injected
+    assert 3 in injected
+    assert filt.last_mode_preserved_count == 2
+
+
 def test_reported_strength_refit_uses_all_measurements() -> None:
     """Reported strengths should be refit from counts after position clustering."""
     np.random.seed(10)
@@ -241,6 +1371,8 @@ def test_death_removes_weak_sources() -> None:
         death_delta_ll_threshold=0.0,
         support_ema_alpha=1.0,
         p_kill=1.0,
+        source_prune_min_distinct_stations=1,
+        source_prune_min_distinct_views=1,
     )
     filt.continuous_particles = [
         IsotopeParticle(
@@ -381,6 +1513,36 @@ def test_weak_source_survives_with_support() -> None:
     for _ in range(3):
         filt.apply_birth_death(support_data=support_data, birth_data=None, candidate_positions=None)
     assert filt.continuous_particles[0].state.num_sources == 2
+
+
+def test_weak_source_prune_respects_min_age() -> None:
+    """Weak-source pruning should not delete newly proposed components immediately."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        weak_source_prune_min_expected_count=3.0,
+        weak_source_prune_min_fraction=0.0,
+        weak_source_prune_min_age=2,
+    )
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([5.0, 5.0], dtype=float),
+        background=0.0,
+        ages=np.array([0, 5], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+    )
+
+    filt._prune_floor_sources_by_expected_counts(
+        state,
+        np.array([0.0, 0.0], dtype=float),
+    )
+
+    assert state.num_sources == 1
+    assert np.allclose(state.positions[0], [0.0, 0.0, 0.0])
 
 
 def test_birth_disabled_skips_moves() -> None:
@@ -1623,6 +2785,73 @@ def test_report_strength_refit_prunes_unsupported_component() -> None:
     assert strengths.shape == (1,)
     assert np.allclose(positions[0], reported_positions[0], atol=1.0e-6)
     assert np.isclose(strengths[0], true_strength[0], rtol=1.0e-2)
+
+
+def test_report_strength_refit_can_preserve_posterior_cardinality() -> None:
+    """Reported strength refit can keep PF clusters when regression is collinear."""
+    isotope = "Cs-137"
+    reported_positions = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
+    detector_positions = [
+        np.array([0.0, 1.0, 0.0], dtype=float),
+        np.array([1.0, 1.0, 0.0], dtype=float),
+        np.array([0.0, 2.0, 0.0], dtype=float),
+    ]
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=2,
+        birth_enable=True,
+        use_clustered_output=True,
+        cluster_min_samples=1,
+        report_strength_refit=True,
+        report_strength_refit_preserve_cardinality=True,
+        report_strength_refit_iters=128,
+        init_num_sources=(1, 1),
+        min_strength=0.01,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=reported_positions,
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    for pose in detector_positions:
+        estimator.add_measurement_pose(pose)
+    estimator._ensure_kernel_cache()
+    design = expected_counts_per_source(
+        kernel=estimator.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=np.vstack(detector_positions),
+        sources=reported_positions[:1],
+        strengths=np.array([90.0], dtype=float),
+        live_times=np.ones(len(detector_positions), dtype=float),
+        fe_indices=np.zeros(len(detector_positions), dtype=int),
+        pb_indices=np.zeros(len(detector_positions), dtype=int),
+    )
+    counts = np.sum(design, axis=1)
+    estimator.measurements = [
+        MeasurementRecord(
+            z_k={isotope: float(count)},
+            pose_idx=idx,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+        for idx, count in enumerate(counts)
+    ]
+
+    positions, strengths = estimator._refit_reported_strengths(
+        isotope,
+        reported_positions,
+        np.array([40.0, 40.0], dtype=float),
+    )
+
+    assert positions.shape == (2, 3)
+    assert strengths.shape == (2,)
 
 
 def test_report_strength_refit_returns_empty_without_signal_support() -> None:

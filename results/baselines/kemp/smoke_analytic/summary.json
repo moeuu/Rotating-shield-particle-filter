@@ -1,0 +1,350 @@
+{
+  "config": {
+    "background_cps": 0.0,
+    "detect_threshold_abs": 0.0,
+    "detect_threshold_rel": 0.0,
+    "detect_threshold_rel_by_isotope": {},
+    "detector_height_m": 0.5,
+    "dwell_time_s": 1.0,
+    "eval_match_radius_m": 1.0,
+    "grid_spacing_m": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "grid_z_levels_m": [
+      0.5,
+      1.0,
+      1.5,
+      2.0
+    ],
+    "max_poses": 2,
+    "max_sources": 3,
+    "measurement_spacing_m": 4.0,
+    "min_peaks_by_isotope": {},
+    "num_particles": 200,
+    "obstacle_config_path": "results/random_no_obstacle_low_isotope_sweep_20260501/configs/case_06_obstacles.json",
+    "output_dir": "results/baselines/kemp/smoke_analytic",
+    "rng_seed": 20260502,
+    "room_size_xyz": [
+      10.0,
+      20.0,
+      10.0
+    ],
+    "shield_fe_index": 0,
+    "shield_pb_index": 0,
+    "sim_backend": "analytic",
+    "sim_config_path": "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
+    "source_config_path": "results/random_no_obstacle_low_isotope_sweep_20260501/configs/case_06_sources.json",
+    "source_strength_log_mean": 10.308952660644293,
+    "source_strength_log_sigma": 1.5,
+    "spectrum_count_method": "response_poisson"
+  },
+  "estimates": {
+    "Co-60": [
+      {
+        "position": [
+          4.0,
+          16.5,
+          1.0
+        ],
+        "strength": 59460.946642193616
+      },
+      {
+        "position": [
+          9.5,
+          13.5,
+          1.5
+        ],
+        "strength": 35281.027325981406
+      }
+    ],
+    "Cs-137": [
+      {
+        "position": [
+          8.0,
+          6.5,
+          1.5
+        ],
+        "strength": 39984.50351630939
+      }
+    ],
+    "Eu-154": []
+  },
+  "measurement_path": [
+    [
+      1.0,
+      1.0,
+      0.5
+    ],
+    [
+      5.0,
+      1.0,
+      0.5
+    ]
+  ],
+  "method": "Kemp et al. parallel log-domain DDPF comparison baseline",
+  "metrics": {
+    "isotopes": {
+      "Co-60": {
+        "counts": {
+          "assigned": 1,
+          "est": 2,
+          "fn": 0,
+          "fp": 1,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 4352.253357806381,
+          "mean": 4352.253357806381,
+          "median": 4352.253357806381
+        },
+        "intensity_rel_error_pct": {
+          "max": 6.820302629873414,
+          "mean": 6.820302629873414,
+          "median": 6.820302629873414
+        },
+        "matches": [
+          {
+            "abs_err": 4352.253357806381,
+            "distance": 3.3042272924240543,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 59460.946642193616,
+            "q_true": 63813.2,
+            "rel_err_pct": 6.820302629873414,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 3.3042272924240543,
+          "mean": 3.3042272924240543,
+          "median": 3.3042272924240543,
+          "rmse": 3.3042272924240543,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Cs-137": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 8758.103516309391,
+          "mean": 8758.103516309391,
+          "median": 8758.103516309391
+        },
+        "intensity_rel_error_pct": {
+          "max": 28.047112431498316,
+          "mean": 28.047112431498316,
+          "median": 28.047112431498316
+        },
+        "matches": [
+          {
+            "abs_err": 8758.103516309391,
+            "distance": 3.5607163605094967,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 39984.50351630939,
+            "q_true": 31226.4,
+            "rel_err_pct": 28.047112431498316,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 3.5607163605094967,
+          "mean": 3.5607163605094967,
+          "median": 3.5607163605094967,
+          "rmse": 3.5607163605094967,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Eu-154": {
+        "counts": {
+          "assigned": 0,
+          "est": 0,
+          "fn": 0,
+          "fp": 0,
+          "gt": 0,
+          "matched": 0
+        },
+        "intensity_abs_error": {
+          "max": null,
+          "mean": null,
+          "median": null
+        },
+        "intensity_rel_error_pct": {
+          "max": null,
+          "mean": null,
+          "median": null
+        },
+        "matches": [],
+        "position_error": {
+          "max": null,
+          "mean": null,
+          "median": null,
+          "rmse": null,
+          "target_m": 0.5,
+          "within_target": null
+        }
+      }
+    },
+    "match_radius_m": 1.0
+  },
+  "observations": [
+    {
+      "counts": {
+        "Co-60": 391.8980437538233,
+        "Cs-137": 689.7054362100733,
+        "Eu-154": 0.2711395928850914
+      },
+      "detected": [
+        "Co-60",
+        "Cs-137"
+      ],
+      "diagnostics": {
+        "Co-60": {
+          "count": 391.8980437538233,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 11.782427819122553,
+          "resampled": true
+        },
+        "Cs-137": {
+          "count": 689.7054362100733,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 2.9513899059848367,
+          "resampled": true
+        },
+        "Eu-154": {
+          "count": 0.2711395928850914,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 1.2572046971302864,
+          "resampled": true
+        }
+      },
+      "geant4_metadata": {
+        "backend": "analytic",
+        "dead_time_s": 5.813e-09,
+        "detector_model": {
+          "crystal_length_m": 0.076,
+          "crystal_material": "cebr3",
+          "crystal_radius_m": 0.038,
+          "crystal_shape": "sphere",
+          "housing_material": "aluminum",
+          "housing_thickness_m": 0.0015
+        },
+        "expected_total_counts": 1305.8628005772682,
+        "num_sources": 2,
+        "python_transport_model": "line_response_attenuation_scatter",
+        "scatter_gain": 0.0,
+        "total_fe_path_cm": 0.0,
+        "total_obstacle_path_cm": 0.0,
+        "total_pb_path_cm": 0.0,
+        "total_stage_path_cm": 0.0,
+        "transport_backend": "python"
+      },
+      "pose": [
+        1.0,
+        1.0,
+        0.5
+      ],
+      "step": 0,
+      "variances": {
+        "Co-60": 2352.96616124146,
+        "Cs-137": 803.9547135113344,
+        "Eu-154": 5484.6706866009545
+      }
+    },
+    {
+      "counts": {
+        "Co-60": 444.8086469128518,
+        "Cs-137": 896.903656361354,
+        "Eu-154": 23.167920660740695
+      },
+      "detected": [
+        "Co-60",
+        "Cs-137"
+      ],
+      "diagnostics": {
+        "Co-60": {
+          "count": 444.8086469128518,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 32.807218968384994,
+          "resampled": true
+        },
+        "Cs-137": {
+          "count": 896.903656361354,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 8.796656205980499,
+          "resampled": true
+        },
+        "Eu-154": {
+          "count": 23.167920660740695,
+          "ess_post": 199.9999999999999,
+          "ess_pre": 14.33411740097357,
+          "resampled": true
+        }
+      },
+      "geant4_metadata": {
+        "backend": "analytic",
+        "dead_time_s": 5.813e-09,
+        "detector_model": {
+          "crystal_length_m": 0.076,
+          "crystal_material": "cebr3",
+          "crystal_radius_m": 0.038,
+          "crystal_shape": "sphere",
+          "housing_material": "aluminum",
+          "housing_thickness_m": 0.0015
+        },
+        "expected_total_counts": 1552.9411484462614,
+        "num_sources": 2,
+        "python_transport_model": "line_response_attenuation_scatter",
+        "scatter_gain": 0.0,
+        "total_fe_path_cm": 0.0,
+        "total_obstacle_path_cm": 0.0,
+        "total_pb_path_cm": 0.0,
+        "total_stage_path_cm": 0.0,
+        "transport_backend": "python"
+      },
+      "pose": [
+        5.0,
+        1.0,
+        0.5
+      ],
+      "step": 1,
+      "variances": {
+        "Co-60": 2036.125508652731,
+        "Cs-137": 1237.4304527498566,
+        "Eu-154": 5204.6700500718325
+      }
+    }
+  ],
+  "sources": [
+    {
+      "intensity_cps_1m": 63813.2,
+      "isotope": "Co-60",
+      "position": [
+        2.03,
+        19.133,
+        0.677
+      ]
+    },
+    {
+      "intensity_cps_1m": 31226.4,
+      "isotope": "Cs-137",
+      "position": [
+        6.694,
+        9.812,
+        1.561
+      ]
+    }
+  ],
+  "wall_time_s": 0.3053244149778038
+}

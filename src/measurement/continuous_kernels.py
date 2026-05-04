@@ -1183,6 +1183,402 @@ class ContinuousKernel:
         values = geom * att
         return values.detach().cpu().numpy().astype(float, copy=False)
 
+    def _kernel_values_all_pairs_torch_chunk(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        tol: float = 1e-6,
+    ) -> NDArray[np.float64]:
+        """Return per-source kernel values for every Fe/Pb pair on the GPU."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
+        num_orients = int(len(self.orientations))
+        num_pairs = num_orients * num_orients
+        if sources_t.numel() == 0:
+            return np.zeros((num_pairs, 0), dtype=float)
+        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 3)
+        with torch.no_grad():
+            direction = detector_t - sources_t
+            dist = torch.linalg.norm(direction, dim=1)
+            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
+            dist = torch.where(dist <= tol_t, tol_t, dist)
+            geom = _finite_sphere_geometric_term_torch(
+                dist,
+                detector_radius_m=self.detector_radius_m,
+                tol=tol_t,
+            )
+            targets, sample_count = self._detector_aperture_targets_torch(
+                sources=sources_t,
+                detector=detector_t,
+                dist=dist,
+                tol=tol,
+            )
+            sampled_sources = sources_t.unsqueeze(-2).expand_as(targets)
+            sampled_direction = targets - sampled_sources
+            sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+            sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+            dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+            detector_to_source_unit = -dir_unit
+
+            l_fe_by_orient: list[torch.Tensor] = []
+            l_pb_by_orient: list[torch.Tensor] = []
+            for orient_idx in range(num_orients):
+                if (
+                    self.shield_params.shield_geometry_model
+                    == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+                    and not self.shield_params.use_angle_attenuation
+                ):
+                    center = detector_t.expand_as(sources_t).unsqueeze(-2)
+                    shield_normal = -np.asarray(
+                        self.orientations[orient_idx],
+                        dtype=float,
+                    )
+                    l_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        center_pos=center,
+                        shield_normal=shield_normal,
+                        inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                        outer_radius_cm=(
+                            self.shield_params.inner_radius_fe_cm
+                            + self.shield_params.thickness_fe_cm
+                        ),
+                        tol=tol,
+                    )
+                    l_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        center_pos=center,
+                        shield_normal=shield_normal,
+                        inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                        outer_radius_cm=(
+                            self.shield_params.inner_radius_pb_cm
+                            + self.shield_params.thickness_pb_cm
+                        ),
+                        tol=tol,
+                    )
+                else:
+                    blocked = self._rotated_octant_blocked_mask_torch(
+                        detector_to_source_unit,
+                        orient_idx,
+                        tol,
+                    )
+                    normal = torch.as_tensor(
+                        self.orientations[orient_idx],
+                        device=device,
+                        dtype=dtype,
+                    )
+                    cos_theta = torch.clamp(
+                        torch.sum(dir_unit * normal, dim=-1),
+                        0.0,
+                        1.0,
+                    )
+                    l_fe, l_pb = self._shield_path_lengths_torch(
+                        direction=sampled_direction,
+                        blocked_fe=blocked,
+                        blocked_pb=blocked,
+                        cos_fe=cos_theta,
+                        cos_pb=cos_theta,
+                        tol_t=tol_t,
+                        device=device,
+                        dtype=dtype,
+                    )
+                l_fe_by_orient.append(l_fe)
+                l_pb_by_orient.append(l_pb)
+
+            l_fe_stack = torch.stack(l_fe_by_orient, dim=0)
+            l_pb_stack = torch.stack(l_pb_by_orient, dim=0)
+            pair_ids = torch.arange(num_pairs, device=device, dtype=torch.long)
+            fe_indices = torch.div(pair_ids, num_orients, rounding_mode="floor")
+            pb_indices = torch.remainder(pair_ids, num_orients)
+            l_fe_pairs = l_fe_stack.index_select(0, fe_indices)
+            l_pb_pairs = l_pb_stack.index_select(0, pb_indices)
+
+            mu_fe, mu_pb = self._mu_values(isotope=isotope)
+            tau_fe = float(mu_fe) * l_fe_pairs
+            tau_pb = float(mu_pb) * l_pb_pairs
+            tau_obstacle = torch.zeros_like(tau_fe)
+            boxes_np = self.obstacle_boxes_m()
+            if boxes_np.size:
+                boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
+                if sample_count > 1:
+                    obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        obstacle_boxes_m=boxes_t,
+                        tol=tol,
+                    )
+                else:
+                    obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                        positions=sources_t,
+                        detector_pos=detector_t.reshape(3),
+                        obstacle_boxes_m=boxes_t,
+                    ).unsqueeze(-1)
+                tau_obstacle = (
+                    float(self.obstacle_mu_cm_inv(isotope))
+                    * obstacle_path_cm.unsqueeze(0)
+                )
+            total_tau = tau_fe + tau_pb + tau_obstacle
+            buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
+            att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
+            att = torch.mean(att, dim=-1)
+            values = geom.unsqueeze(0) * att
+        return values.detach().cpu().numpy().astype(float, copy=False)
+
+    def _kernel_values_all_pairs_for_detector_source_torch_chunk(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        tol: float = 1e-6,
+    ) -> NDArray[np.float64]:
+        """Return all Fe/Pb pair kernels for matched detector-source rows."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        detectors_t = torch.as_tensor(detector_positions, device=device, dtype=dtype)
+        sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
+        if detectors_t.ndim != 2 or detectors_t.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (N, 3).")
+        if sources_t.ndim != 2 or sources_t.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if detectors_t.shape[0] != sources_t.shape[0]:
+            raise ValueError("detector_positions and sources must have the same row count.")
+        num_orients = int(len(self.orientations))
+        num_pairs = num_orients * num_orients
+        if sources_t.numel() == 0:
+            return np.zeros((0, num_pairs), dtype=float)
+        with torch.no_grad():
+            direction = detectors_t - sources_t
+            dist = torch.linalg.norm(direction, dim=1)
+            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
+            dist = torch.where(dist <= tol_t, tol_t, dist)
+            geom = _finite_sphere_geometric_term_torch(
+                dist,
+                detector_radius_m=self.detector_radius_m,
+                tol=tol_t,
+            )
+            targets, sample_count = self._detector_aperture_targets_torch(
+                sources=sources_t,
+                detector=detectors_t,
+                dist=dist,
+                tol=tol,
+            )
+            sampled_sources = sources_t.unsqueeze(-2).expand_as(targets)
+            sampled_direction = targets - sampled_sources
+            sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+            sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
+            dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+            detector_to_source_unit = -dir_unit
+
+            l_fe_by_orient: list[torch.Tensor] = []
+            l_pb_by_orient: list[torch.Tensor] = []
+            for orient_idx in range(num_orients):
+                if (
+                    self.shield_params.shield_geometry_model
+                    == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+                    and not self.shield_params.use_angle_attenuation
+                ):
+                    shield_normal = -np.asarray(
+                        self.orientations[orient_idx],
+                        dtype=float,
+                    )
+                    center = detectors_t.unsqueeze(-2)
+                    l_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        center_pos=center,
+                        shield_normal=shield_normal,
+                        inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                        outer_radius_cm=(
+                            self.shield_params.inner_radius_fe_cm
+                            + self.shield_params.thickness_fe_cm
+                        ),
+                        tol=tol,
+                    )
+                    l_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        center_pos=center,
+                        shield_normal=shield_normal,
+                        inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                        outer_radius_cm=(
+                            self.shield_params.inner_radius_pb_cm
+                            + self.shield_params.thickness_pb_cm
+                        ),
+                        tol=tol,
+                    )
+                else:
+                    blocked = self._rotated_octant_blocked_mask_torch(
+                        detector_to_source_unit,
+                        orient_idx,
+                        tol,
+                    )
+                    normal = torch.as_tensor(
+                        self.orientations[orient_idx],
+                        device=device,
+                        dtype=dtype,
+                    )
+                    cos_theta = torch.clamp(
+                        torch.sum(dir_unit * normal, dim=-1),
+                        0.0,
+                        1.0,
+                    )
+                    l_fe, l_pb = self._shield_path_lengths_torch(
+                        direction=sampled_direction,
+                        blocked_fe=blocked,
+                        blocked_pb=blocked,
+                        cos_fe=cos_theta,
+                        cos_pb=cos_theta,
+                        tol_t=tol_t,
+                        device=device,
+                        dtype=dtype,
+                    )
+                l_fe_by_orient.append(l_fe)
+                l_pb_by_orient.append(l_pb)
+
+            l_fe_stack = torch.stack(l_fe_by_orient, dim=0)
+            l_pb_stack = torch.stack(l_pb_by_orient, dim=0)
+            pair_ids = torch.arange(num_pairs, device=device, dtype=torch.long)
+            fe_indices = torch.div(pair_ids, num_orients, rounding_mode="floor")
+            pb_indices = torch.remainder(pair_ids, num_orients)
+            l_fe_pairs = l_fe_stack.index_select(0, fe_indices)
+            l_pb_pairs = l_pb_stack.index_select(0, pb_indices)
+
+            mu_fe, mu_pb = self._mu_values(isotope=isotope)
+            tau_fe = float(mu_fe) * l_fe_pairs
+            tau_pb = float(mu_pb) * l_pb_pairs
+            tau_obstacle = torch.zeros_like(tau_fe)
+            boxes_np = self.obstacle_boxes_m()
+            if boxes_np.size:
+                boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
+                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    obstacle_boxes_m=boxes_t,
+                    tol=tol,
+                )
+                tau_obstacle = (
+                    float(self.obstacle_mu_cm_inv(isotope))
+                    * obstacle_path_cm.unsqueeze(0)
+                )
+            total_tau = tau_fe + tau_pb + tau_obstacle
+            buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
+            att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
+            att = torch.mean(att, dim=-1)
+            values = geom.unsqueeze(0) * att
+        return values.transpose(0, 1).detach().cpu().numpy().astype(float, copy=False)
+
+    def kernel_values_all_pairs(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        chunk_size: int = 8192,
+    ) -> NDArray[np.float64]:
+        """Evaluate K values for every Fe/Pb orientation pair and source."""
+        sources_arr = np.asarray(sources, dtype=float)
+        num_orients = int(len(self.orientations))
+        num_pairs = num_orients * num_orients
+        if sources_arr.size == 0:
+            return np.zeros((num_pairs, 0), dtype=float)
+        if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if not self.use_gpu:
+            rows = [
+                self.kernel_values_pair(
+                    isotope=isotope,
+                    detector_pos=detector_pos,
+                    sources=sources_arr,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    chunk_size=chunk_size,
+                )
+                for fe_index in range(num_orients)
+                for pb_index in range(num_orients)
+            ]
+            return np.vstack(rows).astype(float, copy=False)
+        self._gpu_enabled()
+        chunk = max(1, int(chunk_size))
+        parts: list[NDArray[np.float64]] = []
+        for start in range(0, sources_arr.shape[0], chunk):
+            stop = min(start + chunk, sources_arr.shape[0])
+            parts.append(
+                self._kernel_values_all_pairs_torch_chunk(
+                    isotope=isotope,
+                    detector_pos=detector_pos,
+                    sources=sources_arr[start:stop],
+                )
+            )
+        if not parts:
+            return np.zeros((num_pairs, 0), dtype=float)
+        return np.concatenate(parts, axis=1)
+
+    def kernel_values_all_pairs_for_detectors(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        chunk_size: int = 262144,
+    ) -> NDArray[np.float64]:
+        """Evaluate all Fe/Pb pair kernels for many detectors and sources."""
+        detectors_arr = np.asarray(detector_positions, dtype=float)
+        sources_arr = np.asarray(sources, dtype=float)
+        num_orients = int(len(self.orientations))
+        num_pairs = num_orients * num_orients
+        if detectors_arr.size == 0 or sources_arr.size == 0:
+            if detectors_arr.size == 0:
+                pose_count = 0
+            else:
+                pose_count = int(detectors_arr.reshape(-1, 3).shape[0])
+            return np.zeros((pose_count, num_pairs, 0), dtype=float)
+        if detectors_arr.ndim != 2 or detectors_arr.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (P, 3).")
+        if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (S, 3).")
+        pose_count = int(detectors_arr.shape[0])
+        source_count = int(sources_arr.shape[0])
+        if not self.use_gpu:
+            return np.stack(
+                [
+                    self.kernel_values_all_pairs(
+                        isotope=isotope,
+                        detector_pos=detector,
+                        sources=sources_arr,
+                        chunk_size=chunk_size,
+                    )
+                    for detector in detectors_arr
+                ],
+                axis=0,
+            ).astype(float, copy=False)
+        self._gpu_enabled()
+        detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
+        sources_flat = np.tile(sources_arr, (pose_count, 1))
+        chunk = max(1, int(chunk_size))
+        parts: list[NDArray[np.float64]] = []
+        for start in range(0, sources_flat.shape[0], chunk):
+            stop = min(start + chunk, sources_flat.shape[0])
+            parts.append(
+                self._kernel_values_all_pairs_for_detector_source_torch_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors_flat[start:stop],
+                    sources=sources_flat[start:stop],
+                )
+            )
+        if not parts:
+            return np.zeros((pose_count, num_pairs, source_count), dtype=float)
+        flat_values = np.concatenate(parts, axis=0)
+        return flat_values.reshape(pose_count, source_count, num_pairs).transpose(
+            0,
+            2,
+            1,
+        )
+
     def kernel_values_pair(
         self,
         isotope: str,

@@ -1,0 +1,1898 @@
+[
+  {
+    "case": {
+      "description": "1 source(s), 1 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        1.5,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_00",
+      "obstacle_cells": [],
+      "pb_index": 1,
+      "sources": [
+        {
+          "intensity_cps_1m": 79901.73054081277,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.3881511651551426,
+            1.655089439547581,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 58802,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 59270,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 587,
+      "process_count_photoelectric": 38,
+      "process_count_rayleigh": 9,
+      "run_time_s": 0.129658,
+      "secondary_count": 625,
+      "source_equivalent_counts_Cs-137": 2948892.188149,
+      "total_spectrum_counts": 2938790.582624,
+      "total_track_steps": 59932,
+      "transport_detected_counts_Cs-137": 2938425.79047,
+      "volume_step_counts": "/World/SimBridge/Robot/FeShield:78,/World/SimBridge/Robot/PbShield:54,WorldPV:59800",
+      "volume_step_counts_top": "/World/SimBridge/Robot/FeShield:78,/World/SimBridge/Robot/PbShield:54,WorldPV:59800",
+      "weighted_spectrum_effective_entries": 58816.456871,
+      "weighted_spectrum_sumw2": 146837986.305152,
+      "weighted_transport": false
+    },
+    "num_primaries": 59270.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1578.219376665541,
+          "photopeak_nnls": 2.5725986629943965e-14,
+          "response_matrix": 259.279199241715,
+          "response_poisson": 2.5725986629943965e-14
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 4014.7242858749455,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 951074.1822260091,
+          "photopeak_nnls": 2939712.946828564,
+          "response_matrix": 2938124.1416252768,
+          "response_poisson": 2938520.0087231607
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.003561906416975665,
+        "relative_errors": {
+          "peak_window": -0.6774808566931604,
+          "photopeak_nnls": -0.0031127761663201827,
+          "response_matrix": -0.003651556529221392,
+          "response_poisson": -0.0035173138805837524
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6763320736870182,
+          "photopeak_nnls": 0.0004380428332540576,
+          "response_matrix": -0.0001026566148791103,
+          "response_poisson": 3.2064193510143636e-05
+        },
+        "response_poisson_variance": 3467107.9932988314,
+        "source_tally_counts": 2948892.188149,
+        "target_pf_counts": 2948892.188148882,
+        "transport_truth_counts": 2938425.79047
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 40076.39006118518,
+          "photopeak_nnls": 0.325543354602975,
+          "response_matrix": 554.9212393549307,
+          "response_poisson": 0.325543354602975
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 6585.145181820157,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 2938790.582628836,
+    "runtime_s": 1.5152673721313477,
+    "total_spectrum_counts": 2938788.5837677154
+  },
+  {
+    "case": {
+      "description": "2 source(s), 2 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        2.5,
+        4.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 3,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_01",
+      "obstacle_cells": [],
+      "pb_index": 6,
+      "sources": [
+        {
+          "intensity_cps_1m": 67649.1334012014,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.4848324562518287,
+            3.074074258462263,
+            0.5111357924617864
+          ]
+        },
+        {
+          "intensity_cps_1m": 52893.33779626544,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            4.353932878619363,
+            6.37809934851809,
+            1.980154091165374
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 23041,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 23315,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 334,
+      "process_count_photoelectric": 14,
+      "process_count_rayleigh": 0,
+      "run_time_s": 0.053285,
+      "secondary_count": 348,
+      "source_equivalent_counts_Co-60": 997962.115781,
+      "source_equivalent_counts_Eu-154": 173322.650344,
+      "total_spectrum_counts": 1148719.257121,
+      "total_track_steps": 23683,
+      "transport_detected_counts_Co-60": 984980.710734,
+      "transport_detected_counts_Eu-154": 166812.861943,
+      "volume_step_counts": "/World/Environment/PillarMesh:5,/World/SimBridge/Robot/FeShield:37,/World/SimBridge/Robot/PbShield:19,WorldPV:23622",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:5,/World/SimBridge/Robot/FeShield:37,/World/SimBridge/Robot/PbShield:19,WorldPV:23622",
+      "weighted_spectrum_effective_entries": 22986.858355,
+      "weighted_spectrum_sumw2": 57404796.744067,
+      "weighted_transport": false
+    },
+    "num_primaries": 23315.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 312482.85617472715,
+          "photopeak_nnls": 980193.4525536419,
+          "response_matrix": 984341.6446640545,
+          "response_poisson": 983823.8525291791
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.013179349509908561,
+        "relative_errors": {
+          "peak_window": -0.6868790395614452,
+          "photopeak_nnls": -0.01780494764946959,
+          "response_matrix": -0.013648284741313889,
+          "response_poisson": -0.014167134231377011
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6827523089849471,
+          "photopeak_nnls": -0.004860255767639013,
+          "response_matrix": -0.0006488107462218556,
+          "response_poisson": -0.0011744983350575567
+        },
+        "response_poisson_variance": 23663341.040620945,
+        "source_tally_counts": 997962.115781,
+        "target_pf_counts": 997962.1157812815,
+        "transport_truth_counts": 984980.710734
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 374.7505889080385,
+          "photopeak_nnls": 3.4277572574510466e-12,
+          "response_matrix": 256.1778742722101,
+          "response_poisson": 3.4277572574510466e-12
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 858490.3192316223,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 105359.8568200629,
+          "photopeak_nnls": 166012.8118363726,
+          "response_matrix": 165471.5645889498,
+          "response_poisson": 165524.29172396712
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.03902449921865195,
+        "relative_errors": {
+          "peak_window": -0.39211720677464085,
+          "photopeak_nnls": -0.04217474457431689,
+          "response_matrix": -0.04529751731261704,
+          "response_poisson": -0.04499330355340671
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.3683948851853858,
+          "photopeak_nnls": -0.00479609364235222,
+          "response_matrix": -0.008040731022938183,
+          "response_poisson": -0.007724645474119248
+        },
+        "response_poisson_variance": 473438.0073883096,
+        "source_tally_counts": 173322.650344,
+        "target_pf_counts": 173322.6503435557,
+        "transport_truth_counts": 166812.861943
+      }
+    },
+    "raw_total_spectrum_counts": 1148719.2571216472,
+    "runtime_s": 2.5269241333007812,
+    "total_spectrum_counts": 1148717.2575668138
+  },
+  {
+    "case": {
+      "description": "3 source(s), 3 isotope(s), obstacle_cells=2",
+      "detector_pose_xyz": [
+        5.0,
+        10.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 6,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_02",
+      "obstacle_cells": [
+        [
+          5,
+          8
+        ],
+        [
+          5,
+          9
+        ]
+      ],
+      "pb_index": 3,
+      "sources": [
+        {
+          "intensity_cps_1m": 42039.36855770769,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            6.316109761374102,
+            8.51407050602051,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 62238.99072680711,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.533327080956084,
+            7.699247418855626,
+            2.0
+          ]
+        },
+        {
+          "intensity_cps_1m": 39223.04204212531,
+          "isotope": "Co-60",
+          "position_xyz": [
+            9.25,
+            14.672107107144509,
+            0.6813193960051891
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 2545,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 9793,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 47750,
+      "process_count_photoelectric": 5069,
+      "process_count_rayleigh": 2237,
+      "run_time_s": 0.06197,
+      "secondary_count": 53035,
+      "source_equivalent_counts_Co-60": 29473.309155,
+      "source_equivalent_counts_Cs-137": 137010.43833,
+      "source_equivalent_counts_Eu-154": 320086.042794,
+      "total_spectrum_counts": 127571.846452,
+      "total_track_steps": 73773,
+      "transport_detected_counts_Co-60": 6349.843033,
+      "transport_detected_counts_Cs-137": 120897.011452,
+      "volume_step_counts": "/World/Environment/PillarMesh:401,/World/SimBridge/Obstacles/Obstacle_0000:40802,/World/SimBridge/Obstacles/Obstacle_0001:17027,/World/SimBridge/Robot/FeShield:2490,/World/SimBridge/Robot/PbShield:72,WorldPV:12981",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:401,/World/SimBridge/Obstacles/Obstacle_0000:40802,/World/SimBridge/Obstacles/Obstacle_0001:17027,/World/SimBridge/Robot/FeShield:2490,/World/SimBridge/Robot/PbShield:72,WorldPV:12981",
+      "weighted_spectrum_effective_entries": 2557.871873,
+      "weighted_spectrum_sumw2": 6362545.434633,
+      "weighted_transport": false
+    },
+    "num_primaries": 9793.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1907.0514886777355,
+          "photopeak_nnls": 5895.424631577402,
+          "response_matrix": 7510.799321593234,
+          "response_poisson": 5949.429526286551
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.29027398142737226,
+        "relative_errors": {
+          "peak_window": -0.7672351009634617,
+          "photopeak_nnls": -0.28043478254586063,
+          "response_matrix": -0.08327045381112995,
+          "response_poisson": -0.273843222779863
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6996695069835854,
+          "photopeak_nnls": -0.0715637219787947,
+          "response_matrix": 0.1828322814532215,
+          "response_poisson": -0.0630588039157045
+        },
+        "response_poisson_variance": 7053.194755692712,
+        "source_tally_counts": 29473.309155,
+        "target_pf_counts": 8193.037251627771,
+        "transport_truth_counts": 6349.843033
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 37648.9593380737,
+          "photopeak_nnls": 116467.29670641843,
+          "response_matrix": 117969.31934854027,
+          "response_poisson": 116695.32362567057
+        },
+        "pf_target_relative_error_vs_transport_truth": -0.0004960980482969458,
+        "relative_errors": {
+          "peak_window": -0.6884319493804468,
+          "photopeak_nnls": -0.036162241035676446,
+          "response_matrix": -0.02373208958341385,
+          "response_poisson": -0.034275179508099954
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6885865176822709,
+          "photopeak_nnls": -0.03664039906677355,
+          "response_matrix": -0.024216414188386454,
+          "response_poisson": -0.0347542737067379
+        },
+        "response_poisson_variance": 1194881.1572510237,
+        "source_tally_counts": 137010.43833,
+        "target_pf_counts": 120837.03468057374,
+        "transport_truth_counts": 120897.011452
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 1897.8560498870477,
+          "photopeak_nnls": 3.393441963609346,
+          "response_matrix": 3633.4489071792527,
+          "response_poisson": 3.393441963609346
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 179855.61193314585,
+        "source_tally_counts": 320086.042794,
+        "target_pf_counts": 7.1233302418239e-07,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 127571.84645122144,
+    "runtime_s": 2.4914968013763428,
+    "total_spectrum_counts": 127567.84655009811
+  },
+  {
+    "case": {
+      "description": "4 source(s), 3 isotope(s), obstacle_cells=5",
+      "detector_pose_xyz": [
+        7.5,
+        15.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 1,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_03",
+      "obstacle_cells": [
+        [
+          3,
+          15
+        ],
+        [
+          4,
+          15
+        ],
+        [
+          5,
+          15
+        ],
+        [
+          6,
+          15
+        ],
+        [
+          6,
+          16
+        ]
+      ],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 70760.56257034186,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            5.672717977859268,
+            17.394416236907993,
+            1.9766436211528475
+          ]
+        },
+        {
+          "intensity_cps_1m": 58382.84218037852,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.5057115658999445,
+            15.616991558076888,
+            0.5224316017143742
+          ]
+        },
+        {
+          "intensity_cps_1m": 75729.38764117588,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            6.734529890437969,
+            14.819188825865957,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 77521.31494515455,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            9.25,
+            15.627345167096701,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 16970,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 65096,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 188730,
+      "process_count_photoelectric": 22146,
+      "process_count_rayleigh": 7675,
+      "run_time_s": 0.30559,
+      "secondary_count": 211567,
+      "source_equivalent_counts_Co-60": 70179.819074,
+      "source_equivalent_counts_Cs-137": 988457.773047,
+      "source_equivalent_counts_Eu-154": 2164834.16587,
+      "total_spectrum_counts": 845586.430949,
+      "total_track_steps": 381058,
+      "transport_detected_counts_Cs-137": 751776.803844,
+      "transport_detected_counts_Eu-154": 96584.172432,
+      "volume_step_counts": "/World/Environment/PillarMesh:673,/World/SimBridge/Obstacles/Obstacle_0000:13108,/World/SimBridge/Obstacles/Obstacle_0001:276,/World/SimBridge/Obstacles/Obstacle_0002:297,/World/SimBridge/Obstacles/Obstacle_0003:162916,/World/SimBridge/Obstacles/Obstacle_0004:35536,/World/SimBridge/Robot/FeShield:36835,/World/SimBridge/Robot/PbShield:15099,WorldPV:116318",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:673,/World/SimBridge/Obstacles/Obstacle_0000:13108,/World/SimBridge/Obstacles/Obstacle_0001:276,/World/SimBridge/Obstacles/Obstacle_0002:297,/World/SimBridge/Obstacles/Obstacle_0003:162916,/World/SimBridge/Obstacles/Obstacle_0004:35536,/World/SimBridge/Robot/FeShield:36835,/World/SimBridge/Robot/PbShield:15099,WorldPV:116318",
+      "weighted_spectrum_effective_entries": 16921.8592,
+      "weighted_spectrum_sumw2": 42254010.255896,
+      "weighted_transport": false
+    },
+    "num_primaries": 65096.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 6257.593175720438,
+          "photopeak_nnls": 1.7599841702564073e-12,
+          "response_matrix": 231.60892767248615,
+          "response_poisson": 1.7599841702564073e-12
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 65841.88577685365,
+        "source_tally_counts": 70179.819074,
+        "target_pf_counts": 4.762172017254994e-15,
+        "transport_truth_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 241265.6993759452,
+          "photopeak_nnls": 751477.5741407209,
+          "response_matrix": 751594.458611758,
+          "response_poisson": 751139.9069338328
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.004809479797581068,
+        "relative_errors": {
+          "peak_window": -0.6806088061386609,
+          "photopeak_nnls": -0.00518258423949861,
+          "response_matrix": -0.005027850803104854,
+          "response_poisson": -0.005629593211825667
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6790727006442595,
+          "photopeak_nnls": -0.0003980299761166725,
+          "response_matrix": -0.00024255235238657087,
+          "response_poisson": -0.0008471888290654738
+        },
+        "response_poisson_variance": 751140.9069338328,
+        "source_tally_counts": 988457.773047,
+        "target_pf_counts": 755392.4591943778,
+        "transport_truth_counts": 751776.803844
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 35116.04649223575,
+          "photopeak_nnls": 64456.490906780644,
+          "response_matrix": 92516.95745340492,
+          "response_poisson": 64516.59080003952
+        },
+        "pf_target_relative_error_vs_transport_truth": -0.46456038862193716,
+        "relative_errors": {
+          "peak_window": -0.3209696975210316,
+          "photopeak_nnls": 0.24637921660233983,
+          "response_matrix": 0.7889775153905626,
+          "response_poisson": 0.24754135336815009
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6364202787267327,
+          "photopeak_nnls": -0.33263919663274877,
+          "response_matrix": -0.042110574395184765,
+          "response_poisson": -0.33201694257449516
+        },
+        "response_poisson_variance": 27464943.60204541,
+        "source_tally_counts": 2164834.16587,
+        "target_pf_counts": 51714.99175226189,
+        "transport_truth_counts": 96584.172432
+      }
+    },
+    "raw_total_spectrum_counts": 845586.4309489925,
+    "runtime_s": 2.788342237472534,
+    "total_spectrum_counts": 845585.431112839
+  },
+  {
+    "case": {
+      "description": "5 source(s), 3 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        8.5,
+        5.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 4,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_04",
+      "obstacle_cells": [],
+      "pb_index": 5,
+      "sources": [
+        {
+          "intensity_cps_1m": 50648.50775672178,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            9.25,
+            5.175330960660617,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 41770.41645535485,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            3.7930309011140952,
+            9.929944197855045,
+            0.6207753885888234
+          ]
+        },
+        {
+          "intensity_cps_1m": 81053.60031117703,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            9.25,
+            4.712674338936696,
+            1.1824829021762235
+          ]
+        },
+        {
+          "intensity_cps_1m": 52756.32487770829,
+          "isotope": "Co-60",
+          "position_xyz": [
+            8.211825351625055,
+            2.502750134619585,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 55345.14602031894,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            9.25,
+            9.028976352916652,
+            2.0
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 36863,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 81719,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 55977,
+      "process_count_photoelectric": 36592,
+      "process_count_rayleigh": 5292,
+      "run_time_s": 0.181223,
+      "secondary_count": 92569,
+      "source_equivalent_counts_Co-60": 174563.588667,
+      "source_equivalent_counts_Cs-137": 3750283.070745,
+      "source_equivalent_counts_Eu-154": 138743.022963,
+      "total_spectrum_counts": 1839760.920159,
+      "total_track_steps": 216257,
+      "transport_detected_counts_Co-60": 173438.149967,
+      "transport_detected_counts_Cs-137": 1533003.313439,
+      "transport_detected_counts_Eu-154": 136051.482481,
+      "volume_step_counts": "/World/Environment/PillarMesh:274,/World/SimBridge/Robot/FeShield:42337,/World/SimBridge/Robot/PbShield:72090,WorldPV:101556",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:274,/World/SimBridge/Robot/FeShield:42337,/World/SimBridge/Robot/PbShield:72090,WorldPV:101556",
+      "weighted_spectrum_effective_entries": 36814.537043,
+      "weighted_spectrum_sumw2": 91939774.751892,
+      "weighted_transport": false
+    },
+    "num_primaries": 81719.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 59591.24896320136,
+          "photopeak_nnls": 172077.53216358254,
+          "response_matrix": 174793.36998104255,
+          "response_poisson": 172487.09855457765
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.006488991607302522,
+        "relative_errors": {
+          "peak_window": -0.6586272691893287,
+          "photopeak_nnls": -0.014241552444757829,
+          "response_matrix": 0.0013163186909474305,
+          "response_poisson": -0.01189532208753524
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6564121044041362,
+          "photopeak_nnls": -0.007844974151744299,
+          "response_matrix": 0.007813851879188045,
+          "response_poisson": -0.0054835191254248945
+        },
+        "response_poisson_variance": 4800166.736285959,
+        "source_tally_counts": 174563.588667,
+        "target_pf_counts": 174563.58866652194,
+        "transport_truth_counts": 173438.149967
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 489646.0252955073,
+          "photopeak_nnls": 1523704.1253352333,
+          "response_matrix": 1526359.2725291636,
+          "response_poisson": 1524798.8725568908
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.09036975059279427,
+        "relative_errors": {
+          "peak_window": -0.7070689925159407,
+          "photopeak_nnls": -0.08844315794722162,
+          "response_matrix": -0.08685471465889492,
+          "response_poisson": -0.08778822481182655
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6805968904287102,
+          "photopeak_nnls": -0.006065993479756867,
+          "response_matrix": -0.004334002967633296,
+          "response_poisson": -0.0053518742002611926
+        },
+        "response_poisson_variance": 6431612.427849371,
+        "source_tally_counts": 3750283.070745,
+        "target_pf_counts": 1671540.4405324096,
+        "transport_truth_counts": 1533003.313439
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 64432.47332454758,
+          "photopeak_nnls": 129323.53210637861,
+          "response_matrix": 140507.65778824847,
+          "response_poisson": 129398.85952059501
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.01978324993813545,
+        "relative_errors": {
+          "peak_window": -0.5355984614696189,
+          "photopeak_nnls": -0.06789163632021612,
+          "response_matrix": 0.012718728388517198,
+          "response_poisson": -0.06734870873648972
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.5264110897612176,
+          "photopeak_nnls": -0.0494515035921125,
+          "response_matrix": 0.03275359610925794,
+          "response_poisson": -0.04889783513629894
+        },
+        "response_poisson_variance": 63384036.50542917,
+        "source_tally_counts": 138743.022963,
+        "target_pf_counts": 138743.0229633755,
+        "transport_truth_counts": 136051.482481
+      }
+    },
+    "raw_total_spectrum_counts": 1839760.9201551783,
+    "runtime_s": 2.6538827419281006,
+    "total_spectrum_counts": 1839757.9212246314
+  },
+  {
+    "case": {
+      "description": "1 source(s), 1 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        1.5,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 7,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_05",
+      "obstacle_cells": [],
+      "pb_index": 2,
+      "sources": [
+        {
+          "intensity_cps_1m": 71109.63598019522,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.677079066738849,
+            0.75,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 71680,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 72065,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 507,
+      "process_count_photoelectric": 34,
+      "process_count_rayleigh": 5,
+      "run_time_s": 0.160807,
+      "secondary_count": 541,
+      "source_equivalent_counts_Co-60": 3592260.584983,
+      "total_spectrum_counts": 3581866.292397,
+      "total_track_steps": 72681,
+      "transport_detected_counts_Co-60": 3581512.53809,
+      "volume_step_counts": "/World/SimBridge/Robot/FeShield:91,/World/SimBridge/Robot/PbShield:70,WorldPV:72520",
+      "volume_step_counts_top": "/World/SimBridge/Robot/FeShield:91,/World/SimBridge/Robot/PbShield:70,WorldPV:72520",
+      "weighted_spectrum_effective_entries": 71694.016671,
+      "weighted_spectrum_sumw2": 178951699.63012,
+      "weighted_transport": false
+    },
+    "num_primaries": 72065.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 1138365.7346503767,
+          "photopeak_nnls": 3576443.5211239336,
+          "response_matrix": 3581228.1062813476,
+          "response_poisson": 3581211.1873362726
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.0030009798315419538,
+        "relative_errors": {
+          "peak_window": -0.6831060253788094,
+          "photopeak_nnls": -0.004403094788114576,
+          "response_matrix": -0.003071179955038425,
+          "response_poisson": -0.0030758897873779103
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.682155032952234,
+          "photopeak_nnls": -0.001415328555228122,
+          "response_matrix": -7.941667260057733e-05,
+          "response_poisson": -8.414063905192347e-05
+        },
+        "response_poisson_variance": 34257429.348702736,
+        "source_tally_counts": 3592260.584983,
+        "target_pf_counts": 3592260.5849832227,
+        "transport_truth_counts": 3581512.53809
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 1890.9646583099131,
+          "photopeak_nnls": 4.1264603344547124e-10,
+          "response_matrix": 397.1606763985085,
+          "response_poisson": 4.1264603344547124e-10
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 2775261.43978073,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 218520.73821329954,
+          "photopeak_nnls": 2.4616569037089888e-11,
+          "response_matrix": 0.0,
+          "response_poisson": 2.4616569037089888e-11
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 93029991.12812196,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 3581866.292399255,
+    "runtime_s": 2.6412341594696045,
+    "total_spectrum_counts": 3581864.2937873467
+  },
+  {
+    "case": {
+      "description": "2 source(s), 2 isotope(s), obstacle_cells=3",
+      "detector_pose_xyz": [
+        2.5,
+        4.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 2,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_06",
+      "obstacle_cells": [
+        [
+          4,
+          2
+        ],
+        [
+          5,
+          1
+        ],
+        [
+          5,
+          2
+        ]
+      ],
+      "pb_index": 7,
+      "sources": [
+        {
+          "intensity_cps_1m": 39972.69739106098,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            6.886064347901321,
+            0.75,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 36484.184603223286,
+          "isotope": "Co-60",
+          "position_xyz": [
+            1.4761613398335887,
+            3.7547079942627226,
+            1.1352150063600859
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 10823,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 11718,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 5130,
+      "process_count_photoelectric": 544,
+      "process_count_rayleigh": 231,
+      "run_time_s": 0.030425,
+      "secondary_count": 5704,
+      "source_equivalent_counts_Co-60": 545298.636032,
+      "source_equivalent_counts_Cs-137": 36011.373704,
+      "total_spectrum_counts": 541477.182129,
+      "total_track_steps": 18169,
+      "transport_detected_counts_Co-60": 541093.222418,
+      "volume_step_counts": "/World/SimBridge/Obstacles/Obstacle_0001:5994,/World/SimBridge/Obstacles/Obstacle_0002:7,/World/SimBridge/Robot/FeShield:15,/World/SimBridge/Robot/PbShield:12,WorldPV:12141",
+      "volume_step_counts_top": "/World/SimBridge/Obstacles/Obstacle_0001:5994,/World/SimBridge/Obstacles/Obstacle_0002:7,/World/SimBridge/Robot/FeShield:15,/World/SimBridge/Robot/PbShield:12,WorldPV:12141",
+      "weighted_spectrum_effective_entries": 10838.221247,
+      "weighted_spectrum_sumw2": 27052182.464143,
+      "weighted_transport": false
+    },
+    "num_primaries": 11718.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 171891.4637593943,
+          "photopeak_nnls": 540051.2041919391,
+          "response_matrix": 540990.4065017262,
+          "response_poisson": 540947.3579296251
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.007772068545806536,
+        "relative_errors": {
+          "peak_window": -0.6847755479270788,
+          "photopeak_nnls": -0.009623042299438422,
+          "response_matrix": -0.007900679088297878,
+          "response_poisson": -0.007979624035628748
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6823256018782538,
+          "photopeak_nnls": -0.0019257646980023163,
+          "response_matrix": -0.00019001516192401424,
+          "response_poisson": -0.0002695736747968832
+        },
+        "response_poisson_variance": 1270589.8144343048,
+        "source_tally_counts": 545298.636032,
+        "target_pf_counts": 545298.636032304,
+        "transport_truth_counts": 541093.222418
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 285.31547486816737,
+          "photopeak_nnls": 7.432719977690239e-11,
+          "response_matrix": 154.71933668785982,
+          "response_poisson": 7.432719977690239e-11
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 419629.7083437914,
+        "source_tally_counts": 36011.373704,
+        "target_pf_counts": 4.156263338073767e-13,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 33344.393397480555,
+          "photopeak_nnls": 3.5927216465060232e-12,
+          "response_matrix": 403.379137971098,
+          "response_poisson": 3.5927216465060232e-12
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 4215731.929889742,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 541477.1821284724,
+    "runtime_s": 2.4983057975769043,
+    "total_spectrum_counts": 541473.1825481533
+  },
+  {
+    "case": {
+      "description": "3 source(s), 2 isotope(s), obstacle_cells=2",
+      "detector_pose_xyz": [
+        5.0,
+        10.0,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 5,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_07",
+      "obstacle_cells": [
+        [
+          3,
+          10
+        ],
+        [
+          4,
+          10
+        ]
+      ],
+      "pb_index": 4,
+      "sources": [
+        {
+          "intensity_cps_1m": 38832.47078920851,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            4.1275113141124,
+            10.615163507383292,
+            0.9293271488789024
+          ]
+        },
+        {
+          "intensity_cps_1m": 36814.32163124831,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            2.5319542331803637,
+            10.006089423763886,
+            0.5185774313176365
+          ]
+        },
+        {
+          "intensity_cps_1m": 38374.497339332,
+          "isotope": "Co-60",
+          "position_xyz": [
+            2.3821657234038445,
+            7.144369989901931,
+            0.5174565032162145
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 1830,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 22786,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 154507,
+      "process_count_photoelectric": 19351,
+      "process_count_rayleigh": 8307,
+      "run_time_s": 0.14334,
+      "secondary_count": 174684,
+      "source_equivalent_counts_Co-60": 76708.166584,
+      "source_equivalent_counts_Cs-137": 1061202.905896,
+      "total_spectrum_counts": 91875.36437,
+      "total_track_steps": 192899,
+      "transport_detected_counts_Co-60": 65298.837504,
+      "transport_detected_counts_Cs-137": 26199.533578,
+      "volume_step_counts": "/World/Environment/PillarMesh:21,/World/SimBridge/Obstacles/Obstacle_0000:16285,/World/SimBridge/Obstacles/Obstacle_0001:168631,/World/SimBridge/Robot/FeShield:19,/World/SimBridge/Robot/PbShield:18,WorldPV:7925",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:21,/World/SimBridge/Obstacles/Obstacle_0000:16285,/World/SimBridge/Obstacles/Obstacle_0001:168631,/World/SimBridge/Robot/FeShield:19,/World/SimBridge/Robot/PbShield:18,WorldPV:7925",
+      "weighted_spectrum_effective_entries": 1844.965889,
+      "weighted_spectrum_sumw2": 4575197.096827,
+      "weighted_transport": false
+    },
+    "num_primaries": 22786.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 20376.555477279006,
+          "photopeak_nnls": 64009.48149454677,
+          "response_matrix": 64535.09857045347,
+          "response_poisson": 64183.421004320946
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.0870981652064439,
+        "relative_errors": {
+          "peak_window": -0.7129506559513955,
+          "photopeak_nnls": -0.09828333368763717,
+          "response_matrix": -0.09087884194083531,
+          "response_poisson": -0.09583300677931912
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6879491847610487,
+          "photopeak_nnls": -0.019745466515759143,
+          "response_matrix": -0.011696057123524593,
+          "response_poisson": -0.017081720629570626
+        },
+        "response_poisson_variance": 75031.70972469889,
+        "source_tally_counts": 76708.166584,
+        "target_pf_counts": 70986.24644071213,
+        "transport_truth_counts": 65298.837504
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 8465.344906356955,
+          "photopeak_nnls": 26154.9583108327,
+          "response_matrix": 26642.071862833145,
+          "response_poisson": 26303.33553826535
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.06370674084651481,
+        "relative_errors": {
+          "peak_window": -0.6962409777595951,
+          "photopeak_nnls": -0.06149074241841807,
+          "response_matrix": -0.04401181652555889,
+          "response_poisson": -0.056166574055964376
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.676889480449935,
+          "photopeak_nnls": -0.0017013763636132126,
+          "response_matrix": 0.01689107493137779,
+          "response_poisson": 0.003961977412930539
+        },
+        "response_poisson_variance": 53609.348356320246,
+        "source_tally_counts": 1061202.905896,
+        "target_pf_counts": 27868.620473953208,
+        "transport_truth_counts": 26199.533578
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 4178.645044316363,
+          "photopeak_nnls": 2.666589784100753e-13,
+          "response_matrix": 1081.8173833411802,
+          "response_poisson": 2.666589784100753e-13
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 237043.47534681432,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 91875.36437044393,
+    "runtime_s": 2.633026361465454,
+    "total_spectrum_counts": 91873.3644060487
+  },
+  {
+    "case": {
+      "description": "4 source(s), 2 isotope(s), obstacle_cells=0",
+      "detector_pose_xyz": [
+        7.5,
+        15.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 0,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_08",
+      "obstacle_cells": [],
+      "pb_index": 1,
+      "sources": [
+        {
+          "intensity_cps_1m": 43246.2799283623,
+          "isotope": "Co-60",
+          "position_xyz": [
+            9.049116625172886,
+            15.44405489672651,
+            0.7446469958348287
+          ]
+        },
+        {
+          "intensity_cps_1m": 69773.31703415296,
+          "isotope": "Co-60",
+          "position_xyz": [
+            5.629150909072121,
+            17.75224217718672,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 50007.71660591396,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            9.25,
+            12.278589159424897,
+            2.0
+          ]
+        },
+        {
+          "intensity_cps_1m": 68807.92532750437,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            7.550004366565705,
+            14.272461643330002,
+            0.6474432425264365
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 43216,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 44083,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 1354,
+      "process_count_photoelectric": 138,
+      "process_count_rayleigh": 31,
+      "run_time_s": 0.10532,
+      "secondary_count": 1495,
+      "source_equivalent_counts_Co-60": 770977.176587,
+      "source_equivalent_counts_Eu-154": 1443831.316897,
+      "total_spectrum_counts": 2132111.79192,
+      "total_track_steps": 46875,
+      "transport_detected_counts_Co-60": 758086.680543,
+      "transport_detected_counts_Eu-154": 1401820.62341,
+      "volume_step_counts": "/World/SimBridge/Robot/FeShield:1503,/World/SimBridge/Robot/PbShield:103,WorldPV:45269",
+      "volume_step_counts_top": "/World/SimBridge/Robot/FeShield:1503,/World/SimBridge/Robot/PbShield:103,WorldPV:45269",
+      "weighted_spectrum_effective_entries": 42667.577396,
+      "weighted_spectrum_sumw2": 106542273.330144,
+      "weighted_transport": false
+    },
+    "num_primaries": 44083.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 295981.8902162216,
+          "photopeak_nnls": 752187.8178044424,
+          "response_matrix": 754403.6327827481,
+          "response_poisson": 754268.7250654827
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.017003986978002355,
+        "relative_errors": {
+          "peak_window": -0.6160951332873027,
+          "photopeak_nnls": -0.024370836586735077,
+          "response_matrix": -0.021496802120352602,
+          "response_poisson": -0.021671784884255696
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6095672199329282,
+          "photopeak_nnls": -0.007781250996696586,
+          "response_matrix": -0.004858346485673416,
+          "response_poisson": -0.005036304654215291
+        },
+        "response_poisson_variance": 7065819.485297232,
+        "source_tally_counts": 770977.176587,
+        "target_pf_counts": 770977.1765871502,
+        "transport_truth_counts": 758086.680543
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 3027.7491343184956,
+          "photopeak_nnls": 6.743068492356779e-12,
+          "response_matrix": 0.0,
+          "response_poisson": 6.743068492356779e-12
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 14441888.161220936,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 484546.91083844675,
+          "photopeak_nnls": 1404390.5743196716,
+          "response_matrix": 1383479.1501189738,
+          "response_poisson": 1402783.071075195
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.013414816018153036,
+        "relative_errors": {
+          "peak_window": -0.6589200938526106,
+          "photopeak_nnls": -0.011428213515246588,
+          "response_matrix": -0.026148081590435485,
+          "response_poisson": -0.012559759385199553
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6543445696641544,
+          "photopeak_nnls": 0.001833295121183244,
+          "response_matrix": -0.013084037276045795,
+          "response_poisson": 0.0006865697715687602
+        },
+        "response_poisson_variance": 252259045.5584953,
+        "source_tally_counts": 1443831.316897,
+        "target_pf_counts": 1420625.7891634977,
+        "transport_truth_counts": 1401820.62341
+      }
+    },
+    "raw_total_spectrum_counts": 2132111.791920276,
+    "runtime_s": 2.5580267906188965,
+    "total_spectrum_counts": 2132108.793159672
+  },
+  {
+    "case": {
+      "description": "5 source(s), 3 isotope(s), obstacle_cells=1",
+      "detector_pose_xyz": [
+        8.5,
+        5.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 3,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_09",
+      "obstacle_cells": [
+        [
+          8,
+          4
+        ]
+      ],
+      "pb_index": 6,
+      "sources": [
+        {
+          "intensity_cps_1m": 58032.9678597188,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            8.570083458068593,
+            3.1852321156371826,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 32653.32751037566,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            9.25,
+            8.372342416065289,
+            2.0
+          ]
+        },
+        {
+          "intensity_cps_1m": 50208.09711209026,
+          "isotope": "Eu-154",
+          "position_xyz": [
+            8.401994519959844,
+            12.279753641868602,
+            0.5854472450207358
+          ]
+        },
+        {
+          "intensity_cps_1m": 37295.375256776584,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            9.25,
+            4.448610556774525,
+            0.5
+          ]
+        },
+        {
+          "intensity_cps_1m": 64641.159213445135,
+          "isotope": "Co-60",
+          "position_xyz": [
+            6.847820719345332,
+            3.5887884889426487,
+            1.8289953229092957
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 3576,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 27209,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 135741,
+      "process_count_photoelectric": 13912,
+      "process_count_rayleigh": 6158,
+      "run_time_s": 0.162886,
+      "secondary_count": 150306,
+      "source_equivalent_counts_Co-60": 237982.20971,
+      "source_equivalent_counts_Cs-137": 995438.335411,
+      "source_equivalent_counts_Eu-154": 121305.841061,
+      "total_spectrum_counts": 177305.908273,
+      "total_track_steps": 206808,
+      "transport_detected_counts_Co-60": 58148.0022,
+      "transport_detected_counts_Cs-137": 9099.687361,
+      "transport_detected_counts_Eu-154": 111546.167591,
+      "volume_step_counts": "/World/Environment/PillarMesh:78,/World/SimBridge/Obstacles/Obstacle_0000:165849,/World/SimBridge/Robot/FeShield:635,/World/SimBridge/Robot/PbShield:227,WorldPV:40019",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:78,/World/SimBridge/Obstacles/Obstacle_0000:165849,/World/SimBridge/Robot/FeShield:635,/World/SimBridge/Robot/PbShield:227,WorldPV:40019",
+      "weighted_spectrum_effective_entries": 3553.350228,
+      "weighted_spectrum_sumw2": 8847252.056733,
+      "weighted_transport": false
+    },
+    "num_primaries": 27209.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 22796.90907903242,
+          "photopeak_nnls": 57461.49034588452,
+          "response_matrix": 57946.144118785734,
+          "response_poisson": 57680.19371968865
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.20168269087857493,
+        "relative_errors": {
+          "peak_window": -0.6737493667354245,
+          "photopeak_nnls": -0.17765835935567104,
+          "response_matrix": -0.1707223927395425,
+          "response_poisson": -0.17452845635200803
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6079502611177858,
+          "photopeak_nnls": -0.011806284449020685,
+          "response_matrix": -0.003471453421907385,
+          "response_poisson": -0.008045134185389992
+        },
+        "response_poisson_variance": 223431.35366078565,
+        "source_tally_counts": 237982.20971,
+        "target_pf_counts": 69875.4477529093,
+        "transport_truth_counts": 58148.0022
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 2983.842595519731,
+          "photopeak_nnls": 8830.67590839003,
+          "response_matrix": 9155.341491246045,
+          "response_poisson": 8952.073372389907
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.15652260045441937,
+        "relative_errors": {
+          "peak_window": -0.7164724181728387,
+          "photopeak_nnls": -0.1609007157533755,
+          "response_matrix": -0.13005068105386153,
+          "response_poisson": -0.1493654124302324
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6720939437646982,
+          "photopeak_nnls": -0.02956271374365184,
+          "response_matrix": 0.0061160486111391564,
+          "response_poisson": -0.016221874747339868
+        },
+        "response_poisson_variance": 92106.47407357107,
+        "source_tally_counts": 995438.335411,
+        "target_pf_counts": 10523.994090065933,
+        "transport_truth_counts": 9099.687361
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 38637.13876633683,
+          "photopeak_nnls": 111122.24930578902,
+          "response_matrix": 110843.97465682132,
+          "response_poisson": 110900.77621780873
+        },
+        "pf_target_relative_error_vs_transport_truth": 0.03782860998389813,
+        "relative_errors": {
+          "peak_window": -0.6662473942105375,
+          "photopeak_nnls": -0.040111627020729027,
+          "response_matrix": -0.04251539945791165,
+          "response_poisson": -0.04202474022180447
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": -0.6536219970550181,
+          "photopeak_nnls": -0.003800384131217648,
+          "response_matrix": -0.006295087938416494,
+          "response_poisson": -0.005785867745431614
+        },
+        "response_poisson_variance": 126936.77164672597,
+        "source_tally_counts": 121305.841061,
+        "target_pf_counts": 115765.80405999848,
+        "transport_truth_counts": 111546.167591
+      }
+    },
+    "raw_total_spectrum_counts": 177305.90827347263,
+    "runtime_s": 2.644237518310547,
+    "total_spectrum_counts": 177304.9083078286
+  },
+  {
+    "case": {
+      "description": "1 source(s), 1 isotope(s), obstacle_cells=1",
+      "detector_pose_xyz": [
+        1.5,
+        1.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 6,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_10",
+      "obstacle_cells": [
+        [
+          2,
+          1
+        ]
+      ],
+      "pb_index": 3,
+      "sources": [
+        {
+          "intensity_cps_1m": 69305.72281807363,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            3.890464863767442,
+            0.75,
+            0.6380445999362063
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 0,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 6777,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 39128,
+      "process_count_photoelectric": 3852,
+      "process_count_rayleigh": 1738,
+      "run_time_s": 0.04141,
+      "secondary_count": 43137,
+      "source_equivalent_counts_Cs-137": 330243.294766,
+      "total_spectrum_counts": 362.999974,
+      "total_track_steps": 57639,
+      "volume_step_counts": "/World/Environment/PillarMesh:11,/World/SimBridge/Obstacles/Obstacle_0000:47533,WorldPV:10095",
+      "volume_step_counts_top": "/World/Environment/PillarMesh:11,/World/SimBridge/Obstacles/Obstacle_0000:47533,WorldPV:10095",
+      "weighted_spectrum_effective_entries": 366.025,
+      "weighted_spectrum_sumw2": 359.999949,
+      "weighted_transport": false
+    },
+    "num_primaries": 6777.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 3.598807605890787,
+          "photopeak_nnls": 2.4393359307852726e-13,
+          "response_matrix": 98.66757954466658,
+          "response_poisson": 2.4393359307852726e-13
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 4014.7242858749455,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 3.031823604863226,
+          "photopeak_nnls": 5.603305344006138,
+          "response_matrix": 116.06096398609256,
+          "response_poisson": 5.603305344006138
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 35649.28280087477,
+        "source_tally_counts": 330243.294766,
+        "target_pf_counts": 0.0058769692425120045,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 10.116699281103724,
+          "photopeak_nnls": 3.964122342883716,
+          "response_matrix": 256.2015607430857,
+          "response_poisson": 3.964122342883716
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 5075.900772473687,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 362.9999744679279,
+    "runtime_s": 2.4985592365264893,
+    "total_spectrum_counts": 360.999974608598
+  },
+  {
+    "case": {
+      "description": "2 source(s), 2 isotope(s), obstacle_cells=4",
+      "detector_pose_xyz": [
+        2.5,
+        4.5,
+        0.5
+      ],
+      "dwell_time_s": 30.0,
+      "fe_index": 1,
+      "include_in_accuracy_summary": true,
+      "name": "g4_case_11",
+      "obstacle_cells": [
+        [
+          1,
+          4
+        ],
+        [
+          1,
+          5
+        ],
+        [
+          1,
+          6
+        ],
+        [
+          2,
+          5
+        ]
+      ],
+      "pb_index": 0,
+      "sources": [
+        {
+          "intensity_cps_1m": 47367.461308492246,
+          "isotope": "Co-60",
+          "position_xyz": [
+            0.75,
+            7.060550304955211,
+            2.0
+          ]
+        },
+        {
+          "intensity_cps_1m": 83963.78529727357,
+          "isotope": "Cs-137",
+          "position_xyz": [
+            0.75,
+            4.4650708202980836,
+            0.5
+          ]
+        }
+      ]
+    },
+    "metadata": {
+      "backend": "geant4",
+      "detector_fast_scoring": true,
+      "detector_fast_scoring_volume": "detector_assembly_entry",
+      "detector_hit_events": 0,
+      "detector_scoring_mode": "incident_gamma_energy",
+      "emission_model": "detector_equivalent_cone",
+      "engine_mode": "external",
+      "num_primaries": 18914,
+      "physics_profile": "balanced",
+      "primary_sampling_fraction": 0.02,
+      "process_count_compton": 130053,
+      "process_count_photoelectric": 14576,
+      "process_count_rayleigh": 6246,
+      "run_time_s": 0.129696,
+      "secondary_count": 145291,
+      "source_equivalent_counts_Co-60": 119726.486906,
+      "source_equivalent_counts_Cs-137": 822174.846196,
+      "total_spectrum_counts": 369.999973,
+      "total_track_steps": 179812,
+      "volume_step_counts": "/World/SimBridge/Obstacles/Obstacle_0000:136704,/World/SimBridge/Obstacles/Obstacle_0001:37,/World/SimBridge/Obstacles/Obstacle_0002:18946,WorldPV:24125",
+      "volume_step_counts_top": "/World/SimBridge/Obstacles/Obstacle_0000:136704,/World/SimBridge/Obstacles/Obstacle_0001:37,/World/SimBridge/Obstacles/Obstacle_0002:18946,WorldPV:24125",
+      "weighted_spectrum_effective_entries": 380.277778,
+      "weighted_spectrum_sumw2": 359.999948,
+      "weighted_transport": false
+    },
+    "num_primaries": 18914.0,
+    "per_isotope": {
+      "Co-60": {
+        "method_counts": {
+          "peak_window": 2.374909802511596,
+          "photopeak_nnls": 9.045213756058053e-11,
+          "response_matrix": 104.2615368221023,
+          "response_poisson": 9.045213756058053e-11
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 4014.7242858749455,
+        "source_tally_counts": 119726.486906,
+        "target_pf_counts": 1.5600468775106503e-06,
+        "transport_truth_counts": 0.0
+      },
+      "Cs-137": {
+        "method_counts": {
+          "peak_window": 1.4704894629209826,
+          "photopeak_nnls": 0.6024968632852649,
+          "response_matrix": 116.61670007988931,
+          "response_poisson": 0.6024968632852649
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 9482.468441889825,
+        "source_tally_counts": 822174.846196,
+        "target_pf_counts": 0.025754309202858768,
+        "transport_truth_counts": 0.0
+      },
+      "Eu-154": {
+        "method_counts": {
+          "peak_window": 8.102056725181729,
+          "photopeak_nnls": 0.2435927716714277,
+          "response_matrix": 258.0660790720874,
+          "response_poisson": 0.2435927716714277
+        },
+        "pf_target_relative_error_vs_transport_truth": null,
+        "relative_errors": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "relative_errors_vs_transport_truth": {
+          "peak_window": null,
+          "photopeak_nnls": null,
+          "response_matrix": null,
+          "response_poisson": null
+        },
+        "response_poisson_variance": 14417.715301634591,
+        "source_tally_counts": 0.0,
+        "target_pf_counts": 0.0,
+        "transport_truth_counts": 0.0
+      }
+    },
+    "raw_total_spectrum_counts": 369.999973473154,
+    "runtime_s": 2.5948777198791504,
+    "total_spectrum_counts": 367.99997361654397
+  }
+]
