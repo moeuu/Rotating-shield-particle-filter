@@ -16,10 +16,13 @@ from measurement.shielding import (
     octant_index_from_normal,
     cartesian_to_spherical,
     iron_shield,
+    mu_by_isotope_from_hvl_mm,
     lead_shield,
     mu_by_isotope_from_tvl_mm,
+    mu_from_hvl_mm,
     mu_from_tvl_mm,
     shield_blocks_radiation,
+    transmission_from_hvl,
 )
 from measurement.kernels import KernelPrecomputer, ShieldParams
 
@@ -165,6 +168,21 @@ def test_tvl_table_mu_and_attenuation_factors() -> None:
     assert eu_fe_factor == pytest.approx(10 ** (-(cs_fe_tvl / eu_fe_tvl)))
 
 
+def test_hvl_table_mu_and_attenuation_factors() -> None:
+    """HVL-derived mu values should reproduce half-value attenuation exactly."""
+    mu_by_isotope = mu_by_isotope_from_hvl_mm(
+        HVL_TVL_TABLE_MM, isotopes=["Cs-137", "Co-60", "Eu-154"]
+    )
+    for isotope in ["Cs-137", "Co-60", "Eu-154"]:
+        for material in ["pb", "fe"]:
+            hvl_mm = HVL_TVL_TABLE_MM[isotope][material]["hvl"]
+            hvl_cm = hvl_mm / 10.0
+            assert mu_by_isotope[isotope][material] == pytest.approx(mu_from_hvl_mm(hvl_mm))
+            assert np.exp(-mu_by_isotope[isotope][material] * hvl_cm) == pytest.approx(0.5)
+            assert transmission_from_hvl(hvl_cm, hvl_mm) == pytest.approx(0.5)
+            assert transmission_from_hvl(2.0 * hvl_cm, hvl_mm) == pytest.approx(0.25)
+
+
 def test_default_shield_thickness_targets_cs137_one_fifth() -> None:
     """Default shield thicknesses should target one-fifth transmission for Cs-137 only."""
     shield_params = ShieldParams()
@@ -186,3 +204,31 @@ def test_default_shield_thickness_targets_cs137_one_fifth() -> None:
 
         assert fe_factor != pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET)
         assert pb_factor != pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET)
+
+
+def test_default_shield_thickness_is_consistent_with_cs137_hvl_theory() -> None:
+    """Default Cs-137 shield thicknesses should stay consistent with HVL theory."""
+    cs_fe_hvl = HVL_TVL_TABLE_MM["Cs-137"]["fe"]["hvl"]
+    cs_pb_hvl = HVL_TVL_TABLE_MM["Cs-137"]["pb"]["hvl"]
+    fe_factor = transmission_from_hvl(DEFAULT_FE_SHIELD_THICKNESS_CM, cs_fe_hvl)
+    pb_factor = transmission_from_hvl(DEFAULT_PB_SHIELD_THICKNESS_CM, cs_pb_hvl)
+
+    assert fe_factor == pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET, rel=0.03)
+    assert pb_factor == pytest.approx(DEFAULT_SHIELD_TRANSMISSION_TARGET, rel=0.12)
+
+
+def test_eu154_hvl_matches_configured_line_effective_attenuation() -> None:
+    """Eu-154 HVL values should match the configured line-set attenuation scale."""
+    eu_fe_hvl = HVL_TVL_TABLE_MM["Eu-154"]["fe"]["hvl"]
+    eu_pb_hvl = HVL_TVL_TABLE_MM["Eu-154"]["pb"]["hvl"]
+
+    assert eu_fe_hvl == pytest.approx(17.36)
+    assert eu_pb_hvl == pytest.approx(8.45)
+    assert transmission_from_hvl(DEFAULT_FE_SHIELD_THICKNESS_CM, eu_fe_hvl) == pytest.approx(
+        0.247,
+        rel=0.03,
+    )
+    assert transmission_from_hvl(DEFAULT_PB_SHIELD_THICKNESS_CM, eu_pb_hvl) == pytest.approx(
+        0.284,
+        rel=0.03,
+    )

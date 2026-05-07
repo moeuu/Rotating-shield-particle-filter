@@ -656,6 +656,29 @@ def test_clustered_output_excludes_quarantined_sources() -> None:
     assert np.allclose(positions[0], np.array([0.0, 0.0, 0.0]))
 
 
+def test_connected_position_clusters_preserve_transitive_components() -> None:
+    """Vectorized clustering should keep the same transitive eps-neighborhoods."""
+    from scipy.spatial import cKDTree
+
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    clusters = IsotopeParticleFilter._connected_position_clusters(
+        cKDTree(positions),
+        point_count=positions.shape[0],
+        eps=0.5,
+        min_samples=2,
+    )
+
+    assert [set(cluster.tolist()) for cluster in clusters] == [{0, 1, 2}]
+
+
 def test_convergence_does_not_skip_unverified_multisource_state() -> None:
     """Convergence gating should not freeze an unresolved tentative source."""
     filt = _build_filter(

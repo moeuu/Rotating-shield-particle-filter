@@ -393,7 +393,7 @@ def test_peak_window_counts_are_not_conservative_for_mixed_spectra() -> None:
         isotopes = ["Co-60", "Cs-137", "Eu-154"]
         sources = [
             PointSource("Cs-137", position=(5.0, 5.0, 4.5), intensity_cps_1m=50000.0),
-            PointSource("Co-60", position=(6.0, 6.0, 5.5), intensity_cps_1m=30000.0),
+            PointSource("Co-60", position=(6.0, 6.0, 5.5), intensity_cps_1m=60000.0),
             PointSource("Eu-154", position=(7.0, 7.0, 6.5), intensity_cps_1m=30000.0),
         ]
         env = EnvironmentConfig(detector_position=(1.0, 1.0, 0.5))

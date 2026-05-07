@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Tuple
+from typing import Any, Callable, List, Tuple
 from collections import deque
 
 import numpy as np
@@ -4960,29 +4960,12 @@ class IsotopeParticleFilter:
         except ImportError:
             return self.estimate()
         tree = cKDTree(pos_arr)
-        assigned = np.zeros(pos_arr.shape[0], dtype=bool)
-        queued = np.zeros(pos_arr.shape[0], dtype=bool)
-        clusters: list[NDArray[np.int64]] = []
-        for idx in range(pos_arr.shape[0]):
-            if assigned[idx]:
-                continue
-            queue = [idx]
-            queued[idx] = True
-            members: list[int] = []
-            while queue:
-                j = queue.pop()
-                if assigned[j]:
-                    continue
-                assigned[j] = True
-                members.append(j)
-                neighbors = tree.query_ball_point(pos_arr[j], r=eps)
-                for n in neighbors:
-                    n_int = int(n)
-                    if not assigned[n_int] and not queued[n_int]:
-                        queued[n_int] = True
-                        queue.append(n_int)
-            if len(members) >= min_samples:
-                clusters.append(np.array(members, dtype=int))
+        clusters = self._connected_position_clusters(
+            tree,
+            point_count=int(pos_arr.shape[0]),
+            eps=eps,
+            min_samples=min_samples,
+        )
         if not clusters:
             return np.zeros((0, 3)), np.zeros(0)
         cluster_pos: list[NDArray[np.float64]] = []
@@ -5018,6 +5001,54 @@ class IsotopeParticleFilter:
         pos_out = np.vstack([cluster_pos[i] for i in order]) if order.size else np.zeros((0, 3))
         q_out = np.array([cluster_q[i] for i in order], dtype=float) if order.size else np.zeros(0, dtype=float)
         return pos_out, q_out
+
+    @staticmethod
+    def _connected_position_clusters(
+        tree: Any,
+        *,
+        point_count: int,
+        eps: float,
+        min_samples: int,
+    ) -> list[NDArray[np.int64]]:
+        """Return epsilon-neighborhood connected components for source positions."""
+        count = max(0, int(point_count))
+        if count <= 0:
+            return []
+        try:
+            pairs = tree.query_pairs(r=float(eps), output_type="ndarray")
+        except TypeError:
+            pair_set = tree.query_pairs(r=float(eps))
+            pairs = (
+                np.asarray(list(pair_set), dtype=np.int64).reshape(-1, 2)
+                if pair_set
+                else np.zeros((0, 2), dtype=np.int64)
+            )
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        if pairs.size == 0:
+            labels = np.arange(count, dtype=np.int64)
+            component_count = count
+        else:
+            try:
+                from scipy.sparse import coo_matrix
+                from scipy.sparse.csgraph import connected_components
+            except ImportError:
+                return [np.array([idx], dtype=np.int64) for idx in range(count)]
+            rows = np.concatenate((pairs[:, 0], pairs[:, 1]))
+            cols = np.concatenate((pairs[:, 1], pairs[:, 0]))
+            graph = coo_matrix(
+                (np.ones(rows.size, dtype=np.int8), (rows, cols)),
+                shape=(count, count),
+            ).tocsr()
+            component_count, labels = connected_components(
+                graph,
+                directed=False,
+                return_labels=True,
+            )
+        sizes = np.bincount(labels, minlength=int(component_count))
+        return [
+            np.flatnonzero(labels == component_idx).astype(np.int64, copy=False)
+            for component_idx in np.flatnonzero(sizes >= max(1, int(min_samples)))
+        ]
 
     def apply_birth_death(
         self,

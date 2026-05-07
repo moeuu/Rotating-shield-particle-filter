@@ -52,7 +52,7 @@ OCTANT_THETA_PHI_RANGES: list[tuple[tuple[float, float], tuple[float, float]]] =
 HVL_TVL_TABLE_MM: dict[str, dict[str, dict[str, float]]] = {
     "Cs-137": {"pb": {"hvl": 7.0, "tvl": 22.0}, "fe": {"hvl": 15.0, "tvl": 50.0}},
     "Co-60": {"pb": {"hvl": 12.0, "tvl": 40.0}, "fe": {"hvl": 20.0, "tvl": 67.0}},
-    "Eu-154": {"pb": {"hvl": 7.4, "tvl": 24.6}, "fe": {"hvl": 13.8, "tvl": 45.8}},
+    "Eu-154": {"pb": {"hvl": 8.45, "tvl": 28.1}, "fe": {"hvl": 17.36, "tvl": 57.7}},
 }
 CONCRETE_MU_CM_INV: dict[str, float] = {
     "Cs-137": 0.17,
@@ -87,6 +87,18 @@ def mu_from_tvl_mm(tvl_mm: float) -> float:
     return float(np.log(10.0) / (tvl_mm / 10.0))
 
 
+def mu_from_hvl_mm(hvl_mm: float) -> float:
+    """Return linear attenuation coefficient (1/cm) for an HVL given in millimeters."""
+    if hvl_mm <= 0:
+        raise ValueError("hvl_mm must be positive.")
+    return float(np.log(2.0) / (hvl_mm / 10.0))
+
+
+def transmission_from_hvl(thickness_cm: float, hvl_mm: float) -> float:
+    """Return Beer-Lambert transmission for a thickness using an HVL value."""
+    return float(np.exp(-mu_from_hvl_mm(float(hvl_mm)) * max(float(thickness_cm), 0.0)))
+
+
 def mu_by_isotope_from_tvl_mm(
     table_mm: dict[str, dict[str, dict[str, float]]],
     isotopes: Sequence[str] | None = None,
@@ -110,6 +122,33 @@ def mu_by_isotope_from_tvl_mm(
         mu_by_isotope[iso] = {
             "fe": mu_from_tvl_mm(float(fe_tvl)),
             "pb": mu_from_tvl_mm(float(pb_tvl)),
+        }
+    return mu_by_isotope
+
+
+def mu_by_isotope_from_hvl_mm(
+    table_mm: dict[str, dict[str, dict[str, float]]],
+    isotopes: Sequence[str] | None = None,
+) -> dict[str, dict[str, float]]:
+    """
+    Build per-isotope attenuation coefficients from HVL values (mm).
+
+    Returns:
+        dict: {isotope: {"fe": mu_fe, "pb": mu_pb}} with mu in 1/cm.
+    """
+    isotopes = list(isotopes) if isotopes is not None else list(table_mm.keys())
+    mu_by_isotope: dict[str, dict[str, float]] = {}
+    for iso in isotopes:
+        entry = table_mm.get(iso)
+        if entry is None:
+            continue
+        fe_hvl = entry.get("fe", {}).get("hvl")
+        pb_hvl = entry.get("pb", {}).get("hvl")
+        if fe_hvl is None or pb_hvl is None:
+            continue
+        mu_by_isotope[iso] = {
+            "fe": mu_from_hvl_mm(float(fe_hvl)),
+            "pb": mu_from_hvl_mm(float(pb_hvl)),
         }
     return mu_by_isotope
 
