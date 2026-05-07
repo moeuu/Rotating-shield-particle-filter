@@ -800,6 +800,17 @@ def _coerce_live_visualization(live: bool) -> bool:
     return True
 
 
+def _resolve_cui_split_view_enabled(
+    runtime_config: dict[str, object],
+    *,
+    save_outputs: bool,
+) -> bool:
+    """Return whether the URL-served CUI progress view should run."""
+    if "cui_split_view" in runtime_config:
+        return bool(runtime_config["cui_split_view"])
+    return bool(save_outputs)
+
+
 def _cui_view_relative_url(output_dir: Path) -> str:
     """Return the CUI split-view URL path relative to the static root."""
     try:
@@ -2585,8 +2596,9 @@ def run_live_pf(
         cleaned_tag = cleaned_tag.lstrip("_")
         if cleaned_tag:
             output_suffix = f"_{cleaned_tag}"
-    cui_split_view_enabled = bool(
-        runtime_config.get("cui_split_view", bool(save_outputs and not live))
+    cui_split_view_enabled = _resolve_cui_split_view_enabled(
+        runtime_config,
+        save_outputs=save_outputs,
     )
     cui_split_view_dir_raw = runtime_config.get("cui_split_view_dir")
     if cui_split_view_dir_raw is None:

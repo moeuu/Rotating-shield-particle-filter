@@ -24,6 +24,7 @@ from realtime_demo import (
     _isotope_count_balance_penalty,
     _resolve_ig_workers,
     _resolve_python_worker_count,
+    _resolve_cui_split_view_enabled,
     _select_best_pair_from_scores,
     _signature_vector_is_dependent,
     _resolve_source_position_bounds,
@@ -71,6 +72,26 @@ def test_python_worker_auto_uses_all_logical_cpus(monkeypatch: pytest.MonkeyPatc
     assert _resolve_python_worker_count(None) == 32
     assert _resolve_ig_workers(0) == 32
     assert _resolve_ig_workers(12) == 12
+
+
+def test_cui_split_view_defaults_to_saved_runs() -> None:
+    """Saved runs should expose the URL-served CUI progress view by default."""
+    assert _resolve_cui_split_view_enabled({}, save_outputs=True) is True
+    assert _resolve_cui_split_view_enabled({}, save_outputs=False) is False
+    assert (
+        _resolve_cui_split_view_enabled(
+            {"cui_split_view": False},
+            save_outputs=True,
+        )
+        is False
+    )
+    assert (
+        _resolve_cui_split_view_enabled(
+            {"cui_split_view": True},
+            save_outputs=False,
+        )
+        is True
+    )
 
 
 def test_reachable_candidate_filter_removes_disconnected_free_cells() -> None:

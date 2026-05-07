@@ -72,6 +72,12 @@ Common options:
 --rotation-overhead-s 0.5  # fixed shield actuation overhead per measurement
 ```
 
+Saved runs start the URL-served CUI progress view by default. The run prints a
+line like `CUI split visualization URL: http://<host>:8877/latest/index.html`
+and continuously updates the robot 2D view, PF 3D view, and spectrum view under
+`results/cui_view/latest/`. Set `cui_split_view: false` in a runtime config only
+when this progress page is intentionally not needed.
+
 ## Optional piplup notifications
 
 Simulation notifications are opt-in and use the existing piplup-notify
