@@ -1522,13 +1522,17 @@ def test_create_simulation_runtime_auto_starts_geant4_sidecar(
             "timeout_s": 12.0,
             "start_isaacsim_sidecar_with_geant4": False,
         },
-        runtime_config_path="configs/geant4/default_scene.json",
+        runtime_config_path=(
+            "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+        ),
     )
 
     assert isinstance(runtime, ManagedGeant4TCPClientRuntime)
     assert started["host"] == "127.0.0.1"
     assert started["port"] == 5556
-    assert started["runtime_config_path"] == "configs/geant4/default_scene.json"
+    assert started["runtime_config_path"] == (
+        "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
     runtime.process.wait(timeout=5.0)
 
 
@@ -1700,7 +1704,9 @@ def test_create_simulation_runtime_pairs_geant4_with_isaacsim(
         mu_by_isotope={},
         shield_params=None,
         runtime_config={"host": "127.0.0.1", "port": 5556, "timeout_s": 12.0},
-        runtime_config_path="configs/geant4/default_scene.json",
+        runtime_config_path=(
+            "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+        ),
     )
 
     assert isinstance(runtime, Geant4WithIsaacSimRuntime)

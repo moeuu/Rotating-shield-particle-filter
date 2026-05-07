@@ -40,7 +40,7 @@ where observations come from:
 
 | Backend | Command role | External requirements |
 | --- | --- | --- |
-| `analytic` | In-process Python spectrum simulator. | None beyond `uv sync`. |
+| `analytic` | Approximate in-process Python spectrum simulator for smoke tests only. | None beyond `uv sync`. |
 | `isaacsim` | TCP client that talks to `scripts/run_isaacsim_bridge.py`. | Isaac Sim only for real mode; mock mode works without it. |
 | `geant4` | TCP client that talks to `scripts/run_geant4_bridge.py`. | Requires the native Geant4 sidecar executable. |
 
@@ -54,8 +54,10 @@ Common options:
 ```bash
 --mode python-gui          # Python spectrum model + Isaac Sim GUI
 --mode geant4-isaacsim-gui # Geant4 spectrum model + Isaac Sim GUI
---mode python-cui          # Python spectrum model, no simulator GUI
---mode geant4-cui          # Geant4 spectrum model, no Isaac Sim GUI
+--mode python-cui          # Python analytic model, no simulator GUI
+--mode geant4-cui          # Standard Geant4 full simulation, no Isaac Sim GUI
+--full-simulation          # Alias for the standard Geant4 full simulation
+--cui                      # Alias for the standard Geant4 full simulation
 --headless                 # force a non-GUI simulator mode
 --matplotlib-live          # optional Matplotlib live plot
 --max-steps 5              # stop after a fixed number of measurements
@@ -86,10 +88,9 @@ shield-orientation indices.
 export PIPLUP_NOTIFY_TOKEN=...  # same token as piplup EVENT_API_TOKEN
 
 uv run python main.py \
-  --mode geant4-cui \
-  --sim-config configs/geant4/random_external_no_isaac.json \
+  --full-simulation \
+  --environment-mode random \
   --max-poses 10 \
-  --rotations-per-pose 4 \
   --max-steps 40 \
   --notify-spectrum
 ```
@@ -106,18 +107,17 @@ Useful overrides:
 --no-notify
 ```
 
-For longer Geant4 runs, `--rotations-per-pose 4 --max-poses 10 --max-steps 40`
-forces four shield measurements at each of ten robot poses before IG early
-stopping can move to the next pose. Add `--min-rotations-per-pose 1` if you
-want the old early-stop behavior under a four-rotation cap. Add
-`--init-grid-spacing-m 0` when `--num-particles` should control the PF size
-instead of the default 1 m grid initialization.
+For longer Geant4 runs, the standard full-simulation config already uses the
+balanced Geant4 physics profile, 32 native/Python workers, response-Poisson
+spectrum counting, eight shield measurements per station, and the no-Isaac CUI
+runtime. Add `--init-grid-spacing-m 0` only when `--num-particles` should
+control the PF size instead of the default grid initialization.
 
-The `configs/geant4/random_external_no_isaac.json` external sidecar config uses
-the balanced Geant4 physics profile with explicit shield and obstacle geometry.
-It does not cap histories or use deterministic background smoothing. For a pure
-source-only high-fidelity run, use
-`configs/geant4/high_fidelity_external_no_isaac.json`. The main
+The standard full-simulation config is
+`configs/geant4/variance_reduction_external_no_isaac_32threads.json`. It uses
+explicit shield and obstacle geometry, does not cap histories, and does not use
+deterministic background smoothing. For detector/secondary-transport validation
+only, use `configs/geant4/high_fidelity_external_no_isaac.json`. The main
 `result_spectrum*.png` output uses the highest-count measurement as the
 representative spectrum; the last measurement is also saved as
 `result_spectrum_last*.png`.
@@ -127,17 +127,19 @@ Environment variables are also supported:
 `PIPLUP_NOTIFY_ACCOUNT`, `PIPLUP_NOTIFY_RUN_ID`, and
 `PIPLUP_NOTIFY_TIMEOUT_S`.
 
-### Analytic backend
+### Approximate analytic backend
 
 Use this for the fastest smoke tests and for development that does not need a
-live simulator process.
+live simulator process. It is isolated from standard runtime simulation and is
+not a substitute for Geant4/PF full simulation.
 
 ```bash
 uv run python main.py --mode python-cui --max-steps 3
 ```
 
 The Python GUI mode uses the same PF loop, but asks an Isaac Sim sidecar to show
-the scene and generate observations with the Python observation model:
+the scene and generate observations with the approximate Python observation
+model:
 
 ```bash
 uv run python main.py --mode python-gui --max-steps 3
@@ -291,9 +293,14 @@ Geant4 executable; it only avoids starting the Isaac Sim GUI companion:
 
 ```bash
 uv run python main.py \
-  --mode geant4-cui \
+  --full-simulation \
   --max-steps 3
 ```
+
+The repository default is the same standard full simulation, so
+`uv run python main.py` also selects
+`configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
+Use `--python-cui` only when you explicitly want the analytic Python model.
 
 Use `configs/geant4/external_gui_scene.json` when you want native Geant4
 transport paired with an Isaac Sim sidecar for robot motion and visualization.
@@ -314,16 +321,16 @@ uv run python main.py \
 ```
 
 For a real USD-backed native Geant4 run against the Manchester Drum_Store mesh,
-prepare the Manchester assets first, then use:
+prepare the Manchester assets first, then use the GUI-capable Geant4 config:
 
 ```bash
 uv run python main.py \
-  --mode geant4-cui \
-  --sim-config configs/geant4/real_scene.json \
+  --mode geant4-isaacsim-gui \
+  --sim-config configs/geant4/external_gui_scene.json \
   --max-steps 5
 ```
 
-`configs/geant4/real_scene.json` uses the native external Geant4 engine while
+`configs/geant4/external_gui_scene.json` uses the native external Geant4 engine while
 reading scene geometry from the USD stage. It includes Poisson source emission,
 explicit stage/shield geometry, Geant4 EM interactions, detector response
 smearing, and dead-time scaling.
@@ -343,29 +350,29 @@ Run the PF loop with the external engine:
 export ISAACSIM_PYTHON=/path/to/isaacsim/python.sh
 
 uv run python main.py \
-  --mode geant4-cui \
-  --sim-config configs/geant4/external_scene.json \
+  --full-simulation \
   --max-steps 5
 ```
 
 The native source is `native/geant4_sidecar/geant4_sidecar.cpp`. The Python
 bridge communicates with it through a file-based request/response protocol, so
-the C++ executable does not need a JSON dependency. GUI external-engine configs
-are available as `configs/geant4/external_gui_scene.json`,
-`configs/geant4/demo_room_external_gui.json`, and
-`configs/geant4/demo_room_scatter_attenuation_external_gui.json`.
+the C++ executable does not need a JSON dependency. Older Geant4 configs that
+are not part of the standard runtime are isolated under `configs/geant4/legacy/`.
 
-The native sidecar emits gamma rays isotropically and uses Geant4 geometry for
-shield, obstacle, and stage attenuation. When Geant4 is built with
-multithreading support, `thread_count` selects the worker count.
+Under the standard `source_rate_model = detector_cps_1m` model, the native
+sidecar uses detector-equivalent source sampling and Geant4 geometry for shield,
+obstacle, and stage attenuation. When Geant4 is built with multithreading
+support, `thread_count` selects the worker count.
 
 ### Geant4 spectrum-count validation
 
 The PF likelihood consumes isotope-wise source-equivalent counts extracted from
 measured spectra. Geant4 runtime configs use
-`spectrum_count_method: "photopeak_nnls"`: local full-energy peak ROIs are
-fitted with nonnegative isotope peak columns and nuisance continuum terms, so
-Compton scatter and room background are not converted into source strength.
+`spectrum_count_method: "response_poisson"`: a calibrated full-spectrum
+Poisson response regression extracts isotope counts and propagates count
+covariance to the PF likelihood. `photopeak_nnls` remains available only for
+diagnostic and calibration checks; `peak_window` and `response_matrix` are not
+runtime count-ingestion methods.
 
 Run the validation report after changing detector geometry, materials, transport
 settings, or peak-efficiency calibration:

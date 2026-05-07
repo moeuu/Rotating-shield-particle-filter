@@ -1,4 +1,4 @@
-"""Shared Python transport approximation for CUI and GUI simulator modes."""
+"""Approximate Python transport for diagnostics and non-Geant4 debug modes."""
 
 from __future__ import annotations
 

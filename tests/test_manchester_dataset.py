@@ -130,7 +130,7 @@ def test_usd_backed_geant4_configs_use_manchester_drum_store() -> None:
     root = Path(__file__).resolve().parents[1]
     expected_usd = "../../data/manchester_nuclear_assets/usd/drum_store.usda"
 
-    for config_name in ("real_scene.json", "external_scene.json", "external_gui_scene.json"):
+    for config_name in ("external_gui_scene.json",):
         config_path = root / "configs" / "geant4" / config_name
         payload = json.loads(config_path.read_text(encoding="utf-8"))
 
@@ -142,3 +142,16 @@ def test_usd_backed_geant4_configs_use_manchester_drum_store() -> None:
         assert payload["stage_material_rules"] == [
             {"path_prefix": "/World/Environment", "material": "concrete"}
         ]
+
+
+def test_legacy_usd_backed_geant4_configs_are_isolated() -> None:
+    """Legacy USD-backed Geant4 configs should live outside runtime defaults."""
+    root = Path(__file__).resolve().parents[1]
+    expected_usd = "../../data/manchester_nuclear_assets/usd/drum_store.usda"
+
+    for config_name in ("real_scene.json", "external_scene.json"):
+        config_path = root / "configs" / "geant4" / "legacy" / config_name
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+
+        assert payload["usd_path"] == expected_usd
+        assert payload["use_mock_stage"] is False

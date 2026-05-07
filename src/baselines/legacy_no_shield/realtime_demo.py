@@ -46,13 +46,13 @@ from sim.blender_environment import generate_blender_environment_usd
 from visualization.realtime_viz import RealTimePFVisualizer, build_frame_from_pf
 from evaluation_metrics import compute_metrics, print_metrics_report
 
-from baseline_pf.measurement import BaselineMeasurement
-from baseline_pf.no_shield_pf import NoShieldPF
-from baseline_pf.planning import generate_measurement_positions
+from baselines.legacy_no_shield.measurement import BaselineMeasurement
+from baselines.legacy_no_shield.no_shield_pf import NoShieldPF
+from baselines.legacy_no_shield.planning import generate_measurement_positions
 from pf.particle_filter import PFConfig
 
 ROOT = Path(__file__).resolve().parents[2]
-RESULTS_DIR = ROOT / "results" / "baseline_pf"
+RESULTS_DIR = ROOT / "results" / "baselines" / "legacy_no_shield"
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = ROOT / "obstacle_layouts" / "demo_obstacles.json"
 MEASUREMENT_TIME_S = 30.0

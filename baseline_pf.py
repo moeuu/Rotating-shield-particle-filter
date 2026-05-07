@@ -1,4 +1,4 @@
-"""CLI entry point for the baseline PF demo."""
+"""CLI entry point for the legacy no-shield baseline PF demo."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from baseline_pf.cli import main
+from baselines.legacy_no_shield.cli import main
 
 
 if __name__ == "__main__":

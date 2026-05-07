@@ -20,9 +20,18 @@ from realtime_demo import (
 )
 from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
 
+STANDARD_GEANT4_FULL_CONFIG = (
+    ROOT
+    / "configs"
+    / "geant4"
+    / "variance_reduction_external_no_isaac_32threads.json"
+)
+
 RUN_MODE_ALIASES = {
     "gui": "geant4-isaacsim-gui",
-    "cui": "python-cui",
+    "cui": "geant4-cui",
+    "full-simulation": "geant4-cui",
+    "standard-geant4-full": "geant4-cui",
 }
 RUN_MODE_DEFAULTS = {
     "python-gui": {
@@ -48,9 +57,7 @@ RUN_MODE_DEFAULTS = {
     },
     "geant4-cui": {
         "sim_backend": "geant4",
-        "sim_config": (
-            ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
-        ).as_posix(),
+        "sim_config": STANDARD_GEANT4_FULL_CONFIG.as_posix(),
         "matplotlib_live": False,
     },
 }
@@ -59,8 +66,20 @@ RUN_MODE_CHOICES = tuple(RUN_MODE_DEFAULTS.keys()) + tuple(RUN_MODE_ALIASES.keys
 
 def _normalize_run_mode(mode: str | None) -> str:
     """Return the canonical execution mode name."""
-    raw_mode = "python-cui" if mode is None else mode.strip().lower()
+    raw_mode = "geant4-cui" if mode is None else mode.strip().lower()
     return RUN_MODE_ALIASES.get(raw_mode, raw_mode)
+
+
+def _default_run_mode_for_backend(backend: str | None) -> str:
+    """Return the default run mode for an explicitly requested backend."""
+    if backend is None:
+        return "geant4-cui"
+    backend_name = backend.strip().lower()
+    if backend_name == "analytic":
+        return "python-cui"
+    if backend_name == "isaacsim":
+        return "python-gui"
+    return "geant4-cui"
 
 
 def _resolve_run_settings(
@@ -69,8 +88,8 @@ def _resolve_run_settings(
 ) -> tuple[str, str, str | None, bool]:
     """Resolve high-level run mode into backend, config, and live-plot settings."""
     selected_mode = args.run_mode
-    if selected_mode is None and args.headless and args.sim_backend == "geant4":
-        selected_mode = "geant4-cui"
+    if selected_mode is None:
+        selected_mode = _default_run_mode_for_backend(args.sim_backend)
     run_mode = _normalize_run_mode(selected_mode)
     if run_mode not in RUN_MODE_DEFAULTS:
         parser.error(f"Unknown run mode: {args.run_mode}")
@@ -105,7 +124,7 @@ def main() -> None:
         choices=RUN_MODE_CHOICES,
         help=(
             "Execution mode: python-gui, geant4-isaacsim-gui, "
-            "python-cui, or geant4-cui."
+            "python-cui, or geant4-cui. Default: geant4-cui."
         ),
     )
     mode_group.add_argument(
@@ -119,8 +138,22 @@ def main() -> None:
         "--cui",
         dest="run_mode",
         action="store_const",
-        const="python-cui",
-        help="Alias for --mode python-cui.",
+        const="geant4-cui",
+        help=(
+            "Alias for the standard no-GUI Geant4 full simulation "
+            "(--mode geant4-cui). Use --python-cui for the analytic Python CUI."
+        ),
+    )
+    mode_group.add_argument(
+        "--full-simulation",
+        "--standard-geant4-full",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-cui",
+        help=(
+            "Run the standard full Geant4/PF simulation: geant4-cui with "
+            "configs/geant4/variance_reduction_external_no_isaac_32threads.json."
+        ),
     )
     mode_group.add_argument(
         "--python-gui",

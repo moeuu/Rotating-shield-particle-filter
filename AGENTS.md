@@ -24,6 +24,14 @@
 ## Simulation fidelity policy
 
 - Runtime simulation fidelity must take priority over speed shortcuts.
+- "Full simulation" means the standard no-GUI Geant4/PF runtime. Use
+  `uv run python main.py --full-simulation` or `uv run python main.py` unless
+  the user explicitly asks for another mode. This resolves to
+  `--mode geant4-cui` with
+  `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
+- Do not use `--cui` to mean the Python analytic model. `--cui` is an alias for
+  the standard Geant4 CUI full simulation; use `--python-cui` only when the user
+  explicitly asks for the Python analytic mode.
 - Before changing simulation, Geant4, spectrum-generation, or PF observation
   ingestion code, read `docs/simulation_fidelity_policy.md`.
 - Do not introduce runtime shortcuts that lower physical fidelity for speed:
@@ -37,7 +45,8 @@
   explicit `source_rate_model = detector_cps_1m` source-rate model.
 - A calibrated full-spectrum Poisson response regression is acceptable when it
   uses the detector response model directly and propagates count covariance to
-  the PF likelihood; do not replace it with unconstrained continuum fitting.
+  the PF likelihood; this is the runtime PF count-ingestion standard. Do not
+  replace it with unconstrained continuum fitting.
 - CUI mode means "run without the Isaac Sim GUI." It must not mean lower
   transport fidelity.
 - GPU or CPU multithreading is allowed only when it preserves the same physics

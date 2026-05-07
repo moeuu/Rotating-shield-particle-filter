@@ -1837,15 +1837,15 @@ class SpectralDecomposer:
 
         - ``photopeak_nnls`` fits local full-energy peak ROIs with
           nonnegative isotope peak columns and nuisance continuum terms. This
-          is the runtime default because it converts only calibrated
-          full-energy peak areas into source-equivalent counts.
+          remains available for diagnostics and calibration checks.
         - ``response_matrix`` fits the full detector response matrix by NNLS.
           This remains available for Python model validation, but it can absorb
           scatter continua into isotope coefficients for measured or Geant4
           spectra.
         - ``response_poisson`` fits the calibrated full-spectrum response
           matrix with a Poisson likelihood and reports an observation
-          covariance approximation for PF updates.
+          covariance approximation for PF updates. Runtime PF ingestion uses
+          this method through ``RuntimeCountExtractor``.
         - ``peak_window`` uses the thesis pipeline: smoothing, ALS baseline,
           net peak integration within ±3 sigma(E), and branching-ratio weighting.
 

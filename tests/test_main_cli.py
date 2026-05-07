@@ -222,6 +222,50 @@ def test_main_modes_select_expected_runtime(
     assert captured["live"] is False
 
 
+def test_main_default_selects_standard_geant4_full_simulation(monkeypatch) -> None:
+    """The CLI default should be the standard no-GUI Geant4 full simulation."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    module.main()
+
+    assert captured["sim_backend"] == "geant4"
+    assert str(captured["sim_config_path"]).endswith(
+        "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
+    assert captured["live"] is False
+
+
+def test_main_backend_override_without_mode_keeps_matching_default_config(
+    monkeypatch,
+) -> None:
+    """Explicit backend overrides should not inherit the Geant4 config blindly."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--sim-backend", "analytic"])
+
+    module.main()
+
+    assert captured["sim_backend"] == "analytic"
+    assert str(captured["sim_config_path"]).endswith(
+        "configs/python/high_fidelity_no_isaac.json"
+    )
+    assert captured["live"] is False
+
+
 def test_main_gui_alias_selects_geant4_isaacsim(monkeypatch) -> None:
     """The GUI alias should select the Geant4 plus Isaac Sim mode."""
     module = _load_main_module()
@@ -239,6 +283,34 @@ def test_main_gui_alias_selects_geant4_isaacsim(monkeypatch) -> None:
     assert captured["sim_backend"] == "geant4"
     assert str(captured["sim_config_path"]).endswith(
         "configs/geant4/external_gui_scene.json"
+    )
+    assert captured["live"] is False
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["--cui", "--full-simulation", "--standard-geant4-full"],
+)
+def test_main_standard_full_aliases_select_geant4_cui(
+    monkeypatch,
+    alias: str,
+) -> None:
+    """Full-simulation aliases should select the standard Geant4 CUI config."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(sys, "argv", ["main.py", alias])
+
+    module.main()
+
+    assert captured["sim_backend"] == "geant4"
+    assert str(captured["sim_config_path"]).endswith(
+        "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     assert captured["live"] is False
 

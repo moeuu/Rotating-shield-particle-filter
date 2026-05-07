@@ -1,4 +1,4 @@
-"""Observation generation for the sidecar bridge."""
+"""Approximate Python observation generation for Isaac/mock debug sidecars."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from sim.isaacsim_app.geometry import (
 from sim.isaacsim_app.robot_controller import RobotController
 from sim.isaacsim_app.scene_builder import SceneDescription
 from sim.isaacsim_app.stage_backend import StageMaterialInfo
-from sim.python_transport import PythonTransportSpectrumModel
+from sim.approx.python_transport import PythonTransportSpectrumModel
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.transport import (
     TransportSegment,

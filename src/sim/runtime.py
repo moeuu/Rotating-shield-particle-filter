@@ -20,7 +20,7 @@ from sim.protocol import (
     decode_message,
     encode_message,
 )
-from sim.python_transport import PythonTransportSpectrumModel
+from sim.approx.python_transport import PythonTransportSpectrumModel
 from spectrum.pipeline import SpectralDecomposer
 
 
@@ -41,7 +41,7 @@ class SimulationRuntime(ABC):
 
 
 class AnalyticSimulationRuntime(SimulationRuntime):
-    """Provide observations using the shared Python transport spectrum model."""
+    """Provide approximate observations using the Python transport debug model."""
 
     def __init__(
         self,
@@ -480,7 +480,12 @@ def _resolve_geant4_sidecar_config_path(
     configured = config.get("sidecar_config_path")
     if configured not in (None, ""):
         return Path(str(configured)).expanduser().resolve(), None
-    default_path = _repo_root() / "configs" / "geant4" / "default_scene.json"
+    default_path = (
+        _repo_root()
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
     if not config and default_path.exists():
         return default_path, None
     temp_path = _write_temp_sidecar_config(config)

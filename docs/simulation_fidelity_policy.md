@@ -4,6 +4,16 @@ Runtime simulation must preserve physical fidelity by default. Performance
 work is acceptable only when it keeps the same physics, geometry, source-rate
 definition, statistics, and observation path.
 
+## Standard Full Simulation Entry Point
+
+- "Full simulation" means `uv run python main.py --full-simulation`.
+- The default `uv run python main.py` entry point and `--cui` alias must resolve
+  to the standard no-GUI Geant4/PF runtime:
+  `--mode geant4-cui` with
+  `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
+- Python analytic CUI is available only through the explicit `--python-cui` or
+  `--mode python-cui` options.
+
 ## Prohibited Runtime Shortcuts
 
 - Do not use surrogate transport in Geant4 runtime modes.
@@ -20,9 +30,10 @@ definition, statistics, and observation path.
 - Do not use `theory_tvl` attenuation or synthetic scatter gain in runtime
   Geant4 configurations.
 - Do not use peak-window or unconstrained full-spectrum-continuum count
-  extraction as a runtime default; use calibrated full-energy photopeak
-  decomposition or a calibrated full-spectrum Poisson response regression that
-  reports observation covariance to the PF likelihood.
+  extraction as a runtime default; runtime PF observation ingestion must use
+  the calibrated full-spectrum Poisson response regression that reports
+  observation covariance to the PF likelihood. Photopeak NNLS remains a
+  diagnostic/calibration method, not a standard runtime input.
 - Do not make CUI mode a low-fidelity mode. CUI only means no Isaac Sim GUI.
 - Do not ignore concrete/environment obstacles in PF observation likelihoods
   when an obstacle layout or generated environment is active.

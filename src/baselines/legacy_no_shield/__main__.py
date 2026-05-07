@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from baseline_pf.cli import main
+from baselines.legacy_no_shield.cli import main
 
 
 if __name__ == "__main__":

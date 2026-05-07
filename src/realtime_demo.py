@@ -97,6 +97,7 @@ from measurement.continuous_kernels import ContinuousKernel
 from spectrum.library import get_detection_lines_keV
 from spectrum.peak_detection import detect_peaks
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
+from spectrum.runtime_counts import RuntimeCountExtractor
 from spectrum.baseline import baseline_als
 from spectrum.smoothing import gaussian_smooth
 from pf.parallel import Measurement
@@ -1758,54 +1759,21 @@ def _evaluate_spectrum_counts(
     transport_metadata: dict[str, object] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], set[str]]:
     """Extract isotope counts, count variances, and detected labels."""
-    counts, detected = decomposer.isotope_counts_with_detection(
+    extractor = RuntimeCountExtractor(
+        decomposer,
+        count_method=spectrum_count_method,
+    )
+    result = extractor.extract(
         spectrum,
         live_time_s=live_time_s,
-        count_method=spectrum_count_method,
-        active_isotopes=None,
         detect_threshold_abs=detect_threshold_abs,
         detect_threshold_rel=detect_threshold_rel,
         detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
         min_peaks_by_isotope=min_peaks_by_isotope,
+        spectrum_variance=spectrum_variance,
+        transport_metadata=transport_metadata,
     )
-    counts_out = {iso: float(val) for iso, val in counts.items()}
-    variances = {
-        iso: float(max(decomposer.last_count_variances.get(iso, max(val, 1.0)), 1.0))
-        for iso, val in counts_out.items()
-    }
-    if spectrum_variance is not None:
-        variance_floor = decomposer.estimate_count_variances_from_spectrum_variance(
-            spectrum_variance,
-            isotopes=list(counts_out.keys()),
-        )
-        variances = {
-            iso: float(max(variances.get(iso, 1.0), variance_floor.get(iso, 1.0)))
-            for iso in counts_out
-        }
-    effective_entries = None
-    if spectrum_variance is not None:
-        total_sum = float(np.sum(np.clip(spectrum, a_min=0.0, a_max=None)))
-        total_variance = float(np.sum(np.clip(spectrum_variance, a_min=0.0, a_max=None)))
-        if total_sum > 0.0 and total_variance > 0.0:
-            effective_entries = (total_sum * total_sum) / total_variance
-    metadata_effective_entries = (
-        None
-        if transport_metadata is None
-        else _metadata_float(transport_metadata, "weighted_spectrum_effective_entries")
-    )
-    if effective_entries is None:
-        effective_entries = metadata_effective_entries
-    if effective_entries is not None and effective_entries > 0.0:
-        variances = {
-            iso: float(
-                max(
-                    variances.get(iso, 1.0),
-                    (max(float(count), 0.0) ** 2) / max(float(effective_entries), 1.0),
-                )
-            )
-            for iso, count in counts_out.items()
-        }
-    return counts_out, variances, set(detected)
+    return result.counts, result.variances, result.detected
 
 
 def _is_adaptive_spectrum_ready(
@@ -2563,12 +2531,7 @@ def run_live_pf(
     spectrum_count_method = str(
         runtime_config.get("spectrum_count_method", default_count_method)
     ).strip().lower()
-    allowed_runtime_count_methods = {"photopeak_nnls", "response_poisson"}
-    if spectrum_count_method not in allowed_runtime_count_methods:
-        raise ValueError(
-            "spectrum_count_method must be 'photopeak_nnls' or "
-            "'response_poisson' for runtime simulations."
-        )
+    RuntimeCountExtractor.validate_count_method(spectrum_count_method)
     if min_peaks_by_isotope is None:
         min_peaks_by_isotope = dict(DETECT_MIN_PEAKS_BY_ISOTOPE)
     detect_threshold_rel_by_isotope = dict(DETECT_REL_THRESH_BY_ISOTOPE)
@@ -3084,10 +3047,9 @@ def run_live_pf(
     if not isinstance(likelihood_runtime, dict):
         likelihood_runtime = {}
     geant4_likelihood_defaults = sim_backend.strip().lower() == "geant4"
-    spectrum_estimate_likelihood_defaults = spectrum_count_method in {
-        "photopeak_nnls",
-        "response_poisson",
-    }
+    spectrum_estimate_likelihood_defaults = (
+        spectrum_count_method == RuntimeCountExtractor.STANDARD_METHOD
+    )
 
     def _likelihood_config_value(key: str, default: object) -> object:
         """Read a PF likelihood setting from nested or legacy runtime config keys."""

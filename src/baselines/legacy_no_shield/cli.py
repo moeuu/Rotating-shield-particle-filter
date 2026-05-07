@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from baseline_pf.realtime_demo import (
+from baselines.legacy_no_shield.realtime_demo import (
     DEFAULT_OBSTACLE_CONFIG,
     DEFAULT_SOURCE_CONFIG,
     load_sources_from_json,
@@ -30,7 +30,7 @@ def main() -> None:
         "--no-live",
         action="store_true",
         help=(
-            "Disable interactive updating (still saves results/baseline_pf/* images)."
+            "Disable interactive updating (still saves results/baselines/legacy_no_shield/* images)."
         ),
     )
     parser.add_argument(

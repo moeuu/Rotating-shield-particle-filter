@@ -23,7 +23,12 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=str,
-        default=(ROOT / "configs" / "geant4" / "default_scene.json").as_posix(),
+        default=(
+            ROOT
+            / "configs"
+            / "geant4"
+            / "variance_reduction_external_no_isaac_32threads.json"
+        ).as_posix(),
         help="Path to the bridge configuration JSON file.",
     )
     parser.add_argument(

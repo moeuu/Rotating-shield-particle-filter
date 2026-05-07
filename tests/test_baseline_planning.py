@@ -2,7 +2,10 @@
 
 import numpy as np
 
-from baseline_pf.planning import generate_measurement_positions, measurement_count
+from baselines.legacy_no_shield.planning import (
+    generate_measurement_positions,
+    measurement_count,
+)
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 
