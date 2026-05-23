@@ -1,0 +1,264 @@
+{
+  "backend": "geant4",
+  "environment_mode": "random",
+  "estimated_sources": {
+    "Co-60": [
+      {
+        "pos": [
+          6.3982092991487605,
+          14.508055771170488,
+          7.341528760545238
+        ],
+        "strength": 19567.570890555515
+      }
+    ],
+    "Cs-137": [
+      {
+        "pos": [
+          3.523051791330292,
+          2.4861198235223134,
+          6.4842556762264865
+        ],
+        "strength": 12974.686179775063
+      }
+    ],
+    "Eu-154": [
+      {
+        "pos": [
+          4.545843504399515,
+          13.40317884252919,
+          7.49088716331816
+        ],
+        "strength": 15062.225554631434
+      }
+    ]
+  },
+  "ground_truth_sources": {
+    "Co-60": [
+      {
+        "pos": [
+          2.604237,
+          20.0,
+          7.393796
+        ],
+        "strength": 30000.0
+      }
+    ],
+    "Cs-137": [
+      {
+        "pos": [
+          7.545632,
+          3.399105,
+          10.0
+        ],
+        "strength": 30000.0
+      }
+    ],
+    "Eu-154": [
+      {
+        "pos": [
+          5.466058,
+          16.390439,
+          10.0
+        ],
+        "strength": 30000.0
+      }
+    ]
+  },
+  "last_counts": {
+    "Co-60": 484.4332496220357,
+    "Cs-137": 48.00167773051621,
+    "Eu-154": 358.97892948434514
+  },
+  "match_metrics": {
+    "isotopes": {
+      "Co-60": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 10432.429109444485,
+          "mean": 10432.429109444485,
+          "median": 10432.429109444485
+        },
+        "intensity_rel_error_pct": {
+          "max": 34.774763698148284,
+          "mean": 34.774763698148284,
+          "median": 34.774763698148284
+        },
+        "matches": [
+          {
+            "abs_err": 10432.429109444485,
+            "distance": 6.6752085423305045,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 19567.570890555515,
+            "q_true": 30000.0,
+            "rel_err_pct": 34.774763698148284,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 6.6752085423305045,
+          "mean": 6.6752085423305045,
+          "median": 6.6752085423305045,
+          "rmse": 6.6752085423305045,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Cs-137": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 17025.31382022494,
+          "mean": 17025.31382022494,
+          "median": 17025.31382022494
+        },
+        "intensity_rel_error_pct": {
+          "max": 56.75104606741647,
+          "mean": 56.75104606741647,
+          "median": 56.75104606741647
+        },
+        "matches": [
+          {
+            "abs_err": 17025.31382022494,
+            "distance": 5.419884834366401,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 12974.686179775063,
+            "q_true": 30000.0,
+            "rel_err_pct": 56.75104606741647,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 5.419884834366401,
+          "mean": 5.419884834366401,
+          "median": 5.419884834366401,
+          "rmse": 5.419884834366401,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Eu-154": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 14937.774445368566,
+          "mean": 14937.774445368566,
+          "median": 14937.774445368566
+        },
+        "intensity_rel_error_pct": {
+          "max": 49.792581484561886,
+          "mean": 49.792581484561886,
+          "median": 49.792581484561886
+        },
+        "matches": [
+          {
+            "abs_err": 14937.774445368566,
+            "distance": 4.008262116370059,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 15062.225554631434,
+            "q_true": 30000.0,
+            "rel_err_pct": 49.792581484561886,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 4.008262116370059,
+          "mean": 4.008262116370059,
+          "median": 4.008262116370059,
+          "rmse": 4.008262116370059,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      }
+    },
+    "match_radius_m": 0.5
+  },
+  "measurements_completed": 8,
+  "mission_metrics": {
+    "adaptive_dwell_chunk_s": 2.0,
+    "adaptive_dwell_enabled": true,
+    "adaptive_min_dwell_s": 2.0,
+    "adaptive_ready_min_counts": 100.0,
+    "adaptive_ready_min_isotopes": 1,
+    "adaptive_ready_min_snr": 0.0,
+    "dss_beam_width": 8,
+    "dss_differential_weight": 1.0,
+    "dss_environment_signature_weight": 0.75,
+    "dss_horizon": 2,
+    "dss_occlusion_boundary_weight": 1.5,
+    "dss_program_length": 1,
+    "dss_rotation_weight": 0.15,
+    "dss_signature_weight": 1.0,
+    "estimated_end_to_end_time_s": 172.71223981599078,
+    "estimated_motion_time_s": 156.71223981599078,
+    "estimated_rotation_time_s": 0.0,
+    "ig_compute_time_s": 0.0,
+    "max_live_time_s": 2.0,
+    "max_orientation_selection_time_s": 0.0,
+    "max_pf_update_time_s": 24.164965422998648,
+    "mean_live_time_s": 2.0,
+    "mean_orientation_selection_time_s": 0.0,
+    "mean_pf_update_time_s": 14.601907848811607,
+    "measurement_live_times_s": [
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0
+    ],
+    "measurement_time_cap_s": 30.0,
+    "min_live_time_s": 2.0,
+    "nominal_motion_speed_m_s": 0.5,
+    "num_motion_segments": 7,
+    "path_planner": "dss_pp",
+    "pf_compute_time_s": 233.6305255809857,
+    "prune_time_s": 5.216909564973321,
+    "rotation_overhead_s_per_measurement": 0.0,
+    "total_compute_time_s": 242.04536023101537,
+    "total_live_time_s": 16.0,
+    "total_measurements": 8,
+    "total_mission_time_s": 172.71223981599078,
+    "total_motion_distance_m": 78.35611990799539,
+    "total_move_measure_time_s": 172.71223981599078,
+    "total_shield_actuation_time_s": 0.0,
+    "total_travel_time_s": 156.71223981599078,
+    "viz_time_s": 3.1979250850563403,
+    "wall_clock_runtime_s": 656.3027751790069
+  },
+  "output_paths": {
+    "cui_pf_3d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/ral_ablation/case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901/latest_pf_3d.png",
+    "cui_robot_2d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/ral_ablation/case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901/latest_robot_2d.png",
+    "cui_split_view": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/ral_ablation/case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901/index.html",
+    "estimates_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_estimates_case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.png",
+    "last_spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_last_case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.png",
+    "pf_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_pf_case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.png",
+    "spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.png",
+    "summary_json": "/home/moeu/research/Rotating-shield-particle-filter/results/result_summary_case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.json"
+  },
+  "sim_config_path": "results/ral_ablation/configs/case01_multi_isotope_baseline_passive_no_shield_single_view_seed_2026050901.json"
+}

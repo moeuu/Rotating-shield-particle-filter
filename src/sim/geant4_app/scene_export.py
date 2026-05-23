@@ -9,7 +9,7 @@ from typing import Any
 
 from sim.isaacsim_app.observation_model import IsaacAssetGeometry
 from sim.isaacsim_app.scene_builder import SceneDescription, StagePrimPaths
-from sim.isaacsim_app.stage_backend import StageBackend, StageMaterialInfo, StageSolidPrim
+from sim.isaacsim_app.stage_backend import StageBackend, StageMaterialInfo
 from sim.shield_geometry import (
     SHIELD_SHAPE_SPHERICAL_OCTANT,
     ShieldThicknessConfig,

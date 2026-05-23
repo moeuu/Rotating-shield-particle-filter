@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import TYPE_CHECKING, Dict, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
 from pf.particle_filter import IsotopeParticleFilter, PFConfig
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass

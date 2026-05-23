@@ -1,0 +1,8632 @@
+{
+  "base_usd_path": "/home/moeu/research/Rotating-shield-particle-filter/configs/isaacsim/demo_room.usda",
+  "obstacle_cell_size_m": 1.0,
+  "obstacle_cells": [
+    [
+      1,
+      2
+    ],
+    [
+      1,
+      3
+    ],
+    [
+      1,
+      5
+    ],
+    [
+      1,
+      6
+    ],
+    [
+      1,
+      7
+    ],
+    [
+      1,
+      9
+    ],
+    [
+      1,
+      11
+    ],
+    [
+      1,
+      13
+    ],
+    [
+      1,
+      14
+    ],
+    [
+      1,
+      15
+    ],
+    [
+      1,
+      17
+    ],
+    [
+      1,
+      18
+    ],
+    [
+      2,
+      1
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      2,
+      3
+    ],
+    [
+      2,
+      5
+    ],
+    [
+      2,
+      6
+    ],
+    [
+      2,
+      7
+    ],
+    [
+      2,
+      9
+    ],
+    [
+      2,
+      11
+    ],
+    [
+      2,
+      13
+    ],
+    [
+      2,
+      14
+    ],
+    [
+      2,
+      15
+    ],
+    [
+      2,
+      17
+    ],
+    [
+      2,
+      18
+    ],
+    [
+      3,
+      1
+    ],
+    [
+      3,
+      2
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      3,
+      5
+    ],
+    [
+      3,
+      6
+    ],
+    [
+      3,
+      7
+    ],
+    [
+      3,
+      9
+    ],
+    [
+      3,
+      11
+    ],
+    [
+      3,
+      13
+    ],
+    [
+      3,
+      14
+    ],
+    [
+      3,
+      15
+    ],
+    [
+      3,
+      17
+    ],
+    [
+      3,
+      18
+    ],
+    [
+      6,
+      1
+    ],
+    [
+      6,
+      2
+    ],
+    [
+      6,
+      3
+    ],
+    [
+      6,
+      5
+    ],
+    [
+      6,
+      6
+    ],
+    [
+      6,
+      7
+    ],
+    [
+      6,
+      9
+    ],
+    [
+      6,
+      11
+    ],
+    [
+      6,
+      13
+    ],
+    [
+      6,
+      14
+    ],
+    [
+      6,
+      15
+    ],
+    [
+      6,
+      17
+    ],
+    [
+      6,
+      18
+    ],
+    [
+      7,
+      1
+    ],
+    [
+      7,
+      2
+    ],
+    [
+      7,
+      3
+    ],
+    [
+      7,
+      5
+    ],
+    [
+      7,
+      6
+    ],
+    [
+      7,
+      7
+    ],
+    [
+      7,
+      9
+    ],
+    [
+      7,
+      11
+    ],
+    [
+      7,
+      13
+    ],
+    [
+      7,
+      14
+    ],
+    [
+      7,
+      15
+    ],
+    [
+      7,
+      17
+    ],
+    [
+      7,
+      18
+    ]
+  ],
+  "obstacle_grid_shape": [
+    10,
+    20
+  ],
+  "obstacle_height_m": 2.0,
+  "obstacle_instances": [
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1172439728542962,
+            2.515438398653731,
+            0.556301797497648
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.112603594995296
+          ]
+        },
+        {
+          "center_xyz": [
+            1.9272439728542963,
+            2.515438398653731,
+            0.556301797497648
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.112603594995296
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5222439728542962,
+            2.110438398653731,
+            0.556301797497648
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.112603594995296
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5222439728542962,
+            2.920438398653731,
+            0.556301797497648
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.112603594995296
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5222439728542962,
+            2.515438398653731,
+            1.097603594995296
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5222439728542962,
+            2.515438398653731,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0000_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5222439728542962,
+            2.515438398653731,
+            0.46729350989802426
+          ],
+          "material": "steel",
+          "name": "Obstacle_0000_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.38941125824835354
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          2
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        2.0,
+        3.0
+      ],
+      "name": "KnownObstacle_0000",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.4944046559775144,
+            3.5104594964710953,
+            0.16546334680177058
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0001_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.33092669360354116
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4944046559775144,
+            3.5104594964710953,
+            0.5039111016235741
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0001_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.3459688160400658
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          3
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        3.0,
+        4.0
+      ],
+      "name": "KnownObstacle_0001",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1658564020088502,
+            5.498428812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4676564020088503,
+            5.498428812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3167564020088502,
+            5.347528812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3167564020088502,
+            5.649328812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3167564020088502,
+            5.498428812689342,
+            0.8587129707277255
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3167564020088502,
+            5.498428812689342,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3167564020088502,
+            5.498428812689342,
+            0.33106092887653565
+          ],
+          "material": "water",
+          "name": "Obstacle_0002_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.479167133900249
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5614564020088502,
+            5.498428812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8632564020088502,
+            5.498428812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7123564020088502,
+            5.347528812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7123564020088502,
+            5.649328812689342,
+            0.4356064853638627
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8712129707277254
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7123564020088502,
+            5.498428812689342,
+            0.8587129707277255
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7123564020088502,
+            5.498428812689342,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0002_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7123564020088502,
+            5.498428812689342,
+            0.33106092887653565
+          ],
+          "material": "water",
+          "name": "Obstacle_0002_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.479167133900249
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          5
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        5.0,
+        6.0
+      ],
+      "name": "KnownObstacle_0002",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.0825918342776433,
+            6.486272696908631,
+            0.6112690764706616
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.2225381529413233
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8925918342776433,
+            6.486272696908631,
+            0.6112690764706616
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.2225381529413233
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4875918342776433,
+            6.081272696908631,
+            0.6112690764706616
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.2225381529413233
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4875918342776433,
+            6.891272696908631,
+            0.6112690764706616
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.2225381529413233
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4875918342776433,
+            6.486272696908631,
+            1.2075381529413234
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4875918342776433,
+            6.486272696908631,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0003_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4875918342776433,
+            6.486272696908631,
+            0.5134660242353558
+          ],
+          "material": "steel",
+          "name": "Obstacle_0003_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.42788835352946314
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          6
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        6.0,
+        7.0
+      ],
+      "name": "KnownObstacle_0003",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1539213702516502,
+            7.524279513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4557213702516503,
+            7.524279513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3048213702516502,
+            7.373379513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3048213702516502,
+            7.675179513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3048213702516502,
+            7.524279513888286,
+            1.0545647676855012
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3048213702516502,
+            7.524279513888286,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.3048213702516502,
+            7.524279513888286,
+            0.40548461172049044
+          ],
+          "material": "water",
+          "name": "Obstacle_0004_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5868856222270257
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5495213702516502,
+            7.524279513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8513213702516502,
+            7.524279513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7004213702516502,
+            7.373379513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7004213702516502,
+            7.675179513888286,
+            0.5335323838427506
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0670647676855012
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7004213702516502,
+            7.524279513888286,
+            1.0545647676855012
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7004213702516502,
+            7.524279513888286,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0004_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.7004213702516502,
+            7.524279513888286,
+            0.40548461172049044
+          ],
+          "material": "water",
+          "name": "Obstacle_0004_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5868856222270257
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          7
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        7.0,
+        8.0
+      ],
+      "name": "KnownObstacle_0004",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.157286782242617,
+            9.523959047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.459086782242617,
+            9.523959047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.308186782242617,
+            9.373059047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.308186782242617,
+            9.674859047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.308186782242617,
+            9.523959047236412,
+            0.8236234792942396
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.308186782242617,
+            9.523959047236412,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.308186782242617,
+            9.523959047236412,
+            0.31772692213181103
+          ],
+          "material": "water",
+          "name": "Obstacle_0005_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.4598679136118318
+          ]
+        },
+        {
+          "center_xyz": [
+            1.552886782242617,
+            9.523959047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.854686782242617,
+            9.523959047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.703786782242617,
+            9.373059047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.703786782242617,
+            9.674859047236412,
+            0.4180617396471198
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.8361234792942396
+          ]
+        },
+        {
+          "center_xyz": [
+            1.703786782242617,
+            9.523959047236412,
+            0.8236234792942396
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.703786782242617,
+            9.523959047236412,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0005_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            1.703786782242617,
+            9.523959047236412,
+            0.31772692213181103
+          ],
+          "material": "water",
+          "name": "Obstacle_0005_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.4598679136118318
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          9
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        9.0,
+        10.0
+      ],
+      "name": "KnownObstacle_0005",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1013022178392897,
+            11.474460752445838,
+            0.5089200696933991
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0178401393867982
+          ]
+        },
+        {
+          "center_xyz": [
+            1.9113022178392898,
+            11.474460752445838,
+            0.5089200696933991
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0178401393867982
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5063022178392897,
+            11.069460752445838,
+            0.5089200696933991
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0178401393867982
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5063022178392897,
+            11.879460752445837,
+            0.5089200696933991
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0178401393867982
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5063022178392897,
+            11.474460752445838,
+            1.0028401393867983
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5063022178392897,
+            11.474460752445838,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0006_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5063022178392897,
+            11.474460752445838,
+            0.4274928585424552
+          ],
+          "material": "steel",
+          "name": "Obstacle_0006_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.35624404878537935
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          11
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        11.0,
+        12.0
+      ],
+      "name": "KnownObstacle_0006",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1084379956770964,
+            13.497870979595493,
+            0.929291943298213
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.858583886596426
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8934379956770961,
+            13.497870979595493,
+            0.929291943298213
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.858583886596426
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5009379956770963,
+            13.105370979595493,
+            0.929291943298213
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.858583886596426
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5009379956770963,
+            13.890370979595493,
+            0.929291943298213
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.858583886596426
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5009379956770963,
+            13.497870979595493,
+            1.8410838865964259
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5009379956770963,
+            13.497870979595493,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0007_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          13
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        13.0,
+        14.0
+      ],
+      "name": "KnownObstacle_0007",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.0957905882095726,
+            14.499824912382037,
+            0.5618787305068327
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1237574610136654
+          ]
+        },
+        {
+          "center_xyz": [
+            1.9057905882095727,
+            14.499824912382037,
+            0.5618787305068327
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1237574610136654
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5007905882095727,
+            14.094824912382037,
+            0.5618787305068327
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1237574610136654
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5007905882095727,
+            14.904824912382036,
+            0.5618787305068327
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1237574610136654
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5007905882095727,
+            14.499824912382037,
+            1.1087574610136655
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5007905882095727,
+            14.499824912382037,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0008_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.5007905882095727,
+            14.499824912382037,
+            0.4719781336257394
+          ],
+          "material": "steel",
+          "name": "Obstacle_0008_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.39331511135478286
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          14
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        14.0,
+        15.0
+      ],
+      "name": "KnownObstacle_0008",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.4863302327151902,
+            15.491387260031589,
+            0.22589882663760186
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0009_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.4517976532752037
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4863302327151902,
+            15.491387260031589,
+            0.6879646083963329
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0009_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.4723339102422584
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          15
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        15.0,
+        16.0
+      ],
+      "name": "KnownObstacle_0009",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.0876940333937235,
+            17.472209117554915,
+            0.7075119324504364
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.4150238649008728
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8976940333937236,
+            17.472209117554915,
+            0.7075119324504364
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.4150238649008728
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4926940333937235,
+            17.067209117554913,
+            0.7075119324504364
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.4150238649008728
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4926940333937235,
+            17.877209117554916,
+            0.7075119324504364
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.4150238649008728
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4926940333937235,
+            17.472209117554915,
+            1.400023864900873
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4926940333937235,
+            17.472209117554915,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0010_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4926940333937235,
+            17.472209117554915,
+            0.5943100232583666
+          ],
+          "material": "steel",
+          "name": "Obstacle_0010_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.49525835271530544
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          17
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        17.0,
+        18.0
+      ],
+      "name": "KnownObstacle_0010",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            1.1099061378371502,
+            18.11386597565973,
+            0.8640996461942486
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7281992923884972
+          ]
+        },
+        {
+          "center_xyz": [
+            1.1099061378371502,
+            18.86986597565973,
+            0.8640996461942486
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7281992923884972
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8659061378371504,
+            18.11386597565973,
+            0.8640996461942486
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7281992923884972
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8659061378371504,
+            18.86986597565973,
+            0.8640996461942486
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7281992923884972
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4879061378371503,
+            18.11386597565973,
+            0.4320498230971243
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4879061378371503,
+            18.86986597565973,
+            0.4320498230971243
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.1099061378371502,
+            18.49186597565973,
+            0.4320498230971243
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8659061378371504,
+            18.49186597565973,
+            0.4320498230971243
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4879061378371503,
+            18.11386597565973,
+            1.3479954480630278
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.4879061378371503,
+            18.86986597565973,
+            1.3479954480630278
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.1099061378371502,
+            18.49186597565973,
+            1.3479954480630278
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            1.8659061378371504,
+            18.49186597565973,
+            1.3479954480630278
+          ],
+          "material": "steel",
+          "name": "Obstacle_0011_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          1,
+          18
+        ]
+      ],
+      "footprint_xy": [
+        1.0,
+        2.0,
+        18.0,
+        19.0
+      ],
+      "name": "KnownObstacle_0011",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.12937046552105,
+            1.508802181517379,
+            0.8854427368404643
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.7708854736809285
+          ]
+        },
+        {
+          "center_xyz": [
+            2.91437046552105,
+            1.508802181517379,
+            0.8854427368404643
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.7708854736809285
+          ]
+        },
+        {
+          "center_xyz": [
+            2.52187046552105,
+            1.1163021815173793,
+            0.8854427368404643
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.7708854736809285
+          ]
+        },
+        {
+          "center_xyz": [
+            2.52187046552105,
+            1.901302181517379,
+            0.8854427368404643
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.7708854736809285
+          ]
+        },
+        {
+          "center_xyz": [
+            2.52187046552105,
+            1.508802181517379,
+            1.7533854736809285
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            2.52187046552105,
+            1.508802181517379,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0012_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          1
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        1.0,
+        2.0
+      ],
+      "name": "KnownObstacle_0012",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.13128328464809,
+            2.502016047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.433083284648089,
+            2.502016047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.2821832846480894,
+            2.351116047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.2821832846480894,
+            2.652916047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.2821832846480894,
+            2.502016047247448,
+            0.94060889452014
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            2.2821832846480894,
+            2.502016047247448,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            2.2821832846480894,
+            2.502016047247448,
+            0.36218137991765315
+          ],
+          "material": "water",
+          "name": "Obstacle_0013_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.524209891986077
+          ]
+        },
+        {
+          "center_xyz": [
+            2.5268832846480898,
+            2.502016047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.828683284648089,
+            2.502016047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.6777832846480893,
+            2.351116047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.6777832846480893,
+            2.652916047247448,
+            0.47655444726006996
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            0.9531088945201399
+          ]
+        },
+        {
+          "center_xyz": [
+            2.6777832846480893,
+            2.502016047247448,
+            0.94060889452014
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            2.6777832846480893,
+            2.502016047247448,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0013_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            2.6777832846480893,
+            2.502016047247448,
+            0.36218137991765315
+          ],
+          "material": "water",
+          "name": "Obstacle_0013_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.524209891986077
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          2
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        2.0,
+        3.0
+      ],
+      "name": "KnownObstacle_0013",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.4961153936523965,
+            3.502749153881802,
+            0.17021414452640432
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0014_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.34042828905280864
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4961153936523965,
+            3.502749153881802,
+            0.518379440148595
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0014_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.3559023021915727
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          3
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        3.0,
+        4.0
+      ],
+      "name": "KnownObstacle_0014",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.088707380862201,
+            5.49009003539046,
+            0.5375499322676129
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0750998645352259
+          ]
+        },
+        {
+          "center_xyz": [
+            2.898707380862201,
+            5.49009003539046,
+            0.5375499322676129
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0750998645352259
+          ]
+        },
+        {
+          "center_xyz": [
+            2.493707380862201,
+            5.08509003539046,
+            0.5375499322676129
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0750998645352259
+          ]
+        },
+        {
+          "center_xyz": [
+            2.493707380862201,
+            5.89509003539046,
+            0.5375499322676129
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0750998645352259
+          ]
+        },
+        {
+          "center_xyz": [
+            2.493707380862201,
+            5.49009003539046,
+            1.060099864535226
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.493707380862201,
+            5.49009003539046,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0015_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.493707380862201,
+            5.49009003539046,
+            0.45154194310479484
+          ],
+          "material": "steel",
+          "name": "Obstacle_0015_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.376284952587329
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          5
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        5.0,
+        6.0
+      ],
+      "name": "KnownObstacle_0015",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.1177806160042607,
+            6.138756175954392,
+            0.7769975079031831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5539950158063662
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1177806160042607,
+            6.8947561759543925,
+            0.7769975079031831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5539950158063662
+          ]
+        },
+        {
+          "center_xyz": [
+            2.873780616004261,
+            6.138756175954392,
+            0.7769975079031831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5539950158063662
+          ]
+        },
+        {
+          "center_xyz": [
+            2.873780616004261,
+            6.8947561759543925,
+            0.7769975079031831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5539950158063662
+          ]
+        },
+        {
+          "center_xyz": [
+            2.495780616004261,
+            6.138756175954392,
+            0.38849875395159156
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.495780616004261,
+            6.8947561759543925,
+            0.38849875395159156
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1177806160042607,
+            6.516756175954392,
+            0.38849875395159156
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.873780616004261,
+            6.516756175954392,
+            0.38849875395159156
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.495780616004261,
+            6.138756175954392,
+            1.2121161123289657
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.495780616004261,
+            6.8947561759543925,
+            1.2121161123289657
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1177806160042607,
+            6.516756175954392,
+            1.2121161123289657
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.873780616004261,
+            6.516756175954392,
+            1.2121161123289657
+          ],
+          "material": "steel",
+          "name": "Obstacle_0016_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          6
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        6.0,
+        7.0
+      ],
+      "name": "KnownObstacle_0016",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.100883150214472,
+            7.507727808524146,
+            0.669112560953197
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.338225121906394
+          ]
+        },
+        {
+          "center_xyz": [
+            2.9108831502144716,
+            7.507727808524146,
+            0.669112560953197
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.338225121906394
+          ]
+        },
+        {
+          "center_xyz": [
+            2.505883150214472,
+            7.102727808524146,
+            0.669112560953197
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.338225121906394
+          ]
+        },
+        {
+          "center_xyz": [
+            2.505883150214472,
+            7.912727808524147,
+            0.669112560953197
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.338225121906394
+          ]
+        },
+        {
+          "center_xyz": [
+            2.505883150214472,
+            7.507727808524146,
+            1.3232251219063942
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.505883150214472,
+            7.507727808524146,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0017_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.505883150214472,
+            7.507727808524146,
+            0.5620545512006855
+          ],
+          "material": "steel",
+          "name": "Obstacle_0017_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.4683787926672379
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          7
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        7.0,
+        8.0
+      ],
+      "name": "KnownObstacle_0017",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.0916575541625386,
+            9.485415581862453,
+            0.6006245745259954
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.2012491490519908
+          ]
+        },
+        {
+          "center_xyz": [
+            2.9016575541625382,
+            9.485415581862453,
+            0.6006245745259954
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.2012491490519908
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4966575541625384,
+            9.080415581862454,
+            0.6006245745259954
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.2012491490519908
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4966575541625384,
+            9.890415581862452,
+            0.6006245745259954
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.2012491490519908
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4966575541625384,
+            9.485415581862453,
+            1.1862491490519909
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4966575541625384,
+            9.485415581862453,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0018_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4966575541625384,
+            9.485415581862453,
+            0.504524642601836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0018_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.42043720216819674
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          9
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        9.0,
+        10.0
+      ],
+      "name": "KnownObstacle_0018",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.0820923579176998,
+            11.529473167216075,
+            0.75375100933897
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.50750201867794
+          ]
+        },
+        {
+          "center_xyz": [
+            2.8670923579177,
+            11.529473167216075,
+            0.75375100933897
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.50750201867794
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4745923579177,
+            11.136973167216075,
+            0.75375100933897
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.50750201867794
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4745923579177,
+            11.921973167216075,
+            0.75375100933897
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.50750201867794
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4745923579177,
+            11.529473167216075,
+            1.49000201867794
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4745923579177,
+            11.529473167216075,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0019_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          11
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        11.0,
+        12.0
+      ],
+      "name": "KnownObstacle_0019",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.0949264651331814,
+            13.523566852647418,
+            0.8655536845846135
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.731107369169227
+          ]
+        },
+        {
+          "center_xyz": [
+            2.8799264651331815,
+            13.523566852647418,
+            0.8655536845846135
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.731107369169227
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4874264651331814,
+            13.131066852647418,
+            0.8655536845846135
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.731107369169227
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4874264651331814,
+            13.916066852647418,
+            0.8655536845846135
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.731107369169227
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4874264651331814,
+            13.523566852647418,
+            1.7136073691692268
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4874264651331814,
+            13.523566852647418,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0020_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          13
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        13.0,
+        14.0
+      ],
+      "name": "KnownObstacle_0020",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.4896852428426324,
+            14.509662080984487,
+            0.24815543906075818
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0021_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.49631087812151636
+          ]
+        },
+        {
+          "center_xyz": [
+            2.4896852428426324,
+            14.509662080984487,
+            0.7557461098668544
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0021_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.5188704634906762
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          14
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        14.0,
+        15.0
+      ],
+      "name": "KnownObstacle_0021",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.50195213614006,
+            15.490072878705305,
+            0.18193678755721324
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0022_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.3638735751144265
+          ]
+        },
+        {
+          "center_xyz": [
+            2.50195213614006,
+            15.490072878705305,
+            0.5540802166515131
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0022_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.38041328307417316
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          15
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        15.0,
+        16.0
+      ],
+      "name": "KnownObstacle_0022",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.1189627183456934,
+            17.502930283309368,
+            0.5451381246122279
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0902762492244558
+          ]
+        },
+        {
+          "center_xyz": [
+            2.928962718345693,
+            17.502930283309368,
+            0.5451381246122279
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0902762492244558
+          ]
+        },
+        {
+          "center_xyz": [
+            2.523962718345693,
+            17.097930283309367,
+            0.5451381246122279
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0902762492244558
+          ]
+        },
+        {
+          "center_xyz": [
+            2.523962718345693,
+            17.90793028330937,
+            0.5451381246122279
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0902762492244558
+          ]
+        },
+        {
+          "center_xyz": [
+            2.523962718345693,
+            17.502930283309368,
+            1.0752762492244559
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.523962718345693,
+            17.502930283309368,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0023_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            2.523962718345693,
+            17.502930283309368,
+            0.4579160246742714
+          ],
+          "material": "steel",
+          "name": "Obstacle_0023_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.3815966872285595
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          17
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        17.0,
+        18.0
+      ],
+      "name": "KnownObstacle_0023",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            2.1269550096827867,
+            18.124439299606582,
+            0.712886350838976
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.425772701677952
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1269550096827867,
+            18.880439299606582,
+            0.712886350838976
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.425772701677952
+          ]
+        },
+        {
+          "center_xyz": [
+            2.882955009682787,
+            18.124439299606582,
+            0.712886350838976
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.425772701677952
+          ]
+        },
+        {
+          "center_xyz": [
+            2.882955009682787,
+            18.880439299606582,
+            0.712886350838976
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.425772701677952
+          ]
+        },
+        {
+          "center_xyz": [
+            2.504955009682787,
+            18.124439299606582,
+            0.356443175419488
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.504955009682787,
+            18.880439299606582,
+            0.356443175419488
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1269550096827867,
+            18.502439299606582,
+            0.356443175419488
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.882955009682787,
+            18.502439299606582,
+            0.356443175419488
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.504955009682787,
+            18.124439299606582,
+            1.1121027073088026
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.504955009682787,
+            18.880439299606582,
+            1.1121027073088026
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.1269550096827867,
+            18.502439299606582,
+            1.1121027073088026
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            2.882955009682787,
+            18.502439299606582,
+            1.1121027073088026
+          ],
+          "material": "steel",
+          "name": "Obstacle_0024_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          2,
+          18
+        ]
+      ],
+      "footprint_xy": [
+        2.0,
+        3.0,
+        18.0,
+        19.0
+      ],
+      "name": "KnownObstacle_0024",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.0900134958007994,
+            1.4854113959101833,
+            0.5095143216728097
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0190286433456195
+          ]
+        },
+        {
+          "center_xyz": [
+            3.900013495800799,
+            1.4854113959101833,
+            0.5095143216728097
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.0190286433456195
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4950134958007992,
+            1.0804113959101833,
+            0.5095143216728097
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0190286433456195
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4950134958007992,
+            1.8904113959101834,
+            0.5095143216728097
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.0190286433456195
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4950134958007992,
+            1.4854113959101833,
+            1.0040286433456196
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4950134958007992,
+            1.4854113959101833,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0025_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4950134958007992,
+            1.4854113959101833,
+            0.4279920302051602
+          ],
+          "material": "steel",
+          "name": "Obstacle_0025_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.3566600251709668
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          1
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        1.0,
+        2.0
+      ],
+      "name": "KnownObstacle_0025",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.0931928921415897,
+            2.5026675711559694,
+            0.5805408274450563
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1610816548901126
+          ]
+        },
+        {
+          "center_xyz": [
+            3.9031928921415893,
+            2.5026675711559694,
+            0.5805408274450563
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1610816548901126
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4981928921415895,
+            2.0976675711559696,
+            0.5805408274450563
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1610816548901126
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4981928921415895,
+            2.907667571155969,
+            0.5805408274450563
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1610816548901126
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4981928921415895,
+            2.5026675711559694,
+            1.1460816548901127
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4981928921415895,
+            2.5026675711559694,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0026_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4981928921415895,
+            2.5026675711559694,
+            0.4876542950538473
+          ],
+          "material": "steel",
+          "name": "Obstacle_0026_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.4063785792115394
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          2
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        2.0,
+        3.0
+      ],
+      "name": "KnownObstacle_0026",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.109074195511876,
+            3.4734110247648986,
+            0.593046318141301
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.186092636282602
+          ]
+        },
+        {
+          "center_xyz": [
+            3.9190741955118757,
+            3.4734110247648986,
+            0.593046318141301
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.186092636282602
+          ]
+        },
+        {
+          "center_xyz": [
+            3.514074195511876,
+            3.068411024764899,
+            0.593046318141301
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.186092636282602
+          ]
+        },
+        {
+          "center_xyz": [
+            3.514074195511876,
+            3.8784110247648984,
+            0.593046318141301
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.186092636282602
+          ]
+        },
+        {
+          "center_xyz": [
+            3.514074195511876,
+            3.4734110247648986,
+            1.1710926362826022
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.514074195511876,
+            3.4734110247648986,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0027_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.514074195511876,
+            3.4734110247648986,
+            0.4981589072386929
+          ],
+          "material": "steel",
+          "name": "Obstacle_0027_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.4151324226989107
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          3
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        3.0,
+        4.0
+      ],
+      "name": "KnownObstacle_0027",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.0738819577234806,
+            5.526160301182252,
+            0.6644401825096287
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.3288803650192573
+          ]
+        },
+        {
+          "center_xyz": [
+            3.88388195772348,
+            5.526160301182252,
+            0.6644401825096287
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.3288803650192573
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4788819577234804,
+            5.121160301182252,
+            0.6644401825096287
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.3288803650192573
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4788819577234804,
+            5.931160301182253,
+            0.6644401825096287
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.3288803650192573
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4788819577234804,
+            5.526160301182252,
+            1.3138803650192574
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4788819577234804,
+            5.526160301182252,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0028_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4788819577234804,
+            5.526160301182252,
+            0.558129753308088
+          ],
+          "material": "steel",
+          "name": "Obstacle_0028_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.46510812775674004
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          5
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        5.0,
+        6.0
+      ],
+      "name": "KnownObstacle_0028",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.1029778755225372,
+            6.50149562679836,
+            0.9182023021411936
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.8364046042823872
+          ]
+        },
+        {
+          "center_xyz": [
+            3.8879778755225374,
+            6.50149562679836,
+            0.9182023021411936
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.8364046042823872
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4954778755225373,
+            6.10899562679836,
+            0.9182023021411936
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.8364046042823872
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4954778755225373,
+            6.89399562679836,
+            0.9182023021411936
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.8364046042823872
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4954778755225373,
+            6.50149562679836,
+            1.818904604282387
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            3.4954778755225373,
+            6.50149562679836,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0029_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          6
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        6.0,
+        7.0
+      ],
+      "name": "KnownObstacle_0029",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.502528147504112,
+            7.505143162453507,
+            0.19627641237806906
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0030_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.3925528247561381
+          ]
+        },
+        {
+          "center_xyz": [
+            3.502528147504112,
+            7.505143162453507,
+            0.5977508922423013
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0030_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.4103961349723262
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          7
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        7.0,
+        8.0
+      ],
+      "name": "KnownObstacle_0030",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.1226684470273596,
+            9.131283658414748,
+            0.872753794197165
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.74550758839433
+          ]
+        },
+        {
+          "center_xyz": [
+            3.1226684470273596,
+            9.887283658414749,
+            0.872753794197165
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.74550758839433
+          ]
+        },
+        {
+          "center_xyz": [
+            3.87866844702736,
+            9.131283658414748,
+            0.872753794197165
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.74550758839433
+          ]
+        },
+        {
+          "center_xyz": [
+            3.87866844702736,
+            9.887283658414749,
+            0.872753794197165
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.74550758839433
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5006684470273597,
+            9.131283658414748,
+            0.4363768970985825
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5006684470273597,
+            9.887283658414749,
+            0.4363768970985825
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.1226684470273596,
+            9.509283658414748,
+            0.4363768970985825
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.87866844702736,
+            9.509283658414748,
+            0.4363768970985825
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5006684470273597,
+            9.131283658414748,
+            1.3614959189475775
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5006684470273597,
+            9.887283658414749,
+            1.3614959189475775
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.1226684470273596,
+            9.509283658414748,
+            1.3614959189475775
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            3.87866844702736,
+            9.509283658414748,
+            1.3614959189475775
+          ],
+          "material": "steel",
+          "name": "Obstacle_0031_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          9
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        9.0,
+        10.0
+      ],
+      "name": "KnownObstacle_0031",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.1192714859692163,
+            11.472290016485664,
+            0.6882443758994385
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.376488751798877
+          ]
+        },
+        {
+          "center_xyz": [
+            3.929271485969216,
+            11.472290016485664,
+            0.6882443758994385
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.376488751798877
+          ]
+        },
+        {
+          "center_xyz": [
+            3.524271485969216,
+            11.067290016485664,
+            0.6882443758994385
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.376488751798877
+          ]
+        },
+        {
+          "center_xyz": [
+            3.524271485969216,
+            11.877290016485663,
+            0.6882443758994385
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.376488751798877
+          ]
+        },
+        {
+          "center_xyz": [
+            3.524271485969216,
+            11.472290016485664,
+            1.3614887517988772
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.524271485969216,
+            11.472290016485664,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0032_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.524271485969216,
+            11.472290016485664,
+            0.5781252757555283
+          ],
+          "material": "steel",
+          "name": "Obstacle_0032_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.48177106312960694
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          11
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        11.0,
+        12.0
+      ],
+      "name": "KnownObstacle_0032",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.1270631903099866,
+            13.477116135247183,
+            0.8047259127282962
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.6094518254565924
+          ]
+        },
+        {
+          "center_xyz": [
+            3.9120631903099867,
+            13.477116135247183,
+            0.8047259127282962
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.6094518254565924
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5195631903099867,
+            13.084616135247183,
+            0.8047259127282962
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.6094518254565924
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5195631903099867,
+            13.869616135247183,
+            0.8047259127282962
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.6094518254565924
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5195631903099867,
+            13.477116135247183,
+            1.5919518254565923
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5195631903099867,
+            13.477116135247183,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0033_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          13
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        13.0,
+        14.0
+      ],
+      "name": "KnownObstacle_0033",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.0677991866223384,
+            14.507193869080512,
+            0.6982559145245085
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.396511829049017
+          ]
+        },
+        {
+          "center_xyz": [
+            3.877799186622338,
+            14.507193869080512,
+            0.6982559145245085
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.396511829049017
+          ]
+        },
+        {
+          "center_xyz": [
+            3.472799186622338,
+            14.102193869080512,
+            0.6982559145245085
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.396511829049017
+          ]
+        },
+        {
+          "center_xyz": [
+            3.472799186622338,
+            14.912193869080511,
+            0.6982559145245085
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.396511829049017
+          ]
+        },
+        {
+          "center_xyz": [
+            3.472799186622338,
+            14.507193869080512,
+            1.3815118290490171
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.472799186622338,
+            14.507193869080512,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0034_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.472799186622338,
+            14.507193869080512,
+            0.5865349682005871
+          ],
+          "material": "steel",
+          "name": "Obstacle_0034_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.48877914016715596
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          14
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        14.0,
+        15.0
+      ],
+      "name": "KnownObstacle_0034",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.0957282006380438,
+            15.51264756755086,
+            0.556605870674286
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.113211741348572
+          ]
+        },
+        {
+          "center_xyz": [
+            3.9057282006380434,
+            15.51264756755086,
+            0.556605870674286
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.113211741348572
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5007282006380436,
+            15.107647567550861,
+            0.556605870674286
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.113211741348572
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5007282006380436,
+            15.91764756755086,
+            0.556605870674286
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.113211741348572
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5007282006380436,
+            15.51264756755086,
+            1.0982117413485721
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5007282006380436,
+            15.51264756755086,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0035_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5007282006380436,
+            15.51264756755086,
+            0.46754893136640024
+          ],
+          "material": "steel",
+          "name": "Obstacle_0035_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.3896241094720002
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          15
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        15.0,
+        16.0
+      ],
+      "name": "KnownObstacle_0035",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.098876997884672,
+            17.47980257973673,
+            0.7865153597781196
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.5730307195562392
+          ]
+        },
+        {
+          "center_xyz": [
+            3.883876997884672,
+            17.47980257973673,
+            0.7865153597781196
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.5730307195562392
+          ]
+        },
+        {
+          "center_xyz": [
+            3.491376997884672,
+            17.08730257973673,
+            0.7865153597781196
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.5730307195562392
+          ]
+        },
+        {
+          "center_xyz": [
+            3.491376997884672,
+            17.872302579736733,
+            0.7865153597781196
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.5730307195562392
+          ]
+        },
+        {
+          "center_xyz": [
+            3.491376997884672,
+            17.47980257973673,
+            1.5555307195562391
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            3.491376997884672,
+            17.47980257973673,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0036_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          17
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        17.0,
+        18.0
+      ],
+      "name": "KnownObstacle_0036",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            3.135731815868881,
+            18.5046199612095,
+            0.78501701685521
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.57003403371042
+          ]
+        },
+        {
+          "center_xyz": [
+            3.9207318158688813,
+            18.5046199612095,
+            0.78501701685521
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.57003403371042
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5282318158688812,
+            18.112119961209498,
+            0.78501701685521
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.57003403371042
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5282318158688812,
+            18.8971199612095,
+            0.78501701685521
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.57003403371042
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5282318158688812,
+            18.5046199612095,
+            1.5525340337104199
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            3.5282318158688812,
+            18.5046199612095,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0037_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          3,
+          18
+        ]
+      ],
+      "footprint_xy": [
+        3.0,
+        4.0,
+        18.0,
+        19.0
+      ],
+      "name": "KnownObstacle_0037",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.135978487914574,
+            1.496502127207768,
+            0.9450986877201473
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.8901973754402945
+          ]
+        },
+        {
+          "center_xyz": [
+            6.920978487914574,
+            1.496502127207768,
+            0.9450986877201473
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.8901973754402945
+          ]
+        },
+        {
+          "center_xyz": [
+            6.528478487914574,
+            1.1040021272077682,
+            0.9450986877201473
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.8901973754402945
+          ]
+        },
+        {
+          "center_xyz": [
+            6.528478487914574,
+            1.889002127207768,
+            0.9450986877201473
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.8901973754402945
+          ]
+        },
+        {
+          "center_xyz": [
+            6.528478487914574,
+            1.496502127207768,
+            1.8726973754402945
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            6.528478487914574,
+            1.496502127207768,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0038_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          1
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        1.0,
+        2.0
+      ],
+      "name": "KnownObstacle_0038",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.122543293418719,
+            2.1227408145159177,
+            0.8689621571148003
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7379243142296006
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122543293418719,
+            2.878740814515918,
+            0.8689621571148003
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7379243142296006
+          ]
+        },
+        {
+          "center_xyz": [
+            6.878543293418719,
+            2.1227408145159177,
+            0.8689621571148003
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7379243142296006
+          ]
+        },
+        {
+          "center_xyz": [
+            6.878543293418719,
+            2.878740814515918,
+            0.8689621571148003
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7379243142296006
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500543293418719,
+            2.1227408145159177,
+            0.43448107855740015
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500543293418719,
+            2.878740814515918,
+            0.43448107855740015
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122543293418719,
+            2.500740814515918,
+            0.43448107855740015
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.878543293418719,
+            2.500740814515918,
+            0.43448107855740015
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500543293418719,
+            2.1227408145159177,
+            1.3555809650990884
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500543293418719,
+            2.878740814515918,
+            1.3555809650990884
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122543293418719,
+            2.500740814515918,
+            1.3555809650990884
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.878543293418719,
+            2.500740814515918,
+            1.3555809650990884
+          ],
+          "material": "steel",
+          "name": "Obstacle_0039_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          2
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        2.0,
+        3.0
+      ],
+      "name": "KnownObstacle_0039",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.502258280187879,
+            3.497946186107415,
+            0.24228053162880867
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0040_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.48456106325761733
+          ]
+        },
+        {
+          "center_xyz": [
+            6.502258280187879,
+            3.497946186107415,
+            0.7378543463240991
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0040_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.5065865661329636
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          3
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        3.0,
+        4.0
+      ],
+      "name": "KnownObstacle_0040",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.4975260921973925,
+            5.511837268132717,
+            0.17104695098672382
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0041_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.34209390197344763
+          ]
+        },
+        {
+          "center_xyz": [
+            6.4975260921973925,
+            5.511837268132717,
+            0.5209157143686589
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0041_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.3576436247904225
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          5
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        5.0,
+        6.0
+      ],
+      "name": "KnownObstacle_0041",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.122683018695725,
+            6.137782836845364,
+            0.6752997739994274
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.3505995479988548
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122683018695725,
+            6.893782836845364,
+            0.6752997739994274
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.3505995479988548
+          ]
+        },
+        {
+          "center_xyz": [
+            6.8786830186957255,
+            6.137782836845364,
+            0.6752997739994274
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.3505995479988548
+          ]
+        },
+        {
+          "center_xyz": [
+            6.8786830186957255,
+            6.893782836845364,
+            0.6752997739994274
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.3505995479988548
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500683018695725,
+            6.137782836845364,
+            0.3376498869997137
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500683018695725,
+            6.893782836845364,
+            0.3376498869997137
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122683018695725,
+            6.515782836845364,
+            0.3376498869997137
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.8786830186957255,
+            6.515782836845364,
+            0.3376498869997137
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500683018695725,
+            6.137782836845364,
+            1.053467647439107
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.500683018695725,
+            6.893782836845364,
+            1.053467647439107
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.122683018695725,
+            6.515782836845364,
+            1.053467647439107
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.8786830186957255,
+            6.515782836845364,
+            1.053467647439107
+          ],
+          "material": "steel",
+          "name": "Obstacle_0042_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          6
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        6.0,
+        7.0
+      ],
+      "name": "KnownObstacle_0042",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.166295918215844,
+            7.508647088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.468095918215844,
+            7.508647088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.317195918215844,
+            7.357747088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.317195918215844,
+            7.659547088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.317195918215844,
+            7.508647088799931,
+            1.0243343617124492
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            6.317195918215844,
+            7.508647088799931,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            6.317195918215844,
+            7.508647088799931,
+            0.39399705745073066
+          ],
+          "material": "water",
+          "name": "Obstacle_0043_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5702588989418471
+          ]
+        },
+        {
+          "center_xyz": [
+            6.561895918215844,
+            7.508647088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.863695918215844,
+            7.508647088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.712795918215844,
+            7.357747088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.712795918215844,
+            7.659547088799931,
+            0.5184171808562246
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0368343617124491
+          ]
+        },
+        {
+          "center_xyz": [
+            6.712795918215844,
+            7.508647088799931,
+            1.0243343617124492
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            6.712795918215844,
+            7.508647088799931,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0043_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            6.712795918215844,
+            7.508647088799931,
+            0.39399705745073066
+          ],
+          "material": "water",
+          "name": "Obstacle_0043_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5702588989418471
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          7
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        7.0,
+        8.0
+      ],
+      "name": "KnownObstacle_0043",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.13720832463308,
+            9.489458931930313,
+            0.7995688899198425
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.599137779839685
+          ]
+        },
+        {
+          "center_xyz": [
+            6.92220832463308,
+            9.489458931930313,
+            0.7995688899198425
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.599137779839685
+          ]
+        },
+        {
+          "center_xyz": [
+            6.52970832463308,
+            9.096958931930313,
+            0.7995688899198425
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.599137779839685
+          ]
+        },
+        {
+          "center_xyz": [
+            6.52970832463308,
+            9.881958931930313,
+            0.7995688899198425
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.599137779839685
+          ]
+        },
+        {
+          "center_xyz": [
+            6.52970832463308,
+            9.489458931930313,
+            1.581637779839685
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            6.52970832463308,
+            9.489458931930313,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0044_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          9
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        9.0,
+        10.0
+      ],
+      "name": "KnownObstacle_0044",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.491681529061978,
+            11.487419713547624,
+            0.18373592115782986
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0045_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.3674718423156597
+          ]
+        },
+        {
+          "center_xyz": [
+            6.491681529061978,
+            11.487419713547624,
+            0.5595593962533909
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0045_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.38417510787546244
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          11
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        11.0,
+        12.0
+      ],
+      "name": "KnownObstacle_0045",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.133905908600544,
+            13.10843420095224,
+            0.7811337075950596
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5622674151901192
+          ]
+        },
+        {
+          "center_xyz": [
+            6.133905908600544,
+            13.86443420095224,
+            0.7811337075950596
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5622674151901192
+          ]
+        },
+        {
+          "center_xyz": [
+            6.889905908600544,
+            13.10843420095224,
+            0.7811337075950596
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5622674151901192
+          ]
+        },
+        {
+          "center_xyz": [
+            6.889905908600544,
+            13.86443420095224,
+            0.7811337075950596
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5622674151901192
+          ]
+        },
+        {
+          "center_xyz": [
+            6.511905908600544,
+            13.10843420095224,
+            0.3905668537975298
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.511905908600544,
+            13.86443420095224,
+            0.3905668537975298
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.133905908600544,
+            13.48643420095224,
+            0.3905668537975298
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.889905908600544,
+            13.48643420095224,
+            0.3905668537975298
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.511905908600544,
+            13.10843420095224,
+            1.2185685838482931
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.511905908600544,
+            13.86443420095224,
+            1.2185685838482931
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.133905908600544,
+            13.48643420095224,
+            1.2185685838482931
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.889905908600544,
+            13.48643420095224,
+            1.2185685838482931
+          ],
+          "material": "steel",
+          "name": "Obstacle_0046_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          13
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        13.0,
+        14.0
+      ],
+      "name": "KnownObstacle_0046",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.093835003713819,
+            14.505302352747343,
+            0.6648187516522658
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.3296375033045316
+          ]
+        },
+        {
+          "center_xyz": [
+            6.903835003713819,
+            14.505302352747343,
+            0.6648187516522658
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.3296375033045316
+          ]
+        },
+        {
+          "center_xyz": [
+            6.498835003713819,
+            14.100302352747343,
+            0.6648187516522658
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.3296375033045316
+          ]
+        },
+        {
+          "center_xyz": [
+            6.498835003713819,
+            14.910302352747342,
+            0.6648187516522658
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.3296375033045316
+          ]
+        },
+        {
+          "center_xyz": [
+            6.498835003713819,
+            14.505302352747343,
+            1.3146375033045317
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            6.498835003713819,
+            14.505302352747343,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0047_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            6.498835003713819,
+            14.505302352747343,
+            0.5584477513879033
+          ],
+          "material": "steel",
+          "name": "Obstacle_0047_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.465373126156586
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          14
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        14.0,
+        15.0
+      ],
+      "name": "KnownObstacle_0047",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.138147279565776,
+            15.12080440122714,
+            0.7884302564594721
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5768605129189441
+          ]
+        },
+        {
+          "center_xyz": [
+            6.138147279565776,
+            15.87680440122714,
+            0.7884302564594721
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5768605129189441
+          ]
+        },
+        {
+          "center_xyz": [
+            6.894147279565776,
+            15.12080440122714,
+            0.7884302564594721
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5768605129189441
+          ]
+        },
+        {
+          "center_xyz": [
+            6.894147279565776,
+            15.87680440122714,
+            0.7884302564594721
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.5768605129189441
+          ]
+        },
+        {
+          "center_xyz": [
+            6.516147279565776,
+            15.12080440122714,
+            0.39421512822973603
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.516147279565776,
+            15.87680440122714,
+            0.39421512822973603
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.138147279565776,
+            15.49880440122714,
+            0.39421512822973603
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.894147279565776,
+            15.49880440122714,
+            0.39421512822973603
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.516147279565776,
+            15.12080440122714,
+            1.2299512000767765
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.516147279565776,
+            15.87680440122714,
+            1.2299512000767765
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.138147279565776,
+            15.49880440122714,
+            1.2299512000767765
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.894147279565776,
+            15.49880440122714,
+            1.2299512000767765
+          ],
+          "material": "steel",
+          "name": "Obstacle_0048_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          15
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        15.0,
+        16.0
+      ],
+      "name": "KnownObstacle_0048",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.12673291643649,
+            17.11093612887784,
+            0.6185596254469122
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.2371192508938245
+          ]
+        },
+        {
+          "center_xyz": [
+            6.12673291643649,
+            17.86693612887784,
+            0.6185596254469122
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.2371192508938245
+          ]
+        },
+        {
+          "center_xyz": [
+            6.88273291643649,
+            17.11093612887784,
+            0.6185596254469122
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.2371192508938245
+          ]
+        },
+        {
+          "center_xyz": [
+            6.88273291643649,
+            17.86693612887784,
+            0.6185596254469122
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.2371192508938245
+          ]
+        },
+        {
+          "center_xyz": [
+            6.50473291643649,
+            17.11093612887784,
+            0.3092798127234561
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.50473291643649,
+            17.86693612887784,
+            0.3092798127234561
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.12673291643649,
+            17.48893612887784,
+            0.3092798127234561
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.88273291643649,
+            17.48893612887784,
+            0.3092798127234561
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.50473291643649,
+            17.11093612887784,
+            0.9649530156971831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.50473291643649,
+            17.86693612887784,
+            0.9649530156971831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.12673291643649,
+            17.48893612887784,
+            0.9649530156971831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            6.88273291643649,
+            17.48893612887784,
+            0.9649530156971831
+          ],
+          "material": "steel",
+          "name": "Obstacle_0049_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          17
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        17.0,
+        18.0
+      ],
+      "name": "KnownObstacle_0049",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            6.5073928424762775,
+            18.50882621007217,
+            0.22923905391218172
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0050_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.45847810782436343
+          ]
+        },
+        {
+          "center_xyz": [
+            6.5073928424762775,
+            18.50882621007217,
+            0.6981371187325535
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0050_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.47931802181637995
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          6,
+          18
+        ]
+      ],
+      "footprint_xy": [
+        6.0,
+        7.0,
+        18.0,
+        19.0
+      ],
+      "name": "KnownObstacle_0050",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.132347042673736,
+            1.5202543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.434147042673736,
+            1.5202543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.283247042673736,
+            1.3693543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.283247042673736,
+            1.6711543882150213,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.283247042673736,
+            1.5202543882150212,
+            1.0583146311989136
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.283247042673736,
+            1.5202543882150212,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.283247042673736,
+            1.5202543882150212,
+            0.40690955985558713
+          ],
+          "material": "water",
+          "name": "Obstacle_0051_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5889480471594025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.527947042673736,
+            1.5202543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.829747042673736,
+            1.5202543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.678847042673736,
+            1.3693543882150212,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.678847042673736,
+            1.6711543882150213,
+            0.5354073155994568
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0708146311989135
+          ]
+        },
+        {
+          "center_xyz": [
+            7.678847042673736,
+            1.5202543882150212,
+            1.0583146311989136
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.678847042673736,
+            1.5202543882150212,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0051_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.678847042673736,
+            1.5202543882150212,
+            0.40690955985558713
+          ],
+          "material": "water",
+          "name": "Obstacle_0051_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5889480471594025
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          1
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        1.0,
+        2.0
+      ],
+      "name": "KnownObstacle_0051",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.500652516283305,
+            2.5116377921828206,
+            0.1691053969399421
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0052_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.3382107938798842
+          ]
+        },
+        {
+          "center_xyz": [
+            7.500652516283305,
+            2.5116377921828206,
+            0.5150027997716418
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0052_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.3535840117835153
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          2
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        2.0,
+        3.0
+      ],
+      "name": "KnownObstacle_0052",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.068696174700169,
+            3.473132072107944,
+            0.5631921694881141
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_west_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1263843389762282
+          ]
+        },
+        {
+          "center_xyz": [
+            7.87869617470017,
+            3.473132072107944,
+            0.5631921694881141
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_east_panel",
+          "size_xyz": [
+            0.03,
+            0.84,
+            1.1263843389762282
+          ]
+        },
+        {
+          "center_xyz": [
+            7.473696174700169,
+            3.0681320721079444,
+            0.5631921694881141
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_south_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1263843389762282
+          ]
+        },
+        {
+          "center_xyz": [
+            7.473696174700169,
+            3.878132072107944,
+            0.5631921694881141
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_north_panel",
+          "size_xyz": [
+            0.84,
+            0.03,
+            1.1263843389762282
+          ]
+        },
+        {
+          "center_xyz": [
+            7.473696174700169,
+            3.473132072107944,
+            1.1113843389762283
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_top_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            7.473696174700169,
+            3.473132072107944,
+            0.015
+          ],
+          "material": "aluminum",
+          "name": "Obstacle_0053_bottom_panel",
+          "size_xyz": [
+            0.84,
+            0.84,
+            0.03
+          ]
+        },
+        {
+          "center_xyz": [
+            7.473696174700169,
+            3.473132072107944,
+            0.4730814223700158
+          ],
+          "material": "steel",
+          "name": "Obstacle_0053_steel_inner_box",
+          "size_xyz": [
+            0.294,
+            0.294,
+            0.39423451864167985
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          3
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        3.0,
+        4.0
+      ],
+      "name": "KnownObstacle_0053",
+      "template": "aluminum_equipment_frame_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.491250093361967,
+            5.501877562914791,
+            0.16843075401090798
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0054_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.33686150802181597
+          ]
+        },
+        {
+          "center_xyz": [
+            7.491250093361967,
+            5.501877562914791,
+            0.5129482053968561
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0054_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.35217339475008036
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          5
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        5.0,
+        6.0
+      ],
+      "name": "KnownObstacle_0054",
+      "template": "concrete_barrier_partial"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.12516357537422,
+            6.110310390356653,
+            0.8033621125701929
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.6067242251403857
+          ]
+        },
+        {
+          "center_xyz": [
+            7.12516357537422,
+            6.866310390356653,
+            0.8033621125701929
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.6067242251403857
+          ]
+        },
+        {
+          "center_xyz": [
+            7.88116357537422,
+            6.110310390356653,
+            0.8033621125701929
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.6067242251403857
+          ]
+        },
+        {
+          "center_xyz": [
+            7.88116357537422,
+            6.866310390356653,
+            0.8033621125701929
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.6067242251403857
+          ]
+        },
+        {
+          "center_xyz": [
+            7.50316357537422,
+            6.110310390356653,
+            0.4016810562850964
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.50316357537422,
+            6.866310390356653,
+            0.4016810562850964
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.12516357537422,
+            6.488310390356653,
+            0.4016810562850964
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.88116357537422,
+            6.488310390356653,
+            0.4016810562850964
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.50316357537422,
+            6.110310390356653,
+            1.2532448956095008
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.50316357537422,
+            6.866310390356653,
+            1.2532448956095008
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.12516357537422,
+            6.488310390356653,
+            1.2532448956095008
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.88116357537422,
+            6.488310390356653,
+            1.2532448956095008
+          ],
+          "material": "steel",
+          "name": "Obstacle_0055_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          6
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        6.0,
+        7.0
+      ],
+      "name": "KnownObstacle_0055",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.095565922414351,
+            7.527615501072471,
+            0.8345990949693112
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.6691981899386223
+          ]
+        },
+        {
+          "center_xyz": [
+            7.880565922414351,
+            7.527615501072471,
+            0.8345990949693112
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.6691981899386223
+          ]
+        },
+        {
+          "center_xyz": [
+            7.488065922414351,
+            7.1351155010724705,
+            0.8345990949693112
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.6691981899386223
+          ]
+        },
+        {
+          "center_xyz": [
+            7.488065922414351,
+            7.920115501072471,
+            0.8345990949693112
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.6691981899386223
+          ]
+        },
+        {
+          "center_xyz": [
+            7.488065922414351,
+            7.527615501072471,
+            1.6516981899386223
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            7.488065922414351,
+            7.527615501072471,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0056_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          7
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        7.0,
+        8.0
+      ],
+      "name": "KnownObstacle_0056",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.127130006373045,
+            9.509955643141538,
+            0.8526876964033815
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.705375392806763
+          ]
+        },
+        {
+          "center_xyz": [
+            7.9121300063730455,
+            9.509955643141538,
+            0.8526876964033815
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.705375392806763
+          ]
+        },
+        {
+          "center_xyz": [
+            7.5196300063730455,
+            9.117455643141538,
+            0.8526876964033815
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.705375392806763
+          ]
+        },
+        {
+          "center_xyz": [
+            7.5196300063730455,
+            9.902455643141538,
+            0.8526876964033815
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.705375392806763
+          ]
+        },
+        {
+          "center_xyz": [
+            7.5196300063730455,
+            9.509955643141538,
+            1.687875392806763
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            7.5196300063730455,
+            9.509955643141538,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0057_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          9
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        9.0,
+        10.0
+      ],
+      "name": "KnownObstacle_0057",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.1246038161890235,
+            11.105889024646064,
+            0.840499321527562
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.680998643055124
+          ]
+        },
+        {
+          "center_xyz": [
+            7.1246038161890235,
+            11.861889024646064,
+            0.840499321527562
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.680998643055124
+          ]
+        },
+        {
+          "center_xyz": [
+            7.880603816189024,
+            11.105889024646064,
+            0.840499321527562
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.680998643055124
+          ]
+        },
+        {
+          "center_xyz": [
+            7.880603816189024,
+            11.861889024646064,
+            0.840499321527562
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.680998643055124
+          ]
+        },
+        {
+          "center_xyz": [
+            7.502603816189024,
+            11.105889024646064,
+            0.420249660763781
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.502603816189024,
+            11.861889024646064,
+            0.420249660763781
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.1246038161890235,
+            11.483889024646064,
+            0.420249660763781
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.880603816189024,
+            11.483889024646064,
+            0.420249660763781
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.502603816189024,
+            11.105889024646064,
+            1.3111789415829969
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.502603816189024,
+            11.861889024646064,
+            1.3111789415829969
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.1246038161890235,
+            11.483889024646064,
+            1.3111789415829969
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.880603816189024,
+            11.483889024646064,
+            1.3111789415829969
+          ],
+          "material": "steel",
+          "name": "Obstacle_0058_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          11
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        11.0,
+        12.0
+      ],
+      "name": "KnownObstacle_0058",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.136484467772649,
+            13.522302571494537,
+            0.7126774114915153
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_west_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.4253548229830306
+          ]
+        },
+        {
+          "center_xyz": [
+            7.9214844677726495,
+            13.522302571494537,
+            0.7126774114915153
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_east_panel",
+          "size_xyz": [
+            0.035,
+            0.82,
+            1.4253548229830306
+          ]
+        },
+        {
+          "center_xyz": [
+            7.528984467772649,
+            13.129802571494537,
+            0.7126774114915153
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_south_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.4253548229830306
+          ]
+        },
+        {
+          "center_xyz": [
+            7.528984467772649,
+            13.914802571494537,
+            0.7126774114915153
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_north_panel",
+          "size_xyz": [
+            0.82,
+            0.035,
+            1.4253548229830306
+          ]
+        },
+        {
+          "center_xyz": [
+            7.528984467772649,
+            13.522302571494537,
+            1.4078548229830306
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_top_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        },
+        {
+          "center_xyz": [
+            7.528984467772649,
+            13.522302571494537,
+            0.0175
+          ],
+          "material": "steel",
+          "name": "Obstacle_0059_bottom_panel",
+          "size_xyz": [
+            0.82,
+            0.82,
+            0.035
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          13
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        13.0,
+        14.0
+      ],
+      "name": "KnownObstacle_0059",
+      "template": "steel_cabinet_hollow"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.142382156695252,
+            14.481023132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.444182156695252,
+            14.481023132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.293282156695252,
+            14.330123132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.293282156695252,
+            14.631923132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.293282156695252,
+            14.481023132594421,
+            0.9881447277312485
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.293282156695252,
+            14.481023132594421,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.293282156695252,
+            14.481023132594421,
+            0.3802449965378744
+          ],
+          "material": "water",
+          "name": "Obstacle_0060_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5503546002521867
+          ]
+        },
+        {
+          "center_xyz": [
+            7.537982156695252,
+            14.481023132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.839782156695252,
+            14.481023132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.688882156695252,
+            14.330123132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.688882156695252,
+            14.631923132594421,
+            0.5003223638656242
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.0006447277312485
+          ]
+        },
+        {
+          "center_xyz": [
+            7.688882156695252,
+            14.481023132594421,
+            0.9881447277312485
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.688882156695252,
+            14.481023132594421,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0060_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.688882156695252,
+            14.481023132594421,
+            0.3802449965378744
+          ],
+          "material": "water",
+          "name": "Obstacle_0060_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.5503546002521867
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          14
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        14.0,
+        15.0
+      ],
+      "name": "KnownObstacle_0060",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.132411036137822,
+            15.11548025152008,
+            0.8588427704756204
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_leg_0_0",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7176855409512408
+          ]
+        },
+        {
+          "center_xyz": [
+            7.132411036137822,
+            15.87148025152008,
+            0.8588427704756204
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_leg_0_1",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7176855409512408
+          ]
+        },
+        {
+          "center_xyz": [
+            7.888411036137822,
+            15.11548025152008,
+            0.8588427704756204
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_leg_1_2",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7176855409512408
+          ]
+        },
+        {
+          "center_xyz": [
+            7.888411036137822,
+            15.87148025152008,
+            0.8588427704756204
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_leg_1_3",
+          "size_xyz": [
+            0.055,
+            0.055,
+            1.7176855409512408
+          ]
+        },
+        {
+          "center_xyz": [
+            7.510411036137822,
+            15.11548025152008,
+            0.4294213852378102
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_x_4",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.510411036137822,
+            15.87148025152008,
+            0.4294213852378102
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_x_5",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.132411036137822,
+            15.49348025152008,
+            0.4294213852378102
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_y_6",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.888411036137822,
+            15.49348025152008,
+            0.4294213852378102
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_y_7",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.510411036137822,
+            15.11548025152008,
+            1.339794721941968
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_x_8",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.510411036137822,
+            15.87148025152008,
+            1.339794721941968
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_x_9",
+          "size_xyz": [
+            0.9,
+            0.055,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.132411036137822,
+            15.49348025152008,
+            1.339794721941968
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_y_10",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        },
+        {
+          "center_xyz": [
+            7.888411036137822,
+            15.49348025152008,
+            1.339794721941968
+          ],
+          "material": "steel",
+          "name": "Obstacle_0061_rail_y_11",
+          "size_xyz": [
+            0.055,
+            0.9,
+            0.055
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          15
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        15.0,
+        16.0
+      ],
+      "name": "KnownObstacle_0061",
+      "template": "steel_pipe_rack_sparse"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.1331277591322415,
+            17.51307609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.434927759132242,
+            17.51307609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.2840277591322415,
+            17.36217609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.2840277591322415,
+            17.66397609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.2840277591322415,
+            17.51307609868017,
+            1.0905482879607673
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.2840277591322415,
+            17.51307609868017,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_0_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.2840277591322415,
+            17.51307609868017,
+            0.41915834942509156
+          ],
+          "material": "water",
+          "name": "Obstacle_0062_drum_0_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.606676558378422
+          ]
+        },
+        {
+          "center_xyz": [
+            7.5287277591322415,
+            17.51307609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_west_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.8305277591322415,
+            17.51307609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_east_panel",
+          "size_xyz": [
+            0.025,
+            0.3268,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.6796277591322415,
+            17.36217609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_south_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.6796277591322415,
+            17.66397609868017,
+            0.5515241439803836
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_north_panel",
+          "size_xyz": [
+            0.3268,
+            0.025,
+            1.1030482879607673
+          ]
+        },
+        {
+          "center_xyz": [
+            7.6796277591322415,
+            17.51307609868017,
+            1.0905482879607673
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_top_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.6796277591322415,
+            17.51307609868017,
+            0.0125
+          ],
+          "material": "steel",
+          "name": "Obstacle_0062_drum_1_bottom_panel",
+          "size_xyz": [
+            0.3268,
+            0.3268,
+            0.025
+          ]
+        },
+        {
+          "center_xyz": [
+            7.6796277591322415,
+            17.51307609868017,
+            0.41915834942509156
+          ],
+          "material": "water",
+          "name": "Obstacle_0062_drum_1_water_fill",
+          "size_xyz": [
+            0.23529599999999998,
+            0.23529599999999998,
+            0.606676558378422
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          17
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        17.0,
+        18.0
+      ],
+      "name": "KnownObstacle_0062",
+      "template": "partially_filled_steel_drums"
+    },
+    {
+      "components": [
+        {
+          "center_xyz": [
+            7.491523911955289,
+            18.502061953025958,
+            0.22120999700994506
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0063_concrete_base",
+          "size_xyz": [
+            0.92,
+            0.4232,
+            0.44241999401989013
+          ]
+        },
+        {
+          "center_xyz": [
+            7.491523911955289,
+            18.502061953025958,
+            0.6736849908939236
+          ],
+          "material": "concrete",
+          "name": "Obstacle_0063_concrete_cap",
+          "size_xyz": [
+            0.6624,
+            0.276,
+            0.46252999374806697
+          ]
+        }
+      ],
+      "footprint_cells": [
+        [
+          7,
+          18
+        ]
+      ],
+      "footprint_xy": [
+        7.0,
+        8.0,
+        18.0,
+        19.0
+      ],
+      "name": "KnownObstacle_0063",
+      "template": "concrete_barrier_partial"
+    }
+  ],
+  "obstacle_material": "concrete",
+  "obstacle_origin_xy": [
+    0.0,
+    0.0
+  ],
+  "room_size_xyz": [
+    10.0,
+    20.0,
+    10.0
+  ],
+  "traversability_blocking_z_range_m": [
+    0.05,
+    2.0
+  ],
+  "traversability_cell_size_m": 1.0,
+  "traversability_output_path": "/home/moeu/research/Rotating-shield-particle-filter/results/blender_environments/random_seed_7_obstacle_nsource_20260512.traversability.json",
+  "traversability_reachable_from_xy": [
+    1.0,
+    1.0
+  ],
+  "traversability_rects_xy": [
+    [
+      1.0,
+      2.0,
+      2.0,
+      3.0
+    ],
+    [
+      1.0,
+      2.0,
+      3.0,
+      4.0
+    ],
+    [
+      1.0,
+      2.0,
+      5.0,
+      6.0
+    ],
+    [
+      1.0,
+      2.0,
+      6.0,
+      7.0
+    ],
+    [
+      1.0,
+      2.0,
+      7.0,
+      8.0
+    ],
+    [
+      1.0,
+      2.0,
+      9.0,
+      10.0
+    ],
+    [
+      1.0,
+      2.0,
+      11.0,
+      12.0
+    ],
+    [
+      1.0,
+      2.0,
+      13.0,
+      14.0
+    ],
+    [
+      1.0,
+      2.0,
+      14.0,
+      15.0
+    ],
+    [
+      1.0,
+      2.0,
+      15.0,
+      16.0
+    ],
+    [
+      1.0,
+      2.0,
+      17.0,
+      18.0
+    ],
+    [
+      1.0,
+      2.0,
+      18.0,
+      19.0
+    ],
+    [
+      2.0,
+      3.0,
+      1.0,
+      2.0
+    ],
+    [
+      2.0,
+      3.0,
+      2.0,
+      3.0
+    ],
+    [
+      2.0,
+      3.0,
+      3.0,
+      4.0
+    ],
+    [
+      2.0,
+      3.0,
+      5.0,
+      6.0
+    ],
+    [
+      2.0,
+      3.0,
+      6.0,
+      7.0
+    ],
+    [
+      2.0,
+      3.0,
+      7.0,
+      8.0
+    ],
+    [
+      2.0,
+      3.0,
+      9.0,
+      10.0
+    ],
+    [
+      2.0,
+      3.0,
+      11.0,
+      12.0
+    ],
+    [
+      2.0,
+      3.0,
+      13.0,
+      14.0
+    ],
+    [
+      2.0,
+      3.0,
+      14.0,
+      15.0
+    ],
+    [
+      2.0,
+      3.0,
+      15.0,
+      16.0
+    ],
+    [
+      2.0,
+      3.0,
+      17.0,
+      18.0
+    ],
+    [
+      2.0,
+      3.0,
+      18.0,
+      19.0
+    ],
+    [
+      3.0,
+      4.0,
+      1.0,
+      2.0
+    ],
+    [
+      3.0,
+      4.0,
+      2.0,
+      3.0
+    ],
+    [
+      3.0,
+      4.0,
+      3.0,
+      4.0
+    ],
+    [
+      3.0,
+      4.0,
+      5.0,
+      6.0
+    ],
+    [
+      3.0,
+      4.0,
+      6.0,
+      7.0
+    ],
+    [
+      3.0,
+      4.0,
+      7.0,
+      8.0
+    ],
+    [
+      3.0,
+      4.0,
+      9.0,
+      10.0
+    ],
+    [
+      3.0,
+      4.0,
+      11.0,
+      12.0
+    ],
+    [
+      3.0,
+      4.0,
+      13.0,
+      14.0
+    ],
+    [
+      3.0,
+      4.0,
+      14.0,
+      15.0
+    ],
+    [
+      3.0,
+      4.0,
+      15.0,
+      16.0
+    ],
+    [
+      3.0,
+      4.0,
+      17.0,
+      18.0
+    ],
+    [
+      3.0,
+      4.0,
+      18.0,
+      19.0
+    ],
+    [
+      6.0,
+      7.0,
+      1.0,
+      2.0
+    ],
+    [
+      6.0,
+      7.0,
+      2.0,
+      3.0
+    ],
+    [
+      6.0,
+      7.0,
+      3.0,
+      4.0
+    ],
+    [
+      6.0,
+      7.0,
+      5.0,
+      6.0
+    ],
+    [
+      6.0,
+      7.0,
+      6.0,
+      7.0
+    ],
+    [
+      6.0,
+      7.0,
+      7.0,
+      8.0
+    ],
+    [
+      6.0,
+      7.0,
+      9.0,
+      10.0
+    ],
+    [
+      6.0,
+      7.0,
+      11.0,
+      12.0
+    ],
+    [
+      6.0,
+      7.0,
+      13.0,
+      14.0
+    ],
+    [
+      6.0,
+      7.0,
+      14.0,
+      15.0
+    ],
+    [
+      6.0,
+      7.0,
+      15.0,
+      16.0
+    ],
+    [
+      6.0,
+      7.0,
+      17.0,
+      18.0
+    ],
+    [
+      6.0,
+      7.0,
+      18.0,
+      19.0
+    ],
+    [
+      7.0,
+      8.0,
+      1.0,
+      2.0
+    ],
+    [
+      7.0,
+      8.0,
+      2.0,
+      3.0
+    ],
+    [
+      7.0,
+      8.0,
+      3.0,
+      4.0
+    ],
+    [
+      7.0,
+      8.0,
+      5.0,
+      6.0
+    ],
+    [
+      7.0,
+      8.0,
+      6.0,
+      7.0
+    ],
+    [
+      7.0,
+      8.0,
+      7.0,
+      8.0
+    ],
+    [
+      7.0,
+      8.0,
+      9.0,
+      10.0
+    ],
+    [
+      7.0,
+      8.0,
+      11.0,
+      12.0
+    ],
+    [
+      7.0,
+      8.0,
+      13.0,
+      14.0
+    ],
+    [
+      7.0,
+      8.0,
+      14.0,
+      15.0
+    ],
+    [
+      7.0,
+      8.0,
+      15.0,
+      16.0
+    ],
+    [
+      7.0,
+      8.0,
+      17.0,
+      18.0
+    ],
+    [
+      7.0,
+      8.0,
+      18.0,
+      19.0
+    ]
+  ],
+  "traversability_robot_radius_m": 0.35
+}

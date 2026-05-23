@@ -58,7 +58,37 @@ def _material(name: str, color: tuple[float, float, float, float]) -> bpy.types.
     """Create a simple diffuse material."""
     mat = bpy.data.materials.new(name)
     mat.diffuse_color = color
+    if color[3] < 1.0:
+        mat.use_nodes = True
+        shader = mat.node_tree.nodes.get("Principled BSDF")
+        if shader is not None and "Alpha" in shader.inputs:
+            shader.inputs["Alpha"].default_value = color[3]
+        mat.blend_method = "BLEND"
+        if hasattr(mat, "show_transparent_back"):
+            mat.show_transparent_back = True
     return mat
+
+
+def _material_library() -> dict[str, bpy.types.Material]:
+    """Create reusable materials with names understood by the Geant4 exporter."""
+    return {
+        "concrete": _material("ConcreteMaterial", (0.55, 0.58, 0.60, 1.0)),
+        "steel": _material("SteelMaterial", (0.32, 0.34, 0.36, 1.0)),
+        "stainless_steel": _material("StainlessSteelMaterial", (0.52, 0.54, 0.55, 1.0)),
+        "aluminum": _material("AluminumMaterial", (0.72, 0.74, 0.76, 1.0)),
+        "water": _material("WaterMaterial", (0.25, 0.45, 0.85, 0.55)),
+        "air": _material("AirMaterial", (0.88, 0.93, 1.0, 0.15)),
+        "ceiling": _material("TransparentCeilingMaterial", (0.88, 0.93, 1.0, 0.04)),
+    }
+
+
+def _resolve_material(
+    materials: dict[str, bpy.types.Material],
+    material_name: str,
+) -> bpy.types.Material:
+    """Return a known material, falling back to concrete."""
+    key = str(material_name).strip().lower().replace("-", "_").replace(" ", "_")
+    return materials.get(key, materials["concrete"])
 
 
 def _ensure_empty(name: str, *, transport_group: str | None = None) -> bpy.types.Object:
@@ -81,6 +111,7 @@ def _add_cube(
     material: bpy.types.Material,
     parent: bpy.types.Object | None = None,
     transport_group: str | None = None,
+    material_name: str | None = None,
 ) -> bpy.types.Object:
     """Add a cube with the requested dimensions and center."""
     bpy.ops.mesh.primitive_cube_add(size=1.0, location=center_xyz)
@@ -89,7 +120,8 @@ def _add_cube(
     obj.dimensions = size_xyz
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     obj.data.materials.append(material)
-    obj["simbridge_material"] = material.name
+    obj["simbridge_material"] = str(material_name or material.name)
+    obj["simbridge_material_preset"] = str(material_name or material.name)
     if parent is not None:
         obj.parent = parent
     if transport_group not in (None, ""):
@@ -98,56 +130,127 @@ def _add_cube(
     return obj
 
 
-def _author_room(payload: dict, concrete: bpy.types.Material) -> None:
+def _author_room(
+    payload: dict,
+    concrete: bpy.types.Material,
+    ceiling_material: bpy.types.Material,
+) -> None:
     """Create the room shell objects in Blender."""
     size_x, size_y, size_z = (float(value) for value in payload["room_size_xyz"])
-    wall_height = min(3.0, size_z)
+    wall_height = max(0.1, size_z)
     wall_thickness = 0.1
     wall_group = _ensure_empty("Wall", transport_group="wall")
-    _add_cube(
-        "Floor",
-        size_xyz=(size_x, size_y, 0.1),
-        center_xyz=(0.5 * size_x, 0.5 * size_y, -0.05),
-        material=concrete,
-        parent=wall_group,
-        transport_group="wall",
+    _author_room_boundaries(
+        size_x=size_x,
+        size_y=size_y,
+        size_z=size_z,
+        wall_height=wall_height,
+        wall_thickness=wall_thickness,
+        wall_group=wall_group,
+        concrete=concrete,
+        ceiling_material=ceiling_material,
+        include_floor=True,
+        include_walls=True,
     )
-    _add_cube(
-        "NorthWall",
-        size_xyz=(size_x, wall_thickness, wall_height),
-        center_xyz=(0.5 * size_x, size_y + 0.5 * wall_thickness, 0.5 * wall_height),
-        material=concrete,
-        parent=wall_group,
-        transport_group="wall",
+
+
+def _author_imported_room_shell(
+    payload: dict,
+    concrete: bpy.types.Material,
+    ceiling_material: bpy.types.Material,
+) -> None:
+    """Create full-height wall and ceiling boundaries for imported base rooms."""
+    size_x, size_y, size_z = (float(value) for value in payload["room_size_xyz"])
+    wall_height = max(0.1, size_z)
+    wall_thickness = 0.1
+    wall_group = _ensure_empty("Wall", transport_group="wall")
+    _author_room_boundaries(
+        size_x=size_x,
+        size_y=size_y,
+        size_z=size_z,
+        wall_height=wall_height,
+        wall_thickness=wall_thickness,
+        wall_group=wall_group,
+        concrete=concrete,
+        ceiling_material=ceiling_material,
+        include_floor=False,
+        include_walls=True,
     )
+
+
+def _author_room_boundaries(
+    *,
+    size_x: float,
+    size_y: float,
+    size_z: float,
+    wall_height: float,
+    wall_thickness: float,
+    wall_group: bpy.types.Object,
+    concrete: bpy.types.Material,
+    ceiling_material: bpy.types.Material,
+    include_floor: bool,
+    include_walls: bool,
+) -> None:
+    """Create reusable room boundary meshes."""
+    if include_floor:
+        _add_cube(
+            "Floor",
+            size_xyz=(size_x, size_y, 0.1),
+            center_xyz=(0.5 * size_x, 0.5 * size_y, -0.05),
+            material=concrete,
+            parent=wall_group,
+            transport_group="wall",
+        )
+    if include_walls:
+        _add_cube(
+            "NorthWall",
+            size_xyz=(size_x, wall_thickness, wall_height),
+            center_xyz=(0.5 * size_x, size_y + 0.5 * wall_thickness, 0.5 * wall_height),
+            material=concrete,
+            parent=wall_group,
+            transport_group="wall",
+        )
+        _add_cube(
+            "SouthWall",
+            size_xyz=(size_x, wall_thickness, wall_height),
+            center_xyz=(0.5 * size_x, -0.5 * wall_thickness, 0.5 * wall_height),
+            material=concrete,
+            parent=wall_group,
+            transport_group="wall",
+        )
+        _add_cube(
+            "EastWall",
+            size_xyz=(wall_thickness, size_y, wall_height),
+            center_xyz=(size_x + 0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
+            material=concrete,
+            parent=wall_group,
+            transport_group="wall",
+        )
+        _add_cube(
+            "WestWall",
+            size_xyz=(wall_thickness, size_y, wall_height),
+            center_xyz=(-0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
+            material=concrete,
+            parent=wall_group,
+            transport_group="wall",
+        )
     _add_cube(
-        "SouthWall",
-        size_xyz=(size_x, wall_thickness, wall_height),
-        center_xyz=(0.5 * size_x, -0.5 * wall_thickness, 0.5 * wall_height),
-        material=concrete,
+        "Ceiling",
+        size_xyz=(size_x, size_y, wall_thickness),
+        center_xyz=(0.5 * size_x, 0.5 * size_y, size_z + 0.5 * wall_thickness),
+        material=ceiling_material,
         parent=wall_group,
         transport_group="wall",
-    )
-    _add_cube(
-        "EastWall",
-        size_xyz=(wall_thickness, size_y, wall_height),
-        center_xyz=(size_x + 0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
-        material=concrete,
-        parent=wall_group,
-        transport_group="wall",
-    )
-    _add_cube(
-        "WestWall",
-        size_xyz=(wall_thickness, size_y, wall_height),
-        center_xyz=(-0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
-        material=concrete,
-        parent=wall_group,
-        transport_group="wall",
+        material_name="concrete",
     )
 
 
 def _author_obstacles(payload: dict, concrete: bpy.types.Material) -> None:
     """Create obstacle box objects in Blender from blocked grid cells."""
+    materials = _material_library()
+    if payload.get("obstacle_instances"):
+        _author_known_obstacle_instances(payload, materials)
+        return
     origin_x, origin_y = (float(value) for value in payload["obstacle_origin_xy"])
     cell_size = float(payload["obstacle_cell_size_m"])
     height = float(payload.get("obstacle_height_m", 2.0))
@@ -163,7 +266,36 @@ def _author_obstacles(payload: dict, concrete: bpy.types.Material) -> None:
             material=concrete,
             parent=obstacle_group,
             transport_group="obstacle",
+            material_name=str(payload.get("obstacle_material", "concrete")),
         )
+
+
+def _author_known_obstacle_instances(
+    payload: dict,
+    materials: dict[str, bpy.types.Material],
+) -> None:
+    """Create composite known obstacle assets from the manifest."""
+    obstacle_group = _ensure_empty("Obstacles", transport_group="obstacle")
+    for instance_index, instance in enumerate(payload.get("obstacle_instances", [])):
+        instance_name = str(instance.get("name", f"KnownObstacle_{instance_index:04d}"))
+        instance_group = _ensure_empty(instance_name, transport_group="obstacle")
+        instance_group.parent = obstacle_group
+        instance_group["simbridge_template"] = str(instance.get("template", "unknown"))
+        for component_index, component in enumerate(instance.get("components", [])):
+            material_name = str(component.get("material", "concrete"))
+            center = tuple(float(value) for value in component["center_xyz"])
+            size = tuple(float(value) for value in component["size_xyz"])
+            if len(center) != 3 or len(size) != 3:
+                raise ValueError("Known obstacle component center_xyz and size_xyz must be 3D.")
+            _add_cube(
+                str(component.get("name", f"{instance_name}_component_{component_index:02d}")),
+                size_xyz=(size[0], size[1], size[2]),
+                center_xyz=(center[0], center[1], center[2]),
+                material=_resolve_material(materials, material_name),
+                parent=instance_group,
+                transport_group="obstacle",
+                material_name=material_name,
+            )
 
 
 def _export_usd(output_path: Path) -> None:
@@ -269,6 +401,10 @@ def _write_traversability_map(payload: dict) -> None:
         for value in payload.get("traversability_blocking_z_range_m", (0.05, 2.0))
     )
     obstacle_rects: list[tuple[float, float, float, float]] = []
+    for rect in payload.get("traversability_rects_xy", []):
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            raise ValueError("traversability_rects_xy entries must be [x0, x1, y0, y1].")
+        obstacle_rects.append(tuple(float(value) for value in rect))
     for obj in bpy.context.scene.objects:
         bounds = _object_world_bounds(obj)
         if bounds is None:
@@ -316,14 +452,23 @@ def main() -> None:
     payload = _load_manifest(Path(args.input).expanduser().resolve())
     output_path = Path(args.output).expanduser().resolve()
     _clear_scene()
-    concrete = _material("ConcreteMaterial", (0.55, 0.58, 0.60, 1.0))
+    materials = _material_library()
+    concrete = materials["concrete"]
     base_imported = _import_base_usd(payload)
     if not base_imported:
-        _author_room(payload, concrete)
+        _author_room(payload, concrete, concrete)
+    else:
+        _author_imported_room_shell(payload, concrete, concrete)
     _author_obstacles(payload, concrete)
     _write_traversability_map(payload)
     _export_usd(output_path)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

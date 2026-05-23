@@ -1,4 +1,5 @@
 """Render an obstacle layout as a 2D environment image."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

@@ -1,4 +1,5 @@
 """Validate Geant4 spectrum-derived counts against source-equivalent theory."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

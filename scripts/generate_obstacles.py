@@ -1,4 +1,5 @@
 """Generate an obstacle layout JSON without running the PF demo."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -18,7 +19,12 @@ from measurement.obstacles import generate_obstacle_grid
 
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
-    parser = argparse.ArgumentParser(description="Generate an obstacle layout JSON file.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate an obstacle layout JSON file with the standard connected "
+            "exploration backbone."
+        )
+    )
     parser.add_argument(
         "--output",
         type=str,

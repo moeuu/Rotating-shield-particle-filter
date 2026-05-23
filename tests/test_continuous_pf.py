@@ -2,8 +2,11 @@
 
 import numpy as np
 
-from measurement.continuous_kernels import expected_counts_single_isotope, ContinuousKernel
-from pf.likelihood import count_log_likelihood
+from measurement.continuous_kernels import expected_counts_single_isotope
+from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
+from measurement.source_surfaces import is_allowed_source_surface_position
+from pf.likelihood import count_likelihood_variance, count_log_likelihood
 from pf.particle_filter import IsotopeParticleFilter, PFConfig, IsotopeParticle
 from pf.state import IsotopeState
 
@@ -134,6 +137,53 @@ def test_deferred_pair_update_allows_scaled_roughening() -> None:
     assert captured["roughening_scale"] == 0.15
 
 
+def test_surface_position_prior_initializes_and_roughens_on_surfaces() -> None:
+    """Surface source prior should keep PF particles on known source surfaces."""
+    env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((1, 1),),
+    )
+    cfg = PFConfig(
+        num_particles=4,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+        init_grid_spacing_m=1.0,
+        init_grid_repeats=1,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(env.size_x, env.size_y, env.size_z),
+        source_position_prior="surface",
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+
+    pf = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=dummy_kernel,
+        config=cfg,
+        obstacle_grid=grid,
+        obstacle_height_m=1.0,
+    )
+    pf.regularize_continuous(
+        sigma_pos=np.array([0.2, 0.2, 0.2]),
+        strength_log_sigma=0.0,
+    )
+
+    assert pf.continuous_particles
+    for particle in pf.continuous_particles:
+        for position in particle.state.positions:
+            assert is_allowed_source_surface_position(
+                position,
+                env,
+                grid,
+                obstacle_height_m=1.0,
+            )
+
+
 def test_student_t_count_likelihood_softens_model_mismatch() -> None:
     """Robust count likelihood should not over-trust a simplified transport kernel."""
     z_obs = np.array([100.0], dtype=float)
@@ -202,6 +252,65 @@ def test_observation_count_variance_softens_spectrum_unfolding_update() -> None:
         model="student_t",
         observation_count_variance=400.0,
         student_t_df=5.0,
+    )
+
+    assert uncertain_gap > 0.0
+    assert uncertain_gap < certain_gap
+
+
+def test_low_count_variance_floor_decays_for_informative_counts() -> None:
+    """Low-count uncertainty should protect weak spectra without weakening high counts."""
+    z_obs = np.array([5.0, 5000.0], dtype=float)
+    lambda_obs = np.array([4.0, 5100.0], dtype=float)
+
+    base_variance = count_likelihood_variance(z_obs, lambda_obs)
+    robust_variance = count_likelihood_variance(
+        z_obs,
+        lambda_obs,
+        transport_model_abs_sigma=10.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+    )
+
+    assert robust_variance[0] - base_variance[0] > 300.0
+    assert robust_variance[1] - base_variance[1] < 110.0
+
+
+def test_transport_absolute_floor_softens_low_count_model_mismatch() -> None:
+    """Absolute transport mismatch should prevent low counts from over-pruning particles."""
+    z_obs = np.array([8.0], dtype=float)
+    lambda_good = np.array([8.0], dtype=float)
+    lambda_mismatch = np.array([20.0], dtype=float)
+
+    certain_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="student_t",
+        transport_model_abs_sigma=0.0,
+        student_t_df=3.0,
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="student_t",
+        transport_model_abs_sigma=0.0,
+        student_t_df=3.0,
+    )
+    uncertain_gap = count_log_likelihood(
+        z_obs,
+        lambda_good,
+        model="student_t",
+        transport_model_abs_sigma=10.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        student_t_df=3.0,
+    ) - count_log_likelihood(
+        z_obs,
+        lambda_mismatch,
+        model="student_t",
+        transport_model_abs_sigma=10.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        student_t_df=3.0,
     )
 
     assert uncertain_gap > 0.0

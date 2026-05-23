@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
+
+EXPLORATION_BACKBONE_MAX_GAP_CELLS = 4
+
+
+def _normalize_isotope_key(value: str) -> str:
+    """Return a normalized isotope key for attenuation table lookup."""
+    return "".join(ch for ch in str(value).upper() if ch.isalnum())
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,8 @@ class ObstacleGrid:
     cell_size: float
     grid_shape: tuple[int, int]
     blocked_cells: tuple[tuple[int, int], ...]
+    transport_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    transport_mu_by_isotope: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize inputs and validate bounds."""
@@ -40,10 +49,29 @@ class ObstacleGrid:
                 raise ValueError("blocked_cells indices must be non-negative.")
             if cell[0] >= grid_shape[0] or cell[1] >= grid_shape[1]:
                 raise ValueError("blocked_cells entry out of grid bounds.")
+        transport_boxes = tuple(
+            tuple(float(value) for value in box)
+            for box in self.transport_boxes_m
+        )
+        for box in transport_boxes:
+            if len(box) != 6:
+                raise ValueError("transport_boxes_m entries must have six values.")
+            if box[3] < box[0] or box[4] < box[1] or box[5] < box[2]:
+                raise ValueError("transport_boxes_m entries must be ordered lower-to-upper.")
+        transport_mu: dict[str, tuple[float, ...]] = {}
+        for isotope, values in self.transport_mu_by_isotope.items():
+            mu_values = tuple(float(value) for value in values)
+            if len(mu_values) != len(transport_boxes):
+                raise ValueError(
+                    "transport_mu_by_isotope entries must match transport_boxes_m length."
+                )
+            transport_mu[str(isotope)] = mu_values
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "cell_size", cell_size)
         object.__setattr__(self, "grid_shape", grid_shape)
         object.__setattr__(self, "blocked_cells", blocked)
+        object.__setattr__(self, "transport_boxes_m", transport_boxes)
+        object.__setattr__(self, "transport_mu_by_isotope", transport_mu)
         object.__setattr__(self, "_blocked_set", frozenset(blocked))
 
     @property
@@ -144,6 +172,46 @@ class ObstacleGrid:
             boxes.append((x0, y0, z_min, x1, y1, z_max))
         return boxes
 
+    @property
+    def has_transport_model(self) -> bool:
+        """Return True when known transport components are attached."""
+        return bool(self.transport_boxes_m)
+
+    def transport_boxes(self) -> list[tuple[float, float, float, float, float, float]]:
+        """Return known obstacle transport boxes in meters."""
+        return [tuple(box) for box in self.transport_boxes_m]
+
+    def transport_mu_values(self, isotope: str) -> tuple[float, ...] | None:
+        """Return per-transport-box attenuation coefficients for an isotope."""
+        if not self.transport_mu_by_isotope:
+            return None
+        if isotope in self.transport_mu_by_isotope:
+            return self.transport_mu_by_isotope[isotope]
+        normalized = {
+            _normalize_isotope_key(key): values
+            for key, values in self.transport_mu_by_isotope.items()
+        }
+        return normalized.get(_normalize_isotope_key(isotope))
+
+    def with_transport_model(
+        self,
+        *,
+        boxes_m: Iterable[Sequence[float]],
+        mu_by_isotope: dict[str, Sequence[float]],
+    ) -> "ObstacleGrid":
+        """Return a copy with known obstacle transport components attached."""
+        return ObstacleGrid(
+            origin=self.origin,
+            cell_size=self.cell_size,
+            grid_shape=self.grid_shape,
+            blocked_cells=self.blocked_cells,
+            transport_boxes_m=tuple(tuple(float(value) for value in box) for box in boxes_m),
+            transport_mu_by_isotope={
+                str(isotope): tuple(float(value) for value in values)
+                for isotope, values in mu_by_isotope.items()
+            },
+        )
+
     def blocked_polygons(
         self, z: float = 0.0
     ) -> list[list[tuple[float, float, float]]]:
@@ -162,6 +230,11 @@ class ObstacleGrid:
             "grid_shape": [self.grid_shape[0], self.grid_shape[1]],
             "blocked_cells": [list(cell) for cell in self.blocked_cells],
             "blocked_fraction": self.blocked_fraction,
+            "transport_boxes_m": [list(box) for box in self.transport_boxes_m],
+            "transport_mu_by_isotope": {
+                isotope: [float(value) for value in values]
+                for isotope, values in sorted(self.transport_mu_by_isotope.items())
+            },
         }
 
     def save(self, path: Path) -> None:
@@ -179,15 +252,29 @@ class ObstacleGrid:
         cell_size = data.get("cell_size", 1.0)
         grid_shape = data.get("grid_shape")
         blocked_cells = data.get("blocked_cells", [])
+        transport_boxes = data.get("transport_boxes_m", [])
+        transport_mu_by_isotope = data.get("transport_mu_by_isotope", {})
         if grid_shape is None:
             raise ValueError("Obstacle layout missing 'grid_shape'.")
         if not isinstance(blocked_cells, list):
             raise ValueError("blocked_cells must be a list.")
+        if not isinstance(transport_boxes, list):
+            raise ValueError("transport_boxes_m must be a list.")
+        if not isinstance(transport_mu_by_isotope, dict):
+            raise ValueError("transport_mu_by_isotope must be a dict.")
         return cls(
             origin=(float(origin[0]), float(origin[1])),
             cell_size=float(cell_size),
             grid_shape=(int(grid_shape[0]), int(grid_shape[1])),
             blocked_cells=tuple((int(cell[0]), int(cell[1])) for cell in blocked_cells),
+            transport_boxes_m=tuple(
+                tuple(float(value) for value in box)
+                for box in transport_boxes
+            ),
+            transport_mu_by_isotope={
+                str(isotope): tuple(float(value) for value in values)
+                for isotope, values in transport_mu_by_isotope.items()
+            },
         )
 
     @classmethod
@@ -307,6 +394,71 @@ def _expand_cells(
     return expanded
 
 
+def _coverage_line_indices(cell_count: int) -> list[int]:
+    """Return grid-line indices that keep coverage gaps bounded."""
+    count = int(cell_count)
+    if count <= 0:
+        return []
+    if count <= 2:
+        return list(range(count))
+    indices = list(range(0, count, EXPLORATION_BACKBONE_MAX_GAP_CELLS))
+    midpoint = count // 2
+    if midpoint not in indices:
+        indices.append(midpoint)
+    if indices[-1] != count - 1:
+        indices.append(count - 1)
+    return sorted(set(indices))
+
+
+def _manhattan_cells_between(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Return a deterministic 4-connected path between two grid cells."""
+    x, y = int(start[0]), int(start[1])
+    gx, gy = int(goal[0]), int(goal[1])
+    cells = [(x, y)]
+    while x != gx:
+        x += 1 if gx > x else -1
+        cells.append((x, y))
+    while y != gy:
+        y += 1 if gy > y else -1
+        cells.append((x, y))
+    return cells
+
+
+def _exploration_backbone_cells(
+    *,
+    grid_shape: tuple[int, int],
+    keep_free_cells: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Return a connected sparse grid backbone for whole-environment traversal."""
+    nx, ny = grid_shape
+    if nx <= 0 or ny <= 0:
+        return set()
+    xs = _coverage_line_indices(nx)
+    ys = _coverage_line_indices(ny)
+    backbone: set[tuple[int, int]] = set()
+    for ix in xs:
+        for iy in range(ny):
+            backbone.add((ix, iy))
+    for iy in ys:
+        for ix in range(nx):
+            backbone.add((ix, iy))
+    anchor = sorted(backbone)[0]
+    for cell in keep_free_cells:
+        if 0 <= cell[0] < nx and 0 <= cell[1] < ny:
+            nearest = min(
+                backbone,
+                key=lambda candidate: abs(candidate[0] - cell[0])
+                + abs(candidate[1] - cell[1]),
+            )
+            backbone.update(_manhattan_cells_between(cell, nearest))
+            backbone.add(cell)
+    backbone.update(_manhattan_cells_between((0, 0), anchor))
+    return backbone
+
+
 def _passage_cells_from_points(
     points: Iterable[Sequence[float]],
     *,
@@ -368,18 +520,22 @@ def generate_obstacle_grid(
             idx = _point_to_cell_index(pt, origin, cell_size, (nx, ny))
             if idx is not None:
                 keep_free_cells.add(idx)
-    reserved_cells = set(keep_free_cells)
-    if passage_width_m > 0.0 or passage_points is not None:
-        width_cells = max(1, int(np.ceil(max(float(passage_width_m), cell_size) / cell_size)))
+    width_cells = max(
+        1,
+        int(np.ceil(max(float(passage_width_m), cell_size) / cell_size)),
+    )
+    reserved_cells = _expand_cells(
+        _exploration_backbone_cells(
+            grid_shape=(nx, ny),
+            keep_free_cells=keep_free_cells,
+        ),
+        width_cells=width_cells,
+        grid_shape=(nx, ny),
+    )
+    reserved_cells.update(keep_free_cells)
+    if passage_points is not None:
         waypoints = (
             list(passage_points)
-            if passage_points is not None
-            else _default_passage_points(
-                keep_free_cells=keep_free_cells,
-                origin=origin,
-                cell_size=cell_size,
-                grid_shape=(nx, ny),
-            )
         )
         reserved_cells.update(
             _passage_cells_from_points(

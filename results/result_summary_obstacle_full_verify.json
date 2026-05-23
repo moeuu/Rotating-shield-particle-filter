@@ -1,0 +1,334 @@
+{
+  "backend": "geant4",
+  "environment_mode": "fixed",
+  "estimated_sources": {
+    "Co-60": [
+      {
+        "pos": [
+          4.366922946495145,
+          13.52419058594339,
+          3.4355810408144496
+        ],
+        "strength": 300000.0
+      }
+    ],
+    "Cs-137": [
+      {
+        "pos": [
+          4.410222827832109,
+          13.270107186686207,
+          3.453982121685783
+        ],
+        "strength": 300000.0
+      }
+    ],
+    "Eu-154": [
+      {
+        "pos": [
+          6.708404924024973,
+          5.036005914963715,
+          3.8045662894430166
+        ],
+        "strength": 46635.90995310598
+      }
+    ]
+  },
+  "ground_truth_sources": {
+    "Co-60": [
+      {
+        "pos": [
+          2.0,
+          15.0,
+          7.0
+        ],
+        "strength": 20000.0
+      }
+    ],
+    "Cs-137": [
+      {
+        "pos": [
+          5.0,
+          10.0,
+          5.0
+        ],
+        "strength": 50000.0
+      }
+    ],
+    "Eu-154": [
+      {
+        "pos": [
+          7.0,
+          5.0,
+          3.0
+        ],
+        "strength": 30000.0
+      }
+    ]
+  },
+  "last_counts": {
+    "Co-60": 0.8969423064844144,
+    "Cs-137": 302.77975491789755,
+    "Eu-154": 0.283838774143372
+  },
+  "match_metrics": {
+    "isotopes": {
+      "Co-60": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 280000.0,
+          "mean": 280000.0,
+          "median": 280000.0
+        },
+        "intensity_rel_error_pct": {
+          "max": 1400.0,
+          "mean": 1400.0,
+          "median": 1400.0
+        },
+        "matches": [
+          {
+            "abs_err": 280000.0,
+            "distance": 4.526082210683405,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 300000.0,
+            "q_true": 20000.0,
+            "rel_err_pct": 1400.0,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 4.526082210683405,
+          "mean": 4.526082210683405,
+          "median": 4.526082210683405,
+          "rmse": 4.526082210683405,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Cs-137": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 250000.0,
+          "mean": 250000.0,
+          "median": 250000.0
+        },
+        "intensity_rel_error_pct": {
+          "max": 500.0,
+          "mean": 500.0,
+          "median": 500.0
+        },
+        "matches": [
+          {
+            "abs_err": 250000.0,
+            "distance": 3.6649160161311105,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 300000.0,
+            "q_true": 50000.0,
+            "rel_err_pct": 500.0,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 3.6649160161311105,
+          "mean": 3.6649160161311105,
+          "median": 3.6649160161311105,
+          "rmse": 3.6649160161311105,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      },
+      "Eu-154": {
+        "counts": {
+          "assigned": 1,
+          "est": 1,
+          "fn": 0,
+          "fp": 0,
+          "gt": 1,
+          "matched": 1
+        },
+        "intensity_abs_error": {
+          "max": 16635.909953105976,
+          "mean": 16635.909953105976,
+          "median": 16635.909953105976
+        },
+        "intensity_rel_error_pct": {
+          "max": 55.45303317701992,
+          "mean": 55.45303317701992,
+          "median": 55.45303317701992
+        },
+        "matches": [
+          {
+            "abs_err": 16635.909953105976,
+            "distance": 0.8565343124203257,
+            "est_index": 0,
+            "gt_index": 0,
+            "q_hat": 46635.90995310598,
+            "q_true": 30000.0,
+            "rel_err_pct": 55.45303317701992,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 0.8565343124203257,
+          "mean": 0.8565343124203257,
+          "median": 0.8565343124203257,
+          "rmse": 0.8565343124203257,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      }
+    },
+    "match_radius_m": 0.5
+  },
+  "measurements_completed": 80,
+  "mission_metrics": {
+    "adaptive_dwell_chunk_s": 2.0,
+    "adaptive_dwell_enabled": true,
+    "adaptive_min_dwell_s": 2.0,
+    "adaptive_ready_min_counts": 100.0,
+    "adaptive_ready_min_isotopes": 1,
+    "adaptive_ready_min_snr": 0.0,
+    "dss_beam_width": 8,
+    "dss_differential_weight": 1.0,
+    "dss_horizon": 2,
+    "dss_program_length": 8,
+    "dss_rotation_weight": 0.15,
+    "dss_signature_weight": 1.0,
+    "estimated_end_to_end_time_s": 1579.5560787363606,
+    "estimated_motion_time_s": 157.55607873636052,
+    "estimated_rotation_time_s": 40.0,
+    "ig_compute_time_s": 44.49804727706942,
+    "max_live_time_s": 30.0,
+    "max_orientation_selection_time_s": 1.6984609889914282,
+    "max_pf_update_time_s": 4.907277865000651,
+    "mean_live_time_s": 17.275,
+    "mean_orientation_selection_time_s": 0.5562255909633678,
+    "mean_pf_update_time_s": 0.3993015030939205,
+    "measurement_live_times_s": [
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      10.0,
+      24.0,
+      14.0,
+      10.0,
+      8.0,
+      6.0,
+      10.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0,
+      4.0,
+      4.0,
+      4.0,
+      2.0,
+      2.0,
+      2.0,
+      2.0
+    ],
+    "measurement_time_cap_s": 30.0,
+    "min_live_time_s": 2.0,
+    "nominal_motion_speed_m_s": 0.5,
+    "num_motion_segments": 9,
+    "path_planner": "dss_pp",
+    "pf_compute_time_s": 63.888240495027276,
+    "prune_time_s": 47.02250679995632,
+    "rotation_overhead_s_per_measurement": 0.5,
+    "total_compute_time_s": 270.02999208998517,
+    "total_live_time_s": 1382.0,
+    "total_measurements": 80,
+    "total_mission_time_s": 1579.5560787363606,
+    "total_motion_distance_m": 78.77803936818026,
+    "total_move_measure_time_s": 1579.5560787363606,
+    "total_shield_actuation_time_s": 40.0,
+    "total_travel_time_s": 157.55607873636052,
+    "viz_time_s": 114.62119751793216,
+    "wall_clock_runtime_s": 866.5128628430102
+  },
+  "output_paths": {
+    "cui_pf_3d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_pf_3d.png",
+    "cui_robot_2d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_robot_2d.png",
+    "cui_split_view": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/index.html",
+    "estimates_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_estimates_obstacle_full_verify.png",
+    "last_spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_last_obstacle_full_verify.png",
+    "pf_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_pf_obstacle_full_verify.png",
+    "spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_obstacle_full_verify.png",
+    "summary_json": "/home/moeu/research/Rotating-shield-particle-filter/results/result_summary_obstacle_full_verify.json"
+  },
+  "sim_config_path": "/home/moeu/research/Rotating-shield-particle-filter/configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+}

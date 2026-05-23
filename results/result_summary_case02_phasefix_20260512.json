@@ -1,0 +1,501 @@
+{
+  "backend": "geant4",
+  "environment_mode": "fixed",
+  "estimated_sources": {
+    "Cs-137": [
+      {
+        "pos": [
+          2.503594231091968,
+          5.349621823757385,
+          5.757084359057499
+        ],
+        "strength": 253887.15539087672
+      },
+      {
+        "pos": [
+          2.2055733280263095,
+          2.920625617293251,
+          1.0619069672715058
+        ],
+        "strength": 15148.466229841248
+      }
+    ]
+  },
+  "final_absent_isotope_diagnostics": {
+    "Co-60": {
+      "count_supported": false,
+      "kept": false,
+      "max_counts": 0.0,
+      "max_strength": 0.0,
+      "observed_measurements": 0,
+      "pf_supported": false,
+      "reason": "no_final_pf_support",
+      "source_count": 0,
+      "support_measurements": 0,
+      "total_counts": 0.0
+    },
+    "Cs-137": {
+      "count_supported": true,
+      "kept": true,
+      "max_counts": 107281.69579578484,
+      "max_strength": 253887.15539087672,
+      "observed_measurements": 96,
+      "pf_supported": true,
+      "reason": "kept",
+      "source_count": 2,
+      "support_measurements": 96,
+      "total_counts": 1869910.5019326988
+    },
+    "Eu-154": {
+      "count_supported": false,
+      "kept": false,
+      "max_counts": 0.0,
+      "max_strength": 0.0,
+      "observed_measurements": 0,
+      "pf_supported": false,
+      "reason": "no_final_pf_support",
+      "source_count": 0,
+      "support_measurements": 0,
+      "total_counts": 0.0
+    }
+  },
+  "final_estimate_diagnostics": {
+    "report_model_order": {
+      "Cs-137": {
+        "background_ll": -1193.7106340036062,
+        "best_by_k": {
+          "0": {
+            "condition_number": 1.0,
+            "criterion": -1193.7106340036062,
+            "indices": [],
+            "ll": -1193.7106340036062
+          },
+          "1": {
+            "condition_number": 1.0,
+            "criterion": -941.8244347921526,
+            "indices": [
+              0
+            ],
+            "ll": -932.6957384092169
+          },
+          "2": {
+            "condition_number": 2.7715196920997713,
+            "criterion": -947.6692456144692,
+            "indices": [
+              0,
+              2
+            ],
+            "ll": -929.4118528485978
+          },
+          "3": {
+            "condition_number": 3.363342284372049,
+            "criterion": -956.8193572772894,
+            "indices": [
+              0,
+              1,
+              2
+            ],
+            "ll": -929.4332681284824
+          }
+        },
+        "best_criterion": -941.8244347921526,
+        "best_ll": -932.6957384092169,
+        "candidate_count": 3,
+        "condition_number": 1.0,
+        "criterion_margin_to_simpler": 251.88619921145357,
+        "evaluated_subsets": 8,
+        "evaluation_mode": "serial",
+        "method": "exhaustive_bic",
+        "model_order_overridden": true,
+        "model_order_ready": false,
+        "model_selected_count": 1,
+        "model_selected_indices": [
+          0
+        ],
+        "preserve_cardinality": true,
+        "reported_count_after_preserve": 3,
+        "selected_count": 3,
+        "selected_indices": [
+          0,
+          1,
+          2
+        ],
+        "workers": 1
+      }
+    },
+    "stages": {
+      "final_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              2.503594231091968,
+              5.349621823757385,
+              5.757084359057499
+            ],
+            "strength": 253887.15539087672
+          },
+          {
+            "pos": [
+              2.2055733280263095,
+              2.920625617293251,
+              1.0619069672715058
+            ],
+            "strength": 15148.466229841248
+          }
+        ]
+      },
+      "final_estimates_before_absent_filter": {
+        "Co-60": [],
+        "Cs-137": [
+          {
+            "pos": [
+              2.503594231091968,
+              5.349621823757385,
+              5.757084359057499
+            ],
+            "strength": 253887.15539087672
+          },
+          {
+            "pos": [
+              2.2055733280263095,
+              2.920625617293251,
+              1.0619069672715058
+            ],
+            "strength": 15148.466229841248
+          }
+        ],
+        "Eu-154": []
+      },
+      "legacy_pruned_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              2.503594231091968,
+              5.349621823757385,
+              5.757084359057499
+            ],
+            "strength": 253887.15539087672
+          },
+          {
+            "pos": [
+              5.71954470094193,
+              1.5463017153601877,
+              3.7410391197628092
+            ],
+            "strength": 253.1392383068038
+          },
+          {
+            "pos": [
+              2.2055733280263095,
+              2.920625617293251,
+              1.0619069672715058
+            ],
+            "strength": 15148.466229841248
+          }
+        ]
+      },
+      "llr_pruned_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              2.503594231091968,
+              5.349621823757385,
+              5.757084359057499
+            ],
+            "strength": 253887.15539087672
+          },
+          {
+            "pos": [
+              5.71954470094193,
+              1.5463017153601877,
+              3.7410391197628092
+            ],
+            "strength": 253.1392383068038
+          },
+          {
+            "pos": [
+              2.2055733280263095,
+              2.920625617293251,
+              1.0619069672715058
+            ],
+            "strength": 15148.466229841248
+          }
+        ]
+      },
+      "raw_estimates": {
+        "Co-60": [],
+        "Cs-137": [
+          {
+            "pos": [
+              2.503594231091968,
+              5.349621823757385,
+              5.757084359057499
+            ],
+            "strength": 253887.15539087672
+          },
+          {
+            "pos": [
+              5.71954470094193,
+              1.5463017153601877,
+              3.7410391197628092
+            ],
+            "strength": 253.1392383068038
+          },
+          {
+            "pos": [
+              2.2055733280263095,
+              2.920625617293251,
+              1.0619069672715058
+            ],
+            "strength": 15148.466229841248
+          }
+        ],
+        "Eu-154": []
+      }
+    }
+  },
+  "ground_truth_sources": {
+    "Cs-137": [
+      {
+        "pos": [
+          1.8,
+          4.2,
+          1.1
+        ],
+        "strength": 52000.0
+      },
+      {
+        "pos": [
+          7.9,
+          6.0,
+          5.6
+        ],
+        "strength": 67000.0
+      },
+      {
+        "pos": [
+          3.1,
+          16.1,
+          8.4
+        ],
+        "strength": 45000.0
+      }
+    ]
+  },
+  "last_counts": {
+    "Co-60": 0.5359597756744514,
+    "Cs-137": 14558.167408614285,
+    "Eu-154": 2.7767095378804307
+  },
+  "match_metrics": {
+    "isotopes": {
+      "Cs-137": {
+        "counts": {
+          "assigned": 2,
+          "est": 2,
+          "fn": 1,
+          "fp": 0,
+          "gt": 3,
+          "matched": 2
+        },
+        "intensity_abs_error": {
+          "max": 186887.15539087672,
+          "mean": 111869.34458051773,
+          "median": 111869.34458051773
+        },
+        "intensity_rel_error_pct": {
+          "max": 278.93605282220403,
+          "mean": 174.90219349779312,
+          "median": 174.90219349779312
+        },
+        "matches": [
+          {
+            "abs_err": 36851.533770158756,
+            "distance": 1.3426613924124973,
+            "est_index": 1,
+            "gt_index": 0,
+            "q_hat": 15148.466229841248,
+            "q_true": 52000.0,
+            "rel_err_pct": 70.86833417338222,
+            "within_radius": false
+          },
+          {
+            "abs_err": 186887.15539087672,
+            "distance": 5.437725856522841,
+            "est_index": 0,
+            "gt_index": 1,
+            "q_hat": 253887.15539087672,
+            "q_true": 67000.0,
+            "rel_err_pct": 278.93605282220403,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 5.437725856522841,
+          "mean": 3.3901936244676687,
+          "median": 3.3901936244676687,
+          "rmse": 3.960530400424426,
+          "target_m": 0.5,
+          "within_target": false
+        }
+      }
+    },
+    "match_radius_m": 0.5
+  },
+  "measurements_completed": 96,
+  "mission_metrics": {
+    "adaptive_dwell_chunk_s": 2.0,
+    "adaptive_dwell_enabled": true,
+    "adaptive_min_dwell_s": 2.0,
+    "adaptive_ready_min_counts": 100.0,
+    "adaptive_ready_min_isotopes": 1,
+    "adaptive_ready_min_snr": 0.0,
+    "display_prune_time_s": 1.6677300110459328,
+    "dss_beam_width": 8,
+    "dss_differential_weight": 1.0,
+    "dss_environment_signature_weight": 0.75,
+    "dss_horizon": 2,
+    "dss_occlusion_boundary_weight": 1.5,
+    "dss_program_length": 8,
+    "dss_rotation_weight": 0.15,
+    "dss_signature_weight": 1.0,
+    "estimated_end_to_end_time_s": 896.9857670769701,
+    "estimated_motion_time_s": 86.98576707697008,
+    "estimated_rotation_time_s": 48.0,
+    "final_absent_isotope_filter": true,
+    "ig_compute_time_s": 0.2843925220076926,
+    "max_live_time_s": 8.0,
+    "max_orientation_selection_time_s": 0.07551175000844523,
+    "max_pf_update_time_s": 48.41237176787399,
+    "mean_live_time_s": 7.9375,
+    "mean_orientation_selection_time_s": 0.035549065250961576,
+    "mean_pf_update_time_s": 15.282333394168441,
+    "measurement_live_times_s": [
+      2.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0,
+      8.0
+    ],
+    "measurement_time_cap_s": 30.0,
+    "min_live_time_s": 2.0,
+    "nominal_motion_speed_m_s": 0.5,
+    "num_motion_segments": 7,
+    "path_planner": "dss_pp",
+    "pf_compute_time_s": 2934.208011680341,
+    "prune_time_s": 1.6677300110459328,
+    "rotation_overhead_s_per_measurement": 0.5,
+    "total_compute_time_s": 2941.8271999133867,
+    "total_live_time_s": 762.0,
+    "total_measurements": 96,
+    "total_mission_time_s": 896.9857670769701,
+    "total_motion_distance_m": 43.49288353848504,
+    "total_move_measure_time_s": 896.9857670769701,
+    "total_shield_actuation_time_s": 48.0,
+    "total_travel_time_s": 86.98576707697008,
+    "viz_time_s": 5.667065699992236,
+    "wall_clock_runtime_s": 3016.6329396039946
+  },
+  "output_paths": {
+    "cui_pf_3d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_pf_3d.png",
+    "cui_robot_2d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_robot_2d.png",
+    "cui_split_view": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/index.html",
+    "estimates_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_estimates_case02_phasefix_20260512.png",
+    "last_spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_last_case02_phasefix_20260512.png",
+    "pf_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_pf_case02_phasefix_20260512.png",
+    "spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_case02_phasefix_20260512.png",
+    "summary_json": "/home/moeu/research/Rotating-shield-particle-filter/results/result_summary_case02_phasefix_20260512.json"
+  },
+  "sim_config_path": "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+}

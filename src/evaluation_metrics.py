@@ -259,7 +259,6 @@ def _format_value(value: float | None) -> str:
 
 def print_metrics_report(metrics: Dict[str, Any]) -> None:
     """Print a human-readable metrics report."""
-    match_radius = metrics.get("match_radius_m", None)
     isotopes = metrics.get("isotopes", {})
     print("=== Evaluation Metrics (PF Final) ===")
     for iso in sorted(isotopes.keys()):

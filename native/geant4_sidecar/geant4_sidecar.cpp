@@ -998,6 +998,9 @@ public:
         }
         UpdatePhysicalPose(fe_shield_physical_, request.fe_pose);
         UpdatePhysicalPose(pb_shield_physical_, request.pb_pose);
+        if (auto* run_manager = G4RunManager::GetRunManager()) {
+            run_manager->GeometryHasBeenModified();
+        }
     }
 
     void ConstructSDandField() override {

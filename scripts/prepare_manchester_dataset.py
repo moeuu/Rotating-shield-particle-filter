@@ -1,4 +1,5 @@
 """Download and convert Manchester nuclear environment assets for Isaac Sim."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

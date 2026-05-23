@@ -1,6 +1,5 @@
 """チューニング関連のヘルパーの動作確認。"""
 
-import numpy as np
 
 from spectrum.tuning import get_best_parameters, simulate_reference_spectrum, evaluate_spectrum_quality
 

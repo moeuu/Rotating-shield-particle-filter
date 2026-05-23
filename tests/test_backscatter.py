@@ -4,7 +4,6 @@ import numpy as np
 
 from spectrum.library import Nuclide, NuclideLine
 from spectrum.response_matrix import (
-    BACKSCATTER_FRACTION,
     backscatter_energy,
     build_response_matrix,
     energy_dependent_efficiency,

@@ -37,6 +37,30 @@ def test_codex_instructions_define_simulation_fidelity_guardrails() -> None:
     assert "Allowed Performance Work" in policy_text
 
 
+def test_codex_instructions_require_parallel_first_heavy_runtime_work() -> None:
+    """Codex project instructions should require parallel-first heavy code."""
+    root = Path(__file__).resolve().parents[1]
+    agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
+    parallel_policy = (root / "docs" / "compute_parallelism_policy.md").read_text(
+        encoding="utf-8"
+    )
+    fidelity_policy = (root / "docs" / "simulation_fidelity_policy.md").read_text(
+        encoding="utf-8"
+    )
+    combined = " ".join((agents_text + "\n" + parallel_policy).split())
+    required_phrases = (
+        "Compute parallelism policy",
+        "batched, GPU, Geant4-threaded, or process-parallel",
+        "Do not add scalar Python runtime loops over particles",
+        "Parallelization must preserve the same physics",
+        "serial-vs-parallel equivalence test",
+    )
+
+    for phrase in required_phrases:
+        assert phrase in combined
+    assert "docs/compute_parallelism_policy.md" in fidelity_policy
+
+
 def test_demo_entrypoints_do_not_expose_expected_count_bypasses() -> None:
     """Demo entrypoints should feed PF updates from spectra, not expected counts."""
     root = Path(__file__).resolve().parents[1]

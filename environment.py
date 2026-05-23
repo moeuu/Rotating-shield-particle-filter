@@ -1,4 +1,5 @@
 """Render a 3D room with obstacle cells on the floor for documentation figures."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

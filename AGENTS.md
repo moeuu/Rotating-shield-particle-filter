@@ -21,6 +21,26 @@
 - After changing code, always run `pytest` and ensure tests pass.
 
 
+## Compute parallelism policy
+
+- Before adding PF, planning, spectrum-processing, obstacle-attenuation, or
+  Geant4 orchestration features, read `docs/compute_parallelism_policy.md`.
+- Implement compute-heavy features in a batched, GPU, Geant4-threaded, or
+  process-parallel form from the first version when the operation spans PF
+  particles, source slots, candidate locations, shield postures, spectrum bins,
+  response-matrix columns, or obstacle components.
+- Do not add scalar Python runtime loops over particles, candidates, source
+  slots, orientations, or obstacle components and leave them for later
+  parallelization. A scalar version may exist only as a small deterministic test
+  oracle or explicit debug fallback.
+- Parallelization must preserve the same physics, geometry, likelihood,
+  source-rate semantics, and statistical meaning. It may only change execution
+  schedule and wall time.
+- Every new batched/parallel runtime path must include a serial-vs-parallel
+  equivalence test, or a test proving that the standard runtime selects the
+  batched/parallel path.
+
+
 ## Simulation fidelity policy
 
 - Runtime simulation fidelity must take priority over speed shortcuts.
@@ -60,3 +80,6 @@
   legacy comparison, keep it out of runtime simulation defaults, name it
   explicitly as approximate, and add tests that prevent it from being selected
   by `main.py` runtime modes.
+- When starting a simulation that exposes a CUI/split-view progress URL, relay
+  that URL in the chat immediately. Do not require the user to inspect terminal
+  logs to find the progress view.

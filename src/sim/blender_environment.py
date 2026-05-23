@@ -10,6 +10,13 @@ import subprocess
 from typing import Any
 
 from measurement.obstacles import ObstacleGrid
+from measurement.obstacle_assets import (
+    KnownObstacleInstance,
+    generate_manchester_obstacle_instances,
+    known_obstacle_transport_model,
+    known_obstacle_traversability_rects,
+    obstacle_instances_to_dicts,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BLENDER_SCRIPT = ROOT / "scripts" / "generate_blender_environment.py"
@@ -38,6 +45,7 @@ def write_blender_environment_manifest(
     room_size_xyz: tuple[float, float, float],
     obstacle_height_m: float,
     obstacle_material: str,
+    obstacle_instances: tuple[KnownObstacleInstance, ...] | None = None,
     base_usd_path: Path | None = None,
     traversability_output_path: Path | None = None,
     robot_radius_m: float = 0.35,
@@ -54,6 +62,11 @@ def write_blender_environment_manifest(
         "obstacle_height_m": float(obstacle_height_m),
         "obstacle_material": str(obstacle_material),
     }
+    if obstacle_instances is not None:
+        payload["obstacle_instances"] = obstacle_instances_to_dicts(obstacle_instances)
+        payload["traversability_rects_xy"] = [
+            list(rect) for rect in known_obstacle_traversability_rects(obstacle_instances)
+        ]
     if base_usd_path is not None:
         payload["base_usd_path"] = base_usd_path.expanduser().resolve().as_posix()
     if traversability_output_path is not None:
@@ -84,6 +97,8 @@ def generate_blender_environment_usd(
     room_size_xyz: tuple[float, float, float],
     obstacle_height_m: float = 2.0,
     obstacle_material: str = "concrete",
+    obstacle_instances: tuple[KnownObstacleInstance, ...] | None = None,
+    obstacle_asset_seed: int | None = None,
     base_usd_path: Path | None = None,
     traversability_output_path: Path | None = None,
     robot_radius_m: float = 0.35,
@@ -96,12 +111,20 @@ def generate_blender_environment_usd(
     """Generate a USD environment file by running Blender in background mode."""
     output_path = output_path.expanduser().resolve()
     manifest_path = output_path.with_suffix(".manifest.json")
+    if obstacle_instances is None:
+        obstacle_instances = generate_manchester_obstacle_instances(
+            grid,
+            room_size_xyz=room_size_xyz,
+            obstacle_height_m=float(obstacle_height_m),
+            rng_seed=obstacle_asset_seed,
+        )
     write_blender_environment_manifest(
         manifest_path,
         grid=grid,
         room_size_xyz=room_size_xyz,
         obstacle_height_m=obstacle_height_m,
         obstacle_material=obstacle_material,
+        obstacle_instances=obstacle_instances,
         base_usd_path=base_usd_path,
         traversability_output_path=traversability_output_path,
         robot_radius_m=robot_radius_m,
@@ -133,5 +156,21 @@ def generate_blender_environment_usd(
         details = "\n".join(part for part in (stderr, stdout) if part)
         raise RuntimeError(f"Blender environment generation failed:\n{details}")
     if not output_path.exists():
-        raise RuntimeError(f"Blender did not create the expected USD file: {output_path}")
+        stderr = (result.stderr or "").strip()
+        stdout = (result.stdout or "").strip()
+        details = "\n".join(part for part in (stderr, stdout) if part)
+        suffix = f"\n{details}" if details else ""
+        raise RuntimeError(
+            f"Blender did not create the expected USD file: {output_path}{suffix}"
+        )
     return output_path
+
+
+def attach_known_obstacle_transport_model(
+    grid: ObstacleGrid,
+    *,
+    instances: tuple[KnownObstacleInstance, ...],
+) -> ObstacleGrid:
+    """Return an obstacle grid whose PF transport uses known obstacle components."""
+    boxes_m, mu_by_isotope = known_obstacle_transport_model(instances)
+    return grid.with_transport_model(boxes_m=boxes_m, mu_by_isotope=mu_by_isotope)

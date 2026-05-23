@@ -67,6 +67,29 @@ def test_generate_obstacle_grid_reserves_passable_corridor() -> None:
         assert (ix, 1) not in grid.blocked_cells
 
 
+def test_generate_obstacle_grid_reserves_exploration_backbone_by_default() -> None:
+    """Generated layouts should keep a sparse whole-room exploration backbone."""
+    rng = np.random.default_rng(3)
+    grid = generate_obstacle_grid(
+        size_x=10.0,
+        size_y=20.0,
+        cell_size=1.0,
+        blocked_fraction=1.0,
+        rng=rng,
+        keep_free_points=[(1.5, 1.5)],
+    )
+
+    anchors = [
+        (0.5, 0.5),
+        (9.5, 0.5),
+        (0.5, 19.5),
+        (9.5, 19.5),
+        (5.5, 10.5),
+    ]
+    for anchor in anchors:
+        assert grid.has_free_path((1.5, 1.5), anchor)
+
+
 def test_load_or_generate_obstacle_grid_creates_file(tmp_path: Path) -> None:
     """Missing obstacle layouts should be generated and saved."""
     path = tmp_path / "generated.json"

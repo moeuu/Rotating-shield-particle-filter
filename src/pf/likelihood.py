@@ -36,8 +36,11 @@ def count_likelihood_variance(
     lambda_k: NDArray[np.float64],
     *,
     transport_model_rel_sigma: float = 0.0,
+    transport_model_abs_sigma: float = 0.0,
     spectrum_count_rel_sigma: float = 0.0,
     spectrum_count_abs_sigma: float = 0.0,
+    low_count_abs_sigma: float = 0.0,
+    low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
     epsilon: float = 1e-12,
 ) -> NDArray[np.float64]:
@@ -53,15 +56,23 @@ def count_likelihood_variance(
     z_arr = np.maximum(np.asarray(z_k, dtype=float), 0.0)
     lam_arr = np.maximum(np.asarray(lambda_k, dtype=float), float(epsilon))
     transport_rel = max(float(transport_model_rel_sigma), 0.0)
+    transport_abs = max(float(transport_model_abs_sigma), 0.0)
     spectrum_rel = max(float(spectrum_count_rel_sigma), 0.0)
     spectrum_abs = max(float(spectrum_count_abs_sigma), 0.0)
+    low_count_abs = max(float(low_count_abs_sigma), 0.0)
+    low_count_transition = max(float(low_count_transition_counts), 0.0)
     obs_var = np.maximum(np.asarray(observation_count_variance, dtype=float), 0.0)
     scale_ref = np.maximum(z_arr, lam_arr)
+    low_count_weight = 0.0
+    if low_count_abs > 0.0 and low_count_transition > 0.0:
+        low_count_weight = low_count_transition / (scale_ref + low_count_transition)
     variance = (
         lam_arr
         + (transport_rel * lam_arr) ** 2
+        + transport_abs**2
         + (spectrum_rel * scale_ref) ** 2
         + spectrum_abs**2
+        + (low_count_abs * low_count_weight) ** 2
         + obs_var
     )
     return np.maximum(variance, float(epsilon))
@@ -73,8 +84,11 @@ def count_log_likelihood(
     *,
     model: str = "poisson",
     transport_model_rel_sigma: float = 0.0,
+    transport_model_abs_sigma: float = 0.0,
     spectrum_count_rel_sigma: float = 0.0,
     spectrum_count_abs_sigma: float = 0.0,
+    low_count_abs_sigma: float = 0.0,
+    low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
     student_t_df: float = 5.0,
     epsilon: float = 1e-12,
@@ -96,8 +110,11 @@ def count_log_likelihood(
         z_arr,
         lam_arr,
         transport_model_rel_sigma=transport_model_rel_sigma,
+        transport_model_abs_sigma=transport_model_abs_sigma,
         spectrum_count_rel_sigma=spectrum_count_rel_sigma,
         spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+        low_count_abs_sigma=low_count_abs_sigma,
+        low_count_transition_counts=low_count_transition_counts,
         observation_count_variance=observation_count_variance,
         epsilon=epsilon,
     )
@@ -119,8 +136,11 @@ def delta_log_likelihood_remove(
     epsilon: float = 1e-12,
     model: str = "poisson",
     transport_model_rel_sigma: float = 0.0,
+    transport_model_abs_sigma: float = 0.0,
     spectrum_count_rel_sigma: float = 0.0,
     spectrum_count_abs_sigma: float = 0.0,
+    low_count_abs_sigma: float = 0.0,
+    low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
     student_t_df: float = 5.0,
 ) -> NDArray[np.float64]:
@@ -138,8 +158,11 @@ def delta_log_likelihood_remove(
             lambda_total,
             model=normalized_model,
             transport_model_rel_sigma=transport_model_rel_sigma,
+            transport_model_abs_sigma=transport_model_abs_sigma,
             spectrum_count_rel_sigma=spectrum_count_rel_sigma,
             spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+            low_count_abs_sigma=low_count_abs_sigma,
+            low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
             student_t_df=student_t_df,
             epsilon=epsilon,
@@ -155,8 +178,11 @@ def delta_log_likelihood_remove(
                 reduced_lambda,
                 model=normalized_model,
                 transport_model_rel_sigma=transport_model_rel_sigma,
+                transport_model_abs_sigma=transport_model_abs_sigma,
                 spectrum_count_rel_sigma=spectrum_count_rel_sigma,
                 spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+                low_count_abs_sigma=low_count_abs_sigma,
+                low_count_transition_counts=low_count_transition_counts,
                 observation_count_variance=observation_count_variance,
                 student_t_df=student_t_df,
                 epsilon=epsilon,
@@ -178,8 +204,11 @@ def delta_log_likelihood_update(
     epsilon: float = 1e-12,
     model: str = "poisson",
     transport_model_rel_sigma: float = 0.0,
+    transport_model_abs_sigma: float = 0.0,
     spectrum_count_rel_sigma: float = 0.0,
     spectrum_count_abs_sigma: float = 0.0,
+    low_count_abs_sigma: float = 0.0,
+    low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
     student_t_df: float = 5.0,
 ) -> float:
@@ -193,8 +222,11 @@ def delta_log_likelihood_update(
             lambda_old,
             model=normalized_model,
             transport_model_rel_sigma=transport_model_rel_sigma,
+            transport_model_abs_sigma=transport_model_abs_sigma,
             spectrum_count_rel_sigma=spectrum_count_rel_sigma,
             spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+            low_count_abs_sigma=low_count_abs_sigma,
+            low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
             student_t_df=student_t_df,
             epsilon=epsilon,
@@ -204,8 +236,11 @@ def delta_log_likelihood_update(
             lambda_new,
             model=normalized_model,
             transport_model_rel_sigma=transport_model_rel_sigma,
+            transport_model_abs_sigma=transport_model_abs_sigma,
             spectrum_count_rel_sigma=spectrum_count_rel_sigma,
             spectrum_count_abs_sigma=spectrum_count_abs_sigma,
+            low_count_abs_sigma=low_count_abs_sigma,
+            low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
             student_t_df=student_t_df,
             epsilon=epsilon,

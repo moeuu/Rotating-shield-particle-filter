@@ -1,4 +1,5 @@
 """CLI entry point for the legacy no-shield baseline PF demo."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

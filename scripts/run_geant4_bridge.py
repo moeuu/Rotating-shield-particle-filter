@@ -1,4 +1,5 @@
 """Run the Geant4 bridge sidecar."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 

@@ -1,0 +1,2 @@
+results/spectrum_validation/**/cases.json filter=lfs diff=lfs merge=lfs -text
+results/spectrum_validation/**/summary.json filter=lfs diff=lfs merge=lfs -text

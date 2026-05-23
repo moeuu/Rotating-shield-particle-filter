@@ -154,6 +154,10 @@ class IsaacSimTCPClientRuntime(TCPSidecarClientRuntime):
         """Send observation metadata to Isaac Sim for stage visualization."""
         self._round_trip("visualize", {"observation": observation.to_dict()})
 
+    def visualize_pf_state(self, payload: dict[str, Any]) -> None:
+        """Send PF particle and estimate markers to Isaac Sim for visualization."""
+        self._round_trip("visualize_pf", payload)
+
 
 class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
     """TCP client for the Geant4 sidecar."""
@@ -186,6 +190,12 @@ class Geant4WithIsaacSimRuntime(SimulationRuntime):
         if visualizer is not None:
             visualizer(observation)
         return observation
+
+    def visualize_pf_state(self, payload: dict[str, Any]) -> None:
+        """Forward PF particle visualization to the Isaac Sim companion runtime."""
+        visualizer = getattr(self.isaacsim_runtime, "visualize_pf_state", None)
+        if visualizer is not None:
+            visualizer(payload)
 
     def close(self) -> None:
         """Close both runtimes, preserving the first close error if any."""
@@ -288,17 +298,39 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
 
 
 def load_runtime_config(path: str | Path | None) -> dict[str, Any]:
-    """Load a JSON runtime configuration file."""
+    """Load a JSON runtime configuration file with optional inheritance."""
+    return _load_runtime_config(path, seen=set())
+
+
+def _load_runtime_config(
+    path: str | Path | None,
+    *,
+    seen: set[Path],
+) -> dict[str, Any]:
+    """Load a runtime config and recursively merge an ``extends`` parent."""
     if path is None:
         return {}
     config_path = Path(path)
     if not config_path.exists():
         raise FileNotFoundError(f"Simulation config not found: {config_path}")
+    config_path = config_path.resolve()
+    if config_path in seen:
+        raise ValueError(f"Cyclic runtime config inheritance at {config_path}")
+    seen.add(config_path)
     with config_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     if not isinstance(data, dict):
         raise ValueError("Simulation config must be a JSON object.")
-    return data
+    parent_ref = data.pop("extends", None)
+    if parent_ref in (None, ""):
+        return data
+    parent_path = Path(str(parent_ref)).expanduser()
+    if not parent_path.is_absolute():
+        parent_path = (config_path.parent / parent_path).resolve()
+    parent = _load_runtime_config(parent_path, seen=seen)
+    merged = dict(parent)
+    merged.update(data)
+    return merged
 
 
 def _repo_root() -> Path:

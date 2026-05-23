@@ -1,4 +1,5 @@
 """Baseline PF demo without shielding, with real-time visualization."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -377,8 +378,6 @@ def run_baseline_pf(
     detect_counts = {iso: 0 for iso in isotopes}
     miss_counts = {iso: 0 for iso in isotopes}
     active_isotopes: set[str] = set()
-    fe_idx = 0
-    pb_idx = 0
     RFe = np.eye(3)
     RPb = np.eye(3)
     for step_idx, pose in enumerate(positions):

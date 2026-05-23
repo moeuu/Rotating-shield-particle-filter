@@ -70,11 +70,13 @@ class SpectrumConfig:
     photopeak_roi_sigma: float = 4.0
     photopeak_roi_min_half_width_keV: float = 12.0
     photopeak_min_line_intensity: float = 0.02
-    photopeak_background_order: int = 1
+    photopeak_background_order: int = 2
     photopeak_efficiency_floor: float = 1e-8
     photopeak_min_snr_for_weight: float = 1.0
     photopeak_full_snr_for_weight: float = 4.0
     photopeak_outlier_mad_sigma: float = 4.0
+    photopeak_mixed_roi_requires_independent_support: bool = True
+    photopeak_mixed_roi_support_snr: float = 2.0
     response_poisson_photopeak_fusion: bool = True
     response_poisson_photopeak_min_snr: float = 2.0
     response_poisson_photopeak_anchor: bool = True
@@ -172,6 +174,8 @@ class PhotopeakRoiEstimate:
     roi_max_keV: float
     reduced_chi2: float
     signal_to_noise: float = 0.0
+    mixed_isotope_roi: bool = False
+    line_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -601,11 +605,9 @@ class SpectralDecomposer:
             )
             observed = observed[:min_len]
             response_matrix = self._count_response_matrix()[:min_len, :]
-            photopeak_response_matrix = self._count_photopeak_response_matrix()[:min_len, :]
             background_shape = self._background_shape[:min_len]
         else:
             response_matrix = self._count_response_matrix()
-            photopeak_response_matrix = self._count_photopeak_response_matrix()
             background_shape = self._background_shape
 
         indices = [
@@ -1110,6 +1112,7 @@ class SpectralDecomposer:
         observed = spectrum[mask]
         present_isotopes = {line.isotope for line in lines}
         group_isotopes = self._photopeak_isotope_order(present_isotopes)
+        mixed_isotope_roi = len(present_isotopes) > 1
         background_design = self._local_background_design(roi_energy)
         min_bins = len(group_isotopes) + background_design.shape[1] + 1
         debug: dict[str, object] = {
@@ -1221,6 +1224,7 @@ class SpectralDecomposer:
                 [float(fit_snr), *[float(line_snr) for line_snr in line_snrs]],
                 default=0.0,
             )
+            isotope_line_count = sum(1 for line in lines if line.isotope == isotope)
             variances.append(variance)
             estimates.append(
                 PhotopeakRoiEstimate(
@@ -1231,6 +1235,8 @@ class SpectralDecomposer:
                     roi_max_keV=float(roi_max),
                     reduced_chi2=reduced_chi2,
                     signal_to_noise=float(signal_to_noise),
+                    mixed_isotope_roi=bool(mixed_isotope_roi),
+                    line_count=int(isotope_line_count),
                 )
             )
 
@@ -1276,6 +1282,10 @@ class SpectralDecomposer:
             [max(float(estimate.signal_to_noise), 0.0) for estimate in finite_estimates],
             dtype=float,
         )
+        mixed_roi = np.asarray(
+            [bool(estimate.mixed_isotope_roi) for estimate in finite_estimates],
+            dtype=bool,
+        )
         variances = np.asarray(
             [float(estimate.variance) for estimate in finite_estimates],
             dtype=float,
@@ -1288,8 +1298,39 @@ class SpectralDecomposer:
         snr_full = max(float(self.config.photopeak_full_snr_for_weight), snr_min + 1e-6)
         snr_weights = np.clip((snr_values - snr_min) / (snr_full - snr_min), 0.0, 1.0)
         weights = (snr_weights**2) / (variances * chi2_values)
+        if (
+            bool(self.config.photopeak_mixed_roi_requires_independent_support)
+            and values.size >= 2
+            and np.any(mixed_roi)
+            and np.any(~mixed_roi)
+        ):
+            support_snr = max(float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6)
+            independent_snr = float(np.max(snr_values[~mixed_roi]))
+            if independent_snr < support_snr:
+                variances[mixed_roi] = np.maximum(
+                    variances[mixed_roi],
+                    np.maximum(values[mixed_roi], 1.0) ** 2,
+                )
+                values[mixed_roi] = 0.0
+                weights[mixed_roi] = 0.0
+            else:
+                support_weight = min((independent_snr / support_snr) ** 2, 1.0)
+                weights[mixed_roi] *= max(float(support_weight), 0.0)
         if finite_estimates and np.max(values) > 0.0 and np.all(weights <= 0.0):
             weights = np.where(values > 0.0, 1.0 / np.maximum(variances, 1e-12), 0.0)
+            if (
+                bool(self.config.photopeak_mixed_roi_requires_independent_support)
+                and values.size >= 2
+                and np.any(mixed_roi)
+                and np.any(~mixed_roi)
+            ):
+                support_snr = max(float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6)
+                independent_snr = float(np.max(snr_values[~mixed_roi]))
+                if independent_snr < support_snr:
+                    weights[mixed_roi] = 0.0
+                else:
+                    support_weight = min((independent_snr / support_snr) ** 2, 1.0)
+                    weights[mixed_roi] *= max(float(support_weight), 0.0)
         if values.size >= 3 and float(self.config.photopeak_outlier_mad_sigma) > 0.0:
             median = float(np.median(values))
             mad = float(np.median(np.abs(values - median)))
@@ -1302,7 +1343,7 @@ class SpectralDecomposer:
             weights *= huber
         weight_sum = float(np.sum(weights))
         if weight_sum <= 0.0:
-            value = max(float(np.mean(values)), 0.0)
+            value = max(float(np.median(values) if values.size >= 2 else np.mean(values)), 0.0)
             variance = float(np.mean(variances) / max(values.size, 1))
             return value, max(variance, value, 1.0)
         value = max(float(np.sum(weights * values) / weight_sum), 0.0)

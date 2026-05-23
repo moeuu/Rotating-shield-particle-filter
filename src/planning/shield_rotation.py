@@ -228,10 +228,6 @@ def _surrogate_scores_gpu(
         return {}
     detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
     kernel = _continuous_kernel_for_estimator(estimator)
-    from measurement.shielding import octant_index_from_rotation
-
-    fe_indices = [octant_index_from_rotation(R) for R in RFe_candidates]
-    pb_indices = [octant_index_from_rotation(R) for R in RPb_candidates]
     mu_by_iso = {iso: kernel._mu_values(isotope=iso) for iso in packed}
     shield_params = kernel.shield_params
     scores: Dict[int, float] = {}

@@ -570,6 +570,9 @@ def test_real_application_loads_scene_into_stage_backend() -> None:
     assert "/World/SimBridge/Obstacles/Obstacle_0000" in backend.prims
     assert "/World/SimBridge/Sources/Cs_137_00" in backend.prims
     assert backend.prims["/World/SimBridge/Sources/Cs_137_00"].scale_xyz == pytest.approx((0.16, 0.16, 0.16))
+    assert backend.prims["/World/SimBridge/Sources/Cs_137_00"].metadata["color_rgb"] == pytest.approx(
+        (1.0, 0.05, 0.05)
+    )
     assert "/World/SimBridge/Robot/Body" in backend.prims
     assert "/World/SimBridge/Robot/WheelFrontLeft" in backend.prims
     assert observation.metadata["backend"] == "isaacsim"
@@ -725,6 +728,52 @@ def test_isaacsim_application_visualizes_radiation_metadata() -> None:
     assert track.metadata["color_rgb"] == pytest.approx((1.0, 0.95, 0.0))
     hit = backend.prims["/World/SimBridge/Radiation/Hits/Hit_0000"]
     assert hit.metadata["color_rgb"] == pytest.approx((1.0, 0.95, 0.0))
+
+
+def test_isaacsim_application_visualizes_pf_particles_and_estimates() -> None:
+    """Real mode should author bounded PF particle and estimate markers."""
+    backend = FakeStageBackend()
+    app = IsaacSimApplication(
+        use_mock=False,
+        app_config={
+            "usd_path": "demo_room.usda",
+            "pf_visual_max_particles_per_isotope": 2,
+            "pf_visual_particle_radius_m": 0.02,
+        },
+        stage_backend=backend,
+    )
+    app.reset(SceneDescription(usd_path="demo_room.usda"))
+    app.visualize_pf_state(
+        {
+            "step_index": 1,
+            "time_s": 2.0,
+            "particle_positions": {
+                "Cs-137": [
+                    [1.0, 2.0, 3.0],
+                    [2.0, 3.0, 4.0],
+                    [3.0, 4.0, 5.0],
+                ]
+            },
+            "particle_weights": {"Cs-137": [0.1, 0.9, 0.2]},
+            "estimated_sources": {"Cs-137": [[4.0, 5.0, 6.0]]},
+            "estimated_strengths": {"Cs-137": [30000.0]},
+        }
+    )
+    app.close()
+
+    particle_prefix = "/World/SimBridge/PFVisualization/Particles/Cs_137/"
+    particle_paths = [
+        path for path in backend.prims if path.startswith(particle_prefix)
+    ]
+    assert len(particle_paths) == 2
+    assert (
+        "/World/SimBridge/PFVisualization/Estimates/Cs_137/Estimate_00/Center"
+        in backend.prims
+    )
+    assert (
+        "/World/SimBridge/PFVisualization/Estimates/Cs_137/Estimate_00/Cross_X"
+        in backend.prims
+    )
 
 
 def test_isaacsim_application_replays_radiation_tracks() -> None:
@@ -1069,6 +1118,30 @@ def test_scene_builder_can_author_room_boundaries_as_wall_group() -> None:
     wall = backend.prims["/World/Environment/Wall/NorthWall"]
     assert wall.metadata["transport_group"] == "wall"
     assert wall.metadata["material"] == "concrete"
+    assert "/World/Environment/Wall/Ceiling" in backend.prims
+    ceiling = backend.prims["/World/Environment/Wall/Ceiling"]
+    assert ceiling.metadata["transport_group"] == "wall"
+    assert ceiling.metadata["material"] == "concrete"
+
+
+def test_fake_visual_material_zero_opacity_marks_prim_hidden() -> None:
+    """Zero-opacity visual overrides should mark matching fake prims hidden."""
+    backend = FakeStageBackend()
+    backend.ensure_box(
+        "/World/Environment/Wall/NorthWall",
+        size_xyz=(1.0, 0.1, 1.0),
+        translation_xyz=(0.0, 0.0, 0.0),
+    )
+
+    backend.apply_visual_material(
+        "/World/Environment/Wall",
+        color_rgb=(0.8, 0.8, 0.8),
+        opacity=0.0,
+    )
+
+    metadata = backend.prims["/World/Environment/Wall/NorthWall"].metadata
+    assert metadata["visual_opacity"] == 0.0
+    assert metadata["visual_visible"] is False
 
 
 def test_application_prefers_scene_usd_over_config_default() -> None:
@@ -1890,6 +1963,54 @@ def test_geant4_with_isaacsim_runtime_forwards_radiation_visualization() -> None
     assert len(observation.metadata["radiation_tracks"]) == 1
 
 
+def test_geant4_with_isaacsim_runtime_forwards_pf_visualization() -> None:
+    """Composite runtime should forward PF marker payloads to Isaac Sim."""
+
+    class _Runtime:
+        """Runtime stub recording PF visualization calls."""
+
+        def __init__(self, name: str, calls: list[str]) -> None:
+            """Store the runtime name and shared call log."""
+            self.name = name
+            self.calls = calls
+
+        def reset(self, payload: dict | None = None) -> None:
+            """Record reset calls."""
+            self.calls.append(f"{self.name}:reset")
+
+        def step(self, command: SimulationCommand) -> SimulationObservation:
+            """Return a minimal observation."""
+            self.calls.append(f"{self.name}:step")
+            return SimulationObservation(
+                step_id=command.step_id,
+                detector_pose_xyz=command.target_pose_xyz,
+                detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+                fe_orientation_index=command.fe_orientation_index,
+                pb_orientation_index=command.pb_orientation_index,
+                spectrum_counts=[1.0],
+                energy_bin_edges_keV=[0.0, 1.0],
+                metadata={"backend": self.name},
+            )
+
+        def visualize_pf_state(self, payload: dict) -> None:
+            """Record PF visualization calls."""
+            self.calls.append(f"{self.name}:pf:{payload['step_index']}")
+
+        def close(self) -> None:
+            """Record close calls."""
+            self.calls.append(f"{self.name}:close")
+
+    calls: list[str] = []
+    runtime = Geant4WithIsaacSimRuntime(
+        geant4_runtime=_Runtime("geant4", calls),  # type: ignore[arg-type]
+        isaacsim_runtime=_Runtime("isaacsim", calls),  # type: ignore[arg-type]
+    )
+
+    runtime.visualize_pf_state({"step_index": 7})
+
+    assert calls == ["isaacsim:pf:7"]
+
+
 def test_external_geant4_engine_reads_file_protocol(tmp_path: Path) -> None:
     """The external Geant4 engine should round-trip through the file protocol."""
     executable = tmp_path / "fake_geant4.py"
@@ -2508,6 +2629,36 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         """Return a zero IG grid to bypass heavy IG evaluation."""
         return np.zeros((8, 8), dtype=float)
 
+    def _fake_shield_selection_grid(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Return a lightweight shield selection grid for reset-payload tests."""
+        ig_scores = np.asarray(kwargs.get("ig_scores", np.zeros((8, 8))), dtype=float)
+        zeros = np.zeros_like(ig_scores, dtype=float)
+        return ig_scores, {
+            "signature": zeros,
+            "signature_utility": zeros,
+            "low_count_penalty": zeros,
+            "count_balance_penalty": zeros,
+            "rotation_cost": zeros,
+        }
+
+    def _fake_shield_selection_grid(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Return a lightweight shield selection grid for runtime payload tests."""
+        ig_scores = np.asarray(kwargs.get("ig_scores", np.zeros((8, 8))), dtype=float)
+        zeros = np.zeros_like(ig_scores, dtype=float)
+        return ig_scores, {
+            "signature": zeros,
+            "signature_utility": zeros,
+            "low_count_penalty": zeros,
+            "count_balance_penalty": zeros,
+            "rotation_cost": zeros,
+        }
+
     def _fake_frame(*args: object, **kwargs: object) -> dict[str, object]:
         """Return an empty frame placeholder."""
         return {}
@@ -2528,6 +2679,11 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
+    monkeypatch.setattr(
+        realtime_demo,
+        "_compute_shield_selection_grid",
+        _fake_shield_selection_grid,
+    )
     monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
     monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
     monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
@@ -2690,6 +2846,21 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         """Return a zero IG grid to bypass heavy IG evaluation."""
         return np.zeros((8, 8), dtype=float)
 
+    def _fake_shield_selection_grid(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Return a lightweight shield selection grid for reset-payload tests."""
+        ig_scores = np.asarray(kwargs.get("ig_scores", np.zeros((8, 8))), dtype=float)
+        zeros = np.zeros_like(ig_scores, dtype=float)
+        return ig_scores, {
+            "signature": zeros,
+            "signature_utility": zeros,
+            "low_count_penalty": zeros,
+            "count_balance_penalty": zeros,
+            "rotation_cost": zeros,
+        }
+
     def _fake_frame(*args: object, **kwargs: object) -> dict[str, object]:
         """Return an empty frame placeholder."""
         return {}
@@ -2741,6 +2912,11 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
+    monkeypatch.setattr(
+        realtime_demo,
+        "_compute_shield_selection_grid",
+        _fake_shield_selection_grid,
+    )
     monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
     monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
     monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
@@ -2778,7 +2954,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     )
     assert runtime.reset_payload is not None
     assert runtime.reset_payload["usd_path"] == generated_usd.as_posix()
-    assert runtime.reset_payload["author_obstacle_prims"] is False
+    assert runtime.reset_payload["author_obstacle_prims"] is True
     assert runtime.reset_payload["obstacle_cells"]
     map_path = Path(str(runtime.reset_payload["traversability_map_path"]))
     map_png_path = Path(str(runtime.reset_payload["traversability_map_png_path"]))

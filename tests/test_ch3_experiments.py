@@ -1,4 +1,5 @@
 """End-to-end smoke test for Chapter 3 experiment runner."""
+# ruff: noqa: E402
 
 import json
 from dataclasses import replace

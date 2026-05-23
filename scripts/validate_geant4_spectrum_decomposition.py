@@ -1,4 +1,5 @@
 """Validate Geant4 spectrum decomposition across multi-source cases."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -20,9 +21,17 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from measurement.continuous_kernels import ContinuousKernel
+from measurement.continuous_kernels import finite_sphere_geometric_term
 from measurement.kernels import ShieldParams
 from measurement.model import PointSource
+from measurement.obstacle_assets import (
+    KnownObstacleInstance,
+    generate_manchester_obstacle_instances,
+    known_obstacle_transport_model,
+    obstacle_instances_to_dicts,
+)
 from measurement.obstacles import ObstacleGrid
+from measurement.obstacles import build_obstacle_grid
 from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
 from sim.geant4_app.app import Geant4Application
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription
@@ -73,6 +82,7 @@ class ValidationCase:
     pb_index: int = 0
     dwell_time_s: float = 30.0
     obstacle_cells: tuple[tuple[int, int], ...] = field(default_factory=tuple)
+    obstacle_instances: tuple[KnownObstacleInstance, ...] = field(default_factory=tuple)
     include_in_accuracy_summary: bool = True
 
 
@@ -116,6 +126,147 @@ def _line_obstacle_cells(
         if len(cells) >= int(max_cells):
             break
     return tuple(cells)
+
+
+def _attach_known_obstacle_transport(
+    grid: ObstacleGrid,
+    instances: tuple[KnownObstacleInstance, ...],
+) -> ObstacleGrid:
+    """Attach known material-specific transport boxes to an obstacle grid."""
+    boxes_m, mu_by_isotope = known_obstacle_transport_model(instances, isotopes=ISOTOPES)
+    return grid.with_transport_model(boxes_m=boxes_m, mu_by_isotope=mu_by_isotope)
+
+
+def _free_cell_centers(grid: ObstacleGrid) -> list[tuple[float, float]]:
+    """Return centers of free grid cells."""
+    centers: list[tuple[float, float]] = []
+    for ix in range(int(grid.grid_shape[0])):
+        for iy in range(int(grid.grid_shape[1])):
+            if not grid.is_cell_free((ix, iy)):
+                continue
+            centers.append(
+                (
+                    float(grid.origin[0] + (ix + 0.5) * grid.cell_size),
+                    float(grid.origin[1] + (iy + 0.5) * grid.cell_size),
+                )
+            )
+    return centers
+
+
+def _jittered_free_pose(
+    grid: ObstacleGrid,
+    rng: np.random.Generator,
+    *,
+    room_size_xyz: tuple[float, float, float],
+    z_m: float = 0.5,
+) -> tuple[float, float, float]:
+    """Sample a detector pose inside a free cell."""
+    centers = _free_cell_centers(grid)
+    if not centers:
+        raise ValueError("Generated obstacle grid has no free cells.")
+    center_xy = centers[int(rng.integers(0, len(centers)))]
+    jitter = 0.32 * float(grid.cell_size)
+    x = float(center_xy[0] + rng.uniform(-jitter, jitter))
+    y = float(center_xy[1] + rng.uniform(-jitter, jitter))
+    x = float(np.clip(x, 0.4, room_size_xyz[0] - 0.4))
+    y = float(np.clip(y, 0.4, room_size_xyz[1] - 0.4))
+    return (x, y, float(z_m))
+
+
+def _component_top_z(instance: KnownObstacleInstance) -> float:
+    """Return the highest z coordinate of a known obstacle instance."""
+    if not instance.components:
+        return 0.0
+    return max(
+        float(component.center_xyz[2]) + 0.5 * float(component.size_xyz[2])
+        for component in instance.components
+    )
+
+
+def _surface_source_position(
+    grid: ObstacleGrid,
+    instances: tuple[KnownObstacleInstance, ...],
+    rng: np.random.Generator,
+    *,
+    room_size_xyz: tuple[float, float, float],
+    source_index: int,
+) -> tuple[float, float, float]:
+    """Sample a source position on free floor, obstacle side, or obstacle top."""
+    mode = int(source_index) % 4
+    if instances and mode in {1, 2}:
+        instance = instances[int(rng.integers(0, len(instances)))]
+        x0, x1, y0, y1 = instance.footprint_xy
+        if mode == 1:
+            side = int(rng.integers(0, 4))
+            if side == 0:
+                x, y = x0 - 0.08, float(rng.uniform(y0, y1))
+            elif side == 1:
+                x, y = x1 + 0.08, float(rng.uniform(y0, y1))
+            elif side == 2:
+                x, y = float(rng.uniform(x0, x1)), y0 - 0.08
+            else:
+                x, y = float(rng.uniform(x0, x1)), y1 + 0.08
+            z = float(rng.uniform(0.45, min(_component_top_z(instance), room_size_xyz[2] - 0.2)))
+        else:
+            x = float(rng.uniform(x0 + 0.12, x1 - 0.12))
+            y = float(rng.uniform(y0 + 0.12, y1 - 0.12))
+            z = min(_component_top_z(instance) + 0.08, room_size_xyz[2] - 0.2)
+        return _clamp_room_position(
+            np.asarray((x, y, z), dtype=float),
+            room_size_xyz=room_size_xyz,
+            margin_xy_m=0.25,
+        )
+
+    return _jittered_free_pose(
+        grid,
+        rng,
+        room_size_xyz=room_size_xyz,
+        z_m=float(rng.uniform(0.35, 1.8)),
+    )
+
+
+def _obstacle_tau_for_sources(
+    grid: ObstacleGrid,
+    detector_xyz: tuple[float, float, float],
+    sources: tuple[ValidationSource, ...],
+) -> float:
+    """Return the maximum obstacle optical depth among source-detector rays."""
+    kernel = ContinuousKernel(obstacle_grid=grid, use_gpu=False)
+    detector = np.asarray(detector_xyz, dtype=float)
+    max_tau = 0.0
+    for source in sources:
+        tau = kernel.obstacle_optical_depth_pair(
+            source.isotope,
+            np.asarray(source.position_xyz, dtype=float),
+            detector,
+        )
+        max_tau = max(max_tau, float(tau))
+    return max_tau
+
+
+def _sample_detector_with_tau_mix(
+    grid: ObstacleGrid,
+    sources: tuple[ValidationSource, ...],
+    rng: np.random.Generator,
+    *,
+    room_size_xyz: tuple[float, float, float],
+    prefer_obstacle_crossing: bool,
+) -> tuple[float, float, float]:
+    """Sample detector poses that alternate direct and obstacle-crossing rays."""
+    best_pose = _jittered_free_pose(grid, rng, room_size_xyz=room_size_xyz)
+    best_tau = _obstacle_tau_for_sources(grid, best_pose, sources)
+    for _ in range(80):
+        pose = _jittered_free_pose(grid, rng, room_size_xyz=room_size_xyz)
+        tau = _obstacle_tau_for_sources(grid, pose, sources)
+        if prefer_obstacle_crossing and tau >= 0.1:
+            return pose
+        if not prefer_obstacle_crossing and tau <= 0.02:
+            return pose
+        if prefer_obstacle_crossing and tau > best_tau:
+            best_pose, best_tau = pose, tau
+        if not prefer_obstacle_crossing and tau < best_tau:
+            best_pose, best_tau = pose, tau
+    return best_pose
 
 
 def _source_isotope_program(case_index: int, source_count: int) -> list[str]:
@@ -229,6 +380,116 @@ def generated_cases(
                 include_in_accuracy_summary=True,
             )
         )
+    return cases
+
+
+def generated_environment_sweep_cases(
+    *,
+    num_environments: int = 10,
+    measurement_points_per_environment: int = 24,
+    rotations_per_point: int = 8,
+    seed: int = 20260430,
+    dwell_time_s: float = 30.0,
+    intensity_min_cps_1m: float = 30000.0,
+    intensity_max_cps_1m: float = 90000.0,
+    blocked_fraction: float = 0.35,
+    passage_width_m: float = 2.0,
+) -> list[ValidationCase]:
+    """Return random known-obstacle environments with point and shield sweeps."""
+    rng = np.random.default_rng(int(seed))
+    room_size = (10.0, 20.0, 10.0)
+    cases: list[ValidationCase] = []
+    for env_index in range(max(0, int(num_environments))):
+        env_seed = int(rng.integers(1, 2**31 - 1))
+        keep_free = (
+            (0.5, 0.5),
+            (room_size[0] - 0.5, room_size[1] - 0.5),
+            (0.5, room_size[1] - 0.5),
+            (room_size[0] - 0.5, 0.5),
+            (0.5 * room_size[0], 0.5 * room_size[1]),
+        )
+        grid = build_obstacle_grid(
+            mode="random",
+            path=None,
+            size_x=room_size[0],
+            size_y=room_size[1],
+            cell_size=1.0,
+            blocked_fraction=float(blocked_fraction),
+            rng_seed=env_seed,
+            keep_free_points=keep_free,
+            passage_width_m=float(passage_width_m),
+        )
+        instances = generate_manchester_obstacle_instances(
+            grid,
+            room_size_xyz=room_size,
+            obstacle_height_m=2.0,
+            rng_seed=env_seed + 17,
+        )
+        transport_grid = _attach_known_obstacle_transport(grid, instances)
+        source_count = 1 + (env_index % 5)
+        if env_index in {2, 6, 9}:
+            source_count = 3 + (env_index % 3)
+        isotope_program = _source_isotope_program(env_index, source_count)
+        sources: list[ValidationSource] = []
+        for source_index, isotope in enumerate(isotope_program):
+            source_pos = _surface_source_position(
+                transport_grid,
+                instances,
+                rng,
+                room_size_xyz=room_size,
+                source_index=source_index,
+            )
+            sources.append(
+                ValidationSource(
+                    isotope=str(isotope),
+                    position_xyz=source_pos,
+                    intensity_cps_1m=float(
+                        rng.uniform(
+                            float(intensity_min_cps_1m),
+                            float(intensity_max_cps_1m),
+                        )
+                    ),
+                )
+            )
+        source_tuple = tuple(sources)
+        template_counts: dict[str, int] = {}
+        for instance in instances:
+            template_counts[instance.template] = template_counts.get(instance.template, 0) + 1
+        template_summary = ",".join(
+            f"{template}:{count}" for template, count in sorted(template_counts.items())
+        )
+        measurement_points: list[tuple[float, float, float]] = []
+        for point_index in range(max(0, int(measurement_points_per_environment))):
+            measurement_points.append(
+                _sample_detector_with_tau_mix(
+                    transport_grid,
+                    source_tuple,
+                    rng,
+                    room_size_xyz=room_size,
+                    prefer_obstacle_crossing=(point_index % 3 != 0),
+                )
+            )
+        for point_index, detector in enumerate(measurement_points):
+            max_tau = _obstacle_tau_for_sources(transport_grid, detector, source_tuple)
+            for rotation_index in range(max(1, int(rotations_per_point))):
+                cases.append(
+                    ValidationCase(
+                        name=f"env{env_index:02d}_pt{point_index:02d}_rot{rotation_index:02d}",
+                        description=(
+                            "Random known-material obstacle environment; "
+                            f"templates={template_summary}; "
+                            f"max_obstacle_tau={max_tau:.3f}"
+                        ),
+                        detector_pose_xyz=detector,
+                        sources=source_tuple,
+                        fe_index=int((rotation_index + 2 * point_index + env_index) % 8),
+                        pb_index=int((3 * rotation_index + point_index + 2 * env_index) % 8),
+                        dwell_time_s=float(dwell_time_s),
+                        obstacle_cells=tuple(grid.blocked_cells),
+                        obstacle_instances=instances,
+                        include_in_accuracy_summary=True,
+                    )
+                )
     return cases
 
 
@@ -371,9 +632,12 @@ def build_scene(case: ValidationCase, usd_path: str | None) -> SceneDescription:
         obstacle_cell_size_m=1.0,
         obstacle_grid_shape=(10, 20),
         obstacle_cells=[tuple(cell) for cell in case.obstacle_cells],
+        obstacle_instances=case.obstacle_instances,
         author_obstacle_prims=True,
+        author_room_boundary_prims=True,
         sources=[source.to_scene_source() for source in case.sources],
         usd_path=usd_path,
+        use_config_usd_fallback=usd_path is not None,
     )
 
 
@@ -427,12 +691,15 @@ def obstacle_grid_for_case(case: ValidationCase) -> ObstacleGrid | None:
     """Return the obstacle grid used by the analytic target for a case."""
     if not case.obstacle_cells:
         return None
-    return ObstacleGrid(
+    grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
         grid_shape=(10, 20),
         blocked_cells=tuple(case.obstacle_cells),
     )
+    if case.obstacle_instances:
+        return _attach_known_obstacle_transport(grid, case.obstacle_instances)
+    return grid
 
 
 def shield_params_from_runtime_config(runtime_config: dict[str, Any]) -> ShieldParams:
@@ -522,6 +789,78 @@ def expected_pf_counts(
     return counts
 
 
+def expected_pf_count_diagnostics(
+    case: ValidationCase,
+    runtime_config: dict[str, Any],
+    mu_by_isotope: dict[str, object],
+) -> list[dict[str, Any]]:
+    """Return per-source PF target components for mismatch diagnosis."""
+    kernel = kernel_for_case(case, runtime_config, mu_by_isotope)
+    shield_only_kernel = ContinuousKernel(
+        mu_by_isotope=mu_by_isotope,
+        shield_params=shield_params_from_runtime_config(runtime_config),
+        obstacle_grid=None,
+        obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+        obstacle_buildup_coeff=0.0,
+        detector_radius_m=kernel.detector_radius_m,
+        detector_aperture_samples=kernel.detector_aperture_samples,
+        use_gpu=False,
+    )
+    detector = np.asarray(case.detector_pose_xyz, dtype=float)
+    rows: list[dict[str, Any]] = []
+    for source_index, source in enumerate(case.sources):
+        source_pos = np.asarray(source.position_xyz, dtype=float)
+        geom = finite_sphere_geometric_term(
+            detector,
+            source_pos,
+            kernel.detector_radius_m,
+        )
+        shield_att = shield_only_kernel.attenuation_factor_pair(
+            source.isotope,
+            source_pos,
+            detector,
+            int(case.fe_index),
+            int(case.pb_index),
+        )
+        obstacle_tau = 0.0
+        obstacle_att = 1.0
+        if kernel.obstacle_grid is not None:
+            obstacle_tau = kernel.obstacle_optical_depth_pair(
+                source.isotope,
+                source_pos,
+                detector,
+            )
+            obstacle_att = float(np.exp(-float(obstacle_tau)))
+        full_kernel = kernel.kernel_value_pair(
+            source.isotope,
+            detector,
+            source_pos,
+            int(case.fe_index),
+            int(case.pb_index),
+        )
+        rows.append(
+            {
+                "source_index": int(source_index),
+                "isotope": source.isotope,
+                "position_xyz": [float(value) for value in source.position_xyz],
+                "intensity_cps_1m": float(source.intensity_cps_1m),
+                "geometric_factor": float(geom),
+                "shield_attenuation": float(shield_att),
+                "obstacle_tau_center_ray": float(obstacle_tau),
+                "obstacle_attenuation_center_ray": float(obstacle_att),
+                "full_kernel": float(full_kernel),
+                "geometric_counts": float(case.dwell_time_s * source.intensity_cps_1m * geom),
+                "shield_only_counts": float(
+                    case.dwell_time_s * source.intensity_cps_1m * geom * shield_att
+                ),
+                "full_target_counts": float(
+                    case.dwell_time_s * source.intensity_cps_1m * full_kernel
+                ),
+            }
+        )
+    return rows
+
+
 def source_tally_counts(metadata: dict[str, Any]) -> dict[str, float]:
     """Read native Geant4 source-equivalent tally counts from metadata."""
     return {
@@ -555,6 +894,7 @@ def case_to_dict(case: ValidationCase) -> dict[str, Any]:
         "pb_index": int(case.pb_index),
         "dwell_time_s": float(case.dwell_time_s),
         "obstacle_cells": [list(cell) for cell in case.obstacle_cells],
+        "obstacle_instances": obstacle_instances_to_dicts(case.obstacle_instances),
         "include_in_accuracy_summary": bool(case.include_in_accuracy_summary),
         "sources": [
             {
@@ -577,7 +917,7 @@ def run_case(
     min_target: float,
 ) -> tuple[dict[str, Any], np.ndarray]:
     """Run one Geant4 validation case and return metrics plus spectrum."""
-    scene = build_scene(case, usd_path=runtime_config.get("usd_path"))
+    scene = build_scene(case, usd_path=runtime_config.get("validation_usd_path"))
     app.reset(scene)
     start = time.time()
     observation = app.step(
@@ -622,6 +962,7 @@ def run_case(
         isotopes=ISOTOPES,
     )
     target_counts = expected_pf_counts(case, runtime_config, mu_by_isotope)
+    target_diagnostics = expected_pf_count_diagnostics(case, runtime_config, mu_by_isotope)
     tally_counts = source_tally_counts(dict(observation.metadata))
     truth_counts = transport_truth_counts(dict(observation.metadata))
     methods = {
@@ -635,6 +976,9 @@ def run_case(
         target = float(target_counts.get(isotope, 0.0))
         per_isotope[isotope] = {
             "target_pf_counts": target,
+            "target_pf_count_diagnostics": [
+                row for row in target_diagnostics if row["isotope"] == isotope
+            ],
             "source_tally_counts": float(tally_counts.get(isotope, 0.0)),
             "transport_truth_counts": float(truth_counts.get(isotope, 0.0)),
             "method_counts": {
@@ -698,6 +1042,7 @@ def run_case(
                 )
             )
         },
+        "target_diagnostics": target_diagnostics,
         "per_isotope": per_isotope,
     }
     return result, spectrum
@@ -861,6 +1206,36 @@ def write_outputs(
     np.savez_compressed(output_dir / "spectra.npz", **spectra)
 
 
+def build_summary(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    cases: list[ValidationCase],
+    results: list[dict[str, Any]],
+    args: argparse.Namespace,
+    sweep_start: float,
+    interrupted: bool,
+) -> dict[str, Any]:
+    """Build a JSON-compatible summary for complete or partial validation output."""
+    return {
+        "config": config_path.as_posix(),
+        "output_dir": output_dir.as_posix(),
+        "num_cases": len(results),
+        "num_requested_cases": len(cases),
+        "interrupted": bool(interrupted),
+        "environment_sweep": bool(args.environment_sweep),
+        "num_environments": int(args.num_environments) if args.environment_sweep else None,
+        "measurement_points_per_environment": (
+            int(args.measurement_points_per_environment) if args.environment_sweep else None
+        ),
+        "rotations_per_point": int(args.rotations_per_point) if args.environment_sweep else None,
+        "elapsed_s": float(time.time() - sweep_start),
+        "min_target_counts": float(args.min_target_counts),
+        "accuracy_summary": summarize_accuracy(results, float(args.min_target_counts)),
+        "cases": [case_to_dict(case) for case in cases],
+    }
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -874,11 +1249,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-target-counts", type=float, default=25.0)
     parser.add_argument("--timeout-s", type=float, default=3600.0)
     parser.add_argument("--thread-count", type=int, default=None)
+    parser.add_argument(
+        "--usd-path",
+        default=None,
+        help=(
+            "Optional external USD to import into Geant4. By default validation "
+            "uses only the generated scene geometry so the PF target and Geant4 "
+            "transport share the same obstacle set."
+        ),
+    )
+    parser.add_argument(
+        "--primary-sampling-fraction",
+        type=float,
+        default=None,
+        help="Override Geant4 primary_sampling_fraction for high-statistics validation.",
+    )
     parser.add_argument("--num-cases", type=int, default=50)
     parser.add_argument("--case-seed", type=int, default=20260430)
     parser.add_argument("--dwell-time-s", type=float, default=30.0)
     parser.add_argument("--intensity-min-cps-1m", type=float, default=30000.0)
     parser.add_argument("--intensity-max-cps-1m", type=float, default=90000.0)
+    parser.add_argument(
+        "--environment-sweep",
+        action="store_true",
+        help=(
+            "Generate random known-material obstacle environments, multiple "
+            "measurement points, and multiple shield rotations per point."
+        ),
+    )
+    parser.add_argument("--num-environments", type=int, default=10)
+    parser.add_argument("--measurement-points-per-environment", type=int, default=24)
+    parser.add_argument("--rotations-per-point", type=int, default=8)
+    parser.add_argument("--blocked-fraction", type=float, default=0.35)
+    parser.add_argument("--passage-width-m", type=float, default=2.0)
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=8,
+        help="Write partial validation outputs every N completed cases; set 0 to disable.",
+    )
     parser.add_argument(
         "--hand-authored-cases",
         action="store_true",
@@ -897,10 +1306,27 @@ def main() -> None:
     runtime_config["timeout_s"] = float(args.timeout_s)
     if args.thread_count is not None:
         runtime_config["thread_count"] = int(args.thread_count)
+    if args.primary_sampling_fraction is not None:
+        runtime_config["primary_sampling_fraction"] = float(args.primary_sampling_fraction)
+    runtime_config["validation_usd_path"] = (
+        resolve_path(str(args.usd_path)).as_posix() if args.usd_path else None
+    )
     runtime_config["engine_mode"] = "external"
     runtime_config["physics_profile"] = "balanced"
 
-    if args.hand_authored_cases:
+    if args.environment_sweep:
+        all_cases = generated_environment_sweep_cases(
+            num_environments=int(args.num_environments),
+            measurement_points_per_environment=int(args.measurement_points_per_environment),
+            rotations_per_point=int(args.rotations_per_point),
+            seed=int(args.case_seed),
+            dwell_time_s=float(args.dwell_time_s),
+            intensity_min_cps_1m=float(args.intensity_min_cps_1m),
+            intensity_max_cps_1m=float(args.intensity_max_cps_1m),
+            blocked_fraction=float(args.blocked_fraction),
+            passage_width_m=float(args.passage_width_m),
+        )
+    elif args.hand_authored_cases:
         all_cases = default_cases()
     else:
         all_cases = generated_cases(
@@ -934,6 +1360,7 @@ def main() -> None:
     spectra: dict[str, np.ndarray] = {}
     sweep_start = time.time()
     app = Geant4Application(app_config=runtime_config, stage_backend=FakeStageBackend())
+    interrupted = False
     try:
         for step_id, case in enumerate(cases):
             print(f"[{step_id + 1}/{len(cases)}] running {case.name}: {case.description}", flush=True)
@@ -974,18 +1401,34 @@ def main() -> None:
                 f"response_poisson={response} rel_err={rel} rel_truth={rel_truth}",
                 flush=True,
             )
+            checkpoint_every = max(int(args.checkpoint_every), 0)
+            if checkpoint_every and len(results) % checkpoint_every == 0:
+                partial_summary = build_summary(
+                    config_path=config_path,
+                    output_dir=output_dir,
+                    cases=cases,
+                    results=results,
+                    args=args,
+                    sweep_start=sweep_start,
+                    interrupted=False,
+                )
+                write_outputs(output_dir, results, spectra, partial_summary)
+                print(f"  checkpoint wrote partial outputs to: {output_dir}", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("Interrupted; writing partial validation outputs.", flush=True)
     finally:
         app.close()
 
-    summary = {
-        "config": config_path.as_posix(),
-        "output_dir": output_dir.as_posix(),
-        "num_cases": len(results),
-        "elapsed_s": float(time.time() - sweep_start),
-        "min_target_counts": float(args.min_target_counts),
-        "accuracy_summary": summarize_accuracy(results, float(args.min_target_counts)),
-        "cases": [case_to_dict(case) for case in cases],
-    }
+    summary = build_summary(
+        config_path=config_path,
+        output_dir=output_dir,
+        cases=cases,
+        results=results,
+        args=args,
+        sweep_start=sweep_start,
+        interrupted=interrupted,
+    )
     write_outputs(output_dir, results, spectra, summary)
     print(json.dumps(summary["accuracy_summary"], indent=2, sort_keys=True))
     print(f"Wrote validation outputs to: {output_dir}")

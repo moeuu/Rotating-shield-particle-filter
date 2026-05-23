@@ -182,6 +182,28 @@ def obstacle_path_length_cm(
     return float(100.0 * path_m)
 
 
+def obstacle_optical_depth(
+    source_pos: NDArray[np.float64],
+    detector_pos: NDArray[np.float64],
+    obstacle_boxes_m: NDArray[np.float64],
+    obstacle_mu_cm_inv_by_box: NDArray[np.float64],
+) -> float:
+    """Return summed material optical depth through known obstacle components."""
+    boxes = np.asarray(obstacle_boxes_m, dtype=float)
+    mu_values = np.asarray(obstacle_mu_cm_inv_by_box, dtype=float)
+    if boxes.size == 0:
+        return 0.0
+    if boxes.ndim != 2 or boxes.shape[1] != 6:
+        raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
+    if mu_values.shape != (boxes.shape[0],):
+        raise ValueError("obstacle_mu_cm_inv_by_box must match obstacle box count.")
+    tau = 0.0
+    for box, mu_value in zip(boxes, mu_values):
+        path_cm = 100.0 * segment_box_intersection_length_m(source_pos, detector_pos, box)
+        tau += float(mu_value) * float(path_cm)
+    return float(tau)
+
+
 def segment_sphere_intersection_length_m(
     source_pos: NDArray[np.float64],
     target_pos: NDArray[np.float64],
@@ -389,10 +411,30 @@ def obstacle_path_lengths_cm_torch(
     tol: float = 1e-9,
 ) -> "torch.Tensor":
     """Return batched obstacle path lengths through axis-aligned boxes in centimeters."""
+    lengths_by_box = obstacle_path_lengths_by_box_cm_torch(
+        positions=positions,
+        detector_pos=detector_pos,
+        obstacle_boxes_m=obstacle_boxes_m,
+        tol=tol,
+    )
+    return torch.sum(lengths_by_box, dim=-1)
+
+
+def obstacle_path_lengths_by_box_cm_torch(
+    positions: "torch.Tensor",
+    detector_pos: "torch.Tensor",
+    obstacle_boxes_m: "torch.Tensor",
+    tol: float = 1e-9,
+) -> "torch.Tensor":
+    """Return batched per-box obstacle path lengths in centimeters."""
     if torch is None:
         raise RuntimeError("torch is not available")
     if obstacle_boxes_m.numel() == 0:
-        return torch.zeros(positions.shape[:-1], device=positions.device, dtype=positions.dtype)
+        return torch.zeros(
+            (*positions.shape[:-1], 0),
+            device=positions.device,
+            dtype=positions.dtype,
+        )
     if obstacle_boxes_m.ndim != 2 or obstacle_boxes_m.shape[1] != 6:
         raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
     detector = detector_pos.to(device=positions.device, dtype=positions.dtype)
@@ -429,7 +471,7 @@ def obstacle_path_lengths_cm_torch(
     t_enter = torch.maximum(torch.stack(t_min_axes, dim=-1).amax(dim=-1), torch.zeros_like(distance).unsqueeze(-1))
     t_exit = torch.minimum(torch.stack(t_max_axes, dim=-1).amin(dim=-1), torch.ones_like(distance).unsqueeze(-1))
     length_m = torch.where(t_exit > t_enter, (t_exit - t_enter) * distance.unsqueeze(-1), torch.zeros_like(t_exit))
-    return 100.0 * torch.sum(length_m, dim=-1)
+    return 100.0 * length_m
 
 
 def obstacle_path_lengths_between_points_cm_torch(
@@ -439,10 +481,30 @@ def obstacle_path_lengths_between_points_cm_torch(
     tol: float = 1e-9,
 ) -> "torch.Tensor":
     """Return path lengths through axis-aligned boxes for source-target segments."""
+    lengths_by_box = obstacle_path_lengths_between_points_by_box_cm_torch(
+        source_pos=source_pos,
+        target_pos=target_pos,
+        obstacle_boxes_m=obstacle_boxes_m,
+        tol=tol,
+    )
+    return torch.sum(lengths_by_box, dim=-1)
+
+
+def obstacle_path_lengths_between_points_by_box_cm_torch(
+    source_pos: "torch.Tensor",
+    target_pos: "torch.Tensor",
+    obstacle_boxes_m: "torch.Tensor",
+    tol: float = 1e-9,
+) -> "torch.Tensor":
+    """Return per-box path lengths through axis-aligned boxes for segments."""
     if torch is None:
         raise RuntimeError("torch is not available")
     if obstacle_boxes_m.numel() == 0:
-        return torch.zeros(source_pos.shape[:-1], device=source_pos.device, dtype=source_pos.dtype)
+        return torch.zeros(
+            (*source_pos.shape[:-1], 0),
+            device=source_pos.device,
+            dtype=source_pos.dtype,
+        )
     if obstacle_boxes_m.ndim != 2 or obstacle_boxes_m.shape[1] != 6:
         raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
     p0 = source_pos.unsqueeze(-2)
@@ -486,7 +548,7 @@ def obstacle_path_lengths_between_points_cm_torch(
         (t_exit - t_enter) * distance.unsqueeze(-1),
         torch.zeros_like(t_exit),
     )
-    return 100.0 * torch.sum(length_m, dim=-1)
+    return 100.0 * length_m
 
 
 def _torch_available() -> bool:
@@ -566,6 +628,42 @@ class ContinuousKernel:
         self.detector_radius_m = max(float(self.detector_radius_m), 0.0)
         self.detector_aperture_samples = max(int(self.detector_aperture_samples), 1)
 
+    def _adaptive_torch_chunk_size(
+        self,
+        requested: int,
+        *,
+        all_orientation_pairs: bool = False,
+    ) -> int:
+        """
+        Return a GPU chunk size that preserves math while bounding tensors.
+
+        Obstacle attenuation with finite detector aperture expands each source
+        into ``source_count * aperture_samples * obstacle_box_count`` segment-box
+        intersections. Random Manchester-style scenes can contain hundreds of
+        transport components, so the old fixed 8192-source chunk could allocate
+        tens of GB. This only changes batching, not the kernel being evaluated.
+        """
+        chunk = max(1, int(requested))
+        sample_count = (
+            max(int(self.detector_aperture_samples), 1)
+            if self.detector_radius_m > 0.0
+            else 1
+        )
+        obstacle_count = int(self.obstacle_boxes_m().shape[0])
+        num_pairs = int(len(self.orientations)) ** 2
+        denom = max(1, sample_count)
+        if obstacle_count > 0:
+            denom = max(denom, sample_count * obstacle_count)
+        if all_orientation_pairs:
+            denom = max(denom, sample_count * num_pairs)
+        element_budget = (
+            4_000_000
+            if str(self.gpu_dtype).lower() == "float64"
+            else 8_000_000
+        )
+        safe_chunk = max(1, int(element_budget // denom))
+        return max(1, min(chunk, safe_chunk))
+
     def _mu_values(self, isotope: str) -> tuple[float, float]:
         """Return (mu_fe, mu_pb) for the given isotope with fallbacks."""
         return resolve_mu_values(
@@ -580,10 +678,13 @@ class ContinuousKernel:
         if self.obstacle_grid is None:
             return np.zeros((0, 6), dtype=float)
         if self._obstacle_boxes_cache is None:
-            boxes = self.obstacle_grid.blocked_boxes(
-                z_min=0.0,
-                z_max=float(self.obstacle_height_m),
-            )
+            if getattr(self.obstacle_grid, "has_transport_model", False):
+                boxes = self.obstacle_grid.transport_boxes()
+            else:
+                boxes = self.obstacle_grid.blocked_boxes(
+                    z_min=0.0,
+                    z_max=float(self.obstacle_height_m),
+                )
             if boxes:
                 self._obstacle_boxes_cache = np.asarray(boxes, dtype=float)
             else:
@@ -595,6 +696,17 @@ class ContinuousKernel:
         if self.obstacle_grid is None:
             return 0.0
         return resolve_obstacle_mu_cm_inv(isotope, self.obstacle_mu_by_isotope)
+
+    def obstacle_mu_values_cm_inv(self, isotope: str) -> NDArray[np.float64]:
+        """Return per-obstacle-box attenuation coefficients in 1/cm."""
+        boxes = self.obstacle_boxes_m()
+        if boxes.size == 0:
+            return np.zeros(0, dtype=float)
+        if self.obstacle_grid is not None:
+            values = self.obstacle_grid.transport_mu_values(isotope)
+            if values is not None:
+                return np.asarray(values, dtype=float)
+        return np.full(boxes.shape[0], self.obstacle_mu_cm_inv(isotope), dtype=float)
 
     def obstacle_path_length_cm(
         self,
@@ -608,19 +720,65 @@ class ContinuousKernel:
             obstacle_boxes_m=self.obstacle_boxes_m(),
         )
 
+    def obstacle_optical_depth_pair(
+        self,
+        isotope: str,
+        source_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+    ) -> float:
+        """Return obstacle-only optical depth for one source-detector ray."""
+        if self.obstacle_grid is None:
+            return 0.0
+        return obstacle_optical_depth(
+            source_pos=source_pos,
+            detector_pos=detector_pos,
+            obstacle_boxes_m=self.obstacle_boxes_m(),
+            obstacle_mu_cm_inv_by_box=self.obstacle_mu_values_cm_inv(isotope),
+        )
+
+    def obstacle_log_attenuation_pair(
+        self,
+        isotope: str,
+        source_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+    ) -> float:
+        """Return log obstacle transmission, log(A_env), for one ray."""
+        return -float(
+            self.obstacle_optical_depth_pair(
+                isotope=isotope,
+                source_pos=source_pos,
+                detector_pos=detector_pos,
+            )
+        )
+
+    def obstacle_attenuation_factor_pair(
+        self,
+        isotope: str,
+        source_pos: NDArray[np.float64],
+        detector_pos: NDArray[np.float64],
+    ) -> float:
+        """Return obstacle-only Beer-Lambert attenuation for one ray."""
+        tau = self.obstacle_optical_depth_pair(
+            isotope=isotope,
+            source_pos=source_pos,
+            detector_pos=detector_pos,
+        )
+        if tau <= 0.0:
+            return 1.0
+        return float(np.exp(-tau))
+
     def _obstacle_attenuation_factor(
         self,
         isotope: str,
         source_pos: NDArray[np.float64],
         detector_pos: NDArray[np.float64],
     ) -> float:
-        """Return Beer-Lambert attenuation through concrete obstacle cells."""
-        if self.obstacle_grid is None:
-            return 1.0
-        path_cm = self.obstacle_path_length_cm(source_pos, detector_pos)
-        if path_cm <= 0.0:
-            return 1.0
-        return float(np.exp(-self.obstacle_mu_cm_inv(isotope) * path_cm))
+        """Return Beer-Lambert attenuation through known obstacle components."""
+        return self.obstacle_attenuation_factor_pair(
+            isotope=isotope,
+            source_pos=source_pos,
+            detector_pos=detector_pos,
+        )
 
     def obstacle_gpu_kwargs(self, isotope: str) -> dict[str, object]:
         """Return optional GPU kwargs for obstacle attenuation."""
@@ -630,6 +788,7 @@ class ContinuousKernel:
         return {
             "obstacle_boxes_m": boxes,
             "obstacle_mu_cm_inv": self.obstacle_mu_cm_inv(isotope),
+            "obstacle_mu_cm_inv_by_box": self.obstacle_mu_values_cm_inv(isotope),
             "obstacle_buildup_coeff": self.obstacle_buildup_coeff,
         }
 
@@ -662,6 +821,26 @@ class ContinuousKernel:
             1.0 - torch.exp(-torch.clamp(tau_obstacle, min=0.0))
         )
         return torch.clamp(factor, min=1.0)
+
+    def _obstacle_tau_from_lengths_torch(
+        self,
+        isotope: str,
+        path_by_box_cm: "torch.Tensor",
+        *,
+        device: "torch.device",
+        dtype: "torch.dtype",
+    ) -> "torch.Tensor":
+        """Return material optical depth from per-box torch path lengths."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        if path_by_box_cm.shape[-1] == 0:
+            return torch.zeros(path_by_box_cm.shape[:-1], device=device, dtype=dtype)
+        mu_values = torch.as_tensor(
+            self.obstacle_mu_values_cm_inv(isotope),
+            device=device,
+            dtype=dtype,
+        )
+        return torch.sum(path_by_box_cm * mu_values, dim=-1)
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
@@ -859,13 +1038,12 @@ class ContinuousKernel:
         if self.obstacle_grid is None:
             buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
             return float(min(1.0, np.exp(-(tau_fe + tau_pb)) * buildup))
-        obstacle_path_cm = obstacle_path_length_cm(
+        tau_obstacle = obstacle_optical_depth(
             source_pos=source_pos,
             detector_pos=target_pos,
             obstacle_boxes_m=self.obstacle_boxes_m(),
+            obstacle_mu_cm_inv_by_box=self.obstacle_mu_values_cm_inv(isotope),
         )
-        if obstacle_path_cm > 0.0:
-            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope) * obstacle_path_cm)
         total_tau = tau_fe + tau_pb + tau_obstacle
         buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
         return float(min(1.0, np.exp(-total_tau) * buildup))
@@ -1055,19 +1233,30 @@ class ContinuousKernel:
         if boxes_np.size:
             boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
             if sample_count > 1:
-                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                obstacle_path_cm = obstacle_path_lengths_between_points_by_box_cm_torch(
                     source_pos=sampled_sources,
                     target_pos=targets,
                     obstacle_boxes_m=boxes_t,
                     tol=tol,
                 )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
+                )
             else:
-                obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                obstacle_path_cm = obstacle_path_lengths_by_box_cm_torch(
                     positions=sources_t,
                     detector_pos=detector_t.reshape(3),
                     obstacle_boxes_m=boxes_t,
+                )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
                 ).unsqueeze(-1)
-            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope)) * obstacle_path_cm
         total_tau = tau_fe + tau_pb + tau_obstacle
         buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
         att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
@@ -1163,19 +1352,30 @@ class ContinuousKernel:
         if boxes_np.size:
             boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
             if sample_count > 1:
-                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                obstacle_path_cm = obstacle_path_lengths_between_points_by_box_cm_torch(
                     source_pos=sampled_sources,
                     target_pos=targets,
                     obstacle_boxes_m=boxes_t,
                     tol=tol,
                 )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
+                )
             else:
-                obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                obstacle_path_cm = obstacle_path_lengths_by_box_cm_torch(
                     positions=sources_t,
                     detector_pos=detector_t.reshape(3),
                     obstacle_boxes_m=boxes_t,
+                )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
                 ).unsqueeze(-1)
-            tau_obstacle = float(self.obstacle_mu_cm_inv(isotope)) * obstacle_path_cm
         total_tau = tau_fe + tau_pb + tau_obstacle
         buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
         att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
@@ -1306,22 +1506,31 @@ class ContinuousKernel:
             if boxes_np.size:
                 boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
                 if sample_count > 1:
-                    obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                    obstacle_path_cm = obstacle_path_lengths_between_points_by_box_cm_torch(
                         source_pos=sampled_sources,
                         target_pos=targets,
                         obstacle_boxes_m=boxes_t,
                         tol=tol,
                     )
+                    tau_obstacle_base = self._obstacle_tau_from_lengths_torch(
+                        isotope,
+                        obstacle_path_cm,
+                        device=device,
+                        dtype=dtype,
+                    )
                 else:
-                    obstacle_path_cm = obstacle_path_lengths_cm_torch(
+                    obstacle_path_cm = obstacle_path_lengths_by_box_cm_torch(
                         positions=sources_t,
                         detector_pos=detector_t.reshape(3),
                         obstacle_boxes_m=boxes_t,
+                    )
+                    tau_obstacle_base = self._obstacle_tau_from_lengths_torch(
+                        isotope,
+                        obstacle_path_cm,
+                        device=device,
+                        dtype=dtype,
                     ).unsqueeze(-1)
-                tau_obstacle = (
-                    float(self.obstacle_mu_cm_inv(isotope))
-                    * obstacle_path_cm.unsqueeze(0)
-                )
+                tau_obstacle = tau_obstacle_base.unsqueeze(0)
             total_tau = tau_fe + tau_pb + tau_obstacle
             buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
             att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
@@ -1457,16 +1666,18 @@ class ContinuousKernel:
             boxes_np = self.obstacle_boxes_m()
             if boxes_np.size:
                 boxes_t = torch.as_tensor(boxes_np, device=device, dtype=dtype)
-                obstacle_path_cm = obstacle_path_lengths_between_points_cm_torch(
+                obstacle_path_cm = obstacle_path_lengths_between_points_by_box_cm_torch(
                     source_pos=sampled_sources,
                     target_pos=targets,
                     obstacle_boxes_m=boxes_t,
                     tol=tol,
                 )
-                tau_obstacle = (
-                    float(self.obstacle_mu_cm_inv(isotope))
-                    * obstacle_path_cm.unsqueeze(0)
-                )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
+                ).unsqueeze(0)
             total_tau = tau_fe + tau_pb + tau_obstacle
             buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
             att = torch.clamp(torch.exp(-total_tau) * buildup, max=1.0)
@@ -1504,7 +1715,7 @@ class ContinuousKernel:
             ]
             return np.vstack(rows).astype(float, copy=False)
         self._gpu_enabled()
-        chunk = max(1, int(chunk_size))
+        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=True)
         parts: list[NDArray[np.float64]] = []
         for start in range(0, sources_arr.shape[0], chunk):
             stop = min(start + chunk, sources_arr.shape[0])
@@ -1559,7 +1770,7 @@ class ContinuousKernel:
         self._gpu_enabled()
         detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
         sources_flat = np.tile(sources_arr, (pose_count, 1))
-        chunk = max(1, int(chunk_size))
+        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=True)
         parts: list[NDArray[np.float64]] = []
         for start in range(0, sources_flat.shape[0], chunk):
             stop = min(start + chunk, sources_flat.shape[0])
@@ -1609,7 +1820,7 @@ class ContinuousKernel:
                 dtype=float,
             )
         self._gpu_enabled()
-        chunk = max(1, int(chunk_size))
+        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=False)
         parts: list[NDArray[np.float64]] = []
         for start in range(0, sources_arr.shape[0], chunk):
             stop = min(start + chunk, sources_arr.shape[0])

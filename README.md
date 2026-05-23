@@ -153,9 +153,21 @@ uv run python main.py --mode python-gui --max-steps 3
 
 Random obstacle layouts can also be generated at startup. If Blender is
 available, a matching USD environment is written under
-`results/blender_environments/`. Random layouts reserve a connected corridor
-from the initial robot cell toward a far corner, so the generated obstacle cells
-cannot fully block robot motion. The startup order is:
+`results/blender_environments/`. Random layouts always reserve a connected
+whole-room exploration backbone before obstacle cells are sampled. This keeps
+reachable lanes across the room instead of merely opening one narrow passage,
+so random obstacles cannot isolate large unobservable regions from the robot.
+Blocked cells are not exported as fully solid concrete cubes. Each random cell
+is replaced by a known Manchester-style clutter asset, such as a hollow steel
+cabinet, pipe rack, partly filled drums, concrete barrier, or aluminum frame.
+The robot traversability map uses each asset footprint, while Geant4 and the PF
+expected-count model use the known component boxes, materials, and hollow
+internal structure for partial attenuation.
+When `--environment-mode random` is used without an explicit `--source-config`,
+the source layout is also generated randomly, but sources are constrained to
+physical surfaces: floor, ceiling, room walls, exposed obstacle sides, or
+obstacle tops. Random source generation never places sources in open air or
+inside obstacle volumes. The startup order is:
 
 1. Generate the random 3D USD environment.
 2. Project its obstacle volumes onto the floor and write a 2D robot traversable map.
@@ -166,7 +178,7 @@ The traversability JSON and PNG are written next to the generated USD as
 `planning.traversability.TraversabilityMap.load(...)` and passed as `map_api`
 to future path-planning code. When a base USD such as Manchester Drum_Store is
 used, Blender extracts occupancy from the imported USD meshes and the generated
-obstacle boxes before the simulator is reset.
+known obstacle assets before the simulator is reset.
 
 ```bash
 uv run python main.py \
@@ -174,6 +186,16 @@ uv run python main.py \
   --environment-mode random \
   --obstacle-seed 7 \
   --max-steps 3
+```
+
+To keep a fixed source layout while randomizing only the obstacles, pass the
+source JSON explicitly:
+
+```bash
+uv run python main.py \
+  --full-simulation \
+  --environment-mode random \
+  --source-config source_layouts/demo_sources.json
 ```
 
 ### Isaac Sim backend
@@ -274,8 +296,8 @@ uv run python main.py \
 
 The same Manchester USD can be used as the base for random layouts. In random
 mode, `main.py` reads `usd_path` from the simulation config, imports that USD in
-Blender, adds the generated obstacle layout, writes a 2D traversability map
-from the combined 3D scene, and only then starts/resets the simulator:
+Blender, adds the generated known obstacle assets, writes a 2D traversability
+map from the combined 3D scene, and only then starts/resets the simulator:
 
 ```bash
 uv run python main.py \
@@ -308,21 +330,16 @@ The repository default is the same standard full simulation, so
 `configs/geant4/variance_reduction_external_no_isaac_32threads.json`.
 Use `--python-cui` only when you explicitly want the analytic Python model.
 
-Use `configs/geant4/external_gui_scene.json` when you want native Geant4
+Use `--mode geant4-isaacsim-gui` when you want the standard native Geant4
 transport paired with an Isaac Sim sidecar for robot motion and visualization.
-Start the Isaac sidecar with Isaac Sim Python first, then let `main.py`
-auto-start the Geant4 sidecar and reuse the running Isaac sidecar.
+The default GUI config is
+`configs/geant4/variance_reduction_external_gui_32threads.json`, which inherits
+the standard no-GUI full-simulation config and only adds Isaac Sim sidecar
+startup settings.
 
 ```bash
-# Terminal 1
-"$ISAACSIM_PYTHON" \
-  scripts/run_isaacsim_bridge.py \
-  --config configs/isaacsim/real_scene.json
-
-# Terminal 2
 uv run python main.py \
   --mode geant4-isaacsim-gui \
-  --sim-config configs/geant4/external_gui_scene.json \
   --max-steps 5
 ```
 
@@ -336,10 +353,10 @@ uv run python main.py \
   --max-steps 5
 ```
 
-`configs/geant4/external_gui_scene.json` uses the native external Geant4 engine while
-reading scene geometry from the USD stage. It includes Poisson source emission,
-explicit stage/shield geometry, Geant4 EM interactions, detector response
-smearing, and dead-time scaling.
+`configs/geant4/external_gui_scene.json` remains available for explicit
+USD-backed Manchester Drum Store runs. It is not the default GUI mode because
+the default GUI/CUI pair should share the same generated environment and Geant4
+runtime settings.
 
 ### Native Geant4 executable
 

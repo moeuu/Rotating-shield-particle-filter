@@ -44,8 +44,11 @@ def prune_spurious_sources(
     likelihood_kwargs = {
         "model": str(params.get("count_likelihood_model", params.get("model", "poisson"))),
         "transport_model_rel_sigma": float(params.get("transport_model_rel_sigma", 0.0)),
+        "transport_model_abs_sigma": float(params.get("transport_model_abs_sigma", 0.0)),
         "spectrum_count_rel_sigma": float(params.get("spectrum_count_rel_sigma", 0.0)),
         "spectrum_count_abs_sigma": float(params.get("spectrum_count_abs_sigma", 0.0)),
+        "low_count_abs_sigma": float(params.get("low_count_abs_sigma", 0.0)),
+        "low_count_transition_counts": float(params.get("low_count_transition_counts", 0.0)),
         "student_t_df": float(params.get("count_likelihood_df", 5.0)),
     }
 
@@ -229,12 +232,24 @@ def prune_spurious_sources_continuous(
                 float(likelihood["transport_model_rel_sigma"]),
             )
             params_for_iso.setdefault(
+                "transport_model_abs_sigma",
+                float(likelihood["transport_model_abs_sigma"]),
+            )
+            params_for_iso.setdefault(
                 "spectrum_count_rel_sigma",
                 float(likelihood["spectrum_count_rel_sigma"]),
             )
             params_for_iso.setdefault(
                 "spectrum_count_abs_sigma",
                 float(likelihood["spectrum_count_abs_sigma"]),
+            )
+            params_for_iso.setdefault(
+                "low_count_abs_sigma",
+                float(likelihood["low_count_abs_sigma"]),
+            )
+            params_for_iso.setdefault(
+                "low_count_transition_counts",
+                float(likelihood["low_count_transition_counts"]),
             )
             params_for_iso.setdefault(
                 "count_likelihood_df",

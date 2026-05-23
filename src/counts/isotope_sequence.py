@@ -8,7 +8,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from spectrum.baseline import asymmetric_least_squares
-from spectrum.dead_time import non_paralyzable_correction
 from spectrum.library import Nuclide
 from spectrum.smoothing import gaussian_smooth
 

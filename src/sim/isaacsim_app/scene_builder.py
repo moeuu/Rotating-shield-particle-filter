@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 
 from measurement.model import PointSource
+from measurement.obstacle_assets import KnownObstacleInstance, obstacle_instances_from_dicts
 
+from sim.isaacsim_app.pf_visualizer import ISOTOPE_COLORS
 from sim.isaacsim_app.stage_backend import StageBackend
 from sim.shield_geometry import (
     SHIELD_CONTACT_RADIUS_M,
@@ -66,6 +68,7 @@ class SceneDescription:
     obstacle_grid_shape: tuple[int, int] = (0, 0)
     obstacle_material: str = "concrete"
     obstacle_cells: list[tuple[int, int]] = field(default_factory=list)
+    obstacle_instances: tuple[KnownObstacleInstance, ...] = ()
     author_obstacle_prims: bool = True
     author_room_boundary_prims: bool = False
     sources: list[SourceDescription] = field(default_factory=list)
@@ -137,6 +140,9 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         raise ValueError("prim_paths must be a JSON object.")
     prim_paths = StagePrimPaths(**{key: str(value) for key, value in prim_paths_payload.items()})
     obstacle_cells = [tuple(int(v) for v in cell) for cell in payload.get("obstacle_cells", [])]
+    obstacle_instances = obstacle_instances_from_dicts(
+        payload.get("obstacle_instances", [])
+    )
     return SceneDescription(
         room_size_xyz=(room_size[0], room_size[1], room_size[2]),
         obstacle_origin_xy=(obstacle_origin[0], obstacle_origin[1]),
@@ -144,6 +150,7 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         obstacle_grid_shape=obstacle_grid_shape,
         obstacle_material=str(payload.get("obstacle_material", "concrete")),
         obstacle_cells=obstacle_cells,
+        obstacle_instances=obstacle_instances,
         author_obstacle_prims=bool(payload.get("author_obstacle_prims", True)),
         author_room_boundary_prims=bool(payload.get("author_room_boundary_prims", False)),
         sources=sources,
@@ -209,8 +216,23 @@ class SceneBuilder:
         self.stage_backend.ensure_xform(prim_paths.robot_root)
 
     def _author_obstacles(self, scene: SceneDescription) -> None:
-        """Create simple box markers for blocked cells."""
+        """Create known obstacle assets or simple box markers for blocked cells."""
         if not scene.author_obstacle_prims:
+            return
+        if scene.obstacle_instances:
+            for instance in scene.obstacle_instances:
+                self.stage_backend.ensure_xform(
+                    f"{scene.prim_paths.obstacles_root}/{instance.name}"
+                )
+                for component in instance.components:
+                    self.stage_backend.ensure_box(
+                        f"{scene.prim_paths.obstacles_root}/{instance.name}/{component.name}",
+                        size_xyz=component.size_xyz,
+                        translation_xyz=component.center_xyz,
+                        color_rgb=(0.3, 0.3, 0.3),
+                        material=component.material,
+                        transport_group="obstacle",
+                    )
             return
         z_center = 0.5 * self.obstacle_height_m
         cell_size = scene.obstacle_cell_size_m
@@ -232,7 +254,7 @@ class SceneBuilder:
         if not scene.author_room_boundary_prims:
             return
         size_x, size_y, size_z = (float(value) for value in scene.room_size_xyz)
-        wall_height = min(3.0, max(0.1, size_z))
+        wall_height = max(0.1, size_z)
         wall_thickness = 0.1
         environment_root = "/World/Environment"
         wall_root = f"{environment_root}/Wall"
@@ -264,12 +286,18 @@ class SceneBuilder:
                 (wall_thickness, size_y, wall_height),
                 (-0.5 * wall_thickness, 0.5 * size_y, 0.5 * wall_height),
             ),
+            (
+                "Ceiling",
+                (size_x, size_y, wall_thickness),
+                (0.5 * size_x, 0.5 * size_y, size_z + 0.5 * wall_thickness),
+            ),
         ):
+            color_rgb = (0.88, 0.93, 1.0) if name == "Ceiling" else (0.75, 0.78, 0.82)
             self.stage_backend.ensure_box(
                 f"{wall_root}/{name}",
                 size_xyz=size_xyz,
                 translation_xyz=center_xyz,
-                color_rgb=(0.75, 0.78, 0.82),
+                color_rgb=color_rgb,
                 material="concrete",
                 transport_group="wall",
             )
@@ -282,7 +310,7 @@ class SceneBuilder:
                 f"{scene.prim_paths.sources_root}/{prim_name}_{index:02d}",
                 radius_m=0.08,
                 translation_xyz=source.position_xyz,
-                color_rgb=(1.0, 0.0, 0.0),
+                color_rgb=ISOTOPE_COLORS.get(source.isotope, (1.0, 0.8, 0.05)),
             )
 
     def _author_robot(self, prim_paths: StagePrimPaths) -> None:

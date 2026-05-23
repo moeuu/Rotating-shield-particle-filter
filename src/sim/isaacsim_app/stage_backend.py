@@ -465,6 +465,7 @@ class FakeStageBackend(StageBackend):
             prim.metadata["visual_opacity"] = float(opacity)
             prim.metadata["visual_roughness"] = float(roughness)
             prim.metadata["visual_emissive_scale"] = float(emissive_scale)
+            prim.metadata["visual_visible"] = bool(float(opacity) > 0.0)
 
     def remove_prim(self, path: str) -> None:
         """Remove a fake prim and any children under it."""
@@ -1274,6 +1275,7 @@ class IsaacSimStageBackend(StageBackend):
             geom = self._UsdGeom.Gprim(prim)
             self._set_display_color(geom, color_rgb)
             self._set_display_opacity(geom, opacity)
+            self._set_visibility(prim, visible=float(opacity) > 0.0)
             self._UsdShade.MaterialBindingAPI(prim).Bind(material)
 
     def remove_prim(self, path: str) -> None:
@@ -1528,6 +1530,12 @@ class IsaacSimStageBackend(StageBackend):
         """Set simple display opacity on a gprim."""
         opacity_attr = geom_prim.CreateDisplayOpacityAttr()
         opacity_attr.Set([float(opacity)])
+
+    def _set_visibility(self, prim: Any, *, visible: bool) -> None:
+        """Set USD visibility for visual-only hidden geometry."""
+        imageable = self._UsdGeom.Imageable(prim)
+        visibility_attr = imageable.CreateVisibilityAttr()
+        visibility_attr.Set("inherited" if visible else "invisible")
 
     def _set_material_attr(self, prim: Any, material: str | None) -> None:
         """Author a lightweight custom material attribute on a prim."""

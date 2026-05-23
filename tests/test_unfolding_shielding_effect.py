@@ -1,7 +1,6 @@
 """Verify shielding attenuates unfolded isotope-wise counts (IAS19_EIJIMORITA)."""
 
 import numpy as np
-import pytest
 
 from pathlib import Path
 

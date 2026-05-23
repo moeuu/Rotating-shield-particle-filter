@@ -124,6 +124,35 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
     )
 
 
+def test_response_poisson_recovers_weak_peaks_under_co_dominant_continuum() -> None:
+    """Quadratic photopeak anchors should preserve weak nuclides under strong Co-60."""
+    config = SpectrumConfig(
+        dead_time_tau_s=0.0,
+        response_efficiency_model="unit",
+        use_incident_gamma_response_matrix=True,
+        normalize_line_intensities=True,
+    )
+    decomposer = SpectralDecomposer(config)
+    isotopes = ["Cs-137", "Co-60", "Eu-154"]
+    truth = {"Cs-137": 10000.0, "Co-60": 17_800_000.0, "Eu-154": 67_000.0}
+    response = decomposer._count_response_matrix()
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for isotope in isotopes:
+        index = decomposer.isotope_names.index(isotope)
+        spectrum += truth[isotope] * response[:, index]
+
+    estimates = decomposer.compute_response_poisson_counts(
+        spectrum,
+        isotopes=isotopes,
+        include_background=True,
+        live_time_s=30.0,
+    )
+
+    assert estimates["Cs-137"] == pytest.approx(truth["Cs-137"], rel=0.08)
+    assert estimates["Eu-154"] == pytest.approx(truth["Eu-154"], rel=0.08)
+    assert estimates["Co-60"] == pytest.approx(truth["Co-60"], rel=0.02)
+
+
 def test_incident_gamma_response_folding_adds_continuum_and_preserves_counts() -> None:
     """Incident-gamma folding should make detector-like spectra without changing total entries."""
     config = SpectrumConfig(
@@ -250,6 +279,68 @@ def test_photopeak_combiner_limits_high_roi_outlier() -> None:
     combined = decomposer._combine_photopeak_estimates(estimates)
 
     assert combined < 1500.0
+
+
+def test_photopeak_combiner_suppresses_unsupported_mixed_roi() -> None:
+    """Mixed-isotope ROI evidence should need independent nuclide support."""
+    decomposer = SpectralDecomposer(SpectrumConfig(dead_time_tau_s=0.0))
+    estimates = [
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=0.0,
+            variance=1000.0,
+            roi_min_keV=820.0,
+            roi_max_keV=926.0,
+            reduced_chi2=1.0,
+            signal_to_noise=0.5,
+            mixed_isotope_roi=False,
+        ),
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=1000.0,
+            variance=100.0,
+            roi_min_keV=1110.0,
+            roi_max_keV=1399.0,
+            reduced_chi2=1.0,
+            signal_to_noise=10.0,
+            mixed_isotope_roi=True,
+        ),
+    ]
+
+    combined = decomposer._combine_photopeak_estimates(estimates)
+
+    assert combined == pytest.approx(0.0)
+
+
+def test_photopeak_combiner_keeps_supported_mixed_roi() -> None:
+    """Mixed-isotope ROI evidence should be retained when independent lines agree."""
+    decomposer = SpectralDecomposer(SpectrumConfig(dead_time_tau_s=0.0))
+    estimates = [
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=800.0,
+            variance=100.0,
+            roi_min_keV=820.0,
+            roi_max_keV=926.0,
+            reduced_chi2=1.0,
+            signal_to_noise=8.0,
+            mixed_isotope_roi=False,
+        ),
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=1000.0,
+            variance=100.0,
+            roi_min_keV=1110.0,
+            roi_max_keV=1399.0,
+            reduced_chi2=1.0,
+            signal_to_noise=10.0,
+            mixed_isotope_roi=True,
+        ),
+    ]
+
+    combined = decomposer._combine_photopeak_estimates(estimates)
+
+    assert combined > 800.0
 
 
 def test_response_model_counts_match_shield_theory_for_mixed_python_spectrum() -> None:

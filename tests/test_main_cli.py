@@ -122,6 +122,7 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
     assert captured["notify_spectrum_every"] == 2
     assert captured["notify_spectrum_max_bins"] == 256
     assert captured["notification_config"].enabled is True
+    assert captured["source_generation_mode"] == "surface_random"
 
 
 def test_main_no_notify_overrides_spectrum_notifications(monkeypatch) -> None:
@@ -148,6 +149,87 @@ def test_main_no_notify_overrides_spectrum_notifications(monkeypatch) -> None:
 
     assert captured["notify_spectrum"] is True
     assert captured["notification_config"].enabled is False
+
+
+def test_main_default_max_poses_uses_runtime_config(monkeypatch) -> None:
+    """The standard full-simulation CLI should not impose its own pose cap."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    module.main()
+
+    assert captured["max_poses"] is None
+
+
+def test_main_explicit_source_config_keeps_fixed_sources_in_random_environment(
+    monkeypatch,
+) -> None:
+    """Explicit source configs should override random-environment source generation."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--environment-mode",
+            "random",
+            "--source-config",
+            "source_layouts/demo_sources.json",
+        ],
+    )
+
+    module.main()
+
+    assert captured["source_generation_mode"] == "demo"
+    assert captured["sources"] is not None
+
+
+def test_main_random_source_token_uses_surface_source_generation(monkeypatch) -> None:
+    """The random source-config token should request surface source generation."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--source-config",
+            "random",
+            "--source-seed",
+            "11",
+            "--random-source-count",
+            "5",
+            "--random-source-intensity-cps-1m",
+            "45000",
+        ],
+    )
+
+    module.main()
+
+    assert captured["source_generation_mode"] == "surface_random"
+    assert captured["random_source_seed"] == 11
+    assert captured["random_source_count"] == 5
+    assert captured["random_source_intensity_cps_1m"] == 45000.0
 
 
 def test_main_allows_min_rotations_override(monkeypatch) -> None:
@@ -185,7 +267,7 @@ def test_main_allows_min_rotations_override(monkeypatch) -> None:
         (
             "geant4-isaacsim-gui",
             "geant4",
-            "configs/geant4/external_gui_scene.json",
+            "configs/geant4/variance_reduction_external_gui_32threads.json",
         ),
         ("python-cui", "analytic", "configs/python/high_fidelity_no_isaac.json"),
         (
@@ -282,7 +364,7 @@ def test_main_gui_alias_selects_geant4_isaacsim(monkeypatch) -> None:
 
     assert captured["sim_backend"] == "geant4"
     assert str(captured["sim_config_path"]).endswith(
-        "configs/geant4/external_gui_scene.json"
+        "configs/geant4/variance_reduction_external_gui_32threads.json"
     )
     assert captured["live"] is False
 

@@ -13,6 +13,10 @@ from sim.isaacsim_app.observation_model import (
     ObservationModel,
     StageMaterialRule,
 )
+from sim.isaacsim_app.pf_visualizer import (
+    PFSceneVisualizationConfig,
+    PFSceneVisualizer,
+)
 from sim.isaacsim_app.robot_controller import RobotController
 from sim.isaacsim_app.radiation_visualizer import RadiationSceneVisualizer
 from sim.isaacsim_app.scene_builder import SceneBuilder, SceneDescription
@@ -86,6 +90,9 @@ class IsaacSimAppConfig:
     initial_camera: InitialCameraConfig | None = None
     lighting: StageLightingConfig | None = None
     preserve_viewport_on_reset: bool = False
+    pf_visualization: PFSceneVisualizationConfig = field(
+        default_factory=PFSceneVisualizationConfig
+    )
     author_obstacle_prims: bool | None = None
     stage_visual_rules: tuple[StageVisualRule, ...] = field(default_factory=tuple)
     stage_material_rules: tuple[StageMaterialRule, ...] = field(default_factory=tuple)
@@ -135,6 +142,7 @@ class IsaacSimAppConfig:
             initial_camera=_parse_initial_camera_config(payload),
             lighting=_parse_lighting_config(payload),
             preserve_viewport_on_reset=bool(payload.get("preserve_viewport_on_reset", False)),
+            pf_visualization=PFSceneVisualizationConfig.from_mapping(payload),
             author_obstacle_prims=(
                 None
                 if payload.get("author_obstacle_prims") is None
@@ -277,6 +285,7 @@ class IsaacSimApplication:
         self.scene_builder: SceneBuilder | None = None
         self.robot_controller: RobotController | None = None
         self.radiation_visualizer: RadiationSceneVisualizer | None = None
+        self.pf_visualizer: PFSceneVisualizer | None = None
         self.observation_model: ObservationModel
         self._stage_backend = stage_backend
         self._loaded_scene_usd_path: str | None = None
@@ -305,6 +314,10 @@ class IsaacSimApplication:
             )
         self._stage_backend = backend
         self.radiation_visualizer = RadiationSceneVisualizer(backend)
+        self.pf_visualizer = PFSceneVisualizer(
+            backend,
+            config=self.config.pf_visualization,
+        )
         self.scene_builder = SceneBuilder(
             backend,
             detector_height_m=self.config.detector_height_m,
@@ -463,6 +476,14 @@ class IsaacSimApplication:
         if self.radiation_visualizer is None:
             return
         self.radiation_visualizer.update_from_observation(observation)
+
+    def visualize_pf_state(self, payload: dict[str, Any]) -> None:
+        """Render PF particles and estimates as visual-only Isaac Sim markers."""
+        if self.use_mock:
+            return
+        if self.pf_visualizer is None:
+            return
+        self.pf_visualizer.update_from_payload(payload)
 
     def update(self) -> None:
         """Pump the simulator event loop once when a real backend is active."""

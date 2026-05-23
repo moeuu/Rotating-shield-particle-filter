@@ -1,4 +1,5 @@
 """CLI entry point for the real-time PF demo."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -26,6 +27,12 @@ STANDARD_GEANT4_FULL_CONFIG = (
     / "geant4"
     / "variance_reduction_external_no_isaac_32threads.json"
 )
+STANDARD_GEANT4_GUI_CONFIG = (
+    ROOT
+    / "configs"
+    / "geant4"
+    / "variance_reduction_external_gui_32threads.json"
+)
 
 RUN_MODE_ALIASES = {
     "gui": "geant4-isaacsim-gui",
@@ -43,9 +50,7 @@ RUN_MODE_DEFAULTS = {
     },
     "geant4-isaacsim-gui": {
         "sim_backend": "geant4",
-        "sim_config": (
-            ROOT / "configs" / "geant4" / "external_gui_scene.json"
-        ).as_posix(),
+        "sim_config": STANDARD_GEANT4_GUI_CONFIG.as_posix(),
         "matplotlib_live": False,
     },
     "python-cui": {
@@ -62,6 +67,7 @@ RUN_MODE_DEFAULTS = {
     },
 }
 RUN_MODE_CHOICES = tuple(RUN_MODE_DEFAULTS.keys()) + tuple(RUN_MODE_ALIASES.keys())
+RANDOM_SOURCE_CONFIG_TOKENS = {"random", "surface-random", "surface_random"}
 
 
 def _normalize_run_mode(mode: str | None) -> str:
@@ -108,6 +114,12 @@ def _resolve_run_settings(
     if args.no_live or args.headless:
         matplotlib_live = False
     return run_mode, sim_backend, sim_config, matplotlib_live
+
+
+def _source_config_was_explicit(argv: list[str] | None = None) -> bool:
+    """Return whether the CLI explicitly set --source-config."""
+    raw_args = sys.argv[1:] if argv is None else argv
+    return any(arg == "--source-config" or arg.startswith("--source-config=") for arg in raw_args)
 
 
 def main() -> None:
@@ -194,8 +206,8 @@ def main() -> None:
     parser.add_argument(
         "--max-poses",
         type=int,
-        default=15,
-        help="Maximum number of measurement poses (default: 15).",
+        default=None,
+        help="Maximum number of measurement poses (default: runtime config or no cap).",
     )
     parser.add_argument(
         "--pose-candidates",
@@ -237,7 +249,28 @@ def main() -> None:
         "--source-config",
         type=str,
         default=DEFAULT_SOURCE_CONFIG.as_posix(),
-        help="Path to a JSON file that defines the point sources.",
+        help=(
+            "Path to a JSON file that defines the point sources, or 'random' "
+            "for surface-constrained random sources."
+        ),
+    )
+    parser.add_argument(
+        "--source-seed",
+        type=int,
+        default=None,
+        help="RNG seed for surface-constrained random source generation.",
+    )
+    parser.add_argument(
+        "--random-source-count",
+        type=int,
+        default=3,
+        help="Number of surface-constrained random sources to generate.",
+    )
+    parser.add_argument(
+        "--random-source-intensity-cps-1m",
+        type=float,
+        default=30000.0,
+        help="Detector cps@1m assigned to each generated random source.",
     )
     parser.add_argument(
         "--obstacle-config",
@@ -367,7 +400,10 @@ def main() -> None:
         "--max-sources",
         type=int,
         default=None,
-        help="Maximum number of sources per isotope (defaults to 3 with --birth, else 1).",
+        help=(
+            "Maximum number of sources per isotope. Defaults to no cap with "
+            "--birth, else 1."
+        ),
     )
     parser.add_argument(
         "--temper-max-resamples",
@@ -702,7 +738,7 @@ def main() -> None:
         parser,
     )
     if args.max_sources is None:
-        args.max_sources = 3 if args.birth else 1
+        args.max_sources = None if args.birth else 1
     pf_overrides: dict[str, object] = {
         "max_sources": args.max_sources,
         "max_resamples_per_observation": args.temper_max_resamples,
@@ -747,7 +783,15 @@ def main() -> None:
             int(args.planning_rollout_particles),
         )
     sources = None
-    if args.source_config:
+    source_generation_mode = "demo"
+    source_config_token = str(args.source_config).strip().lower() if args.source_config else ""
+    source_config_explicit = _source_config_was_explicit()
+    if source_config_token in RANDOM_SOURCE_CONFIG_TOKENS or (
+        args.environment_mode == "random" and not source_config_explicit
+    ):
+        source_generation_mode = "surface_random"
+        print("Using surface-constrained random source generation.")
+    elif args.source_config:
         source_path = Path(args.source_config)
         if not source_path.is_absolute():
             source_path = (ROOT / source_path).resolve()
@@ -829,6 +873,10 @@ def main() -> None:
         dss_signature_weight=args.dss_signature_weight,
         dss_differential_weight=args.dss_differential_weight,
         dss_rotation_weight=args.dss_rotation_weight,
+        source_generation_mode=source_generation_mode,
+        random_source_seed=args.source_seed,
+        random_source_count=args.random_source_count,
+        random_source_intensity_cps_1m=args.random_source_intensity_cps_1m,
         notification_config=notification_config,
         notify_spectrum=args.notify_spectrum,
         notify_spectrum_every=args.notify_spectrum_every,

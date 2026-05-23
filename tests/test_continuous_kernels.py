@@ -13,10 +13,9 @@ from measurement.obstacles import ObstacleGrid
 from measurement.shielding import (
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
-    generate_octant_orientations,
 )
 from measurement.continuous_kernels import expected_counts_single_isotope
-from pf.gpu_utils import expected_counts_pair_torch
+from pf.gpu_utils import expected_counts_all_pairs_torch, expected_counts_pair_torch
 
 
 def test_geometric_term_inverse_square() -> None:
@@ -56,7 +55,6 @@ def test_attenuation_applies_blocking_factor() -> None:
     """Blocked orientation should reduce expected counts by exp(-mu*L)."""
     shield_params = ShieldParams()
     kernel = ContinuousKernel(shield_params=shield_params, use_gpu=False)
-    orientations = generate_octant_orientations()
     det = np.array([0.0, 0.0, 0.0])
     src = np.array([1.0, 1.0, 1.0])
     strengths = np.array([10.0])
@@ -219,6 +217,38 @@ def test_concrete_obstacle_path_reduces_kernel_value() -> None:
     assert blocked == pytest.approx(unblocked * np.exp(-1.0), rel=1e-12)
 
 
+def test_obstacle_only_optical_depth_diagnostics_match_kernel() -> None:
+    """Public obstacle diagnostics should expose the same attenuation used by the kernel."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    )
+    kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+
+    tau = kernel.obstacle_optical_depth_pair("Cs-137", source, detector)
+
+    assert tau == pytest.approx(1.0)
+    assert kernel.obstacle_log_attenuation_pair(
+        "Cs-137",
+        source,
+        detector,
+    ) == pytest.approx(-1.0)
+    assert kernel.obstacle_attenuation_factor_pair(
+        "Cs-137",
+        source,
+        detector,
+    ) == pytest.approx(np.exp(-1.0))
+
+
 def test_broad_beam_buildup_increases_but_bounds_attenuated_counts() -> None:
     """Build-up should increase attenuated broad-beam counts without exceeding unattenuated counts."""
     detector = np.zeros(3, dtype=float)
@@ -339,6 +369,93 @@ def test_gpu_expected_counts_include_obstacle_attenuation_on_cpu_device() -> Non
     )
     expected = (9.0 / 9.0) * np.exp(-1.0)
     assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
+
+
+def test_gpu_expected_counts_all_pairs_matches_pair_loop() -> None:
+    """The batched all-pair GPU helper should match scalar pair evaluation."""
+    torch = pytest.importorskip("torch")
+    device = torch.device("cpu")
+    dtype = torch.float64
+    positions = torch.as_tensor(
+        [
+            [[-1.0, 0.0, 1.0], [-0.5, 0.4, 0.9]],
+            [[1.2, -0.8, 1.1], [0.2, 1.1, 0.7]],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    strengths = torch.as_tensor(
+        [[9.0, 4.0], [6.0, 3.0]],
+        device=device,
+        dtype=dtype,
+    )
+    backgrounds = torch.as_tensor([0.1, 0.2], device=device, dtype=dtype)
+    mask = torch.ones(2, 2, device=device, dtype=dtype)
+    detector = np.array([2.0, 0.25, 1.0], dtype=float)
+    boxes = np.array(
+        [
+            [0.0, -0.5, 0.0, 1.0, 0.5, 2.0],
+            [0.5, 0.7, 0.0, 1.0, 1.2, 1.5],
+        ],
+        dtype=float,
+    )
+    for aperture_samples in (1, 3):
+        all_pairs = expected_counts_all_pairs_torch(
+            detector_pos=detector,
+            positions=positions,
+            strengths=strengths,
+            backgrounds=backgrounds,
+            mask=mask,
+            mu_fe=0.03,
+            mu_pb=0.06,
+            thickness_fe_cm=1.5,
+            thickness_pb_cm=0.8,
+            inner_radius_fe_cm=3.0,
+            inner_radius_pb_cm=4.5,
+            live_time_s=2.0,
+            device=device,
+            dtype=dtype,
+            obstacle_boxes_m=boxes,
+            obstacle_mu_cm_inv=0.01,
+            detector_radius_m=0.04,
+            detector_aperture_samples=aperture_samples,
+            buildup_fe_coeff=0.02,
+            buildup_pb_coeff=0.01,
+            obstacle_buildup_coeff=0.03,
+        )
+        rows = []
+        for fe_idx in range(8):
+            for pb_idx in range(8):
+                rows.append(
+                    expected_counts_pair_torch(
+                        detector_pos=detector,
+                        positions=positions,
+                        strengths=strengths,
+                        backgrounds=backgrounds,
+                        mask=mask,
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                        mu_fe=0.03,
+                        mu_pb=0.06,
+                        thickness_fe_cm=1.5,
+                        thickness_pb_cm=0.8,
+                        inner_radius_fe_cm=3.0,
+                        inner_radius_pb_cm=4.5,
+                        live_time_s=2.0,
+                        device=device,
+                        dtype=dtype,
+                        obstacle_boxes_m=boxes,
+                        obstacle_mu_cm_inv=0.01,
+                        detector_radius_m=0.04,
+                        detector_aperture_samples=aperture_samples,
+                        buildup_fe_coeff=0.02,
+                        buildup_pb_coeff=0.01,
+                        obstacle_buildup_coeff=0.03,
+                    )
+                )
+        pair_loop = torch.stack(rows, dim=0)
+        assert all_pairs.shape == pair_loop.shape
+        assert torch.allclose(all_pairs, pair_loop, rtol=1e-10, atol=1e-10)
 
 
 def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
@@ -689,3 +806,25 @@ def test_continuous_kernel_cuda_matches_cpu_with_obstacles_and_aperture() -> Non
                 pb_index,
             )
             assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)
+
+
+def test_gpu_chunk_size_accounts_for_obstacle_aperture_expansion() -> None:
+    """GPU batching should shrink when obstacle-aperture tensors get large."""
+    blocked = tuple((idx, 0) for idx in range(494))
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(494, 1),
+        blocked_cells=blocked,
+    )
+    kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        detector_radius_m=0.038,
+        detector_aperture_samples=121,
+        gpu_dtype="float64",
+    )
+
+    chunk = kernel._adaptive_torch_chunk_size(8192)
+
+    assert chunk == 66
+    assert chunk < 8192

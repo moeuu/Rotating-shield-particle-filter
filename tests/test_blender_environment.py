@@ -57,7 +57,54 @@ def test_generate_blender_environment_usd_invokes_blender(
     assert manifest_path.exists()
     manifest_text = manifest_path.read_text(encoding="utf-8")
     assert '"obstacle_cells":' in manifest_text
+    assert '"obstacle_instances":' in manifest_text
+    assert '"traversability_rects_xy":' in manifest_text
     assert base_usd_path.as_posix() in manifest_text
+
+
+def test_generate_blender_environment_usd_reports_missing_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The helper should surface Blender output when no USD file is produced."""
+
+    def _fake_which(name: str) -> str:
+        """Resolve the fake Blender executable."""
+        assert name == "blender"
+        return "/usr/bin/blender"
+
+    def _fake_run(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        """Return success without creating the expected USD file."""
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="Traceback: missing base USD",
+            stderr="",
+        )
+
+    monkeypatch.setattr("sim.blender_environment.shutil.which", _fake_which)
+    monkeypatch.setattr("sim.blender_environment.subprocess.run", _fake_run)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((0, 1),),
+    )
+
+    try:
+        generate_blender_environment_usd(
+            grid=grid,
+            output_path=tmp_path / "missing.usda",
+            room_size_xyz=(2.0, 2.0, 3.0),
+        )
+    except RuntimeError as exc:
+        assert "Blender did not create the expected USD file" in str(exc)
+        assert "missing base USD" in str(exc)
+    else:
+        raise AssertionError("Expected missing Blender output to fail.")
 
 
 def test_blender_generator_uses_semantic_wall_group() -> None:
@@ -68,6 +115,8 @@ def test_blender_generator_uses_semantic_wall_group() -> None:
     )
 
     assert '_ensure_empty("Wall", transport_group="wall")' in generator_source
+    assert 'TransparentCeilingMaterial' in generator_source
+    assert '"Ceiling"' in generator_source
     assert 'parent=wall_group' in generator_source
     assert 'transport_group="wall"' in generator_source
     assert '_ensure_empty("Obstacles", transport_group="obstacle")' in generator_source

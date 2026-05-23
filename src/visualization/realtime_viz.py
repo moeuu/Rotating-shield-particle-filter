@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any, Sequence
 
 from pathlib import Path
+import multiprocessing as mp
+import pickle
+import queue
 import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
@@ -54,6 +57,65 @@ class PFFrame:
     spectrum_energy_keV: Optional[NDArray[np.float64]] = None
     spectrum_counts: Optional[NDArray[np.float64]] = None
     spectrum_components_by_isotope: Optional[Dict[str, NDArray[np.float64]]] = None
+
+
+def frame_to_isaac_pf_payload(
+    frame: PFFrame,
+    *,
+    max_particles_per_isotope: int | None = None,
+) -> Dict[str, Any]:
+    """Return a JSON-serializable PF marker payload for Isaac Sim."""
+    max_particles = (
+        None
+        if max_particles_per_isotope is None
+        else max(0, int(max_particles_per_isotope))
+    )
+    particle_positions: Dict[str, list[list[float]]] = {}
+    particle_weights: Dict[str, list[float]] = {}
+    for isotope, positions_raw in frame.particle_positions.items():
+        positions = np.asarray(positions_raw, dtype=float).reshape((-1, 3))
+        weights = np.asarray(
+            frame.particle_weights.get(isotope, np.ones(positions.shape[0])),
+            dtype=float,
+        ).reshape(-1)
+        if weights.size != positions.shape[0]:
+            weights = np.ones(positions.shape[0], dtype=float)
+        if max_particles is not None and max_particles > 0 and positions.shape[0] > max_particles:
+            order = np.argsort(weights)[::-1][:max_particles]
+            positions = positions[order]
+            weights = weights[order]
+        particle_positions[isotope] = _array2_to_list(positions)
+        particle_weights[isotope] = [float(value) for value in weights]
+    estimated_sources = {
+        isotope: _array2_to_list(np.asarray(positions, dtype=float).reshape((-1, 3)))
+        for isotope, positions in frame.estimated_sources.items()
+    }
+    estimated_strengths = {
+        isotope: [float(value) for value in np.asarray(strengths, dtype=float).reshape(-1)]
+        for isotope, strengths in frame.estimated_strengths.items()
+    }
+    payload: Dict[str, Any] = {
+        "step_index": int(frame.step_index),
+        "time_s": float(frame.time),
+        "robot_position": [float(value) for value in np.asarray(frame.robot_position, dtype=float).reshape(-1)[:3]],
+        "particle_positions": particle_positions,
+        "particle_weights": particle_weights,
+        "estimated_sources": estimated_sources,
+        "estimated_strengths": estimated_strengths,
+    }
+    waypoints = _coerce_path_waypoints(frame)
+    if waypoints.size:
+        payload["path_waypoints_xyz"] = _array2_to_list(waypoints)
+    return payload
+
+
+def _array2_to_list(values: NDArray[np.float64]) -> list[list[float]]:
+    """Convert a two-dimensional numeric array to a JSON list."""
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return []
+    arr = arr.reshape((-1, arr.shape[-1]))
+    return [[float(component) for component in row] for row in arr]
 
 
 @dataclass(frozen=True)
@@ -1830,6 +1892,98 @@ class CUISplitPFVisualizer:
         plt.close(fig)
 
 
+def _async_cui_split_worker(
+    config: dict[str, Any],
+    frame_queue: Any,
+) -> None:
+    """Render CUI split-view frames in a dedicated worker process."""
+    visualizer = CUISplitPFVisualizer(**config)
+    while True:
+        message, payload = frame_queue.get()
+        if message == "close":
+            return
+        if message != "frame":
+            continue
+        try:
+            frame = pickle.loads(payload)
+            visualizer.update(frame)
+        except Exception as exc:  # pragma: no cover - worker-side diagnostics only.
+            print(f"Async CUI split visualization worker error: {exc}", flush=True)
+
+
+class AsyncCUISplitPFVisualizer:
+    """Non-blocking process-backed wrapper for CUI split visualization."""
+
+    def __init__(
+        self,
+        isotopes: List[str],
+        output_dir: str | Path,
+        *,
+        world_bounds: Optional[Tuple[float, float, float, float, float, float]] = None,
+        true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
+        true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
+        obstacle_grid: ObstacleGrid | None = None,
+        max_particles_per_isotope: int | None = None,
+        queue_size: int = 2,
+    ) -> None:
+        """Start a renderer process that consumes latest PF frames asynchronously."""
+        self.isotopes = list(isotopes)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.output_dir / "index.html"
+        self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
+        self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
+        self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
+        self._closed = False
+        self._ctx = mp.get_context("spawn")
+        self._queue = self._ctx.Queue(maxsize=max(1, int(queue_size)))
+        config = {
+            "isotopes": self.isotopes,
+            "output_dir": self.output_dir,
+            "world_bounds": world_bounds,
+            "true_sources": true_sources,
+            "true_strengths": true_strengths,
+            "obstacle_grid": obstacle_grid,
+            "max_particles_per_isotope": max_particles_per_isotope,
+        }
+        self._process = self._ctx.Process(
+            target=_async_cui_split_worker,
+            args=(config, self._queue),
+            daemon=True,
+        )
+        self._process.start()
+
+    def update(self, frame: PFFrame) -> None:
+        """Queue the latest frame for asynchronous rendering without blocking."""
+        if self._closed or not self._process.is_alive():
+            return
+        payload = pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL)
+        while True:
+            try:
+                self._queue.put_nowait(("frame", payload))
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def close(self, timeout_s: float = 10.0) -> None:
+        """Ask the renderer process to finish queued work and stop."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.is_alive():
+            try:
+                self._queue.put(("close", None), timeout=1.0)
+            except queue.Full:
+                pass
+            self._process.join(timeout=max(0.1, float(timeout_s)))
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=2.0)
+
+
 def build_frame_from_pf(
     pf,
     measurement,
@@ -1839,6 +1993,7 @@ def build_frame_from_pf(
     estimate_mode: str = "mmse",
     min_est_strength: float | None = None,
     min_existence_prob: float | None = None,
+    estimated_override: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] | None = None,
 ) -> PFFrame:
     """
     Construct a PFFrame snapshot from a PF (ParallelIsotopePF-like) and a Measurement.
@@ -1851,11 +2006,14 @@ def build_frame_from_pf(
         estimate_mode: "mmse" for weighted mean or "map" for max-weight particle
         min_est_strength: optional minimum strength threshold for displayed estimates
         min_existence_prob: optional minimum existence probability for displayed estimates
+        estimated_override: optional precomputed estimates keyed by isotope
     """
-    if hasattr(pf, "estimate_all"):
-        est = pf.estimate_all()
-    else:
-        est = pf.estimates()  # type: ignore[attr-defined]
+    est: Dict[str, object] = {}
+    if estimated_override is None:
+        if hasattr(pf, "estimate_all"):
+            est = pf.estimate_all()
+        else:
+            est = pf.estimates()  # type: ignore[attr-defined]
     particle_positions: Dict[str, NDArray[np.float64]] = {}
     particle_weights: Dict[str, NDArray[np.float64]] = {}
     estimated_sources: Dict[str, NDArray[np.float64]] = {}
@@ -1880,7 +2038,17 @@ def build_frame_from_pf(
                     weights.append(float(w))
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
         particle_weights[iso] = np.asarray(weights, dtype=float)
-        if cont_particles and len(cont_weights) == len(cont_particles):
+        if estimated_override is not None and iso in estimated_override:
+            est_pos_raw, est_str_raw = estimated_override[iso]
+            est_pos = np.asarray(est_pos_raw, dtype=float)
+            est_str = np.asarray(est_str_raw, dtype=float)
+            if min_est_strength is not None and est_str.size:
+                mask = est_str >= min_est_strength
+                est_pos = est_pos[mask]
+                est_str = est_str[mask]
+            estimated_sources[iso] = est_pos
+            estimated_strengths[iso] = est_str
+        elif cont_particles and len(cont_weights) == len(cont_particles):
             states = [p.state for p in cont_particles]
             weights_arr = np.asarray(cont_weights, dtype=float)
             use_clustered = bool(

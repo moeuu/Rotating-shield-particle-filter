@@ -19,7 +19,6 @@ from measurement.shielding import (
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     DEFAULT_SHIELD_CONTACT_RADIUS_CM,
     path_length_cm,
-    shield_blocks_radiation,
     spherical_shell_path_length_cm,
 )
 from sim.isaacsim_app.geometry import quaternion_wxyz_to_matrix

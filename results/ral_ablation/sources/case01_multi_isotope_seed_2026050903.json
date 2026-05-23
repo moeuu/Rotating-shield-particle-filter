@@ -1,0 +1,40 @@
+{
+  "metadata": {
+    "case": "case01_multi_isotope",
+    "description": "Obstacle-cluttered separated Cs/Co/Eu sources.",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+    "obstacle_seed": 2026050903,
+    "sampling": "surface-constrained room/obstacle source placement",
+    "source_seed": 2026050920
+  },
+  "name": "ral_ablation_case01_multi_isotope_seed_2026050920",
+  "sources": [
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        10.0,
+        3.837658,
+        4.635692
+      ]
+    },
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Co-60",
+      "position": [
+        0.0,
+        4.228502,
+        9.675742
+      ]
+    },
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Eu-154",
+      "position": [
+        0.0,
+        10.959011,
+        6.30414
+      ]
+    }
+  ]
+}

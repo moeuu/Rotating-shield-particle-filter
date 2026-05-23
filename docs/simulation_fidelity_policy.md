@@ -45,6 +45,11 @@ definition, statistics, and observation path.
 
 - CPU multithreading inside Geant4.
 - GPU acceleration for PF or planning math when it preserves the same model.
+- Batched or process-parallel PF structure updates when they preserve the same
+  likelihood, model-order tests, and source-state semantics.
+- Batched obstacle attenuation, shield-orientation scoring, spectrum-response
+  regression, and candidate-source evaluation when they are numerically
+  equivalent to the scalar equations.
 - Geometry caching that does not change exported geometry or materials.
 - Detector-equivalent Geant4 source sampling under `source_rate_model =
   detector_cps_1m`, where primary histories represent detector-count-rate
@@ -61,3 +66,7 @@ definition, statistics, and observation path.
   `tests/test_simulation_fidelity_shortcuts.py` passing.
 - Add a regression test before introducing any new simulation option that could
   lower runtime fidelity.
+- For PF, planning, spectrum, obstacle, or Geant4 orchestration code that spans
+  particles, candidates, source slots, orientations, spectrum bins, or obstacle
+  components, follow `docs/compute_parallelism_policy.md` and add a
+  serial-vs-parallel equivalence test or a runtime-path selection test.

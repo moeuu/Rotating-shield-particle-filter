@@ -8,7 +8,6 @@ from typing import Dict, Iterable, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import PatchCollection
-from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
 
@@ -224,7 +223,6 @@ def render_heatmap(
     # Plot estimated sources
     for iso, est in estimates.items():
         pos3d = est.get("positions", np.zeros((0, 3)))
-        strengths = est.get("strengths", np.zeros(0))
         if pos3d.size == 0:
             continue
         ax.scatter(pos3d[:, 0], pos3d[:, 1], s=40, label=f"{iso} est.")

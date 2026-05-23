@@ -22,7 +22,6 @@ from measurement.shielding import (
     generate_octant_orientations,
     rotation_matrix_between_vectors,
 )
-from measurement.continuous_kernels import obstacle_path_lengths_cm_torch
 from pf.state import IsotopeState
 
 
@@ -200,8 +199,24 @@ def _obstacle_path_lengths_between_points_cm_torch(
     tol: float,
 ) -> "torch.Tensor":
     """Return path lengths through obstacle boxes for batched source-target segments."""
+    lengths_by_box = _obstacle_path_lengths_between_points_by_box_cm_torch(
+        source,
+        target,
+        obstacle_boxes_m,
+        tol,
+    )
+    return torch.sum(lengths_by_box, dim=-1)
+
+
+def _obstacle_path_lengths_between_points_by_box_cm_torch(
+    source: "torch.Tensor",
+    target: "torch.Tensor",
+    obstacle_boxes_m: "torch.Tensor",
+    tol: float,
+) -> "torch.Tensor":
+    """Return per-box path lengths through obstacle boxes for batched segments."""
     if obstacle_boxes_m.numel() == 0:
-        return torch.zeros(source.shape[:-1], device=source.device, dtype=source.dtype)
+        return torch.zeros((*source.shape[:-1], 0), device=source.device, dtype=source.dtype)
     p0 = source.unsqueeze(-2)
     delta = (target - source).unsqueeze(-2)
     distance = torch.linalg.norm(target - source, dim=-1)
@@ -243,7 +258,55 @@ def _obstacle_path_lengths_between_points_cm_torch(
         (t_exit - t_enter) * distance.unsqueeze(-1),
         torch.zeros_like(t_exit),
     )
-    return 100.0 * torch.sum(length_m, dim=-1)
+    return 100.0 * length_m
+
+
+def _obstacle_tau_between_points_cm_torch(
+    source: "torch.Tensor",
+    target: "torch.Tensor",
+    obstacle_boxes_m: "torch.Tensor",
+    obstacle_mu_cm_inv: float,
+    obstacle_mu_cm_inv_by_box: np.ndarray | "torch.Tensor" | None,
+    *,
+    device: "torch.device",
+    dtype: "torch.dtype",
+    tol: float,
+    chunk_size: int = 64,
+) -> "torch.Tensor":
+    """Return optical depth through obstacle boxes without allocating all boxes at once."""
+    if obstacle_boxes_m.numel() == 0:
+        return torch.zeros(source.shape[:-1], device=device, dtype=dtype)
+    boxes_t = torch.as_tensor(obstacle_boxes_m, device=device, dtype=dtype)
+    if boxes_t.ndim != 2 or boxes_t.shape[1] != 6:
+        raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
+    mu_t = None
+    if obstacle_mu_cm_inv_by_box is not None:
+        mu_t = torch.as_tensor(obstacle_mu_cm_inv_by_box, device=device, dtype=dtype)
+        if mu_t.numel() != boxes_t.shape[0]:
+            raise ValueError("obstacle_mu_cm_inv_by_box must match obstacle box count.")
+    chunk_size = max(1, int(chunk_size))
+    segment_count = int(np.prod(tuple(int(v) for v in source.shape[:-1])))
+    if segment_count > 0:
+        # The temporary segment-box tensors have shape
+        # ``source.shape[:-1] + (box_chunk,)``.  Finite detector aperture and
+        # multi-source particles can make ``source.shape[:-1]`` very large, so
+        # bound the box chunk by element count rather than by box count alone.
+        element_budget = 4_000_000 if dtype == torch.float64 else 8_000_000
+        chunk_size = min(chunk_size, max(1, int(element_budget // segment_count)))
+    tau = torch.zeros(source.shape[:-1], device=device, dtype=dtype)
+    for start in range(0, int(boxes_t.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(boxes_t.shape[0]))
+        path_by_box = _obstacle_path_lengths_between_points_by_box_cm_torch(
+            source,
+            target,
+            boxes_t[start:end],
+            tol,
+        )
+        if mu_t is None:
+            tau = tau + float(obstacle_mu_cm_inv) * torch.sum(path_by_box, dim=-1)
+        else:
+            tau = tau + torch.sum(path_by_box * mu_t[start:end], dim=-1)
+    return tau
 
 
 def torch_available() -> bool:
@@ -331,11 +394,13 @@ def expected_counts_pair_torch(
     shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     obstacle_boxes_m: np.ndarray | "torch.Tensor" | None = None,
     obstacle_mu_cm_inv: float = 0.0,
+    obstacle_mu_cm_inv_by_box: np.ndarray | "torch.Tensor" | None = None,
     detector_radius_m: float = 0.0,
     detector_aperture_samples: int = 1,
     buildup_fe_coeff: float = 0.0,
     buildup_pb_coeff: float = 0.0,
     obstacle_buildup_coeff: float = 0.0,
+    obstacle_box_chunk_size: int = 64,
     tol: float = 1e-6,
 ) -> "torch.Tensor":
     """
@@ -485,23 +550,23 @@ def expected_counts_pair_torch(
     tau_fe = float(mu_fe) * L_fe
     tau_pb = float(mu_pb) * L_pb
     tau_obstacle = torch.zeros_like(tau_fe)
-    if obstacle_boxes_m is not None and float(obstacle_mu_cm_inv) > 0.0:
+    if obstacle_boxes_m is not None and (
+        obstacle_mu_cm_inv_by_box is not None or float(obstacle_mu_cm_inv) > 0.0
+    ):
         boxes_t = torch.as_tensor(obstacle_boxes_m, device=device, dtype=dtype)
         if boxes_t.numel() > 0:
-            if sample_count > 1:
-                obstacle_path_cm = _obstacle_path_lengths_between_points_cm_torch(
-                    sampled_positions,
-                    targets,
-                    boxes_t,
-                    tol,
-                )
-            else:
-                obstacle_path_cm = obstacle_path_lengths_cm_torch(
-                    positions=positions,
-                    detector_pos=detector.view(3),
-                    obstacle_boxes_m=boxes_t,
-                ).unsqueeze(-1)
-            tau_obstacle = float(obstacle_mu_cm_inv) * obstacle_path_cm
+            tau_base = _obstacle_tau_between_points_cm_torch(
+                sampled_positions,
+                targets,
+                boxes_t,
+                obstacle_mu_cm_inv,
+                obstacle_mu_cm_inv_by_box,
+                device=device,
+                dtype=dtype,
+                tol=tol,
+                chunk_size=obstacle_box_chunk_size,
+            )
+            tau_obstacle = tau_base
     buildup = torch.ones_like(tau_fe)
     buildup = buildup + max(float(buildup_fe_coeff), 0.0) * (1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0)))
     buildup = buildup + max(float(buildup_pb_coeff), 0.0) * (1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0)))
@@ -514,4 +579,252 @@ def expected_counts_pair_torch(
     strengths = strengths * mask
     source_scale_t = torch.as_tensor(max(float(source_scale), 0.0), device=device, dtype=dtype)
     rate = source_scale_t * torch.sum(geom * att * strengths, dim=-1) + backgrounds
+    return live_time_s * rate
+
+
+def expected_counts_all_pairs_torch(
+    detector_pos: np.ndarray,
+    positions: "torch.Tensor",
+    strengths: "torch.Tensor",
+    backgrounds: "torch.Tensor",
+    mask: "torch.Tensor",
+    mu_fe: float,
+    mu_pb: float,
+    thickness_fe_cm: float,
+    thickness_pb_cm: float,
+    live_time_s: float,
+    device: "torch.device",
+    dtype: "torch.dtype",
+    use_angle_attenuation: bool = False,
+    source_scale: float = 1.0,
+    inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT,
+    obstacle_boxes_m: np.ndarray | "torch.Tensor" | None = None,
+    obstacle_mu_cm_inv: float = 0.0,
+    obstacle_mu_cm_inv_by_box: np.ndarray | "torch.Tensor" | None = None,
+    detector_radius_m: float = 0.0,
+    detector_aperture_samples: int = 1,
+    buildup_fe_coeff: float = 0.0,
+    buildup_pb_coeff: float = 0.0,
+    obstacle_buildup_coeff: float = 0.0,
+    obstacle_box_chunk_size: int = 64,
+    tol: float = 1e-6,
+) -> "torch.Tensor":
+    """Compute expected counts for all Fe/Pb orientation pairs in one batch."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    detector = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 1, 3)
+    direction = detector - positions
+    dist = torch.linalg.norm(direction, dim=-1)
+    dist = torch.where(dist <= tol, torch.full_like(dist, tol), dist)
+    if float(detector_radius_m) > 0.0 and int(detector_aperture_samples) > 1:
+        sample_count = max(int(detector_aperture_samples), 1)
+        axis = direction / dist.unsqueeze(-1)
+        helper_z = torch.zeros_like(axis)
+        helper_z[..., 2] = 1.0
+        helper_y = torch.zeros_like(axis)
+        helper_y[..., 1] = 1.0
+        helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
+        basis_u = torch.linalg.cross(axis, helper, dim=-1)
+        basis_u_norm = torch.linalg.norm(basis_u, dim=-1, keepdim=True)
+        basis_u = basis_u / torch.clamp(basis_u_norm, min=tol)
+        basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
+        indices = torch.arange(sample_count, device=device, dtype=dtype)
+        if sample_count == 1:
+            radii = torch.zeros(1, device=device, dtype=dtype)
+        else:
+            fractions = torch.clamp(
+                (indices - 0.5) / float(sample_count - 1),
+                min=0.0,
+                max=1.0,
+            )
+            radii = torch.sqrt(fractions)
+            radii[0] = 0.0
+        max_radius = torch.minimum(
+            torch.as_tensor(
+                max(float(detector_radius_m), 0.0),
+                device=device,
+                dtype=dtype,
+            ),
+            0.95 * dist,
+        )
+        angles = indices * torch.as_tensor(
+            np.pi * (3.0 - np.sqrt(5.0)),
+            device=device,
+            dtype=dtype,
+        )
+        offsets = (
+            max_radius.unsqueeze(-1).unsqueeze(-1)
+            * radii.view(*([1] * dist.ndim), sample_count, 1)
+            * (
+                torch.cos(angles).view(*([1] * dist.ndim), sample_count, 1)
+                * basis_u.unsqueeze(-2)
+                + torch.sin(angles).view(*([1] * dist.ndim), sample_count, 1)
+                * basis_v.unsqueeze(-2)
+            )
+        )
+        targets = detector.unsqueeze(-2) + offsets
+        sampled_positions = positions.unsqueeze(-2).expand_as(targets)
+        sampled_direction = targets - sampled_positions
+        sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+        sampled_dist = torch.where(
+            sampled_dist <= tol,
+            torch.full_like(sampled_dist, tol),
+            sampled_dist,
+        )
+        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+    else:
+        sample_count = 1
+        targets = detector.expand_as(positions).unsqueeze(-2)
+        sampled_positions = positions.unsqueeze(-2)
+        sampled_direction = direction.unsqueeze(-2)
+        dir_unit = direction / dist.unsqueeze(-1)
+        dir_unit = dir_unit.unsqueeze(-2)
+
+    geom = _finite_sphere_geometric_term_torch(
+        dist,
+        detector_radius_m=detector_radius_m,
+        tol=tol,
+    )
+    detector_to_source_unit = -dir_unit
+    normals_np = generate_octant_orientations()
+    normals = torch.as_tensor(normals_np, device=device, dtype=dtype)
+    thickness_fe = torch.as_tensor(thickness_fe_cm, device=device, dtype=dtype)
+    thickness_pb = torch.as_tensor(thickness_pb_cm, device=device, dtype=dtype)
+    l_fe_by_orient = []
+    l_pb_by_orient = []
+    for orient_idx in range(int(normals.shape[0])):
+        blocked = _rotated_positive_octant_mask_torch(
+            detector_to_source_unit,
+            orient_idx,
+            device=device,
+            dtype=dtype,
+            tol=tol,
+        )
+        normal = normals[orient_idx]
+        cos_theta = torch.clamp(torch.sum(dir_unit * normal, dim=-1), 0.0, 1.0)
+        if shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT and not use_angle_attenuation:
+            normal_np = -np.asarray(normals_np[orient_idx], dtype=float)
+            if sample_count > 1:
+                center = detector.expand_as(positions).unsqueeze(-2)
+                l_fe = _segment_rotated_octant_shell_length_cm_torch(
+                    sampled_positions,
+                    targets,
+                    center,
+                    normal_np,
+                    inner_radius_fe_cm,
+                    inner_radius_fe_cm + thickness_fe_cm,
+                    device,
+                    dtype,
+                    tol,
+                )
+                l_pb = _segment_rotated_octant_shell_length_cm_torch(
+                    sampled_positions,
+                    targets,
+                    center,
+                    normal_np,
+                    inner_radius_pb_cm,
+                    inner_radius_pb_cm + thickness_pb_cm,
+                    device,
+                    dtype,
+                    tol,
+                )
+            else:
+                center = detector.expand_as(positions)
+                target = detector.expand_as(positions)
+                l_fe = _segment_rotated_octant_shell_length_cm_torch(
+                    positions,
+                    target,
+                    center,
+                    normal_np,
+                    inner_radius_fe_cm,
+                    inner_radius_fe_cm + thickness_fe_cm,
+                    device,
+                    dtype,
+                    tol,
+                ).unsqueeze(-1)
+                l_pb = _segment_rotated_octant_shell_length_cm_torch(
+                    positions,
+                    target,
+                    center,
+                    normal_np,
+                    inner_radius_pb_cm,
+                    inner_radius_pb_cm + thickness_pb_cm,
+                    device,
+                    dtype,
+                    tol,
+                ).unsqueeze(-1)
+        elif use_angle_attenuation:
+            l_fe = torch.where(
+                blocked & (cos_theta > tol),
+                thickness_fe / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+            l_pb = torch.where(
+                blocked & (cos_theta > tol),
+                thickness_pb / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+        else:
+            l_fe = torch.where(blocked, thickness_fe, torch.zeros_like(cos_theta))
+            l_pb = torch.where(blocked, thickness_pb, torch.zeros_like(cos_theta))
+        l_fe_by_orient.append(l_fe)
+        l_pb_by_orient.append(l_pb)
+
+    l_fe_stack = torch.stack(l_fe_by_orient, dim=0)
+    l_pb_stack = torch.stack(l_pb_by_orient, dim=0)
+    num_orients = int(l_fe_stack.shape[0])
+    num_pairs = num_orients * num_orients
+    pair_ids = torch.arange(num_pairs, device=device, dtype=torch.long)
+    fe_indices = torch.div(pair_ids, num_orients, rounding_mode="floor")
+    pb_indices = torch.remainder(pair_ids, num_orients)
+    l_fe_pairs = l_fe_stack.index_select(0, fe_indices)
+    l_pb_pairs = l_pb_stack.index_select(0, pb_indices)
+    tau_fe = float(mu_fe) * l_fe_pairs
+    tau_pb = float(mu_pb) * l_pb_pairs
+    tau_obstacle = torch.zeros_like(sampled_direction[..., 0])
+    if obstacle_boxes_m is not None and (
+        obstacle_mu_cm_inv_by_box is not None or float(obstacle_mu_cm_inv) > 0.0
+    ):
+        boxes_t = torch.as_tensor(obstacle_boxes_m, device=device, dtype=dtype)
+        if boxes_t.numel() > 0:
+            tau_obstacle = _obstacle_tau_between_points_cm_torch(
+                sampled_positions,
+                targets,
+                boxes_t,
+                obstacle_mu_cm_inv,
+                obstacle_mu_cm_inv_by_box,
+                device=device,
+                dtype=dtype,
+                tol=tol,
+                chunk_size=obstacle_box_chunk_size,
+            )
+    tau_obstacle_pairs = tau_obstacle.unsqueeze(0)
+    buildup = torch.ones_like(tau_fe)
+    buildup = buildup + max(float(buildup_fe_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0))
+    )
+    buildup = buildup + max(float(buildup_pb_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0))
+    )
+    buildup = buildup + max(float(obstacle_buildup_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_obstacle_pairs, min=0.0))
+    )
+    att = torch.clamp(
+        torch.exp(-(tau_fe + tau_pb + tau_obstacle_pairs)) * buildup,
+        max=1.0,
+    )
+    att = torch.mean(att, dim=-1)
+    strengths_masked = strengths * mask
+    source_scale_t = torch.as_tensor(
+        max(float(source_scale), 0.0),
+        device=device,
+        dtype=dtype,
+    )
+    rate = (
+        source_scale_t
+        * torch.sum(geom.unsqueeze(0) * att * strengths_masked.unsqueeze(0), dim=-1)
+        + backgrounds.unsqueeze(0)
+    )
     return live_time_s * rate

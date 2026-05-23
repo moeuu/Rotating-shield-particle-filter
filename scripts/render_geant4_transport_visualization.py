@@ -14,7 +14,6 @@ import math
 import shutil
 import sys
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 

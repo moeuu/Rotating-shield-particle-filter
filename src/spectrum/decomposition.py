@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Tuple
 
-import numpy as np
-from numpy.typing import NDArray
 
 from spectrum.library import Nuclide
 
@@ -24,8 +22,11 @@ def reference_line(nuclide: Nuclide, efficiency_fn: Callable[[float], float] | N
     if not nuclide.lines:
         raise ValueError("Nuclide has no line information.")
     if efficiency_fn is None:
-        return max(nuclide.lines, key=lambda l: l.intensity).energy_keV
-    return max(nuclide.lines, key=lambda l: l.intensity * float(efficiency_fn(l.energy_keV))).energy_keV
+        return max(nuclide.lines, key=lambda line: line.intensity).energy_keV
+    return max(
+        nuclide.lines,
+        key=lambda line: line.intensity * float(efficiency_fn(line.energy_keV)),
+    ).energy_keV
 
 
 def intensity_ratios(
@@ -37,11 +38,13 @@ def intensity_ratios(
     Returns:
         {line_energy_keV: ratio}
     """
-    ref_energy = reference_line(nuclide, efficiency_fn=efficiency_fn)
     if efficiency_fn is None:
-        ref_intensity = max(l.intensity for l in nuclide.lines)
+        ref_intensity = max(line.intensity for line in nuclide.lines)
     else:
-        ref_intensity = max(l.intensity * float(efficiency_fn(l.energy_keV)) for l in nuclide.lines)
+        ref_intensity = max(
+            line.intensity * float(efficiency_fn(line.energy_keV))
+            for line in nuclide.lines
+        )
     ratios: Dict[float, float] = {}
     for line in nuclide.lines:
         weight = line.intensity

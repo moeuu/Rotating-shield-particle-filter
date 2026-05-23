@@ -6,8 +6,9 @@ uses measurement.continuous_kernels instead.
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import TYPE_CHECKING, Dict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,11 +24,13 @@ from measurement.shielding import (
     OctantShield,
     SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     mu_from_tvl_mm,
-    octant_index_from_normal,
     resolve_mu_values,
     rotation_matrix_between_vectors,
     spherical_shell_path_length_cm_torch,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 CS137_MU_PB_CM_INV = mu_from_tvl_mm(CS137_TVL_PB_MM)
 CS137_MU_FE_CM_INV = mu_from_tvl_mm(CS137_TVL_FE_MM)
@@ -44,11 +47,7 @@ def _torch_available() -> bool:
 
 def _torch_installed() -> bool:
     """Return True if torch is installed (CUDA not required)."""
-    try:
-        import torch
-    except ImportError:
-        return False
-    return True
+    return importlib.util.find_spec("torch") is not None
 
 
 def _resolve_device(device: str) -> "torch.device":
