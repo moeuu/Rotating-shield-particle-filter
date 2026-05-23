@@ -7,33 +7,105 @@ import pytest
 
 from measurement.obstacles import ObstacleGrid
 from measurement.model import EnvironmentConfig
-from pf.estimator import MeasurementRecord, RotatingShieldPFConfig, RotatingShieldPFEstimator
+from pf.estimator import (
+    MeasurementRecord,
+    RotatingShieldPFConfig,
+    RotatingShieldPFEstimator,
+)
 from pf.mixing import prune_spurious_sources_continuous
+from pf.particle_filter import IsotopeParticle
+from pf.state import IsotopeState
 from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
+    DeferredPFVisualizer,
     _acquire_spectrum_observation,
     _adaptive_mission_stop_reason,
+    _all_pf_filters_converged,
+    _argv_requests_cui,
     _build_candidate_sources,
     _build_robot_path_segment,
     _compute_shield_selection_grid,
     _evaluate_spectrum_counts,
+    _filter_absent_final_estimates,
     _filter_reachable_candidates,
     _has_birth_residual_evidence,
+    _has_unresolved_discriminative_pseudo_failures,
     _inflate_low_signal_variances,
     _is_adaptive_spectrum_ready,
     _isotope_count_balance_penalty,
     _resolve_ig_workers,
+    _resolve_mission_max_poses,
+    _resolve_plot_save_interval,
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
+    _resolve_display_prune_refresh_interval,
+    _particle_surface_diagnostics,
     _select_best_pair_from_scores,
+    _should_refresh_display_pruned_estimates,
     _signature_vector_is_dependent,
     _resolve_source_position_bounds,
     _spectrum_config_from_runtime_config,
+    _source_cardinality_dwell_status,
     run_live_pf,
 )
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer
+
+
+def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
+    """An explicit CLI pose cap should not be overwritten by runtime config."""
+    runtime_config = {"mission_stop_max_poses": 10}
+
+    assert _resolve_mission_max_poses(8, runtime_config) == 8
+    assert _resolve_mission_max_poses(None, runtime_config) == 10
+
+
+def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
+    """Final particle surface diagnostics should count report-visible sources."""
+    isotope = "Cs-137"
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            max_sources=2,
+            report_exclude_unverified_sources=True,
+            use_gpu=False,
+        ),
+    )
+    estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array([[1.0, 1.0, 0.0], [2.0, 2.0, 1.0]], dtype=float),
+        strengths=np.array([100.0, 50.0], dtype=float),
+        background=0.0,
+        ages=np.array([3, 0], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+        tentative_sources=np.array([False, True], dtype=bool),
+        verification_fail_streaks=np.array([0, 0], dtype=int),
+    )
+    estimator.filters[isotope].continuous_particles = [
+        IsotopeParticle(state=state, log_weight=0.0)
+    ]
+
+    diagnostics = _particle_surface_diagnostics(
+        estimator,
+        env,
+        None,
+        obstacle_height_m=2.0,
+    )[isotope]
+
+    assert diagnostics["raw_source_slots"] == 2
+    assert diagnostics["report_visible_source_slots"] == 1
+    assert diagnostics["report_excluded_source_slots"] == 1
+    assert diagnostics["surface_counts"]["floor"] == 1
+    assert diagnostics["off_surface_count"] == 0
 
 
 def test_robot_path_segment_uses_obstacle_aware_grid_path() -> None:
@@ -64,7 +136,15 @@ def test_robot_path_segment_uses_obstacle_aware_grid_path() -> None:
     assert np.max(waypoints[:, 1]) > 2.0
 
 
-def test_python_worker_auto_uses_all_logical_cpus(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_full_simulation_cli_requests_cui_matplotlib_backend() -> None:
+    """Full-simulation aliases should force a non-GUI Matplotlib backend."""
+    assert _argv_requests_cui(["--full-simulation"]) is True
+    assert _argv_requests_cui(["--standard-geant4-full"]) is True
+
+
+def test_python_worker_auto_uses_all_logical_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Python planning worker auto mode should not be capped below CPU count."""
     monkeypatch.setattr("realtime_demo.os.cpu_count", lambda: 32)
 
@@ -91,6 +171,130 @@ def test_cui_split_view_defaults_to_saved_runs() -> None:
             save_outputs=False,
         )
         is True
+    )
+
+
+def test_display_pruned_estimate_refresh_interval_is_clamped() -> None:
+    """Display pruning refresh intervals should parse safely."""
+    assert _resolve_display_prune_refresh_interval({}) == 1
+    assert (
+        _resolve_display_prune_refresh_interval(
+            {"display_pruned_estimates_every": 8},
+        )
+        == 8
+    )
+    assert (
+        _resolve_display_prune_refresh_interval(
+            {"display_pruned_estimates_every": 0},
+        )
+        == 0
+    )
+    assert (
+        _resolve_display_prune_refresh_interval(
+            {"display_pruned_estimates_every": "bad"},
+        )
+        == 1
+    )
+
+
+def test_plot_save_interval_can_disable_intermediate_pf_plots() -> None:
+    """PF plot save intervals should allow disabling intermediate figures."""
+    assert (
+        _resolve_plot_save_interval(
+            {"pf_plot_save_every": 0},
+            "pf_plot_save_every",
+            default=1,
+            allow_disable=True,
+        )
+        == 0
+    )
+    assert (
+        _resolve_plot_save_interval(
+            {"pf_plot_save_every": 0},
+            "pf_plot_save_every",
+            default=1,
+            allow_disable=False,
+        )
+        == 1
+    )
+    assert (
+        _resolve_plot_save_interval(
+            {"pf_plot_save_every": "bad"},
+            "pf_plot_save_every",
+            default=4,
+            allow_disable=True,
+        )
+        == 4
+    )
+
+
+def test_deferred_pf_visualizer_renders_only_on_save() -> None:
+    """Deferred visualizer should not create Matplotlib figures during updates."""
+    calls: list[tuple[str, object]] = []
+
+    class _DummyVisualizer:
+        """Record update and save calls from the deferred wrapper."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            """Record construction."""
+            calls.append(("init", (args, kwargs)))
+
+        def update(self, frame: object) -> None:
+            """Record rendered frames."""
+            calls.append(("update", frame))
+
+        def save_final(self, path: str) -> None:
+            """Record final save calls."""
+            calls.append(("save_final", path))
+
+        def save_estimates_only(self, path: str) -> None:
+            """Record estimates-only save calls."""
+            calls.append(("save_estimates_only", path))
+
+    wrapper = DeferredPFVisualizer(_DummyVisualizer, "arg", option=True)
+    wrapper.update("frame-1")
+    wrapper.update("frame-2")
+
+    assert calls == []
+
+    wrapper.save_final("out.png")
+
+    assert calls[0][0] == "init"
+    assert calls[1] == ("update", "frame-2")
+    assert calls[2] == ("save_final", "out.png")
+
+
+def test_display_pruned_estimates_refresh_policy() -> None:
+    """Display-only pruning should refresh on cache miss, force, or interval."""
+    assert _should_refresh_display_pruned_estimates(
+        step_index=3,
+        refresh_every=8,
+        cache_available=False,
+        force_refresh=False,
+    )
+    assert _should_refresh_display_pruned_estimates(
+        step_index=3,
+        refresh_every=8,
+        cache_available=True,
+        force_refresh=True,
+    )
+    assert _should_refresh_display_pruned_estimates(
+        step_index=16,
+        refresh_every=8,
+        cache_available=True,
+        force_refresh=False,
+    )
+    assert not _should_refresh_display_pruned_estimates(
+        step_index=17,
+        refresh_every=8,
+        cache_available=True,
+        force_refresh=False,
+    )
+    assert not _should_refresh_display_pruned_estimates(
+        step_index=16,
+        refresh_every=0,
+        cache_available=True,
+        force_refresh=False,
     )
 
 
@@ -169,6 +373,630 @@ def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
         _DummyEstimator(),  # type: ignore[arg-type]
         min_support=2,
     )
+
+
+def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
+    """Mission stop should wait while source verification needs new views."""
+
+    class _DummyFilter:
+        """Minimal filter state exposing discriminative pseudo-source failures."""
+
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+        last_pseudo_source_fail_reasons = {
+            "needs_discriminative_views": 2,
+            "high_response_corr": 1,
+        }
+
+    class _DummyEstimator:
+        """Minimal estimator state for adaptive mission stop tests."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 1),
+        blocked_cells=(),
+    )
+    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
+    estimator = _DummyEstimator()
+
+    reason = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=grid,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=0.5,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason is None
+    assert _has_unresolved_discriminative_pseudo_failures(
+        estimator,  # type: ignore[arg-type]
+        min_count=1,
+    )
+
+    reason_without_guard = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=grid,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=0.5,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        require_no_unresolved_discriminative_failures=False,
+    )
+
+    assert reason_without_guard == "environment_coverage:1.000"
+
+
+def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
+    """PF convergence should not stop before the guaranteed pose count."""
+
+    class _DummyEstimator:
+        """Minimal estimator state exposing a converged PF."""
+
+        filters: dict[str, object] = {}
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a converged global exploration state."""
+            return True
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
+
+    reason = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=None,
+        min_poses=8,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason is None
+
+    reason_after_min = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited * 8,
+        map_api=None,
+        min_poses=8,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason_after_min == "pf_converged_low_information_gain"
+
+
+def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
+    """Per-isotope convergence flags should stop after the guaranteed pose count."""
+
+    class _DummyConfig:
+        """Minimal convergence config for filter and estimator dummies."""
+
+        converge_enable = True
+
+    class _DummyFilter:
+        """Minimal filter exposing the per-isotope convergence flag."""
+
+        config = _DummyConfig()
+        is_converged = True
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+
+    class _DummyEstimator:
+        """Estimator whose global IG condition is not yet quiet."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter(), "Co-60": _DummyFilter()}
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
+    estimator = _DummyEstimator()
+
+    assert _all_pf_filters_converged(estimator) is True  # type: ignore[arg-type]
+    reason = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=None,
+        min_poses=8,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason is None
+
+    reason_after_min = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited * 8,
+        map_api=None,
+        min_poses=8,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason_after_min == "pf_filters_converged"
+
+
+def test_pf_convergence_rejects_report_cardinality_collapse() -> None:
+    """Mission convergence should reject a report that collapses PF cardinality."""
+
+    class _DummyConfig:
+        """Minimal convergence config for filter and estimator dummies."""
+
+        converge_enable = True
+        converge_cardinality_var_max = 0.05
+        report_model_order_require_posterior_match = True
+
+    class _DummyState:
+        """Minimal state with only an active source count."""
+
+        def __init__(self, num_sources: int) -> None:
+            """Store the active source count."""
+            self.num_sources = int(num_sources)
+
+    class _DummyParticle:
+        """Minimal particle wrapping a source-count state."""
+
+        def __init__(self, num_sources: int) -> None:
+            """Store the particle state."""
+            self.state = _DummyState(num_sources)
+
+    class _DummyFilter:
+        """Minimal converged filter whose posterior supports three sources."""
+
+        config = _DummyConfig()
+        is_converged = True
+        continuous_particles = [_DummyParticle(3), _DummyParticle(3)]
+        continuous_weights = np.array([0.5, 0.5], dtype=float)
+
+        def state_without_quarantined_sources(self, state: _DummyState) -> _DummyState:
+            """Return the state unchanged for this dummy."""
+            return state
+
+    class _DummyEstimator:
+        """Estimator with report model-order diagnostics collapsed to one source."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a collapsed one-source report."""
+            return {
+                "Cs-137": (
+                    np.zeros((1, 3), dtype=float),
+                    np.ones(1, dtype=float),
+                )
+            }
+
+        def report_model_order_ready(self) -> bool:
+            """Return ready to exercise the posterior-cardinality guard."""
+            return True
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return diagnostics indicating one selected source from three candidates."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 1,
+                    "model_order_ready": True,
+                }
+            }
+
+    assert _all_pf_filters_converged(_DummyEstimator()) is False  # type: ignore[arg-type]
+
+
+def test_pf_convergence_accepts_matching_report_cardinality() -> None:
+    """Mission convergence can stop when PF and report cardinality agree."""
+
+    class _DummyConfig:
+        """Minimal convergence config for filter and estimator dummies."""
+
+        converge_enable = True
+        converge_cardinality_var_max = 0.05
+        report_model_order_require_posterior_match = True
+
+    class _DummyState:
+        """Minimal state with only an active source count."""
+
+        num_sources = 2
+
+    class _DummyParticle:
+        """Minimal particle wrapping a source-count state."""
+
+        state = _DummyState()
+
+    class _DummyFilter:
+        """Minimal converged filter whose posterior supports two sources."""
+
+        config = _DummyConfig()
+        is_converged = True
+        continuous_particles = [_DummyParticle(), _DummyParticle()]
+        continuous_weights = np.array([0.5, 0.5], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator with report model-order diagnostics matching two sources."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a two-source report."""
+            return {
+                "Cs-137": (
+                    np.zeros((2, 3), dtype=float),
+                    np.ones(2, dtype=float),
+                )
+            }
+
+        def report_model_order_ready(self) -> bool:
+            """Return ready for this dummy."""
+            return True
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return diagnostics indicating two selected sources."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 2,
+                    "model_order_ready": True,
+                }
+            }
+
+    assert _all_pf_filters_converged(_DummyEstimator()) is True  # type: ignore[arg-type]
+
+
+def test_pf_convergence_rejects_report_count_above_posterior_cardinality() -> None:
+    """Mission convergence should reject report clusters unsupported by PF K-mass."""
+
+    class _DummyConfig:
+        """Minimal convergence config for filter and estimator dummies."""
+
+        converge_enable = True
+        converge_cardinality_var_max = 0.05
+        report_model_order_require_posterior_match = True
+
+    class _DummyState:
+        """Minimal state with only an active source count."""
+
+        num_sources = 1
+
+    class _DummyParticle:
+        """Minimal particle wrapping a source-count state."""
+
+        state = _DummyState()
+
+    class _DummyFilter:
+        """Minimal converged filter whose posterior supports one source."""
+
+        config = _DummyConfig()
+        is_converged = True
+        continuous_particles = [_DummyParticle(), _DummyParticle()]
+        continuous_weights = np.array([0.5, 0.5], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator whose report overstates posterior source cardinality."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a three-source report."""
+            return {
+                "Cs-137": (
+                    np.zeros((3, 3), dtype=float),
+                    np.ones(3, dtype=float),
+                )
+            }
+
+        def report_model_order_ready(self) -> bool:
+            """Return ready to exercise the posterior-cardinality guard."""
+            return True
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return diagnostics indicating three selected sources."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 3,
+                    "model_order_ready": True,
+                }
+            }
+
+    assert _all_pf_filters_converged(_DummyEstimator()) is False  # type: ignore[arg-type]
+
+
+def test_pf_convergence_can_trust_report_model_order_without_posterior_match() -> None:
+    """Mission convergence can use stable BIC report order as the cardinality source."""
+
+    class _DummyConfig:
+        """Minimal config that disables the report/PF cardinality equality guard."""
+
+        converge_enable = True
+        converge_cardinality_var_max = 0.05
+        report_model_order_require_posterior_match = False
+
+    class _DummyState:
+        """Minimal state with only an active source count."""
+
+        num_sources = 3
+
+    class _DummyParticle:
+        """Minimal particle wrapping a three-source state."""
+
+        state = _DummyState()
+
+    class _DummyFilter:
+        """Minimal converged filter whose posterior supports three sources."""
+
+        config = _DummyConfig()
+        is_converged = True
+        continuous_particles = [_DummyParticle()]
+        continuous_weights = np.array([1.0], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator whose BIC report selects fewer sources than PF K-mass."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return the BIC-selected two-source report."""
+            return {
+                "Cs-137": (
+                    np.zeros((2, 3), dtype=float),
+                    np.ones(2, dtype=float),
+                )
+            }
+
+        def report_model_order_ready(self) -> bool:
+            """Return a stable report-level model order."""
+            return True
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return diagnostics indicating a BIC-selected two-source report."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 2,
+                    "model_order_ready": True,
+                }
+            }
+
+    assert _all_pf_filters_converged(_DummyEstimator()) is True  # type: ignore[arg-type]
+
+
+def test_source_cardinality_dwell_rejects_unstable_posterior_when_report_collapses() -> None:
+    """Adaptive dwell should not stop when report clusters miss multisource K-mass."""
+
+    class _DummyConfig:
+        """Minimal PF config for dwell status checks."""
+
+        converge_cardinality_var_max = 0.05
+        birth_enable = True
+        max_sources = 3
+
+    class _StateOne:
+        """Single-source dummy state."""
+
+        num_sources = 1
+
+    class _StateThree:
+        """Three-source dummy state."""
+
+        num_sources = 3
+
+    class _ParticleOne:
+        """Particle wrapper for a single-source state."""
+
+        state = _StateOne()
+
+    class _ParticleThree:
+        """Particle wrapper for a three-source state."""
+
+        state = _StateThree()
+
+    class _DummyFilter:
+        """Filter whose posterior is still split across source counts."""
+
+        config = _DummyConfig()
+        continuous_particles = [_ParticleOne(), _ParticleThree()]
+        continuous_weights = np.array([0.5, 0.5], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator with a collapsed one-source report."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a collapsed one-source estimate."""
+            return {
+                "Cs-137": (
+                    np.zeros((1, 3), dtype=float),
+                    np.ones(1, dtype=float),
+                )
+            }
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a one-source report despite multisource posterior mass."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 1,
+                    "selected_count": 1,
+                    "model_order_ready": True,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=0.0,
+    )
+
+    assert ready is False
+    assert "posterior_cardinality_var" in reason
+
+
+def test_source_cardinality_dwell_allows_uncapped_max_sources() -> None:
+    """Adaptive dwell should treat max_sources=None as an uncapped PF."""
+
+    class _DummyConfig:
+        """Minimal uncapped PF config for dwell status checks."""
+
+        converge_cardinality_var_max = 0.05
+        birth_enable = True
+        max_sources = None
+
+    class _State:
+        """Two-source dummy state."""
+
+        num_sources = 2
+
+    class _Particle:
+        """Particle wrapper for a two-source state."""
+
+        state = _State()
+
+    class _DummyFilter:
+        """Filter whose posterior cardinality is stable."""
+
+        config = _DummyConfig()
+        continuous_particles = [_Particle()]
+        continuous_weights = np.array([1.0], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator with no report-visible source and uncapped birth enabled."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty estimate to initialize report diagnostics."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a no-source report below the dwell candidate threshold."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "model_order_ready": True,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=0.0,
+    )
+
+    assert ready is True
+    assert reason == "model_order_ready"
+
+
+def test_source_cardinality_dwell_can_use_report_order_without_posterior_match() -> None:
+    """Adaptive dwell can ignore stable PF/report K mismatch when configured."""
+
+    class _DummyConfig:
+        """Minimal PF config with report-order cardinality as the stop source."""
+
+        converge_cardinality_var_max = 0.05
+        birth_enable = True
+        max_sources = None
+        report_model_order_require_posterior_match = False
+
+    class _State:
+        """Three-source dummy state."""
+
+        num_sources = 3
+
+    class _Particle:
+        """Particle wrapper for a three-source state."""
+
+        state = _State()
+
+    class _DummyFilter:
+        """Filter whose posterior cardinality disagrees with the report."""
+
+        config = _DummyConfig()
+        continuous_particles = [_Particle()]
+        continuous_weights = np.array([1.0], dtype=float)
+
+    class _DummyEstimator:
+        """Estimator with stable two-source report diagnostics."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a two-source report."""
+            return {
+                "Cs-137": (
+                    np.zeros((2, 3), dtype=float),
+                    np.ones(2, dtype=float),
+                )
+            }
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a stable two-source model-order report."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 2,
+                    "model_order_ready": True,
+                    "condition_number": 1.0,
+                    "criterion_margin_to_simpler": 10.0,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+    )
+
+    assert ready is True
+    assert reason == "model_order_ready"
 
 
 def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> None:
@@ -286,8 +1114,10 @@ def test_source_position_support_limits_candidate_grid_z() -> None:
     assert np.max(grid[:, 2]) <= 1.5
 
 
-def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensure demo measurements keep all isotope keys after detection locking."""
+def test_demo_spectrum_counts_use_detected_isotopes_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ensure demo PF measurements include only spectrum-confirmed isotopes."""
     import realtime_demo
 
     class _DummyViz:
@@ -331,13 +1161,17 @@ def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch)
             )
         )
 
-    def _fake_estimates(self: RotatingShieldPFEstimator) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _fake_estimates(
+        self: RotatingShieldPFEstimator,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """Return a non-empty estimate for each isotope."""
         positions = np.array([[0.5, 0.5, 0.5]], dtype=float)
         strengths = np.array([1.0], dtype=float)
         return {iso: (positions.copy(), strengths.copy()) for iso in ANALYSIS_ISOTOPES}
 
-    def _fake_sim(self: SpectralDecomposer, *args: object, **kwargs: object) -> tuple[np.ndarray, None]:
+    def _fake_sim(
+        self: SpectralDecomposer, *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, None]:
         """Return a zero spectrum to avoid heavy simulation work."""
         return np.zeros_like(self.energy_axis, dtype=float), None
 
@@ -382,12 +1216,14 @@ def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch)
         """Pretend GPU is disabled to avoid CUDA checks in tests."""
         return False
 
-    def _forbidden_restrict(
+    def _fake_add_isotopes(
         self: RotatingShieldPFEstimator,
-        active_isotopes: list[str],
+        new_isotopes: list[str],
     ) -> None:
-        """Fail if runtime detection tries to remove isotope filters."""
-        raise AssertionError("Detection must not restrict runtime isotopes.")
+        """Activate isotopes without building heavy kernels in this test."""
+        for iso in new_isotopes:
+            if iso not in self.isotopes:
+                self.isotopes.append(iso)
 
     planning_isotope_args: list[list[str] | None] = []
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
@@ -403,13 +1239,17 @@ def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch)
         "generate_candidate_poses",
         _fake_candidate_poses,
     )
-    monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
+    monkeypatch.setattr(
+        realtime_demo, "select_next_pose_from_candidates", _fake_next_pose
+    )
     monkeypatch.setattr(SpectralDecomposer, "simulate_spectrum", _fake_sim)
-    monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
+    monkeypatch.setattr(
+        SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
+    )
     monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
-    monkeypatch.setattr(RotatingShieldPFEstimator, "restrict_isotopes", _forbidden_restrict)
+    monkeypatch.setattr(RotatingShieldPFEstimator, "add_isotopes", _fake_add_isotopes)
 
     estimator = run_live_pf(
         live=False,
@@ -453,17 +1293,70 @@ def test_demo_spectrum_counts_keep_all_isotopes(monkeypatch: pytest.MonkeyPatch)
     assert metrics["mean_orientation_selection_time_s"] >= 0.0
     assert metrics["mean_pf_update_time_s"] >= 0.0
     for rec in estimator.measurements:
-        for iso in ANALYSIS_ISOTOPES:
-            assert iso in rec.z_k
-            assert rec.z_variance_k is not None
-            assert rec.z_variance_k[iso] == pytest.approx(2.0)
+        assert set(rec.z_k) == {"Cs-137"}
+        assert rec.z_variance_k is not None
+        assert set(rec.z_variance_k) == {"Cs-137"}
+        assert rec.z_variance_k["Cs-137"] == pytest.approx(2.0)
     assert planning_isotope_args
     assert all(value is None for value in planning_isotope_args)
     estimates = estimator.estimates()
-    for iso in ANALYSIS_ISOTOPES:
-        positions, strengths = estimates.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-        assert positions.size > 0
-        assert strengths.size > 0
+    positions, strengths = estimates.get("Cs-137", (np.zeros((0, 3)), np.zeros(0)))
+    assert positions.size > 0
+    assert strengths.size > 0
+
+
+def test_final_absent_filter_removes_unsupported_isotope() -> None:
+    """Final reporting should drop isotopes without count and PF support."""
+    measurements = [
+        MeasurementRecord(
+            z_k={"Cs-137": 120.0, "Co-60": 3.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={"Cs-137": 120.0, "Co-60": 9.0},
+        ),
+        MeasurementRecord(
+            z_k={"Cs-137": 130.0, "Co-60": 2.0},
+            pose_idx=0,
+            orient_idx=1,
+            live_time_s=1.0,
+            fe_index=1,
+            pb_index=0,
+            z_variance_k={"Cs-137": 130.0, "Co-60": 9.0},
+        ),
+    ]
+    estimates = {
+        "Cs-137": (
+            np.array([[1.0, 2.0, 3.0]], dtype=float),
+            np.array([1000.0], dtype=float),
+        ),
+        "Co-60": (
+            np.array([[4.0, 5.0, 6.0]], dtype=float),
+            np.array([1000.0], dtype=float),
+        ),
+        "Eu-154": (
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        ),
+    }
+
+    filtered, diagnostics = _filter_absent_final_estimates(
+        estimates,
+        measurements,
+        enabled=True,
+        count_threshold_abs=30.0,
+        min_support_measurements=2,
+        min_total_counts=60.0,
+        snr_threshold=3.0,
+        min_strength=500.0,
+    )
+
+    assert set(filtered) == {"Cs-137"}
+    assert diagnostics["Cs-137"]["kept"] is True
+    assert diagnostics["Co-60"]["reason"] == "insufficient_spectral_support"
+    assert diagnostics["Eu-154"]["reason"] == "no_final_pf_support"
 
 
 def test_shield_selection_uses_signature_floor_and_dependency() -> None:
@@ -591,10 +1484,14 @@ def test_incident_gamma_runtime_uses_detector_response_folding() -> None:
     assert config.apply_incident_gamma_detector_response is True
 
 
-def test_prune_missing_isotope_does_not_zero_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prune_missing_isotope_does_not_zero_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Missing isotope keys should not be treated as zero-count measurements."""
     isotopes = ["Cs-137", "Co-60"]
-    pf_conf = RotatingShieldPFConfig(num_particles=4, min_particles=4, max_particles=4, use_gpu=False)
+    pf_conf = RotatingShieldPFConfig(
+        num_particles=4, min_particles=4, max_particles=4, use_gpu=False
+    )
     estimator = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=np.zeros((1, 3), dtype=float),
@@ -750,8 +1647,12 @@ def test_adaptive_dwell_chunks_stop_at_ready_counts(
     assert observation.metadata["num_primaries"] == pytest.approx(40.0)
     assert observation.metadata["run_time_s"] == pytest.approx(2.0)
     assert observation.metadata["primaries_per_sec"] == pytest.approx(20.0)
-    assert observation.metadata["source_equivalent_counts_Cs-137"] == pytest.approx(120.0)
-    assert observation.metadata["transport_detected_counts_Cs-137"] == pytest.approx(160.0)
+    assert observation.metadata["source_equivalent_counts_Cs-137"] == pytest.approx(
+        120.0
+    )
+    assert observation.metadata["transport_detected_counts_Cs-137"] == pytest.approx(
+        160.0
+    )
     assert commands[0].step_id == 7 * ADAPTIVE_STEP_ID_STRIDE
     assert commands[1].step_id == 7 * ADAPTIVE_STEP_ID_STRIDE + 1
     assert commands[0].travel_time_s == pytest.approx(5.0)
@@ -944,7 +1845,9 @@ def test_adaptive_dwell_stops_when_projected_live_time_is_unproductive() -> None
     assert reason.startswith("low_signal_projected_time:positive=0")
 
 
-def test_adaptive_dwell_keeps_collecting_when_projected_live_time_is_reasonable() -> None:
+def test_adaptive_dwell_keeps_collecting_when_projected_live_time_is_reasonable() -> (
+    None
+):
     """A sub-threshold count should continue when extrapolated target time is modest."""
     ready, reason = _is_adaptive_spectrum_ready(
         {"Cs-137": 60.0, "Co-60": 2.0, "Eu-154": 8.0},
@@ -1033,7 +1936,9 @@ def test_partial_ready_variance_inflation_marks_unresolved_isotopes() -> None:
     assert inflated["Eu-154"] >= 10000.0
 
 
-def test_effective_entries_add_count_variance_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_effective_entries_add_count_variance_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Weighted effective entries should soften high-count PF observations."""
     decomposer = SpectralDecomposer()
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)

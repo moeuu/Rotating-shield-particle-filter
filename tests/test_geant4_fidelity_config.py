@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
     ExportedDetectorModel,
 )
+from sim.runtime import load_runtime_config
 from sim.shield_geometry import (
     FE_SHIELD_INNER_RADIUS_M,
     FE_SHIELD_THICKNESS_M,
@@ -31,6 +31,11 @@ def _geant4_runtime_config_paths() -> list[Path]:
     ]
 
 
+def _load_geant4_runtime_config(config_path: Path) -> dict[str, object]:
+    """Load a Geant4 runtime config after resolving optional inheritance."""
+    return load_runtime_config(config_path)
+
+
 def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
     """Geant4 configs should use detector cps@1m source-rate semantics."""
     forbidden_args = {
@@ -39,7 +44,7 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
         "--no-poisson-background",
     }
     for config_path in _geant4_runtime_config_paths():
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload = _load_geant4_runtime_config(config_path)
         executable_args = set(payload.get("executable_args", []))
 
         assert payload.get("engine_mode", "external") == "external"
@@ -68,7 +73,7 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     """The explicit high-fidelity external config should use balanced native transport."""
     root = Path(__file__).resolve().parents[1]
     config_path = root / "configs" / "geant4" / "high_fidelity_external_no_isaac.json"
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload = _load_geant4_runtime_config(config_path)
 
     assert payload["engine_mode"] == "external"
     assert payload["physics_profile"] == "balanced"
@@ -84,6 +89,18 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
+    assert int(payload["birth_min_distinct_stations"]) >= 2
+    assert int(payload["birth_min_distinct_poses"]) >= 5
+    assert float(payload["birth_existing_response_corr_max"]) <= 0.99
+    assert payload["report_exclude_unverified_sources"] is True
+    assert payload["report_strength_refit_preserve_cardinality"] is False
+    assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert payload["report_model_order_require_posterior_match"] is False
+    assert payload["report_model_order_prune_particles"] is True
+    assert payload["mode_preserving_resample"] is True
+    assert int(payload["mode_preserving_max_modes"]) >= 12
+    assert int(payload["mode_preserving_particles_per_mode"]) >= 8
+    assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
     assert "executable_args" not in payload
 
 
@@ -109,7 +126,7 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
         / "geant4"
         / "variance_reduction_external_no_isaac_32threads.json"
     )
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload = _load_geant4_runtime_config(config_path)
     config = Geant4AppConfig.from_dict(payload)
 
     assert config.source_rate_model == "detector_cps_1m"
@@ -124,12 +141,64 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
+    assert int(payload["birth_min_distinct_stations"]) >= 2
+    assert int(payload["birth_min_distinct_poses"]) >= 5
+    assert float(payload["birth_existing_response_corr_max"]) <= 0.99
+    assert payload["report_exclude_unverified_sources"] is True
+    assert payload["report_strength_refit_preserve_cardinality"] is False
+    assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert payload["report_model_order_require_posterior_match"] is False
+    assert payload["report_model_order_prune_particles"] is True
+    assert payload["mission_stop_max_poses"] is None
+    assert payload["mission_stop_require_pf_convergence_for_coverage"] is False
+    assert payload["mode_preserving_resample"] is True
+    assert int(payload["mode_preserving_max_modes"]) >= 12
+    assert int(payload["mode_preserving_particles_per_mode"]) >= 8
+    assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
+
+
+def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
+    """The default GUI runtime should differ from CUI only by Isaac Sim controls."""
+    root = Path(__file__).resolve().parents[1]
+    standard_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    gui_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_gui_32threads.json"
+    )
+    standard_payload = _load_geant4_runtime_config(standard_path)
+    gui_payload = _load_geant4_runtime_config(gui_path)
+    gui_only_keys = {
+        "start_isaacsim_sidecar_with_geant4",
+        "isaacsim_sidecar_config_path",
+        "isaacsim_sidecar_python_env",
+        "isaacsim_sidecar_startup_timeout_s",
+        "isaacsim_keep_sidecar_alive",
+    }
+
+    assert standard_payload["start_isaacsim_sidecar_with_geant4"] is False
+    assert gui_payload["start_isaacsim_sidecar_with_geant4"] is True
+    assert {
+        key: value
+        for key, value in gui_payload.items()
+        if key not in gui_only_keys
+    } == {
+        key: value
+        for key, value in standard_payload.items()
+        if key not in gui_only_keys
+    }
 
 
 def test_geant4_configs_use_large_detector_model() -> None:
     """Runtime configs should use the large spherical CeBr3 detector."""
     for config_path in _geant4_runtime_config_paths():
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload = _load_geant4_runtime_config(config_path)
         detector = payload.get("detector_model", {})
 
         assert detector["crystal_radius_m"] == pytest.approx(DEFAULT_DETECTOR_CRYSTAL_RADIUS_M)
