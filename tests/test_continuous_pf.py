@@ -1,12 +1,17 @@
 """Basic tests for continuous measurement model and PF scaffold."""
 
 import numpy as np
+import pytest
 
 from measurement.continuous_kernels import expected_counts_single_isotope
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import is_allowed_source_surface_position
-from pf.likelihood import count_likelihood_variance, count_log_likelihood
+from pf.likelihood import (
+    count_likelihood_variance,
+    count_log_likelihood,
+    normalize_count_likelihood_model,
+)
 from pf.particle_filter import IsotopeParticleFilter, PFConfig, IsotopeParticle
 from pf.state import IsotopeState
 
@@ -256,6 +261,159 @@ def test_observation_count_variance_softens_spectrum_unfolding_update() -> None:
 
     assert uncertain_gap > 0.0
     assert uncertain_gap < certain_gap
+
+
+def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
+    """The batched NumPy likelihood path should normalize model aliases."""
+    cfg = PFConfig(
+        num_particles=1,
+        count_likelihood_model="normal",
+        transport_model_rel_sigma=0.15,
+        spectrum_count_abs_sigma=2.0,
+        count_likelihood_df=3.0,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    z_obs = np.array([42.0, 18.0], dtype=float)
+    lambda_kp = np.array(
+        [
+            [39.0, 23.0],
+            [21.0, 12.0],
+        ],
+        dtype=float,
+    )
+    obs_var = np.array([4.0, 9.0], dtype=float)
+
+    actual = filt._count_log_likelihood_matrix_np(
+        z_obs,
+        lambda_kp,
+        observation_count_variance=obs_var,
+    )
+    expected = np.array(
+        [
+            count_log_likelihood(
+                z_obs,
+                lambda_kp[:, idx],
+                model="normal",
+                transport_model_rel_sigma=0.15,
+                spectrum_count_abs_sigma=2.0,
+                observation_count_variance=obs_var,
+                student_t_df=3.0,
+            )
+            for idx in range(lambda_kp.shape[1])
+        ],
+        dtype=float,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_matrix_count_likelihood_rejects_unknown_model() -> None:
+    """The batched likelihood path should not silently reinterpret bad models."""
+    cfg = PFConfig(num_particles=1, count_likelihood_model="not_a_model")
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+
+    with pytest.raises(ValueError, match="Unknown count likelihood model"):
+        filt._count_log_likelihood_matrix_np(
+            np.array([1.0], dtype=float),
+            np.array([[1.0]], dtype=float),
+        )
+
+
+def test_matrix_count_likelihood_scalar_variance_broadcasts() -> None:
+    """Scalar unfolding variance should apply to every batched measurement."""
+    cfg = PFConfig(num_particles=1, count_likelihood_model="gaussian")
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    z_obs = np.array([12.0, 18.0, 25.0], dtype=float)
+    lambda_kp = np.array(
+        [
+            [11.0, 14.0],
+            [17.0, 20.0],
+            [23.0, 26.0],
+        ],
+        dtype=float,
+    )
+
+    scalar = filt._count_log_likelihood_matrix_np(
+        z_obs,
+        lambda_kp,
+        observation_count_variance=4.0,
+    )
+    repeated = filt._count_log_likelihood_matrix_np(
+        z_obs,
+        lambda_kp,
+        observation_count_variance=np.full(z_obs.shape, 4.0, dtype=float),
+    )
+
+    np.testing.assert_allclose(scalar, repeated, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_matrix_count_likelihood_rejects_mismatched_variance() -> None:
+    """Batched likelihoods should reject ambiguous observation variance shapes."""
+    cfg = PFConfig(num_particles=1, count_likelihood_model="gaussian")
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+
+    with pytest.raises(ValueError, match="observation_count_variance"):
+        filt._count_log_likelihood_matrix_np(
+            np.array([12.0, 18.0, 25.0], dtype=float),
+            np.array([[11.0], [17.0], [23.0]], dtype=float),
+            observation_count_variance=np.array([4.0, 9.0], dtype=float),
+        )
+
+
+def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
+    """Scalar, matrix, and torch increments should agree on model aliases."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(
+        num_particles=1,
+        count_likelihood_model="normal",
+        transport_model_rel_sigma=0.2,
+        spectrum_count_abs_sigma=1.5,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    lam = torch.as_tensor([37.0, 41.0], dtype=torch.float64)
+
+    actual = filt._log_likelihood_increment_gpu(
+        lam,
+        z_obs=39.0,
+        observation_count_variance=4.0,
+    ).detach().cpu().numpy()
+    expected = np.array(
+        [
+            count_log_likelihood(
+                np.array([39.0], dtype=float),
+                np.array([value], dtype=float),
+                model="gaussian",
+                transport_model_rel_sigma=0.2,
+                spectrum_count_abs_sigma=1.5,
+                observation_count_variance=4.0,
+            )
+            for value in (37.0, 41.0)
+        ],
+        dtype=float,
+    )
+
+    assert normalize_count_likelihood_model("") == "poisson"
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_low_count_variance_floor_decays_for_informative_counts() -> None:

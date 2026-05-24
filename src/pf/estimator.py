@@ -54,6 +54,31 @@ def _weighted_quantile(
     return float(values[idx])
 
 
+def _measurement_vector(
+    values: float | NDArray[np.float64],
+    count: int,
+    name: str,
+    *,
+    min_value: float | None = None,
+    allow_scalar: bool = True,
+) -> NDArray[np.float64]:
+    """Return a validated one-value-per-measurement vector."""
+    expected = max(int(count), 0)
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        if expected == 0:
+            return np.zeros(0, dtype=float)
+        raise ValueError(f"{name} must contain one value per measurement.")
+    if arr.size == 1 and expected != 1 and allow_scalar:
+        arr = np.full(expected, float(arr[0]), dtype=float)
+    elif arr.size != expected:
+        scalar_text = "scalar or " if allow_scalar else ""
+        raise ValueError(f"{name} must be {scalar_text}one value per measurement.")
+    if min_value is not None:
+        arr = np.maximum(arr, float(min_value))
+    return np.asarray(arr, dtype=float)
+
+
 @dataclass
 class RotatingShieldPFConfig:
     """
@@ -111,6 +136,11 @@ class RotatingShieldPFConfig:
         - birth_matching_pursuit_max_new_sources: max sequential residual births per particle
         - birth_matching_pursuit_topk_candidates: candidates evaluated per matching-pursuit birth
         - birth_jitter_topk_candidates: base residual-supported candidates jittered for birth
+        - birth_global_rescue_enable: add station-level MLE-style surface candidates to runtime birth
+        - birth_global_rescue_max_candidates: max global surface candidates used by runtime birth
+        - birth_global_rescue_min_residual_fraction: residual fraction needed before runtime global rescue
+        - birth_global_rescue_dedup_radius_m: distance used to merge runtime global birth candidates
+        - birth_global_rescue_forced_min_delta_ll: minimum ΔLL for forced runtime global rescue births
         - residual_decomposition_enable: enable raw/peak-suppressed residual layers
         - peak_suppression_enable: use strong-source leave-one-out residual layers
         - peak_suppression_min_source_fraction: source fraction defining suppressible peaks
@@ -121,6 +151,7 @@ class RotatingShieldPFConfig:
         - pseudo_source_min_distinct_views: distinct shield views needed to confirm sources
         - pseudo_source_fail_grace_stations: failed verifications before pruning tentative sources
         - pseudo_source_corr_max: response-correlation ceiling against stronger sources
+        - pseudo_source_temporal_sep_min: whitened temporal-code separation that can confirm high-correlation sources
         - report_exclude_unverified_sources: hide tentative birth sources from report estimates
         - source_prune_refit_after_remove: refit remaining strengths before pruning
         - source_prune_bic_penalty_params: source parameter count for BIC prune gain
@@ -140,12 +171,22 @@ class RotatingShieldPFConfig:
         - conditional_strength_refit_min_snr: minimum count SNR for strength refit
         - conditional_strength_refit_prior_weight: MAP strength-prior weight
         - conditional_strength_refit_prior_rel_sigma: relative strength-prior sigma
+        - source_strength_prior_mean: absolute source-rate prior mean shared by runtime/report refits
+        - source_strength_prior_weight: absolute source-rate prior weight to suppress one-source absorption
+        - source_strength_prior_rel_sigma: relative sigma for the absolute source-rate prior
         - report_strength_refit: refit reported strengths conditioned on reported positions
         - report_strength_refit_iters: multiplicative Poisson regression iterations
         - report_strength_refit_eps: numerical floor for reported-strength regression
+        - report_strength_refit_use_all_measurements: include shielded and low-count postures in report refit
         - report_strength_refit_preserve_cardinality: keep posterior clusters during report refit
         - report_strength_refit_prior_weight: MAP strength-prior weight for report refit
         - report_strength_refit_prior_rel_sigma: relative strength-prior sigma for report refit
+        - report_mle_rescue_enable: add MLE-style global/residual surface candidates before report BIC
+        - report_mle_rescue_max_candidates: total report candidates kept after rescue
+        - report_mle_rescue_max_posterior_candidates: unverified posterior clusters added as rescue candidates
+        - report_mle_rescue_max_residual_candidates: global/residual-ranked surface candidates added as rescue candidates
+        - report_mle_rescue_dedup_radius_m: distance used to merge duplicate rescue candidates
+        - report_mle_rescue_min_residual_fraction: residual fraction needed before surface-grid rescue
         - report_cluster_model_selection: remove redundant reported clusters by refit-after-remove
         - report_cluster_bic_penalty_params: source parameter count for reported cluster BIC
         - report_cluster_delta_ll_threshold: tolerated report-model likelihood loss
@@ -327,6 +368,11 @@ class RotatingShieldPFConfig:
     birth_matching_pursuit_max_new_sources: int = 3
     birth_matching_pursuit_topk_candidates: int = 16
     birth_jitter_topk_candidates: int | None = 512
+    birth_global_rescue_enable: bool = False
+    birth_global_rescue_max_candidates: int = 8
+    birth_global_rescue_min_residual_fraction: float = 0.005
+    birth_global_rescue_dedup_radius_m: float = 0.5
+    birth_global_rescue_forced_min_delta_ll: float = 0.0
     residual_decomposition_enable: bool = True
     peak_suppression_enable: bool = True
     peak_suppression_min_source_fraction: float = 0.25
@@ -337,6 +383,7 @@ class RotatingShieldPFConfig:
     pseudo_source_min_distinct_views: int = 2
     pseudo_source_fail_grace_stations: int = 2
     pseudo_source_corr_max: float = 0.995
+    pseudo_source_temporal_sep_min: float = 0.0
     pseudo_source_quarantine_on_suppress: bool = True
     pseudo_source_quarantine_excludes_runtime: bool = False
     report_exclude_unverified_sources: bool = False
@@ -362,12 +409,22 @@ class RotatingShieldPFConfig:
     conditional_strength_refit_min_snr: float = 1.0
     conditional_strength_refit_prior_weight: float = 0.0
     conditional_strength_refit_prior_rel_sigma: float = 2.0
+    source_strength_prior_mean: float = 0.0
+    source_strength_prior_weight: float = 0.0
+    source_strength_prior_rel_sigma: float = 1.0
     report_strength_refit: bool = False
     report_strength_refit_iters: int = 64
     report_strength_refit_eps: float = 1.0e-9
+    report_strength_refit_use_all_measurements: bool = True
     report_strength_refit_preserve_cardinality: bool = False
     report_strength_refit_prior_weight: float = 0.0
     report_strength_refit_prior_rel_sigma: float = 2.0
+    report_mle_rescue_enable: bool = False
+    report_mle_rescue_max_candidates: int = 12
+    report_mle_rescue_max_posterior_candidates: int = 8
+    report_mle_rescue_max_residual_candidates: int = 8
+    report_mle_rescue_dedup_radius_m: float = 0.5
+    report_mle_rescue_min_residual_fraction: float = 0.01
     report_cluster_model_selection: bool = True
     report_cluster_bic_penalty_params: int = 4
     report_cluster_delta_ll_threshold: float = 0.0
@@ -495,6 +552,7 @@ class RotatingShieldPFConfig:
     converge_cluster_min_support_fraction: float = 0.0
 
     def __post_init__(self) -> None:
+        """Validate and normalize estimator configuration values."""
         if self.min_particles is None:
             self.min_particles = max(1, int(self.num_particles * 0.5))
         if self.max_particles is None:
@@ -674,6 +732,22 @@ class RotatingShieldPFConfig:
                 1,
                 int(self.birth_jitter_topk_candidates),
             )
+        self.birth_global_rescue_enable = bool(self.birth_global_rescue_enable)
+        self.birth_global_rescue_max_candidates = max(
+            0,
+            int(self.birth_global_rescue_max_candidates),
+        )
+        self.birth_global_rescue_min_residual_fraction = max(
+            0.0,
+            float(self.birth_global_rescue_min_residual_fraction),
+        )
+        self.birth_global_rescue_dedup_radius_m = max(
+            0.0,
+            float(self.birth_global_rescue_dedup_radius_m),
+        )
+        self.birth_global_rescue_forced_min_delta_ll = float(
+            self.birth_global_rescue_forced_min_delta_ll
+        )
         self.residual_decomposition_enable = bool(self.residual_decomposition_enable)
         self.peak_suppression_enable = bool(self.peak_suppression_enable)
         self.peak_suppression_min_source_fraction = float(
@@ -700,6 +774,10 @@ class RotatingShieldPFConfig:
         )
         self.pseudo_source_corr_max = float(
             np.clip(float(self.pseudo_source_corr_max), 0.0, 1.0)
+        )
+        self.pseudo_source_temporal_sep_min = max(
+            0.0,
+            float(self.pseudo_source_temporal_sep_min),
         )
         self.pseudo_source_quarantine_on_suppress = bool(
             self.pseudo_source_quarantine_on_suppress
@@ -786,10 +864,25 @@ class RotatingShieldPFConfig:
             1.0e-6,
             float(self.conditional_strength_refit_prior_rel_sigma),
         )
+        self.source_strength_prior_mean = max(
+            0.0,
+            float(self.source_strength_prior_mean),
+        )
+        self.source_strength_prior_weight = max(
+            0.0,
+            float(self.source_strength_prior_weight),
+        )
+        self.source_strength_prior_rel_sigma = max(
+            1.0e-6,
+            float(self.source_strength_prior_rel_sigma),
+        )
         self.report_strength_refit_iters = max(1, int(self.report_strength_refit_iters))
         self.report_strength_refit_eps = max(
             1.0e-15,
             float(self.report_strength_refit_eps),
+        )
+        self.report_strength_refit_use_all_measurements = bool(
+            self.report_strength_refit_use_all_measurements
         )
         self.report_strength_refit_preserve_cardinality = bool(
             self.report_strength_refit_preserve_cardinality
@@ -801,6 +894,27 @@ class RotatingShieldPFConfig:
         self.report_strength_refit_prior_rel_sigma = max(
             1.0e-6,
             float(self.report_strength_refit_prior_rel_sigma),
+        )
+        self.report_mle_rescue_enable = bool(self.report_mle_rescue_enable)
+        self.report_mle_rescue_max_candidates = max(
+            1,
+            int(self.report_mle_rescue_max_candidates),
+        )
+        self.report_mle_rescue_max_posterior_candidates = max(
+            0,
+            int(self.report_mle_rescue_max_posterior_candidates),
+        )
+        self.report_mle_rescue_max_residual_candidates = max(
+            0,
+            int(self.report_mle_rescue_max_residual_candidates),
+        )
+        self.report_mle_rescue_dedup_radius_m = max(
+            0.0,
+            float(self.report_mle_rescue_dedup_radius_m),
+        )
+        self.report_mle_rescue_min_residual_fraction = max(
+            0.0,
+            float(self.report_mle_rescue_min_residual_fraction),
         )
         self.report_cluster_model_selection = bool(self.report_cluster_model_selection)
         self.report_cluster_bic_penalty_params = max(
@@ -906,6 +1020,7 @@ class RotatingShieldPFEstimator:
         detector_radius_m: float = 0.0,
         detector_aperture_samples: int = 1,
     ) -> None:
+        """Initialize per-isotope filters and shared measurement-model state."""
         self.all_isotopes = list(isotopes)
         self.isotopes = list(isotopes)
         self.pf_config = pf_config or RotatingShieldPFConfig()
@@ -977,6 +1092,7 @@ class RotatingShieldPFEstimator:
         from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
 
         def _norm_key(name: str) -> str:
+            """Return a normalized isotope key for attenuation lookup."""
             return re.sub(r"[^A-Za-z0-9]", "", name).upper()
 
         canonical_by_norm = {
@@ -1024,6 +1140,7 @@ class RotatingShieldPFEstimator:
         return resolved
 
     def _ensure_kernel_cache(self) -> None:
+        """Build the discrete kernel cache when it is first needed."""
         if self.kernel_cache is not None:
             return
         if len(self.poses) == 0:
@@ -1163,6 +1280,19 @@ class RotatingShieldPFEstimator:
                 self.pf_config.birth_matching_pursuit_topk_candidates
             ),
             birth_jitter_topk_candidates=self.pf_config.birth_jitter_topk_candidates,
+            birth_global_rescue_enable=self.pf_config.birth_global_rescue_enable,
+            birth_global_rescue_max_candidates=(
+                self.pf_config.birth_global_rescue_max_candidates
+            ),
+            birth_global_rescue_min_residual_fraction=(
+                self.pf_config.birth_global_rescue_min_residual_fraction
+            ),
+            birth_global_rescue_dedup_radius_m=(
+                self.pf_config.birth_global_rescue_dedup_radius_m
+            ),
+            birth_global_rescue_forced_min_delta_ll=(
+                self.pf_config.birth_global_rescue_forced_min_delta_ll
+            ),
             residual_decomposition_enable=(
                 self.pf_config.residual_decomposition_enable
             ),
@@ -1185,6 +1315,9 @@ class RotatingShieldPFEstimator:
                 self.pf_config.pseudo_source_fail_grace_stations
             ),
             pseudo_source_corr_max=self.pf_config.pseudo_source_corr_max,
+            pseudo_source_temporal_sep_min=(
+                self.pf_config.pseudo_source_temporal_sep_min
+            ),
             pseudo_source_quarantine_on_suppress=(
                 self.pf_config.pseudo_source_quarantine_on_suppress
             ),
@@ -1230,6 +1363,11 @@ class RotatingShieldPFEstimator:
             conditional_strength_refit_min_snr=self.pf_config.conditional_strength_refit_min_snr,
             conditional_strength_refit_prior_weight=self.pf_config.conditional_strength_refit_prior_weight,
             conditional_strength_refit_prior_rel_sigma=self.pf_config.conditional_strength_refit_prior_rel_sigma,
+            source_strength_prior_mean=self.pf_config.source_strength_prior_mean,
+            source_strength_prior_weight=self.pf_config.source_strength_prior_weight,
+            source_strength_prior_rel_sigma=(
+                self.pf_config.source_strength_prior_rel_sigma
+            ),
             min_age_to_split=self.pf_config.min_age_to_split,
             use_clustered_output=self.pf_config.use_clustered_output,
             cluster_eps_m=self.pf_config.cluster_eps_m,
@@ -2526,6 +2664,24 @@ class RotatingShieldPFEstimator:
                 background_rate = float(level)
         return np.maximum(background_rate, 0.0) * np.asarray(live_times, dtype=float)
 
+    def _report_absolute_strength_prior_terms(
+        self,
+        shape: tuple[int, ...],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return absolute report-strength prior precision and mean arrays."""
+        mean = max(float(self.pf_config.source_strength_prior_mean), 0.0)
+        weight = max(float(self.pf_config.source_strength_prior_weight), 0.0)
+        if mean <= 0.0 or weight <= 0.0:
+            zeros = np.zeros(shape, dtype=float)
+            return zeros, zeros
+        rel_sigma = max(float(self.pf_config.source_strength_prior_rel_sigma), 1.0e-6)
+        sigma = max(rel_sigma * mean, 1.0e-12)
+        precision = weight / (sigma * sigma)
+        return (
+            np.full(shape, precision, dtype=float),
+            np.full(shape, mean, dtype=float),
+        )
+
     def _solve_report_strengths(
         self,
         *,
@@ -2540,17 +2696,22 @@ class RotatingShieldPFEstimator:
         """Return non-negative strengths for fixed reported cluster positions."""
         design_arr = np.maximum(np.asarray(design, dtype=float), 0.0)
         z_arr = np.maximum(np.asarray(z_obs, dtype=float).reshape(-1), 0.0)
-        bg_arr = np.asarray(background, dtype=float).reshape(-1)
         if design_arr.ndim != 2 or design_arr.shape[0] != z_arr.size:
             return np.asarray(initial_strengths, dtype=float).reshape(-1)
-        if bg_arr.size != z_arr.size:
-            bg_arr = np.resize(bg_arr, z_arr.size)
+        bg_arr = _measurement_vector(
+            background,
+            z_arr.size,
+            "background",
+            min_value=0.0,
+        )
         source_count = int(design_arr.shape[1])
         if source_count <= 0:
             return np.zeros(0, dtype=float)
         q = np.maximum(np.asarray(initial_strengths, dtype=float).reshape(-1), eps)
-        if q.size != source_count:
-            q = np.resize(q, source_count)
+        if q.size == 0:
+            q = np.full(source_count, eps, dtype=float)
+        elif q.size != source_count:
+            raise ValueError("initial_strengths must have one value per source.")
         if not np.any(np.isfinite(q)):
             q = np.full(source_count, eps, dtype=float)
         prior_q = np.maximum(np.where(np.isfinite(q), q, eps), eps)
@@ -2564,10 +2725,20 @@ class RotatingShieldPFEstimator:
             1.0e-6,
             float(self.pf_config.report_strength_refit_prior_rel_sigma),
         )
-        prior_precision = np.zeros(source_count, dtype=float)
+        abs_precision, abs_mean = self._report_absolute_strength_prior_terms(
+            prior_q.shape
+        )
+        local_precision = np.zeros(source_count, dtype=float)
         if prior_weight > 0.0:
             prior_sigma = np.maximum(prior_rel_sigma * prior_q, eps)
-            prior_precision = prior_weight / np.maximum(prior_sigma**2, eps)
+            local_precision = prior_weight / np.maximum(prior_sigma**2, eps)
+        prior_precision = local_precision + abs_precision
+        prior_target = np.divide(
+            local_precision * prior_q + abs_precision * abs_mean,
+            np.maximum(prior_precision, eps),
+            out=prior_q.copy(),
+            where=prior_precision > 0.0,
+        )
         column_sum = np.sum(design_arr, axis=0)
         observable = column_sum > eps
         signal_total = max(float(np.sum(z_arr - bg_arr)), 0.0)
@@ -2576,17 +2747,18 @@ class RotatingShieldPFEstimator:
             denom = max(float(np.sum(column_sum[observable])), eps)
             q[weak_or_invalid & observable] = signal_total / denom
         q[~observable] = 0.0
-        obs_weights = 1.0 / np.maximum(
-            np.asarray(observation_variances, dtype=float).reshape(-1),
-            1.0,
+        obs_variances = _measurement_vector(
+            observation_variances,
+            z_arr.size,
+            "observation_variances",
+            min_value=1.0,
         )
-        if obs_weights.size != z_arr.size:
-            obs_weights = np.resize(obs_weights, z_arr.size)
+        obs_weights = 1.0 / obs_variances
         gram = (design_arr.T * obs_weights[None, :]) @ design_arr
         rhs = (design_arr.T * obs_weights[None, :]) @ (z_arr - bg_arr)
-        if prior_weight > 0.0:
+        if np.any(prior_precision > 0.0):
             gram = gram + np.diag(prior_precision)
-            rhs = rhs + prior_precision * prior_q
+            rhs = rhs + prior_precision * prior_target
         try:
             direct = np.linalg.solve(
                 gram + np.eye(source_count, dtype=float) * eps,
@@ -2603,8 +2775,8 @@ class RotatingShieldPFEstimator:
             ratio = np.divide(z_arr, lam, out=np.zeros_like(z_arr), where=lam > 0.0)
             numerator = design_arr.T @ ratio
             denominator = np.maximum(column_sum, eps)
-            if prior_weight > 0.0:
-                numerator = numerator + prior_precision * prior_q
+            if np.any(prior_precision > 0.0):
+                numerator = numerator + prior_precision * prior_target
                 denominator = denominator + prior_precision * np.maximum(q, eps)
             q = q * np.clip(numerator / denominator, 0.0, np.inf)
             q[~observable] = 0.0
@@ -2634,17 +2806,22 @@ class RotatingShieldPFEstimator:
         """
         design_arr = np.maximum(np.asarray(design_batch, dtype=float), 0.0)
         z_arr = np.maximum(np.asarray(z_obs, dtype=float).reshape(-1), 0.0)
-        bg_arr = np.asarray(background, dtype=float).reshape(-1)
         if design_arr.ndim != 3 or design_arr.shape[1] != z_arr.size:
             return np.asarray(initial_strengths, dtype=float)
-        if bg_arr.size != z_arr.size:
-            bg_arr = np.resize(bg_arr, z_arr.size)
+        bg_arr = _measurement_vector(
+            background,
+            z_arr.size,
+            "background",
+            min_value=0.0,
+        )
         batch_count, _, source_count = design_arr.shape
         if source_count <= 0:
             return np.zeros((batch_count, 0), dtype=float)
         q = np.maximum(np.asarray(initial_strengths, dtype=float), eps)
-        if q.shape != (batch_count, source_count):
-            q = np.resize(q, (batch_count, source_count))
+        if q.shape == (source_count,):
+            q = np.broadcast_to(q[None, :], (batch_count, source_count)).copy()
+        elif q.shape != (batch_count, source_count):
+            raise ValueError("initial_strengths must have shape B x S.")
         q = np.where(np.isfinite(q), q, eps)
         prior_q = np.maximum(np.where(np.isfinite(q), q, eps), eps)
         if q_max > 0.0:
@@ -2657,10 +2834,20 @@ class RotatingShieldPFEstimator:
             1.0e-6,
             float(self.pf_config.report_strength_refit_prior_rel_sigma),
         )
-        prior_precision = np.zeros((batch_count, source_count), dtype=float)
+        local_precision = np.zeros((batch_count, source_count), dtype=float)
         if prior_weight > 0.0:
             prior_sigma = np.maximum(prior_rel_sigma * prior_q, eps)
-            prior_precision = prior_weight / np.maximum(prior_sigma**2, eps)
+            local_precision = prior_weight / np.maximum(prior_sigma**2, eps)
+        abs_precision, abs_mean = self._report_absolute_strength_prior_terms(
+            prior_q.shape
+        )
+        prior_precision = local_precision + abs_precision
+        prior_target = np.divide(
+            local_precision * prior_q + abs_precision * abs_mean,
+            np.maximum(prior_precision, eps),
+            out=prior_q.copy(),
+            where=prior_precision > 0.0,
+        )
         column_sum = np.sum(design_arr, axis=1)
         observable = column_sum > eps
         signal_total = max(float(np.sum(z_arr - bg_arr)), 0.0)
@@ -2676,19 +2863,20 @@ class RotatingShieldPFEstimator:
                 q,
             )
         q = np.where(observable, q, 0.0)
-        obs_weights = 1.0 / np.maximum(
-            np.asarray(observation_variances, dtype=float).reshape(-1),
-            1.0,
+        obs_variances = _measurement_vector(
+            observation_variances,
+            z_arr.size,
+            "observation_variances",
+            min_value=1.0,
         )
-        if obs_weights.size != z_arr.size:
-            obs_weights = np.resize(obs_weights, z_arr.size)
+        obs_weights = 1.0 / obs_variances
         weighted_design = design_arr * obs_weights[None, :, None]
         gram = np.einsum("bmi,bmj->bij", weighted_design, design_arr)
         rhs = np.einsum("bmk,m->bk", design_arr, obs_weights * (z_arr - bg_arr))
-        if prior_weight > 0.0:
+        if np.any(prior_precision > 0.0):
             eye = np.eye(source_count, dtype=float)[None, :, :]
             gram = gram + eye * prior_precision[:, None, :]
-            rhs = rhs + prior_precision * prior_q
+            rhs = rhs + prior_precision * prior_target
         try:
             eye = np.eye(source_count, dtype=float)[None, :, :]
             direct = np.linalg.solve(gram + eye * eps, rhs[:, :, None])[:, :, 0]
@@ -2711,8 +2899,8 @@ class RotatingShieldPFEstimator:
             )
             numerator = np.einsum("bmk,bm->bk", design_arr, ratio)
             denominator = np.maximum(column_sum, eps)
-            if prior_weight > 0.0:
-                numerator = numerator + prior_precision * prior_q
+            if np.any(prior_precision > 0.0):
+                numerator = numerator + prior_precision * prior_target
                 denominator = denominator + prior_precision * np.maximum(q, eps)
             q = q * np.clip(numerator / denominator, 0.0, np.inf)
             q = np.where(observable, q, 0.0)
@@ -2720,6 +2908,477 @@ class RotatingShieldPFEstimator:
                 q = np.minimum(q, q_max)
             q = np.where(np.isfinite(q), q, 0.0)
         return np.maximum(q, 0.0)
+
+    @staticmethod
+    def _dedupe_report_candidates(
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        *,
+        radius_m: float,
+        max_candidates: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return report candidates after deterministic radius de-duplication."""
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
+        q_arr = np.asarray(strengths, dtype=float).reshape(-1)
+        if pos_arr.shape[0] == 0 or q_arr.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        if q_arr.size != pos_arr.shape[0]:
+            raise ValueError("strengths must have one value per report candidate.")
+        finite = np.all(np.isfinite(pos_arr), axis=1) & np.isfinite(q_arr)
+        pos_arr = pos_arr[finite]
+        q_arr = np.maximum(q_arr[finite], 0.0)
+        limit = max(1, int(max_candidates))
+        radius = max(float(radius_m), 0.0)
+        kept_pos: list[NDArray[np.float64]] = []
+        kept_q: list[float] = []
+        for pos, strength in zip(pos_arr, q_arr):
+            if len(kept_pos) >= limit:
+                break
+            if radius > 0.0 and kept_pos:
+                distances = np.linalg.norm(np.vstack(kept_pos) - pos[None, :], axis=1)
+                if np.any(distances <= radius):
+                    continue
+            kept_pos.append(np.asarray(pos, dtype=float))
+            kept_q.append(max(float(strength), 0.0))
+        if not kept_pos:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        return np.vstack(kept_pos), np.asarray(kept_q, dtype=float)
+
+    def _rank_residual_surface_candidates(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+        data: MeasurementData,
+        *,
+        residual: NDArray[np.float64],
+        existing_positions: NDArray[np.float64],
+        background: NDArray[np.float64],
+        eps: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], dict[str, Any]]:
+        """Return residual-ranked surface candidates for MLE-style report rescue."""
+        max_candidates = max(
+            0,
+            int(self.pf_config.report_mle_rescue_max_residual_candidates),
+        )
+        if max_candidates <= 0 or self.candidate_sources.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        residual_arr = np.maximum(np.asarray(residual, dtype=float).reshape(-1), 0.0)
+        if residual_arr.size != data.z_k.size:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        residual_sum = float(np.sum(residual_arr))
+        reference_sum = max(
+            float(np.sum(np.maximum(np.asarray(data.z_k, dtype=float), 0.0))),
+            float(np.sum(np.maximum(np.asarray(background, dtype=float), 0.0))),
+            eps,
+        )
+        min_fraction = max(
+            0.0,
+            float(self.pf_config.report_mle_rescue_min_residual_fraction),
+        )
+        residual_fraction = residual_sum / reference_sum
+        if residual_fraction < min_fraction:
+            return (
+                np.zeros((0, 3), dtype=float),
+                np.zeros(0, dtype=float),
+                {
+                    "residual_sum": residual_sum,
+                    "residual_reference_sum": reference_sum,
+                    "residual_fraction": residual_fraction,
+                    "residual_candidates_skipped": True,
+                },
+            )
+        pool = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
+        if existing_positions.size:
+            existing = np.asarray(existing_positions, dtype=float).reshape(-1, 3)
+            distances = np.linalg.norm(pool[:, None, :] - existing[None, :, :], axis=2)
+            dedup_radius = max(
+                float(self.pf_config.report_mle_rescue_dedup_radius_m),
+                0.0,
+            )
+            if dedup_radius > 0.0:
+                pool = pool[np.min(distances, axis=1) > dedup_radius]
+        if pool.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        candidate_counts = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=data.detector_positions,
+            sources=pool,
+            strengths=np.ones(pool.shape[0], dtype=float),
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=self.response_scale_for_isotope(isotope),
+        )
+        candidate_counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
+        variances = _measurement_vector(
+            data.observation_variances,
+            data.z_k.size,
+            "observation_variances",
+            min_value=1.0,
+        )
+        weights = 1.0 / variances
+        numerator = np.sum(
+            weights[:, None] * residual_arr[:, None] * candidate_counts,
+            axis=0,
+        )
+        denominator = np.sum(
+            weights[:, None] * candidate_counts * candidate_counts,
+            axis=0,
+        )
+        q_hat = np.divide(
+            numerator,
+            np.maximum(denominator, eps),
+            out=np.zeros_like(numerator, dtype=float),
+            where=denominator > eps,
+        )
+        q_hat = np.maximum(np.where(np.isfinite(q_hat), q_hat, 0.0), 0.0)
+        scores = numerator * q_hat
+        valid = np.isfinite(scores) & (scores > 0.0) & (q_hat > 0.0)
+        if not np.any(valid):
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        valid_indices = np.flatnonzero(valid)
+        order = valid_indices[np.argsort(scores[valid_indices])[::-1]]
+        selected = order[:max_candidates]
+        stats = {
+            "residual_sum": residual_sum,
+            "residual_reference_sum": reference_sum,
+            "residual_fraction": residual_fraction,
+            "residual_candidate_pool": int(pool.shape[0]),
+            "residual_candidate_count": int(selected.size),
+            "residual_candidate_best_score": (
+                float(scores[selected[0]]) if selected.size else 0.0
+            ),
+        }
+        return pool[selected], q_hat[selected], stats
+
+    def _rank_global_surface_candidates(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+        data: MeasurementData,
+        *,
+        existing_positions: NDArray[np.float64],
+        background: NDArray[np.float64],
+        eps: float,
+        q_max: float,
+        max_candidates: int | None = None,
+        min_residual_fraction: float | None = None,
+        dedup_radius_m: float | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], dict[str, Any]]:
+        """Return greedy surface candidates from all observations for report rescue."""
+        max_candidates_value = max(
+            0,
+            int(
+                self.pf_config.report_mle_rescue_max_residual_candidates
+                if max_candidates is None
+                else max_candidates
+            ),
+        )
+        if max_candidates_value <= 0 or self.candidate_sources.size == 0:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        z_obs = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
+        background_arr = _measurement_vector(
+            background,
+            z_obs.size,
+            "background",
+            min_value=0.0,
+        )
+        initial_residual = np.maximum(z_obs - background_arr, 0.0)
+        reference_sum = max(float(np.sum(z_obs)), float(np.sum(background_arr)), eps)
+        min_fraction = max(
+            0.0,
+            float(
+                self.pf_config.report_mle_rescue_min_residual_fraction
+                if min_residual_fraction is None
+                else min_residual_fraction
+            ),
+        )
+        initial_fraction = float(np.sum(initial_residual)) / reference_sum
+        if initial_fraction < min_fraction:
+            return (
+                np.zeros((0, 3), dtype=float),
+                np.zeros(0, dtype=float),
+                {
+                    "global_rescue_initial_residual_fraction": initial_fraction,
+                    "global_rescue_candidates_skipped": True,
+                },
+            )
+        pool = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
+        dedup_radius = max(
+            float(
+                self.pf_config.report_mle_rescue_dedup_radius_m
+                if dedup_radius_m is None
+                else dedup_radius_m
+            ),
+            0.0,
+        )
+        unavailable = np.zeros(pool.shape[0], dtype=bool)
+        if existing_positions.size and dedup_radius > 0.0:
+            existing = np.asarray(existing_positions, dtype=float).reshape(-1, 3)
+            distances = np.linalg.norm(pool[:, None, :] - existing[None, :, :], axis=2)
+            unavailable |= np.min(distances, axis=1) <= dedup_radius
+        candidate_counts = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=data.detector_positions,
+            sources=pool,
+            strengths=np.ones(pool.shape[0], dtype=float),
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=self.response_scale_for_isotope(isotope),
+        )
+        candidate_counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
+        if candidate_counts.ndim != 2 or candidate_counts.shape[1] != pool.shape[0]:
+            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), {}
+        variances = _measurement_vector(
+            data.observation_variances,
+            z_obs.size,
+            "observation_variances",
+            min_value=1.0,
+        )
+        weights = 1.0 / variances
+        selected_indices: list[int] = []
+        selected_q: list[float] = []
+        selected_design = np.zeros((z_obs.size, 0), dtype=float)
+        residual = initial_residual
+        best_score = 0.0
+        final_fraction = initial_fraction
+        for _ in range(max_candidates_value):
+            residual_sum = float(np.sum(residual))
+            final_fraction = residual_sum / reference_sum
+            if final_fraction < min_fraction:
+                break
+            numerator = np.sum(
+                weights[:, None] * residual[:, None] * candidate_counts,
+                axis=0,
+            )
+            denominator = np.sum(
+                weights[:, None] * candidate_counts * candidate_counts,
+                axis=0,
+            )
+            q_hat = np.divide(
+                numerator,
+                np.maximum(denominator, eps),
+                out=np.zeros_like(numerator, dtype=float),
+                where=denominator > eps,
+            )
+            q_hat = np.maximum(np.where(np.isfinite(q_hat), q_hat, 0.0), 0.0)
+            if q_max > 0.0:
+                q_hat = np.minimum(q_hat, q_max)
+            scores = numerator * q_hat
+            valid = (
+                np.isfinite(scores)
+                & (scores > 0.0)
+                & (q_hat > eps)
+                & (~unavailable)
+            )
+            if not np.any(valid):
+                break
+            valid_indices = np.flatnonzero(valid)
+            best_idx = int(valid_indices[np.argmax(scores[valid_indices])])
+            best_score = max(best_score, float(scores[best_idx]))
+            selected_indices.append(best_idx)
+            selected_q.append(float(q_hat[best_idx]))
+            selected_design = candidate_counts[:, selected_indices]
+            selected_q_arr = self._solve_report_strengths(
+                design=selected_design,
+                z_obs=z_obs,
+                background=background_arr,
+                observation_variances=variances,
+                initial_strengths=np.asarray(selected_q, dtype=float),
+                eps=eps,
+                q_max=q_max,
+            )
+            selected_q = [float(value) for value in selected_q_arr]
+            residual = np.maximum(
+                z_obs - (background_arr + selected_design @ selected_q_arr),
+                0.0,
+            )
+            if dedup_radius > 0.0:
+                distances = np.linalg.norm(
+                    pool - pool[best_idx][None, :],
+                    axis=1,
+                )
+                unavailable |= distances <= dedup_radius
+            else:
+                unavailable[best_idx] = True
+        if not selected_indices:
+            return (
+                np.zeros((0, 3), dtype=float),
+                np.zeros(0, dtype=float),
+                {
+                    "global_rescue_initial_residual_fraction": initial_fraction,
+                    "global_rescue_candidate_pool": int(pool.shape[0]),
+                    "global_rescue_candidate_count": 0,
+                },
+            )
+        final_fraction = float(np.sum(residual)) / reference_sum
+        selected = np.asarray(selected_indices, dtype=int)
+        final_q = np.asarray(selected_q, dtype=float)
+        stats = {
+            "global_rescue_initial_residual_fraction": initial_fraction,
+            "global_rescue_final_residual_fraction": float(final_fraction),
+            "global_rescue_candidate_pool": int(pool.shape[0]),
+            "global_rescue_candidate_count": int(selected.size),
+            "global_rescue_best_score": float(best_score),
+        }
+        return pool[selected], final_q, stats
+
+    def _augment_report_candidates_with_mle_rescue(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+        data: MeasurementData,
+        *,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        background: NDArray[np.float64],
+        eps: float,
+        q_max: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], dict[str, Any]]:
+        """Add MLE-style global and residual surface candidates for report BIC."""
+        base_pos = np.asarray(positions, dtype=float).reshape(-1, 3)
+        base_q = np.asarray(strengths, dtype=float).reshape(-1)
+        max_total = max(
+            1,
+            min(
+                int(self.pf_config.report_mle_rescue_max_candidates),
+                int(self.pf_config.report_cluster_model_selection_max_candidates),
+            ),
+        )
+        dedup_radius = max(float(self.pf_config.report_mle_rescue_dedup_radius_m), 0.0)
+        all_pos = [base_pos] if base_pos.size else []
+        all_q = [np.maximum(base_q, eps)] if base_q.size else []
+        global_pos, global_q, global_stats = self._rank_global_surface_candidates(
+            isotope,
+            filt,
+            data,
+            existing_positions=base_pos,
+            background=background,
+            eps=eps,
+            q_max=q_max,
+        )
+        if global_pos.size:
+            all_pos.append(global_pos)
+            all_q.append(np.maximum(global_q, eps))
+        posterior_count = 0
+        max_posterior = max(
+            0,
+            int(self.pf_config.report_mle_rescue_max_posterior_candidates),
+        )
+        if max_posterior > 0 and hasattr(filt, "estimate_clustered"):
+            try:
+                post_pos, post_q = filt.estimate_clustered(
+                    max_k=max_posterior,
+                    include_report_excluded=True,
+                )
+            except RuntimeError:
+                post_pos = np.zeros((0, 3), dtype=float)
+                post_q = np.zeros(0, dtype=float)
+            if post_pos.size and post_q.size:
+                posterior_count = int(post_pos.shape[0])
+                all_pos.append(np.asarray(post_pos, dtype=float).reshape(-1, 3))
+                all_q.append(np.maximum(np.asarray(post_q, dtype=float).reshape(-1), eps))
+        if all_pos:
+            seed_pos = np.vstack(all_pos)
+            seed_q = np.concatenate(all_q)
+        else:
+            seed_pos = np.zeros((0, 3), dtype=float)
+            seed_q = np.zeros(0, dtype=float)
+        seed_pos, seed_q = self._dedupe_report_candidates(
+            seed_pos,
+            seed_q,
+            radius_m=dedup_radius,
+            max_candidates=max_total,
+        )
+        residual_stats: dict[str, Any] = {}
+        residual_pos = np.zeros((0, 3), dtype=float)
+        residual_q = np.zeros(0, dtype=float)
+        if seed_pos.size and seed_pos.shape[0] < max_total:
+            seed_design = expected_counts_per_source(
+                kernel=filt.continuous_kernel,
+                isotope=isotope,
+                detector_positions=data.detector_positions,
+                sources=seed_pos,
+                strengths=np.ones(seed_pos.shape[0], dtype=float),
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+                source_scale=self.response_scale_for_isotope(isotope),
+            )
+            seed_q_fit = self._solve_report_strengths(
+                design=seed_design,
+                z_obs=data.z_k,
+                background=background,
+                observation_variances=data.observation_variances,
+                initial_strengths=seed_q,
+                eps=eps,
+                q_max=q_max,
+            )
+            residual = np.maximum(
+                np.asarray(data.z_k, dtype=float).reshape(-1)
+                - (
+                    np.asarray(background, dtype=float).reshape(-1)
+                    + np.asarray(seed_design, dtype=float) @ seed_q_fit
+                ),
+                0.0,
+            )
+            residual_pos, residual_q, residual_stats = (
+                self._rank_residual_surface_candidates(
+                    isotope,
+                    filt,
+                    data,
+                    residual=residual,
+                    existing_positions=seed_pos,
+                    background=background,
+                    eps=eps,
+                )
+            )
+        elif seed_pos.shape[0] == 0:
+            residual = np.maximum(
+                np.asarray(data.z_k, dtype=float).reshape(-1)
+                - np.asarray(background, dtype=float).reshape(-1),
+                0.0,
+            )
+            residual_pos, residual_q, residual_stats = (
+                self._rank_residual_surface_candidates(
+                    isotope,
+                    filt,
+                    data,
+                    residual=residual,
+                    existing_positions=seed_pos,
+                    background=background,
+                    eps=eps,
+                )
+            )
+        if residual_pos.size:
+            merged_pos = (
+                np.vstack([seed_pos, residual_pos]) if seed_pos.size else residual_pos
+            )
+            merged_q = np.concatenate([seed_q, residual_q]) if seed_q.size else residual_q
+        else:
+            merged_pos = seed_pos
+            merged_q = seed_q
+        final_pos, final_q = self._dedupe_report_candidates(
+            merged_pos,
+            merged_q,
+            radius_m=dedup_radius,
+            max_candidates=max_total,
+        )
+        stats = {
+            "mle_rescue_enabled": True,
+            "mle_rescue_base_candidates": int(base_pos.shape[0]),
+            "mle_rescue_global_candidates": int(global_pos.shape[0]),
+            "mle_rescue_posterior_candidates": int(posterior_count),
+            "mle_rescue_residual_candidates": int(residual_pos.shape[0]),
+            "mle_rescue_candidate_limit": int(max_total),
+            "mle_rescue_candidate_count": int(final_pos.shape[0]),
+        }
+        stats.update(global_stats)
+        stats.update(residual_stats)
+        return final_pos, final_q, stats
 
     def _report_cluster_log_likelihood(
         self,
@@ -2766,6 +3425,27 @@ class RotatingShieldPFEstimator:
         if positive.size <= 0:
             return float("inf")
         return float(np.max(positive) / max(float(np.min(positive)), eps))
+
+    @staticmethod
+    def _report_design_max_abs_correlation(
+        design: NDArray[np.float64],
+        *,
+        eps: float,
+    ) -> float:
+        """Return the maximum normalized response-column correlation."""
+        design_arr = np.maximum(np.asarray(design, dtype=float), 0.0)
+        if design_arr.ndim != 2 or design_arr.shape[1] <= 1:
+            return 0.0
+        column_norm = np.linalg.norm(design_arr, axis=0)
+        valid = column_norm > max(float(eps), 1.0e-12)
+        if np.count_nonzero(valid) <= 1:
+            return 0.0
+        normalized = design_arr[:, valid] / np.maximum(column_norm[valid], eps)
+        corr = np.abs(normalized.T @ normalized)
+        upper = np.triu_indices(corr.shape[0], k=1)
+        if upper[0].size == 0:
+            return 0.0
+        return float(np.max(corr[upper]))
 
     def _select_report_clusters_by_model_order(
         self,
@@ -3010,6 +3690,13 @@ class RotatingShieldPFEstimator:
                 best["strengths"],
                 dtype=float,
             )
+            selected_design = design_arr[:, np.asarray(selected_indices, dtype=int)]
+            selected_max_corr = self._report_design_max_abs_correlation(
+                selected_design,
+                eps=eps,
+            )
+        else:
+            selected_max_corr = 0.0
         selected_count = int(np.count_nonzero(keep))
         simpler_criteria = [
             float(stats["criterion"])
@@ -3046,6 +3733,7 @@ class RotatingShieldPFEstimator:
             "best_ll": float(best["ll"]),
             "best_criterion": float(best["criterion"]),
             "condition_number": float(best["condition_number"]),
+            "selected_max_response_correlation": float(selected_max_corr),
             "criterion_margin_to_simpler": float(simpler_margin),
             "model_order_ready": bool(model_order_ready),
             "best_by_k": {
@@ -3186,8 +3874,12 @@ class RotatingShieldPFEstimator:
         str_arr = np.asarray(strengths, dtype=float).reshape(-1)
         if not bool(self.pf_config.report_strength_refit):
             return pos_arr, str_arr
-        if pos_arr.size == 0 or str_arr.size == 0:
+        rescue_enabled = bool(self.pf_config.report_mle_rescue_enable)
+        if (pos_arr.size == 0 or str_arr.size == 0) and not rescue_enabled:
             return pos_arr, str_arr
+        if pos_arr.size == 0:
+            pos_arr = np.zeros((0, 3), dtype=float)
+            str_arr = np.zeros(0, dtype=float)
         if pos_arr.shape[0] != str_arr.size:
             return pos_arr, str_arr
         data = self._measurement_data_for_iso(isotope, None)
@@ -3196,10 +3888,37 @@ class RotatingShieldPFEstimator:
         filt = self.filters.get(isotope)
         if filt is None:
             return pos_arr, str_arr
-        refit_data = filt._signal_bearing_refit_data(data)
-        if refit_data is None or refit_data.z_k.size == 0:
-            return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
-        data = refit_data
+        if not bool(self.pf_config.report_strength_refit_use_all_measurements):
+            refit_data = filt._signal_bearing_refit_data(data)
+            if refit_data is None or refit_data.z_k.size == 0:
+                return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+            data = refit_data
+        z_obs = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
+        background = self._background_counts_for_report_refit(isotope, data.live_times)
+        background = _measurement_vector(
+            background,
+            z_obs.size,
+            "background",
+            min_value=0.0,
+        )
+        eps = float(self.pf_config.report_strength_refit_eps)
+        q_max = float(getattr(self.pf_config, "birth_q_max", 0.0))
+        rescue_stats: dict[str, Any] = {}
+        if rescue_enabled:
+            pos_arr, str_arr, rescue_stats = (
+                self._augment_report_candidates_with_mle_rescue(
+                    isotope,
+                    filt,
+                    data,
+                    positions=pos_arr,
+                    strengths=str_arr,
+                    background=background,
+                    eps=eps,
+                    q_max=q_max,
+                )
+            )
+            if pos_arr.size == 0 or str_arr.size == 0:
+                return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
         unit_strengths = np.ones(str_arr.size, dtype=float)
         design = expected_counts_per_source(
             kernel=filt.continuous_kernel,
@@ -3216,15 +3935,9 @@ class RotatingShieldPFEstimator:
         if design.ndim != 2 or design.shape[1] != str_arr.size:
             return pos_arr, str_arr
         column_sum = np.sum(design, axis=0)
-        observable = column_sum > float(self.pf_config.report_strength_refit_eps)
+        observable = column_sum > eps
         if not np.any(observable):
             return pos_arr, np.zeros_like(str_arr, dtype=float)
-        z_obs = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
-        background = self._background_counts_for_report_refit(isotope, data.live_times)
-        if background.size != z_obs.size:
-            background = np.resize(background, z_obs.size)
-        eps = float(self.pf_config.report_strength_refit_eps)
-        q_max = float(getattr(self.pf_config, "birth_q_max", 0.0))
         q = self._solve_report_strengths(
             design=design,
             z_obs=z_obs,
@@ -3245,6 +3958,9 @@ class RotatingShieldPFEstimator:
             eps=eps,
             q_max=q_max,
         )
+        diagnostics = self._last_report_model_order_diagnostics.get(isotope)
+        if rescue_stats and isinstance(diagnostics, dict):
+            diagnostics.update(rescue_stats)
         support_floor = max(float(self.pf_config.min_strength), 0.0) * (1.0 + 1.0e-6)
         preserve_cardinality = bool(
             self.pf_config.report_strength_refit_preserve_cardinality
@@ -3326,7 +4042,7 @@ class RotatingShieldPFEstimator:
         ],
     ) -> None:
         """Run one isotope's deferred strength refit and birth/death update."""
-        _, filt, refit_data, support_data, birth_data = task
+        isotope, filt, refit_data, support_data, birth_data = task
         if bool(self.pf_config.conditional_strength_refit):
             filt.refit_strengths_for_particles(
                 refit_data,
@@ -3336,11 +4052,67 @@ class RotatingShieldPFEstimator:
                     self.pf_config.birth_residual_suppress_death
                 ),
             )
+        proposal_data = birth_data if birth_data is not None else support_data
+        global_birth_candidates = self._runtime_global_birth_rescue_candidates(
+            isotope,
+            filt,
+            proposal_data,
+        )
         filt.apply_birth_death(
             support_data=support_data,
             birth_data=birth_data,
             candidate_positions=self.candidate_sources,
+            global_birth_candidates=global_birth_candidates,
         )
+
+    def _runtime_global_birth_rescue_candidates(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+        data: MeasurementData | None,
+    ) -> NDArray[np.float64]:
+        """Return surface-grid candidates for station-level global birth rescue."""
+        if (
+            not bool(self.pf_config.birth_global_rescue_enable)
+            or data is None
+            or data.z_k.size == 0
+            or self.candidate_sources.size == 0
+        ):
+            return np.zeros((0, 3), dtype=float)
+        max_candidates = max(0, int(self.pf_config.birth_global_rescue_max_candidates))
+        if max_candidates <= 0:
+            return np.zeros((0, 3), dtype=float)
+        try:
+            existing_positions, _existing_strengths = filt.estimate_clustered(
+                max_k=max(max_candidates, int(self.pf_config.max_sources or 1)),
+                include_report_excluded=True,
+            )
+        except (RuntimeError, ValueError, AttributeError):
+            if filt.continuous_particles:
+                existing_positions = np.asarray(
+                    filt.best_particle().state.positions[
+                        : filt.best_particle().state.num_sources
+                    ],
+                    dtype=float,
+                )
+            else:
+                existing_positions = np.zeros((0, 3), dtype=float)
+        background = self._background_counts_for_report_refit(isotope, data.live_times)
+        positions, _strengths, _stats = self._rank_global_surface_candidates(
+            isotope,
+            filt,
+            data,
+            existing_positions=np.asarray(existing_positions, dtype=float).reshape(-1, 3),
+            background=background,
+            eps=max(float(self.pf_config.refit_eps), 1.0e-12),
+            q_max=float(self.pf_config.birth_q_max),
+            max_candidates=max_candidates,
+            min_residual_fraction=(
+                self.pf_config.birth_global_rescue_min_residual_fraction
+            ),
+            dedup_radius_m=self.pf_config.birth_global_rescue_dedup_radius_m,
+        )
+        return np.asarray(positions, dtype=float).reshape(-1, 3)
 
     def _structural_update_worker_count(self, task_count: int) -> int:
         """Return the worker count for independent per-isotope structural updates."""
@@ -3520,7 +4292,7 @@ class RotatingShieldPFEstimator:
         """Return True when report-level multi-source model orders are stable."""
         diagnostics = self.report_model_order_diagnostics()
         if not diagnostics:
-            return True
+            return not bool(self.unresolved_structural_evidence())
         for stats in diagnostics.values():
             candidate_count = int(stats.get("candidate_count", 0))
             selected_count = int(stats.get("selected_count", 0))
@@ -3528,7 +4300,57 @@ class RotatingShieldPFEstimator:
                 continue
             if not bool(stats.get("model_order_ready", True)):
                 return False
-        return True
+        return not bool(self.unresolved_structural_evidence())
+
+    def unresolved_structural_evidence(self) -> dict[str, dict[str, Any]]:
+        """
+        Return isotope-wise pseudo-source or birth-residual evidence that still needs views.
+
+        Report-level BIC can only compare candidates that survived into the current
+        report set.  If residual birth or pseudo-source verification is still asking
+        for discriminative views, a one-candidate BIC result must not be treated as
+        a settled model order.
+        """
+        unresolved: dict[str, dict[str, Any]] = {}
+        discriminative_reasons = {
+            "needs_discriminative_views",
+            "insufficient_distinct_views",
+            "high_response_corr",
+            "too_young_to_prune",
+        }
+        support_floor = max(1, int(self.pf_config.birth_residual_min_support))
+        for isotope, filt in self.filters.items():
+            payload: dict[str, Any] = {}
+            reasons = getattr(filt, "last_pseudo_source_fail_reasons", {})
+            reason_payload = (
+                {str(reason): int(count) for reason, count in reasons.items()}
+                if isinstance(reasons, dict)
+                else {}
+            )
+            unresolved_pseudo = {
+                reason: count
+                for reason, count in reason_payload.items()
+                if reason in discriminative_reasons and int(count) > 0
+            }
+            if unresolved_pseudo:
+                payload["pseudo_source_fail_reasons"] = unresolved_pseudo
+            birth_gate_passed = bool(
+                getattr(filt, "last_birth_residual_gate_passed", False)
+            )
+            birth_support = int(getattr(filt, "last_birth_residual_support", 0))
+            if birth_gate_passed and birth_support >= support_floor:
+                payload["birth_residual"] = {
+                    "gate_passed": True,
+                    "support": int(birth_support),
+                    "support_floor": int(support_floor),
+                    "chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
+                    "p_value": float(
+                        getattr(filt, "last_birth_residual_p_value", 1.0)
+                    ),
+                }
+            if payload:
+                unresolved[str(isotope)] = payload
+        return unresolved
 
     def step_diagnostics(
         self,
@@ -3608,6 +4430,21 @@ class RotatingShieldPFEstimator:
                     "birth_forced_best_delta": float(
                         getattr(filt, "last_birth_forced_best_delta", -np.inf)
                     ),
+                    "birth_global_rescue_candidates": int(
+                        getattr(filt, "last_birth_global_rescue_candidates", 0)
+                    ),
+                    "birth_global_rescue_attempts": int(
+                        getattr(filt, "last_birth_global_rescue_attempts", 0)
+                    ),
+                    "birth_global_rescue_accepts": int(
+                        getattr(filt, "last_birth_global_rescue_accepts", 0)
+                    ),
+                    "birth_global_rescue_rejected": int(
+                        getattr(filt, "last_birth_global_rescue_rejected", 0)
+                    ),
+                    "birth_global_rescue_best_delta": float(
+                        getattr(filt, "last_birth_global_rescue_best_delta", -np.inf)
+                    ),
                     "birth_structural_eligible": int(
                         getattr(filt, "last_birth_structural_eligible", 0)
                     ),
@@ -3636,6 +4473,10 @@ class RotatingShieldPFEstimator:
                     "temper_resamples": 0,
                     "r_mean": 0.0,
                     "r_var": 0.0,
+                    "r_weighted_mean": 0.0,
+                    "r_weighted_var": 0.0,
+                    "r_probability_by_count": {},
+                    "r_particle_count_by_count": {},
                     "map": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "top_k": [],
@@ -3647,11 +4488,30 @@ class RotatingShieldPFEstimator:
             total = float(np.sum(weights))
             if total > 0.0:
                 weights = weights / total
+            elif weights.size:
+                weights = np.full(weights.size, 1.0 / float(weights.size), dtype=float)
             r_vals = np.array(
                 [p.state.num_sources for p in filt.continuous_particles], dtype=float
             )
+            if weights.size != r_vals.size and r_vals.size:
+                weights = np.full(r_vals.size, 1.0 / float(r_vals.size), dtype=float)
             r_mean = float(np.mean(r_vals)) if r_vals.size else 0.0
             r_var = float(np.var(r_vals)) if r_vals.size else 0.0
+            r_int = r_vals.astype(int, copy=False)
+            r_weighted_mean = float(np.sum(weights * r_vals)) if r_vals.size else 0.0
+            r_weighted_var = (
+                float(np.sum(weights * (r_vals - r_weighted_mean) ** 2))
+                if r_vals.size
+                else 0.0
+            )
+            r_probability_by_count = {
+                str(int(value)): float(np.sum(weights[r_int == int(value)]))
+                for value in sorted(set(int(v) for v in r_int.tolist()))
+            }
+            r_particle_count_by_count = {
+                str(int(value)): int(np.count_nonzero(r_int == int(value)))
+                for value in sorted(set(int(v) for v in r_int.tolist()))
+            }
             ess_pre = getattr(filt, "last_ess_pre", None)
             if ess_pre is None and weights.size:
                 ess_pre = float(1.0 / max(np.sum(weights**2), eps))
@@ -3757,6 +4617,21 @@ class RotatingShieldPFEstimator:
                 "birth_forced_best_delta": float(
                     getattr(filt, "last_birth_forced_best_delta", -np.inf)
                 ),
+                "birth_global_rescue_candidates": int(
+                    getattr(filt, "last_birth_global_rescue_candidates", 0)
+                ),
+                "birth_global_rescue_attempts": int(
+                    getattr(filt, "last_birth_global_rescue_attempts", 0)
+                ),
+                "birth_global_rescue_accepts": int(
+                    getattr(filt, "last_birth_global_rescue_accepts", 0)
+                ),
+                "birth_global_rescue_rejected": int(
+                    getattr(filt, "last_birth_global_rescue_rejected", 0)
+                ),
+                "birth_global_rescue_best_delta": float(
+                    getattr(filt, "last_birth_global_rescue_best_delta", -np.inf)
+                ),
                 "birth_structural_eligible": int(
                     getattr(filt, "last_birth_structural_eligible", 0)
                 ),
@@ -3785,6 +4660,10 @@ class RotatingShieldPFEstimator:
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
                 "r_mean": r_mean,
                 "r_var": r_var,
+                "r_weighted_mean": r_weighted_mean,
+                "r_weighted_var": r_weighted_var,
+                "r_probability_by_count": r_probability_by_count,
+                "r_particle_count_by_count": r_particle_count_by_count,
                 "map": (map_positions, map_strengths),
                 "mmse": (mmse_positions, mmse_strengths),
                 "top_k": top_entries,
@@ -3853,6 +4732,7 @@ class RotatingShieldPFEstimator:
 
     @property
     def num_orientations(self) -> int:
+        """Return the number of shield orientation normals."""
         return self.normals.shape[0]
 
     def orientation_information_gain(
@@ -3961,6 +4841,7 @@ class RotatingShieldPFEstimator:
         def _compute_lam_torch(
             states: Sequence[IsotopeState], isotope: str
         ) -> "torch.Tensor":
+            """Compute expected counts for a state subset on the torch backend."""
             if not states:
                 return torch.zeros(0, device=device, dtype=dtype)
             positions, strengths, backgrounds, mask = gpu_utils.pack_states(
@@ -5079,6 +5960,7 @@ class RotatingShieldPFEstimator:
             min_obs_count=min_obs_count,
             min_strength_abs=min_strength_abs,
             min_strength_ratio=min_strength_ratio,
+            estimate_snapshot=est,
         )
         pruned: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
         for iso, (pos, strg) in est.items():
@@ -5088,7 +5970,7 @@ class RotatingShieldPFEstimator:
             else:
                 keep_arr = np.asarray(keep, dtype=bool).reshape(-1)
                 if keep_arr.size != pos.shape[0]:
-                    keep_arr = np.resize(keep_arr, pos.shape[0])
+                    raise ValueError("report model-order keep mask must match estimate count.")
                 diagnostics = self._last_report_model_order_diagnostics.get(iso)
                 if isinstance(diagnostics, dict) and bool(
                     diagnostics.get("preserve_cardinality", False)

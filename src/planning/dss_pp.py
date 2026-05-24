@@ -126,6 +126,19 @@ class DSSPPConfig:
     candidate_preselect_enable: bool = True
     candidate_preselect_min: int = 32
     candidate_preselect_multiplier: int = 8
+    remaining_budget_guidance: bool = False
+    remaining_station_estimate: int | None = None
+    remaining_budget_urgency_stations: int = 4
+    remaining_route_weight: float = 0.0
+    remaining_route_distance_weight: float = 0.5
+    remaining_route_revisit_weight: float = 1.0
+    remaining_route_turn_weight: float = 0.75
+    remaining_route_backtrack_weight: float = 1.0
+    remaining_route_coverage_weight: float = 0.5
+    remaining_route_frontier_weight: float = 0.5
+    same_isotope_direct_separation_guard: bool = True
+    same_isotope_direct_separation_epsilon: float = 1.0e-9
+    diagnostic_ranked_node_limit: int = 64
 
 
 @dataclass(frozen=True)
@@ -159,6 +172,9 @@ class DSSPPNode:
     elevation_signature_score: float
     elevation_condition_gain: float
     vertical_environment_signature_score: float
+    remaining_route_pressure: float = 0.0
+    remaining_route_penalty: float = 0.0
+    remaining_route_gain: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -170,7 +186,48 @@ class DSSPPResult:
     shield_program: ShieldProgram
     score: float
     sequence: tuple[DSSPPNode, ...]
-    diagnostics: dict[str, float | int | str]
+    diagnostics: dict[str, Any]
+
+
+def _node_diagnostic_payload(node: DSSPPNode, rank: int) -> dict[str, object]:
+    """Return a JSON-serializable diagnostic payload for one DSS-PP node."""
+    return {
+        "rank": int(rank),
+        "pose_index": int(node.pose_index),
+        "pose_xyz": [float(value) for value in np.asarray(node.pose_xyz, dtype=float)],
+        "program_name": str(node.program.name),
+        "program_kind": str(node.program.kind),
+        "pair_ids": [int(value) for value in node.program.pair_ids],
+        "score": float(node.score),
+        "static_score": float(node.static_score),
+        "distance_weight": float(node.distance_weight),
+        "observation_penalty_weight": float(node.observation_penalty_weight),
+        "information_gain": float(node.information_gain),
+        "signature_score": float(node.signature_score),
+        "temporal_separation_score": float(node.temporal_separation_score),
+        "elevation_signature_score": float(node.elevation_signature_score),
+        "observation_penalty": float(node.observation_penalty),
+        "count_balance_penalty": float(node.count_balance_penalty),
+        "differential_penalty": float(node.differential_penalty),
+        "dose_score": float(node.dose_score),
+        "count_utility": float(node.count_utility),
+        "coverage_gain": float(node.coverage_gain),
+        "revisit_penalty": float(node.revisit_penalty),
+        "bearing_diversity_gain": float(node.bearing_diversity_gain),
+        "frontier_gain": float(node.frontier_gain),
+        "turn_penalty": float(node.turn_penalty),
+        "local_orbit_gain": float(node.local_orbit_gain),
+        "station_condition_gain": float(node.station_condition_gain),
+        "environment_signature_score": float(node.environment_signature_score),
+        "occlusion_boundary_gain": float(node.occlusion_boundary_gain),
+        "elevation_condition_gain": float(node.elevation_condition_gain),
+        "vertical_environment_signature_score": float(
+            node.vertical_environment_signature_score
+        ),
+        "remaining_route_pressure": float(node.remaining_route_pressure),
+        "remaining_route_penalty": float(node.remaining_route_penalty),
+        "remaining_route_gain": float(node.remaining_route_gain),
+    }
 
 
 def _normalise_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -396,7 +453,9 @@ def extract_signature_modes(
                 else np.asarray(tentative_raw, dtype=bool)
             )
             if tentative.size != num_sources:
-                tentative = np.resize(tentative, num_sources)
+                padded = np.zeros(num_sources, dtype=bool)
+                padded[: min(tentative.size, num_sources)] = tentative[:num_sources]
+                tentative = padded
             failed_raw = getattr(state, "verification_fail_streaks", None)
             failed = (
                 np.zeros(num_sources, dtype=int)
@@ -404,7 +463,9 @@ def extract_signature_modes(
                 else np.asarray(failed_raw, dtype=int)
             )
             if failed.size != num_sources:
-                failed = np.resize(failed, num_sources)
+                padded = np.zeros(num_sources, dtype=int)
+                padded[: min(failed.size, num_sources)] = failed[:num_sources]
+                failed = padded
             quarantine_mask = tentative & (failed > 0)
             state_strengths = np.maximum(
                 np.asarray(state.strengths[:num_sources], dtype=float),
@@ -2611,6 +2672,9 @@ def _static_station_program_score(
     occlusion_boundary_gain: float,
     elevation_condition_gain: float,
     vertical_environment_signature_score: float,
+    remaining_route_pressure: float,
+    remaining_route_penalty: float,
+    remaining_route_gain: float,
     coverage_floor: float,
     config: DSSPPConfig,
 ) -> float:
@@ -2642,6 +2706,9 @@ def _static_station_program_score(
         )
         + float(config.lambda_occlusion_boundary)
         * float(np.log1p(max(occlusion_boundary_gain, 0.0)))
+        + float(config.remaining_route_weight)
+        * float(remaining_route_pressure)
+        * (float(remaining_route_gain) - float(remaining_route_penalty))
         - float(config.lambda_dose) * float(dose_score)
         - float(config.eta_count_balance) * float(count_balance_penalty)
         - float(config.eta_differential) * float(differential_penalty)
@@ -2722,6 +2789,15 @@ def _evaluate_pose_index_from_context(
         context["occlusion_boundary_gains"],
         dtype=float,
     )
+    remaining_route_pressure = float(context["remaining_route_pressure"])
+    remaining_route_penalties = np.asarray(
+        context["remaining_route_penalties"],
+        dtype=float,
+    )
+    remaining_route_gains = np.asarray(
+        context["remaining_route_gains"],
+        dtype=float,
+    )
     coverage_floor = float(context["coverage_floor"])
 
     local_pending: list[tuple[Any, ...]] = []
@@ -2789,6 +2865,9 @@ def _evaluate_pose_index_from_context(
                 vertical_environment_signature_scores[pose_index]
             ),
             occlusion_boundary_gain=float(occlusion_boundary_gains[pose_index]),
+            remaining_route_pressure=remaining_route_pressure,
+            remaining_route_penalty=float(remaining_route_penalties[pose_index]),
+            remaining_route_gain=float(remaining_route_gains[pose_index]),
             coverage_floor=coverage_floor,
             config=config,
         )
@@ -2820,6 +2899,9 @@ def _evaluate_pose_index_from_context(
                 float(environment_signature_scores[pose_index]),
                 float(vertical_environment_signature_scores[pose_index]),
                 float(occlusion_boundary_gains[pose_index]),
+                remaining_route_pressure,
+                float(remaining_route_penalties[pose_index]),
+                float(remaining_route_gains[pose_index]),
             )
         )
     return (
@@ -3355,6 +3437,113 @@ def _route_turn_penalties_batch(
     return penalties
 
 
+def _remaining_budget_pressure(config: DSSPPConfig) -> float:
+    """Return a 0..1 route-efficiency pressure from remaining station budget."""
+    if not bool(config.remaining_budget_guidance):
+        return 0.0
+    if float(config.remaining_route_weight) <= 0.0:
+        return 0.0
+    if config.remaining_station_estimate is None:
+        return 0.0
+    remaining = max(0, int(config.remaining_station_estimate))
+    if remaining <= 0:
+        return 0.0
+    urgency = max(1, int(config.remaining_budget_urgency_stations))
+    pressure = (float(urgency) + 1.0 - float(remaining)) / float(urgency)
+    return float(np.clip(pressure, 0.0, 1.0))
+
+
+def _route_regression_penalties_batch(
+    candidate_poses_xyz: NDArray[np.float64],
+    current_pose_xyz: NDArray[np.float64],
+    visited_poses_xyz: NDArray[np.float64] | None,
+    *,
+    radius_m: float,
+) -> NDArray[np.float64]:
+    """Return penalties for moving back near older visited stations."""
+    candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    if candidates.ndim != 2 or candidates.shape[1] != 3:
+        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
+    penalties = np.zeros(candidates.shape[0], dtype=float)
+    radius = max(float(radius_m), 1.0e-12)
+    visited = _pose_matrix_or_empty(visited_poses_xyz)
+    if visited.shape[0] <= 1 or candidates.shape[0] == 0:
+        return penalties
+    current = np.asarray(current_pose_xyz, dtype=float).reshape(3)
+    current_dist = np.linalg.norm(visited[:, :2] - current[None, :2], axis=1)
+    older = visited[current_dist > max(0.25 * radius, 1.0e-6)]
+    if older.size == 0:
+        return penalties
+    distances = np.linalg.norm(
+        candidates[:, None, :2] - older[None, :, :2],
+        axis=2,
+    )
+    nearest = np.min(distances, axis=1)
+    active = nearest < radius
+    shortfall = 1.0 - nearest[active] / radius
+    penalties[active] = shortfall * shortfall
+    return penalties
+
+
+def _remaining_route_terms_batch(
+    *,
+    candidate_poses_xyz: NDArray[np.float64],
+    current_pose_xyz: NDArray[np.float64],
+    visited_poses_xyz: NDArray[np.float64] | None,
+    path_lengths: NDArray[np.float64],
+    coverage_norm: NDArray[np.float64],
+    revisit_penalties: NDArray[np.float64],
+    frontier_gains: NDArray[np.float64],
+    turn_penalties: NDArray[np.float64],
+    config: DSSPPConfig,
+) -> tuple[float, NDArray[np.float64], NDArray[np.float64]]:
+    """Return remaining-budget route pressure, penalties, and gains in batch."""
+    candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    pressure = _remaining_budget_pressure(config)
+    if candidates.ndim != 2 or candidates.shape[1] != 3:
+        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
+    zeros = np.zeros(candidates.shape[0], dtype=float)
+    if pressure <= 0.0 or candidates.shape[0] == 0:
+        return pressure, zeros, zeros
+    nominal_step = max(
+        float(config.min_station_separation_m),
+        float(config.coverage_radius_m),
+        1.0,
+    )
+    remaining = max(1, int(config.remaining_station_estimate or 1))
+    path_arr = np.asarray(path_lengths, dtype=float)
+    distance_penalty = np.divide(
+        path_arr,
+        nominal_step * float(remaining),
+        out=np.zeros_like(path_arr, dtype=float),
+        where=np.isfinite(path_arr),
+    )
+    distance_penalty = np.clip(distance_penalty, 0.0, 2.0)
+    coverage_arr = np.clip(np.asarray(coverage_norm, dtype=float), 0.0, 1.0)
+    backtrack_penalty = _route_regression_penalties_batch(
+        candidates,
+        current_pose_xyz,
+        visited_poses_xyz,
+        radius_m=2.0 * nominal_step,
+    )
+    penalty = (
+        float(config.remaining_route_distance_weight) * distance_penalty
+        + float(config.remaining_route_revisit_weight)
+        * np.asarray(revisit_penalties, dtype=float)
+        + float(config.remaining_route_turn_weight)
+        * np.asarray(turn_penalties, dtype=float)
+        + float(config.remaining_route_backtrack_weight) * backtrack_penalty
+        + float(config.remaining_route_coverage_weight) * (1.0 - coverage_arr)
+    )
+    gain = (
+        float(config.remaining_route_coverage_weight) * coverage_arr
+        + float(config.remaining_route_frontier_weight)
+        * np.asarray(frontier_gains, dtype=float)
+    )
+    penalty[~np.isfinite(path_arr)] = np.inf
+    return pressure, np.maximum(penalty, 0.0), np.maximum(gain, 0.0)
+
+
 def _program_evaluation_pose_indices(
     *,
     path_lengths: NDArray[np.float64],
@@ -3369,6 +3558,9 @@ def _program_evaluation_pose_indices(
     occlusion_boundary_gains: NDArray[np.float64],
     elevation_condition_gains: NDArray[np.float64],
     vertical_environment_signature_scores: NDArray[np.float64],
+    remaining_route_pressure: float,
+    remaining_route_penalties: NDArray[np.float64],
+    remaining_route_gains: NDArray[np.float64],
     lambda_distance: float,
     config: DSSPPConfig,
 ) -> NDArray[np.int64]:
@@ -3412,6 +3604,12 @@ def _program_evaluation_pose_indices(
         )
         + float(config.lambda_occlusion_boundary)
         * np.log1p(np.maximum(np.asarray(occlusion_boundary_gains, dtype=float), 0.0))
+        + float(config.remaining_route_weight)
+        * float(remaining_route_pressure)
+        * (
+            np.asarray(remaining_route_gains, dtype=float)
+            - np.asarray(remaining_route_penalties, dtype=float)
+        )
         - float(config.eta_revisit) * np.asarray(revisit_penalties, dtype=float)
         - float(config.lambda_turn_smoothness) * np.asarray(turn_penalties, dtype=float)
         - float(lambda_distance) * np.asarray(path_lengths, dtype=float) / length_scale
@@ -3670,6 +3868,21 @@ def _build_nodes(
         poses_xyz=candidate_poses,
         config=config,
     )
+    (
+        remaining_route_pressure,
+        remaining_route_penalties,
+        remaining_route_gains,
+    ) = _remaining_route_terms_batch(
+        candidate_poses_xyz=candidate_poses,
+        current_pose_xyz=current_pose_xyz,
+        visited_poses_xyz=visited_poses_xyz,
+        path_lengths=path_lengths,
+        coverage_norm=coverage_norm,
+        revisit_penalties=revisit_penalties,
+        frontier_gains=frontier_gains,
+        turn_penalties=turn_penalties,
+        config=config,
+    )
     finite_path = np.isfinite(path_lengths)
     if config.lambda_distance is None:
         lambda_distance = estimate_lambda_cost(
@@ -3693,6 +3906,9 @@ def _build_nodes(
             occlusion_boundary_gains=occlusion_boundary_gains,
             elevation_condition_gains=elevation_condition_gains,
             vertical_environment_signature_scores=vertical_environment_signature_scores,
+            remaining_route_pressure=remaining_route_pressure,
+            remaining_route_penalties=remaining_route_penalties,
+            remaining_route_gains=remaining_route_gains,
             lambda_distance=lambda_distance,
             config=config,
         )
@@ -3714,6 +3930,8 @@ def _build_nodes(
                 vertical_environment_signature_scores[selected_indices]
             )
             occlusion_boundary_gains = occlusion_boundary_gains[selected_indices]
+            remaining_route_penalties = remaining_route_penalties[selected_indices]
+            remaining_route_gains = remaining_route_gains[selected_indices]
     evaluation_pose_indices = np.arange(candidate_poses.shape[0], dtype=np.int64)
     raw_nodes: list[DSSPPNode] = []
     static_scores: list[float] = []
@@ -3754,6 +3972,9 @@ def _build_nodes(
         "environment_signature_scores": environment_signature_scores,
         "vertical_environment_signature_scores": vertical_environment_signature_scores,
         "occlusion_boundary_gains": occlusion_boundary_gains,
+        "remaining_route_pressure": float(remaining_route_pressure),
+        "remaining_route_penalties": remaining_route_penalties,
+        "remaining_route_gains": remaining_route_gains,
         "coverage_floor": float(coverage_floor),
     }
     pose_results = _evaluate_pose_indices_parallel(
@@ -3873,6 +4094,9 @@ def _build_nodes(
             environment_signature_score,
             vertical_environment_signature_score,
             occlusion_boundary_gain,
+            remaining_route_pressure,
+            remaining_route_penalty,
+            remaining_route_gain,
         ) = item
         info_gain = float(info_gains[pose_index])
         placeholder_node = DSSPPNode(
@@ -3905,6 +4129,9 @@ def _build_nodes(
                 vertical_environment_signature_score
             ),
             occlusion_boundary_gain=float(occlusion_boundary_gain),
+            remaining_route_pressure=float(remaining_route_pressure),
+            remaining_route_penalty=float(remaining_route_penalty),
+            remaining_route_gain=float(remaining_route_gain),
         )
         score, _ = _compose_transition_score(
             node=placeholder_node,
@@ -3945,6 +4172,9 @@ def _build_nodes(
                     vertical_environment_signature_score
                 ),
                 occlusion_boundary_gain=float(occlusion_boundary_gain),
+                remaining_route_pressure=float(remaining_route_pressure),
+                remaining_route_penalty=float(remaining_route_penalty),
+                remaining_route_gain=float(remaining_route_gain),
             )
         )
     raw_nodes.sort(key=lambda node: node.score, reverse=True)
@@ -3955,6 +4185,7 @@ def _filter_nodes_for_multimode_separation(
     nodes: Sequence[DSSPPNode],
     modes_by_isotope: dict[str, list[SignatureMode]],
     *,
+    config: DSSPPConfig | None = None,
     epsilon: float = 1.0e-12,
 ) -> list[DSSPPNode]:
     """
@@ -3962,30 +4193,46 @@ def _filter_nodes_for_multimode_separation(
 
     If at least one isotope has multiple posterior modes, a zero-signature
     station is not evidence that those modes are false.  It is simply an
-    uninformative observation for source-cardinality decisions.  When any
-    candidate node has positive shield, temporal, elevation, station-condition,
-    or environment signature, discard the zero-separation nodes before beam
-    search.
+    uninformative observation for source-cardinality decisions.  The first
+    preference is a direct shield/temporal/elevation signature because that is
+    the evidence used to split same-isotope sources.  Obstacle and station
+    condition scores are retained as a fallback when no direct separating node
+    exists.
     """
     node_list = list(nodes)
     has_multi_mode = any(len(mode_list) >= 2 for mode_list in modes_by_isotope.values())
     if not has_multi_mode:
         return node_list
-    positive: list[DSSPPNode] = []
-    threshold = max(float(epsilon), 0.0)
+    cfg = config or DSSPPConfig()
+    if not bool(cfg.same_isotope_direct_separation_guard):
+        return node_list
+    threshold = max(
+        float(epsilon),
+        float(cfg.same_isotope_direct_separation_epsilon),
+        0.0,
+    )
+    direct_positive: list[DSSPPNode] = []
+    fallback_positive: list[DSSPPNode] = []
     for node in node_list:
-        separable = (
+        direct_separable = (
             float(node.signature_score) > threshold
             or float(node.temporal_separation_score) > threshold
             or float(node.elevation_signature_score) > threshold
-            or float(node.station_condition_gain) > threshold
+        )
+        if direct_separable:
+            direct_positive.append(node)
+            continue
+        fallback_separable = (
+            float(node.station_condition_gain) > threshold
             or float(node.elevation_condition_gain) > threshold
             or float(node.environment_signature_score) > threshold
             or float(node.vertical_environment_signature_score) > threshold
         )
-        if separable:
-            positive.append(node)
-    return positive if positive else node_list
+        if fallback_separable:
+            fallback_positive.append(node)
+    if direct_positive:
+        return direct_positive
+    return fallback_positive if fallback_positive else node_list
 
 
 def _beam_search_sequence(
@@ -4116,7 +4363,7 @@ def select_dss_pp_next_station(
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
     original_node_count = int(len(nodes))
-    nodes = _filter_nodes_for_multimode_separation(nodes, modes)
+    nodes = _filter_nodes_for_multimode_separation(nodes, modes, config=cfg)
     sequence = _beam_search_sequence(
         nodes,
         current_pose_xyz=current_pose,
@@ -4136,7 +4383,11 @@ def select_dss_pp_next_station(
         if configured_workers is None
         else min(int(candidates.shape[0]), max(1, int(configured_workers)))
     )
-    diagnostics: dict[str, float | int | str] = {
+    ranked_limit = int(cfg.diagnostic_ranked_node_limit)
+    ranked_nodes = sorted(nodes, key=lambda node: float(node.score), reverse=True)
+    if ranked_limit > 0:
+        ranked_nodes = ranked_nodes[:ranked_limit]
+    diagnostics: dict[str, Any] = {
         "candidate_count": int(candidates.shape[0]),
         "separation_filtered_candidates": int(separation_filtered),
         "path_filtered_candidates": int(path_filtered),
@@ -4188,6 +4439,20 @@ def select_dss_pp_next_station(
             )
         ),
         "first_occlusion_boundary_gain": float(first.occlusion_boundary_gain),
+        "remaining_budget_guidance": int(bool(cfg.remaining_budget_guidance)),
+        "remaining_station_estimate": (
+            -1
+            if cfg.remaining_station_estimate is None
+            else int(cfg.remaining_station_estimate)
+        ),
+        "remaining_route_pressure": float(first.remaining_route_pressure),
+        "first_remaining_route_penalty": float(first.remaining_route_penalty),
+        "first_remaining_route_gain": float(first.remaining_route_gain),
+        "diagnostic_ranked_node_limit": int(ranked_limit),
+        "ranked_nodes": [
+            _node_diagnostic_payload(node, rank)
+            for rank, node in enumerate(ranked_nodes, start=1)
+        ],
     }
     return DSSPPResult(
         next_pose=first.pose_xyz.copy(),

@@ -444,9 +444,11 @@ def run_baseline_pf(
         if target_isotopes:
             class _FilteredPF:
                 def __init__(self, pf: NoShieldPF, allowed: set[str]) -> None:
+                    """Keep only the requested isotope filters for visualization."""
                     self.filters = {iso: filt for iso, filt in pf.filters.items() if iso in allowed}
 
                 def estimate_all(self) -> dict[str, object]:
+                    """Return current estimates for the retained isotope filters."""
                     return {iso: filt.estimate() for iso, filt in self.filters.items()}
 
             viz_pf = _FilteredPF(baseline_pf, target_isotopes)
@@ -456,6 +458,7 @@ def run_baseline_pf(
 
                 @staticmethod
                 def estimate_all() -> dict[str, object]:
+                    """Return an empty estimate mapping for inactive visualization."""
                     return {}
 
             viz_pf = _EmptyPF()

@@ -129,6 +129,7 @@ def save_summary_json(summary: Dict[str, Dict[str, float]], output_dir: Path) ->
 
 
 def main() -> None:
+    """Parse CLI arguments and write Chapter 3 aggregate plots."""
     parser = argparse.ArgumentParser(description="Plot Chapter 3 experiment results.")
     parser.add_argument("--logdir", type=Path, default=Path("results/ch3_experiments"), help="Directory with JSONL logs.")
     parser.add_argument("--output", type=Path, default=Path("results/ch3_experiments"), help="Directory for plots.")

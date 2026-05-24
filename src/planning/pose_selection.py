@@ -185,6 +185,7 @@ def recommend_num_rollouts(
             raise ValueError("tmax_s is required when eval_fn is not provided.")
 
         def _eval(n_rollouts: int, seed: int) -> float:
+            """Evaluate expected uncertainty for one rollout budget and seed."""
             return float(
                 estimator.expected_uncertainty_after_rotation(
                     pose_xyz=np.asarray(pose_xyz, dtype=float),
@@ -416,6 +417,15 @@ def select_next_pose_from_candidates(
         rollouts = int(num_rollouts)
         if rollouts <= 0 and not use_mean_measurement:
             rollouts = 1
+        observation_max_particles = min_observation_max_particles
+        if observation_max_particles is None and pf_config is not None:
+            planning_limit = getattr(pf_config, "planning_rollout_particles", None)
+            if planning_limit is None:
+                planning_limit = getattr(pf_config, "planning_particles", None)
+            if planning_limit is not None:
+                observation_max_particles = max(1, int(planning_limit))
+        elif observation_max_particles is not None:
+            observation_max_particles = max(1, int(observation_max_particles))
         uncertainties = []
         motion_costs = []
         observation_penalties = []
@@ -481,7 +491,7 @@ def select_next_pose_from_candidates(
                     pose,
                     live_time_s=t_short_s,
                     aggregate=min_observation_aggregate,
-                    max_particles=min_observation_max_particles,
+                    max_particles=observation_max_particles,
                 )
                 observation_counts_by_candidate.append(counts_by_iso)
                 observation_penalties.append(

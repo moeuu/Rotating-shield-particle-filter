@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 
 import pytest
 
+from measurement.shielding import HVL_TVL_TABLE_MM
 from sim.geant4_app.app import Geant4AppConfig
 from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
@@ -55,6 +57,7 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
         assert not forbidden_args.intersection(executable_args)
         assert "net_response_calibration_path" not in payload
         assert "net_response_calibration" not in payload
+        assert payload.get("pf_obstacle_attenuation", True) is not False
         assert float(payload.get("scatter_gain", 0.0)) == 0.0
         source_bias_mode = str(payload.get("source_bias_mode", "detector_cone"))
         assert source_bias_mode == "detector_cone"
@@ -84,17 +87,34 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["source_bias_isotropic_fraction"] == pytest.approx(1.0)
     assert payload["detector_scoring_mode"] == "full_transport"
     assert payload["secondary_transport_mode"] == "full_transport"
+    assert payload["source_surface_prior"] is True
+    assert payload["pf_obstacle_attenuation"] is True
+    assert payload["joint_observation_update"] is True
+    assert payload["delayed_resample_update"] is False
+    assert payload["random_source_visibility_filter"] is True
+    assert float(payload["random_source_min_visible_fraction"]) > 0.0
     assert int(payload["thread_count"]) == 32
     assert int(payload["python_worker_count"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
+    assert int(payload["structural_trial_workers"]) == 32
+    assert int(payload["structural_trial_parallel_min_trials"]) <= 8
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
     assert int(payload["birth_min_distinct_stations"]) >= 2
     assert int(payload["birth_min_distinct_poses"]) >= 5
     assert float(payload["birth_existing_response_corr_max"]) <= 0.99
+    assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
     assert payload["report_exclude_unverified_sources"] is True
+    assert payload["report_strength_refit"] is True
+    assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert payload["report_mle_rescue_enable"] is True
+    assert int(payload["report_mle_rescue_max_candidates"]) >= 12
+    assert payload["birth_global_rescue_enable"] is True
+    assert int(payload["birth_global_rescue_max_candidates"]) >= 8
+    assert float(payload["source_strength_prior_mean"]) > 0.0
+    assert float(payload["source_strength_prior_weight"]) > 0.0
     assert payload["report_model_order_require_posterior_match"] is False
     assert payload["report_model_order_prune_particles"] is True
     assert payload["mode_preserving_resample"] is True
@@ -137,20 +157,41 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert config.detector_scoring_mode == "incident_gamma_energy"
     assert config.secondary_transport_mode == "gamma_only"
     assert config.primary_sampling_fraction == pytest.approx(0.02)
+    assert payload["source_surface_prior"] is True
+    assert payload["pf_obstacle_attenuation"] is True
+    assert payload["joint_observation_update"] is True
+    assert payload["delayed_resample_update"] is False
+    assert payload["random_source_visibility_filter"] is True
+    assert float(payload["random_source_min_visible_fraction"]) > 0.0
     assert int(payload["python_worker_count"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
+    assert int(payload["structural_trial_workers"]) == 32
+    assert int(payload["structural_trial_parallel_min_trials"]) <= 8
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
     assert int(payload["birth_min_distinct_stations"]) >= 2
     assert int(payload["birth_min_distinct_poses"]) >= 5
     assert float(payload["birth_existing_response_corr_max"]) <= 0.99
+    assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
     assert payload["report_exclude_unverified_sources"] is True
+    assert payload["report_strength_refit"] is True
+    assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert payload["report_mle_rescue_enable"] is True
+    assert int(payload["report_mle_rescue_max_candidates"]) >= 12
+    assert payload["birth_global_rescue_enable"] is True
+    assert int(payload["birth_global_rescue_max_candidates"]) >= 8
+    assert float(payload["source_strength_prior_mean"]) > 0.0
+    assert float(payload["source_strength_prior_weight"]) > 0.0
     assert payload["report_model_order_require_posterior_match"] is False
     assert payload["report_model_order_prune_particles"] is True
-    assert payload["mission_stop_max_poses"] is None
+    assert int(payload["mission_stop_max_poses"]) == 20
+    assert payload["mission_stop_require_model_order_ready"] is True
     assert payload["mission_stop_require_pf_convergence_for_coverage"] is False
+    assert payload["dss_pp"]["same_isotope_direct_separation_guard"] is True
+    assert float(payload["dss_pp"]["temporal_separation_weight"]) >= 8.0
+    assert float(payload["dss_pp"]["coverage_weight"]) <= 2.0
     assert payload["mode_preserving_resample"] is True
     assert int(payload["mode_preserving_max_modes"]) >= 12
     assert int(payload["mode_preserving_particles_per_mode"]) >= 8
@@ -298,6 +339,30 @@ def test_native_sidecar_exposes_detector_cps_source_rate_model() -> None:
         "const double source_rate_scale = detector_cps_rate_model",
     ):
         assert token in source
+
+
+def test_native_theory_tvl_table_matches_python_shielding_constants() -> None:
+    """Native theory-TVL fallback should mirror the Python/PF shielding table."""
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    pattern = re.compile(
+        r'if \(isotope == "([^"]+)"\) \{\s*'
+        r"return is_fe \? ([0-9.]+) : ([0-9.]+);\s*"
+        r"\}",
+        re.MULTILINE,
+    )
+    native_table = {
+        match.group(1): {"fe": float(match.group(2)), "pb": float(match.group(3))}
+        for match in pattern.finditer(source)
+    }
+
+    for isotope, material_table in HVL_TVL_TABLE_MM.items():
+        assert native_table[isotope]["fe"] == pytest.approx(
+            float(material_table["fe"]["tvl"])
+        )
+        assert native_table[isotope]["pb"] == pytest.approx(
+            float(material_table["pb"]["tvl"])
+        )
 
 
 def test_native_sidecar_exposes_fast_detector_scoring_mode() -> None:

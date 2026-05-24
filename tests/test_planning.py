@@ -433,6 +433,57 @@ def test_pose_selection_enforces_observability_when_feasible() -> None:
     assert selected == 1
 
 
+def test_pose_selection_uses_planning_particle_cap_for_observability() -> None:
+    """One-step observability scoring should use the configured planning subset."""
+
+    class _Config:
+        """Minimal PF config exposing the planning particle cap."""
+
+        lambda_cost = 0.0
+        ig_threshold = 0.0
+        max_dwell_time_s = 2.0
+        short_time_s = 1.0
+        planning_rollout_particles = 7
+        planning_particles = None
+
+    class _Estimator:
+        """Minimal estimator recording observability kwargs."""
+
+        pf_config = _Config()
+
+        def __init__(self) -> None:
+            """Initialize call recording."""
+            self.max_particles_seen: list[int | None] = []
+
+        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
+            """Return identical uncertainty for every candidate."""
+            return 0.0
+
+        def expected_observation_counts_by_isotope_at_pose(
+            self,
+            pose_xyz: np.ndarray,
+            **kwargs: object,
+        ) -> dict[str, float]:
+            """Record the particle cap used for observability scoring."""
+            self.max_particles_seen.append(kwargs.get("max_particles"))
+            return {"Cs-137": 10.0}
+
+    estimator = _Estimator()
+    selected = select_next_pose_from_candidates(
+        estimator=estimator,
+        candidate_poses_xyz=np.array(
+            [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]],
+            dtype=float,
+        ),
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        min_observation_counts=5.0,
+        num_rollouts=1,
+    )
+
+    assert selected == 0
+    assert estimator.max_particles_seen == [7, 7]
+
+
 def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:
     """recommend_num_rollouts should pick the smallest rollout meeting the target SE."""
     samples = {
@@ -1198,14 +1249,184 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     assert result.next_pose.shape == (3,)
     assert result.shield_program.pair_ids
     assert result.diagnostics["node_count"] > 0
+    assert result.diagnostics["ranked_nodes"]
+    assert result.diagnostics["ranked_nodes"][0]["score"] >= result.diagnostics[
+        "ranked_nodes"
+    ][-1]["score"]
     assert np.allclose(result.next_pose, candidates[result.next_pose_index])
+
+
+def _scalar_remaining_route_terms(
+    candidates: np.ndarray,
+    current_pose: np.ndarray,
+    visited: np.ndarray,
+    path_lengths: np.ndarray,
+    coverage_norm: np.ndarray,
+    revisit_penalties: np.ndarray,
+    frontier_gains: np.ndarray,
+    turn_penalties: np.ndarray,
+    config: DSSPPConfig,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Return a serial oracle for remaining-budget route terms."""
+    pressure = dss_pp._remaining_budget_pressure(config)
+    if pressure <= 0.0:
+        return pressure, np.zeros(candidates.shape[0]), np.zeros(candidates.shape[0])
+    nominal_step = max(
+        float(config.min_station_separation_m),
+        float(config.coverage_radius_m),
+        1.0,
+    )
+    remaining = max(1, int(config.remaining_station_estimate or 1))
+    current_xy = np.asarray(current_pose[:2], dtype=float)
+    older = []
+    radius = 2.0 * nominal_step
+    for pose in visited:
+        if float(np.linalg.norm(pose[:2] - current_xy)) > max(0.25 * radius, 1.0e-6):
+            older.append(pose)
+    penalties = []
+    gains = []
+    for idx, candidate in enumerate(candidates):
+        if np.isfinite(path_lengths[idx]):
+            distance_penalty = min(
+                max(float(path_lengths[idx]) / (nominal_step * float(remaining)), 0.0),
+                2.0,
+            )
+        else:
+            distance_penalty = float("inf")
+        backtrack_penalty = 0.0
+        if older:
+            nearest = min(
+                float(np.linalg.norm(candidate[:2] - pose[:2])) for pose in older
+            )
+            if nearest < radius:
+                shortfall = 1.0 - nearest / radius
+                backtrack_penalty = shortfall * shortfall
+        coverage = min(max(float(coverage_norm[idx]), 0.0), 1.0)
+        penalty = (
+            float(config.remaining_route_distance_weight) * distance_penalty
+            + float(config.remaining_route_revisit_weight) * revisit_penalties[idx]
+            + float(config.remaining_route_turn_weight) * turn_penalties[idx]
+            + float(config.remaining_route_backtrack_weight) * backtrack_penalty
+            + float(config.remaining_route_coverage_weight) * (1.0 - coverage)
+        )
+        gain = (
+            float(config.remaining_route_coverage_weight) * coverage
+            + float(config.remaining_route_frontier_weight) * frontier_gains[idx]
+        )
+        penalties.append(max(float(penalty), 0.0))
+        gains.append(max(float(gain), 0.0))
+    return pressure, np.asarray(penalties), np.asarray(gains)
+
+
+def test_remaining_route_terms_batch_match_scalar_oracle() -> None:
+    """Remaining-budget route terms should match a serial route oracle."""
+    candidates = np.array(
+        [[1.0, 0.0, 0.5], [6.0, 0.0, 0.5], [4.0, 2.0, 0.5]],
+        dtype=float,
+    )
+    current = np.array([4.0, 0.0, 0.5], dtype=float)
+    visited = np.array([[0.0, 0.0, 0.5], [2.0, 0.0, 0.5], [4.0, 0.0, 0.5]])
+    path_lengths = np.array([3.0, 2.0, 2.0], dtype=float)
+    coverage_norm = np.array([0.0, 0.8, 0.4], dtype=float)
+    revisit_penalties = np.array([0.5, 0.0, 0.1], dtype=float)
+    frontier_gains = np.array([0.2, 0.7, 0.5], dtype=float)
+    turn_penalties = np.array([1.0, 0.0, 0.5], dtype=float)
+    config = DSSPPConfig(
+        remaining_budget_guidance=True,
+        remaining_station_estimate=2,
+        remaining_budget_urgency_stations=4,
+        remaining_route_weight=2.0,
+        min_station_separation_m=2.0,
+        coverage_radius_m=1.0,
+    )
+
+    expected = _scalar_remaining_route_terms(
+        candidates,
+        current,
+        visited,
+        path_lengths,
+        coverage_norm,
+        revisit_penalties,
+        frontier_gains,
+        turn_penalties,
+        config,
+    )
+    actual = dss_pp._remaining_route_terms_batch(
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        path_lengths=path_lengths,
+        coverage_norm=coverage_norm,
+        revisit_penalties=revisit_penalties,
+        frontier_gains=frontier_gains,
+        turn_penalties=turn_penalties,
+        config=config,
+    )
+
+    assert actual[0] == pytest.approx(expected[0])
+    assert np.allclose(actual[1], expected[1])
+    assert np.allclose(actual[2], expected[2])
+
+
+def test_dss_pp_remaining_budget_guidance_avoids_backtracking() -> None:
+    """Low remaining station budgets should penalize route regression."""
+    est = _build_simple_estimator()
+    candidates = np.array(
+        [[1.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    current = np.array([4.0, 0.0, 0.0], dtype=float)
+    visited = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], current], dtype=float)
+
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            eta_count_balance=0.0,
+            lambda_rotation=0.0,
+            augment_candidates=False,
+            min_station_separation_m=0.0,
+            coverage_radius_m=1.0,
+            remaining_budget_guidance=True,
+            remaining_station_estimate=1,
+            remaining_budget_urgency_stations=4,
+            remaining_route_weight=5.0,
+            remaining_route_distance_weight=0.2,
+            remaining_route_revisit_weight=1.0,
+            remaining_route_turn_weight=1.0,
+            remaining_route_backtrack_weight=1.0,
+            remaining_route_coverage_weight=0.0,
+            remaining_route_frontier_weight=0.0,
+        ),
+    )
+
+    assert result.next_pose_index == 1
+    assert np.allclose(result.next_pose, candidates[1])
+    assert result.diagnostics["remaining_route_pressure"] > 0.0
 
 
 def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
     """Multi-source planning should not choose zero-signature nodes when avoidable."""
     program = dss_pp.ShieldProgram(name="p", pair_ids=(0,), kind="test")
 
-    def node(index: int, temporal: float) -> dss_pp.DSSPPNode:
+    def node(
+        index: int,
+        temporal: float,
+        *,
+        environment: float = 0.0,
+    ) -> dss_pp.DSSPPNode:
         """Build a minimal DSS-PP node for separation filtering tests."""
         return dss_pp.DSSPPNode(
             pose_index=index,
@@ -1231,7 +1452,7 @@ def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
             turn_penalty=0.0,
             local_orbit_gain=0.0,
             station_condition_gain=0.0,
-            environment_signature_score=0.0,
+            environment_signature_score=float(environment),
             occlusion_boundary_gain=0.0,
             elevation_condition_gain=0.0,
             vertical_environment_signature_score=0.0,
@@ -1257,11 +1478,18 @@ def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
     }
 
     filtered = dss_pp._filter_nodes_for_multimode_separation(
-        [node(0, 0.0), node(1, 0.25), node(2, 0.0)],
+        [node(0, 0.0), node(1, 0.25), node(2, 0.0, environment=10.0)],
         modes,
     )
 
     assert [item.pose_index for item in filtered] == [1]
+
+    fallback = dss_pp._filter_nodes_for_multimode_separation(
+        [node(0, 0.0), node(2, 0.0, environment=10.0)],
+        modes,
+    )
+
+    assert [item.pose_index for item in fallback] == [2]
 
 
 def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:

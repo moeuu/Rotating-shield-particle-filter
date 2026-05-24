@@ -590,7 +590,7 @@ double TvlMmForShield(const std::string& isotope, const std::string& shield_kind
         return is_fe ? 67.0 : 40.0;
     }
     if (isotope == "Eu-154") {
-        return is_fe ? 45.8 : 24.6;
+        return is_fe ? 57.7 : 28.1;
     }
     return is_fe ? 50.0 : 22.0;
 }

@@ -247,6 +247,7 @@ class SpectralDecomposer:
         self.last_response_poisson_components: Dict[str, NDArray[np.float64]] = {}
         self.last_response_poisson_background: NDArray[np.float64] | None = None
         self.last_response_poisson_fit: NDArray[np.float64] | None = None
+        self.last_response_poisson_diagnostics: dict[str, object] = {}
         self.last_count_variances: Dict[str, float] = {}
         self._incident_gamma_response_matrix: NDArray[np.float64] | None = None
         self._incident_gamma_isotope_response_matrix: NDArray[np.float64] | None = None
@@ -668,6 +669,10 @@ class SpectralDecomposer:
             self.last_response_poisson_components = {}
             self.last_response_poisson_background = None
             self.last_response_poisson_fit = None
+            self.last_response_poisson_diagnostics = {
+                "status": "empty_spectrum",
+                "requested_isotopes": requested,
+            }
             return estimates
         if observed.size != energy_axis.size:
             min_len = min(observed.size, energy_axis.size)
@@ -699,6 +704,10 @@ class SpectralDecomposer:
             self.last_response_poisson_components = {}
             self.last_response_poisson_background = None
             self.last_response_poisson_fit = None
+            self.last_response_poisson_diagnostics = {
+                "status": "no_requested_isotopes_in_library",
+                "requested_isotopes": requested,
+            }
             return estimates
         fit_names = [self.isotope_names[index] for index in indices]
         design_columns = [response_matrix[:, index] for index in indices]
@@ -955,6 +964,69 @@ class SpectralDecomposer:
         self.last_response_poisson_components = component_spectra
         self.last_response_poisson_fit = np.asarray(fitted, dtype=float)
         self.last_count_variances = dict(variances)
+        residual = np.asarray(observed, dtype=float) - np.asarray(fitted, dtype=float)
+        fit_variance = np.maximum(np.asarray(fitted, dtype=float), 1.0)
+        dof = max(1, int(observed.size) - int(coeffs.size))
+        try:
+            design_condition = float(np.linalg.cond(design))
+        except np.linalg.LinAlgError:
+            design_condition = float("inf")
+        try:
+            fisher_condition = float(np.linalg.cond(fisher))
+        except np.linalg.LinAlgError:
+            fisher_condition = float("inf")
+        self.last_response_poisson_diagnostics = {
+            "status": "ok" if bool(result.success) else "optimizer_fallback_initial",
+            "optimizer_success": bool(result.success),
+            "optimizer_message": str(result.message),
+            "objective": float(objective(coeffs)),
+            "requested_isotopes": requested,
+            "fit_isotopes": fit_names,
+            "include_background": bool(include_background),
+            "anchor_term_count": int(len(anchor_terms)),
+            "design_condition_number": float(design_condition),
+            "fisher_condition_number": float(fisher_condition),
+            "reduced_chi2": float(np.sum((residual * residual) / fit_variance) / dof),
+            "residual_l2": float(np.linalg.norm(residual)),
+            "residual_l1": float(np.sum(np.abs(residual))),
+            "positive_residual_sum": float(np.sum(np.maximum(residual, 0.0))),
+            "negative_residual_sum": float(np.sum(np.maximum(-residual, 0.0))),
+            "observed_total_counts": float(np.sum(observed)),
+            "fitted_total_counts": float(np.sum(fitted)),
+            "background_total_counts": float(
+                0.0
+                if self.last_response_poisson_background is None
+                else np.sum(self.last_response_poisson_background)
+            ),
+            "coefficients": {
+                name: float(coeffs[idx]) for idx, name in enumerate(fit_names)
+            },
+            "counts": {
+                name: float(estimates[name].counts)
+                for name in fit_names
+                if name in estimates
+            },
+            "variances": {
+                name: float(variances.get(name, 1.0)) for name in fit_names
+            },
+            "snr": {
+                name: float(
+                    estimates[name].counts
+                    / max(np.sqrt(max(float(variances.get(name, 1.0)), 1.0)), 1e-12)
+                )
+                for name in fit_names
+                if name in estimates
+            },
+            "methods": {
+                name: str(estimates[name].method)
+                for name in fit_names
+                if name in estimates
+            },
+            "component_integrals": {
+                name: float(np.sum(component_spectra.get(name, np.zeros(0))))
+                for name in fit_names
+            },
+        }
         return estimates
 
     def compute_response_poisson_counts(
@@ -1608,12 +1680,14 @@ class SpectralDecomposer:
         parent = list(range(num_lines))
 
         def _find(idx: int) -> int:
+            """Return the disjoint-set root for a line index."""
             while parent[idx] != idx:
                 parent[idx] = parent[parent[idx]]
                 idx = parent[idx]
             return idx
 
         def _union(i: int, j: int) -> None:
+            """Merge two disjoint-set line groups."""
             ri = _find(i)
             rj = _find(j)
             if ri != rj:

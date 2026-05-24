@@ -569,6 +569,7 @@ class OctantShield:
         orientation_index: int = 0,
         octant_normals: NDArray[np.float64] | None = None,
     ) -> None:
+        """Initialize the shield material label and octant orientation table."""
         self.material = material or "generic"
         self.orientation_index = orientation_index
         self.octant_normals = octant_normals if octant_normals is not None else OCTANT_NORMALS

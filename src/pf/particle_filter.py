@@ -27,6 +27,7 @@ from pf.likelihood import (
     delta_log_likelihood_remove,
     delta_log_likelihood_update,
     expected_counts_per_source,
+    normalize_count_likelihood_model,
 )
 from pf.state import IsotopeState
 from pf.resampling import systematic_resample
@@ -120,6 +121,11 @@ class PFConfig:
     birth_matching_pursuit_max_new_sources: int = 3
     birth_matching_pursuit_topk_candidates: int = 16
     birth_jitter_topk_candidates: int | None = 512
+    birth_global_rescue_enable: bool = False
+    birth_global_rescue_max_candidates: int = 8
+    birth_global_rescue_min_residual_fraction: float = 0.005
+    birth_global_rescue_dedup_radius_m: float = 0.5
+    birth_global_rescue_forced_min_delta_ll: float = 0.0
     residual_decomposition_enable: bool = True
     peak_suppression_enable: bool = True
     peak_suppression_min_source_fraction: float = 0.25
@@ -130,6 +136,7 @@ class PFConfig:
     pseudo_source_min_distinct_views: int = 2
     pseudo_source_fail_grace_stations: int = 2
     pseudo_source_corr_max: float = 0.995
+    pseudo_source_temporal_sep_min: float = 0.0
     pseudo_source_quarantine_on_suppress: bool = True
     pseudo_source_quarantine_excludes_runtime: bool = False
     report_exclude_unverified_sources: bool = False
@@ -155,6 +162,9 @@ class PFConfig:
     conditional_strength_refit_min_snr: float = 1.0
     conditional_strength_refit_prior_weight: float = 0.0
     conditional_strength_refit_prior_rel_sigma: float = 2.0
+    source_strength_prior_mean: float = 0.0
+    source_strength_prior_weight: float = 0.0
+    source_strength_prior_rel_sigma: float = 1.0
     min_age_to_split: int = 5
     use_clustered_output: bool = True
     cluster_eps_m: float = 0.8
@@ -252,6 +262,7 @@ class PFConvergenceMonitor:
     require_all: bool
 
     def __post_init__(self) -> None:
+        """Initialize bounded convergence-history buffers."""
         self.positions: deque[NDArray[np.float64] | None] = deque(maxlen=self.window)
         self.ess_ratios: deque[float] = deque(maxlen=self.window)
         self.ll_values: deque[float] = deque(maxlen=self.window)
@@ -337,6 +348,7 @@ class IsotopeParticleFilter:
         detector_radius_m: float = 0.0,
         detector_aperture_samples: int = 1,
     ) -> None:
+        """Initialize particle state, priors, and continuous measurement kernels."""
         self.isotope = isotope
         self.kernel = kernel
         self.config = config or PFConfig()
@@ -383,6 +395,11 @@ class IsotopeParticleFilter:
         self.last_birth_forced_no_candidate = 0
         self.last_birth_forced_rejected = 0
         self.last_birth_forced_best_delta = -np.inf
+        self.last_birth_global_rescue_candidates = 0
+        self.last_birth_global_rescue_attempts = 0
+        self.last_birth_global_rescue_accepts = 0
+        self.last_birth_global_rescue_rejected = 0
+        self.last_birth_global_rescue_best_delta = -np.inf
         self.last_birth_structural_eligible = 0
         self.last_pseudo_source_verified = 0
         self.last_pseudo_source_failed = 0
@@ -390,6 +407,7 @@ class IsotopeParticleFilter:
         self.last_pseudo_source_quarantined = 0
         self.last_pseudo_source_quarantine_active = 0
         self.last_pseudo_source_fail_reasons: dict[str, int] = {}
+        self.last_source_event_diagnostics: list[dict[str, object]] = []
         self.last_structural_timing_s: dict[str, float] = {}
         self._deferred_resampled_any = False
         self._deferred_ess_min: float | None = None
@@ -448,6 +466,33 @@ class IsotopeParticleFilter:
             return 1.0
         return max(float(scales.get(self.isotope, 1.0)), 0.0)
 
+    @staticmethod
+    def _measurement_vector(
+        values: float | NDArray[np.float64],
+        count: int,
+        name: str,
+        *,
+        min_value: float | None = None,
+        allow_scalar: bool = True,
+    ) -> NDArray[np.float64]:
+        """Return a validated one-value-per-measurement vector."""
+        expected = max(int(count), 0)
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        if arr.size == 0:
+            if expected == 0:
+                return np.zeros(0, dtype=float)
+            raise ValueError(f"{name} must contain one value per measurement.")
+        if arr.size == 1 and expected != 1 and allow_scalar:
+            arr = np.full(expected, float(arr[0]), dtype=float)
+        elif arr.size != expected:
+            scalar_text = "scalar or " if allow_scalar else ""
+            raise ValueError(
+                f"{name} must be {scalar_text}one value per measurement."
+            )
+        if min_value is not None:
+            arr = np.maximum(arr, float(min_value))
+        return np.asarray(arr, dtype=float)
+
     def _reset_structural_residual_gate(self) -> None:
         """Reset birth residual diagnostics when structural updates are skipped."""
         self.last_birth_residual_chi2 = 0.0
@@ -490,12 +535,12 @@ class IsotopeParticleFilter:
         if min_count <= 0.0 and min_snr <= 0.0:
             return data
         counts = np.asarray(data.z_k, dtype=float).reshape(-1)
-        variances = np.maximum(
-            np.asarray(data.observation_variances, dtype=float).reshape(-1),
-            1.0e-12,
+        variances = self._measurement_vector(
+            data.observation_variances,
+            counts.size,
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != counts.size:
-            variances = np.resize(variances, counts.size)
         count_ok = counts >= min_count if min_count > 0.0 else np.zeros_like(counts, dtype=bool)
         snr = np.maximum(counts, 0.0) / np.sqrt(variances)
         snr_ok = snr >= min_snr if min_snr > 0.0 else np.zeros_like(counts, dtype=bool)
@@ -566,10 +611,14 @@ class IsotopeParticleFilter:
         obs_var = np.asarray(observation_count_variance, dtype=float).reshape(-1)
         if obs_var.size == 0:
             obs_var = np.zeros(z_arr.size, dtype=float)
-        if obs_var.size != z_arr.size:
-            obs_var = np.resize(obs_var, z_arr.size)
+        elif obs_var.size == 1:
+            obs_var = np.full(z_arr.size, float(obs_var[0]), dtype=float)
+        elif obs_var.size != z_arr.size:
+            raise ValueError(
+                "observation_count_variance must be scalar or have one value per measurement."
+            )
         kwargs = self._count_likelihood_kwargs()
-        model = str(kwargs["model"])
+        model = normalize_count_likelihood_model(str(kwargs["model"]))
         z_col = z_arr[:, None]
         if model == "poisson":
             return np.sum(z_col * np.log(lam) - lam, axis=0)
@@ -618,12 +667,12 @@ class IsotopeParticleFilter:
         z_arr = np.asarray(data.z_k, dtype=float).reshape(-1)
         if z_arr.size == 0:
             return None
-        variances = np.maximum(
-            np.asarray(data.observation_variances, dtype=float).reshape(-1),
-            1.0,
+        variances = self._measurement_vector(
+            data.observation_variances,
+            z_arr.size,
+            "observation_variances",
+            min_value=1.0,
         )
-        if variances.size != z_arr.size:
-            variances = np.resize(variances, z_arr.size)
         min_count = max(float(self.config.conditional_strength_refit_min_count), 0.0)
         min_snr = max(float(self.config.conditional_strength_refit_min_snr), 0.0)
         if min_count <= 0.0 and min_snr <= 0.0:
@@ -669,6 +718,57 @@ class IsotopeParticleFilter:
         )
         return np.where(inactive, 0.0, precision)
 
+    def _absolute_strength_prior_terms(
+        self,
+        shape: tuple[int, ...],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return absolute source-strength prior precision and mean arrays."""
+        mean = max(float(self.config.source_strength_prior_mean), 0.0)
+        weight = max(float(self.config.source_strength_prior_weight), 0.0)
+        if mean <= 0.0 or weight <= 0.0:
+            zeros = np.zeros(shape, dtype=float)
+            return zeros, zeros
+        rel_sigma = max(float(self.config.source_strength_prior_rel_sigma), 1.0e-6)
+        sigma = max(rel_sigma * mean, 1.0e-12)
+        precision = weight / (sigma * sigma)
+        precision_arr = np.full(shape, precision, dtype=float)
+        mean_arr = np.full(shape, mean, dtype=float)
+        return precision_arr, mean_arr
+
+    def _absolute_strength_prior_log_ratio(
+        self,
+        prior_strengths: NDArray[np.float64],
+        posterior_strengths: NDArray[np.float64],
+    ) -> float:
+        """Return absolute strength-prior log-density change for one particle."""
+        prior = np.asarray(prior_strengths, dtype=float)
+        posterior = np.asarray(posterior_strengths, dtype=float)
+        if prior.shape != posterior.shape or prior.size == 0:
+            return 0.0
+        precision, mean = self._absolute_strength_prior_terms(prior.shape)
+        if not np.any(precision > 0.0):
+            return 0.0
+        before = np.sum(precision * (prior - mean) ** 2)
+        after = np.sum(precision * (posterior - mean) ** 2)
+        return float(-0.5 * (after - before))
+
+    def _absolute_strength_prior_log_ratio_batched(
+        self,
+        prior_strengths: NDArray[np.float64],
+        posterior_strengths: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return absolute strength-prior log-density changes for particles."""
+        prior = np.asarray(prior_strengths, dtype=float)
+        posterior = np.asarray(posterior_strengths, dtype=float)
+        if prior.shape != posterior.shape or prior.size == 0:
+            return np.zeros(prior.shape[0] if prior.ndim else 0, dtype=float)
+        precision, mean = self._absolute_strength_prior_terms(prior.shape)
+        if not np.any(precision > 0.0):
+            return np.zeros(prior.shape[0], dtype=float)
+        before = np.sum(precision * (prior - mean) ** 2, axis=1)
+        after = np.sum(precision * (posterior - mean) ** 2, axis=1)
+        return -0.5 * (after - before)
+
     def _strength_refit_prior_log_ratio(
         self,
         prior_mean: NDArray[np.float64],
@@ -688,14 +788,14 @@ class IsotopeParticleFilter:
         posterior = np.asarray(posterior_strengths, dtype=float)
         if prior.size == 0 or posterior.size == 0:
             return 0.0
-        size = min(prior.size, posterior.size)
-        prior = prior[:size]
-        posterior = posterior[:size]
+        if prior.shape != posterior.shape:
+            raise ValueError("posterior_strengths must match prior_mean.")
         precision = self._strength_refit_prior_precision(prior)
-        if precision.size != size:
-            precision = np.resize(precision, size)
+        if precision.shape != prior.shape:
+            raise ValueError("strength prior precision must match prior_mean.")
         delta = posterior - prior
-        return float(-0.5 * np.sum(precision * delta * delta))
+        local_ratio = float(-0.5 * np.sum(precision * delta * delta))
+        return local_ratio + self._absolute_strength_prior_log_ratio(prior, posterior)
 
     def _strength_refit_prior_log_ratio_batched(
         self,
@@ -708,15 +808,16 @@ class IsotopeParticleFilter:
         if prior.size == 0 or posterior.size == 0:
             return np.zeros(prior.shape[0] if prior.ndim else 0, dtype=float)
         if prior.shape != posterior.shape:
-            rows = min(prior.shape[0], posterior.shape[0])
-            cols = min(prior.shape[1], posterior.shape[1])
-            prior = prior[:rows, :cols]
-            posterior = posterior[:rows, :cols]
+            raise ValueError("posterior_strengths must match prior_mean.")
         precision = self._strength_refit_prior_precision(prior)
         if precision.shape != prior.shape:
-            precision = np.resize(precision, prior.shape)
+            raise ValueError("strength prior precision must match prior_mean.")
         delta = posterior - prior
-        return -0.5 * np.sum(precision * delta * delta, axis=1)
+        local_ratio = -0.5 * np.sum(precision * delta * delta, axis=1)
+        return local_ratio + self._absolute_strength_prior_log_ratio_batched(
+            prior,
+            posterior,
+        )
 
     def _delta_log_likelihood_remove(
         self,
@@ -1018,6 +1119,11 @@ class IsotopeParticleFilter:
         self.last_birth_forced_no_candidate = 0
         self.last_birth_forced_rejected = 0
         self.last_birth_forced_best_delta = -np.inf
+        self.last_birth_global_rescue_candidates = 0
+        self.last_birth_global_rescue_attempts = 0
+        self.last_birth_global_rescue_accepts = 0
+        self.last_birth_global_rescue_rejected = 0
+        self.last_birth_global_rescue_best_delta = -np.inf
         self.last_birth_structural_eligible = 0
         self.last_pseudo_source_verified = 0
         self.last_pseudo_source_failed = 0
@@ -1025,6 +1131,7 @@ class IsotopeParticleFilter:
         self.last_pseudo_source_quarantined = 0
         self.last_pseudo_source_quarantine_active = 0
         self.last_pseudo_source_fail_reasons = {}
+        self.last_source_event_diagnostics = []
         self.last_structural_timing_s = {}
         self._resample_count_in_observation = 0
 
@@ -1038,6 +1145,45 @@ class IsotopeParticleFilter:
         steps = max(0, int(self.config.adapt_cooldown_steps))
         if steps > 0:
             self._adapt_cooldown_remaining = max(self._adapt_cooldown_remaining, steps + 1)
+
+    def _record_source_event(
+        self,
+        event: str,
+        st: IsotopeState,
+        source_idx: int,
+        *,
+        reason: str,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        """Record a source-slot birth, death, quarantine, or verification event."""
+        self._ensure_source_metadata(st)
+        idx = int(source_idx)
+        if idx < 0 or idx >= int(st.num_sources):
+            return
+        record: dict[str, object] = {
+            "event": str(event),
+            "isotope": str(self.isotope),
+            "reason": str(reason),
+            "source_index": idx,
+            "position": [float(value) for value in st.positions[idx]],
+            "strength": float(st.strengths[idx]),
+            "age": int(st.ages[idx]) if st.ages is not None else None,
+            "low_q_streak": int(st.low_q_streaks[idx])
+            if st.low_q_streaks is not None
+            else None,
+            "support_score": float(st.support_scores[idx])
+            if st.support_scores is not None
+            else None,
+            "tentative": bool(st.tentative_sources[idx])
+            if st.tentative_sources is not None
+            else None,
+            "verification_fail_streak": int(st.verification_fail_streaks[idx])
+            if st.verification_fail_streaks is not None
+            else None,
+        }
+        if extra:
+            record.update(extra)
+        self.last_source_event_diagnostics.append(record)
 
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
@@ -1397,15 +1543,9 @@ class IsotopeParticleFilter:
         lam_t = lam_t.to(dtype=torch.float64)
         lam_t = torch.clamp(lam_t, min=1e-12)
         z = torch.as_tensor(z_obs, device=lam_t.device, dtype=torch.float64)
-        model = str(self.config.count_likelihood_model).strip().lower()
+        model = normalize_count_likelihood_model(str(self.config.count_likelihood_model))
         if model in {"poisson", ""}:
             return z * torch.log(lam_t) - lam_t
-        if model == "normal":
-            model = "gaussian"
-        if model in {"robust", "robust_gaussian", "t"}:
-            model = "student_t"
-        if model not in {"gaussian", "student_t"}:
-            raise ValueError(f"Unknown count likelihood model: {self.config.count_likelihood_model}")
 
         transport_rel = self._isotope_float_config(self.config.transport_model_rel_sigma)
         transport_abs = self._isotope_float_config(self.config.transport_model_abs_sigma)
@@ -2935,7 +3075,9 @@ class IsotopeParticleFilter:
         tentative = np.asarray(st.tentative_sources[:count], dtype=bool)
         failed = np.asarray(st.verification_fail_streaks[:count], dtype=int)
         if failed.size != count:
-            failed = np.resize(failed, count)
+            failed_padded = np.zeros(count, dtype=int)
+            failed_padded[: min(failed.size, count)] = failed[:count]
+            failed = failed_padded
         grace = self._pseudo_source_fail_grace()
         return tentative & (failed > 0) & (failed >= grace)
 
@@ -3031,9 +3173,13 @@ class IsotopeParticleFilter:
             tentative = np.asarray(st.tentative_sources[:count], dtype=bool)
             failed = np.asarray(st.verification_fail_streaks[:count], dtype=int)
             if tentative.size != count:
-                tentative = np.resize(tentative, count)
+                tentative_padded = np.zeros(count, dtype=bool)
+                tentative_padded[: min(tentative.size, count)] = tentative[:count]
+                tentative = tentative_padded
             if failed.size != count:
-                failed = np.resize(failed, count)
+                failed_padded = np.zeros(count, dtype=int)
+                failed_padded[: min(failed.size, count)] = failed[:count]
+                failed = failed_padded
             mask &= ~(tentative | (failed > 0))
         return mask
 
@@ -3068,7 +3214,7 @@ class IsotopeParticleFilter:
         self._ensure_source_metadata(st)
         keep_arr = np.asarray(keep, dtype=bool).ravel()[: int(st.num_sources)]
         if keep_arr.size != int(st.num_sources):
-            keep_arr = np.resize(keep_arr, int(st.num_sources))
+            raise ValueError("keep mask must match source count.")
         removed = int(np.count_nonzero(~keep_arr))
         if removed <= 0:
             return 0
@@ -3103,7 +3249,7 @@ class IsotopeParticleFilter:
         if pos_arr.shape[0] == 0:
             return 0
         if selected.size != pos_arr.shape[0]:
-            selected = np.resize(selected, pos_arr.shape[0])
+            raise ValueError("selected_mask must match report_positions.")
         dropped = pos_arr[~selected]
         kept = pos_arr[selected]
         if dropped.shape[0] == 0 or kept.shape[0] == 0:
@@ -3990,9 +4136,13 @@ class IsotopeParticleFilter:
         counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
         if counts.ndim != 2 or counts.size == 0:
             return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
-        residual = np.maximum(np.asarray(residual_mix, dtype=float).ravel(), 0.0)
-        if residual.size != counts.shape[0]:
-            residual = np.resize(residual, counts.shape[0])
+        residual = self._measurement_vector(
+            residual_mix,
+            counts.shape[0],
+            "residual_mix",
+            min_value=0.0,
+            allow_scalar=False,
+        )
         if not bool(self.config.birth_use_shield_coded_residual):
             sums = np.maximum(np.sum(counts, axis=0), 1.0e-12)
             residual_sum = max(float(np.sum(residual)), 0.0)
@@ -4004,12 +4154,12 @@ class IsotopeParticleFilter:
                 q_hat=q_hat,
             )
             return scores, q_hat
-        variances = np.maximum(
-            np.asarray(observation_variances, dtype=float).ravel(),
-            1.0e-12,
+        variances = self._measurement_vector(
+            observation_variances,
+            counts.shape[0],
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != counts.shape[0]:
-            variances = np.resize(variances, counts.shape[0])
         weights = 1.0 / variances
         numerator = np.sum(weights[:, None] * residual[:, None] * counts, axis=0)
         denominator = np.sum(weights[:, None] * counts * counts, axis=0)
@@ -4044,9 +4194,13 @@ class IsotopeParticleFilter:
         num_candidates = counts.shape[1]
         if response_weight <= 0.0 and strength_weight <= 0.0:
             return np.ones(num_candidates, dtype=float)
-        residual = np.maximum(np.asarray(residual_mix, dtype=float).ravel(), 0.0)
-        if residual.size != counts.shape[0]:
-            residual = np.resize(residual, counts.shape[0])
+        residual = self._measurement_vector(
+            residual_mix,
+            counts.shape[0],
+            "residual_mix",
+            min_value=0.0,
+            allow_scalar=False,
+        )
         residual_sum = float(np.sum(residual))
         if residual_sum <= 0.0:
             return np.ones(num_candidates, dtype=float)
@@ -4073,7 +4227,7 @@ class IsotopeParticleFilter:
 
         q = np.maximum(np.asarray(q_hat, dtype=float).ravel(), 0.0)
         if q.size != num_candidates:
-            q = np.resize(q, num_candidates)
+            raise ValueError("q_hat must have one value per candidate.")
         finite_q = np.isfinite(q) & (q > eps)
         if strength_weight > 0.0 and np.any(finite_q):
             q_ref = float(np.median(q[finite_q]))
@@ -4232,14 +4386,16 @@ class IsotopeParticleFilter:
         existing = np.maximum(np.asarray(existing_response_counts, dtype=float), 0.0)
         if existing.ndim != 2 or existing.size == 0 or existing.shape[1] == 0:
             return np.ones(candidates.shape[1], dtype=bool)
-        variances = np.maximum(
-            np.asarray(observation_variances, dtype=float).ravel(),
-            1.0e-12,
+        variances = self._measurement_vector(
+            observation_variances,
+            candidates.shape[0],
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != candidates.shape[0]:
-            variances = np.resize(variances, candidates.shape[0])
         if existing.shape[0] != candidates.shape[0]:
-            existing = np.resize(existing, (candidates.shape[0], existing.shape[1]))
+            raise ValueError(
+                "existing_response_counts must have one row per measurement."
+            )
         scale = 1.0 / np.sqrt(variances)
         cand_w = candidates * scale[:, None]
         exist_w = existing * scale[:, None]
@@ -4258,12 +4414,12 @@ class IsotopeParticleFilter:
         columns = np.maximum(np.asarray(response_counts, dtype=float), 0.0)
         if columns.ndim != 2 or columns.shape[1] <= 1:
             return 1.0
-        variances = np.maximum(
-            np.asarray(observation_variances, dtype=float).ravel(),
-            1.0e-12,
+        variances = self._measurement_vector(
+            observation_variances,
+            columns.shape[0],
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != columns.shape[0]:
-            variances = np.resize(variances, columns.shape[0])
         weighted = columns * (1.0 / np.sqrt(variances))[:, None]
         norms = np.linalg.norm(weighted, axis=0)
         active = norms > 1.0e-12
@@ -4307,13 +4463,15 @@ class IsotopeParticleFilter:
         if existing.ndim != 2 or existing.size == 0 or existing.shape[1] == 0:
             return np.ones(candidates.shape[1], dtype=bool)
         if existing.shape[0] != candidates.shape[0]:
-            existing = np.resize(existing, (candidates.shape[0], existing.shape[1]))
-        variances = np.maximum(
-            np.asarray(observation_variances, dtype=float).ravel(),
-            1.0e-12,
+            raise ValueError(
+                "existing_response_counts must have one row per measurement."
+            )
+        variances = self._measurement_vector(
+            observation_variances,
+            candidates.shape[0],
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != candidates.shape[0]:
-            variances = np.resize(variances, candidates.shape[0])
         scale = 1.0 / np.sqrt(variances)
         exist_w = existing * scale[:, None]
         cand_w = candidates * scale[:, None]
@@ -4590,13 +4748,15 @@ class IsotopeParticleFilter:
         variance. It prevents a single low-confidence spectrum decomposition
         outlier from creating persistent false-positive sources.
         """
-        residual = np.maximum(np.asarray(residual_mix, dtype=float), 0.0)
-        variances = np.maximum(np.asarray(observation_variances, dtype=float), 1.0e-12)
+        residual = np.maximum(np.asarray(residual_mix, dtype=float).reshape(-1), 0.0)
         if residual.size == 0:
             return False
-        if variances.size != residual.size:
-            variances = np.resize(variances, residual.size)
-            variances = np.maximum(variances, 1.0e-12)
+        variances = self._measurement_vector(
+            observation_variances,
+            residual.size,
+            "observation_variances",
+            min_value=1.0e-12,
+        )
         sigma = np.sqrt(variances)
         z_score = residual / np.maximum(sigma, 1.0e-12)
         min_sigma = max(float(self.config.birth_residual_support_sigma), 0.0)
@@ -4795,7 +4955,7 @@ class IsotopeParticleFilter:
         num_meas, particle_count, source_count = k_arr.shape
         bg = np.asarray(background_counts, dtype=float)
         if bg.shape != (num_meas, particle_count):
-            bg = np.resize(bg, (num_meas, particle_count))
+            raise ValueError("background_counts must have shape K x P.")
         if source_count <= 0 or particle_count <= 0:
             return (
                 np.zeros((particle_count, source_count), dtype=float),
@@ -4803,20 +4963,29 @@ class IsotopeParticleFilter:
             )
         prior = np.asarray(prior_mean, dtype=float)
         if prior.shape != (particle_count, source_count):
-            prior = np.resize(prior, (particle_count, source_count))
+            raise ValueError("prior_mean must have shape P x S.")
         z_arr = np.asarray(data.z_k, dtype=float).reshape(-1)
         if z_arr.size != num_meas:
-            z_arr = np.resize(z_arr, num_meas)
-        obs_weights = 1.0 / np.maximum(
-            np.asarray(data.observation_variances, dtype=float).reshape(-1),
-            1.0,
+            raise ValueError("data.z_k must have one value per measurement.")
+        obs_variances = self._measurement_vector(
+            data.observation_variances,
+            num_meas,
+            "observation_variances",
+            min_value=1.0,
         )
-        if obs_weights.size != num_meas:
-            obs_weights = np.resize(obs_weights, num_meas)
+        obs_weights = 1.0 / obs_variances
         strengths = np.clip(np.maximum(prior.copy(), 0.0), q_min, q_max)
-        prior_precision = self._strength_refit_prior_precision(prior)
+        local_precision = self._strength_refit_prior_precision(prior)
+        abs_precision, abs_mean = self._absolute_strength_prior_terms(prior.shape)
+        prior_precision = local_precision + abs_precision
+        prior_target = np.divide(
+            local_precision * prior + abs_precision * abs_mean,
+            np.maximum(prior_precision, 1.0e-12),
+            out=prior.copy(),
+            where=prior_precision > 0.0,
+        )
         if prior_precision.shape != prior.shape:
-            prior_precision = np.resize(prior_precision, prior.shape)
+            raise ValueError("strength prior precision must match prior_mean.")
 
         gram = np.einsum("kps,kpt,k->pst", k_arr, k_arr, obs_weights)
         rhs = np.einsum(
@@ -4828,7 +4997,7 @@ class IsotopeParticleFilter:
         prior_diag = np.zeros_like(gram, dtype=float)
         diag_idx = np.arange(source_count)
         prior_diag[:, diag_idx, diag_idx] = prior_precision
-        rhs = rhs + prior_precision * prior
+        rhs = rhs + prior_precision * prior_target
         eye = np.eye(source_count, dtype=float)[None, :, :] * float(eps)
         try:
             direct = np.linalg.solve(gram + prior_diag + eye, rhs[:, :, None])
@@ -4852,7 +5021,7 @@ class IsotopeParticleFilter:
                 residual = z_col - (lambda_total - old_strength[None, :] * k_col)
                 numer = (
                     np.sum(weight_col * residual * k_col, axis=0)
-                    + prior_col * prior[:, source_idx]
+                    + prior_col * prior_target[:, source_idx]
                 )
                 q_new = np.divide(
                     numer,
@@ -4920,7 +5089,7 @@ class IsotopeParticleFilter:
             observation_count_variance=data.observation_variances,
         )
         if ll_full.size != particle_count:
-            ll_full = np.resize(ll_full, particle_count)
+            raise ValueError("full_lambda_total must have one column per particle.")
         penalty_gain = self._bic_model_penalty(
             int(data.z_k.size),
             int(self.config.source_prune_bic_penalty_params),
@@ -4947,7 +5116,7 @@ class IsotopeParticleFilter:
                 observation_count_variance=data.observation_variances,
             )
             if ll_without.size != particle_count:
-                ll_without = np.resize(ll_without, particle_count)
+                raise ValueError("lambda_without must have one column per particle.")
             loss = ll_full - ll_without
             removable[:, source_idx] = np.isfinite(loss) & (loss <= allowed_loss)
         return removable
@@ -4981,7 +5150,7 @@ class IsotopeParticleFilter:
             observation_count_variance=data.observation_variances,
         )
         if ll_full.size != particle_count:
-            ll_full = np.resize(ll_full, particle_count)
+            raise ValueError("full_lambda_total must have one column per particle.")
         penalty_gain = self._bic_model_penalty(
             int(data.z_k.size),
             int(self.config.source_prune_bic_penalty_params),
@@ -4993,7 +5162,7 @@ class IsotopeParticleFilter:
         prior_removed = np.zeros((trial_count, reduced_count), dtype=float)
         full_strengths_arr = np.asarray(full_strengths, dtype=float)
         if full_strengths_arr.shape != (particle_count, source_count):
-            full_strengths_arr = np.resize(full_strengths_arr, (particle_count, source_count))
+            raise ValueError("full_strengths must have shape P x S.")
         for removed_idx in range(source_count):
             keep = np.ones(source_count, dtype=bool)
             keep[removed_idx] = False
@@ -5003,7 +5172,7 @@ class IsotopeParticleFilter:
             prior_removed[start:stop, :] = full_strengths_arr[:, keep]
         bg = np.asarray(background_counts, dtype=float)
         if bg.shape != (num_meas, particle_count):
-            bg = np.resize(bg, (num_meas, particle_count))
+            raise ValueError("background_counts must have shape K x P.")
         background_removed = np.tile(bg, (1, source_count))
         _, lambda_without_all = self._solve_strengths_for_kernel_tensor_batched(
             data,
@@ -5021,7 +5190,7 @@ class IsotopeParticleFilter:
             observation_count_variance=data.observation_variances,
         )
         if ll_without_all.size != trial_count:
-            ll_without_all = np.resize(ll_without_all, trial_count)
+            raise ValueError("lambda_without_all must have one column per trial.")
         ll_without = ll_without_all.reshape(source_count, particle_count).T
         loss = ll_full[:, None] - ll_without
         removable = np.isfinite(loss) & (loss <= allowed_loss)
@@ -5157,15 +5326,19 @@ class IsotopeParticleFilter:
         counts = np.asarray(candidate_counts, dtype=float)
         if counts.ndim != 2 or counts.size == 0:
             return np.zeros(0, dtype=bool)
-        residual = np.maximum(np.asarray(residual_mix, dtype=float).ravel(), 0.0)
-        variances = np.maximum(
-            np.asarray(observation_variances, dtype=float).ravel(),
-            1.0e-12,
+        residual = self._measurement_vector(
+            residual_mix,
+            counts.shape[0],
+            "residual_mix",
+            min_value=0.0,
+            allow_scalar=False,
         )
-        if residual.size != counts.shape[0]:
-            residual = np.resize(residual, counts.shape[0])
-        if variances.size != counts.shape[0]:
-            variances = np.resize(variances, counts.shape[0])
+        variances = self._measurement_vector(
+            observation_variances,
+            counts.shape[0],
+            "observation_variances",
+            min_value=1.0e-12,
+        )
         sigma = np.sqrt(variances)
         z_score = residual / np.maximum(sigma, 1.0e-12)
         residual_support = z_score >= max(float(self.config.birth_residual_support_sigma), 0.0)
@@ -5386,7 +5559,7 @@ class IsotopeParticleFilter:
         )
         k_mat = np.asarray(k_mat, dtype=float)
         if k_mat.shape != (int(data.z_k.size), num_sources):
-            k_mat = np.resize(k_mat, (int(data.z_k.size), num_sources))
+            raise ValueError("unit response matrix must have shape K x S.")
         q_min = max(float(self.config.min_strength), 0.0)
         q_max = float(self.config.birth_q_max)
         if q_max < q_min:
@@ -5404,12 +5577,22 @@ class IsotopeParticleFilter:
             1.0,
         )
         prior_mean = strengths.copy()
-        prior_precision = self._strength_refit_prior_precision(prior_mean)
+        local_precision = self._strength_refit_prior_precision(prior_mean)
+        abs_precision, abs_mean = self._absolute_strength_prior_terms(
+            prior_mean.shape
+        )
+        prior_precision = local_precision + abs_precision
+        prior_target = np.divide(
+            local_precision * prior_mean + abs_precision * abs_mean,
+            np.maximum(prior_precision, 1.0e-12),
+            out=prior_mean.copy(),
+            where=prior_precision > 0.0,
+        )
         gram = (k_mat.T * obs_weights[None, :]) @ k_mat
         rhs = (k_mat.T * obs_weights[None, :]) @ (data.z_k - background_counts)
         try:
             gram = gram + np.diag(prior_precision)
-            rhs = rhs + prior_precision * prior_mean
+            rhs = rhs + prior_precision * prior_target
             direct = np.linalg.solve(
                 gram + np.eye(num_sources, dtype=float) * float(eps),
                 rhs,
@@ -5432,7 +5615,7 @@ class IsotopeParticleFilter:
                 residual = data.z_k - (lambda_total - strengths[j] * k_col)
                 numer = float(
                     np.sum(obs_weights * residual * k_col)
-                    + prior_precision[j] * prior_mean[j]
+                    + prior_precision[j] * prior_target[j]
                 )
                 q_new = max(0.0, numer / denom)
                 q_new = float(np.clip(q_new, q_min, q_max))
@@ -5800,7 +5983,7 @@ class IsotopeParticleFilter:
                 : st.num_sources
             ]
             if allowed.size != st.num_sources:
-                allowed = np.resize(allowed, st.num_sources)
+                raise ValueError("drop_allowed_mask must match source count.")
             drop &= allowed
         if bool(self.config.pseudo_source_verification_enable):
             grace = max(0, int(self.config.pseudo_source_fail_grace_stations))
@@ -5813,7 +5996,7 @@ class IsotopeParticleFilter:
         if min_age > 0:
             ages = np.asarray(st.ages[: st.num_sources], dtype=int)
             if ages.size != st.num_sources:
-                ages = np.resize(ages, st.num_sources)
+                raise ValueError("source ages must match source count.")
             drop &= ages >= min_age
         if not np.any(drop):
             return
@@ -5825,6 +6008,20 @@ class IsotopeParticleFilter:
         keep = ~drop
         if record_kill_count:
             self.last_kill_count += int(np.count_nonzero(drop))
+        for idx in np.flatnonzero(drop):
+            self._record_source_event(
+                "source_removed",
+                st,
+                int(idx),
+                reason="weak_floor_prune",
+                extra={
+                    "expected_count": float(expected_counts[int(idx)]),
+                    "expected_fraction": float(fraction[int(idx)]),
+                    "min_expected_count": float(min_expected),
+                    "min_expected_fraction": float(min_fraction),
+                    "record_kill_count": bool(record_kill_count),
+                },
+            )
         st.positions = st.positions[keep]
         st.strengths = st.strengths[keep]
         st.ages = st.ages[keep]
@@ -5926,11 +6123,16 @@ class IsotopeParticleFilter:
         """
         counts = np.asarray(unit_counts, dtype=float)
         if counts.ndim != 2:
-            counts = np.resize(counts, (int(data.z_k.size), 0))
+            if counts.size == 0:
+                counts = np.zeros((int(data.z_k.size), 0), dtype=float)
+            else:
+                raise ValueError("unit_counts must have shape K x S.")
+        if counts.shape[0] != int(data.z_k.size):
+            raise ValueError("unit_counts must have one row per measurement.")
         source_count = int(counts.shape[1])
         prior = np.asarray(prior_strengths, dtype=float).reshape(-1)
         if prior.size != source_count:
-            prior = np.resize(prior, source_count)
+            raise ValueError("prior_strengths must have one value per source.")
         q_min = max(float(self.config.min_strength), 0.0)
         q_max = float(self.config.birth_q_max)
         if q_max < q_min:
@@ -6002,7 +6204,7 @@ class IsotopeParticleFilter:
         if existing_count > 0:
             source_prior = np.asarray(source_strengths, dtype=float).reshape(-1)
             if source_prior.size != existing_count:
-                source_prior = np.resize(source_prior, existing_count)
+                raise ValueError("source_strengths must match existing source count.")
             prior[:, :existing_count] = source_prior[None, :]
         prior[:, -1] = trial_q
         strengths, lambda_total = self._solve_strengths_for_kernel_tensor_batched(
@@ -6104,7 +6306,7 @@ class IsotopeParticleFilter:
             else np.asarray(candidate_kernel_sums, dtype=float).reshape(-1)[:count]
         )
         if kernel_sums.size != count:
-            kernel_sums = np.resize(kernel_sums, count)
+            raise ValueError("candidate_kernel_sums must match candidate_count.")
         denom = np.maximum(kernel_sums, 1.0e-12)
         q = float(self.config.birth_alpha) * max(float(residual_sum), 0.0) / denom
         q = np.clip(q, q_min, q_max)
@@ -6163,7 +6365,7 @@ class IsotopeParticleFilter:
             candidate_counts_arr = np.asarray(candidate_unit_counts, dtype=float)
             expected_shape = (int(data.z_k.size), int(candidates.shape[0]))
             if candidate_counts_arr.shape != expected_shape:
-                candidate_counts_arr = np.resize(candidate_counts_arr, expected_shape)
+                raise ValueError("candidate_unit_counts must have shape K x C.")
             base_lambda = (
                 np.asarray(data.live_times, dtype=float) * float(st.background)
                 + existing_unit_counts
@@ -6497,6 +6699,7 @@ class IsotopeParticleFilter:
         max_new_sources: int,
         residual_gate_forced: bool = False,
         candidate_unit_counts: NDArray[np.float64] | None = None,
+        global_rescue: bool = False,
     ) -> int:
         """
         Add multiple residual-supported sources by matching pursuit.
@@ -6542,10 +6745,12 @@ class IsotopeParticleFilter:
             unit_counts_all = np.asarray(candidate_unit_counts, dtype=float)
             expected_shape = (int(data.z_k.size), int(candidates.shape[0]))
             if unit_counts_all.shape != expected_shape:
-                unit_counts_all = np.resize(unit_counts_all, expected_shape)
+                raise ValueError("candidate_unit_counts must have shape K x C.")
         for _ in range(max_new):
             if self.config.max_sources is not None and st.num_sources >= self.config.max_sources:
                 break
+            if global_rescue:
+                self.last_birth_global_rescue_attempts += 1
             if residual_gate_forced and bool(self.config.birth_residual_force_proposal_on_gate):
                 self.last_birth_forced_attempts += 1
             unit_counts_existing = self._unit_response_counts_for_state(st, data)
@@ -6558,6 +6763,14 @@ class IsotopeParticleFilter:
                 + unit_counts_existing @ source_strengths
             )
             residual = np.maximum(np.asarray(data.z_k, dtype=float) - lambda_total, 0.0)
+            if float(np.sum(residual)) <= 0.0 and global_rescue:
+                background_counts = (
+                    np.asarray(data.live_times, dtype=float) * float(st.background)
+                )
+                residual = np.maximum(
+                    np.asarray(data.z_k, dtype=float) - background_counts,
+                    0.0,
+                )
             if float(np.sum(residual)) <= 0.0:
                 break
             support_mask = self._birth_candidate_support_mask(
@@ -6599,7 +6812,7 @@ class IsotopeParticleFilter:
             keep &= distance_mask
             if (
                 not np.any(keep)
-                and residual_gate_forced
+                and (residual_gate_forced or global_rescue)
                 and bool(self.config.birth_residual_force_proposal_on_gate)
                 and bool(self.config.birth_residual_force_relax_candidate_masks)
             ):
@@ -6619,13 +6832,16 @@ class IsotopeParticleFilter:
                 for relaxed in relaxed_masks:
                     keep = np.asarray(relaxed, dtype=bool) & distance_mask
                     if np.any(keep):
-                        self.last_birth_forced_mask_relaxations += 1
+                        if residual_gate_forced:
+                            self.last_birth_forced_mask_relaxations += 1
                         break
             if not np.any(keep):
                 if residual_gate_forced and bool(
                     self.config.birth_residual_force_proposal_on_gate
                 ):
                     self.last_birth_forced_no_candidate += 1
+                if global_rescue:
+                    self.last_birth_global_rescue_rejected += 1
                 break
             scores, q_hat = self._birth_residual_candidate_scores(
                 candidate_counts=unit_counts_all,
@@ -6634,6 +6850,8 @@ class IsotopeParticleFilter:
             )
             valid = keep & np.isfinite(scores) & np.isfinite(q_hat) & (scores > 0.0) & (q_hat > 0.0)
             if not np.any(valid):
+                if global_rescue:
+                    self.last_birth_global_rescue_rejected += 1
                 break
             ranked = np.flatnonzero(valid)
             ranked = ranked[np.argsort(scores[ranked])[::-1][:topk]]
@@ -6641,7 +6859,7 @@ class IsotopeParticleFilter:
             best_trial: IsotopeState | None = None
             best_delta = -np.inf
             suppress_prune = (
-                residual_gate_forced
+                (residual_gate_forced or global_rescue)
                 and bool(self.config.birth_residual_suppress_death)
             )
             if suppress_prune:
@@ -6718,6 +6936,18 @@ class IsotopeParticleFilter:
                 and np.isfinite(best_delta)
                 and best_delta >= float(self.config.birth_residual_forced_min_delta_ll)
             )
+            if global_rescue and np.isfinite(best_delta):
+                self.last_birth_global_rescue_best_delta = max(
+                    float(self.last_birth_global_rescue_best_delta),
+                    float(best_delta),
+                )
+            global_forced_proposal = (
+                global_rescue
+                and np.isfinite(best_delta)
+                and best_delta
+                >= float(self.config.birth_global_rescue_forced_min_delta_ll)
+            )
+            forced_proposal = bool(forced_proposal or global_forced_proposal)
             if residual_gate_forced and bool(self.config.birth_residual_force_proposal_on_gate):
                 if np.isfinite(best_delta):
                     self.last_birth_forced_best_delta = max(
@@ -6729,15 +6959,45 @@ class IsotopeParticleFilter:
                 elif best_delta < threshold and not forced_proposal:
                     self.last_birth_forced_rejected += 1
             if (
+                global_rescue
+                and best_trial is not None
+                and np.isfinite(best_delta)
+                and best_delta < threshold
+                and not forced_proposal
+            ):
+                self.last_birth_global_rescue_rejected += 1
+            if (
                 best_trial is None
                 or not np.isfinite(best_delta)
                 or (best_delta < threshold and not forced_proposal)
             ):
+                if global_rescue and (
+                    best_trial is None or not np.isfinite(best_delta)
+                ):
+                    self.last_birth_global_rescue_rejected += 1
                 break
+            old_count = int(st.num_sources)
+            for idx in range(old_count, int(best_trial.num_sources)):
+                self._record_source_event(
+                    "source_birth_accepted",
+                    best_trial,
+                    int(idx),
+                    reason=(
+                        "global_mle_rescue_birth"
+                        if global_rescue
+                        else "matching_pursuit_birth"
+                    ),
+                    extra={
+                        "delta_ll": float(best_delta),
+                        "forced_proposal": bool(forced_proposal),
+                    },
+                )
             self._replace_particle_state_from_trial(st, best_trial)
             accepted += 1
-            if forced_proposal:
+            if forced_proposal and residual_gate_forced:
                 self.last_birth_forced_accepts += 1
+            if global_rescue:
+                self.last_birth_global_rescue_accepts += 1
         return accepted
 
     def _birth_existing_unit_response_counts_for_state(
@@ -6813,17 +7073,21 @@ class IsotopeParticleFilter:
             )
         if lambda_m.shape[1] != st.num_sources:
             return False
-        variances = np.maximum(
-            np.asarray(data.observation_variances, dtype=float).ravel(),
-            1.0e-12,
+        variances = self._measurement_vector(
+            data.observation_variances,
+            data.z_k.size,
+            "observation_variances",
+            min_value=1.0e-12,
         )
-        if variances.size != data.z_k.size:
-            variances = np.resize(variances, data.z_k.size)
         sigma = np.sqrt(variances)
         min_delta = float(self.config.pseudo_source_min_delta_ll)
         min_views = max(1, int(self.config.pseudo_source_min_distinct_views))
         grace = self._pseudo_source_fail_grace()
         corr_max = float(np.clip(float(self.config.pseudo_source_corr_max), 0.0, 1.0))
+        temporal_sep_min = max(
+            0.0,
+            float(getattr(self.config, "pseudo_source_temporal_sep_min", 0.0)),
+        )
         keep = np.ones(st.num_sources, dtype=bool)
         changed = False
         prune_allowed: NDArray[np.bool_] | None = None
@@ -6860,7 +7124,30 @@ class IsotopeParticleFilter:
                         for idx in stronger
                     ]
                     corr_failed = max(correlations, default=0.0) >= corr_max
+                    if corr_failed and temporal_sep_min > 0.0:
+                        separations = [
+                            self._temporal_response_separation(
+                                component,
+                                lambda_m[:, idx],
+                                sigma,
+                            )
+                            for idx in stronger
+                        ]
+                        if max(separations, default=0.0) >= temporal_sep_min:
+                            corr_failed = False
             if response_supported and not corr_failed:
+                self._record_source_event(
+                    "pseudo_source_verified",
+                    st,
+                    source_idx,
+                    reason="delta_ll_and_distinct_views_supported",
+                    extra={
+                        "delta_ll": float(delta_ll[source_idx]),
+                        "distinct_views": int(distinct_views),
+                        "min_delta_ll": float(min_delta),
+                        "min_distinct_views": int(min_views),
+                    },
+                )
                 st.tentative_sources[source_idx] = False
                 st.verification_fail_streaks[source_idx] = 0
                 self.last_pseudo_source_verified += 1
@@ -6875,6 +7162,8 @@ class IsotopeParticleFilter:
                 fail_reasons.append("insufficient_distinct_views")
             if corr_failed:
                 fail_reasons.append("high_response_corr")
+                if temporal_sep_min > 0.0:
+                    fail_reasons.append("insufficient_temporal_separation")
             if float(np.sum(component)) <= 0.0:
                 fail_reasons.append("low_expected_contribution")
             if int(st.verification_fail_streaks[source_idx]) < grace:
@@ -6943,6 +7232,19 @@ class IsotopeParticleFilter:
                     and (was_quarantined or not quarantine_enabled)
                 )
                 if quarantine_enabled and not was_quarantined:
+                    self._record_source_event(
+                        "pseudo_source_quarantined",
+                        st,
+                        source_idx,
+                        reason=";".join(fail_reasons),
+                        extra={
+                            "delta_ll": float(delta_ll[source_idx]),
+                            "distinct_views": int(distinct_views),
+                            "min_delta_ll": float(min_delta),
+                            "min_distinct_views": int(min_views),
+                            "suppress_prune": bool(suppress_prune),
+                        },
+                    )
                     self.last_pseudo_source_quarantined += 1
                     changed = True
                 elif prune_now:
@@ -6959,6 +7261,14 @@ class IsotopeParticleFilter:
         pruned = int(np.count_nonzero(~keep))
         if pruned <= 0:
             return changed
+        for idx in np.flatnonzero(~keep):
+            self._record_source_event(
+                "source_removed",
+                st,
+                int(idx),
+                reason="pseudo_source_pruned",
+                extra={"suppress_prune": bool(suppress_prune)},
+            )
         st.positions = st.positions[keep]
         st.strengths = st.strengths[keep]
         st.ages = st.ages[keep]
@@ -6986,6 +7296,23 @@ class IsotopeParticleFilter:
         if a_norm <= 0.0 or b_norm <= 0.0:
             return 0.0
         return float(np.dot(a, b) / max(a_norm * b_norm, 1.0e-12))
+
+    @staticmethod
+    def _temporal_response_separation(
+        first: NDArray[np.float64],
+        second: NDArray[np.float64],
+        sigma: NDArray[np.float64],
+    ) -> float:
+        """Return whitened temporal-code separation between two source responses."""
+        a = np.asarray(first, dtype=float).reshape(-1)
+        b = np.asarray(second, dtype=float).reshape(-1)
+        s = np.asarray(sigma, dtype=float).reshape(-1)
+        if a.size == 0 or a.size != b.size or a.size != s.size:
+            return 0.0
+        denom = np.maximum(s, 1.0e-12)
+        diff = (a - b) / denom
+        value = float(np.sum(diff * diff))
+        return value if np.isfinite(value) else 0.0
 
     def _structural_trial_worker_count(self, trial_count: int) -> int:
         """Return worker count for deterministic structural trial chunks."""
@@ -7222,7 +7549,7 @@ class IsotopeParticleFilter:
         trial_count = int(len(trials))
         merged_unit_counts = np.asarray(merged_unit_counts, dtype=float)
         if merged_unit_counts.shape != (int(data.z_k.size), trial_count):
-            merged_unit_counts = np.resize(merged_unit_counts, (int(data.z_k.size), trial_count))
+            raise ValueError("merged_unit_counts must have shape K x trial_count.")
         k_tensor = np.zeros((int(data.z_k.size), trial_count, source_count), dtype=float)
         for trial_idx, (_score, i, j) in enumerate(pair_scores):
             keep = np.ones(int(st.num_sources), dtype=bool)
@@ -7587,7 +7914,12 @@ class IsotopeParticleFilter:
         idx = min(max(idx, 0), vals.size - 1)
         return float(vals[idx])
 
-    def estimate_clustered(self, max_k: int | None = None) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def estimate_clustered(
+        self,
+        max_k: int | None = None,
+        *,
+        include_report_excluded: bool = False,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """
         Estimate source positions/strengths by robust posterior clustering.
 
@@ -7606,7 +7938,11 @@ class IsotopeParticleFilter:
             st = p.state
             if st.num_sources <= 0:
                 continue
-            active_mask = self._report_source_mask(st)
+            active_mask = (
+                self._active_source_mask(st, include_quarantined=True)
+                if bool(include_report_excluded)
+                else self._report_source_mask(st)
+            )
             for pos, q in zip(
                 st.positions[: st.num_sources][active_mask],
                 st.strengths[: st.num_sources][active_mask],
@@ -7842,6 +8178,7 @@ class IsotopeParticleFilter:
         support_data: MeasurementData | None,
         birth_data: MeasurementData | None,
         candidate_positions: NDArray[np.float64] | None = None,
+        global_birth_candidates: NDArray[np.float64] | None = None,
     ) -> None:
         """
         Apply hysteretic death, residual-driven birth, and split/merge proposals.
@@ -7932,10 +8269,6 @@ class IsotopeParticleFilter:
             and bool(self.config.birth_residual_always_try)
             and residual_sum > 0.0
         )
-        suppress_death = (
-            residual_birth_gate_active
-            and bool(self.config.birth_residual_suppress_death)
-        )
         split_candidate_strengths = (
             self._candidate_initial_strengths(
                 candidate_count=birth_candidates.shape[0],
@@ -7951,6 +8284,28 @@ class IsotopeParticleFilter:
         elif support_data is not None and support_data.z_k.size:
             proposal_data = support_data
         refit_data = proposal_data
+        global_candidates = np.zeros((0, 3), dtype=float)
+        if global_birth_candidates is not None:
+            global_candidates = np.asarray(global_birth_candidates, dtype=float).reshape(
+                -1,
+                3,
+            )
+            if proposal_data is not None and global_candidates.size:
+                global_candidates = self._exclude_birth_candidates_near_detectors(
+                    global_candidates,
+                    proposal_data,
+                )
+        global_birth_rescue_active = (
+            bool(self.config.birth_global_rescue_enable)
+            and proposal_data is not None
+            and proposal_data.z_k.size > 0
+            and global_candidates.shape[0] > 0
+        )
+        self.last_birth_global_rescue_candidates = int(global_candidates.shape[0])
+        suppress_death = (
+            (residual_birth_gate_active or global_birth_rescue_active)
+            and bool(self.config.birth_residual_suppress_death)
+        )
         max_births = self.config.birth_max_per_update
         births_remaining = (
             None if max_births is None else max(0, int(max_births))
@@ -7976,7 +8331,7 @@ class IsotopeParticleFilter:
                 int(topk_structural),
             )
         if (
-            residual_birth_gate_active
+            (residual_birth_gate_active or global_birth_rescue_active)
             and bool(self.config.birth_residual_expand_structural_particles)
         ):
             structural_proposal_indices = self._select_structural_proposal_indices(
@@ -8124,6 +8479,7 @@ class IsotopeParticleFilter:
             )
             has_support = has_support_data
             moved = False
+            global_birth_moved = False
             if st.num_sources > 0:
                 st.ages = st.ages + 1
                 below = st.strengths < float(self.config.min_strength)
@@ -8233,6 +8589,28 @@ class IsotopeParticleFilter:
                             kill_mask[idx] = False
                     if not np.all(kill_mask):
                         self.last_kill_count += int(np.sum(~kill_mask))
+                        for idx in np.flatnonzero(~kill_mask):
+                            reason = (
+                                "death_low_q_deterministic"
+                                if bool(deterministic[int(idx)])
+                                else "death_low_support_stochastic"
+                            )
+                            self._record_source_event(
+                                "source_removed",
+                                st,
+                                int(idx),
+                                reason=reason,
+                                extra={
+                                    "support_score": float(st.support_scores[int(idx)]),
+                                    "low_q_streak": int(st.low_q_streaks[int(idx)]),
+                                    "death_delta_ll_threshold": float(
+                                        self.config.death_delta_ll_threshold
+                                    ),
+                                    "death_low_q_streak": int(
+                                        self.config.death_low_q_streak
+                                    ),
+                                },
+                            )
                         st.positions = st.positions[kill_mask]
                         st.strengths = st.strengths[kill_mask]
                         st.ages = st.ages[kill_mask]
@@ -8250,6 +8628,17 @@ class IsotopeParticleFilter:
                         drop = np.argsort(st.support_scores)[:over]
                         keep = np.ones(st.num_sources, dtype=bool)
                         keep[drop] = False
+                        for idx in np.asarray(drop, dtype=int):
+                            self._record_source_event(
+                                "source_removed",
+                                st,
+                                int(idx),
+                                reason="max_sources_support_drop",
+                                extra={
+                                    "max_sources": int(self.config.max_sources),
+                                    "support_score": float(st.support_scores[int(idx)]),
+                                },
+                            )
                         st.positions = st.positions[keep]
                         st.strengths = st.strengths[keep]
                         st.ages = st.ages[keep]
@@ -8295,6 +8684,15 @@ class IsotopeParticleFilter:
                                 ),
                             )
                         ):
+                            old_count = int(st.num_sources)
+                            for idx in range(old_count, int(split_trial.num_sources)):
+                                self._record_source_event(
+                                    "source_birth_accepted",
+                                    split_trial,
+                                    int(idx),
+                                    reason="residual_guided_split",
+                                    extra={"delta_ll": float(split_delta)},
+                                )
                             self._replace_particle_state_from_trial(st, split_trial)
                             split_moved = True
                             moved = True
@@ -8371,6 +8769,13 @@ class IsotopeParticleFilter:
                                     if delta_ll >= split_threshold and np.log(
                                         np.random.rand()
                                     ) < delta_ll:
+                                        self._record_source_event(
+                                            "source_removed",
+                                            st,
+                                            int(idx),
+                                            reason="random_split_replaced_parent",
+                                            extra={"delta_ll": float(delta_ll)},
+                                        )
                                         st.positions = np.vstack(
                                             [
                                                 st.positions[:idx],
@@ -8418,6 +8823,20 @@ class IsotopeParticleFilter:
                                             ]
                                         )
                                         st.num_sources = st.positions.shape[0]
+                                        self._record_source_event(
+                                            "source_birth_accepted",
+                                            st,
+                                            int(st.num_sources - 2),
+                                            reason="random_split_child",
+                                            extra={"delta_ll": float(delta_ll)},
+                                        )
+                                        self._record_source_event(
+                                            "source_birth_accepted",
+                                            st,
+                                            int(st.num_sources - 1),
+                                            reason="random_split_child",
+                                            extra={"delta_ll": float(delta_ll)},
+                                        )
                                         moved = True
                 timing["split"] += time.perf_counter() - split_start
 
@@ -8436,11 +8855,56 @@ class IsotopeParticleFilter:
                     merge_trial is not None
                     and merge_delta >= float(self.config.merge_delta_ll_threshold)
                 ):
+                    for idx in range(int(st.num_sources)):
+                        self._record_source_event(
+                            "source_merge_accepted",
+                            st,
+                            int(idx),
+                            reason="merge_replaced_particle_state",
+                            extra={
+                                "delta_ll": float(merge_delta),
+                                "merged_source_count": int(merge_trial.num_sources),
+                            },
+                        )
                     self._replace_particle_state_from_trial(st, merge_trial)
                     moved = True
 
             if (
                 allow_structural_proposal
+                and global_birth_rescue_active
+                and proposal_data is not None
+                and proposal_data.z_k.size
+                and (births_remaining is None or births_remaining > 0)
+                and (
+                    self.config.max_sources is None
+                    or st.num_sources < self.config.max_sources
+                )
+            ):
+                rescue_start = time.perf_counter()
+                mp_limit = max(1, int(self.config.birth_matching_pursuit_max_new_sources))
+                if births_remaining is None:
+                    max_new = mp_limit
+                else:
+                    max_new = min(mp_limit, max(0, int(births_remaining)))
+                accepted_births = self._apply_matching_pursuit_births_to_state(
+                    st,
+                    proposal_data,
+                    global_candidates,
+                    max_new_sources=max_new,
+                    residual_gate_forced=False,
+                    global_rescue=True,
+                )
+                timing["birth"] += time.perf_counter() - rescue_start
+                if accepted_births > 0:
+                    self.last_birth_count += int(accepted_births)
+                    if births_remaining is not None:
+                        births_remaining -= int(accepted_births)
+                    global_birth_moved = True
+                    moved = True
+
+            if (
+                allow_structural_proposal
+                and not global_birth_moved
                 and birth_probs is not None
                 and birth_kernel_sums is not None
                 and birth_candidates is not None
@@ -8571,6 +9035,16 @@ class IsotopeParticleFilter:
                         or (delta_ll < birth_threshold and not forced_birth_proposal)
                     ):
                         continue
+                    self._record_source_event(
+                        "source_birth_accepted",
+                        trial,
+                        int(trial.num_sources - 1),
+                        reason="single_residual_birth",
+                        extra={
+                            "delta_ll": float(delta_ll),
+                            "forced_proposal": bool(forced_birth_proposal),
+                        },
+                    )
                     self._replace_particle_state_from_trial(st, trial)
                     self.last_birth_count += 1
                     if births_remaining is not None:

@@ -166,11 +166,48 @@ def _position_error_summary(values: Sequence[float]) -> Dict[str, float | bool |
     return summary
 
 
+def _threshold_count_summary(
+    *,
+    gt_count: int,
+    est_count: int,
+    assigned_distances: Sequence[float],
+    thresholds_m: Sequence[float],
+) -> Dict[str, Dict[str, float | int]]:
+    """Return recall/precision summaries at localization distance thresholds."""
+    distances = np.asarray(assigned_distances, dtype=float)
+    payload: Dict[str, Dict[str, float | int]] = {}
+    for threshold in thresholds_m:
+        radius = max(float(threshold), 0.0)
+        true_positive = int(np.count_nonzero(distances <= radius))
+        false_positive = max(0, int(est_count) - true_positive)
+        false_negative = max(0, int(gt_count) - true_positive)
+        precision = (
+            true_positive / float(true_positive + false_positive)
+            if true_positive + false_positive > 0
+            else 0.0
+        )
+        recall = (
+            true_positive / float(true_positive + false_negative)
+            if true_positive + false_negative > 0
+            else 0.0
+        )
+        payload[f"{radius:g}m"] = {
+            "radius_m": radius,
+            "tp": true_positive,
+            "fp": false_positive,
+            "fn": false_negative,
+            "precision": float(precision),
+            "recall": float(recall),
+        }
+    return payload
+
+
 def compute_metrics(
     gt_by_iso: Dict[str, List[Any]],
     est_by_iso: Dict[str, List[Any]],
     *,
     match_radius_m: float,
+    distance_thresholds_m: Sequence[float] = (1.0, 2.0, 3.0),
     match_strength_weight: float = 2.0,
     match_distance_weight: float = 1.0,
     outside_radius_penalty: float = 1e3,
@@ -238,7 +275,15 @@ def compute_metrics(
                 "matched": len(matched),
                 "fp": fp,
                 "fn": fn,
+                "source_count_error": int(len(est) - len(gt)),
+                "source_count_abs_error": int(abs(len(est) - len(gt))),
             },
+            "threshold_counts": _threshold_count_summary(
+                gt_count=len(gt),
+                est_count=len(est),
+                assigned_distances=pos_errors,
+                thresholds_m=distance_thresholds_m,
+            ),
             "position_error": _position_error_summary(pos_errors),
             "intensity_abs_error": _summary_abs(abs_errors),
             "intensity_rel_error_pct": _summary_abs(rel_errors),
@@ -288,6 +333,16 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
             f"<={_format_value(pos_err.get('target_m'))}, "
             f"within_target={pos_err.get('within_target')}"
         )
+        threshold_counts = data.get("threshold_counts", {})
+        if threshold_counts:
+            threshold_msg = ", ".join(
+                f"{key}:P={value['precision']:.2f}/R={value['recall']:.2f}"
+                for key, value in sorted(
+                    threshold_counts.items(),
+                    key=lambda item: float(item[1]["radius_m"]),
+                )
+            )
+            print(f"  Threshold precision/recall: {threshold_msg}")
         print(
             "  Intensity abs error [cps@1m]: "
             f"mean={_format_value(abs_err['mean'])}, "

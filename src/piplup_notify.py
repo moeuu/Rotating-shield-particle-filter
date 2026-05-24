@@ -85,6 +85,7 @@ class PiplupNotifier:
     """Small no-op-safe client for normalized piplup event ingest."""
 
     def __init__(self, config: PiplupNotificationConfig | None) -> None:
+        """Initialize the notifier with an optional resolved configuration."""
         self.config = config or PiplupNotificationConfig()
         self._warned_disabled = False
 

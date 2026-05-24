@@ -8,10 +8,11 @@ from numpy.typing import NDArray
 from measurement.continuous_kernels import ContinuousKernel
 
 
-def _normalize_count_likelihood_model(model: str) -> str:
+def normalize_count_likelihood_model(model: str) -> str:
     """Return a canonical count likelihood model name."""
     normalized = str(model).strip().lower()
     aliases = {
+        "": "poisson",
         "normal": "gaussian",
         "robust": "student_t",
         "robust_gaussian": "student_t",
@@ -21,6 +22,11 @@ def _normalize_count_likelihood_model(model: str) -> str:
     if normalized not in {"poisson", "gaussian", "student_t"}:
         raise ValueError(f"Unknown count likelihood model: {model}")
     return normalized
+
+
+def _normalize_count_likelihood_model(model: str) -> str:
+    """Return a canonical count likelihood model name for legacy callers."""
+    return normalize_count_likelihood_model(model)
 
 
 def poisson_log_likelihood(z_k: NDArray[np.float64], lambda_k: NDArray[np.float64], epsilon: float = 1e-12) -> float:

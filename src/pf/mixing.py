@@ -148,12 +148,18 @@ def prune_spurious_sources_continuous(
     min_obs_count: float = 0.0,
     min_strength_abs: float | None = None,
     min_strength_ratio: float | None = None,
+    estimate_snapshot: Dict[
+        str, tuple[NDArray[np.float64], NDArray[np.float64]]
+    ]
+    | None = None,
 ) -> Dict[str, NDArray[np.bool_]]:
     """
     Apply spurious-source pruning to continuous PF estimates.
 
     Uses MMSE estimates as candidate sources. Returns a keep mask per isotope that
-    can be applied to continuous particle source indices by order.
+    can be applied to continuous particle source indices by order.  When supplied,
+    estimate_snapshot pins pruning to the caller's report estimate generation so
+    report-side particle pruning cannot mix masks from a later estimate revision.
     """
     if not estimator.measurements:
         return {iso: np.ones(0, dtype=bool) for iso in estimator.filters}
@@ -178,7 +184,7 @@ def prune_spurious_sources_continuous(
         detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
     )
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
-    estimates = estimator.estimates()
+    estimates = estimate_snapshot if estimate_snapshot is not None else estimator.estimates()
     method_params = dict(params or {})
     method_params.setdefault("epsilon", float(epsilon))
     method_params.setdefault("tau_mix", float(tau_mix))
@@ -257,6 +263,7 @@ def prune_spurious_sources_continuous(
             )
 
         def _forward_model(pos: NDArray[np.float64], strg: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Return per-source expected counts for one isotope estimate."""
             return expected_counts_per_source(
                 kernel=kernel,
                 isotope=iso,

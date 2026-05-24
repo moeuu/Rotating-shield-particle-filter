@@ -1,0 +1,50 @@
+{
+  "metadata": {
+    "blocked_fraction": 0.32,
+    "case": "case02_three_cs",
+    "description": "Random obstacle environment with three random Cs-137 surface sources.",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+    "obstacle_seed": 2026052402,
+    "random_source_clear_path_max_m": 0.01,
+    "random_source_min_visible_fraction": 0.1,
+    "sampling": "surface-constrained room/obstacle source placement with ground-visibility rejection",
+    "source_seed": 2026052403,
+    "traversable_reference_points": 136
+  },
+  "name": "case02_three_cs_random_env_2026052402_sources_2026052403",
+  "sources": [
+    {
+      "ground_visible_fraction": 0.705882,
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        1.619352,
+        8.961747,
+        10.0
+      ],
+      "surface_kind": "ceiling"
+    },
+    {
+      "ground_visible_fraction": 0.176471,
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        0.0,
+        1.453547,
+        1.789961
+      ],
+      "surface_kind": "wall"
+    },
+    {
+      "ground_visible_fraction": 0.5,
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        4.630912,
+        0.0,
+        5.640889
+      ],
+      "surface_kind": "wall"
+    }
+  ]
+}

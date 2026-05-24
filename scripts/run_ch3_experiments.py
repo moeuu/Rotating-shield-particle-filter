@@ -58,6 +58,7 @@ class ExperimentScenario:
 
 
 def _build_estimator(scn: ExperimentScenario) -> RotatingShieldPFEstimator:
+    """Create an estimator configured for one experiment scenario."""
     isotopes = sorted(set(ts.isotope for ts in scn.true_sources))
     cfg = RotatingShieldPFConfig(
         num_particles=scn.num_particles,
@@ -362,6 +363,7 @@ def run_experiments(
 
 
 def main() -> None:
+    """Parse CLI arguments and run the configured Chapter 3 experiments."""
     parser = argparse.ArgumentParser(description="Run Chapter 3 PF experiments.")
     parser.add_argument(
         "--output",

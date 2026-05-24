@@ -40,6 +40,7 @@ def _evaluate_method(
         strengths = np.ones(num_sources, dtype=float)
 
         def forward_model(_: np.ndarray, __: np.ndarray) -> np.ndarray:
+            """Return the simulated per-source count matrix for this trial."""
             return lambda_m
 
         keep = prune_spurious_sources(

@@ -735,6 +735,144 @@ def is_allowed_source_surface_position(
     )
 
 
+def _visibility_obstacle_boxes_m(
+    obstacle_grid: ObstacleGrid | None,
+    obstacle_height_m: float,
+) -> NDArray[np.float64]:
+    """Return footprint boxes used for source-placement visibility screening."""
+    if obstacle_grid is None or not obstacle_grid.blocked_cells:
+        return np.zeros((0, 6), dtype=float)
+    boxes = obstacle_grid.blocked_boxes(
+        z_min=0.0,
+        z_max=max(0.0, float(obstacle_height_m)),
+    )
+    if not boxes:
+        return np.zeros((0, 6), dtype=float)
+    return np.asarray(boxes, dtype=float).reshape(-1, 6)
+
+
+def _coerce_visibility_measurement_points(
+    measurement_points: NDArray[np.float64],
+    *,
+    detector_height_m: float,
+) -> NDArray[np.float64]:
+    """Return visibility reference points as an ``(N, 3)`` float array."""
+    points = np.asarray(measurement_points, dtype=float)
+    if points.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    points = points.reshape(-1, points.shape[-1])
+    if points.shape[1] == 2:
+        z = np.full((points.shape[0], 1), float(detector_height_m), dtype=float)
+        return np.column_stack([points, z])
+    if points.shape[1] >= 3:
+        return points[:, :3].astype(float, copy=False)
+    raise ValueError("measurement_points must contain 2D or 3D points.")
+
+
+def _segment_path_lengths_through_boxes_m(
+    source_positions: NDArray[np.float64],
+    detector_positions: NDArray[np.float64],
+    boxes_m: NDArray[np.float64],
+    *,
+    box_chunk_size: int = 64,
+) -> NDArray[np.float64]:
+    """Return batched obstacle path lengths for source-detector segments."""
+    sources = np.asarray(source_positions, dtype=float).reshape(-1, 3)
+    detectors = np.asarray(detector_positions, dtype=float).reshape(-1, 3)
+    boxes = np.asarray(boxes_m, dtype=float).reshape(-1, 6)
+    if sources.size == 0 or detectors.size == 0 or boxes.size == 0:
+        return np.zeros((sources.shape[0], detectors.shape[0]), dtype=float)
+    total = np.zeros((sources.shape[0], detectors.shape[0]), dtype=float)
+    delta = detectors[None, :, :] - sources[:, None, :]
+    distance = np.linalg.norm(delta, axis=-1)
+    p0 = sources[:, None, None, :]
+    step = delta[:, :, None, :]
+    chunk_size = max(1, int(box_chunk_size))
+    for start in range(0, boxes.shape[0], chunk_size):
+        chunk = boxes[start : start + chunk_size]
+        lower = chunk[None, None, :, :3]
+        upper = chunk[None, None, :, 3:]
+        t_enter = np.zeros((sources.shape[0], detectors.shape[0], chunk.shape[0]))
+        t_exit = np.ones_like(t_enter)
+        valid = np.ones_like(t_enter, dtype=bool)
+        for axis in range(3):
+            value = p0[..., axis]
+            axis_step = step[..., axis]
+            lo = lower[..., axis]
+            hi = upper[..., axis]
+            parallel = np.abs(axis_step) <= 1.0e-12
+            inside = (value >= lo) & (value <= hi)
+            valid &= ~parallel | inside
+            safe_step = np.where(parallel, 1.0, axis_step)
+            t0 = (lo - value) / safe_step
+            t1 = (hi - value) / safe_step
+            axis_enter = np.minimum(t0, t1)
+            axis_exit = np.maximum(t0, t1)
+            axis_enter = np.where(parallel & inside, -np.inf, axis_enter)
+            axis_exit = np.where(parallel & inside, np.inf, axis_exit)
+            t_enter = np.maximum(t_enter, axis_enter)
+            t_exit = np.minimum(t_exit, axis_exit)
+        overlap = valid & (t_exit > t_enter)
+        lengths = np.where(overlap, (t_exit - t_enter) * distance[:, :, None], 0.0)
+        total += np.sum(lengths, axis=2)
+    return total
+
+
+def surface_observable_fractions(
+    positions: NDArray[np.float64],
+    obstacle_grid: ObstacleGrid | None,
+    measurement_points: NDArray[np.float64],
+    *,
+    obstacle_height_m: float = 2.0,
+    detector_height_m: float = 0.5,
+    clear_path_max_m: float = 0.01,
+    box_chunk_size: int = 64,
+) -> NDArray[np.float64]:
+    """Return the clear ground-view fraction for each source position."""
+    sources = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if sources.size == 0:
+        return np.zeros(0, dtype=float)
+    detectors = _coerce_visibility_measurement_points(
+        measurement_points,
+        detector_height_m=detector_height_m,
+    )
+    if detectors.size == 0:
+        return np.ones(sources.shape[0], dtype=float)
+    boxes = _visibility_obstacle_boxes_m(obstacle_grid, obstacle_height_m)
+    if boxes.size == 0:
+        return np.ones(sources.shape[0], dtype=float)
+    path_lengths = _segment_path_lengths_through_boxes_m(
+        sources,
+        detectors,
+        boxes,
+        box_chunk_size=box_chunk_size,
+    )
+    visible = path_lengths <= max(0.0, float(clear_path_max_m))
+    return np.mean(visible, axis=1).astype(float, copy=False)
+
+
+def is_ground_observable_source_position(
+    position: Sequence[float],
+    obstacle_grid: ObstacleGrid | None,
+    measurement_points: NDArray[np.float64],
+    *,
+    min_visible_fraction: float,
+    obstacle_height_m: float = 2.0,
+    detector_height_m: float = 0.5,
+    clear_path_max_m: float = 0.01,
+) -> bool:
+    """Return True when enough reachable ground views have a clear ray."""
+    fraction = surface_observable_fractions(
+        np.asarray(position, dtype=float).reshape(1, 3),
+        obstacle_grid,
+        measurement_points,
+        obstacle_height_m=obstacle_height_m,
+        detector_height_m=detector_height_m,
+        clear_path_max_m=clear_path_max_m,
+    )
+    return bool(fraction.size and fraction[0] >= float(min_visible_fraction))
+
+
 def _weighted_choice(
     rng: np.random.Generator,
     weights_by_kind: Sequence[tuple[SourceSurfaceKind, float]],
@@ -887,6 +1025,95 @@ def _sample_obstacle_top_position(
     )
 
 
+def _sample_surface_position_batch(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    rng: np.random.Generator,
+    *,
+    obstacle_height_m: float,
+    batch_size: int,
+) -> NDArray[np.float64]:
+    """Draw a small batch of surface positions before batched visibility tests."""
+    batch = max(1, int(batch_size))
+    return np.asarray(
+        [
+            sample_surface_position(
+                env,
+                obstacle_grid,
+                rng,
+                obstacle_height_m=obstacle_height_m,
+            )
+            for _ in range(batch)
+        ],
+        dtype=float,
+    ).reshape(-1, 3)
+
+
+def sample_observable_surface_position(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    rng: np.random.Generator,
+    *,
+    measurement_points: NDArray[np.float64] | None,
+    min_visible_fraction: float,
+    obstacle_height_m: float = 2.0,
+    detector_height_m: float = 0.5,
+    clear_path_max_m: float = 0.01,
+    batch_size: int = 256,
+    max_attempts: int = 4096,
+) -> tuple[float, float, float]:
+    """Sample a surface position with enough clear ground measurement views."""
+    min_fraction = max(0.0, float(min_visible_fraction))
+    if min_fraction <= 0.0 or measurement_points is None:
+        return sample_surface_position(
+            env,
+            obstacle_grid,
+            rng,
+            obstacle_height_m=obstacle_height_m,
+        )
+    detectors = _coerce_visibility_measurement_points(
+        np.asarray(measurement_points, dtype=float),
+        detector_height_m=detector_height_m,
+    )
+    if detectors.size == 0:
+        return sample_surface_position(
+            env,
+            obstacle_grid,
+            rng,
+            obstacle_height_m=obstacle_height_m,
+        )
+    remaining = max(1, int(max_attempts))
+    sample_batch = max(1, int(batch_size))
+    while remaining > 0:
+        current_batch = min(sample_batch, remaining)
+        candidates = _sample_surface_position_batch(
+            env,
+            obstacle_grid,
+            rng,
+            obstacle_height_m=obstacle_height_m,
+            batch_size=current_batch,
+        )
+        fractions = surface_observable_fractions(
+            candidates,
+            obstacle_grid,
+            detectors,
+            obstacle_height_m=obstacle_height_m,
+            detector_height_m=detector_height_m,
+            clear_path_max_m=clear_path_max_m,
+        )
+        valid = np.flatnonzero(fractions >= min_fraction)
+        if valid.size:
+            selected = int(valid[int(rng.integers(0, valid.size))])
+            point = candidates[selected]
+            return (float(point[0]), float(point[1]), float(point[2]))
+        remaining -= current_batch
+    raise ValueError(
+        "No surface-random source position satisfied the ground-visibility "
+        f"constraint after {int(max_attempts)} attempts "
+        f"(min_visible_fraction={min_fraction:.3f})."
+    )
+
+
 def generate_surface_sources(
     *,
     env: EnvironmentConfig,
@@ -896,8 +1123,14 @@ def generate_surface_sources(
     rng: np.random.Generator,
     count: int | None = None,
     obstacle_height_m: float = 2.0,
+    visibility_measurement_points: NDArray[np.float64] | None = None,
+    visibility_min_fraction: float = 0.0,
+    visibility_detector_height_m: float = 0.5,
+    visibility_clear_path_max_m: float = 0.01,
+    visibility_batch_size: int = 256,
+    visibility_max_attempts_per_source: int = 4096,
 ) -> list[PointSource]:
-    """Generate point sources constrained to physical room or obstacle surfaces."""
+    """Generate point sources constrained to observable physical surfaces."""
     if not isotopes:
         raise ValueError("At least one isotope is required.")
     source_count = len(isotopes) if count is None else max(1, int(count))
@@ -908,11 +1141,17 @@ def generate_surface_sources(
             intensity = float(intensity_cps_1m[isotope])
         else:
             intensity = float(intensity_cps_1m)
-        position = sample_surface_position(
+        position = sample_observable_surface_position(
             env,
             obstacle_grid,
             rng,
+            measurement_points=visibility_measurement_points,
+            min_visible_fraction=float(visibility_min_fraction),
             obstacle_height_m=obstacle_height_m,
+            detector_height_m=visibility_detector_height_m,
+            clear_path_max_m=visibility_clear_path_max_m,
+            batch_size=visibility_batch_size,
+            max_attempts=visibility_max_attempts_per_source,
         )
         sources.append(
             PointSource(

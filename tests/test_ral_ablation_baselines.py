@@ -81,6 +81,8 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "baseline_passive_fixed_shield_single_view" in by_variant
     assert "baseline_onestep_fixed_shield" in by_variant
     assert "no_obstacle_signature" in by_variant
+    assert "no_pf_obstacle_attenuation" in by_variant
+    assert "volume_source_prior" in by_variant
     fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
     assert fixed_config["baseline_shield_policy"]["name"] == "fixed"
     assert fixed_config["cui_split_view_dir"] == DEFAULT_CUI_SPLIT_VIEW_DIR
@@ -95,6 +97,16 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert obstacle_off["dss_pp"]["environment_signature_weight"] == 0.0
     assert obstacle_off["dss_pp"]["occlusion_boundary_weight"] == 0.0
+    pf_obstacle_off = json.loads(
+        by_variant["no_pf_obstacle_attenuation"].config_path.read_text()
+    )
+    assert pf_obstacle_off["pf_obstacle_attenuation"] is False
+    assert pf_obstacle_off["author_obstacle_prims"] is True
+    assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
+    volume_prior = json.loads(
+        by_variant["volume_source_prior"].config_path.read_text()
+    )
+    assert volume_prior["source_surface_prior"] is False
     no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
     assert no_birth["birth_max_per_update"] == 0
     assert no_birth["pf_max_sources"] == DEFAULT_ABLATION_CASES[0].max_sources

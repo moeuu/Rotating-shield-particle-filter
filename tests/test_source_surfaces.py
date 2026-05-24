@@ -5,15 +5,19 @@ from __future__ import annotations
 import numpy as np
 
 from measurement.model import EnvironmentConfig
+from measurement.continuous_kernels import segment_box_intersection_length_m
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import (
+    _segment_path_lengths_through_boxes_m,
     build_surface_candidate_sources,
     generate_surface_sources,
+    is_ground_observable_source_position,
     is_allowed_source_surface_position,
     project_positions_to_allowed_surfaces,
     source_surface_kind_counts,
     source_surface_kind,
     source_surface_kinds,
+    surface_observable_fractions,
 )
 
 
@@ -44,6 +48,143 @@ def test_generate_surface_sources_never_places_sources_in_air_or_obstacles() -> 
             grid,
             obstacle_height_m=2.0,
         )
+
+
+def test_surface_observable_fraction_rejects_obstacle_top_sources() -> None:
+    """Visibility screening should reject sources hidden by their support obstacle."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1),),
+    )
+    measurement_points = np.array(
+        [
+            [ix + 0.5, iy + 0.5, 0.5]
+            for ix in range(4)
+            for iy in range(4)
+            if grid.is_cell_free((ix, iy))
+        ],
+        dtype=float,
+    )
+    positions = np.array(
+        [
+            [1.5, 1.5, 1.0],
+            [0.5, 0.5, 0.0],
+            [1.0, 1.5, 0.5],
+        ],
+        dtype=float,
+    )
+
+    fractions = surface_observable_fractions(
+        positions,
+        grid,
+        measurement_points,
+        obstacle_height_m=1.0,
+        detector_height_m=0.5,
+    )
+
+    assert fractions[0] < 0.1
+    assert fractions[1] > 0.5
+    assert fractions[2] > fractions[0]
+    assert not is_ground_observable_source_position(
+        positions[0],
+        grid,
+        measurement_points,
+        min_visible_fraction=0.5,
+        obstacle_height_m=1.0,
+    )
+
+
+def test_batched_visibility_path_lengths_match_scalar_box_intersections() -> None:
+    """Batched source-visibility geometry should match the scalar box oracle."""
+    sources = np.array(
+        [
+            [0.0, 0.5, 0.5],
+            [1.5, 1.5, 1.0],
+        ],
+        dtype=float,
+    )
+    detectors = np.array(
+        [
+            [3.0, 0.5, 0.5],
+            [0.5, 3.0, 0.5],
+        ],
+        dtype=float,
+    )
+    boxes = np.array(
+        [
+            [1.0, 0.0, 0.0, 2.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 2.0, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+    batched = _segment_path_lengths_through_boxes_m(
+        sources,
+        detectors,
+        boxes,
+        box_chunk_size=1,
+    )
+    scalar = np.zeros_like(batched)
+    for source_index, source in enumerate(sources):
+        for detector_index, detector in enumerate(detectors):
+            scalar[source_index, detector_index] = sum(
+                segment_box_intersection_length_m(source, detector, box)
+                for box in boxes
+            )
+
+    assert np.allclose(batched, scalar)
+
+
+def test_generate_surface_sources_respects_ground_visibility_filter() -> None:
+    """Random source generation should avoid mostly occluded surface locations."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1),),
+    )
+    measurement_points = np.array(
+        [
+            [ix + 0.5, iy + 0.5, 0.5]
+            for ix in range(4)
+            for iy in range(4)
+            if grid.is_cell_free((ix, iy))
+        ],
+        dtype=float,
+    )
+
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=grid,
+        isotopes=("Cs-137",),
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(12),
+        count=30,
+        obstacle_height_m=1.0,
+        visibility_measurement_points=measurement_points,
+        visibility_min_fraction=0.5,
+        visibility_detector_height_m=0.5,
+        visibility_batch_size=64,
+        visibility_max_attempts_per_source=1024,
+    )
+    fractions = surface_observable_fractions(
+        np.asarray([source.position for source in sources], dtype=float),
+        grid,
+        measurement_points,
+        obstacle_height_m=1.0,
+        detector_height_m=0.5,
+    )
+
+    assert len(sources) == 30
+    assert np.min(fractions) >= 0.5
+    assert not any(
+        source_surface_kind(source.position, env, grid, obstacle_height_m=1.0)
+        == "obstacle_top"
+        for source in sources
+    )
 
 
 def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:

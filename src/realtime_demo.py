@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from functools import partial
@@ -69,6 +70,20 @@ def _argv_requests_cui(argv: list[str] | None = None) -> bool:
     return False
 
 
+def _resolve_station_update_modes(
+    runtime_config: Mapping[str, Any],
+) -> tuple[bool, bool]:
+    """Return joint-observation and delayed-resample PF update switches."""
+    joint_observation_update = bool(runtime_config.get("joint_observation_update", False))
+    delayed_default = not joint_observation_update
+    delayed_resample_update = bool(
+        runtime_config.get("delayed_resample_update", delayed_default)
+    )
+    if joint_observation_update:
+        delayed_resample_update = False
+    return joint_observation_update, delayed_resample_update
+
+
 def _configure_matplotlib() -> None:
     """Configure matplotlib backend for interactive or headless use."""
     headless = _argv_requests_cui()
@@ -98,6 +113,7 @@ from measurement.source_surfaces import (
     generate_surface_sources,
     source_surface_kind_counts,
     source_surface_kinds,
+    surface_observable_fractions,
 )
 from measurement.shielding import (
     HVL_TVL_TABLE_MM,
@@ -112,6 +128,7 @@ from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from spectrum.runtime_counts import RuntimeCountExtractor
 from spectrum.baseline import baseline_als
 from spectrum.smoothing import gaussian_smooth
+from pf.likelihood import expected_counts_per_source
 from pf.parallel import Measurement
 from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
 from planning.candidate_generation import generate_candidate_poses
@@ -121,6 +138,11 @@ from planning.pose_selection import (
     select_next_pose_from_candidates,
 )
 from planning.dss_pp import DSSPPConfig, select_dss_pp_next_station
+from planning.remaining_measurements import (
+    RemainingMeasurementConfig,
+    estimate_remaining_measurement_budget,
+    format_remaining_measurement_estimate,
+)
 from planning.traversability import (
     TraversabilityMap,
     build_traversability_map_from_obstacle_grid,
@@ -247,6 +269,35 @@ def _has_environment_obstacles(obstacle_grid: ObstacleGrid | None) -> bool:
     return obstacle_grid is not None and len(obstacle_grid.blocked_cells) > 0
 
 
+def _pf_obstacle_attenuation_enabled(runtime_config: dict[str, object]) -> bool:
+    """Return whether PF expected-count kernels should include obstacles."""
+    raw = runtime_config.get("pf_obstacle_attenuation", True)
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    return str(raw).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "disable",
+        "disabled",
+    }
+
+
+def _pf_obstacle_grid_for_runtime(
+    obstacle_grid: ObstacleGrid | None,
+    runtime_config: dict[str, object],
+) -> ObstacleGrid | None:
+    """Return the obstacle grid used by the PF observation model."""
+    if _pf_obstacle_attenuation_enabled(runtime_config):
+        return obstacle_grid
+    return None
+
+
 def _surface_count_payload(
     positions: NDArray[np.float64],
     env: EnvironmentConfig,
@@ -267,6 +318,75 @@ def _surface_count_payload(
         "total_sources": int(pos_arr.shape[0]),
         "surface_counts": counts,
         "off_surface_count": int(counts.get("off_surface", 0)),
+    }
+
+
+def _ground_visibility_reference_points(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    robot_radius_m: float,
+    detector_height_m: float,
+) -> NDArray[np.float64]:
+    """Return reachable ground detector positions for source-placement screening."""
+    if obstacle_grid is None or not obstacle_grid.blocked_cells:
+        return np.zeros((0, 3), dtype=float)
+    traversable = build_traversability_map_from_obstacle_grid(
+        obstacle_grid,
+        robot_radius_m=float(robot_radius_m),
+        reachable_from=env.detector_position,
+    )
+    points = [
+        (
+            float(traversable.cell_center(cell)[0]),
+            float(traversable.cell_center(cell)[1]),
+            float(detector_height_m),
+        )
+        for cell in traversable.traversable_cells
+    ]
+    return np.asarray(points, dtype=float).reshape(-1, 3)
+
+
+def _source_ground_visibility_payload(
+    sources: Sequence[PointSource],
+    obstacle_grid: ObstacleGrid | None,
+    measurement_points: NDArray[np.float64] | None,
+    *,
+    obstacle_height_m: float,
+    detector_height_m: float,
+    clear_path_max_m: float,
+    min_visible_fraction: float,
+) -> dict[str, object]:
+    """Return serializable source ground-visibility diagnostics."""
+    points = (
+        np.zeros((0, 3), dtype=float)
+        if measurement_points is None
+        else np.asarray(measurement_points, dtype=float).reshape(-1, 3)
+    )
+    if not sources or points.size == 0:
+        return {
+            "enabled": False,
+            "reference_point_count": int(points.shape[0]),
+            "min_visible_fraction": float(min_visible_fraction),
+            "source_visible_fractions": [],
+        }
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    fractions = surface_observable_fractions(
+        positions,
+        obstacle_grid,
+        points,
+        obstacle_height_m=obstacle_height_m,
+        detector_height_m=detector_height_m,
+        clear_path_max_m=clear_path_max_m,
+    )
+    return {
+        "enabled": True,
+        "reference_point_count": int(points.shape[0]),
+        "min_visible_fraction": float(min_visible_fraction),
+        "clear_path_max_m": float(clear_path_max_m),
+        "min_source_visible_fraction": float(np.min(fractions)),
+        "mean_source_visible_fraction": float(np.mean(fractions)),
+        "source_visible_fractions": [float(value) for value in fractions],
     }
 
 
@@ -329,7 +449,9 @@ def _particle_surface_diagnostics(
                 keep = np.ones(count, dtype=bool)
             keep = np.asarray(keep, dtype=bool).reshape(-1)[:count]
             if keep.size != count:
-                keep = np.resize(keep, count)
+                padded = np.zeros(count, dtype=bool)
+                padded[: min(keep.size, count)] = keep[:count]
+                keep = padded
             kept = int(np.count_nonzero(keep))
             report_slots += kept
             if kept <= 0:
@@ -878,6 +1000,665 @@ def _fmt_sources(positions: NDArray[np.float64], strengths: NDArray[np.float64])
     return "[" + ", ".join(chunks) + "]"
 
 
+def _true_strength_array(
+    true_strengths: dict[str, float | Sequence[float]],
+    isotope: str,
+    count: int,
+) -> NDArray[np.float64]:
+    """Return a true-strength array for one isotope."""
+    values = true_strengths.get(isotope, [])
+    if isinstance(values, (int, float, np.floating)):
+        return np.full(count, float(values), dtype=float)
+    arr = np.asarray(list(values), dtype=float).reshape(-1)
+    if arr.size == count:
+        return arr
+    if arr.size == 1 and count > 1:
+        return np.full(count, float(arr[0]), dtype=float)
+    if arr.size < count:
+        padded = np.full(count, np.nan, dtype=float)
+        padded[: arr.size] = arr
+        return padded
+    return arr[:count]
+
+
+def _estimate_accuracy_records(
+    isotope: str,
+    est_positions: NDArray[np.float64],
+    est_strengths: NDArray[np.float64],
+    true_positions: NDArray[np.float64],
+    true_strengths: NDArray[np.float64],
+    surface_kinds: NDArray[np.object_],
+    *,
+    match_radius_m: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Return per-estimate accuracy records and an isotope-level summary."""
+    est_pos = np.asarray(est_positions, dtype=float).reshape(-1, 3)
+    est_q = np.asarray(est_strengths, dtype=float).reshape(-1)
+    true_pos = np.asarray(true_positions, dtype=float).reshape(-1, 3)
+    true_q = np.asarray(true_strengths, dtype=float).reshape(-1)
+    source_count = min(est_pos.shape[0], est_q.size)
+    est_pos = est_pos[:source_count]
+    est_q = est_q[:source_count]
+    kinds = np.asarray(surface_kinds, dtype=object).reshape(-1)
+    if kinds.size < source_count:
+        padded = np.full(source_count, "unknown", dtype=object)
+        padded[: kinds.size] = kinds
+        kinds = padded
+    else:
+        kinds = kinds[:source_count]
+
+    nearest_indices = np.full(source_count, -1, dtype=int)
+    nearest_distances = np.full(source_count, np.nan, dtype=float)
+    if true_pos.size and source_count:
+        deltas = est_pos[:, None, :] - true_pos[None, :, :]
+        distances = np.linalg.norm(deltas, axis=2)
+        nearest_indices = np.argmin(distances, axis=1).astype(int, copy=False)
+        nearest_distances = distances[np.arange(source_count), nearest_indices]
+
+    records: list[dict[str, object]] = []
+    rel_errors: list[float] = []
+    matched_truth_indices: list[int] = []
+    for idx in range(source_count):
+        truth_idx = int(nearest_indices[idx])
+        truth_strength = (
+            float(true_q[truth_idx])
+            if truth_idx >= 0 and truth_idx < true_q.size
+            else None
+        )
+        strength_error = (
+            float(est_q[idx] - truth_strength)
+            if truth_strength is not None and np.isfinite(truth_strength)
+            else None
+        )
+        strength_rel_error = None
+        if (
+            strength_error is not None
+            and truth_strength is not None
+            and abs(float(truth_strength)) > 1.0e-12
+        ):
+            strength_rel_error = float(strength_error / float(truth_strength))
+            rel_errors.append(abs(strength_rel_error))
+        position_error = float(nearest_distances[idx])
+        within_radius = bool(
+            np.isfinite(position_error) and position_error <= float(match_radius_m)
+        )
+        if truth_idx >= 0 and within_radius:
+            matched_truth_indices.append(truth_idx)
+        record: dict[str, object] = {
+            "isotope": isotope,
+            "estimate_index": int(idx),
+            "pos": [float(v) for v in est_pos[idx]],
+            "strength": float(est_q[idx]),
+            "surface_kind": str(kinds[idx]) if kinds[idx] is not None else "off_surface",
+            "nearest_truth_index": truth_idx if truth_idx >= 0 else None,
+            "position_error_m": position_error if np.isfinite(position_error) else None,
+            "within_match_radius": within_radius,
+            "nearest_truth_strength": truth_strength,
+            "strength_error": strength_error,
+            "strength_rel_error": strength_rel_error,
+        }
+        if truth_idx >= 0 and truth_idx < true_pos.shape[0]:
+            record["nearest_truth_pos"] = [float(v) for v in true_pos[truth_idx]]
+        else:
+            record["nearest_truth_pos"] = None
+        records.append(record)
+
+    match_counts = Counter(matched_truth_indices)
+    duplicate_truth_matches = sum(max(0, count - 1) for count in match_counts.values())
+    unmatched_truth_count = max(0, int(true_pos.shape[0]) - len(match_counts))
+    valid_distances = nearest_distances[np.isfinite(nearest_distances)]
+    total_truth_strength = float(np.nansum(true_q)) if true_q.size else 0.0
+    total_est_strength = float(np.sum(est_q)) if est_q.size else 0.0
+    total_strength_rel_error = (
+        float((total_est_strength - total_truth_strength) / total_truth_strength)
+        if abs(total_truth_strength) > 1.0e-12
+        else None
+    )
+    surface_counts = Counter(str(kind) if kind is not None else "off_surface" for kind in kinds)
+    summary: dict[str, object] = {
+        "estimate_count": int(source_count),
+        "truth_count": int(true_pos.shape[0]),
+        "source_count_error": int(source_count - true_pos.shape[0]),
+        "matched_truth_count": int(len(match_counts)),
+        "unmatched_truth_count": int(unmatched_truth_count),
+        "duplicate_truth_matches": int(duplicate_truth_matches),
+        "mean_position_error_m": (
+            float(np.mean(valid_distances)) if valid_distances.size else None
+        ),
+        "max_position_error_m": (
+            float(np.max(valid_distances)) if valid_distances.size else None
+        ),
+        "mean_abs_strength_rel_error": (
+            float(np.mean(rel_errors)) if rel_errors else None
+        ),
+        "total_est_strength": total_est_strength,
+        "total_truth_strength": total_truth_strength,
+        "total_strength_rel_error": total_strength_rel_error,
+        "surface_counts": dict(sorted(surface_counts.items())),
+        "off_surface_count": int(surface_counts.get("off_surface", 0)),
+    }
+    return records, summary
+
+
+def _truth_coverage_records(
+    isotope: str,
+    est_positions: NDArray[np.float64],
+    est_strengths: NDArray[np.float64],
+    true_positions: NDArray[np.float64],
+    true_strengths: NDArray[np.float64],
+    *,
+    match_radius_m: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Return truth-centric nearest-estimate coverage diagnostics."""
+    est_pos = np.asarray(est_positions, dtype=float).reshape(-1, 3)
+    est_q = np.asarray(est_strengths, dtype=float).reshape(-1)
+    true_pos = np.asarray(true_positions, dtype=float).reshape(-1, 3)
+    true_q = np.asarray(true_strengths, dtype=float).reshape(-1)
+    est_count = min(est_pos.shape[0], est_q.size)
+    truth_count = min(true_pos.shape[0], true_q.size)
+    est_pos = est_pos[:est_count]
+    est_q = est_q[:est_count]
+    true_pos = true_pos[:truth_count]
+    true_q = true_q[:truth_count]
+
+    nearest_indices = np.full(truth_count, -1, dtype=int)
+    nearest_distances = np.full(truth_count, np.nan, dtype=float)
+    if truth_count and est_count:
+        deltas = true_pos[:, None, :] - est_pos[None, :, :]
+        distances = np.linalg.norm(deltas, axis=2)
+        nearest_indices = np.argmin(distances, axis=1).astype(int, copy=False)
+        nearest_distances = distances[np.arange(truth_count), nearest_indices]
+
+    records: list[dict[str, object]] = []
+    covered = 0
+    rel_errors: list[float] = []
+    for truth_idx in range(truth_count):
+        est_idx = int(nearest_indices[truth_idx])
+        distance = float(nearest_distances[truth_idx])
+        covered_here = bool(
+            np.isfinite(distance) and distance <= float(match_radius_m)
+        )
+        if covered_here:
+            covered += 1
+        nearest_strength = (
+            float(est_q[est_idx]) if est_idx >= 0 and est_idx < est_q.size else None
+        )
+        strength_error = (
+            float(nearest_strength - true_q[truth_idx])
+            if nearest_strength is not None and np.isfinite(true_q[truth_idx])
+            else None
+        )
+        strength_rel_error = None
+        if strength_error is not None and abs(float(true_q[truth_idx])) > 1.0e-12:
+            strength_rel_error = float(strength_error / float(true_q[truth_idx]))
+            rel_errors.append(abs(strength_rel_error))
+        records.append(
+            {
+                "isotope": isotope,
+                "truth_index": int(truth_idx),
+                "truth_pos": [float(v) for v in true_pos[truth_idx]],
+                "truth_strength": float(true_q[truth_idx]),
+                "nearest_estimate_index": est_idx if est_idx >= 0 else None,
+                "nearest_estimate_pos": (
+                    [float(v) for v in est_pos[est_idx]]
+                    if est_idx >= 0 and est_idx < est_pos.shape[0]
+                    else None
+                ),
+                "nearest_estimate_strength": nearest_strength,
+                "nearest_estimate_distance_m": (
+                    distance if np.isfinite(distance) else None
+                ),
+                "covered": covered_here,
+                "nearest_strength_error": strength_error,
+                "nearest_strength_rel_error": strength_rel_error,
+            }
+        )
+
+    valid_distances = nearest_distances[np.isfinite(nearest_distances)]
+    summary: dict[str, object] = {
+        "truth_covered_count": int(covered),
+        "truth_uncovered_count": int(max(0, truth_count - covered)),
+        "mean_truth_nearest_estimate_error_m": (
+            float(np.mean(valid_distances)) if valid_distances.size else None
+        ),
+        "max_truth_nearest_estimate_error_m": (
+            float(np.max(valid_distances)) if valid_distances.size else None
+        ),
+        "mean_truth_nearest_strength_rel_error": (
+            float(np.mean(rel_errors)) if rel_errors else None
+        ),
+    }
+    return records, summary
+
+
+def _frame_field(frame: PFFrame | dict[str, object], name: str, default: object) -> object:
+    """Return a PFFrame field from either a dataclass frame or test stub dict."""
+    if isinstance(frame, dict):
+        return frame.get(name, default)
+    return getattr(frame, name, default)
+
+
+def _current_map_estimate_trace_frame(
+    estimator: RotatingShieldPFEstimator,
+    isotopes: Sequence[str],
+    frame: PFFrame | dict[str, object],
+    *,
+    step_index: int,
+    elapsed_s: float,
+    counts_by_isotope: dict[str, float],
+    estimate_source: str = "current_map",
+) -> dict[str, object]:
+    """Return a lightweight trace frame from current MAP particles."""
+    estimated_sources: dict[str, NDArray[np.float64]] = {}
+    estimated_strengths: dict[str, NDArray[np.float64]] = {}
+    estimated_metadata: dict[str, list[dict[str, object]]] = {}
+    for isotope in sorted(set(str(name) for name in isotopes) | set(estimator.filters)):
+        empty_pos = np.zeros((0, 3), dtype=float)
+        empty_q = np.zeros(0, dtype=float)
+        filt = estimator.filters.get(isotope)
+        if filt is None or not getattr(filt, "continuous_particles", None):
+            estimated_sources[isotope] = empty_pos
+            estimated_strengths[isotope] = empty_q
+            estimated_metadata[isotope] = []
+            continue
+        try:
+            state = filt.best_particle().state
+            if hasattr(filt, "state_without_quarantined_sources"):
+                state = filt.state_without_quarantined_sources(state)
+            source_count = max(0, int(getattr(state, "num_sources", 0)))
+            positions = np.asarray(getattr(state, "positions"), dtype=float).reshape(-1, 3)
+            strengths = np.asarray(getattr(state, "strengths"), dtype=float).reshape(-1)
+            source_count = min(source_count, positions.shape[0], strengths.size)
+            estimated_sources[isotope] = positions[:source_count].copy()
+            estimated_strengths[isotope] = strengths[:source_count].copy()
+            ages_raw = getattr(state, "ages", None)
+            low_q_raw = getattr(state, "low_q_streaks", None)
+            support_raw = getattr(state, "support_scores", None)
+            tentative_raw = getattr(state, "tentative_sources", None)
+            fail_raw = getattr(state, "verification_fail_streaks", None)
+            ages = np.asarray(
+                ages_raw if ages_raw is not None else np.zeros(0, dtype=int),
+                dtype=int,
+            ).reshape(-1)
+            low_q = np.asarray(
+                low_q_raw if low_q_raw is not None else np.zeros(0, dtype=int),
+                dtype=int,
+            ).reshape(-1)
+            support = np.asarray(
+                support_raw if support_raw is not None else np.zeros(0, dtype=float),
+                dtype=float,
+            ).reshape(-1)
+            tentative = np.asarray(
+                tentative_raw if tentative_raw is not None else np.zeros(0, dtype=bool),
+                dtype=bool,
+            ).reshape(-1)
+            fail_streak = np.asarray(
+                fail_raw if fail_raw is not None else np.zeros(0, dtype=int),
+                dtype=int,
+            ).reshape(-1)
+            metadata: list[dict[str, object]] = []
+            for idx in range(source_count):
+                metadata.append(
+                    {
+                        "age": int(ages[idx]) if idx < ages.size else None,
+                        "low_q_streak": int(low_q[idx]) if idx < low_q.size else None,
+                        "support_score": (
+                            float(support[idx]) if idx < support.size else None
+                        ),
+                        "tentative": bool(tentative[idx])
+                        if idx < tentative.size
+                        else None,
+                        "verification_fail_streak": int(fail_streak[idx])
+                        if idx < fail_streak.size
+                        else None,
+                    }
+                )
+            estimated_metadata[isotope] = metadata
+        except (AttributeError, IndexError, RuntimeError, ValueError):
+            estimated_sources[isotope] = empty_pos
+            estimated_strengths[isotope] = empty_q
+            estimated_metadata[isotope] = []
+    robot_position = np.asarray(
+        _frame_field(frame, "robot_position", np.zeros(3)),
+        dtype=float,
+    ).reshape(-1)
+    if robot_position.size < 3:
+        robot_position = np.pad(robot_position, (0, 3 - robot_position.size))
+    return {
+        "estimate_source": str(estimate_source),
+        "step_index": int(step_index),
+        "time": float(elapsed_s),
+        "robot_position": robot_position[:3].copy(),
+        "counts_by_isotope": dict(counts_by_isotope),
+        "estimated_sources": estimated_sources,
+        "estimated_strengths": estimated_strengths,
+        "estimated_metadata": estimated_metadata,
+    }
+
+
+def _build_intermediate_estimate_trace_payload(
+    frame: PFFrame | dict[str, object],
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    match_radius_m: float,
+) -> dict[str, object]:
+    """Build a JSON-serializable intermediate estimate accuracy payload."""
+    payload_records: list[dict[str, object]] = []
+    truth_records_payload: list[dict[str, object]] = []
+    summaries: dict[str, dict[str, object]] = {}
+    estimated_sources_raw = _frame_field(frame, "estimated_sources", {})
+    estimated_strengths_raw = _frame_field(frame, "estimated_strengths", {})
+    estimated_metadata_raw = _frame_field(frame, "estimated_metadata", {})
+    estimated_sources = (
+        dict(estimated_sources_raw) if isinstance(estimated_sources_raw, dict) else {}
+    )
+    estimated_strengths = (
+        dict(estimated_strengths_raw)
+        if isinstance(estimated_strengths_raw, dict)
+        else {}
+    )
+    estimated_metadata = (
+        dict(estimated_metadata_raw)
+        if isinstance(estimated_metadata_raw, dict)
+        else {}
+    )
+    isotope_names = sorted(
+        set(estimated_sources)
+        | set(estimated_strengths)
+        | set(true_sources)
+    )
+    for isotope in isotope_names:
+        est_positions = np.asarray(
+            estimated_sources.get(isotope, np.zeros((0, 3))),
+            dtype=float,
+        ).reshape(-1, 3)
+        est_strengths = np.asarray(
+            estimated_strengths.get(isotope, np.zeros(0)),
+            dtype=float,
+        ).reshape(-1)
+        true_positions = np.asarray(
+            true_sources.get(isotope, np.zeros((0, 3))),
+            dtype=float,
+        ).reshape(-1, 3)
+        true_strength_arr = _true_strength_array(
+            true_strengths,
+            isotope,
+            true_positions.shape[0],
+        )
+        surface_kinds = source_surface_kinds(
+            est_positions,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=1.0e-5,
+        )
+        records, summary = _estimate_accuracy_records(
+            isotope,
+            est_positions,
+            est_strengths,
+            true_positions,
+            true_strength_arr,
+            surface_kinds,
+            match_radius_m=match_radius_m,
+        )
+        metadata_records = estimated_metadata.get(isotope, [])
+        if isinstance(metadata_records, Sequence):
+            for record in records:
+                idx = int(record.get("estimate_index", -1))
+                if idx < 0 or idx >= len(metadata_records):
+                    continue
+                metadata = metadata_records[idx]
+                if not isinstance(metadata, dict):
+                    continue
+                for key in (
+                    "age",
+                    "low_q_streak",
+                    "support_score",
+                    "tentative",
+                    "verification_fail_streak",
+                ):
+                    if key in metadata:
+                        record[key] = metadata[key]
+        truth_records, truth_summary = _truth_coverage_records(
+            isotope,
+            est_positions,
+            est_strengths,
+            true_positions,
+            true_strength_arr,
+            match_radius_m=match_radius_m,
+        )
+        summary.update(truth_summary)
+        payload_records.extend(records)
+        truth_records_payload.extend(truth_records)
+        summaries[isotope] = summary
+    counts_raw = _frame_field(frame, "counts_by_isotope", {})
+    counts_by_isotope = dict(counts_raw) if isinstance(counts_raw, dict) else {}
+    robot_position = np.asarray(
+        _frame_field(frame, "robot_position", np.zeros(3)),
+        dtype=float,
+    ).reshape(-1)
+    if robot_position.size < 3:
+        robot_position = np.pad(robot_position, (0, 3 - robot_position.size))
+    return {
+        "estimate_source": str(_frame_field(frame, "estimate_source", "frame")),
+        "step_index": int(_frame_field(frame, "step_index", -1)),
+        "time_s": float(_frame_field(frame, "time", 0.0)),
+        "robot_position": [float(v) for v in robot_position[:3]],
+        "counts_by_isotope": {
+            str(key): float(value)
+            for key, value in sorted(counts_by_isotope.items())
+        },
+        "isotopes": summaries,
+        "estimates": payload_records,
+        "truth_sources": truth_records_payload,
+    }
+
+
+def _format_estimate_trace_log_line(
+    step_index: int,
+    isotope: str,
+    summary: dict[str, object],
+    records: list[dict[str, object]],
+    *,
+    max_records: int = 6,
+) -> str:
+    """Format one intermediate estimate trace summary line for the console log."""
+    mean_err = summary.get("mean_position_error_m")
+    max_err = summary.get("max_position_error_m")
+    total_rel = summary.get("total_strength_rel_error")
+    mean_q_rel = summary.get("mean_abs_strength_rel_error")
+    estimate_source = str(summary.get("estimate_source", "frame"))
+    chunks: list[str] = []
+    for record in records[: max(0, int(max_records))]:
+        pos = np.asarray(record.get("pos", np.zeros(3)), dtype=float)
+        truth_idx = record.get("nearest_truth_index")
+        dist = record.get("position_error_m")
+        q_rel = record.get("strength_rel_error")
+        distance_text = f"{float(dist):.2f}m" if dist is not None else "NA"
+        chunks.append(
+            "#"
+            f"{int(record.get('estimate_index', 0))}"
+            f" pos={_fmt_pos(pos)}"
+            f" q={float(record.get('strength', 0.0)):.1f}"
+            f" surface={record.get('surface_kind')}"
+            f" nn={truth_idx if truth_idx is not None else 'NA'}"
+            f" d={distance_text}"
+        )
+        if q_rel is not None:
+            chunks[-1] += f" dq_rel={float(q_rel):+.2f}"
+        if record.get("age") is not None:
+            chunks[-1] += f" age={int(record.get('age', 0))}"
+        if record.get("tentative") is not None:
+            chunks[-1] += f" tent={bool(record.get('tentative'))}"
+        if record.get("verification_fail_streak") is not None:
+            chunks[-1] += f" fail={int(record.get('verification_fail_streak', 0))}"
+        if record.get("support_score") is not None:
+            chunks[-1] += f" support={float(record.get('support_score', 0.0)):.2f}"
+    return (
+        f"[step {step_index}] pf_estimates[{isotope}] "
+        f"mode={estimate_source} "
+        f"n={int(summary.get('estimate_count', 0))}/{int(summary.get('truth_count', 0))} "
+        f"source_count_error={int(summary.get('source_count_error', 0))} "
+        f"matched_truth={int(summary.get('matched_truth_count', 0))} "
+        f"unmatched_truth={int(summary.get('unmatched_truth_count', 0))} "
+        f"duplicate_truth={int(summary.get('duplicate_truth_matches', 0))} "
+        f"mean_d={_fmt_optional_float(mean_err)}m "
+        f"max_d={_fmt_optional_float(max_err)}m "
+        f"total_q={float(summary.get('total_est_strength', 0.0)):.1f}/"
+        f"{float(summary.get('total_truth_strength', 0.0)):.1f} "
+        f"total_q_rel={_fmt_optional_float(total_rel)} "
+        f"mean_abs_q_rel={_fmt_optional_float(mean_q_rel)} "
+        f"off_surface={int(summary.get('off_surface_count', 0))} "
+        f"entries=[{'; '.join(chunks)}]"
+    )
+
+
+def _format_truth_coverage_log_line(
+    step_index: int,
+    isotope: str,
+    summary: dict[str, object],
+    truth_records: list[dict[str, object]],
+    *,
+    max_records: int = 6,
+) -> str:
+    """Format truth-centric coverage diagnostics for the console log."""
+    estimate_source = str(summary.get("estimate_source", "frame"))
+    mean_err = summary.get("mean_truth_nearest_estimate_error_m")
+    max_err = summary.get("max_truth_nearest_estimate_error_m")
+    mean_q_rel = summary.get("mean_truth_nearest_strength_rel_error")
+    chunks: list[str] = []
+    for record in truth_records[: max(0, int(max_records))]:
+        pos = np.asarray(record.get("truth_pos", np.zeros(3)), dtype=float)
+        est_idx = record.get("nearest_estimate_index")
+        dist = record.get("nearest_estimate_distance_m")
+        q_est = record.get("nearest_estimate_strength")
+        q_rel = record.get("nearest_strength_rel_error")
+        distance_text = f"{float(dist):.2f}m" if dist is not None else "NA"
+        q_est_text = f"{float(q_est):.1f}" if q_est is not None else "NA"
+        chunk = (
+            "#"
+            f"{int(record.get('truth_index', 0))}"
+            f" pos={_fmt_pos(pos)}"
+            f" q_true={float(record.get('truth_strength', 0.0)):.1f}"
+            f" nearest_est={est_idx if est_idx is not None else 'NA'}"
+            f" d={distance_text}"
+            f" q_est={q_est_text}"
+            f" covered={bool(record.get('covered', False))}"
+        )
+        if q_rel is not None:
+            chunk += f" dq_rel={float(q_rel):+.2f}"
+        chunks.append(chunk)
+    return (
+        f"[step {step_index}] pf_truth_coverage[{isotope}] "
+        f"mode={estimate_source} "
+        f"covered={int(summary.get('truth_covered_count', 0))}/"
+        f"{int(summary.get('truth_count', 0))} "
+        f"uncovered={int(summary.get('truth_uncovered_count', 0))} "
+        f"mean_truth_nn_d={_fmt_optional_float(mean_err)}m "
+        f"max_truth_nn_d={_fmt_optional_float(max_err)}m "
+        f"mean_truth_nn_abs_q_rel={_fmt_optional_float(mean_q_rel)} "
+        f"entries=[{'; '.join(chunks)}]"
+    )
+
+
+def _append_estimate_trace_jsonl(
+    trace_path: Path,
+    payload: dict[str, object],
+) -> None:
+    """Append one intermediate estimate trace payload as JSON Lines."""
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    with trace_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _emit_intermediate_estimate_trace(
+    estimator: RotatingShieldPFEstimator,
+    isotopes: Sequence[str],
+    frame: PFFrame | dict[str, object],
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    step_index: int,
+    elapsed_s: float,
+    counts_by_isotope: dict[str, float],
+    obstacle_height_m: float,
+    match_radius_m: float,
+    trace_path: Path | None,
+    log_enabled: bool,
+    log_every: int,
+    max_log_records: int,
+    estimate_source: str,
+) -> None:
+    """Write and optionally print current MAP estimate trace diagnostics."""
+    estimate_trace_frame = _current_map_estimate_trace_frame(
+        estimator,
+        isotopes,
+        frame,
+        step_index=step_index,
+        elapsed_s=elapsed_s,
+        counts_by_isotope={
+            str(key): float(value) for key, value in counts_by_isotope.items()
+        },
+        estimate_source=estimate_source,
+    )
+    estimate_trace_payload = _build_intermediate_estimate_trace_payload(
+        estimate_trace_frame,
+        true_sources,
+        true_strengths,
+        env,
+        obstacle_grid,
+        obstacle_height_m=obstacle_height_m,
+        match_radius_m=match_radius_m,
+    )
+    if trace_path is not None:
+        _append_estimate_trace_jsonl(trace_path, estimate_trace_payload)
+    if not log_enabled or step_index % max(1, int(log_every)) != 0:
+        return
+    estimate_records = list(estimate_trace_payload.get("estimates", []))
+    truth_records = list(estimate_trace_payload.get("truth_sources", []))
+    for iso, summary in sorted(dict(estimate_trace_payload.get("isotopes", {})).items()):
+        summary_with_source = dict(summary)
+        summary_with_source["estimate_source"] = estimate_trace_payload.get(
+            "estimate_source"
+        )
+        iso_records = [
+            dict(record)
+            for record in estimate_records
+            if dict(record).get("isotope") == iso
+        ]
+        iso_truth_records = [
+            dict(record)
+            for record in truth_records
+            if dict(record).get("isotope") == iso
+        ]
+        print(
+            _format_estimate_trace_log_line(
+                step_index,
+                iso,
+                summary_with_source,
+                iso_records,
+                max_records=max_log_records,
+            ),
+            flush=True,
+        )
+        print(
+            _format_truth_coverage_log_line(
+                step_index,
+                iso,
+                summary_with_source,
+                iso_truth_records,
+                max_records=max_log_records,
+            ),
+            flush=True,
+        )
+
+
 def _fmt_top_k(entries: list[dict[str, object]]) -> str:
     """Format top-k particle summaries for logging."""
     chunks = []
@@ -919,6 +1700,24 @@ def _fmt_count_map(counts: dict[str, float], precision: int = 2) -> str:
     chunks = [
         f"{iso}:{float(value):.{precision}f}" for iso, value in sorted(counts.items())
     ]
+    return "{" + ", ".join(chunks) + "}"
+
+
+def _fmt_probability_map(probabilities: dict[str, float], precision: int = 3) -> str:
+    """Format discrete probability maps for compact PF diagnostics."""
+    if not probabilities:
+        return "{}"
+    chunks: list[str] = []
+    for key, value in sorted(
+        probabilities.items(),
+        key=lambda item: (
+            0,
+            int(item[0]),
+        )
+        if str(item[0]).lstrip("-").isdigit()
+        else (1, str(item[0])),
+    ):
+        chunks.append(f"{key}:{float(value):.{precision}f}")
     return "{" + ", ".join(chunks) + "}"
 
 
@@ -1066,6 +1865,13 @@ def _log_pf_diagnostics(
         birth_forced_no_candidate = int(stats.get("birth_forced_no_candidate", 0))
         birth_forced_rejected = int(stats.get("birth_forced_rejected", 0))
         birth_forced_best_delta = float(stats.get("birth_forced_best_delta", float("-inf")))
+        birth_global_candidates = int(stats.get("birth_global_rescue_candidates", 0))
+        birth_global_attempts = int(stats.get("birth_global_rescue_attempts", 0))
+        birth_global_accepts = int(stats.get("birth_global_rescue_accepts", 0))
+        birth_global_rejected = int(stats.get("birth_global_rescue_rejected", 0))
+        birth_global_best_delta = float(
+            stats.get("birth_global_rescue_best_delta", float("-inf"))
+        )
         birth_structural_eligible = int(stats.get("birth_structural_eligible", 0))
         pseudo_verified = int(stats.get("pseudo_source_verified", 0))
         pseudo_failed = int(stats.get("pseudo_source_failed", 0))
@@ -1078,6 +1884,10 @@ def _log_pf_diagnostics(
         temper_resamples = int(stats.get("temper_resamples", 0))
         r_mean = float(stats["r_mean"])
         r_var = float(stats["r_var"])
+        r_weighted_mean = float(stats.get("r_weighted_mean", r_mean))
+        r_weighted_var = float(stats.get("r_weighted_var", r_var))
+        r_probabilities = dict(stats.get("r_probability_by_count", {}))
+        r_particle_counts = dict(stats.get("r_particle_count_by_count", {}))
         map_pos, map_str = stats["map"]
         mmse_pos, mmse_str = stats["mmse"]
         top_entries = stats["top_k"]
@@ -1088,14 +1898,30 @@ def _log_pf_diagnostics(
         )
         max_sources = getattr(getattr(filt, "config", None), "max_sources", None)
         p_birth = float(getattr(getattr(filt, "config", None), "p_birth", 0.0))
+        structural_workers = int(
+            getattr(getattr(filt, "config", None), "structural_trial_workers", 1)
+        )
+        structural_min_trials = int(
+            getattr(
+                getattr(filt, "config", None),
+                "structural_trial_parallel_min_trials",
+                1,
+            )
+        )
         print(
             f"[step {step_index}] pf[{iso}] ess_pre={ess_pre:.2f} resampled={resampled} "
             f"ess_post={_fmt_optional_float(ess_post)} n_after={n_after_adapt} "
             f"resamples={resamples} mode_preserved={mode_preserved} "
             f"births={births} kills={kills} "
             f"r_mean={r_mean:.2f} r_var={r_var:.2f} "
+            f"r_weighted_mean={r_weighted_mean:.2f} "
+            f"r_weighted_var={r_weighted_var:.2f} "
+            f"r_posterior={_fmt_probability_map(r_probabilities)} "
+            f"r_particles={r_particle_counts} "
             f"converged={converged} skipped={updates_skipped} "
             f"birth_enabled={birth_enabled} max_sources={max_sources} p_birth={p_birth:.3f} "
+            f"structural_trial_workers={structural_workers} "
+            f"structural_trial_parallel_min_trials={structural_min_trials} "
             f"birth_gate={birth_gate_passed} "
             f"birth_residual_support={birth_gate_support} "
             f"birth_residual_distinct_poses={birth_gate_distinct} "
@@ -1111,6 +1937,11 @@ def _log_pf_diagnostics(
             f"birth_forced_no_candidate={birth_forced_no_candidate} "
             f"birth_forced_rejected={birth_forced_rejected} "
             f"birth_forced_best_delta={_fmt_optional_float(birth_forced_best_delta)} "
+            f"birth_global_candidates={birth_global_candidates} "
+            f"birth_global_attempts={birth_global_attempts} "
+            f"birth_global_accepts={birth_global_accepts} "
+            f"birth_global_rejected={birth_global_rejected} "
+            f"birth_global_best_delta={_fmt_optional_float(birth_global_best_delta)} "
             f"birth_structural_eligible={birth_structural_eligible} "
             f"pseudo_verified={pseudo_verified} "
             f"pseudo_failed={pseudo_failed} "
@@ -1151,6 +1982,1207 @@ def _log_pf_diagnostics(
         )
         if top_entries:
             print(f"[step {step_index}] pf[{iso}] top_k={_fmt_top_k(top_entries)}")
+
+
+def _log_report_model_order_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    step_index: int,
+    *,
+    label: str,
+) -> None:
+    """Log report-level model-order selection diagnostics."""
+    if not hasattr(estimator, "report_model_order_diagnostics"):
+        return
+    diagnostics = estimator.report_model_order_diagnostics()
+    if not diagnostics:
+        print(f"[step {step_index}] report_model_order[{label}]: no diagnostics")
+        return
+    for iso, stats_raw in sorted(diagnostics.items()):
+        stats = dict(stats_raw)
+        candidate_count = int(stats.get("candidate_count", 0))
+        selected_count = int(stats.get("selected_count", 0))
+        method = str(stats.get("method", "unknown"))
+        ready = bool(stats.get("model_order_ready", True))
+        margin = stats.get("criterion_margin_to_simpler")
+        condition = stats.get("condition_number")
+        max_corr = stats.get("selected_max_response_correlation")
+        evaluated = int(stats.get("evaluated_subsets", 0))
+        workers = int(stats.get("workers", 1))
+        eval_mode = str(stats.get("evaluation_mode", "unknown"))
+        selected_indices = stats.get("selected_indices", [])
+        best_by_k = stats.get("best_by_k", {})
+        best_by_k_chunks: list[str] = []
+        if isinstance(best_by_k, dict):
+            for k, entry_raw in sorted(
+                best_by_k.items(),
+                key=lambda item: int(item[0])
+                if str(item[0]).lstrip("-").isdigit()
+                else 10**9,
+            ):
+                entry = dict(entry_raw) if isinstance(entry_raw, dict) else {}
+                best_by_k_chunks.append(
+                    f"k{k}:crit={_fmt_optional_float(entry.get('criterion'))}"
+                    f",ll={_fmt_optional_float(entry.get('ll'))}"
+                    f",cond={_fmt_optional_float(entry.get('condition_number'))}"
+                )
+        print(
+            f"[step {step_index}] report_model_order[{iso}] label={label} "
+            f"method={method} ready={ready} candidates={candidate_count} "
+            f"selected={selected_count} selected_indices={selected_indices} "
+            f"margin_to_simpler={_fmt_optional_float(margin)} "
+            f"condition={_fmt_optional_float(condition)} "
+            f"max_response_corr={_fmt_optional_float(max_corr, 3)} "
+            f"evaluated_subsets={evaluated} workers={workers} "
+            f"evaluation_mode={eval_mode} "
+            f"best_by_k=[{'; '.join(best_by_k_chunks)}]"
+        )
+
+
+def _log_dss_ranked_node_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Log ranked DSS-PP station/program candidates with score components."""
+    ranked_raw = diagnostics.get("ranked_nodes", [])
+    if not isinstance(ranked_raw, Sequence):
+        return
+    ranked = [dict(node) for node in ranked_raw if isinstance(node, dict)]
+    if not ranked:
+        print(f"DSS-PP ranked candidates[{label}]: none")
+        return
+    limit = int(diagnostics.get("diagnostic_ranked_node_limit", len(ranked)))
+    print(
+        f"DSS-PP ranked candidates[{label}]: "
+        f"logged={len(ranked)} limit={limit} "
+        f"nodes={int(diagnostics.get('node_count', len(ranked)))} "
+        f"candidates={int(diagnostics.get('candidate_count', 0))} "
+        f"programs={int(diagnostics.get('program_count', 0))}"
+    )
+    for entry in ranked:
+        pose = np.asarray(entry.get("pose_xyz", np.zeros(3)), dtype=float)
+        pairs = entry.get("pair_ids", [])
+        print(
+            "DSS-PP candidate "
+            f"[{label}] rank={int(entry.get('rank', 0))} "
+            f"pose_idx={int(entry.get('pose_index', -1))} "
+            f"pose={_fmt_pos(pose)} "
+            f"program={entry.get('program_name')} "
+            f"kind={entry.get('program_kind')} "
+            f"pairs={list(pairs) if isinstance(pairs, Sequence) else pairs} "
+            f"score={float(entry.get('score', 0.0)):.6g} "
+            f"static={float(entry.get('static_score', 0.0)):.6g} "
+            f"ig={float(entry.get('information_gain', 0.0)):.6g} "
+            f"signature={float(entry.get('signature_score', 0.0)):.6g} "
+            f"temporal_sep={float(entry.get('temporal_separation_score', 0.0)):.6g} "
+            f"elevation_sep={float(entry.get('elevation_signature_score', 0.0)):.6g} "
+            f"obs_penalty={float(entry.get('observation_penalty', 0.0)):.6g} "
+            f"count_balance={float(entry.get('count_balance_penalty', 0.0)):.6g} "
+            f"diff_penalty={float(entry.get('differential_penalty', 0.0)):.6g} "
+            f"dose={float(entry.get('dose_score', 0.0)):.6g} "
+            f"count_util={float(entry.get('count_utility', 0.0)):.6g} "
+            f"coverage={float(entry.get('coverage_gain', 0.0)):.6g} "
+            f"revisit={float(entry.get('revisit_penalty', 0.0)):.6g} "
+            f"bearing={float(entry.get('bearing_diversity_gain', 0.0)):.6g} "
+            f"frontier={float(entry.get('frontier_gain', 0.0)):.6g} "
+            f"turn={float(entry.get('turn_penalty', 0.0)):.6g} "
+            f"local_orbit={float(entry.get('local_orbit_gain', 0.0)):.6g} "
+            f"station_cond={float(entry.get('station_condition_gain', 0.0)):.6g} "
+            f"elev_cond={float(entry.get('elevation_condition_gain', 0.0)):.6g} "
+            f"env_sig={float(entry.get('environment_signature_score', 0.0)):.6g} "
+            f"vertical_env={float(entry.get('vertical_environment_signature_score', 0.0)):.6g} "
+            f"occ_boundary={float(entry.get('occlusion_boundary_gain', 0.0)):.6g} "
+            f"route_pressure={float(entry.get('remaining_route_pressure', 0.0)):.6g} "
+            f"route_penalty={float(entry.get('remaining_route_penalty', 0.0)):.6g} "
+            f"route_gain={float(entry.get('remaining_route_gain', 0.0)):.6g}"
+        )
+
+
+def _safe_json_dumps(payload: object) -> str:
+    """Return a compact JSON string for diagnostic payloads."""
+    def _default(value: object) -> object:
+        """Convert numpy values to plain JSON-compatible objects."""
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return float(value)
+        if isinstance(value, (np.bool_,)):
+            return bool(value)
+        return str(value)
+
+    return json.dumps(payload, sort_keys=True, default=_default)
+
+
+def _nearest_truth_diagnostic(
+    isotope: str,
+    position_xyz: NDArray[np.float64],
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+) -> dict[str, object]:
+    """Return nearest truth-source diagnostics for one estimated position."""
+    truths = np.asarray(true_sources.get(isotope, np.zeros((0, 3))), dtype=float)
+    truths = truths.reshape(-1, 3)
+    if truths.size == 0:
+        return {
+            "nearest_truth_index": None,
+            "nearest_truth_distance_m": None,
+            "nearest_truth_position": None,
+            "nearest_truth_strength": None,
+        }
+    pos = np.asarray(position_xyz, dtype=float).reshape(3)
+    distances = np.linalg.norm(truths - pos[None, :], axis=1)
+    truth_idx = int(np.argmin(distances))
+    strengths = _true_strength_array(true_strengths, isotope, truths.shape[0])
+    truth_strength = (
+        float(strengths[truth_idx]) if truth_idx < strengths.size else None
+    )
+    return {
+        "nearest_truth_index": truth_idx,
+        "nearest_truth_distance_m": float(distances[truth_idx]),
+        "nearest_truth_position": [float(value) for value in truths[truth_idx]],
+        "nearest_truth_strength": truth_strength,
+    }
+
+
+def _active_state_for_diagnostics(filt: object) -> object | None:
+    """Return the current MAP state with quarantined sources removed when possible."""
+    try:
+        state = filt.best_particle().state
+        if hasattr(filt, "state_without_quarantined_sources"):
+            state = filt.state_without_quarantined_sources(state)
+        return state
+    except (AttributeError, IndexError, RuntimeError, ValueError):
+        return None
+
+
+def _state_source_arrays(state: object | None) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+    """Return source positions, strengths, and background from a PF state."""
+    if state is None:
+        return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float), 0.0
+    count = max(0, int(getattr(state, "num_sources", 0)))
+    positions = np.asarray(
+        getattr(state, "positions", np.zeros((0, 3))),
+        dtype=float,
+    ).reshape(-1, 3)
+    strengths = np.asarray(
+        getattr(state, "strengths", np.zeros(0)),
+        dtype=float,
+    ).reshape(-1)
+    count = min(count, positions.shape[0], strengths.size)
+    background = float(getattr(state, "background", 0.0))
+    return positions[:count], strengths[:count], background
+
+
+def _measurement_geometry_arrays(
+    measurement: Measurement,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64], NDArray[np.int64]]:
+    """Return single-measurement detector, live-time, Fe-index, and Pb-index arrays."""
+    detector = np.asarray(
+        measurement.detector_position
+        if measurement.detector_position is not None
+        else np.zeros(3),
+        dtype=float,
+    ).reshape(1, 3)
+    live_times = np.asarray([float(measurement.live_time_s)], dtype=float)
+    fe_index = (
+        int(measurement.fe_index)
+        if measurement.fe_index is not None
+        else int(measurement.orient_idx)
+    )
+    pb_index = (
+        int(measurement.pb_index)
+        if measurement.pb_index is not None
+        else int(measurement.orient_idx)
+    )
+    return (
+        detector,
+        live_times,
+        np.asarray([fe_index], dtype=int),
+        np.asarray([pb_index], dtype=int),
+    )
+
+
+def _log_spectrum_response_poisson_diagnostics(
+    decomposer: SpectralDecomposer,
+    *,
+    step_index: int,
+) -> None:
+    """Log the full-spectrum response-regression diagnostics from spectrum processing."""
+    diagnostics = dict(getattr(decomposer, "last_response_poisson_diagnostics", {}))
+    if not diagnostics:
+        print(f"[step {step_index}] spectrum_response_poisson: no diagnostics")
+        return
+    print(
+        f"[step {step_index}] spectrum_response_poisson "
+        f"{_safe_json_dumps(diagnostics)}"
+    )
+
+
+def _log_current_map_prediction_residuals(
+    estimator: RotatingShieldPFEstimator,
+    measurement: Measurement,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    step_index: int,
+) -> None:
+    """Log current MAP expected counts and residuals for the latest measurement."""
+    detector, live_times, fe_indices, pb_indices = _measurement_geometry_arrays(
+        measurement
+    )
+    for isotope, filt in sorted(estimator.filters.items()):
+        state = _active_state_for_diagnostics(filt)
+        positions, strengths, background = _state_source_arrays(state)
+        observed = float(measurement.counts_by_isotope.get(isotope, 0.0))
+        if measurement.count_variance_by_isotope is None:
+            variance = max(observed, 1.0)
+        else:
+            variance = max(
+                float(measurement.count_variance_by_isotope.get(isotope, observed)),
+                1.0,
+            )
+        if positions.size:
+            source_counts = expected_counts_per_source(
+                kernel=filt.continuous_kernel,
+                isotope=isotope,
+                detector_positions=detector,
+                sources=positions,
+                strengths=strengths,
+                live_times=live_times,
+                fe_indices=fe_indices,
+                pb_indices=pb_indices,
+                source_scale=filt._measurement_source_scale(),
+            )[0]
+        else:
+            source_counts = np.zeros(0, dtype=float)
+        background_counts = float(background) * float(measurement.live_time_s)
+        predicted = float(np.sum(source_counts) + background_counts)
+        residual = float(observed - predicted)
+        whitened = residual / float(np.sqrt(max(variance, 1.0e-12)))
+        rel_residual = residual / max(abs(predicted), 1.0e-12)
+        surface_kinds = source_surface_kinds(
+            positions,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=1.0e-5,
+        )
+        print(
+            f"[step {step_index}] map_prediction_residual[{isotope}] "
+            f"observed={observed:.3f} predicted={predicted:.3f} "
+            f"residual={residual:.3f} whitened={whitened:.3f} "
+            f"rel={rel_residual:+.3f} variance={variance:.3f} "
+            f"background_counts={background_counts:.3f} "
+            f"source_count={positions.shape[0]} "
+            f"detector={_fmt_pos(detector[0])} "
+            f"fe={int(fe_indices[0])} pb={int(pb_indices[0])} "
+            f"live={float(live_times[0]):.3f}"
+        )
+        for idx, (pos, strength, expected) in enumerate(
+            zip(positions, strengths, source_counts)
+        ):
+            truth_diag = _nearest_truth_diagnostic(
+                isotope,
+                pos,
+                true_sources,
+                true_strengths,
+            )
+            fraction = float(expected) / max(predicted, 1.0e-12)
+            surface_kind = (
+                str(surface_kinds[idx]) if idx < len(surface_kinds) else "unknown"
+            )
+            print(
+                f"[step {step_index}] map_source_contribution[{isotope}] "
+                f"idx={idx} pos={_fmt_pos(pos)} q={float(strength):.3f} "
+                f"expected_counts={float(expected):.3f} "
+                f"fraction={fraction:.3f} surface={surface_kind} "
+                f"nearest_truth={truth_diag.get('nearest_truth_index')} "
+                f"truth_d={_fmt_optional_float(truth_diag.get('nearest_truth_distance_m'))}m "
+                f"truth_q={_fmt_optional_float(truth_diag.get('nearest_truth_strength'))}"
+            )
+
+
+def _log_truth_observability_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    measurement: Measurement,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    step_index: int,
+) -> None:
+    """Log how observable each true source is from the latest detector pose."""
+    detector, live_times, fe_indices, pb_indices = _measurement_geometry_arrays(
+        measurement
+    )
+    detector_pos = detector[0]
+    for isotope, truth_positions_raw in sorted(true_sources.items()):
+        filt = estimator.filters.get(isotope)
+        if filt is None:
+            continue
+        truth_positions = np.asarray(truth_positions_raw, dtype=float).reshape(-1, 3)
+        truth_strength_arr = _true_strength_array(
+            true_strengths,
+            isotope,
+            truth_positions.shape[0],
+        )
+        if truth_positions.size == 0:
+            continue
+        expected = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=detector,
+            sources=truth_positions,
+            strengths=truth_strength_arr,
+            live_times=live_times,
+            fe_indices=fe_indices,
+            pb_indices=pb_indices,
+            source_scale=filt._measurement_source_scale(),
+        )[0]
+        surface_kinds = source_surface_kinds(
+            truth_positions,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=1.0e-5,
+        )
+        for idx, pos in enumerate(truth_positions):
+            q_true = (
+                float(truth_strength_arr[idx])
+                if idx < truth_strength_arr.size
+                else 0.0
+            )
+            distance = float(np.linalg.norm(detector_pos - pos))
+            kernel = filt.continuous_kernel
+            obstacle_path_cm = 0.0
+            obstacle_tau = 0.0
+            obstacle_att = 1.0
+            try:
+                obstacle_path_cm = float(
+                    kernel.obstacle_path_length_cm(pos, detector_pos)
+                )
+                obstacle_tau = float(
+                    kernel.obstacle_optical_depth_pair(
+                        isotope,
+                        pos,
+                        detector_pos,
+                    )
+                )
+                obstacle_att = float(
+                    kernel.obstacle_attenuation_factor_pair(
+                        isotope,
+                        pos,
+                        detector_pos,
+                    )
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                obstacle_path_cm = 0.0
+                obstacle_tau = 0.0
+                obstacle_att = 1.0
+            per_cps_1m = float(expected[idx]) / max(
+                float(live_times[0]) * max(q_true, 1.0e-12),
+                1.0e-12,
+            )
+            surface_kind = (
+                str(surface_kinds[idx]) if idx < len(surface_kinds) else "unknown"
+            )
+            print(
+                f"[step {step_index}] truth_observability[{isotope}] "
+                f"truth_idx={idx} pos={_fmt_pos(pos)} q_true={q_true:.3f} "
+                f"surface={surface_kind} detector={_fmt_pos(detector_pos)} "
+                f"distance_m={distance:.3f} expected_counts={float(expected[idx]):.3f} "
+                f"response_per_cps_1m={per_cps_1m:.6g} "
+                f"obstacle_path_cm={obstacle_path_cm:.3f} "
+                f"obstacle_tau={obstacle_tau:.6g} "
+                f"obstacle_att={obstacle_att:.6g} "
+                f"fe={int(fe_indices[0])} pb={int(pb_indices[0])}"
+            )
+
+
+def _log_posterior_truth_mass_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    *,
+    step_index: int,
+) -> None:
+    """Log posterior mass and source slots near each true source."""
+    radii = (1.0, 2.0, 3.0)
+    for isotope, truth_positions_raw in sorted(true_sources.items()):
+        filt = estimator.filters.get(isotope)
+        if filt is None or not getattr(filt, "continuous_particles", None):
+            continue
+        truth_positions = np.asarray(truth_positions_raw, dtype=float).reshape(-1, 3)
+        if truth_positions.size == 0:
+            continue
+        truth_strength_arr = _true_strength_array(
+            true_strengths,
+            isotope,
+            truth_positions.shape[0],
+        )
+        weights = np.asarray(filt.continuous_weights, dtype=float).reshape(-1)
+        if weights.size != len(filt.continuous_particles) or float(np.sum(weights)) <= 0.0:
+            weights = np.ones(len(filt.continuous_particles), dtype=float)
+            weights /= max(float(weights.size), 1.0)
+        map_positions, map_strengths, _ = _state_source_arrays(
+            _active_state_for_diagnostics(filt)
+        )
+        for truth_idx, truth_pos in enumerate(truth_positions):
+            mass_by_radius = {radius: 0.0 for radius in radii}
+            weighted_nn_distance = 0.0
+            weighted_nn_strength = 0.0
+            weighted_source_count = 0.0
+            no_source_mass = 0.0
+            finite_nn_mass = 0.0
+            for weight, particle in zip(weights, filt.continuous_particles):
+                state = particle.state
+                if hasattr(filt, "state_without_quarantined_sources"):
+                    state = filt.state_without_quarantined_sources(state)
+                positions, strengths, _ = _state_source_arrays(state)
+                if positions.size == 0:
+                    no_source_mass += float(weight)
+                    continue
+                distances = np.linalg.norm(positions - truth_pos[None, :], axis=1)
+                nearest_idx = int(np.argmin(distances))
+                nearest_distance = float(distances[nearest_idx])
+                for radius in radii:
+                    if np.any(distances <= radius):
+                        mass_by_radius[radius] += float(weight)
+                weighted_nn_distance += float(weight) * nearest_distance
+                weighted_nn_strength += float(weight) * float(strengths[nearest_idx])
+                weighted_source_count += float(weight) * float(positions.shape[0])
+                finite_nn_mass += float(weight)
+            if finite_nn_mass > 0.0:
+                weighted_nn_distance /= finite_nn_mass
+                weighted_nn_strength /= finite_nn_mass
+            else:
+                weighted_nn_distance = float("nan")
+                weighted_nn_strength = float("nan")
+            map_nn_distance = None
+            map_nn_strength = None
+            if map_positions.size:
+                map_distances = np.linalg.norm(
+                    map_positions - truth_pos[None, :],
+                    axis=1,
+                )
+                map_idx = int(np.argmin(map_distances))
+                map_nn_distance = float(map_distances[map_idx])
+                map_nn_strength = float(map_strengths[map_idx])
+            q_true = (
+                float(truth_strength_arr[truth_idx])
+                if truth_idx < truth_strength_arr.size
+                else 0.0
+            )
+            print(
+                f"[step {step_index}] posterior_truth_mass[{isotope}] "
+                f"truth_idx={truth_idx} pos={_fmt_pos(truth_pos)} q_true={q_true:.3f} "
+                f"mass_1m={mass_by_radius[1.0]:.4f} "
+                f"mass_2m={mass_by_radius[2.0]:.4f} "
+                f"mass_3m={mass_by_radius[3.0]:.4f} "
+                f"weighted_nn_d={_fmt_optional_float(weighted_nn_distance, 3)}m "
+                f"weighted_nn_q={_fmt_optional_float(weighted_nn_strength, 3)} "
+                f"weighted_source_count={weighted_source_count:.3f} "
+                f"no_source_mass={no_source_mass:.4f} "
+                f"map_nn_d={_fmt_optional_float(map_nn_distance, 3)}m "
+                f"map_nn_q={_fmt_optional_float(map_nn_strength, 3)}"
+            )
+
+
+def _metadata_value_array(
+    state: object,
+    name: str,
+    count: int,
+    *,
+    fill: float | int | bool,
+    dtype: object,
+) -> NDArray[Any]:
+    """Return a fixed-length per-source metadata array for a particle state."""
+    values = np.asarray(getattr(state, name, np.zeros(0)), dtype=dtype).reshape(-1)
+    out = np.full(max(count, 0), fill, dtype=dtype)
+    if count > 0 and values.size > 0:
+        out[: min(count, values.size)] = values[:count]
+    return out
+
+
+def _particle_source_payload(
+    isotope: str,
+    source_idx: int,
+    pos: NDArray[np.float64],
+    strength: float,
+    surface: str,
+    state: object,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+) -> dict[str, object]:
+    """Return JSON-serializable diagnostics for one particle source slot."""
+    count = max(0, int(getattr(state, "num_sources", 0)))
+    ages = _metadata_value_array(state, "ages", count, fill=0, dtype=int)
+    support = _metadata_value_array(
+        state,
+        "support_scores",
+        count,
+        fill=0.0,
+        dtype=float,
+    )
+    tentative = _metadata_value_array(
+        state,
+        "tentative_sources",
+        count,
+        fill=False,
+        dtype=bool,
+    )
+    fail_streak = _metadata_value_array(
+        state,
+        "verification_fail_streaks",
+        count,
+        fill=0,
+        dtype=int,
+    )
+    truth_diag = _nearest_truth_diagnostic(
+        isotope,
+        np.asarray(pos, dtype=float).reshape(3),
+        true_sources,
+        true_strengths,
+    )
+    payload: dict[str, object] = {
+        "slot": int(source_idx),
+        "pos": [round(float(v), 6) for v in np.asarray(pos, dtype=float).reshape(3)],
+        "q": float(strength),
+        "surface": str(surface),
+        "age": int(ages[source_idx]) if source_idx < ages.size else 0,
+        "support": float(support[source_idx]) if source_idx < support.size else 0.0,
+        "tentative": bool(tentative[source_idx])
+        if source_idx < tentative.size
+        else False,
+        "verification_fail_streak": int(fail_streak[source_idx])
+        if source_idx < fail_streak.size
+        else 0,
+    }
+    payload.update(truth_diag)
+    return payload
+
+
+def _weighted_mean_std(
+    values: NDArray[np.float64],
+    weights: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return weighted mean and standard deviation along the first axis."""
+    arr = np.asarray(values, dtype=float)
+    weight_arr = np.asarray(weights, dtype=float).reshape(-1)
+    if arr.shape[0] == 0 or weight_arr.size != arr.shape[0]:
+        return np.zeros(arr.shape[1:], dtype=float), np.zeros(arr.shape[1:], dtype=float)
+    total = max(float(np.sum(weight_arr)), 1.0e-300)
+    normalized = weight_arr / total
+    reshape = (-1,) + (1,) * (arr.ndim - 1)
+    mean = np.sum(arr * normalized.reshape(reshape), axis=0)
+    variance = np.sum(((arr - mean) ** 2) * normalized.reshape(reshape), axis=0)
+    return np.asarray(mean, dtype=float), np.sqrt(np.maximum(variance, 0.0))
+
+
+def _log_particle_cloud_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    step_index: int,
+    particle_log_limit: int,
+) -> None:
+    """Log posterior particle-cloud positions, strengths, and slot-wise spread."""
+    for isotope, filt in sorted(estimator.filters.items()):
+        particles = list(getattr(filt, "continuous_particles", []))
+        if not particles:
+            print(f"[step {step_index}] particle_cloud[{isotope}]: no particles")
+            continue
+        weights = np.asarray(filt.continuous_weights, dtype=float).reshape(-1)
+        if weights.size != len(particles) or float(np.sum(weights)) <= 0.0:
+            weights = np.ones(len(particles), dtype=float)
+            weights /= max(float(weights.size), 1.0)
+        weights = weights / max(float(np.sum(weights)), 1.0e-300)
+        source_counts = np.asarray(
+            [
+                max(0, int(getattr(particle.state, "num_sources", 0)))
+                for particle in particles
+            ],
+            dtype=int,
+        )
+        source_count_mass: dict[str, float] = {}
+        for count in sorted(set(int(v) for v in source_counts.tolist())):
+            source_count_mass[str(count)] = float(np.sum(weights[source_counts == count]))
+        ess = float(1.0 / max(float(np.sum(weights**2)), 1.0e-300))
+        order = np.argsort(weights)[::-1]
+        log_order = order
+        if particle_log_limit > 0:
+            log_order = order[: min(int(particle_log_limit), order.size)]
+        print(
+            f"[step {step_index}] particle_cloud[{isotope}] "
+            f"particles={len(particles)} logged_particles={int(log_order.size)} "
+            f"ess={ess:.3f} ess_ratio={ess / max(len(particles), 1):.4f} "
+            f"max_weight={float(np.max(weights)):.6g} "
+            f"source_count_mean={float(np.sum(weights * source_counts)):.3f} "
+            f"source_count_mass={_safe_json_dumps(source_count_mass)}"
+        )
+        max_slots = int(np.max(source_counts)) if source_counts.size else 0
+        for slot_idx in range(max_slots):
+            slot_positions: list[NDArray[np.float64]] = []
+            slot_strengths: list[float] = []
+            slot_weights: list[float] = []
+            slot_runtime_weights: list[float] = []
+            slot_ages: list[float] = []
+            slot_tentative_weights: list[float] = []
+            for particle_idx, particle in enumerate(particles):
+                state = particle.state
+                raw_positions = np.asarray(
+                    getattr(state, "positions", np.zeros((0, 3))),
+                    dtype=float,
+                ).reshape(-1, 3)
+                raw_strengths = np.asarray(
+                    getattr(state, "strengths", np.zeros(0)),
+                    dtype=float,
+                ).reshape(-1)
+                count = min(
+                    max(0, int(getattr(state, "num_sources", 0))),
+                    raw_positions.shape[0],
+                    raw_strengths.size,
+                )
+                if slot_idx >= count:
+                    continue
+                source_weight = float(weights[particle_idx])
+                slot_positions.append(raw_positions[slot_idx])
+                slot_strengths.append(float(raw_strengths[slot_idx]))
+                slot_weights.append(source_weight)
+                active_mask = (
+                    filt._active_source_mask(state, include_quarantined=False)
+                    if hasattr(filt, "_active_source_mask")
+                    else np.ones(count, dtype=bool)
+                )
+                runtime_active = bool(slot_idx < active_mask.size and active_mask[slot_idx])
+                slot_runtime_weights.append(source_weight if runtime_active else 0.0)
+                ages = _metadata_value_array(state, "ages", count, fill=0, dtype=int)
+                tentative = _metadata_value_array(
+                    state,
+                    "tentative_sources",
+                    count,
+                    fill=False,
+                    dtype=bool,
+                )
+                slot_ages.append(float(ages[slot_idx]) if slot_idx < ages.size else 0.0)
+                slot_tentative_weights.append(
+                    source_weight
+                    if slot_idx < tentative.size and bool(tentative[slot_idx])
+                    else 0.0
+                )
+            if not slot_positions:
+                continue
+            pos_arr = np.vstack(slot_positions)
+            strength_arr = np.asarray(slot_strengths, dtype=float)
+            weight_arr = np.asarray(slot_weights, dtype=float)
+            mean_pos, std_pos = _weighted_mean_std(pos_arr, weight_arr)
+            mean_q, std_q = _weighted_mean_std(strength_arr[:, None], weight_arr)
+            age_mean, _age_std = _weighted_mean_std(
+                np.asarray(slot_ages, dtype=float)[:, None],
+                weight_arr,
+            )
+            surfaces = source_surface_kinds(
+                pos_arr,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                tolerance_m=1.0e-5,
+            )
+            surface_mass: dict[str, float] = {}
+            for surface, weight in zip(surfaces, weight_arr):
+                key = str(surface)
+                surface_mass[key] = surface_mass.get(key, 0.0) + float(weight)
+            truth_diag = _nearest_truth_diagnostic(
+                isotope,
+                mean_pos,
+                true_sources,
+                true_strengths,
+            )
+            print(
+                f"[step {step_index}] particle_slot_cloud[{isotope}] "
+                f"slot={slot_idx} source_mass={float(np.sum(weight_arr)):.6f} "
+                f"runtime_active_mass={float(np.sum(slot_runtime_weights)):.6f} "
+                f"tentative_mass={float(np.sum(slot_tentative_weights)):.6f} "
+                f"samples={len(slot_positions)} "
+                f"mean_pos={_fmt_pos(mean_pos)} std_pos={_fmt_pos(std_pos)} "
+                f"min_pos={_fmt_pos(np.min(pos_arr, axis=0))} "
+                f"max_pos={_fmt_pos(np.max(pos_arr, axis=0))} "
+                f"mean_q={float(mean_q[0]):.3f} std_q={float(std_q[0]):.3f} "
+                f"mean_age={float(age_mean[0]):.3f} "
+                f"surface_mass={_safe_json_dumps(surface_mass)} "
+                f"nearest_truth={truth_diag.get('nearest_truth_index')} "
+                f"truth_d={_fmt_optional_float(truth_diag.get('nearest_truth_distance_m'))}m "
+                f"truth_q={_fmt_optional_float(truth_diag.get('nearest_truth_strength'))}"
+            )
+        for rank, particle_idx_raw in enumerate(log_order, start=1):
+            particle_idx = int(particle_idx_raw)
+            particle = particles[particle_idx]
+            state = particle.state
+            positions, strengths, background = _state_source_arrays(state)
+            surfaces = (
+                source_surface_kinds(
+                    positions,
+                    env,
+                    obstacle_grid,
+                    obstacle_height_m=obstacle_height_m,
+                    tolerance_m=1.0e-5,
+                )
+                if positions.size
+                else []
+            )
+            sources = [
+                _particle_source_payload(
+                    isotope,
+                    source_idx,
+                    positions[source_idx],
+                    float(strengths[source_idx]),
+                    str(surfaces[source_idx]) if source_idx < len(surfaces) else "unknown",
+                    state,
+                    true_sources,
+                    true_strengths,
+                )
+                for source_idx in range(positions.shape[0])
+            ]
+            print(
+                f"[step {step_index}] particle_source[{isotope}] "
+                f"rank={rank} particle_idx={particle_idx} "
+                f"weight={float(weights[particle_idx]):.8g} "
+                f"log_weight={float(getattr(particle, 'log_weight', 0.0)):.8g} "
+                f"source_count={positions.shape[0]} background={background:.6g} "
+                f"sources={_safe_json_dumps(sources)}"
+            )
+
+
+def _candidate_max_weighted_correlation(
+    candidate_counts: NDArray[np.float64],
+    existing_counts: NDArray[np.float64],
+    observation_variances: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return maximum whitened response correlation for each candidate."""
+    candidates = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
+    existing = np.maximum(np.asarray(existing_counts, dtype=float), 0.0)
+    if candidates.ndim != 2 or candidates.size == 0:
+        return np.zeros(0, dtype=float)
+    if existing.ndim != 2 or existing.size == 0 or existing.shape[1] == 0:
+        return np.zeros(candidates.shape[1], dtype=float)
+    variances = np.asarray(observation_variances, dtype=float).reshape(-1)
+    if variances.size != candidates.shape[0]:
+        variances = np.ones(candidates.shape[0], dtype=float)
+    scale = 1.0 / np.sqrt(np.maximum(variances, 1.0e-12))
+    cand_w = candidates * scale[:, None]
+    exist_w = existing * scale[:, None]
+    cand_norm = np.maximum(np.linalg.norm(cand_w, axis=0), 1.0e-12)
+    exist_norm = np.maximum(np.linalg.norm(exist_w, axis=0), 1.0e-12)
+    corr = np.abs(exist_w.T @ cand_w) / (exist_norm[:, None] * cand_norm[None, :])
+    if corr.size == 0:
+        return np.zeros(candidates.shape[1], dtype=float)
+    return np.asarray(np.max(corr, axis=0), dtype=float)
+
+
+def _birth_support_detail_counts(
+    filt: object,
+    *,
+    candidate_counts: NDArray[np.float64],
+    residual: NDArray[np.float64],
+    observation_variances: NDArray[np.float64],
+    detector_positions: NDArray[np.float64],
+    fe_indices: NDArray[np.int64],
+    pb_indices: NDArray[np.int64],
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.int64]]:
+    """Return raw support, distinct-view, and distinct-station counts."""
+    counts = np.asarray(candidate_counts, dtype=float)
+    if counts.ndim != 2 or counts.size == 0:
+        empty = np.zeros(0, dtype=int)
+        return empty, empty, empty
+    residual_arr = np.asarray(residual, dtype=float).reshape(-1)
+    variances = np.asarray(observation_variances, dtype=float).reshape(-1)
+    if residual_arr.size != counts.shape[0]:
+        residual_arr = np.zeros(counts.shape[0], dtype=float)
+    if variances.size != counts.shape[0]:
+        variances = np.ones(counts.shape[0], dtype=float)
+    sigma = np.sqrt(np.maximum(variances, 1.0e-12))
+    threshold_sigma = max(
+        float(getattr(filt.config, "birth_residual_support_sigma", 0.0)),
+        0.0,
+    )
+    residual_support = residual_arr / sigma >= threshold_sigma
+    if not np.any(residual_support):
+        empty = np.zeros(counts.shape[1], dtype=int)
+        return empty, empty, empty
+    overlap = np.maximum(counts, 0.0) * residual_arr[:, None]
+    max_overlap = np.max(overlap, axis=0)
+    fraction = float(
+        np.clip(getattr(filt.config, "birth_candidate_support_fraction", 0.05), 0.0, 1.0)
+    )
+    support = (overlap >= max_overlap[None, :] * fraction) & (
+        max_overlap[None, :] > 0.0
+    )
+    support &= residual_support[:, None]
+    raw_counts = np.sum(support, axis=0).astype(int)
+    view_labels = filt._support_view_labels(
+        detector_positions,
+        fe_indices,
+        pb_indices,
+        counts.shape[0],
+    )
+    station_labels = filt._support_station_labels(
+        detector_positions,
+        counts.shape[0],
+    )
+    view_counts = filt._distinct_label_counts_for_support_matrix(
+        support,
+        view_labels,
+    )
+    station_counts = filt._distinct_label_counts_for_support_matrix(
+        support,
+        station_labels,
+    )
+    return raw_counts, view_counts, station_counts
+
+
+def _birth_rejection_reason(
+    *,
+    support: bool,
+    corr: bool,
+    condition: bool,
+    distance: bool,
+    score_valid: bool,
+) -> str:
+    """Return the first failed birth-candidate diagnostic gate."""
+    if not support:
+        return "support_gate_failed"
+    if not corr:
+        return "response_correlation_gate_failed"
+    if not condition:
+        return "response_condition_gate_failed"
+    if not distance:
+        return "distance_gate_failed"
+    if not score_valid:
+        return "invalid_residual_score"
+    return "kept"
+
+
+def _log_birth_candidate_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    step_index: int,
+    candidate_log_limit: int,
+) -> None:
+    """Log residual-birth candidate scores and gate outcomes."""
+    candidates_all = np.asarray(
+        getattr(estimator, "candidate_sources", np.zeros((0, 3))),
+        dtype=float,
+    ).reshape(-1, 3)
+    if candidates_all.size == 0:
+        print(f"[step {step_index}] birth_candidates: no candidate source grid")
+        return
+    for isotope, filt in sorted(estimator.filters.items()):
+        data = estimator._measurement_data_for_iso(
+            isotope,
+            getattr(filt.config, "birth_window", None),
+        )
+        if data is None or data.z_k.size == 0:
+            print(f"[step {step_index}] birth_candidates[{isotope}]: no data")
+            continue
+        state = _active_state_for_diagnostics(filt)
+        positions, strengths, background = _state_source_arrays(state)
+        existing_unit = (
+            filt._unit_response_counts_for_state(state, data)
+            if state is not None
+            else np.zeros((data.z_k.size, 0), dtype=float)
+        )
+        source_count = min(int(existing_unit.shape[1]), int(strengths.size))
+        existing_unit = existing_unit[:, :source_count]
+        strengths = strengths[:source_count]
+        positions = positions[:source_count]
+        lambda_total = (
+            np.asarray(data.live_times, dtype=float) * float(background)
+            + existing_unit @ strengths
+        )
+        residual = np.maximum(np.asarray(data.z_k, dtype=float) - lambda_total, 0.0)
+        residual_sum = float(np.sum(residual))
+        candidate_counts = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=data.detector_positions,
+            sources=candidates_all,
+            strengths=np.ones(candidates_all.shape[0], dtype=float),
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=filt._measurement_source_scale(),
+        )
+        support_mask = filt._birth_candidate_support_mask(
+            candidate_counts=candidate_counts,
+            residual_mix=residual,
+            observation_variances=data.observation_variances,
+            detector_positions=data.detector_positions,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+        )
+        corr_mask = filt._birth_existing_response_correlation_mask(
+            candidate_counts=candidate_counts,
+            existing_response_counts=existing_unit,
+            observation_variances=data.observation_variances,
+        )
+        condition_mask = filt._birth_response_condition_mask(
+            candidate_counts=candidate_counts,
+            existing_response_counts=existing_unit,
+            observation_variances=data.observation_variances,
+        )
+        distance_mask = np.ones(candidates_all.shape[0], dtype=bool)
+        if positions.size:
+            distances = np.linalg.norm(
+                candidates_all[:, None, :] - positions[None, :, :],
+                axis=2,
+            )
+            distance_mask = (
+                np.min(distances, axis=1)
+                >= float(getattr(filt.config, "birth_min_sep_m", 0.0))
+            )
+        scores, q_hat = filt._birth_residual_candidate_scores(
+            candidate_counts=candidate_counts,
+            residual_mix=residual,
+            observation_variances=data.observation_variances,
+        )
+        score_valid = (
+            np.isfinite(scores)
+            & np.isfinite(q_hat)
+            & (scores > 0.0)
+            & (q_hat > 0.0)
+        )
+        keep = support_mask & corr_mask & condition_mask & distance_mask & score_valid
+        support_counts, view_counts, station_counts = _birth_support_detail_counts(
+            filt,
+            candidate_counts=candidate_counts,
+            residual=residual,
+            observation_variances=data.observation_variances,
+            detector_positions=data.detector_positions,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+        )
+        max_corr = _candidate_max_weighted_correlation(
+            candidate_counts,
+            existing_unit,
+            data.observation_variances,
+        )
+        order = np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1]
+        if candidate_log_limit > 0:
+            order = order[: min(int(candidate_log_limit), order.size)]
+        surface_kinds = source_surface_kinds(
+            candidates_all,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=1.0e-5,
+        )
+        print(
+            f"[step {step_index}] birth_candidates[{isotope}] "
+            f"candidate_count={candidates_all.shape[0]} "
+            f"logged={order.size} residual_sum={residual_sum:.3f} "
+            f"residual_max={float(np.max(residual)) if residual.size else 0.0:.3f} "
+            f"support_pass={int(np.sum(support_mask))} "
+            f"corr_pass={int(np.sum(corr_mask))} "
+            f"condition_pass={int(np.sum(condition_mask))} "
+            f"distance_pass={int(np.sum(distance_mask))} "
+            f"score_valid={int(np.sum(score_valid))} "
+            f"kept={int(np.sum(keep))} "
+            f"existing_sources={positions.shape[0]} "
+            f"window_measurements={data.z_k.size}"
+        )
+        for rank, cand_idx in enumerate(order, start=1):
+            idx = int(cand_idx)
+            pos = candidates_all[idx]
+            reason = _birth_rejection_reason(
+                support=bool(support_mask[idx]),
+                corr=bool(corr_mask[idx]),
+                condition=bool(condition_mask[idx]),
+                distance=bool(distance_mask[idx]),
+                score_valid=bool(score_valid[idx]),
+            )
+            truth_diag = _nearest_truth_diagnostic(
+                isotope,
+                pos,
+                true_sources,
+                true_strengths,
+            )
+            surface_kind = (
+                str(surface_kinds[idx]) if idx < len(surface_kinds) else "unknown"
+            )
+            print(
+                f"[step {step_index}] birth_candidate[{isotope}] "
+                f"rank={rank} idx={idx} pos={_fmt_pos(pos)} "
+                f"surface={surface_kind} score={float(scores[idx]):.6g} "
+                f"q_hat={float(q_hat[idx]):.6g} kept={bool(keep[idx])} "
+                f"reason={reason} support={bool(support_mask[idx])} "
+                f"support_count={int(support_counts[idx]) if idx < support_counts.size else 0} "
+                f"view_count={int(view_counts[idx]) if idx < view_counts.size else 0} "
+                f"station_count={int(station_counts[idx]) if idx < station_counts.size else 0} "
+                f"corr_pass={bool(corr_mask[idx])} max_corr={float(max_corr[idx]):.6g} "
+                f"condition_pass={bool(condition_mask[idx])} "
+                f"distance_pass={bool(distance_mask[idx])} "
+                f"nearest_truth={truth_diag.get('nearest_truth_index')} "
+                f"truth_d={_fmt_optional_float(truth_diag.get('nearest_truth_distance_m'))}m "
+                f"truth_q={_fmt_optional_float(truth_diag.get('nearest_truth_strength'))}"
+            )
+
+
+def _log_source_event_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    *,
+    step_index: int,
+) -> None:
+    """Log source birth, death, merge, and verification events with truth matching."""
+    any_event = False
+    for isotope, filt in sorted(estimator.filters.items()):
+        events = list(getattr(filt, "last_source_event_diagnostics", []))
+        if not events:
+            continue
+        any_event = True
+        for event_idx, event_raw in enumerate(events):
+            event = dict(event_raw)
+            position = np.asarray(event.get("position", np.zeros(3)), dtype=float)
+            if position.size >= 3:
+                event.update(
+                    _nearest_truth_diagnostic(
+                        isotope,
+                        position[:3],
+                        true_sources,
+                        true_strengths,
+                    )
+                )
+            print(
+                f"[step {step_index}] source_event[{isotope}] "
+                f"event_idx={event_idx} {_safe_json_dumps(event)}"
+            )
+    if not any_event:
+        print(f"[step {step_index}] source_event: none")
+
+
+def _run_precision_diagnostic_block(
+    label: str,
+    callback: Callable[[], None],
+) -> None:
+    """Run one diagnostic callback and log failures without interrupting the simulation."""
+    try:
+        callback()
+    except Exception as exc:  # pragma: no cover - defensive logging path
+        print(f"precision_diagnostic_error[{label}]: {type(exc).__name__}: {exc}")
+
+
+def _log_precision_degradation_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    decomposer: SpectralDecomposer,
+    measurement: Measurement | None,
+    true_sources: dict[str, NDArray[np.float64]],
+    true_strengths: dict[str, float | Sequence[float]],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    step_index: int,
+    candidate_log_limit: int,
+    particle_log_limit: int,
+) -> None:
+    """Log high-detail diagnostics for identifying PF accuracy degradation."""
+    _run_precision_diagnostic_block(
+        "spectrum_response_poisson",
+        lambda: _log_spectrum_response_poisson_diagnostics(
+            decomposer,
+            step_index=step_index,
+        ),
+    )
+    if measurement is None:
+        print(f"[step {step_index}] precision_diagnostics: no latest measurement")
+    else:
+        _run_precision_diagnostic_block(
+            "map_prediction_residuals",
+            lambda: _log_current_map_prediction_residuals(
+                estimator,
+                measurement,
+                true_sources,
+                true_strengths,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                step_index=step_index,
+            ),
+        )
+        _run_precision_diagnostic_block(
+            "truth_observability",
+            lambda: _log_truth_observability_diagnostics(
+                estimator,
+                measurement,
+                true_sources,
+                true_strengths,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                step_index=step_index,
+            ),
+        )
+    _run_precision_diagnostic_block(
+        "posterior_truth_mass",
+        lambda: _log_posterior_truth_mass_diagnostics(
+            estimator,
+            true_sources,
+            true_strengths,
+            step_index=step_index,
+        ),
+    )
+    _run_precision_diagnostic_block(
+        "particle_cloud",
+        lambda: _log_particle_cloud_diagnostics(
+            estimator,
+            true_sources,
+            true_strengths,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            step_index=step_index,
+            particle_log_limit=particle_log_limit,
+        ),
+    )
+    _run_precision_diagnostic_block(
+        "source_events",
+        lambda: _log_source_event_diagnostics(
+            estimator,
+            true_sources,
+            true_strengths,
+            step_index=step_index,
+        ),
+    )
+    _run_precision_diagnostic_block(
+        "birth_candidates",
+        lambda: _log_birth_candidate_diagnostics(
+            estimator,
+            true_sources,
+            true_strengths,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            step_index=step_index,
+            candidate_log_limit=candidate_log_limit,
+        ),
+    )
 
 
 def _resolve_ig_threshold(
@@ -1799,7 +3831,7 @@ def _build_robot_path_segment(
     nominal_motion_speed_m_s: float,
     path_planner: str,
     planned_shield_program: tuple[int, ...] | None,
-    dss_diagnostics: dict[str, float | int | str] | None,
+    dss_diagnostics: dict[str, Any] | None,
 ) -> dict[str, object]:
     """Build an obstacle-aware robot travel segment for timing and rendering."""
     waypoints, obstacle_aware = _obstacle_aware_waypoints(
@@ -2005,9 +4037,14 @@ def _adaptive_mission_stop_reason(
     require_pf_convergence_for_coverage: bool = False,
     require_no_unresolved_discriminative_failures: bool = True,
     unresolved_discriminative_failure_min_count: int = 1,
+    require_model_order_ready: bool = True,
 ) -> str | None:
     """Return an adaptive mission-stop reason when exploration is sufficiently complete."""
     if len(visited_poses_xyz) < max(1, int(min_poses)):
+        return None
+    if bool(require_model_order_ready) and not _report_model_order_ready_for_stop(
+        estimator
+    ):
         return None
     if bool(require_no_unresolved_discriminative_failures) and (
         _has_unresolved_discriminative_pseudo_failures(
@@ -2286,6 +4323,96 @@ def _has_unresolved_discriminative_pseudo_failures(
         elif int(getattr(filt, "last_pseudo_source_failed", 0)) >= count_floor:
             return True
     return False
+
+
+def _final_model_order_status(estimator: object) -> dict[str, Any]:
+    """Return compact model-order and pseudo-source diagnostics for JSON output."""
+    if hasattr(estimator, "estimates"):
+        try:
+            estimator.estimates()
+        except RuntimeError:
+            pass
+    diagnostics = {}
+    if hasattr(estimator, "report_model_order_diagnostics"):
+        diagnostics = dict(estimator.report_model_order_diagnostics())
+    ready_values = [
+        bool(stats.get("model_order_ready", True))
+        for stats in diagnostics.values()
+        if isinstance(stats, dict)
+    ]
+    condition_values = [
+        float(stats.get("condition_number", 0.0))
+        for stats in diagnostics.values()
+        if isinstance(stats, dict)
+        and np.isfinite(float(stats.get("condition_number", 0.0)))
+    ]
+    margin_values = [
+        float(stats.get("criterion_margin_to_simpler", float("inf")))
+        for stats in diagnostics.values()
+        if isinstance(stats, dict)
+        and np.isfinite(float(stats.get("criterion_margin_to_simpler", float("inf"))))
+    ]
+    response_corr_values = [
+        float(stats.get("selected_max_response_correlation", 0.0))
+        for stats in diagnostics.values()
+        if isinstance(stats, dict)
+        and np.isfinite(
+            float(stats.get("selected_max_response_correlation", 0.0))
+        )
+    ]
+    pseudo_by_isotope: dict[str, dict[str, Any]] = {}
+    unresolved_reason_totals: dict[str, int] = {}
+    unresolved_structural_evidence: dict[str, Any] = {}
+    if hasattr(estimator, "unresolved_structural_evidence"):
+        try:
+            unresolved_structural_evidence = dict(
+                estimator.unresolved_structural_evidence()
+            )
+        except RuntimeError:
+            unresolved_structural_evidence = {}
+    filters = getattr(estimator, "filters", {})
+    if isinstance(filters, dict):
+        for isotope, filt in sorted(filters.items()):
+            reasons = getattr(filt, "last_pseudo_source_fail_reasons", {})
+            reason_payload = {
+                str(reason): int(count)
+                for reason, count in dict(reasons).items()
+            } if isinstance(reasons, dict) else {}
+            for reason, count in reason_payload.items():
+                unresolved_reason_totals[reason] = (
+                    int(unresolved_reason_totals.get(reason, 0)) + int(count)
+                )
+            pseudo_by_isotope[str(isotope)] = {
+                "verified": int(getattr(filt, "last_pseudo_source_verified", 0)),
+                "failed": int(getattr(filt, "last_pseudo_source_failed", 0)),
+                "pruned": int(getattr(filt, "last_pseudo_source_pruned", 0)),
+                "quarantined": int(
+                    getattr(filt, "last_pseudo_source_quarantined", 0)
+                ),
+                "quarantine_active": int(
+                    getattr(filt, "last_pseudo_source_quarantine_active", 0)
+                ),
+                "fail_reasons": reason_payload,
+            }
+    raw_ready = bool(all(ready_values)) if ready_values else True
+    return {
+        "all_model_order_ready": bool(
+            raw_ready and not unresolved_structural_evidence
+        ),
+        "all_model_order_ready_before_structural_gates": raw_ready,
+        "max_condition_number": (
+            float(max(condition_values)) if condition_values else None
+        ),
+        "min_bic_margin_to_simpler": (
+            float(min(margin_values)) if margin_values else None
+        ),
+        "max_response_correlation": (
+            float(max(response_corr_values)) if response_corr_values else None
+        ),
+        "unresolved_pseudo_source_reasons": unresolved_reason_totals,
+        "unresolved_structural_evidence": unresolved_structural_evidence,
+        "pseudo_source_verification": pseudo_by_isotope,
+    }
 
 
 def _signature_vector_is_dependent(
@@ -3462,11 +5589,61 @@ def run_live_pf(
                 f"transport_components={len(obstacle_grid.transport_boxes_m)}, "
                 f"templates={template_counts}"
             )
+    random_source_visibility_points: NDArray[np.float64] | None = None
+    random_source_visibility_diagnostics: dict[str, object] = {
+        "enabled": False,
+        "reference_point_count": 0,
+    }
     if normalized_source_generation_mode == "surface_random":
         source_rng_seed = (
             obstacle_seed if random_source_seed is None else random_source_seed
         )
         source_rng = np.random.default_rng(source_rng_seed)
+        source_visibility_enabled = bool(
+            runtime_config.get("random_source_visibility_filter", True)
+        )
+        source_visibility_min_fraction = max(
+            0.0,
+            float(runtime_config.get("random_source_min_visible_fraction", 0.10)),
+        )
+        source_visibility_clear_path_max_m = max(
+            0.0,
+            float(runtime_config.get("random_source_clear_path_max_m", 0.01)),
+        )
+        source_visibility_batch_size = max(
+            1,
+            int(runtime_config.get("random_source_visibility_batch_size", 256)),
+        )
+        source_visibility_max_attempts = max(
+            1,
+            int(
+                runtime_config.get(
+                    "random_source_visibility_max_attempts_per_source",
+                    4096,
+                )
+            ),
+        )
+        source_visibility_detector_height_m = float(
+            runtime_config.get("detector_height_m", env.detector_position[2])
+        )
+        if (
+            source_visibility_enabled
+            and source_visibility_min_fraction > 0.0
+            and obstacle_grid is not None
+            and obstacle_grid.blocked_cells
+        ):
+            random_source_visibility_points = _ground_visibility_reference_points(
+                env,
+                obstacle_grid,
+                robot_radius_m=float(robot_radius_m),
+                detector_height_m=source_visibility_detector_height_m,
+            )
+            print(
+                "Random source ground-visibility filter: "
+                f"min_visible_fraction={source_visibility_min_fraction:.3f}, "
+                f"reference_points={random_source_visibility_points.shape[0]}, "
+                f"clear_path_max_m={source_visibility_clear_path_max_m:.3f}"
+            )
         sources = generate_surface_sources(
             env=env,
             obstacle_grid=obstacle_grid,
@@ -3475,12 +5652,43 @@ def run_live_pf(
             rng=source_rng,
             count=max(1, int(random_source_count)),
             obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+            visibility_measurement_points=random_source_visibility_points,
+            visibility_min_fraction=(
+                source_visibility_min_fraction
+                if source_visibility_enabled
+                else 0.0
+            ),
+            visibility_detector_height_m=source_visibility_detector_height_m,
+            visibility_clear_path_max_m=source_visibility_clear_path_max_m,
+            visibility_batch_size=source_visibility_batch_size,
+            visibility_max_attempts_per_source=source_visibility_max_attempts,
+        )
+        random_source_visibility_diagnostics = _source_ground_visibility_payload(
+            sources,
+            obstacle_grid,
+            random_source_visibility_points,
+            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+            detector_height_m=source_visibility_detector_height_m,
+            clear_path_max_m=source_visibility_clear_path_max_m,
+            min_visible_fraction=(
+                source_visibility_min_fraction
+                if source_visibility_enabled
+                else 0.0
+            ),
         )
         print(
             "Generated surface-constrained random sources: "
             f"count={len(sources)}, seed={source_rng_seed}, "
             f"intensity_cps_1m={float(random_source_intensity_cps_1m):.6g}"
         )
+        if random_source_visibility_diagnostics.get("enabled"):
+            print(
+                "Random source ground visibility: "
+                "min_fraction="
+                f"{random_source_visibility_diagnostics['min_source_visible_fraction']:.3f}, "
+                "mean_fraction="
+                f"{random_source_visibility_diagnostics['mean_source_visible_fraction']:.3f}"
+            )
     elif sources is None:
         sources = _build_demo_sources()
     normals = generate_octant_orientations()
@@ -3496,6 +5704,35 @@ def run_live_pf(
         cleaned_tag = cleaned_tag.lstrip("_")
         if cleaned_tag:
             output_suffix = f"_{cleaned_tag}"
+    estimate_trace_enabled = bool(
+        runtime_config.get("intermediate_estimate_trace", True)
+    )
+    estimate_trace_log_enabled = bool(
+        runtime_config.get("intermediate_estimate_trace_log", True)
+    )
+    estimate_trace_log_every = max(
+        1,
+        int(runtime_config.get("intermediate_estimate_trace_log_every", 1)),
+    )
+    estimate_trace_max_log_records = max(
+        0,
+        int(runtime_config.get("intermediate_estimate_trace_max_log_records", 6)),
+    )
+    precision_diagnostic_birth_candidate_log_limit = int(
+        runtime_config.get("precision_diagnostic_birth_candidate_log_limit", 0)
+    )
+    precision_diagnostic_particle_log_limit = int(
+        runtime_config.get("precision_diagnostic_particle_log_limit", 0)
+    )
+    estimate_trace_out_path: Path | None = None
+    if save_outputs and estimate_trace_enabled:
+        estimate_trace_out_path = (
+            RESULTS_DIR
+            / "estimate_traces"
+            / f"intermediate_estimates{output_suffix}.jsonl"
+        )
+        estimate_trace_out_path.parent.mkdir(parents=True, exist_ok=True)
+        estimate_trace_out_path.write_text("", encoding="utf-8")
     cui_split_view_enabled = _resolve_cui_split_view_enabled(
         runtime_config,
         save_outputs=save_outputs,
@@ -3598,6 +5835,8 @@ def run_live_pf(
     planning_map = (
         traversability_map if traversability_map is not None else obstacle_grid
     )
+    pf_obstacle_attenuation_enabled = _pf_obstacle_attenuation_enabled(runtime_config)
+    pf_obstacle_grid = _pf_obstacle_grid_for_runtime(obstacle_grid, runtime_config)
 
     # Candidate sources: dense grid inside environment (used by birth proposals).
     spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
@@ -3697,6 +5936,9 @@ def run_live_pf(
             runtime_config.get("pf_obstacle_buildup_coeff", 0.0),
         )
     )
+    pf_obstacle_buildup_coeff = (
+        obstacle_buildup_coeff if pf_obstacle_grid is not None else 0.0
+    )
     print(
         "Shield thickness model: "
         f"scale={float(shield_thickness.thickness_scale):.6g} "
@@ -3708,6 +5950,13 @@ def run_live_pf(
         f"buildup=(Fe {shield_params.buildup_fe_coeff:.3g}, "
         f"Pb {shield_params.buildup_pb_coeff:.3g}, "
         f"obstacle {obstacle_buildup_coeff:.3g})"
+    )
+    print(
+        "PF obstacle attenuation: "
+        f"{'enabled' if pf_obstacle_attenuation_enabled else 'disabled'} "
+        f"(environment_obstacles={_has_environment_obstacles(obstacle_grid)}, "
+        f"pf_grid_active={_has_environment_obstacles(pf_obstacle_grid)}, "
+        f"buildup_coeff={pf_obstacle_buildup_coeff:.3g})"
     )
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
     if not mu_by_isotope:
@@ -4059,7 +6308,170 @@ def run_live_pf(
             1,
             int(_dss_value("candidate_preselect_multiplier", 8)),
         ),
+        remaining_budget_guidance=bool(
+            _dss_value("remaining_budget_guidance", True)
+        ),
+        remaining_budget_urgency_stations=max(
+            1,
+            int(_dss_value("remaining_budget_urgency_stations", 4)),
+        ),
+        remaining_route_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_weight", 2.0)),
+        ),
+        remaining_route_distance_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_distance_weight", 0.5)),
+        ),
+        remaining_route_revisit_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_revisit_weight", 1.0)),
+        ),
+        remaining_route_turn_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_turn_weight", 0.75)),
+        ),
+        remaining_route_backtrack_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_backtrack_weight", 1.0)),
+        ),
+        remaining_route_coverage_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_coverage_weight", 0.5)),
+        ),
+        remaining_route_frontier_weight=max(
+            0.0,
+            float(_dss_value("remaining_route_frontier_weight", 0.5)),
+        ),
+        same_isotope_direct_separation_guard=bool(
+            _dss_value("same_isotope_direct_separation_guard", True)
+        ),
+        same_isotope_direct_separation_epsilon=max(
+            0.0,
+            float(_dss_value("same_isotope_direct_separation_epsilon", 1.0e-9)),
+        ),
+        diagnostic_ranked_node_limit=int(
+            _dss_value("diagnostic_ranked_node_limit", 64)
+        ),
         rng_seed=obstacle_seed,
+    )
+    remaining_runtime = runtime_config.get("remaining_measurement_estimate", {})
+    if not isinstance(remaining_runtime, dict):
+        remaining_runtime = {}
+
+    def _remaining_value(key: str, default: object) -> object:
+        """Read remaining-measurement estimator settings from runtime config."""
+        if key in remaining_runtime:
+            return remaining_runtime[key]
+        legacy_key = f"remaining_measurement_{key}"
+        return runtime_config.get(legacy_key, default)
+
+    remaining_measurement_config = RemainingMeasurementConfig(
+        enabled=bool(_remaining_value("enabled", True)),
+        mode_cluster_radius_m=max(
+            1.0e-6,
+            float(
+                _remaining_value(
+                    "mode_cluster_radius_m",
+                    dss_config.mode_cluster_radius_m,
+                )
+            ),
+        ),
+        max_modes_per_isotope=max(
+            1,
+            int(
+                _remaining_value(
+                    "max_modes_per_isotope",
+                    dss_config.max_modes_per_isotope,
+                )
+            ),
+        ),
+        max_particles=(
+            None
+            if _remaining_value("max_particles", dss_config.planning_particles) is None
+            else max(
+                1,
+                int(_remaining_value("max_particles", dss_config.planning_particles)),
+            )
+        ),
+        planning_method=(
+            None
+            if _remaining_value("planning_method", dss_config.planning_method) is None
+            else str(_remaining_value("planning_method", dss_config.planning_method))
+        ),
+        target_position_spread_m=max(
+            1.0e-6,
+            float(_remaining_value("target_position_spread_m", 1.0)),
+        ),
+        target_strength_cv=max(
+            1.0e-6,
+            float(_remaining_value("target_strength_cv", 0.5)),
+        ),
+        target_cardinality_confidence=float(
+            np.clip(
+                float(_remaining_value("target_cardinality_confidence", 0.9)),
+                0.0,
+                1.0,
+            )
+        ),
+        pairwise_separation_threshold=max(
+            0.0,
+            float(_remaining_value("pairwise_separation_threshold", 9.0)),
+        ),
+        residual_chi2_threshold=max(
+            1.0e-12,
+            float(_remaining_value("residual_chi2_threshold", 9.0)),
+        ),
+        count_variance_floor=max(
+            1.0e-12,
+            float(
+                _remaining_value(
+                    "count_variance_floor",
+                    dss_config.count_variance_floor,
+                )
+            ),
+        ),
+        stop_budget=max(0.0, float(_remaining_value("stop_budget", 0.0))),
+        eta_default=float(_remaining_value("eta_default", 0.7)),
+        eta_min=float(_remaining_value("eta_min", 0.3)),
+        eta_max=float(_remaining_value("eta_max", 1.0)),
+        gain_epsilon=max(
+            1.0e-12,
+            float(_remaining_value("gain_epsilon", 1.0e-6)),
+        ),
+        max_reported_stations=max(
+            0,
+            int(_remaining_value("max_reported_stations", 99)),
+        ),
+        uncertainty_weight=max(
+            0.0,
+            float(_remaining_value("uncertainty_weight", 1.0)),
+        ),
+        cardinality_weight=max(
+            0.0,
+            float(_remaining_value("cardinality_weight", 1.0)),
+        ),
+        separation_weight=max(
+            0.0,
+            float(_remaining_value("separation_weight", 1.5)),
+        ),
+        verification_weight=max(
+            0.0,
+            float(_remaining_value("verification_weight", 1.0)),
+        ),
+        residual_weight=max(
+            0.0,
+            float(_remaining_value("residual_weight", 1.0)),
+        ),
+        dss_information_gain_weight=max(
+            0.0,
+            float(_remaining_value("dss_information_gain_weight", 1.0)),
+        ),
+        dss_count_utility_weight=max(
+            0.0,
+            float(_remaining_value("dss_count_utility_weight", 0.25)),
+        ),
+        range_scale=max(1.0, float(_remaining_value("range_scale", 1.35))),
     )
     likelihood_runtime = runtime_config.get("pf_count_likelihood", {})
     if not isinstance(likelihood_runtime, dict):
@@ -4156,6 +6568,9 @@ def run_live_pf(
             "mission_stop_require_no_unresolved_discriminative_failures",
             True,
         )
+    )
+    mission_stop_require_model_order_ready = bool(
+        runtime_config.get("mission_stop_require_model_order_ready", True)
     )
     mission_stop_unresolved_discriminative_fail_min_count = max(
         1,
@@ -4519,6 +6934,29 @@ def run_live_pf(
             int(runtime_config.get("birth_matching_pursuit_topk_candidates", 16)),
         ),
         birth_jitter_topk_candidates=birth_jitter_topk_candidates,
+        birth_global_rescue_enable=bool(
+            runtime_config.get("birth_global_rescue_enable", False)
+        ),
+        birth_global_rescue_max_candidates=max(
+            0,
+            int(runtime_config.get("birth_global_rescue_max_candidates", 8)),
+        ),
+        birth_global_rescue_min_residual_fraction=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "birth_global_rescue_min_residual_fraction",
+                    0.005,
+                )
+            ),
+        ),
+        birth_global_rescue_dedup_radius_m=max(
+            0.0,
+            float(runtime_config.get("birth_global_rescue_dedup_radius_m", 0.5)),
+        ),
+        birth_global_rescue_forced_min_delta_ll=float(
+            runtime_config.get("birth_global_rescue_forced_min_delta_ll", 0.0)
+        ),
         residual_decomposition_enable=bool(
             runtime_config.get("residual_decomposition_enable", True)
         ),
@@ -4557,6 +6995,10 @@ def run_live_pf(
             np.clip(
                 float(runtime_config.get("pseudo_source_corr_max", 0.995)), 0.0, 1.0
             )
+        ),
+        pseudo_source_temporal_sep_min=max(
+            0.0,
+            float(runtime_config.get("pseudo_source_temporal_sep_min", 0.0)),
         ),
         pseudo_source_quarantine_on_suppress=bool(
             runtime_config.get("pseudo_source_quarantine_on_suppress", True)
@@ -4643,6 +7085,18 @@ def run_live_pf(
                 runtime_config.get("conditional_strength_refit_prior_rel_sigma", 2.0)
             ),
         ),
+        source_strength_prior_mean=max(
+            0.0,
+            float(runtime_config.get("source_strength_prior_mean", 0.0)),
+        ),
+        source_strength_prior_weight=max(
+            0.0,
+            float(runtime_config.get("source_strength_prior_weight", 0.0)),
+        ),
+        source_strength_prior_rel_sigma=max(
+            1.0e-6,
+            float(runtime_config.get("source_strength_prior_rel_sigma", 1.0)),
+        ),
         report_strength_refit=bool(runtime_config.get("report_strength_refit", False)),
         report_strength_refit_iters=max(
             1,
@@ -4651,6 +7105,9 @@ def run_live_pf(
         report_strength_refit_eps=max(
             1.0e-15,
             float(runtime_config.get("report_strength_refit_eps", 1.0e-9)),
+        ),
+        report_strength_refit_use_all_measurements=bool(
+            runtime_config.get("report_strength_refit_use_all_measurements", True)
         ),
         report_strength_refit_preserve_cardinality=bool(
             runtime_config.get("report_strength_refit_preserve_cardinality", False)
@@ -4662,6 +7119,29 @@ def run_live_pf(
         report_strength_refit_prior_rel_sigma=max(
             1.0e-6,
             float(runtime_config.get("report_strength_refit_prior_rel_sigma", 2.0)),
+        ),
+        report_mle_rescue_enable=bool(
+            runtime_config.get("report_mle_rescue_enable", False)
+        ),
+        report_mle_rescue_max_candidates=max(
+            1,
+            int(runtime_config.get("report_mle_rescue_max_candidates", 12)),
+        ),
+        report_mle_rescue_max_posterior_candidates=max(
+            0,
+            int(runtime_config.get("report_mle_rescue_max_posterior_candidates", 8)),
+        ),
+        report_mle_rescue_max_residual_candidates=max(
+            0,
+            int(runtime_config.get("report_mle_rescue_max_residual_candidates", 8)),
+        ),
+        report_mle_rescue_dedup_radius_m=max(
+            0.0,
+            float(runtime_config.get("report_mle_rescue_dedup_radius_m", 0.5)),
+        ),
+        report_mle_rescue_min_residual_fraction=max(
+            0.0,
+            float(runtime_config.get("report_mle_rescue_min_residual_fraction", 0.01)),
         ),
         report_cluster_model_selection=bool(
             runtime_config.get("report_cluster_model_selection", True)
@@ -4793,10 +7273,8 @@ def run_live_pf(
             pf_conf.init_num_sources = (1, 1)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
-    delayed_resample_update = bool(runtime_config.get("delayed_resample_update", True))
-    joint_observation_update = (
-        bool(runtime_config.get("joint_observation_update", False))
-        and not delayed_resample_update
+    joint_observation_update, delayed_resample_update = _resolve_station_update_modes(
+        runtime_config
     )
     strict_planned_shield_program = bool(
         runtime_config.get(
@@ -4960,9 +7438,9 @@ def run_live_pf(
             shield_normals=normals,
             mu_by_isotope=mu_by_isotope,
             pf_config=pf_conf,
-            obstacle_grid=obstacle_grid,
+            obstacle_grid=pf_obstacle_grid,
             obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
-            obstacle_buildup_coeff=obstacle_buildup_coeff,
+            obstacle_buildup_coeff=pf_obstacle_buildup_coeff,
             detector_radius_m=pf_detector_radius_m,
             detector_aperture_samples=pf_detector_aperture_samples,
         )
@@ -5270,6 +7748,7 @@ def run_live_pf(
     last_spectrum: np.ndarray | None = None
     last_spectrum_components: dict[str, NDArray[np.float64]] = {}
     last_counts: dict[str, float] | None = None
+    last_measurement_for_diagnostics: Measurement | None = None
     representative_spectrum: np.ndarray | None = None
     representative_spectrum_components: dict[str, NDArray[np.float64]] = {}
     representative_counts: dict[str, float] | None = None
@@ -5284,6 +7763,7 @@ def run_live_pf(
     pending_motion_time_s = 0.0
     pending_path_segment: dict[str, object] | None = None
     path_segments: list[dict[str, object]] = []
+    remaining_measurement_estimates: list[dict[str, Any]] = []
     measurement_live_times_s: list[float] = []
     total_ig_wall_s = 0.0
     total_pf_wall_s = 0.0
@@ -5381,8 +7861,23 @@ def run_live_pf(
         f"occ_boundary_w={float(dss_config.lambda_occlusion_boundary):.3f} "
         f"turn_w={float(dss_config.lambda_turn_smoothness):.3f} "
         f"revisit_w={float(dss_config.eta_revisit):.3f} "
+        f"remaining_guidance={bool(dss_config.remaining_budget_guidance)} "
+        f"remaining_route_w={float(dss_config.remaining_route_weight):.3f} "
+        f"remaining_urgency={int(dss_config.remaining_budget_urgency_stations)} "
+        "same_iso_direct_guard="
+        f"{bool(dss_config.same_isotope_direct_separation_guard)} "
+        "same_iso_direct_eps="
+        f"{float(dss_config.same_isotope_direct_separation_epsilon):.3g} "
         f"min_station_sep={float(dss_config.min_station_separation_m):.2f}m "
         f"enforce_min_obs={bool(dss_config.enforce_min_observation)}"
+    )
+    print(
+        "Remaining measurement estimator: "
+        f"enabled={bool(remaining_measurement_config.enabled)} "
+        f"target_spread={float(remaining_measurement_config.target_position_spread_m):.2f}m "
+        f"target_card_conf={float(remaining_measurement_config.target_cardinality_confidence):.2f} "
+        f"sep_threshold={float(remaining_measurement_config.pairwise_separation_threshold):.2f} "
+        f"eta_default={float(remaining_measurement_config.eta_default):.2f}"
     )
     print(
         "PF count likelihood: "
@@ -5421,6 +7916,10 @@ def run_live_pf(
         f"mp_max_new={int(pf_conf.birth_matching_pursuit_max_new_sources)} "
         f"mp_topk={int(pf_conf.birth_matching_pursuit_topk_candidates)} "
         f"jitter_topk={pf_conf.birth_jitter_topk_candidates} "
+        f"global_rescue={bool(pf_conf.birth_global_rescue_enable)} "
+        f"global_rescue_max={int(pf_conf.birth_global_rescue_max_candidates)} "
+        f"global_rescue_min_frac={float(pf_conf.birth_global_rescue_min_residual_fraction):.3f} "
+        f"global_rescue_dedup={float(pf_conf.birth_global_rescue_dedup_radius_m):.2f} "
         f"max_per_update={pf_conf.birth_max_per_update} "
         f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
         f"residual_layers={bool(pf_conf.residual_decomposition_enable)} "
@@ -5440,8 +7939,12 @@ def run_live_pf(
         f"min_snr={float(pf_conf.conditional_strength_refit_min_snr):.3f} "
         f"prior_weight={float(pf_conf.conditional_strength_refit_prior_weight):.3f} "
         f"prior_rel_sigma={float(pf_conf.conditional_strength_refit_prior_rel_sigma):.3f} "
+        f"abs_q_prior_mean={float(pf_conf.source_strength_prior_mean):.3f} "
+        f"abs_q_prior_weight={float(pf_conf.source_strength_prior_weight):.3f} "
+        f"abs_q_prior_rel_sigma={float(pf_conf.source_strength_prior_rel_sigma):.3f} "
         f"report_refit={bool(pf_conf.report_strength_refit)} "
         f"report_refit_iters={int(pf_conf.report_strength_refit_iters)} "
+        f"report_refit_all_measurements={bool(pf_conf.report_strength_refit_use_all_measurements)} "
         f"weak_prune_min_counts={float(pf_conf.weak_source_prune_min_expected_count):.3f} "
         f"weak_prune_min_fraction={float(pf_conf.weak_source_prune_min_fraction):.4f} "
         f"weak_prune_min_age={int(pf_conf.weak_source_prune_min_age)} "
@@ -5450,7 +7953,8 @@ def run_live_pf(
         f"report_prior_rel_sigma={float(pf_conf.report_strength_refit_prior_rel_sigma):.3f} "
         f"report_require_posterior_match={bool(pf_conf.report_model_order_require_posterior_match)} "
         f"report_prune_particles={bool(pf_conf.report_model_order_prune_particles)} "
-        f"report_exclude_unverified={bool(pf_conf.report_exclude_unverified_sources)}"
+        f"report_exclude_unverified={bool(pf_conf.report_exclude_unverified_sources)} "
+        f"report_mle_rescue={bool(pf_conf.report_mle_rescue_enable)}"
     )
     print(
         "PF shield-program update: "
@@ -5479,7 +7983,8 @@ def run_live_pf(
         "Python CPU workers: "
         f"general={python_worker_count_resolved} "
         f"ig_grid={ig_workers} "
-        f"dss_program_eval={dss_config.program_eval_workers}"
+        f"dss_program_eval={dss_config.program_eval_workers} "
+        f"pf_structural_trials={pf_conf.structural_trial_workers}"
     )
     print(
         "Candidate grid: "
@@ -5565,7 +8070,10 @@ def run_live_pf(
     print(
         "PF parallelism: "
         f"parallel_isotope_updates={bool(estimator.pf_config.parallel_isotope_updates)} "
-        f"parallel_isotope_workers={estimator.pf_config.parallel_isotope_workers}"
+        f"parallel_isotope_workers={estimator.pf_config.parallel_isotope_workers} "
+        f"structural_trial_workers={estimator.pf_config.structural_trial_workers} "
+        f"structural_trial_parallel_min_trials="
+        f"{estimator.pf_config.structural_trial_parallel_min_trials}"
     )
     print(f"Simulation backend: {sim_backend}")
     print(
@@ -5598,6 +8106,7 @@ def run_live_pf(
         f"birth_residual_min_support={mission_stop_birth_residual_min_support} "
         "require_no_unresolved_discriminative_failures="
         f"{mission_stop_require_no_unresolved_discriminative_failures} "
+        f"require_model_order_ready={mission_stop_require_model_order_ready} "
         "unresolved_fail_min_count="
         f"{mission_stop_unresolved_discriminative_fail_min_count}"
     )
@@ -5612,6 +8121,7 @@ def run_live_pf(
             "usd_path": reset_usd_path,
             "room_size_xyz": [env.size_x, env.size_y, env.size_z],
             "source_count": len(sources),
+            "random_source_visibility": random_source_visibility_diagnostics,
             "sources": [
                 {
                     "isotope": source.isotope,
@@ -5668,6 +8178,21 @@ def run_live_pf(
             "obstacle_blocked_fraction": (
                 None if obstacle_grid is None else float(obstacle_grid.blocked_fraction)
             ),
+            "pf_obstacle_attenuation": bool(pf_obstacle_attenuation_enabled),
+            "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
+            "remaining_measurement_estimator": {
+                "enabled": bool(remaining_measurement_config.enabled),
+                "target_position_spread_m": float(
+                    remaining_measurement_config.target_position_spread_m
+                ),
+                "target_cardinality_confidence": float(
+                    remaining_measurement_config.target_cardinality_confidence
+                ),
+                "pairwise_separation_threshold": float(
+                    remaining_measurement_config.pairwise_separation_threshold
+                ),
+                "eta_default": float(remaining_measurement_config.eta_default),
+            },
             "source_count": len(sources),
             "sources": [
                 {
@@ -5791,6 +8316,13 @@ def run_live_pf(
             ),
             "dss_revisit_penalty_weight": float(dss_config.eta_revisit),
             "dss_min_station_separation_m": float(dss_config.min_station_separation_m),
+            "dss_remaining_budget_guidance": bool(
+                dss_config.remaining_budget_guidance
+            ),
+            "dss_remaining_route_weight": float(dss_config.remaining_route_weight),
+            "dss_remaining_budget_urgency_stations": int(
+                dss_config.remaining_budget_urgency_stations
+            ),
         }
     )
     ig_max_global = 0.0
@@ -6328,6 +8860,7 @@ def run_live_pf(
                     RPb=RPb_sel,
                     detector_position=pose_for_pf,
                 )
+                last_measurement_for_diagnostics = meas
                 pf_start = time.perf_counter()
                 if joint_observation_update:
                     joint_update_records.append(
@@ -6485,6 +9018,43 @@ def run_live_pf(
                 viz_elapsed += time.perf_counter() - viz_start
                 total_viz_wall_s += viz_elapsed
                 _log_pf_diagnostics(estimator, step_counter)
+                _log_precision_degradation_diagnostics(
+                    estimator,
+                    decomposer,
+                    last_measurement_for_diagnostics,
+                    true_src,
+                    true_strengths,
+                    env,
+                    obstacle_grid,
+                    obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+                    step_index=step_counter,
+                    candidate_log_limit=precision_diagnostic_birth_candidate_log_limit,
+                    particle_log_limit=precision_diagnostic_particle_log_limit,
+                )
+                if estimate_trace_out_path is not None or estimate_trace_log_enabled:
+                    _emit_intermediate_estimate_trace(
+                        estimator,
+                        isotopes,
+                        frame,
+                        true_src,
+                        true_strengths,
+                        env,
+                        obstacle_grid,
+                        step_index=step_counter,
+                        elapsed_s=elapsed,
+                        counts_by_isotope={
+                            str(key): float(value) for key, value in z_counts.items()
+                        },
+                        obstacle_height_m=float(
+                            runtime_config.get("obstacle_height_m", 2.0)
+                        ),
+                        match_radius_m=float(eval_match_radius_m),
+                        trace_path=estimate_trace_out_path,
+                        log_enabled=estimate_trace_log_enabled,
+                        log_every=estimate_trace_log_every,
+                        max_log_records=estimate_trace_max_log_records,
+                        estimate_source="current_map",
+                    )
                 print(
                     f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
                     f"display_prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s "
@@ -6539,7 +9109,58 @@ def run_live_pf(
                         f"pf={pf_elapsed:.3f}s "
                         f"per_measurement={per_measurement_pf:.3f}s"
                     )
-                    _log_pf_diagnostics(estimator, max(step_counter - 1, 0))
+                    finalize_step_index = max(step_counter - 1, 0)
+                    _log_pf_diagnostics(estimator, finalize_step_index)
+                    _log_precision_degradation_diagnostics(
+                        estimator,
+                        decomposer,
+                        last_measurement_for_diagnostics,
+                        true_src,
+                        true_strengths,
+                        env,
+                        obstacle_grid,
+                        obstacle_height_m=float(
+                            runtime_config.get("obstacle_height_m", 2.0)
+                        ),
+                        step_index=finalize_step_index,
+                        candidate_log_limit=(
+                            precision_diagnostic_birth_candidate_log_limit
+                        ),
+                        particle_log_limit=precision_diagnostic_particle_log_limit,
+                    )
+                    _log_report_model_order_diagnostics(
+                        estimator,
+                        finalize_step_index,
+                        label=f"pose_{current_pose_idx}_finalize",
+                    )
+                    if (
+                        last_frame is not None
+                        and (
+                            estimate_trace_out_path is not None
+                            or estimate_trace_log_enabled
+                        )
+                    ):
+                        _emit_intermediate_estimate_trace(
+                            estimator,
+                            isotopes,
+                            last_frame,
+                            true_src,
+                            true_strengths,
+                            env,
+                            obstacle_grid,
+                            step_index=finalize_step_index,
+                            elapsed_s=elapsed,
+                            counts_by_isotope=dict(last_counts or {}),
+                            obstacle_height_m=float(
+                                runtime_config.get("obstacle_height_m", 2.0)
+                            ),
+                            match_radius_m=float(eval_match_radius_m),
+                            trace_path=estimate_trace_out_path,
+                            log_enabled=estimate_trace_log_enabled,
+                            log_every=estimate_trace_log_every,
+                            max_log_records=estimate_trace_max_log_records,
+                            estimate_source="post_finalize_map",
+                        )
                     pruned_display_force_refresh = True
             elif joint_observation_update and joint_update_records:
                 pf_start = time.perf_counter()
@@ -6588,7 +9209,56 @@ def run_live_pf(
                     f"pf={pf_elapsed:.3f}s "
                     f"per_measurement={per_measurement_pf:.3f}s"
                 )
-                _log_pf_diagnostics(estimator, max(step_counter - 1, 0))
+                joint_step_index = max(step_counter - 1, 0)
+                _log_pf_diagnostics(estimator, joint_step_index)
+                _log_precision_degradation_diagnostics(
+                    estimator,
+                    decomposer,
+                    last_measurement_for_diagnostics,
+                    true_src,
+                    true_strengths,
+                    env,
+                    obstacle_grid,
+                    obstacle_height_m=float(
+                        runtime_config.get("obstacle_height_m", 2.0)
+                    ),
+                    step_index=joint_step_index,
+                    candidate_log_limit=precision_diagnostic_birth_candidate_log_limit,
+                    particle_log_limit=precision_diagnostic_particle_log_limit,
+                )
+                _log_report_model_order_diagnostics(
+                    estimator,
+                    joint_step_index,
+                    label=f"pose_{current_pose_idx}_joint_update",
+                )
+                if (
+                    last_frame is not None
+                    and (
+                        estimate_trace_out_path is not None
+                        or estimate_trace_log_enabled
+                    )
+                ):
+                    _emit_intermediate_estimate_trace(
+                        estimator,
+                        isotopes,
+                        last_frame,
+                        true_src,
+                        true_strengths,
+                        env,
+                        obstacle_grid,
+                        step_index=joint_step_index,
+                        elapsed_s=elapsed,
+                        counts_by_isotope=dict(last_counts or {}),
+                        obstacle_height_m=float(
+                            runtime_config.get("obstacle_height_m", 2.0)
+                        ),
+                        match_radius_m=float(eval_match_radius_m),
+                        trace_path=estimate_trace_out_path,
+                        log_enabled=estimate_trace_log_enabled,
+                        log_every=estimate_trace_log_every,
+                        max_log_records=estimate_trace_max_log_records,
+                        estimate_source="post_joint_update_map",
+                    )
                 pruned_display_force_refresh = True
             if (
                 save_outputs
@@ -6609,9 +9279,15 @@ def run_live_pf(
                 and last_max_ig < ig_threshold_current
                 and (pose_counter + 1) >= mission_stop_min_convergence_poses
             ):
-                if estimator.should_stop_exploration(
-                    ig_threshold=ig_threshold_current,
-                    live_time_s=planning_live_time,
+                if (
+                    (
+                        not bool(mission_stop_require_model_order_ready)
+                        or _report_model_order_ready_for_stop(estimator)
+                    )
+                    and estimator.should_stop_exploration(
+                        ig_threshold=ig_threshold_current,
+                        live_time_s=planning_live_time,
+                    )
                 ):
                     print(
                         "Converged; stopping exploration "
@@ -6642,6 +9318,7 @@ def run_live_pf(
                     unresolved_discriminative_failure_min_count=(
                         mission_stop_unresolved_discriminative_fail_min_count
                     ),
+                    require_model_order_ready=mission_stop_require_model_order_ready,
                 )
                 if stop_reason is not None:
                     print(f"Adaptive mission stop: {stop_reason}.")
@@ -6673,7 +9350,8 @@ def run_live_pf(
                 f"Generated {len(candidates)} candidate poses. Computing best next pose..."
             )
             planned_program_for_next: tuple[int, ...] | None = None
-            dss_diagnostics: dict[str, float | int | str] | None = None
+            dss_diagnostics: dict[str, Any] | None = None
+            dss_first_node = None
             baseline_path_selection = select_baseline_next_pose(
                 baseline_path_policy,
                 candidate_poses_xyz=candidates,
@@ -6692,6 +9370,41 @@ def run_live_pf(
                 )
             elif path_planner_resolved == "dss_pp":
                 dss_selection_config = dss_config
+                remaining_guidance_estimate = None
+                if (
+                    bool(dss_selection_config.remaining_budget_guidance)
+                    and bool(remaining_measurement_config.enabled)
+                    and estimator.measurements
+                ):
+                    fallback_pair = (
+                        0
+                        if current_shield_pair_id is None
+                        else int(current_shield_pair_id)
+                    )
+                    remaining_guidance_estimate = (
+                        estimate_remaining_measurement_budget(
+                            estimator,
+                            shield_program_pair_ids=(fallback_pair,),
+                            live_time_s=planning_live_time,
+                            config=remaining_measurement_config,
+                            current_station_count=pose_counter,
+                            update_history=False,
+                        )
+                    )
+                    dss_selection_config = replace(
+                        dss_selection_config,
+                        remaining_station_estimate=(
+                            remaining_guidance_estimate.estimated_remaining_stations
+                        ),
+                    )
+                    print(
+                        "DSS-PP remaining-budget guidance: "
+                        "estimated_remaining_stations="
+                        f"{remaining_guidance_estimate.estimated_remaining_stations} "
+                        f"range={remaining_guidance_estimate.estimated_remaining_station_low}-"
+                        f"{remaining_guidance_estimate.estimated_remaining_station_high} "
+                        f"bottleneck={remaining_guidance_estimate.bottleneck}"
+                    )
                 residual_burst_active = _has_birth_residual_evidence(
                     estimator,
                     min_support=max(
@@ -6703,7 +9416,7 @@ def run_live_pf(
                     dss_config.program_length
                 ):
                     dss_selection_config = replace(
-                        dss_config,
+                        dss_selection_config,
                         program_length=int(dss_residual_program_length_resolved),
                     )
                     print(
@@ -6728,6 +9441,7 @@ def run_live_pf(
                     int(pair_id) for pair_id in dss_result.shield_program.pair_ids
                 )
                 dss_diagnostics = dict(dss_result.diagnostics)
+                dss_first_node = dss_result.sequence[0] if dss_result.sequence else None
                 print(
                     "DSS-PP selected next station: "
                     f"pose={next_pose.tolist()} "
@@ -6751,8 +9465,15 @@ def run_live_pf(
                     f"vertical_env_sig={float(dss_result.sequence[0].vertical_environment_signature_score):.6g} "
                     f"occ_boundary={float(dss_result.sequence[0].occlusion_boundary_gain):.6g} "
                     f"turn_penalty={float(dss_result.sequence[0].turn_penalty):.6g} "
+                    f"remaining_route_pressure={float(dss_result.sequence[0].remaining_route_pressure):.6g} "
+                    f"remaining_route_penalty={float(dss_result.sequence[0].remaining_route_penalty):.6g} "
+                    f"remaining_route_gain={float(dss_result.sequence[0].remaining_route_gain):.6g} "
                     f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
                     f"compute={dss_elapsed:.3f}s"
+                )
+                _log_dss_ranked_node_diagnostics(
+                    dss_diagnostics,
+                    label=f"pose_{current_pose_idx}_next",
                 )
             else:
                 next_idx = select_next_pose_from_candidates(
@@ -6773,6 +9494,34 @@ def run_live_pf(
                     min_observation_max_particles=pf_conf.pose_min_observation_max_particles,
                 )
                 next_pose = candidates[next_idx]
+            if bool(remaining_measurement_config.enabled) and estimator.measurements:
+                remaining_program = planned_program_for_next
+                if remaining_program is None:
+                    fallback_pair = (
+                        0
+                        if current_shield_pair_id is None
+                        else int(current_shield_pair_id)
+                    )
+                    remaining_program = (fallback_pair,)
+                remaining_estimate = estimate_remaining_measurement_budget(
+                    estimator,
+                    next_pose_xyz=next_pose,
+                    shield_program_pair_ids=remaining_program,
+                    live_time_s=planning_live_time,
+                    dss_node=dss_first_node,
+                    dss_diagnostics=dss_diagnostics,
+                    config=remaining_measurement_config,
+                    current_station_count=pose_counter,
+                )
+                remaining_payload = remaining_estimate.to_dict()
+                remaining_payload["next_pose"] = [
+                    float(value) for value in np.asarray(next_pose, dtype=float)
+                ]
+                remaining_payload["planned_pairs"] = [
+                    int(value) for value in remaining_program
+                ]
+                remaining_measurement_estimates.append(remaining_payload)
+                print(format_remaining_measurement_estimate(remaining_estimate))
             pending_path_segment = _build_robot_path_segment(
                 map_api=planning_map,
                 from_pose_xyz=pose,
@@ -6838,6 +9587,10 @@ def run_live_pf(
             "last_spectrum_plot": last_spectrum_out_path.as_posix(),
             "summary_json": summary_out_path.as_posix(),
         }
+        if estimate_trace_out_path is not None:
+            result_paths["intermediate_estimate_trace_jsonl"] = (
+                estimate_trace_out_path.as_posix()
+            )
         if cui_split_viz is not None:
             result_paths.update(
                 {
@@ -7009,6 +9762,19 @@ def run_live_pf(
             dss_config.lambda_environment_signature
         ),
         "dss_occlusion_boundary_weight": float(dss_config.lambda_occlusion_boundary),
+        "dss_remaining_budget_guidance": bool(dss_config.remaining_budget_guidance),
+        "dss_remaining_route_weight": float(dss_config.remaining_route_weight),
+        "dss_same_isotope_direct_separation_guard": bool(
+            dss_config.same_isotope_direct_separation_guard
+        ),
+        "dss_same_isotope_direct_separation_epsilon": float(
+            dss_config.same_isotope_direct_separation_epsilon
+        ),
+        "mission_stop_require_model_order_ready": bool(
+            mission_stop_require_model_order_ready
+        ),
+        "pf_obstacle_attenuation": bool(pf_obstacle_attenuation_enabled),
+        "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
         "total_compute_time_s": total_compute_time_s,
         "ig_compute_time_s": float(total_ig_wall_s),
         "mean_orientation_selection_time_s": mean_ig_wall_s,
@@ -7155,12 +9921,19 @@ def run_live_pf(
             obstacle_height_m=surface_obstacle_height_m,
         ),
     }
+    pf_obstacle_diagnostics = {
+        "pf_obstacle_attenuation_active": bool(pf_obstacle_attenuation_enabled),
+        "environment_obstacles_active": _has_environment_obstacles(obstacle_grid),
+        "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
+        "obstacle_buildup_coeff": float(pf_obstacle_buildup_coeff),
+    }
     metrics = compute_metrics(
         gt_by_iso,
         est_by_iso,
         match_radius_m=eval_match_radius_m,
     )
     print_metrics_report(metrics)
+    final_model_order_status = _final_model_order_status(estimator)
     final_payload = {
         "measurements_completed": int(step_counter),
         "mission_metrics": {
@@ -7170,13 +9943,22 @@ def run_live_pf(
         },
         "match_metrics": metrics,
         "estimated_sources": est_by_iso,
+        "remaining_measurement_estimates": remaining_measurement_estimates,
+        "last_remaining_measurement_estimate": (
+            None
+            if not remaining_measurement_estimates
+            else remaining_measurement_estimates[-1]
+        ),
+        "random_source_visibility": random_source_visibility_diagnostics,
         "source_surface_diagnostics": source_surface_diagnostics,
+        "pf_obstacle_diagnostics": pf_obstacle_diagnostics,
         "final_estimate_diagnostics": {
             "stages": {
                 stage: _serialize_estimate_stage(stage_estimates)
                 for stage, stage_estimates in final_estimate_stages.items()
             },
             "report_model_order": estimator.report_model_order_diagnostics(),
+            "model_order_status": final_model_order_status,
         },
         "ground_truth_sources": gt_by_iso,
         "last_counts": last_counts,

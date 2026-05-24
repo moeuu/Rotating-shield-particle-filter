@@ -333,35 +333,37 @@ def _shell_components(
     """Return thin wall components for a hollow rectangular shell."""
     cx, cy = center_xy
     sx, sy = size_xy
-    t = min(float(thickness_m), 0.45 * min(sx, sy))
     h = float(height_m)
+    t = min(float(thickness_m), 0.45 * min(sx, sy, h))
+    inner_y = max(sy - 2.0 * t, 1.0e-3)
+    inner_h = max(h - 2.0 * t, 1.0e-3)
     components = [
         _component(
             f"{name_prefix}_west_panel",
             center_xy=(cx - 0.5 * sx + 0.5 * t, cy),
             z_center=0.5 * h,
-            size_xyz=(t, sy, h),
+            size_xyz=(t, inner_y, inner_h),
             material=material,
         ),
         _component(
             f"{name_prefix}_east_panel",
             center_xy=(cx + 0.5 * sx - 0.5 * t, cy),
             z_center=0.5 * h,
-            size_xyz=(t, sy, h),
+            size_xyz=(t, inner_y, inner_h),
             material=material,
         ),
         _component(
             f"{name_prefix}_south_panel",
             center_xy=(cx, cy - 0.5 * sy + 0.5 * t),
             z_center=0.5 * h,
-            size_xyz=(sx, t, h),
+            size_xyz=(sx, t, inner_h),
             material=material,
         ),
         _component(
             f"{name_prefix}_north_panel",
             center_xy=(cx, cy + 0.5 * sy - 0.5 * t),
             z_center=0.5 * h,
-            size_xyz=(sx, t, h),
+            size_xyz=(sx, t, inner_h),
             material=material,
         ),
         _component(
@@ -420,6 +422,8 @@ def _pipe_rack_components(
     beam = 0.055
     xs = (cx - 0.42 * sx, cx + 0.42 * sx)
     ys = (cy - 0.42 * sy, cy + 0.42 * sy)
+    span_x = max(xs[1] - xs[0] - beam, 1.0e-3)
+    span_y = max(ys[1] - ys[0] - beam, 1.0e-3)
     components: list[ObstacleComponent] = []
     for leg_idx, x in enumerate(xs):
         for y in ys:
@@ -438,7 +442,7 @@ def _pipe_rack_components(
                 f"{name_prefix}_rail_x_{len(components)}",
                 center_xy=(cx, ys[0]),
                 z_center=z_center,
-                size_xyz=(sx, beam, beam),
+                size_xyz=(span_x, beam, beam),
                 material="steel",
             )
         )
@@ -447,7 +451,7 @@ def _pipe_rack_components(
                 f"{name_prefix}_rail_x_{len(components)}",
                 center_xy=(cx, ys[1]),
                 z_center=z_center,
-                size_xyz=(sx, beam, beam),
+                size_xyz=(span_x, beam, beam),
                 material="steel",
             )
         )
@@ -456,7 +460,7 @@ def _pipe_rack_components(
                 f"{name_prefix}_rail_y_{len(components)}",
                 center_xy=(xs[0], cy),
                 z_center=z_center,
-                size_xyz=(beam, sy, beam),
+                size_xyz=(beam, span_y, beam),
                 material="steel",
             )
         )
@@ -465,7 +469,7 @@ def _pipe_rack_components(
                 f"{name_prefix}_rail_y_{len(components)}",
                 center_xy=(xs[1], cy),
                 z_center=z_center,
-                size_xyz=(beam, sy, beam),
+                size_xyz=(beam, span_y, beam),
                 material="steel",
             )
         )

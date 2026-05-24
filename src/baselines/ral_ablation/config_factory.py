@@ -264,8 +264,10 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "birth_use_shield_coded_residual": False,
             "birth_residual_always_try": False,
             "birth_residual_expand_structural_particles": False,
+            "birth_global_rescue_enable": False,
             "residual_decomposition_enable": False,
             "peak_suppression_enable": False,
+            "report_mle_rescue_enable": False,
         },
     ),
     AblationVariant(
@@ -277,6 +279,22 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "occlusion_boundary_weight": 0.0,
             },
         },
+    ),
+    AblationVariant(
+        name="no_pf_obstacle_attenuation",
+        description=(
+            "Keep Geant4 obstacles and obstacle-aware planning but remove "
+            "known-obstacle attenuation from the PF observation kernel."
+        ),
+        overrides={"pf_obstacle_attenuation": False},
+    ),
+    AblationVariant(
+        name="volume_source_prior",
+        description=(
+            "Use legacy full-volume PF source-position support instead of "
+            "known room, floor, ceiling, and obstacle surfaces."
+        ),
+        overrides={"source_surface_prior": False},
     ),
 )
 
@@ -533,8 +551,6 @@ def _trial_command(
         "--birth",
         "--max-sources",
         str(int(max_sources)),
-        "--max-poses",
-        "8",
         "--adaptive-dwell",
         "--measurement-time-s",
         "30",
@@ -557,7 +573,15 @@ def write_ablation_plan(
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("case", "variant", "seed", "config_path", "source_path", "command"),
+            fieldnames=(
+                "case",
+                "variant",
+                "seed",
+                "config_path",
+                "source_path",
+                "command",
+            ),
+            lineterminator="\n",
         )
         writer.writeheader()
         for entry in entries:

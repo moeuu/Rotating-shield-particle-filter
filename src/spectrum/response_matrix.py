@@ -196,6 +196,7 @@ def default_resolution() -> Callable[[float], float]:
     """
 
     def sigma(energy_keV: float) -> float:
+        """Return the energy-dependent Gaussian sigma in keV."""
         return max(0.5 * np.sqrt(energy_keV) - 1.5, 0.1)
 
     return sigma
@@ -205,6 +206,7 @@ def constant_efficiency(value: float = 1.0) -> Callable[[float], float]:
     """Return a constant detection efficiency function."""
 
     def eff(_: float) -> float:
+        """Return the configured constant efficiency."""
         return value
 
     return eff

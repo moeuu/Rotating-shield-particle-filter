@@ -122,6 +122,15 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
         float(np.sum(spectrum)),
         rel=1e-4,
     )
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["status"] == "ok"
+    assert diagnostics["fit_isotopes"] == isotopes
+    assert diagnostics["observed_total_counts"] == pytest.approx(float(np.sum(spectrum)))
+    assert diagnostics["fitted_total_counts"] == pytest.approx(
+        float(np.sum(decomposer.last_response_poisson_fit)),
+    )
+    assert diagnostics["design_condition_number"] >= 1.0
+    assert "Cs-137" in diagnostics["snr"]
 
 
 def test_response_poisson_recovers_weak_peaks_under_co_dominant_continuum() -> None:

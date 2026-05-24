@@ -2065,6 +2065,7 @@ def expected_counts_single_isotope(
         k = kernel
 
     def _normal_from_R(R: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return a shield normal from either a vector or rotation matrix."""
         if R.ndim == 1:
             return np.asarray(R, dtype=float)
         if R.shape == (3, 3):

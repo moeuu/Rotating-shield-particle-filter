@@ -21,6 +21,19 @@
 - After changing code, always run `pytest` and ensure tests pass.
 
 
+## RA-L paper ablation plan
+
+- Before running RA-L paper ablations, read
+  `docs/ral_minimal_ablation_plan.md`.
+- The current RA-L paper subset is 13 full-simulation runs:
+  `proposed`, `baseline_passive_no_shield`, `round_robin_shield`, and
+  `one_step_path` for all three cases, plus `no_residual_birth` only for
+  `case03_mixed_cardinality`.
+- Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
+  `results/ral_ablation/ral_paper_subset_manifest.csv` and
+  `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.
+
+
 ## Compute parallelism policy
 
 - Before adding PF, planning, spectrum-processing, obstacle-attenuation, or

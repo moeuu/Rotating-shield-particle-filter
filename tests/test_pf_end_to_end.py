@@ -162,6 +162,11 @@ def test_step_diagnostics_can_skip_report_estimate_recomputation():
     assert mmse_pos.shape == (0, 3)
     assert mmse_strength.shape == (0,)
     assert diagnostics["Cs-137"]["r_mean"] >= 0.0
+    assert "r_weighted_mean" in diagnostics["Cs-137"]
+    assert "r_probability_by_count" in diagnostics["Cs-137"]
+    assert sum(diagnostics["Cs-137"]["r_probability_by_count"].values()) == pytest.approx(
+        1.0
+    )
 
 
 def test_report_refit_removes_redundant_duplicate_cluster():

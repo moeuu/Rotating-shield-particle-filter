@@ -24,6 +24,9 @@ from measurement.shielding import (
 )
 from pf.state import IsotopeState
 
+_OBSTACLE_TAU_ELEMENT_BUDGET_FLOAT64 = 32_000_000
+_OBSTACLE_TAU_ELEMENT_BUDGET_FLOAT32 = 64_000_000
+
 
 def _finite_sphere_geometric_term_torch(
     distance: "torch.Tensor",
@@ -291,7 +294,11 @@ def _obstacle_tau_between_points_cm_torch(
         # ``source.shape[:-1] + (box_chunk,)``.  Finite detector aperture and
         # multi-source particles can make ``source.shape[:-1]`` very large, so
         # bound the box chunk by element count rather than by box count alone.
-        element_budget = 4_000_000 if dtype == torch.float64 else 8_000_000
+        element_budget = (
+            _OBSTACLE_TAU_ELEMENT_BUDGET_FLOAT64
+            if dtype == torch.float64
+            else _OBSTACLE_TAU_ELEMENT_BUDGET_FLOAT32
+        )
         chunk_size = min(chunk_size, max(1, int(element_budget // segment_count)))
     tau = torch.zeros(source.shape[:-1], device=device, dtype=dtype)
     for start in range(0, int(boxes_t.shape[0]), chunk_size):

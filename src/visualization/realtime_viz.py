@@ -601,6 +601,7 @@ class RealTimePFVisualizer:
             line.set_zorder(10)
 
     def _init_axes(self) -> None:
+        """Initialize 3-D axis limits, ticks, labels, and aspect ratio."""
         xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
         self.ax3d.set_xlim(xmin, xmax)
         self.ax3d.set_ylim(ymin, ymax)
@@ -1260,6 +1261,7 @@ class RealTimePFVisualizer:
         hidden: list[tuple[Any, bool]] = []
 
         def _hide(artist: Any) -> None:
+            """Hide one artist while recording its previous visibility."""
             if artist is None:
                 return
             if hasattr(artist, "get_visible") and hasattr(artist, "set_visible"):

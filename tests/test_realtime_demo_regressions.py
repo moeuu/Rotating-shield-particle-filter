@@ -12,8 +12,9 @@ from pf.estimator import (
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator,
 )
+from pf.likelihood import expected_counts_per_source
 from pf.mixing import prune_spurious_sources_continuous
-from pf.particle_filter import IsotopeParticle
+from pf.particle_filter import IsotopeParticle, MeasurementData
 from pf.state import IsotopeState
 from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
@@ -23,22 +24,29 @@ from realtime_demo import (
     _all_pf_filters_converged,
     _argv_requests_cui,
     _build_candidate_sources,
+    _build_intermediate_estimate_trace_payload,
     _build_robot_path_segment,
     _compute_shield_selection_grid,
     _evaluate_spectrum_counts,
     _filter_absent_final_estimates,
     _filter_reachable_candidates,
+    _format_estimate_trace_log_line,
+    _format_truth_coverage_log_line,
+    _final_model_order_status,
     _has_birth_residual_evidence,
     _has_unresolved_discriminative_pseudo_failures,
     _inflate_low_signal_variances,
     _is_adaptive_spectrum_ready,
     _isotope_count_balance_penalty,
+    _pf_obstacle_attenuation_enabled,
+    _pf_obstacle_grid_for_runtime,
     _resolve_ig_workers,
     _resolve_mission_max_poses,
     _resolve_plot_save_interval,
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
     _resolve_display_prune_refresh_interval,
+    _resolve_station_update_modes,
     _particle_surface_diagnostics,
     _select_best_pair_from_scores,
     _should_refresh_display_pruned_estimates,
@@ -51,6 +59,7 @@ from realtime_demo import (
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer
+from visualization.realtime_viz import PFFrame
 
 
 def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
@@ -59,6 +68,22 @@ def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
 
     assert _resolve_mission_max_poses(8, runtime_config) == 8
     assert _resolve_mission_max_poses(None, runtime_config) == 10
+
+
+def test_joint_observation_update_disables_delayed_resample() -> None:
+    """Station-window joint PF updates should not resample between postures."""
+    assert _resolve_station_update_modes({}) == (False, True)
+    assert _resolve_station_update_modes({"delayed_resample_update": False}) == (
+        False,
+        False,
+    )
+    assert _resolve_station_update_modes({"joint_observation_update": True}) == (
+        True,
+        False,
+    )
+    assert _resolve_station_update_modes(
+        {"joint_observation_update": True, "delayed_resample_update": True}
+    ) == (True, False)
 
 
 def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
@@ -106,6 +131,256 @@ def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
     assert diagnostics["report_excluded_source_slots"] == 1
     assert diagnostics["surface_counts"]["floor"] == 1
     assert diagnostics["off_surface_count"] == 0
+
+
+def test_report_mle_rescue_global_surface_candidates_recover_modes() -> None:
+    """Global report rescue should recover separated sources from all candidates."""
+    isotope = "Cs-137"
+    candidates = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [4.0, 4.0, 1.0],
+            [2.5, 2.5, 2.0],
+            [1.0, 4.0, 1.0],
+            [4.0, 1.2, 2.0],
+        ],
+        dtype=float,
+    )
+    truth = np.array([[1.0, 4.0, 1.0], [4.0, 1.2, 2.0]], dtype=float)
+    strengths = np.array([450.0, 450.0], dtype=float)
+    detector_positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0],
+            [5.0, 5.0, 0.0],
+            [2.5, 0.0, 1.0],
+            [0.0, 2.5, 1.0],
+            [5.0, 2.5, 1.0],
+            [2.5, 5.0, 1.0],
+        ],
+        dtype=float,
+    )
+    fe_indices = np.zeros(detector_positions.shape[0], dtype=int)
+    pb_indices = np.zeros(detector_positions.shape[0], dtype=int)
+    live_times = np.full(detector_positions.shape[0], 5.0, dtype=float)
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidates,
+        shield_normals=None,
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            use_gpu=False,
+            report_mle_rescue_enable=True,
+            report_mle_rescue_max_candidates=4,
+            report_mle_rescue_max_residual_candidates=3,
+            report_mle_rescue_dedup_radius_m=0.25,
+            report_mle_rescue_min_residual_fraction=0.0,
+        ),
+    )
+    estimator.add_measurement_pose(detector_positions[0])
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    design = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=truth,
+        strengths=np.ones(truth.shape[0], dtype=float),
+        live_times=live_times,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        source_scale=estimator.response_scale_for_isotope(isotope),
+    )
+    z_obs = design @ strengths
+    data = MeasurementData(
+        z_k=z_obs,
+        observation_variances=np.maximum(z_obs, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        live_times=live_times,
+    )
+
+    rescued_pos, rescued_q, stats = estimator._rank_global_surface_candidates(
+        isotope,
+        filt,
+        data,
+        existing_positions=np.zeros((0, 3), dtype=float),
+        background=np.zeros_like(z_obs),
+        eps=1.0e-9,
+        q_max=0.0,
+    )
+
+    assert rescued_pos.shape == (3, 3)
+    assert rescued_q.shape == (3,)
+    assert int(stats["global_rescue_candidate_count"]) == 3
+    distances = np.linalg.norm(rescued_pos[:, None, :] - truth[None, :, :], axis=2)
+    assert np.max(np.min(distances, axis=0)) < 0.25
+
+
+def test_intermediate_estimate_trace_reports_position_and_strength_error() -> None:
+    """Intermediate estimate traces should expose source and strength accuracy."""
+    isotope = "Cs-137"
+    env = EnvironmentConfig(size_x=10.0, size_y=10.0, size_z=10.0)
+    frame = PFFrame(
+        step_index=7,
+        time=123.0,
+        robot_position=np.array([1.0, 2.0, 0.5], dtype=float),
+        robot_orientation=None,
+        RFe=np.eye(3),
+        RPb=np.eye(3),
+        duration=30.0,
+        counts_by_isotope={isotope: 1000.0},
+        particle_positions={isotope: np.zeros((0, 3), dtype=float)},
+        particle_weights={isotope: np.zeros(0, dtype=float)},
+        estimated_sources={
+            isotope: np.array(
+                [[0.0, 1.0, 1.0], [5.0, 5.0, 10.0]],
+                dtype=float,
+            )
+        },
+        estimated_strengths={isotope: np.array([12.0, 20.0], dtype=float)},
+    )
+    true_sources = {
+        isotope: np.array(
+            [[0.0, 1.0, 1.0], [5.0, 5.0, 10.0], [9.0, 9.0, 0.0]],
+            dtype=float,
+        )
+    }
+    true_strengths = {isotope: [10.0, 20.0, 30.0]}
+
+    payload = _build_intermediate_estimate_trace_payload(
+        frame,
+        true_sources,
+        true_strengths,
+        env,
+        None,
+        obstacle_height_m=2.0,
+        match_radius_m=0.5,
+    )
+    summary = payload["isotopes"][isotope]
+    records = payload["estimates"]
+    truth_records = payload["truth_sources"]
+    line = _format_estimate_trace_log_line(
+        7,
+        isotope,
+        summary,
+        records,
+    )
+    truth_line = _format_truth_coverage_log_line(
+        7,
+        isotope,
+        summary,
+        truth_records,
+    )
+
+    assert summary["estimate_count"] == 2
+    assert summary["truth_count"] == 3
+    assert summary["source_count_error"] == -1
+    assert summary["unmatched_truth_count"] == 1
+    assert summary["truth_covered_count"] == 2
+    assert summary["truth_uncovered_count"] == 1
+    assert summary["total_est_strength"] == pytest.approx(32.0)
+    assert summary["total_truth_strength"] == pytest.approx(60.0)
+    assert records[0]["position_error_m"] == pytest.approx(0.0)
+    assert records[0]["strength_rel_error"] == pytest.approx(0.2)
+    assert records[0]["surface_kind"] == "wall"
+    assert records[1]["surface_kind"] == "ceiling"
+    assert truth_records[2]["covered"] is False
+    assert truth_records[2]["nearest_estimate_distance_m"] == pytest.approx(
+        np.sqrt(132.0)
+    )
+    assert "q=12.0" in line
+    assert "source_count_error=-1" in line
+    assert "pf_truth_coverage[Cs-137]" in truth_line
+    assert "covered=2/3" in truth_line
+
+
+def test_intermediate_estimate_trace_includes_source_slot_metadata() -> None:
+    """Intermediate estimate traces should keep MAP source-slot diagnostics."""
+    isotope = "Cs-137"
+    env = EnvironmentConfig(size_x=10.0, size_y=10.0, size_z=10.0)
+    frame = {
+        "estimate_source": "post_finalize_map",
+        "step_index": 8,
+        "time": 130.0,
+        "robot_position": np.array([1.0, 2.0, 0.5], dtype=float),
+        "counts_by_isotope": {isotope: 500.0},
+        "estimated_sources": {
+            isotope: np.array([[0.0, 1.0, 1.0]], dtype=float),
+        },
+        "estimated_strengths": {isotope: np.array([12.0], dtype=float)},
+        "estimated_metadata": {
+            isotope: [
+                {
+                    "age": 4,
+                    "tentative": True,
+                    "verification_fail_streak": 2,
+                    "support_score": 3.5,
+                    "low_q_streak": 1,
+                }
+            ],
+        },
+    }
+
+    payload = _build_intermediate_estimate_trace_payload(
+        frame,
+        {isotope: np.array([[0.0, 1.0, 1.0]], dtype=float)},
+        {isotope: [10.0]},
+        env,
+        None,
+        obstacle_height_m=2.0,
+        match_radius_m=0.5,
+    )
+    record = payload["estimates"][0]
+    line = _format_estimate_trace_log_line(
+        8,
+        isotope,
+        {
+            **payload["isotopes"][isotope],
+            "estimate_source": payload["estimate_source"],
+        },
+        payload["estimates"],
+    )
+
+    assert record["age"] == 4
+    assert record["tentative"] is True
+    assert record["verification_fail_streak"] == 2
+    assert record["support_score"] == pytest.approx(3.5)
+    assert "mode=post_finalize_map" in line
+    assert "age=4" in line
+    assert "tent=True" in line
+    assert "fail=2" in line
+
+
+def test_pf_obstacle_attenuation_config_defaults_to_fidelity_path() -> None:
+    """PF obstacle attenuation should stay enabled unless explicitly ablated."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((1, 1),),
+    )
+
+    assert _pf_obstacle_attenuation_enabled({}) is True
+    assert _pf_obstacle_attenuation_enabled({"pf_obstacle_attenuation": None}) is True
+    assert _pf_obstacle_grid_for_runtime(grid, {}) is grid
+    assert (
+        _pf_obstacle_grid_for_runtime(
+            grid,
+            {"pf_obstacle_attenuation": False},
+        )
+        is None
+    )
+    assert (
+        _pf_obstacle_grid_for_runtime(
+            grid,
+            {"pf_obstacle_attenuation": "off"},
+        )
+        is None
+    )
 
 
 def test_robot_path_segment_uses_obstacle_aware_grid_path() -> None:
@@ -442,6 +717,115 @@ def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
     )
 
     assert reason_without_guard == "environment_coverage:1.000"
+
+
+def test_final_model_order_status_marks_unresolved_pseudo_sources_not_ready() -> None:
+    """Final model-order status should include pseudo-source structural gates."""
+
+    class _DummyFilter:
+        """Minimal filter state exposing unresolved pseudo-source verification."""
+
+        last_pseudo_source_verified = 0
+        last_pseudo_source_failed = 2
+        last_pseudo_source_pruned = 0
+        last_pseudo_source_quarantined = 0
+        last_pseudo_source_quarantine_active = 0
+        last_pseudo_source_fail_reasons = {
+            "needs_discriminative_views": 2,
+            "high_response_corr": 1,
+        }
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+
+    class _DummyEstimator:
+        """Minimal estimator with ready BIC but unresolved structural evidence."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty report estimate."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return report-level BIC diagnostics that are locally ready."""
+            return {
+                "Cs-137": {
+                    "model_order_ready": True,
+                    "condition_number": 1.0,
+                    "criterion_margin_to_simpler": float("inf"),
+                    "selected_max_response_correlation": 0.0,
+                }
+            }
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return unresolved structural evidence as the estimator does."""
+            return {
+                "Cs-137": {
+                    "pseudo_source_fail_reasons": {
+                        "needs_discriminative_views": 2,
+                        "high_response_corr": 1,
+                    }
+                }
+            }
+
+    status = _final_model_order_status(_DummyEstimator())
+
+    assert status["all_model_order_ready"] is False
+    assert status["all_model_order_ready_before_structural_gates"] is True
+    assert status["unresolved_structural_evidence"]["Cs-137"]
+
+
+def test_adaptive_mission_waits_for_model_order_readiness() -> None:
+    """Mission stop should not accept low IG while model order is unresolved."""
+
+    class _DummyEstimator:
+        """Minimal estimator with unresolved report-level source count."""
+
+        filters: dict[str, object] = {}
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a quiet global IG state."""
+            return True
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a quiet local shield state."""
+            return True
+
+        def report_model_order_ready(self) -> bool:
+            """Return unresolved model-order readiness."""
+            return False
+
+    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
+    estimator = _DummyEstimator()
+
+    reason = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=None,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+    )
+
+    assert reason is None
+
+    reason_without_guard = _adaptive_mission_stop_reason(
+        estimator,  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=None,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        require_model_order_ready=False,
+    )
+
+    assert reason_without_guard == "pf_converged_low_information_gain"
 
 
 def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:

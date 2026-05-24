@@ -65,6 +65,7 @@ class ParallelIsotopePF:
     """
 
     def __init__(self, isotope_names: List[str], config: PFConfig) -> None:
+        """Create one isotope filter per isotope name."""
         self.measurements: List[Measurement] = []
         self.filters: Dict[str, IsotopeParticleFilter] = {
             iso: IsotopeParticleFilter(isotope=iso, kernel=None, config=config)  # kernel to be injected later

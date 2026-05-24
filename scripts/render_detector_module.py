@@ -57,6 +57,7 @@ def make_octant_shell(name, r_inner, r_outer, signs, material):
                 vertices.append(tuple(sph(r, theta, phi, signs)))
 
     def idx(layer, i, j):
+        """Return the flattened vertex index for a shell grid point."""
         return layer * (n_theta + 1) * (n_phi + 1) + i * (n_phi + 1) + j
 
     faces = []
