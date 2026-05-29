@@ -8,11 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from measurement.shielding import HVL_TVL_TABLE_MM
+from measurement.kernels import ShieldParams
+from measurement.shielding import HVL_TVL_TABLE_MM, SHIELD_GEOMETRY_SPHERICAL_OCTANT
+from scripts.validate_geant4_spectrum_decomposition import (
+    shield_params_from_runtime_config,
+)
 from sim.geant4_app.app import Geant4AppConfig
 from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
     DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
+    DEFAULT_DETECTOR_HOUSING_THICKNESS_M,
     ExportedDetectorModel,
 )
 from sim.runtime import load_runtime_config
@@ -20,6 +25,9 @@ from sim.shield_geometry import (
     FE_SHIELD_INNER_RADIUS_M,
     FE_SHIELD_THICKNESS_M,
     PB_SHIELD_INNER_RADIUS_M,
+    SHIELD_SHAPE_SPHERICAL_OCTANT,
+    nested_shield_inner_radii_cm,
+    resolve_shield_thickness_config,
 )
 
 
@@ -93,8 +101,12 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["delayed_resample_update"] is False
     assert payload["random_source_visibility_filter"] is True
     assert float(payload["random_source_min_visible_fraction"]) > 0.0
+    assert payload["random_source_response_observability_filter"] is True
+    assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.995
+    assert float(payload["random_source_response_condition_max"]) >= 1.0
     assert int(payload["thread_count"]) == 32
     assert int(payload["python_worker_count"]) == 32
+    assert int(payload["pose_selection_workers"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
     assert int(payload["structural_trial_workers"]) == 32
@@ -109,18 +121,74 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert float(payload["report_strength_absorption_penalty_weight"]) > 0.0
+    assert float(payload["report_strength_absorption_q_multiple"]) >= 1.0
+    assert payload["report_surface_local_refine"] is True
+    assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
+    assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
     assert payload["report_mle_rescue_enable"] is True
     assert int(payload["report_mle_rescue_max_candidates"]) >= 12
+    assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
+    assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
+    assert payload["report_mle_rescue_surface_quota_enable"] is True
+    assert int(payload["report_mle_rescue_surface_quota_per_stratum"]) >= 2
+    assert payload["report_mle_rescue_spatial_quota_enable"] is True
+    assert float(payload["report_mle_rescue_spatial_quota_tile_m"]) > 0.0
     assert payload["birth_global_rescue_enable"] is True
     assert int(payload["birth_global_rescue_max_candidates"]) >= 8
+    assert int(payload["birth_global_rescue_min_support"]) >= 2
+    assert int(payload["birth_global_rescue_min_distinct_poses"]) >= 2
+    assert int(payload["birth_global_rescue_min_distinct_stations"]) == 1
+    assert payload["high_strength_split_enable"] is True
+    assert float(payload["high_strength_split_q_multiple"]) >= 1.0
+    assert payload["runtime_report_rescue_enable"] is True
+    assert float(payload["runtime_report_rescue_weight"]) > 0.0
+    assert payload["runtime_report_rescue_quarantine_enable"] is True
+    assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
+    assert payload["runtime_report_rescue_memory_enable"] is True
+    assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
+    assert payload["weak_source_prune_require_observable"] is True
+    assert int(payload["weak_source_prune_min_observable_measurements"]) >= 1
+    assert payload["cardinality_preserving_resample"] is True
+    assert int(payload["cardinality_preserving_min_stations"]) == 0
+    assert payload["cardinality_preserving_require_confirmed_structure"] is False
     assert float(payload["source_strength_prior_mean"]) > 0.0
-    assert float(payload["source_strength_prior_weight"]) > 0.0
+    assert float(payload["source_strength_prior_weight"]) >= 4.0
     assert payload["report_model_order_require_posterior_match"] is False
     assert payload["report_model_order_prune_particles"] is True
     assert payload["mode_preserving_resample"] is True
     assert int(payload["mode_preserving_max_modes"]) >= 12
     assert int(payload["mode_preserving_particles_per_mode"]) >= 8
     assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
+    assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
+    assert payload["mode_preserving_cardinality_strata"] is True
+    assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
+    assert payload["split_residual_guided"] is True
+    assert payload["split_residual_always_try"] is True
+    assert int(payload["split_residual_candidate_count"]) >= 8
+    assert payload["remaining_measurement_estimate"]["enabled"] is True
+    assert (
+        float(
+            payload["remaining_measurement_estimate"][
+                "high_surface_ambiguity_weight"
+            ]
+        )
+        > 0.0
+    )
+    assert (
+        int(
+            payload["remaining_measurement_estimate"][
+                "residual_surface_gain_candidate_limit"
+            ]
+        )
+        >= 512
+    )
+    assert payload["dss_pp"]["include_runtime_rescue_modes"] is True
+    assert float(payload["dss_pp"]["runtime_rescue_mode_weight"]) > 0.0
+    assert float(payload["dss_pp"]["high_surface_pair_boost"]) > 1.0
+    assert float(payload["dss_pp"]["high_surface_cross_stratum_boost"]) > 1.0
+    assert float(payload["dss_pp"]["correlation_reduction_weight"]) > 0.0
+    assert float(payload["dss_pp"]["isotope_balance_weight"]) > 0.0
     assert "executable_args" not in payload
 
 
@@ -163,7 +231,11 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert payload["delayed_resample_update"] is False
     assert payload["random_source_visibility_filter"] is True
     assert float(payload["random_source_min_visible_fraction"]) > 0.0
+    assert payload["random_source_response_observability_filter"] is True
+    assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.995
+    assert float(payload["random_source_response_condition_max"]) >= 1.0
     assert int(payload["python_worker_count"]) == 32
+    assert int(payload["pose_selection_workers"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
     assert int(payload["structural_trial_workers"]) == 32
@@ -178,24 +250,85 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
+    assert float(payload["report_strength_absorption_penalty_weight"]) > 0.0
+    assert float(payload["report_strength_absorption_q_multiple"]) >= 1.0
+    assert payload["report_surface_local_refine"] is True
+    assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
+    assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
     assert payload["report_mle_rescue_enable"] is True
     assert int(payload["report_mle_rescue_max_candidates"]) >= 12
+    assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
+    assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
+    assert payload["report_mle_rescue_surface_quota_enable"] is True
+    assert payload["report_mle_rescue_spatial_quota_enable"] is True
     assert payload["birth_global_rescue_enable"] is True
     assert int(payload["birth_global_rescue_max_candidates"]) >= 8
+    assert int(payload["birth_global_rescue_min_support"]) >= 2
+    assert int(payload["birth_global_rescue_min_distinct_poses"]) >= 2
+    assert int(payload["birth_global_rescue_min_distinct_stations"]) == 1
+    assert payload["high_strength_split_enable"] is True
+    assert payload["runtime_report_rescue_enable"] is True
+    assert float(payload["runtime_report_rescue_weight"]) > 0.0
+    assert payload["runtime_report_rescue_quarantine_enable"] is True
+    assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
+    assert payload["runtime_report_rescue_memory_enable"] is True
+    assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
+    assert payload["weak_source_prune_require_observable"] is True
+    assert int(payload["weak_source_prune_min_observable_measurements"]) >= 1
+    assert payload["cardinality_preserving_resample"] is True
+    assert int(payload["cardinality_preserving_min_stations"]) == 0
+    assert payload["cardinality_preserving_require_confirmed_structure"] is False
     assert float(payload["source_strength_prior_mean"]) > 0.0
-    assert float(payload["source_strength_prior_weight"]) > 0.0
+    assert float(payload["source_strength_prior_weight"]) >= 4.0
     assert payload["report_model_order_require_posterior_match"] is False
     assert payload["report_model_order_prune_particles"] is True
+    assert payload["split_residual_guided"] is True
+    assert payload["split_residual_always_try"] is True
+    assert int(payload["split_residual_candidate_count"]) >= 8
+    assert payload["remaining_measurement_estimate"]["enabled"] is True
+    assert (
+        float(
+            payload["remaining_measurement_estimate"][
+                "high_surface_ambiguity_weight"
+            ]
+        )
+        > 0.0
+    )
+    assert (
+        int(
+            payload["remaining_measurement_estimate"][
+                "residual_surface_gain_candidate_limit"
+            ]
+        )
+        >= 512
+    )
     assert int(payload["mission_stop_max_poses"]) == 20
     assert payload["mission_stop_require_model_order_ready"] is True
+    assert payload["mission_stop_require_remaining_measurement_ready"] is True
+    assert payload["mission_stop_soft_extend_on_unresolved"] is True
+    assert int(payload["mission_stop_soft_extension_poses"]) >= 1
     assert payload["mission_stop_require_pf_convergence_for_coverage"] is False
+    assert payload["mission_stop_report_simple_enable"] is True
+    assert float(payload["mission_stop_report_simple_min_bic_margin"]) >= 10.0
+    assert payload["mission_stop_report_simple_allow_high_surface_ambiguity"] is True
+    assert payload["dss_pp"]["adaptive_program_length_enable"] is True
+    assert int(payload["dss_pp"]["adaptive_simple_program_length"]) <= 2
     assert payload["dss_pp"]["same_isotope_direct_separation_guard"] is True
+    assert payload["dss_pp"]["include_runtime_rescue_modes"] is True
+    assert float(payload["dss_pp"]["runtime_rescue_mode_weight"]) > 0.0
+    assert float(payload["dss_pp"]["high_surface_pair_boost"]) > 1.0
+    assert float(payload["dss_pp"]["high_surface_cross_stratum_boost"]) > 1.0
     assert float(payload["dss_pp"]["temporal_separation_weight"]) >= 8.0
+    assert float(payload["dss_pp"]["correlation_reduction_weight"]) > 0.0
+    assert float(payload["dss_pp"]["isotope_balance_weight"]) > 0.0
     assert float(payload["dss_pp"]["coverage_weight"]) <= 2.0
     assert payload["mode_preserving_resample"] is True
     assert int(payload["mode_preserving_max_modes"]) >= 12
     assert int(payload["mode_preserving_particles_per_mode"]) >= 8
     assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
+    assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
+    assert payload["mode_preserving_cardinality_strata"] is True
+    assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
 
 
 def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
@@ -281,6 +414,67 @@ def test_geant4_default_detector_model_matches_native_sidecar() -> None:
     )
     assert PB_SHIELD_INNER_RADIUS_M == pytest.approx(
         FE_SHIELD_INNER_RADIUS_M + FE_SHIELD_THICKNESS_M
+    )
+
+
+def test_pf_and_geant4_share_spherical_octant_shield_geometry() -> None:
+    """PF shield likelihoods should use the same spherical-octant shell geometry."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    payload = _load_geant4_runtime_config(config_path)
+    detector_model = ExportedDetectorModel()
+    shield_thickness = resolve_shield_thickness_config(payload)
+    detector_outer_radius_cm = 100.0 * (
+        detector_model.crystal_radius_m + detector_model.housing_thickness_m
+    )
+    fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
+        thickness_fe_cm=shield_thickness.thickness_fe_cm,
+        detector_outer_radius_cm=detector_outer_radius_cm,
+    )
+    pf_params = ShieldParams(
+        thickness_fe_cm=shield_thickness.thickness_fe_cm,
+        thickness_pb_cm=shield_thickness.thickness_pb_cm,
+        inner_radius_fe_cm=fe_inner_cm,
+        inner_radius_pb_cm=pb_inner_cm,
+    )
+
+    assert SHIELD_SHAPE_SPHERICAL_OCTANT == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+    assert pf_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+    assert pf_params.use_angle_attenuation is False
+    assert pf_params.inner_radius_fe_cm == pytest.approx(
+        100.0 * (DEFAULT_DETECTOR_CRYSTAL_RADIUS_M + DEFAULT_DETECTOR_HOUSING_THICKNESS_M)
+    )
+    assert pf_params.inner_radius_pb_cm == pytest.approx(
+        pf_params.inner_radius_fe_cm + pf_params.thickness_fe_cm
+    )
+
+
+def test_spectrum_validation_uses_runtime_shield_inner_radii() -> None:
+    """Validation PF targets should derive shield radii from runtime detector geometry."""
+    payload = {
+        "detector_model": {
+            "crystal_radius_m": 0.05,
+            "housing_thickness_m": 0.002,
+        },
+        "shield_transmission_target": 0.2,
+    }
+    shield_thickness = resolve_shield_thickness_config(payload)
+    expected_fe_cm, expected_pb_cm = nested_shield_inner_radii_cm(
+        thickness_fe_cm=shield_thickness.thickness_fe_cm,
+        detector_outer_radius_cm=5.2,
+    )
+
+    params = shield_params_from_runtime_config(payload)
+
+    assert params.inner_radius_fe_cm == pytest.approx(expected_fe_cm)
+    assert params.inner_radius_pb_cm == pytest.approx(expected_pb_cm)
+    assert params.inner_radius_pb_cm == pytest.approx(
+        params.inner_radius_fe_cm + params.thickness_fe_cm
     )
 
 

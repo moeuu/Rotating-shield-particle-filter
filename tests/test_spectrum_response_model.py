@@ -352,6 +352,47 @@ def test_photopeak_combiner_keeps_supported_mixed_roi() -> None:
     assert combined > 800.0
 
 
+def test_photopeak_combiner_downweights_inconsistent_mixed_roi() -> None:
+    """Mixed ROI evidence should not dominate conflicting independent lines."""
+    decomposer = SpectralDecomposer(SpectrumConfig(dead_time_tau_s=0.0))
+    estimates = [
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=900.0,
+            variance=100.0,
+            roi_min_keV=820.0,
+            roi_max_keV=926.0,
+            reduced_chi2=1.0,
+            signal_to_noise=20.0,
+            mixed_isotope_roi=False,
+        ),
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=1100.0,
+            variance=100.0,
+            roi_min_keV=939.0,
+            roi_max_keV=1053.0,
+            reduced_chi2=1.0,
+            signal_to_noise=20.0,
+            mixed_isotope_roi=False,
+        ),
+        PhotopeakRoiEstimate(
+            isotope="Eu-154",
+            counts=5000.0,
+            variance=25.0,
+            roi_min_keV=1110.0,
+            roi_max_keV=1399.0,
+            reduced_chi2=1.0,
+            signal_to_noise=80.0,
+            mixed_isotope_roi=True,
+        ),
+    ]
+
+    combined = decomposer._combine_photopeak_estimates(estimates)
+
+    assert combined < 1500.0
+
+
 def test_response_model_counts_match_shield_theory_for_mixed_python_spectrum() -> None:
     """Full-response NNLS should recover theory for mixed shielded Python spectra."""
     import spectrum.pipeline as pipeline

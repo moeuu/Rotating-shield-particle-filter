@@ -89,11 +89,20 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     ),
     AblationVariant(
         name="no_shield",
-        description="Remove shield attenuation while keeping the same measurement budget.",
+        description=(
+            "Remove shield attenuation while taking one unshielded spectrum per "
+            "measurement station."
+        ),
         overrides={
             "shield_transmission_target": 1.0,
             "shield_thickness_scale": 0.0,
+            "orientation_k": 1,
+            "min_rotations_per_pose": 1,
             "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+            "dss_pp": {
+                "program_length": 1,
+                "residual_program_length": 1,
+            },
         },
         cli_args=("--rotation-overhead-s", "0.0"),
     ),
@@ -118,7 +127,10 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
     AblationVariant(
         name="one_step_path",
         description="Use the existing greedy one-step pose planner instead of DSS-PP.",
-        overrides={"path_planner": "one_step"},
+        overrides={
+            "path_planner": "one_step",
+            "strict_planned_shield_program": True,
+        },
     ),
     AblationVariant(
         name="passive_serpentine_path",
@@ -131,14 +143,20 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         name="baseline_passive_no_shield",
         description=(
             "Ordinary mobile-PF baseline: no shield attenuation and passive "
-            "serpentine coverage path with the same spectra budget as the "
-            "proposed method."
+            "serpentine coverage path with one unshielded spectrum per "
+            "measurement station."
         ),
         overrides={
             "shield_transmission_target": 1.0,
             "shield_thickness_scale": 0.0,
+            "orientation_k": 1,
+            "min_rotations_per_pose": 1,
             "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
             "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
+            "dss_pp": {
+                "program_length": 1,
+                "residual_program_length": 1,
+            },
         },
         cli_args=("--rotation-overhead-s", "0.0"),
     ),
@@ -195,13 +213,19 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         name="baseline_onestep_no_shield",
         description=(
             "Greedy one-step planner baseline without shield attenuation and "
-            "with the same spectra budget as the proposed method."
+            "with one unshielded spectrum per measurement station."
         ),
         overrides={
             "shield_transmission_target": 1.0,
             "shield_thickness_scale": 0.0,
+            "orientation_k": 1,
+            "min_rotations_per_pose": 1,
             "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
             "path_planner": "one_step",
+            "dss_pp": {
+                "program_length": 1,
+                "residual_program_length": 1,
+            },
         },
         cli_args=("--rotation-overhead-s", "0.0"),
     ),
@@ -277,6 +301,7 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "dss_pp": {
                 "environment_signature_weight": 0.0,
                 "occlusion_boundary_weight": 0.0,
+                "vertical_environment_signature_weight": 0.0,
             },
         },
     ),
@@ -314,6 +339,10 @@ def _parallel_runtime_overrides(base_config: Mapping[str, Any]) -> dict[str, Any
     return {
         "thread_count": max(1, int(base_config.get("thread_count", workers))),
         "python_worker_count": workers,
+        "pose_selection_workers": max(
+            1,
+            int(base_config.get("pose_selection_workers", workers)),
+        ),
         "ig_workers": max(1, int(base_config.get("ig_workers", workers))),
         "parallel_isotope_updates": bool(
             base_config.get("parallel_isotope_updates", True)

@@ -794,6 +794,7 @@ def select_separation_orientations(
         lambda_eig=0.0,
         lambda_signature=0.0,
         lambda_temporal_separation=1.0,
+        lambda_elevation_signature=1.0,
         temporal_cover_programs=1,
     )
     kernel = dss_pp._continuous_kernel_for_estimator(estimator)

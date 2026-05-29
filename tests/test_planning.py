@@ -484,6 +484,62 @@ def test_pose_selection_uses_planning_particle_cap_for_observability() -> None:
     assert estimator.max_particles_seen == [7, 7]
 
 
+def test_pose_selection_parallel_matches_serial_selection() -> None:
+    """Parallel one-step candidate evaluation should preserve serial scores."""
+
+    class _Config:
+        """Minimal PF config for deterministic one-step pose selection."""
+
+        lambda_cost = 0.0
+        ig_threshold = 0.0
+        max_dwell_time_s = 2.0
+        short_time_s = 1.0
+        planning_rollout_particles = None
+        planning_particles = None
+        use_gpu = False
+        ig_workers = 4
+
+    class _Estimator:
+        """Deterministic estimator whose score depends only on the pose."""
+
+        pf_config = _Config()
+
+        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
+            """Return a smooth deterministic uncertainty surface."""
+            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
+            return float((pose[0] - 2.0) ** 2 + 0.1 * pose[1] ** 2)
+
+    candidates = np.array(
+        [
+            [0.0, 0.0, 0.5],
+            [1.5, 1.0, 0.5],
+            [2.0, 0.2, 0.5],
+            [3.0, 0.0, 0.5],
+        ],
+        dtype=float,
+    )
+    serial_idx = select_next_pose_from_candidates(
+        estimator=_Estimator(),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        lambda_cost=0.0,
+        num_rollouts=1,
+        worker_count=1,
+        rng_seed=123,
+    )
+    parallel_idx = select_next_pose_from_candidates(
+        estimator=_Estimator(),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        lambda_cost=0.0,
+        num_rollouts=1,
+        worker_count=3,
+        rng_seed=123,
+    )
+
+    assert parallel_idx == serial_idx == 2
+
+
 def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:
     """recommend_num_rollouts should pick the smallest rollout meeting the target SE."""
     samples = {
@@ -707,15 +763,18 @@ def test_expected_uncertainty_after_pose_is_finite() -> None:
 
 
 def test_dss_pp_program_library_contains_differential_primitives() -> None:
-    """DSS-PP should expose bearing, material, and occlusion shield programs."""
+    """DSS-PP should expose bearing, material, occlusion, and vertical programs."""
     mats = generate_octant_rotation_matrices()
     normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
-    programs = build_shield_program_library(normals, program_length=2, max_programs=32)
+    programs = build_shield_program_library(normals, program_length=2, max_programs=40)
     kinds = {program.kind for program in programs}
 
     assert "bearing_split" in kinds
     assert "material_split" in kinds
     assert "occlusion_test" in kinds
+    assert "vertical_split" in kinds
+    assert "vertical_material_split" in kinds
+    assert "elevation_bearing_split" in kinds
     assert all(len(program.pair_ids) == 2 for program in programs)
 
 
@@ -727,6 +786,23 @@ def test_dss_pp_program_library_can_build_separation_bursts() -> None:
 
     assert programs
     assert all(len(program.pair_ids) == 8 for program in programs)
+
+
+def test_pairwise_cover_objective_uses_vertical_ambiguity() -> None:
+    """Greedy shield-program search should score height separation directly."""
+    config = DSSPPConfig(
+        lambda_temporal_separation=0.0,
+        lambda_elevation_signature=4.0,
+    )
+    objective = dss_pp._pairwise_cover_objective(
+        None,
+        np.asarray([0.0, 0.0], dtype=float),
+        np.asarray([0.1, 0.8], dtype=float),
+        config=config,
+    )
+
+    assert int(np.argmax(objective)) == 1
+    assert objective[1] > objective[0]
 
 
 def test_temporal_separation_uses_response_shape_not_strength_scale() -> None:
@@ -838,6 +914,33 @@ def test_extract_signature_modes_keeps_soft_quarantined_sources() -> None:
     )["Cs-137"]
 
     assert len(modes) == 2
+
+
+def test_extract_signature_modes_adds_runtime_rescue_modes() -> None:
+    """DSS-PP should see station-level rescue modes outside the posterior."""
+    est = _build_simple_estimator()
+    rescue_pos = np.array([[5.0, 0.0, 0.0]], dtype=float)
+    rescue_q = np.array([200.0], dtype=float)
+    est._runtime_report_rescue_modes = {"Cs-137": (rescue_pos, rescue_q, 0.1)}
+
+    with_rescue = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        include_runtime_rescue_modes=True,
+        runtime_rescue_mode_weight=1.0,
+    )["Cs-137"]
+    without_rescue = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        include_runtime_rescue_modes=False,
+    )["Cs-137"]
+
+    assert any(np.allclose(mode.position_xyz, rescue_pos[0]) for mode in with_rescue)
+    assert not any(
+        np.allclose(mode.position_xyz, rescue_pos[0]) for mode in without_rescue
+    )
 
 
 def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
@@ -1254,6 +1357,87 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
         "ranked_nodes"
     ][-1]["score"]
     assert np.allclose(result.next_pose, candidates[result.next_pose_index])
+    assert "component_leaders" in result.diagnostics
+    assert "score" in result.diagnostics["component_leaders"]
+
+
+def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
+    """Forced DSS-PP programs should match baseline shield-policy execution."""
+    isotopes = ["Cs-137"]
+    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        use_gpu=False,
+        planning_particles=None,
+        init_num_sources=(1, 1),
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    est._ensure_kernel_cache()
+    filt = est.filters["Cs-137"]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
+    forced_pairs = (7, 8, 9, 10)
+    result = select_dss_pp_next_station(
+        estimator=est,
+        candidate_poses_xyz=np.array([[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]]),
+        current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=8,
+            program_length=4,
+            forced_program_pair_ids=forced_pairs,
+            temporal_cover_programs=4,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=1.0,
+            lambda_distance=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            lambda_rotation=0.0,
+            augment_candidates=False,
+        ),
+    )
+
+    assert result.shield_program.pair_ids == forced_pairs
+    assert result.shield_program.kind == "forced_baseline"
+    assert result.diagnostics["program_count"] == 1
+    assert {
+        tuple(node["pair_ids"]) for node in result.diagnostics["ranked_nodes"]
+    } == {forced_pairs}
+    pair_diag = result.diagnostics["selected_pairwise_ambiguity"]["Cs-137"]
+    assert pair_diag["mode_count"] == 2
+    assert pair_diag["program_measurements"] == len(result.shield_program.pair_ids)
+    assert pair_diag["bottleneck_pairs"]
 
 
 def _scalar_remaining_route_terms(
@@ -1452,6 +1636,8 @@ def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
             turn_penalty=0.0,
             local_orbit_gain=0.0,
             station_condition_gain=0.0,
+            correlation_reduction_gain=0.0,
+            isotope_balance_gain=0.0,
             environment_signature_score=float(environment),
             occlusion_boundary_gain=0.0,
             elevation_condition_gain=0.0,
@@ -1490,6 +1676,15 @@ def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
     )
 
     assert [item.pose_index for item in fallback] == [2]
+
+    single_mode = {"Cs-137": modes["Cs-137"][:1]}
+    unresolved_filtered = dss_pp._filter_nodes_for_multimode_separation(
+        [node(0, 0.0), node(1, 0.25), node(2, 0.0, environment=10.0)],
+        single_mode,
+        unresolved_evidence=True,
+    )
+
+    assert [item.pose_index for item in unresolved_filtered] == [1]
 
 
 def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:
@@ -1641,6 +1836,115 @@ def test_dss_pp_elevation_signature_scores_vertical_mode_pairs() -> None:
 
     assert scores[0] > 0.0
     assert scores[1] == 0.0
+
+
+def test_dss_pp_temporal_score_prioritizes_high_surface_pairs() -> None:
+    """High-surface mode pairs should receive extra temporal-separation focus."""
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([1.0, 1.0, 10.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.25,
+            spread_m=0.2,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([4.0, 1.0, 10.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.25,
+            spread_m=0.2,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([1.0, 1.0, 0.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.5,
+            spread_m=0.2,
+        ),
+    ]
+    raw = np.array(
+        [
+            [
+                [20.0, 2.0, 12.0],
+                [2.0, 20.0, 12.0],
+            ],
+        ],
+        dtype=float,
+    )
+    base_config = DSSPPConfig(
+        temporal_pair_contrast_threshold=2.0,
+        temporal_logdet_weight=0.0,
+        temporal_decorrelation_weight=0.0,
+    )
+    boosted_config = DSSPPConfig(
+        temporal_pair_contrast_threshold=2.0,
+        temporal_logdet_weight=0.0,
+        temporal_decorrelation_weight=0.0,
+        high_surface_pair_boost=4.0,
+        high_surface_z_fraction=0.75,
+    )
+    priority = dss_pp._high_surface_pair_priority_weights(
+        modes,
+        config=boosted_config,
+        room_z_m=10.0,
+    )
+
+    base = dss_pp._batched_temporal_separation_scores(
+        raw,
+        np.array([0.25, 0.25, 0.5], dtype=float),
+        config=base_config,
+    )
+    boosted = dss_pp._batched_temporal_separation_scores(
+        raw,
+        np.array([0.25, 0.25, 0.5], dtype=float),
+        config=boosted_config,
+        pair_priority_weights=priority,
+    )
+
+    assert boosted[0] > base[0]
+
+
+def test_high_surface_pair_priority_boosts_ceiling_wall_ambiguity() -> None:
+    """Ceiling-vs-high-wall mode pairs should get the strongest priority."""
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([1.0, 1.0, 10.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.25,
+            spread_m=0.2,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([1.0, 1.0, 8.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.25,
+            spread_m=0.2,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([1.0, 1.0, 0.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=0.5,
+            spread_m=0.2,
+        ),
+    ]
+    config = DSSPPConfig(
+        high_surface_pair_boost=2.0,
+        high_surface_cross_stratum_boost=3.0,
+        high_surface_z_fraction=0.75,
+    )
+
+    priority = dss_pp._high_surface_pair_priority_weights(
+        modes,
+        config=config,
+        room_z_m=10.0,
+    )
+
+    assert priority[0] == pytest.approx(6.0)
+    assert priority[0] > priority[1]
+    assert priority[0] > priority[2]
 
 
 def test_dss_pp_elevation_condition_prefers_elevation_separating_view() -> None:
@@ -1919,6 +2223,56 @@ def test_dss_pp_batched_station_features_match_scalar_oracle() -> None:
         ],
         dtype=float,
     )
+    scalar_correlation = []
+    scalar_balance = []
+    for pose in candidates:
+        corr_rows = []
+        corr_weights = []
+        balance_rows = []
+        for modes in modes_by_isotope.values():
+            active = [mode for mode in modes if float(mode.weight) > 0.0]
+            if len(active) >= 2:
+                before = dss_pp._station_response_matrix(
+                    visited,
+                    active,
+                    live_time_s=float(config.live_time_s),
+                )
+                candidate_row = dss_pp._station_response_matrix(
+                    pose.reshape(1, 3),
+                    active,
+                    live_time_s=float(config.live_time_s),
+                )
+                before_corr = dss_pp._max_column_correlation_from_design(before)
+                after_corr = dss_pp._max_column_correlation_after_candidate_batch(
+                    before_matrix=before,
+                    candidate_rows=candidate_row,
+                )[0]
+                corr_rows.append(max(float(before_corr - after_corr), 0.0))
+                corr_weights.append(float(sum(mode.weight for mode in active)))
+            if active:
+                response = dss_pp._station_response_matrix(
+                    pose.reshape(1, 3),
+                    active,
+                    live_time_s=float(config.live_time_s),
+                )
+                weights = dss_pp._normalise_weights(
+                    np.asarray([float(mode.weight) for mode in active], dtype=float)
+                )
+                expected = float(np.sum(response[0] * weights))
+                saturation = max(float(config.count_utility_saturation_counts), 1e-12)
+                balance_rows.append(1.0 - np.exp(-max(expected, 0.0) / saturation))
+        if corr_rows:
+            corr_weight_arr = dss_pp._normalise_weights(np.asarray(corr_weights))
+            scalar_correlation.append(float(np.sum(corr_weight_arr * corr_rows)))
+        else:
+            scalar_correlation.append(0.0)
+        if balance_rows:
+            balance = np.asarray(balance_rows, dtype=float)
+            scalar_balance.append(float(0.75 * np.min(balance) + 0.25 * np.mean(balance)))
+        else:
+            scalar_balance.append(0.0)
+    scalar_correlation = np.asarray(scalar_correlation, dtype=float)
+    scalar_balance = np.asarray(scalar_balance, dtype=float)
 
     assert np.allclose(
         dss_pp._coverage_gain_fractions_batch(
@@ -1977,6 +2331,23 @@ def test_dss_pp_batched_station_features_match_scalar_oracle() -> None:
             config=config,
         ),
         scalar_condition,
+    )
+    assert np.allclose(
+        dss_pp._station_correlation_reduction_gains_batch(
+            candidates,
+            visited,
+            modes_by_isotope,
+            config=config,
+        ),
+        scalar_correlation,
+    )
+    assert np.allclose(
+        dss_pp._isotope_balance_gains_batch(
+            candidates,
+            modes_by_isotope,
+            config=config,
+        ),
+        scalar_balance,
     )
 
 

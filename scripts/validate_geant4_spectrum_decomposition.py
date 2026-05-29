@@ -38,6 +38,7 @@ from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription
 from sim.isaacsim_app.stage_backend import FakeStageBackend
 from sim.protocol import SimulationCommand
 from sim.runtime import load_runtime_config
+from sim.shield_geometry import nested_shield_inner_radii_cm
 from sim.shield_geometry import resolve_shield_thickness_config
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 
@@ -222,6 +223,62 @@ def _surface_source_position(
         rng,
         room_size_xyz=room_size_xyz,
         z_m=float(rng.uniform(0.35, 1.8)),
+    )
+
+
+def _multi_isotope_surface_source_position(
+    grid: ObstacleGrid,
+    instances: tuple[KnownObstacleInstance, ...],
+    rng: np.random.Generator,
+    *,
+    room_size_xyz: tuple[float, float, float],
+    source_index: int,
+) -> tuple[float, float, float]:
+    """Sample a surface source over room and obstacle surfaces."""
+    mode = int(source_index) % 6
+    eps = 0.08
+    if mode == 0:
+        pose = _jittered_free_pose(grid, rng, room_size_xyz=room_size_xyz, z_m=eps)
+        return (pose[0], pose[1], eps)
+    if mode == 1:
+        pose = _jittered_free_pose(
+            grid,
+            rng,
+            room_size_xyz=room_size_xyz,
+            z_m=room_size_xyz[2] - eps,
+        )
+        return (pose[0], pose[1], room_size_xyz[2] - eps)
+    if mode == 2:
+        wall = int(rng.integers(0, 4))
+        z = float(rng.uniform(0.35, room_size_xyz[2] - 0.35))
+        if wall == 0:
+            return (eps, float(rng.uniform(0.35, room_size_xyz[1] - 0.35)), z)
+        if wall == 1:
+            return (
+                room_size_xyz[0] - eps,
+                float(rng.uniform(0.35, room_size_xyz[1] - 0.35)),
+                z,
+            )
+        if wall == 2:
+            return (float(rng.uniform(0.35, room_size_xyz[0] - 0.35)), eps, z)
+        return (
+            float(rng.uniform(0.35, room_size_xyz[0] - 0.35)),
+            room_size_xyz[1] - eps,
+            z,
+        )
+    if instances and mode in {3, 4}:
+        return _surface_source_position(
+            grid,
+            instances,
+            rng,
+            room_size_xyz=room_size_xyz,
+            source_index=1 if mode == 3 else 2,
+        )
+    return _jittered_free_pose(
+        grid,
+        rng,
+        room_size_xyz=room_size_xyz,
+        z_m=float(rng.uniform(0.35, room_size_xyz[2] - 0.35)),
     )
 
 
@@ -493,6 +550,159 @@ def generated_environment_sweep_cases(
     return cases
 
 
+def generated_multi_isotope_source_cases(
+    *,
+    num_cases: int = 1000,
+    seed: int = 20260430,
+    dwell_time_s: float = 30.0,
+    intensity_min_cps_1m: float = 30000.0,
+    intensity_max_cps_1m: float = 90000.0,
+    sources_per_isotope: int = 2,
+    blocked_fraction: float = 0.35,
+    passage_width_m: float = 2.0,
+    min_isotope_target_counts: float = 0.0,
+    detector_attempts: int = 24,
+    runtime_config: dict[str, Any] | None = None,
+    mu_by_isotope: dict[str, object] | None = None,
+) -> list[ValidationCase]:
+    """Return cases where Cs-137, Co-60, and Eu-154 each have multiple sources."""
+    rng = np.random.default_rng(int(seed))
+    room_size = (10.0, 20.0, 10.0)
+    cases: list[ValidationCase] = []
+    source_replicates = max(2, int(sources_per_isotope))
+    for case_index in range(max(0, int(num_cases))):
+        env_seed = int(rng.integers(1, 2**31 - 1))
+        keep_free = (
+            (0.5, 0.5),
+            (room_size[0] - 0.5, room_size[1] - 0.5),
+            (0.5, room_size[1] - 0.5),
+            (room_size[0] - 0.5, 0.5),
+            (0.5 * room_size[0], 0.5 * room_size[1]),
+        )
+        grid = build_obstacle_grid(
+            mode="random",
+            path=None,
+            size_x=room_size[0],
+            size_y=room_size[1],
+            cell_size=1.0,
+            blocked_fraction=float(blocked_fraction),
+            rng_seed=env_seed,
+            keep_free_points=keep_free,
+            passage_width_m=float(passage_width_m),
+        )
+        instances = generate_manchester_obstacle_instances(
+            grid,
+            room_size_xyz=room_size,
+            obstacle_height_m=2.0,
+            rng_seed=env_seed + 17,
+        )
+        transport_grid = _attach_known_obstacle_transport(grid, instances)
+        sources: list[ValidationSource] = []
+        source_index = 0
+        isotope_order = list(ISOTOPES)
+        rng.shuffle(isotope_order)
+        for isotope in isotope_order:
+            for _ in range(source_replicates):
+                source_pos = _multi_isotope_surface_source_position(
+                    transport_grid,
+                    instances,
+                    rng,
+                    room_size_xyz=room_size,
+                    source_index=source_index,
+                )
+                sources.append(
+                    ValidationSource(
+                        isotope=str(isotope),
+                        position_xyz=source_pos,
+                        intensity_cps_1m=float(
+                            rng.uniform(
+                                float(intensity_min_cps_1m),
+                                float(intensity_max_cps_1m),
+                            )
+                        ),
+                    )
+                )
+                source_index += 1
+        source_tuple = tuple(sources)
+        fe_index = int((case_index * 3 + 1) % 8)
+        pb_index = int((case_index * 5 + 2) % 8)
+        require_target = (
+            float(min_isotope_target_counts) > 0.0
+            and runtime_config is not None
+            and mu_by_isotope is not None
+        )
+        best_detector: tuple[float, float, float] | None = None
+        best_min_target = -float("inf")
+        max_detector_attempts = max(1, int(detector_attempts)) if require_target else 1
+        for detector_attempt in range(max_detector_attempts):
+            detector_candidate = _sample_detector_with_tau_mix(
+                transport_grid,
+                source_tuple,
+                rng,
+                room_size_xyz=room_size,
+                prefer_obstacle_crossing=((case_index + detector_attempt) % 3 != 0),
+            )
+            if not require_target:
+                best_detector = detector_candidate
+                break
+            candidate_case = ValidationCase(
+                name=f"multi_iso_{case_index:04d}",
+                description="candidate",
+                detector_pose_xyz=detector_candidate,
+                sources=source_tuple,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                dwell_time_s=float(dwell_time_s),
+                obstacle_cells=tuple(grid.blocked_cells),
+                obstacle_instances=instances,
+                include_in_accuracy_summary=True,
+            )
+            counts = expected_pf_counts(candidate_case, runtime_config, mu_by_isotope)
+            min_count = min(float(counts[isotope]) for isotope in ISOTOPES)
+            if min_count > best_min_target:
+                best_detector = detector_candidate
+                best_min_target = min_count
+            if min_count >= float(min_isotope_target_counts):
+                break
+        if best_detector is None:
+            best_detector = _jittered_free_pose(
+                transport_grid,
+                rng,
+                room_size_xyz=room_size,
+            )
+        template_counts: dict[str, int] = {}
+        for instance in instances:
+            template_counts[instance.template] = template_counts.get(instance.template, 0) + 1
+        template_summary = ",".join(
+            f"{template}:{count}" for template, count in sorted(template_counts.items())
+        )
+        max_tau = _obstacle_tau_for_sources(transport_grid, best_detector, source_tuple)
+        min_target_text = (
+            f"; min_isotope_target={best_min_target:.1f}"
+            if require_target
+            else ""
+        )
+        cases.append(
+            ValidationCase(
+                name=f"multi_iso_{case_index:04d}",
+                description=(
+                    f"{source_replicates} sources per isotope; "
+                    f"templates={template_summary}; max_obstacle_tau={max_tau:.3f}"
+                    f"{min_target_text}"
+                ),
+                detector_pose_xyz=best_detector,
+                sources=source_tuple,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                dwell_time_s=float(dwell_time_s),
+                obstacle_cells=tuple(grid.blocked_cells),
+                obstacle_instances=instances,
+                include_in_accuracy_summary=True,
+            )
+        )
+    return cases
+
+
 def default_cases() -> list[ValidationCase]:
     """Return a small hand-authored compatibility set of Geant4 validation cases."""
     detector = (1.0, 1.0, 0.5)
@@ -705,12 +915,25 @@ def obstacle_grid_for_case(case: ValidationCase) -> ObstacleGrid | None:
 def shield_params_from_runtime_config(runtime_config: dict[str, Any]) -> ShieldParams:
     """Return PF-side shield parameters matching the Geant4 runtime config."""
     shield_thickness = resolve_shield_thickness_config(runtime_config)
+    detector_model = runtime_config.get("detector_model", {})
+    if not isinstance(detector_model, dict):
+        detector_model = {}
+    detector_outer_radius_cm = 100.0 * (
+        float(detector_model.get("crystal_radius_m", 0.038))
+        + float(detector_model.get("housing_thickness_m", 0.0015))
+    )
+    inner_radius_fe_cm, inner_radius_pb_cm = nested_shield_inner_radii_cm(
+        thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
+        detector_outer_radius_cm=detector_outer_radius_cm,
+    )
     buildup = runtime_config.get("pf_buildup", {})
     if not isinstance(buildup, dict):
         buildup = {}
     return ShieldParams(
         thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
         thickness_pb_cm=float(shield_thickness.thickness_pb_cm),
+        inner_radius_fe_cm=float(inner_radius_fe_cm),
+        inner_radius_pb_cm=float(inner_radius_pb_cm),
         buildup_fe_coeff=float(
             buildup.get(
                 "fe_coeff",
@@ -1277,6 +1500,35 @@ def parse_args() -> argparse.Namespace:
             "measurement points, and multiple shield rotations per point."
         ),
     )
+    parser.add_argument(
+        "--multi-isotope-multi-source-cases",
+        action="store_true",
+        help=(
+            "Generate cases where Cs-137, Co-60, and Eu-154 each have multiple "
+            "sources on room or obstacle surfaces."
+        ),
+    )
+    parser.add_argument(
+        "--sources-per-isotope",
+        type=int,
+        default=2,
+        help="Number of sources for each isotope in multi-isotope cases.",
+    )
+    parser.add_argument(
+        "--multi-source-min-isotope-target-counts",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum PF-theory counts required for every isotope when sampling "
+            "multi-isotope multi-source detector poses."
+        ),
+    )
+    parser.add_argument(
+        "--multi-source-detector-attempts",
+        type=int,
+        default=24,
+        help="Detector-pose resampling attempts for each multi-isotope case.",
+    )
     parser.add_argument("--num-environments", type=int, default=10)
     parser.add_argument("--measurement-points-per-environment", type=int, default=24)
     parser.add_argument("--rotations-per-point", type=int, default=8)
@@ -1314,7 +1566,26 @@ def main() -> None:
     runtime_config["engine_mode"] = "external"
     runtime_config["physics_profile"] = "balanced"
 
-    if args.environment_sweep:
+    mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=ISOTOPES)
+
+    if args.multi_isotope_multi_source_cases:
+        all_cases = generated_multi_isotope_source_cases(
+            num_cases=int(args.num_cases),
+            seed=int(args.case_seed),
+            dwell_time_s=float(args.dwell_time_s),
+            intensity_min_cps_1m=float(args.intensity_min_cps_1m),
+            intensity_max_cps_1m=float(args.intensity_max_cps_1m),
+            sources_per_isotope=int(args.sources_per_isotope),
+            blocked_fraction=float(args.blocked_fraction),
+            passage_width_m=float(args.passage_width_m),
+            min_isotope_target_counts=float(
+                args.multi_source_min_isotope_target_counts
+            ),
+            detector_attempts=int(args.multi_source_detector_attempts),
+            runtime_config=runtime_config,
+            mu_by_isotope=mu_by_isotope,
+        )
+    elif args.environment_sweep:
         all_cases = generated_environment_sweep_cases(
             num_environments=int(args.num_environments),
             measurement_points_per_environment=int(args.measurement_points_per_environment),
@@ -1354,7 +1625,6 @@ def main() -> None:
         else ROOT / "results" / "spectrum_validation" / f"geant4_photopeak_nnls_sweep_{timestamp}"
     )
 
-    mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=ISOTOPES)
     decomposer = SpectralDecomposer(spectrum_config_from_runtime_config(runtime_config))
     results: list[dict[str, Any]] = []
     spectra: dict[str, np.ndarray] = {}

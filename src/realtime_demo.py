@@ -84,6 +84,34 @@ def _resolve_station_update_modes(
     return joint_observation_update, delayed_resample_update
 
 
+def _resolve_random_source_isotopes(
+    requested: str | Sequence[str] | None,
+    runtime_config: Mapping[str, Any],
+    library_isotopes: Sequence[str],
+) -> tuple[str, ...]:
+    """Return isotope names used by surface-random source generation."""
+    config_requested = runtime_config.get("random_source_isotopes")
+    raw_requested: object = requested if requested is not None else config_requested
+    if raw_requested is None:
+        names = [str(name) for name in library_isotopes]
+    elif isinstance(raw_requested, str):
+        names = [name.strip() for name in raw_requested.split(",") if name.strip()]
+    elif isinstance(raw_requested, Sequence):
+        names = [str(name).strip() for name in raw_requested if str(name).strip()]
+    else:
+        raise TypeError("random_source_isotopes must be a string or sequence.")
+    if not names:
+        raise ValueError("random_source_isotopes must contain at least one isotope.")
+    library_set = {str(name) for name in library_isotopes}
+    unknown = sorted(set(names).difference(library_set))
+    if unknown:
+        raise ValueError(
+            "random_source_isotopes contains isotopes not in the spectrum library: "
+            f"{unknown}"
+        )
+    return tuple(names)
+
+
 def _configure_matplotlib() -> None:
     """Configure matplotlib backend for interactive or headless use."""
     headless = _argv_requests_cui()
@@ -114,6 +142,7 @@ from measurement.source_surfaces import (
     source_surface_kind_counts,
     source_surface_kinds,
     surface_observable_fractions,
+    surface_response_observability_diagnostics,
 )
 from measurement.shielding import (
     HVL_TVL_TABLE_MM,
@@ -379,6 +408,14 @@ def _source_ground_visibility_payload(
         detector_height_m=detector_height_m,
         clear_path_max_m=clear_path_max_m,
     )
+    response_diag = surface_response_observability_diagnostics(
+        positions,
+        obstacle_grid,
+        points,
+        obstacle_height_m=obstacle_height_m,
+        detector_height_m=detector_height_m,
+        clear_path_max_m=clear_path_max_m,
+    )
     return {
         "enabled": True,
         "reference_point_count": int(points.shape[0]),
@@ -387,6 +424,7 @@ def _source_ground_visibility_payload(
         "min_source_visible_fraction": float(np.min(fractions)),
         "mean_source_visible_fraction": float(np.mean(fractions)),
         "source_visible_fractions": [float(value) for value in fractions],
+        "response_observability": response_diag,
     }
 
 
@@ -815,6 +853,219 @@ def _isotope_measurement_evidence(
         "max_counts": float(max_counts),
         "support_measurements": int(support_measurements),
         "observed_measurements": int(observed_measurements),
+    }
+
+
+def _final_isotope_count_residual_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    estimates: Mapping[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
+) -> dict[str, dict[str, float | int]]:
+    """Return isotope-wise final count prediction and residual diagnostics."""
+    diagnostics: dict[str, dict[str, float | int]] = {}
+    for isotope, filt in sorted(estimator.filters.items()):
+        data = estimator._measurement_data_for_iso(isotope, window=None)
+        if data is None or data.z_k.size == 0:
+            estimate = estimates.get(isotope, (np.zeros((0, 3)), np.zeros(0)))
+            diagnostics[str(isotope)] = {
+                "measurement_count": 0,
+                "observed_total_counts": 0.0,
+                "predicted_total_counts": 0.0,
+                "positive_residual_total_counts": 0.0,
+                "negative_residual_total_counts": 0.0,
+                "residual_chi2": 0.0,
+                "reported_source_count": int(
+                    np.asarray(estimate[0], dtype=float).reshape(-1, 3).shape[0]
+                ),
+            }
+            continue
+        positions, strengths = estimates.get(
+            isotope,
+            (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+        )
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
+        q_arr = np.asarray(strengths, dtype=float).reshape(-1)
+        source_count = min(pos_arr.shape[0], q_arr.size)
+        pos_arr = pos_arr[:source_count]
+        q_arr = np.maximum(q_arr[:source_count], 0.0)
+        background = estimator._background_counts_for_report_refit(
+            isotope,
+            data.live_times,
+        )
+        if source_count:
+            source_counts = expected_counts_per_source(
+                kernel=filt.continuous_kernel,
+                isotope=isotope,
+                detector_positions=data.detector_positions,
+                sources=pos_arr,
+                strengths=q_arr,
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+                source_scale=estimator.response_scale_for_isotope(isotope),
+            )
+            predicted = np.asarray(background, dtype=float) + np.sum(
+                np.maximum(np.asarray(source_counts, dtype=float), 0.0),
+                axis=1,
+            )
+        else:
+            predicted = np.asarray(background, dtype=float)
+        observed = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
+        residual = observed - np.asarray(predicted, dtype=float).reshape(-1)
+        variances = np.maximum(
+            np.asarray(data.observation_variances, dtype=float).reshape(-1),
+            1.0,
+        )
+        diagnostics[str(isotope)] = {
+            "measurement_count": int(observed.size),
+            "reported_source_count": int(source_count),
+            "observed_total_counts": float(np.sum(observed)),
+            "observed_max_counts": float(np.max(observed)) if observed.size else 0.0,
+            "predicted_total_counts": float(np.sum(predicted)),
+            "background_total_counts": float(np.sum(background)),
+            "positive_residual_total_counts": float(np.sum(np.maximum(residual, 0.0))),
+            "negative_residual_total_counts": float(np.sum(np.maximum(-residual, 0.0))),
+            "residual_chi2": float(np.sum((residual * residual) / variances)),
+            "residual_snr": float(
+                np.sum(residual) / np.sqrt(max(float(np.sum(variances)), 1.0e-12))
+            ),
+            "source_strength_total": float(np.sum(q_arr)),
+            "source_strength_max": float(np.max(q_arr)) if q_arr.size else 0.0,
+        }
+    return diagnostics
+
+
+def _estimate_map_to_metric_sources(
+    estimates: Mapping[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
+) -> dict[str, list[dict[str, float | list[float]]]]:
+    """Convert an estimator estimate map into compute_metrics source records."""
+    payload: dict[str, list[dict[str, float | list[float]]]] = {}
+    for isotope, (positions, strengths) in estimates.items():
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
+        q_arr = np.asarray(strengths, dtype=float).reshape(-1)
+        count = min(pos_arr.shape[0], q_arr.size)
+        payload[str(isotope)] = [
+            {
+                "pos": [float(value) for value in pos_arr[idx]],
+                "strength": float(q_arr[idx]),
+            }
+            for idx in range(count)
+        ]
+    return payload
+
+
+def _online_estimate_metric_summary(
+    history_estimates: Sequence[Mapping[str, tuple[NDArray[np.float64], NDArray[np.float64]]]],
+    gt_by_iso: Mapping[str, list[dict[str, float | list[float]]]],
+    *,
+    match_radius_m: float,
+) -> dict[str, dict[str, float | int | None]]:
+    """Summarize online source-count and localization stability over PF history."""
+    summaries: dict[str, dict[str, float | int | None]] = {}
+    isotopes = sorted(
+        set(str(name) for name in gt_by_iso)
+        | {
+            str(iso)
+            for estimate_map in history_estimates
+            for iso in estimate_map.keys()
+        }
+    )
+    if not history_estimates:
+        return {
+            isotope: {
+                "history_length": 0,
+                "first_correct_cardinality_step": None,
+                "last_correct_cardinality_step": None,
+                "max_consecutive_wrong_cardinality": 0,
+                "final_online_source_count_error": None,
+            }
+            for isotope in isotopes
+        }
+    cardinality_errors: dict[str, list[int]] = {isotope: [] for isotope in isotopes}
+    mean_errors: dict[str, list[float | None]] = {isotope: [] for isotope in isotopes}
+    for estimate_map in history_estimates:
+        metrics = compute_metrics(
+            dict(gt_by_iso),
+            _estimate_map_to_metric_sources(estimate_map),
+            match_radius_m=float(match_radius_m),
+        )
+        isotope_metrics = metrics.get("isotopes", {})
+        for isotope in isotopes:
+            data = isotope_metrics.get(isotope, {})
+            counts = data.get("counts", {}) if isinstance(data, dict) else {}
+            pos_summary = data.get("position_error", {}) if isinstance(data, dict) else {}
+            cardinality_errors[isotope].append(
+                int(counts.get("source_count_error", 0))
+            )
+            mean_errors[isotope].append(pos_summary.get("mean"))
+    for isotope in isotopes:
+        errors = cardinality_errors[isotope]
+        correct_steps = [idx for idx, value in enumerate(errors) if int(value) == 0]
+        max_wrong = 0
+        current_wrong = 0
+        for value in errors:
+            if int(value) == 0:
+                current_wrong = 0
+            else:
+                current_wrong += 1
+                max_wrong = max(max_wrong, current_wrong)
+        finite_mean_errors = [
+            float(value)
+            for value in mean_errors[isotope]
+            if value is not None and np.isfinite(float(value))
+        ]
+        summaries[isotope] = {
+            "history_length": int(len(errors)),
+            "first_correct_cardinality_step": (
+                int(correct_steps[0]) if correct_steps else None
+            ),
+            "last_correct_cardinality_step": (
+                int(correct_steps[-1]) if correct_steps else None
+            ),
+            "max_consecutive_wrong_cardinality": int(max_wrong),
+            "final_online_source_count_error": int(errors[-1]) if errors else None,
+            "mean_online_position_error_m": (
+                float(np.mean(finite_mean_errors)) if finite_mean_errors else None
+            ),
+            "final_online_position_error_m": (
+                float(finite_mean_errors[-1]) if finite_mean_errors else None
+            ),
+        }
+    return summaries
+
+
+def _remaining_measurement_trace_summary(
+    estimates: Sequence[Mapping[str, Any]],
+) -> dict[str, float | int | list[str]]:
+    """Summarize remaining-measurement trace health for final JSON output."""
+    if not estimates:
+        return {
+            "trace_length": 0,
+            "residual_budget_auc": 0.0,
+            "max_estimated_remaining_stations": 0,
+            "last_unresolved_factors": [],
+        }
+    residual_auc = 0.0
+    max_remaining = 0
+    for payload_raw in estimates:
+        payload = dict(payload_raw)
+        components = payload.get("components", {})
+        if isinstance(components, Mapping):
+            residual_auc += float(components.get("residual", 0.0))
+        max_remaining = max(
+            max_remaining,
+            int(payload.get("estimated_remaining_stations", 0) or 0),
+        )
+    last = dict(estimates[-1])
+    unresolved = last.get("unresolved_factors", [])
+    if not isinstance(unresolved, Sequence) or isinstance(unresolved, (str, bytes)):
+        unresolved_values: list[str] = []
+    else:
+        unresolved_values = [str(value) for value in unresolved]
+    return {
+        "trace_length": int(len(estimates)),
+        "residual_budget_auc": float(residual_auc),
+        "max_estimated_remaining_stations": int(max_remaining),
+        "last_unresolved_factors": unresolved_values,
     }
 
 
@@ -1703,6 +1954,20 @@ def _fmt_count_map(counts: dict[str, float], precision: int = 2) -> str:
     return "{" + ", ".join(chunks) + "}"
 
 
+def _count_ratio_map(
+    numerator: dict[str, float],
+    denominator: dict[str, float],
+) -> dict[str, float]:
+    """Return isotope-wise count ratios with zero denominators omitted."""
+    ratios: dict[str, float] = {}
+    for isotope, denom in sorted(denominator.items()):
+        denom_value = float(denom)
+        if denom_value <= 0.0:
+            continue
+        ratios[str(isotope)] = float(numerator.get(isotope, 0.0)) / denom_value
+    return ratios
+
+
 def _fmt_probability_map(probabilities: dict[str, float], precision: int = 3) -> str:
     """Format discrete probability maps for compact PF diagnostics."""
     if not probabilities:
@@ -1819,6 +2084,24 @@ def _log_geant4_transport_decomposition_diagnostics(
         f"{selected_count_method}={_fmt_count_map(selected_counts)}"
         f"{response_suffix}"
     )
+    selected_to_transport = _count_ratio_map(
+        selected_counts,
+        transport_detected_counts,
+    )
+    response_to_transport = _count_ratio_map(
+        response_poisson_counts,
+        transport_detected_counts,
+    )
+    transport_to_source = _count_ratio_map(
+        transport_detected_counts,
+        source_equivalent_counts,
+    )
+    print(
+        f"[step {step_index}] geant4_decomposition_ratios "
+        f"selected_over_transport={_fmt_count_map(selected_to_transport, 3)} "
+        f"response_poisson_over_transport={_fmt_count_map(response_to_transport, 3)} "
+        f"transport_over_source_equivalent={_fmt_count_map(transport_to_source, 3)}"
+    )
     volume_top = str(metadata.get("volume_step_counts_top", "")).strip()
     if volume_top and volume_top != "-":
         print(f"[step {step_index}] geant4_volume_steps_top {volume_top}")
@@ -1872,6 +2155,12 @@ def _log_pf_diagnostics(
         birth_global_best_delta = float(
             stats.get("birth_global_rescue_best_delta", float("-inf"))
         )
+        runtime_rescue_candidates = int(
+            stats.get("runtime_report_rescue_candidates", 0)
+        )
+        runtime_rescue_sources = int(stats.get("runtime_report_rescue_sources", 0))
+        runtime_rescue_injected = int(stats.get("runtime_report_rescue_injected", 0))
+        runtime_rescue_weight = float(stats.get("runtime_report_rescue_weight", 0.0))
         birth_structural_eligible = int(stats.get("birth_structural_eligible", 0))
         pseudo_verified = int(stats.get("pseudo_source_verified", 0))
         pseudo_failed = int(stats.get("pseudo_source_failed", 0))
@@ -1882,6 +2171,14 @@ def _log_pf_diagnostics(
         structural_timing = stats.get("structural_timing_s", {})
         temper_steps = stats.get("temper_steps", [])
         temper_resamples = int(stats.get("temper_resamples", 0))
+        mode_strata_summary = dict(stats.get("mode_preserving_strata_summary", {}))
+        mode_selected_strata = list(stats.get("mode_preserving_selected_strata", []))
+        mode_cardinality_summary = dict(
+            stats.get("mode_preserving_cardinality_summary", {})
+        )
+        mode_selected_cardinalities = list(
+            stats.get("mode_preserving_selected_cardinalities", [])
+        )
         r_mean = float(stats["r_mean"])
         r_var = float(stats["r_var"])
         r_weighted_mean = float(stats.get("r_weighted_mean", r_mean))
@@ -1942,6 +2239,10 @@ def _log_pf_diagnostics(
             f"birth_global_accepts={birth_global_accepts} "
             f"birth_global_rejected={birth_global_rejected} "
             f"birth_global_best_delta={_fmt_optional_float(birth_global_best_delta)} "
+            f"runtime_report_rescue_candidates={runtime_rescue_candidates} "
+            f"runtime_report_rescue_sources={runtime_rescue_sources} "
+            f"runtime_report_rescue_injected={runtime_rescue_injected} "
+            f"runtime_report_rescue_weight={runtime_rescue_weight:.3f} "
             f"birth_structural_eligible={birth_structural_eligible} "
             f"pseudo_verified={pseudo_verified} "
             f"pseudo_failed={pseudo_failed} "
@@ -1955,6 +2256,19 @@ def _log_pf_diagnostics(
                 for key, value in sorted(dict(pseudo_reasons).items())
             )
             print(f"[step {step_index}] pf[{iso}] pseudo_fail_reasons={reason_str}")
+        if (
+            mode_strata_summary
+            or mode_selected_strata
+            or mode_cardinality_summary
+            or mode_selected_cardinalities
+        ):
+            print(
+                f"[step {step_index}] pf[{iso}] mode_preservation "
+                f"strata_mass={_safe_json_dumps(mode_strata_summary)} "
+                f"selected={_safe_json_dumps(mode_selected_strata)} "
+                f"cardinality_mass={_safe_json_dumps(mode_cardinality_summary)} "
+                f"selected_cardinality={_safe_json_dumps(mode_selected_cardinalities)}"
+            )
         if structural_timing:
             timing_items = {
                 key: float(value)
@@ -2004,6 +2318,7 @@ def _log_report_model_order_diagnostics(
         method = str(stats.get("method", "unknown"))
         ready = bool(stats.get("model_order_ready", True))
         margin = stats.get("criterion_margin_to_simpler")
+        runner_margin = stats.get("criterion_margin_to_runner_up")
         condition = stats.get("condition_number")
         max_corr = stats.get("selected_max_response_correlation")
         evaluated = int(stats.get("evaluated_subsets", 0))
@@ -2030,11 +2345,49 @@ def _log_report_model_order_diagnostics(
             f"method={method} ready={ready} candidates={candidate_count} "
             f"selected={selected_count} selected_indices={selected_indices} "
             f"margin_to_simpler={_fmt_optional_float(margin)} "
+            f"margin_to_runner_up={_fmt_optional_float(runner_margin)} "
             f"condition={_fmt_optional_float(condition)} "
             f"max_response_corr={_fmt_optional_float(max_corr, 3)} "
             f"evaluated_subsets={evaluated} workers={workers} "
             f"evaluation_mode={eval_mode} "
             f"best_by_k=[{'; '.join(best_by_k_chunks)}]"
+        )
+
+
+def _log_surface_candidate_observability_diagnostics(
+    estimator: RotatingShieldPFEstimator,
+    step_index: int,
+    *,
+    label: str,
+    window: int | None = None,
+    max_candidates: int = 256,
+) -> None:
+    """Log truth-independent surface-candidate observability diagnostics."""
+    if not hasattr(estimator, "surface_candidate_observability_diagnostics"):
+        return
+    diagnostics = estimator.surface_candidate_observability_diagnostics(
+        window=window,
+        max_candidates=max_candidates,
+    )
+    if not diagnostics:
+        print(f"[step {step_index}] surface_observability[{label}]: no diagnostics")
+        return
+    for iso, stats_raw in sorted(diagnostics.items()):
+        stats = dict(stats_raw)
+        print(
+            f"[step {step_index}] surface_observability[{iso}] label={label} "
+            f"measurements={int(stats.get('measurement_count', 0))} "
+            f"candidates={int(stats.get('candidate_count', 0))} "
+            f"sampled={int(stats.get('sampled_candidate_count', 0))} "
+            f"active={int(stats.get('active_candidate_count', 0))} "
+            f"weak={int(stats.get('weak_column_count', 0))} "
+            f"condition={_fmt_optional_float(stats.get('condition_number'))} "
+            f"max_corr={_fmt_optional_float(stats.get('max_abs_correlation'), 3)} "
+            "ambiguous99="
+            f"{int(stats.get('ambiguous_pair_count_corr_ge_0p99', 0))} "
+            "ambiguous995="
+            f"{int(stats.get('ambiguous_pair_count_corr_ge_0p995', 0))} "
+            f"surface_counts={_safe_json_dumps(stats.get('surface_counts', {}))}"
         )
 
 
@@ -2088,6 +2441,8 @@ def _log_dss_ranked_node_diagnostics(
             f"turn={float(entry.get('turn_penalty', 0.0)):.6g} "
             f"local_orbit={float(entry.get('local_orbit_gain', 0.0)):.6g} "
             f"station_cond={float(entry.get('station_condition_gain', 0.0)):.6g} "
+            f"corr_reduction={float(entry.get('correlation_reduction_gain', 0.0)):.6g} "
+            f"isotope_balance={float(entry.get('isotope_balance_gain', 0.0)):.6g} "
             f"elev_cond={float(entry.get('elevation_condition_gain', 0.0)):.6g} "
             f"env_sig={float(entry.get('environment_signature_score', 0.0)):.6g} "
             f"vertical_env={float(entry.get('vertical_environment_signature_score', 0.0)):.6g} "
@@ -2096,6 +2451,101 @@ def _log_dss_ranked_node_diagnostics(
             f"route_penalty={float(entry.get('remaining_route_penalty', 0.0)):.6g} "
             f"route_gain={float(entry.get('remaining_route_gain', 0.0)):.6g}"
         )
+
+
+def _log_dss_pairwise_ambiguity_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Log selected DSS-PP program diagnostics for ambiguous mode pairs."""
+    payload_raw = diagnostics.get("selected_pairwise_ambiguity", {})
+    if not isinstance(payload_raw, dict) or not payload_raw:
+        print(f"DSS-PP pairwise ambiguity[{label}]: none")
+        return
+    for isotope, stats_raw in sorted(payload_raw.items()):
+        stats = dict(stats_raw) if isinstance(stats_raw, dict) else {}
+        print(
+            f"DSS-PP pairwise ambiguity[{label}][{isotope}] "
+            f"modes={int(stats.get('mode_count', 0))} "
+            f"pairs={list(stats.get('program_pair_ids', []))} "
+            f"before_meas={int(stats.get('before_measurements', 0))} "
+            f"program_meas={int(stats.get('program_measurements', 0))} "
+            f"before_min_sep={_fmt_optional_float(stats.get('before_min_separation'), 3)} "
+            f"program_min_sep={_fmt_optional_float(stats.get('program_min_separation'), 3)} "
+            f"combined_min_sep={_fmt_optional_float(stats.get('combined_min_separation'), 3)} "
+            f"before_max_corr={_fmt_optional_float(stats.get('before_max_correlation'), 3)} "
+            f"program_max_corr={_fmt_optional_float(stats.get('program_max_correlation'), 3)} "
+            f"combined_max_corr={_fmt_optional_float(stats.get('combined_max_correlation'), 3)} "
+            f"unresolved={int(stats.get('before_unresolved_pairs', 0))}->"
+            f"{int(stats.get('combined_unresolved_pairs', 0))}"
+        )
+        bottlenecks = stats.get("bottleneck_pairs", [])
+        if not isinstance(bottlenecks, Sequence):
+            continue
+        for pair_raw in bottlenecks:
+            if not isinstance(pair_raw, dict):
+                continue
+            left = dict(pair_raw.get("left_mode", {}))
+            right = dict(pair_raw.get("right_mode", {}))
+            print(
+                f"DSS-PP bottleneck_pair[{label}][{isotope}] "
+                f"rank={int(pair_raw.get('rank', 0))} "
+                f"left={int(left.get('index', -1))}@{left.get('pos')} "
+                f"right={int(right.get('index', -1))}@{right.get('pos')} "
+                f"before_sep={_fmt_optional_float(pair_raw.get('before_separation'), 3)} "
+                f"program_sep={_fmt_optional_float(pair_raw.get('program_separation'), 3)} "
+                f"combined_sep={_fmt_optional_float(pair_raw.get('combined_separation'), 3)} "
+                f"combined_corr={_fmt_optional_float(pair_raw.get('combined_correlation'), 3)} "
+                f"bearing_delta_deg={_fmt_optional_float(pair_raw.get('bearing_delta_deg'), 2)} "
+                f"elevation_delta_deg={_fmt_optional_float(pair_raw.get('elevation_delta_deg'), 2)} "
+                f"program_left={pair_raw.get('program_left_response')} "
+                f"program_right={pair_raw.get('program_right_response')}"
+            )
+
+
+def _log_dss_component_leader_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    """Log per-component DSS-PP leaders for counterfactual selection analysis."""
+    leaders_raw = diagnostics.get("component_leaders", {})
+    if not isinstance(leaders_raw, dict) or not leaders_raw:
+        print(f"DSS-PP component leaders[{label}]: none")
+        return
+    for component, entry_raw in sorted(leaders_raw.items()):
+        if not isinstance(entry_raw, dict):
+            continue
+        pose = np.asarray(entry_raw.get("pose_xyz", np.zeros(3)), dtype=float)
+        pairs = entry_raw.get("pair_ids", [])
+        print(
+            f"DSS-PP component leader[{label}] component={component} "
+            f"value={_fmt_optional_float(entry_raw.get('component_value'), 6)} "
+            f"pose_idx={int(entry_raw.get('pose_index', -1))} "
+            f"pose={_fmt_pos(pose)} "
+            f"program={entry_raw.get('program_name')} "
+            f"kind={entry_raw.get('program_kind')} "
+            f"pairs={list(pairs) if isinstance(pairs, Sequence) else pairs} "
+            f"score={float(entry_raw.get('score', 0.0)):.6g}"
+        )
+
+
+def _log_remaining_measurement_detail(
+    estimate: object,
+    *,
+    label: str,
+) -> None:
+    """Log remaining-measurement component and gain breakdowns."""
+    components = getattr(estimate, "components", {})
+    gains = getattr(estimate, "gains", {})
+    isotope_details = getattr(estimate, "isotope_details", {})
+    print(
+        f"Remaining measurement detail[{label}]: "
+        f"components={_safe_json_dumps(components)} "
+        f"gains={_safe_json_dumps(gains)} "
+        f"isotopes={_safe_json_dumps(isotope_details)}"
+    )
 
 
 def _safe_json_dumps(payload: object) -> str:
@@ -2620,9 +3070,7 @@ def _log_particle_cloud_diagnostics(
             source_count_mass[str(count)] = float(np.sum(weights[source_counts == count]))
         ess = float(1.0 / max(float(np.sum(weights**2)), 1.0e-300))
         order = np.argsort(weights)[::-1]
-        log_order = order
-        if particle_log_limit > 0:
-            log_order = order[: min(int(particle_log_limit), order.size)]
+        log_order = _diagnostic_detail_order(order, particle_log_limit)
         print(
             f"[step {step_index}] particle_cloud[{isotope}] "
             f"particles={len(particles)} logged_particles={int(log_order.size)} "
@@ -2982,9 +3430,10 @@ def _log_birth_candidate_diagnostics(
             existing_unit,
             data.observation_variances,
         )
-        order = np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1]
-        if candidate_log_limit > 0:
-            order = order[: min(int(candidate_log_limit), order.size)]
+        order = _diagnostic_detail_order(
+            np.argsort(np.where(np.isfinite(scores), scores, -np.inf))[::-1],
+            candidate_log_limit,
+        )
         surface_kinds = source_surface_kinds(
             candidates_all,
             env,
@@ -3086,6 +3535,20 @@ def _run_precision_diagnostic_block(
         callback()
     except Exception as exc:  # pragma: no cover - defensive logging path
         print(f"precision_diagnostic_error[{label}]: {type(exc).__name__}: {exc}")
+
+
+def _diagnostic_detail_order(
+    ordered_indices: NDArray[np.integer] | Sequence[int],
+    limit: int,
+) -> NDArray[np.int64]:
+    """Return diagnostic detail indices using 0=none, positive=N, negative=all."""
+    order = np.asarray(ordered_indices, dtype=np.int64).reshape(-1)
+    limit_int = int(limit)
+    if limit_int < 0:
+        return order
+    if limit_int == 0:
+        return order[:0]
+    return order[: min(limit_int, order.size)]
 
 
 def _log_precision_degradation_diagnostics(
@@ -3267,6 +3730,21 @@ def _resolve_display_prune_refresh_interval(
     return interval
 
 
+def _resolve_structural_trial_parallelism(
+    runtime_config: Mapping[str, object],
+) -> tuple[int, int]:
+    """Return PF structural trial worker count and minimum trial threshold."""
+    try:
+        workers = int(runtime_config.get("structural_trial_workers", 1))
+    except (TypeError, ValueError):
+        workers = 1
+    try:
+        min_trials = int(runtime_config.get("structural_trial_parallel_min_trials", 8))
+    except (TypeError, ValueError):
+        min_trials = 8
+    return max(1, workers), max(1, min_trials)
+
+
 def _should_refresh_display_pruned_estimates(
     *,
     step_index: int,
@@ -3275,10 +3753,10 @@ def _should_refresh_display_pruned_estimates(
     force_refresh: bool,
 ) -> bool:
     """Return whether display-only pruned estimates should be recomputed."""
-    if force_refresh or not cache_available:
-        return True
     if int(refresh_every) <= 0:
         return False
+    if force_refresh or not cache_available:
+        return True
     return int(step_index) % max(1, int(refresh_every)) == 0
 
 
@@ -4021,6 +4499,234 @@ def _coverage_fraction_for_poses(
     return float(covered) / float(len(cells))
 
 
+def _remaining_measurement_ready_for_stop(
+    estimate: Mapping[str, Any] | None,
+) -> bool:
+    """Return True when the remaining-measurement estimate has no unresolved budget."""
+    if not estimate:
+        return True
+    unresolved_raw = estimate.get("unresolved_factors", [])
+    if isinstance(unresolved_raw, str):
+        unresolved_factors = [unresolved_raw] if unresolved_raw else []
+    else:
+        unresolved_factors = [str(value) for value in unresolved_raw or []]
+    try:
+        remaining = int(estimate.get("estimated_remaining_stations", 0))
+    except (TypeError, ValueError):
+        remaining = 0
+    try:
+        budget = float(estimate.get("current_budget", 0.0))
+    except (TypeError, ValueError):
+        budget = 0.0
+    return not (unresolved_factors and remaining > 0 and budget > 0.0)
+
+
+def _remaining_measurement_payload(
+    estimate: Mapping[str, Any] | object | None,
+) -> Mapping[str, Any]:
+    """Return a mapping view of a remaining-measurement estimate."""
+    if estimate is None:
+        return {}
+    if isinstance(estimate, Mapping):
+        return estimate
+    if hasattr(estimate, "to_dict"):
+        try:
+            payload = estimate.to_dict()
+        except (TypeError, ValueError):
+            return {}
+        if isinstance(payload, Mapping):
+            return payload
+    return {}
+
+
+def _remaining_measurement_component(
+    estimate: Mapping[str, Any] | object | None,
+    key: str,
+) -> float:
+    """Return one remaining-measurement component with a zero fallback."""
+    payload = _remaining_measurement_payload(estimate)
+    components = payload.get("components", {})
+    if not isinstance(components, Mapping):
+        return 0.0
+    try:
+        return float(components.get(key, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _report_model_order_simple_ready_for_stop(
+    estimator: object,
+    *,
+    remaining_measurement_estimate: Mapping[str, Any] | object | None,
+    max_sources_per_isotope: int = 1,
+    min_bic_margin: float = 10.0,
+    max_condition_number: float = 100.0,
+    max_response_correlation: float = 0.98,
+    residual_budget_threshold: float = 1.0e-9,
+    ambiguity_budget_threshold: float = 1.0e-9,
+    allow_high_surface_ambiguity: bool = False,
+    require_no_birth_residual: bool = True,
+    birth_residual_min_support: int = 1,
+) -> bool:
+    """Return True when report-level BIC makes the mission structurally simple."""
+    residual_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "residual",
+    )
+    isotope_absence_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "isotope_absence",
+    )
+    if (
+        residual_budget > float(residual_budget_threshold)
+        or isotope_absence_budget > float(residual_budget_threshold)
+    ):
+        return False
+    same_isotope_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "same_isotope_separation",
+    )
+    high_surface_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "high_surface_ambiguity",
+    )
+    if same_isotope_budget > float(ambiguity_budget_threshold):
+        return False
+    if (
+        high_surface_budget > float(ambiguity_budget_threshold)
+        and not bool(allow_high_surface_ambiguity)
+    ):
+        return False
+    if bool(require_no_birth_residual) and _has_birth_residual_evidence(
+        estimator,
+        min_support=max(1, int(birth_residual_min_support)),
+    ):
+        return False
+    if hasattr(estimator, "estimates"):
+        try:
+            estimator.estimates()
+        except RuntimeError:
+            return False
+    if not hasattr(estimator, "report_model_order_diagnostics"):
+        return False
+    diagnostics = estimator.report_model_order_diagnostics()
+    if not diagnostics:
+        return False
+    max_sources = max(0, int(max_sources_per_isotope))
+    margin_floor = max(0.0, float(min_bic_margin))
+    condition_limit = max(0.0, float(max_condition_number))
+    corr_limit = max(0.0, float(max_response_correlation))
+    for _isotope, stats in diagnostics.items():
+        if not isinstance(stats, Mapping):
+            return False
+        try:
+            selected_count = int(stats.get("selected_count", 0))
+        except (TypeError, ValueError):
+            return False
+        if selected_count > max_sources:
+            return False
+        try:
+            margin_default = float("-inf") if selected_count > 0 else float("inf")
+            margin = float(stats.get("criterion_margin_to_simpler", margin_default))
+        except (TypeError, ValueError):
+            margin = float("-inf")
+        if selected_count > 0 and (
+            not np.isfinite(margin) or margin < margin_floor
+        ):
+            return False
+        try:
+            condition = float(stats.get("condition_number", 0.0))
+        except (TypeError, ValueError):
+            condition = float("inf")
+        if (
+            selected_count > 1
+            and condition_limit > 0.0
+            and np.isfinite(condition)
+            and condition > condition_limit
+        ):
+            return False
+        try:
+            response_corr = float(
+                stats.get("selected_max_response_correlation", 0.0)
+            )
+        except (TypeError, ValueError):
+            response_corr = float("inf")
+        if (
+            selected_count > 1
+            and np.isfinite(response_corr)
+            and response_corr > corr_limit
+        ):
+            return False
+    return True
+
+
+def _adapt_dss_program_length_for_budget(
+    config: DSSPPConfig,
+    *,
+    enabled: bool,
+    simple_program_length: int,
+    residual_program_length: int,
+    residual_burst_active: bool,
+    report_simple_ready: bool,
+    remaining_measurement_estimate: Mapping[str, Any] | object | None,
+    residual_budget_threshold: float,
+    ambiguity_budget_threshold: float,
+    allow_high_surface_simple: bool = False,
+) -> tuple[DSSPPConfig, str]:
+    """Return a DSS-PP config with a measurement-budget-aware program length."""
+    if not bool(enabled):
+        return config, "disabled"
+    if config.forced_program_pair_ids is not None:
+        return config, "forced_program"
+    base_length = max(1, int(config.program_length))
+    simple_length = max(1, min(base_length, int(simple_program_length)))
+    residual_length = max(base_length, int(residual_program_length))
+    residual_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "residual",
+    )
+    isotope_absence_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "isotope_absence",
+    )
+    if (
+        residual_budget > float(residual_budget_threshold)
+        or isotope_absence_budget > float(residual_budget_threshold)
+    ):
+        if residual_length != base_length:
+            return replace(config, program_length=residual_length), "residual"
+        return config, "residual"
+    if bool(residual_burst_active) and not bool(report_simple_ready):
+        if residual_length != base_length:
+            return replace(config, program_length=residual_length), "residual"
+        return config, "residual"
+    same_isotope_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "same_isotope_separation",
+    )
+    high_surface_budget = _remaining_measurement_component(
+        remaining_measurement_estimate,
+        "high_surface_ambiguity",
+    )
+    if same_isotope_budget > float(ambiguity_budget_threshold):
+        return config, "ambiguity"
+    if (
+        high_surface_budget > float(ambiguity_budget_threshold)
+        and not (bool(report_simple_ready) and bool(allow_high_surface_simple))
+    ):
+        return config, "ambiguity"
+    if bool(report_simple_ready) and simple_length < base_length:
+        return replace(config, program_length=simple_length), "simple_report"
+    remaining_payload = _remaining_measurement_payload(remaining_measurement_estimate)
+    if (
+        remaining_payload
+        and _remaining_measurement_ready_for_stop(remaining_payload)
+        and simple_length < base_length
+    ):
+        return replace(config, program_length=simple_length), "remaining_ready"
+    return config, "full"
+
+
 def _adaptive_mission_stop_reason(
     estimator: RotatingShieldPFEstimator,
     *,
@@ -4038,21 +4744,59 @@ def _adaptive_mission_stop_reason(
     require_no_unresolved_discriminative_failures: bool = True,
     unresolved_discriminative_failure_min_count: int = 1,
     require_model_order_ready: bool = True,
+    remaining_measurement_estimate: Mapping[str, Any] | None = None,
+    require_remaining_measurement_ready: bool = True,
+    allow_report_simple_stop: bool = True,
+    report_simple_max_sources_per_isotope: int = 1,
+    report_simple_min_bic_margin: float = 10.0,
+    report_simple_max_condition_number: float = 100.0,
+    report_simple_max_response_correlation: float = 0.98,
+    report_simple_residual_budget_threshold: float = 1.0e-9,
+    report_simple_ambiguity_budget_threshold: float = 1.0e-9,
+    report_simple_allow_high_surface_ambiguity: bool = False,
 ) -> str | None:
     """Return an adaptive mission-stop reason when exploration is sufficiently complete."""
     if len(visited_poses_xyz) < max(1, int(min_poses)):
         return None
-    if bool(require_model_order_ready) and not _report_model_order_ready_for_stop(
-        estimator
-    ):
+    report_simple_ready = bool(allow_report_simple_stop) and (
+        _report_model_order_simple_ready_for_stop(
+            estimator,
+            remaining_measurement_estimate=remaining_measurement_estimate,
+            max_sources_per_isotope=int(report_simple_max_sources_per_isotope),
+            min_bic_margin=float(report_simple_min_bic_margin),
+            max_condition_number=float(report_simple_max_condition_number),
+            max_response_correlation=float(report_simple_max_response_correlation),
+            residual_budget_threshold=float(
+                report_simple_residual_budget_threshold
+            ),
+            ambiguity_budget_threshold=float(
+                report_simple_ambiguity_budget_threshold
+            ),
+            allow_high_surface_ambiguity=bool(
+                report_simple_allow_high_surface_ambiguity
+            ),
+            require_no_birth_residual=False,
+            birth_residual_min_support=int(birth_residual_min_support),
+        )
+    )
+    report_ready = _report_model_order_ready_for_stop(estimator)
+    if bool(require_model_order_ready) and not (report_ready or report_simple_ready):
         return None
     if bool(require_no_unresolved_discriminative_failures) and (
         _has_unresolved_discriminative_pseudo_failures(
             estimator,
             min_count=int(unresolved_discriminative_failure_min_count),
         )
+        and not report_simple_ready
     ):
         return None
+    if bool(require_remaining_measurement_ready) and not (
+        _remaining_measurement_ready_for_stop(remaining_measurement_estimate)
+        or report_simple_ready
+    ):
+        return None
+    if report_simple_ready:
+        return "report_simple_model_order"
     if _all_pf_filters_converged(estimator):
         if bool(require_quiet_birth_residual) and _has_birth_residual_evidence(
             estimator,
@@ -5382,6 +6126,7 @@ def run_live_pf(
     source_generation_mode: str = "demo",
     random_source_seed: int | None = None,
     random_source_count: int = 3,
+    random_source_isotopes: str | Sequence[str] | None = None,
     random_source_intensity_cps_1m: float = 30000.0,
     notification_config: PiplupNotificationConfig | None = None,
     notify_spectrum: bool = False,
@@ -5448,6 +6193,7 @@ def run_live_pf(
         source_generation_mode: Source layout mode ("demo" or "surface_random").
         random_source_seed: RNG seed for surface-random source generation.
         random_source_count: Number of surface-random sources to generate.
+        random_source_isotopes: Optional isotope list for surface-random sources.
         random_source_intensity_cps_1m: Detector-cps@1m strength for random sources.
         notification_config: Optional piplup-notify delivery settings.
         notify_spectrum: Send per-measurement spectrum events through piplup.
@@ -5599,6 +6345,11 @@ def run_live_pf(
             obstacle_seed if random_source_seed is None else random_source_seed
         )
         source_rng = np.random.default_rng(source_rng_seed)
+        source_isotopes = _resolve_random_source_isotopes(
+            random_source_isotopes,
+            runtime_config,
+            tuple(decomposer.isotope_names),
+        )
         source_visibility_enabled = bool(
             runtime_config.get("random_source_visibility_filter", True)
         )
@@ -5626,6 +6377,19 @@ def run_live_pf(
         source_visibility_detector_height_m = float(
             runtime_config.get("detector_height_m", env.detector_position[2])
         )
+        source_response_filter_enabled = bool(
+            runtime_config.get("random_source_response_observability_filter", False)
+        )
+        source_response_max_corr = float(
+            runtime_config.get("random_source_response_max_pairwise_corr", 0.995)
+        )
+        source_response_max_condition = float(
+            runtime_config.get("random_source_response_condition_max", 1.0e3)
+        )
+        source_response_max_sets = max(
+            1,
+            int(runtime_config.get("random_source_response_max_set_attempts", 16)),
+        )
         if (
             source_visibility_enabled
             and source_visibility_min_fraction > 0.0
@@ -5644,41 +6408,89 @@ def run_live_pf(
                 f"reference_points={random_source_visibility_points.shape[0]}, "
                 f"clear_path_max_m={source_visibility_clear_path_max_m:.3f}"
             )
-        sources = generate_surface_sources(
-            env=env,
-            obstacle_grid=obstacle_grid,
-            isotopes=tuple(decomposer.isotope_names),
-            intensity_cps_1m=float(random_source_intensity_cps_1m),
-            rng=source_rng,
-            count=max(1, int(random_source_count)),
-            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
-            visibility_measurement_points=random_source_visibility_points,
-            visibility_min_fraction=(
-                source_visibility_min_fraction
-                if source_visibility_enabled
-                else 0.0
-            ),
-            visibility_detector_height_m=source_visibility_detector_height_m,
-            visibility_clear_path_max_m=source_visibility_clear_path_max_m,
-            visibility_batch_size=source_visibility_batch_size,
-            visibility_max_attempts_per_source=source_visibility_max_attempts,
+        source_set_attempts = (
+            source_response_max_sets
+            if source_response_filter_enabled
+            else 1
         )
-        random_source_visibility_diagnostics = _source_ground_visibility_payload(
-            sources,
-            obstacle_grid,
-            random_source_visibility_points,
-            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
-            detector_height_m=source_visibility_detector_height_m,
-            clear_path_max_m=source_visibility_clear_path_max_m,
-            min_visible_fraction=(
-                source_visibility_min_fraction
-                if source_visibility_enabled
-                else 0.0
-            ),
+        used_source_set_attempts = 0
+        last_sources: list[PointSource] | None = None
+        last_visibility_diagnostics: dict[str, object] | None = None
+        for source_set_attempt in range(source_set_attempts):
+            used_source_set_attempts = source_set_attempt + 1
+            trial_sources = generate_surface_sources(
+                env=env,
+                obstacle_grid=obstacle_grid,
+                isotopes=source_isotopes,
+                intensity_cps_1m=float(random_source_intensity_cps_1m),
+                rng=source_rng,
+                count=max(1, int(random_source_count)),
+                obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+                visibility_measurement_points=random_source_visibility_points,
+                visibility_min_fraction=(
+                    source_visibility_min_fraction
+                    if source_visibility_enabled
+                    else 0.0
+                ),
+                visibility_detector_height_m=source_visibility_detector_height_m,
+                visibility_clear_path_max_m=source_visibility_clear_path_max_m,
+                visibility_batch_size=source_visibility_batch_size,
+                visibility_max_attempts_per_source=source_visibility_max_attempts,
+            )
+            trial_visibility = _source_ground_visibility_payload(
+                trial_sources,
+                obstacle_grid,
+                random_source_visibility_points,
+                obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+                detector_height_m=source_visibility_detector_height_m,
+                clear_path_max_m=source_visibility_clear_path_max_m,
+                min_visible_fraction=(
+                    source_visibility_min_fraction
+                    if source_visibility_enabled
+                    else 0.0
+                ),
+            )
+            last_sources = trial_sources
+            last_visibility_diagnostics = trial_visibility
+            if not source_response_filter_enabled:
+                break
+            response_diag = trial_visibility.get("response_observability", {})
+            if not isinstance(response_diag, Mapping):
+                break
+            max_corr = float(response_diag.get("max_pairwise_correlation", 0.0))
+            condition = float(response_diag.get("condition_number", 1.0))
+            if (
+                max_corr <= source_response_max_corr
+                and condition <= source_response_max_condition
+            ):
+                break
+            if source_set_attempt + 1 == source_set_attempts:
+                print(
+                    "Random source response-observability filter reached "
+                    f"attempt limit={source_set_attempts}; using last set "
+                    f"(max_corr={max_corr:.3f}, condition={condition:.3g})."
+                )
+        sources = last_sources or []
+        random_source_visibility_diagnostics = last_visibility_diagnostics or {
+            "enabled": False,
+            "reference_point_count": 0,
+        }
+        random_source_visibility_diagnostics["response_filter_enabled"] = bool(
+            source_response_filter_enabled
+        )
+        random_source_visibility_diagnostics["response_filter_max_pairwise_corr"] = (
+            float(source_response_max_corr)
+        )
+        random_source_visibility_diagnostics["response_filter_condition_max"] = (
+            float(source_response_max_condition)
+        )
+        random_source_visibility_diagnostics["response_filter_set_attempts"] = int(
+            used_source_set_attempts
         )
         print(
             "Generated surface-constrained random sources: "
             f"count={len(sources)}, seed={source_rng_seed}, "
+            f"isotopes={list(source_isotopes)}, "
             f"intensity_cps_1m={float(random_source_intensity_cps_1m):.6g}"
         )
         if random_source_visibility_diagnostics.get("enabled"):
@@ -5874,7 +6686,7 @@ def run_live_pf(
         runtime_config.get("pf_detected_isotopes_only", True)
     )
     pf_detection_activation_only = bool(
-        runtime_config.get("pf_detected_isotope_activation_only", True)
+        runtime_config.get("pf_detected_isotope_activation_only", False)
     )
     pf_detect_consecutive = max(
         1,
@@ -6059,6 +6871,33 @@ def run_live_pf(
         dss_program_length_resolved,
         int(_dss_value("residual_program_length", 16)),
     )
+    dss_adaptive_program_length_enabled = bool(
+        _dss_value("adaptive_program_length_enable", True)
+    )
+    dss_adaptive_simple_program_length = max(
+        1,
+        int(_dss_value("adaptive_simple_program_length", 2)),
+    )
+    dss_adaptive_residual_budget_threshold = max(
+        0.0,
+        float(_dss_value("adaptive_residual_budget_threshold", 1.0e-9)),
+    )
+    dss_adaptive_ambiguity_budget_threshold = max(
+        0.0,
+        float(_dss_value("adaptive_ambiguity_budget_threshold", 1.0e-9)),
+    )
+    pose_selection_workers_resolved = max(
+        1,
+        int(
+            runtime_config.get(
+                "pose_selection_workers",
+                runtime_config.get(
+                    "one_step_pose_eval_workers",
+                    python_worker_count_resolved,
+                ),
+            )
+        ),
+    )
     dss_signature_weight_resolved = float(
         dss_signature_weight
         if dss_signature_weight is not None
@@ -6085,7 +6924,7 @@ def run_live_pf(
     dss_config = DSSPPConfig(
         horizon=max(1, dss_horizon_resolved),
         beam_width=max(1, dss_beam_width_resolved),
-        max_programs=max(1, int(_dss_value("max_programs", 24))),
+        max_programs=max(1, int(_dss_value("max_programs", 40))),
         program_length=max(1, dss_program_length_resolved),
         mode_cluster_radius_m=float(_dss_value("mode_cluster_radius_m", 1.5)),
         max_modes_per_isotope=max(1, int(_dss_value("max_modes_per_isotope", 4))),
@@ -6138,6 +6977,14 @@ def run_live_pf(
         lambda_station_condition=max(
             0.0,
             float(_dss_value("station_condition_weight", 0.75)),
+        ),
+        lambda_correlation_reduction=max(
+            0.0,
+            float(_dss_value("correlation_reduction_weight", 0.0)),
+        ),
+        lambda_isotope_balance=max(
+            0.0,
+            float(_dss_value("isotope_balance_weight", 0.0)),
         ),
         lambda_environment_signature=max(
             0.0,
@@ -6294,6 +7141,10 @@ def run_live_pf(
             0,
             int(_dss_value("temporal_cover_programs", 1)),
         ),
+        temporal_cover_beam_width=max(
+            1,
+            int(_dss_value("temporal_cover_beam_width", 4)),
+        ),
         program_eval_workers=(
             python_worker_count_resolved
             if _dss_value("program_eval_workers", None) is None
@@ -6349,6 +7200,28 @@ def run_live_pf(
         same_isotope_direct_separation_epsilon=max(
             0.0,
             float(_dss_value("same_isotope_direct_separation_epsilon", 1.0e-9)),
+        ),
+        include_runtime_rescue_modes=bool(
+            _dss_value("include_runtime_rescue_modes", True)
+        ),
+        runtime_rescue_mode_weight=max(
+            0.0,
+            float(_dss_value("runtime_rescue_mode_weight", 0.5)),
+        ),
+        high_surface_pair_boost=max(
+            1.0,
+            float(_dss_value("high_surface_pair_boost", 1.0)),
+        ),
+        high_surface_cross_stratum_boost=max(
+            1.0,
+            float(_dss_value("high_surface_cross_stratum_boost", 1.0)),
+        ),
+        high_surface_z_fraction=float(
+            np.clip(float(_dss_value("high_surface_z_fraction", 0.75)), 0.0, 1.0)
+        ),
+        high_surface_pair_distance_m=max(
+            0.0,
+            float(_dss_value("high_surface_pair_distance_m", 0.0)),
         ),
         diagnostic_ranked_node_limit=int(
             _dss_value("diagnostic_ranked_node_limit", 64)
@@ -6463,6 +7336,30 @@ def run_live_pf(
             0.0,
             float(_remaining_value("residual_weight", 1.0)),
         ),
+        high_surface_ambiguity_weight=max(
+            0.0,
+            float(_remaining_value("high_surface_ambiguity_weight", 1.0)),
+        ),
+        high_surface_z_fraction=float(
+            np.clip(
+                float(_remaining_value("high_surface_z_fraction", 0.75)),
+                0.0,
+                1.0,
+            )
+        ),
+        high_surface_pairwise_separation_threshold=max(
+            0.0,
+            float(
+                _remaining_value(
+                    "high_surface_pairwise_separation_threshold",
+                    _remaining_value("pairwise_separation_threshold", 9.0),
+                )
+            ),
+        ),
+        high_surface_absorption_q_multiple=max(
+            1.0,
+            float(_remaining_value("high_surface_absorption_q_multiple", 2.0)),
+        ),
         dss_information_gain_weight=max(
             0.0,
             float(_remaining_value("dss_information_gain_weight", 1.0)),
@@ -6472,6 +7369,26 @@ def run_live_pf(
             float(_remaining_value("dss_count_utility_weight", 0.25)),
         ),
         range_scale=max(1.0, float(_remaining_value("range_scale", 1.35))),
+        unresolved_absent_min_total_counts=max(
+            0.0,
+            float(_remaining_value("unresolved_absent_min_total_counts", 25.0)),
+        ),
+        unresolved_absent_min_max_counts=max(
+            0.0,
+            float(_remaining_value("unresolved_absent_min_max_counts", 5.0)),
+        ),
+        unresolved_absent_min_snr=max(
+            0.0,
+            float(_remaining_value("unresolved_absent_min_snr", 2.0)),
+        ),
+        unresolved_absent_budget_weight=max(
+            0.0,
+            float(_remaining_value("unresolved_absent_budget_weight", 1.0)),
+        ),
+        residual_surface_gain_candidate_limit=max(
+            0,
+            int(_remaining_value("residual_surface_gain_candidate_limit", 2048)),
+        ),
     )
     likelihood_runtime = runtime_config.get("pf_count_likelihood", {})
     if not isinstance(likelihood_runtime, dict):
@@ -6572,6 +7489,16 @@ def run_live_pf(
     mission_stop_require_model_order_ready = bool(
         runtime_config.get("mission_stop_require_model_order_ready", True)
     )
+    mission_stop_require_remaining_measurement_ready = bool(
+        runtime_config.get("mission_stop_require_remaining_measurement_ready", True)
+    )
+    mission_stop_soft_extend_on_unresolved = bool(
+        runtime_config.get("mission_stop_soft_extend_on_unresolved", False)
+    )
+    mission_stop_soft_extension_poses = max(
+        0,
+        int(runtime_config.get("mission_stop_soft_extension_poses", 4)),
+    )
     mission_stop_unresolved_discriminative_fail_min_count = max(
         1,
         int(
@@ -6583,6 +7510,59 @@ def run_live_pf(
                 ),
             )
         ),
+    )
+    mission_stop_report_simple_enable = bool(
+        runtime_config.get("mission_stop_report_simple_enable", True)
+    )
+    mission_stop_report_simple_max_sources_per_isotope = max(
+        0,
+        int(runtime_config.get("mission_stop_report_simple_max_sources_per_isotope", 1)),
+    )
+    mission_stop_report_simple_min_bic_margin = max(
+        0.0,
+        float(runtime_config.get("mission_stop_report_simple_min_bic_margin", 10.0)),
+    )
+    mission_stop_report_simple_max_condition_number = max(
+        0.0,
+        float(
+            runtime_config.get(
+                "mission_stop_report_simple_max_condition_number",
+                runtime_config.get("report_model_order_condition_max", 100.0),
+            )
+        ),
+    )
+    mission_stop_report_simple_max_response_correlation = max(
+        0.0,
+        float(
+            runtime_config.get(
+                "mission_stop_report_simple_max_response_correlation",
+                runtime_config.get("report_model_order_response_corr_max", 0.98),
+            )
+        ),
+    )
+    mission_stop_report_simple_residual_budget_threshold = max(
+        0.0,
+        float(
+            runtime_config.get(
+                "mission_stop_report_simple_residual_budget_threshold",
+                1.0e-9,
+            )
+        ),
+    )
+    mission_stop_report_simple_ambiguity_budget_threshold = max(
+        0.0,
+        float(
+            runtime_config.get(
+                "mission_stop_report_simple_ambiguity_budget_threshold",
+                1.0e-9,
+            )
+        ),
+    )
+    mission_stop_report_simple_allow_high_surface_ambiguity = bool(
+        runtime_config.get(
+            "mission_stop_report_simple_allow_high_surface_ambiguity",
+            False,
+        )
     )
     simulation_runtime = create_simulation_runtime(
         sim_backend,
@@ -6701,6 +7681,10 @@ def run_live_pf(
         if structural_proposal_topk_raw is None
         else max(1, int(structural_proposal_topk_raw))
     )
+    (
+        structural_trial_workers,
+        structural_trial_parallel_min_trials,
+    ) = _resolve_structural_trial_parallelism(runtime_config)
     pf_conf = RotatingShieldPFConfig(
         num_particles=num_particles,
         min_particles=num_particles,
@@ -6731,6 +7715,16 @@ def run_live_pf(
         cardinality_preserving_resample=bool(
             runtime_config.get("cardinality_preserving_resample", True)
         ),
+        cardinality_preserving_min_stations=max(
+            0,
+            int(runtime_config.get("cardinality_preserving_min_stations", 0)),
+        ),
+        cardinality_preserving_require_confirmed_structure=bool(
+            runtime_config.get(
+                "cardinality_preserving_require_confirmed_structure",
+                False,
+            )
+        ),
         mode_preserving_resample=bool(
             runtime_config.get("mode_preserving_resample", True)
         ),
@@ -6749,6 +7743,36 @@ def run_live_pf(
         mode_preserving_min_weight_fraction=max(
             0.0,
             float(runtime_config.get("mode_preserving_min_weight_fraction", 1e-4)),
+        ),
+        mode_preserving_surface_strata=bool(
+            runtime_config.get("mode_preserving_surface_strata", True)
+        ),
+        mode_preserving_height_bin_m=max(
+            0.0,
+            float(runtime_config.get("mode_preserving_height_bin_m", 2.0)),
+        ),
+        mode_preserving_high_surface_extra_particles=max(
+            0,
+            int(runtime_config.get("mode_preserving_high_surface_extra_particles", 0)),
+        ),
+        mode_preserving_high_surface_z_fraction=float(
+            np.clip(
+                float(
+                    runtime_config.get(
+                        "mode_preserving_high_surface_z_fraction",
+                        0.75,
+                    )
+                ),
+                0.0,
+                1.0,
+            )
+        ),
+        mode_preserving_cardinality_strata=bool(
+            runtime_config.get("mode_preserving_cardinality_strata", True)
+        ),
+        mode_preserving_min_particles_per_cardinality=max(
+            0,
+            int(runtime_config.get("mode_preserving_min_particles_per_cardinality", 2)),
         ),
         deferred_resample_roughening_scale=max(
             0.0,
@@ -6796,6 +7820,8 @@ def run_live_pf(
             int(runtime_config.get("merge_search_topk_pairs", 8)),
         ),
         structural_proposal_topk_particles=structural_proposal_topk_particles,
+        structural_trial_workers=structural_trial_workers,
+        structural_trial_parallel_min_trials=structural_trial_parallel_min_trials,
         structural_update_min_counts=float(
             runtime_config.get("structural_update_min_counts", 0.0)
         ),
@@ -6957,6 +7983,42 @@ def run_live_pf(
         birth_global_rescue_forced_min_delta_ll=float(
             runtime_config.get("birth_global_rescue_forced_min_delta_ll", 0.0)
         ),
+        birth_global_rescue_min_support=(
+            None
+            if runtime_config.get("birth_global_rescue_min_support") is None
+            else max(1, int(runtime_config.get("birth_global_rescue_min_support")))
+        ),
+        birth_global_rescue_min_distinct_poses=(
+            None
+            if runtime_config.get("birth_global_rescue_min_distinct_poses") is None
+            else max(
+                1,
+                int(runtime_config.get("birth_global_rescue_min_distinct_poses")),
+            )
+        ),
+        birth_global_rescue_min_distinct_stations=(
+            None
+            if runtime_config.get("birth_global_rescue_min_distinct_stations") is None
+            else max(
+                1,
+                int(runtime_config.get("birth_global_rescue_min_distinct_stations")),
+            )
+        ),
+        high_strength_split_enable=bool(
+            runtime_config.get("high_strength_split_enable", True)
+        ),
+        high_strength_split_q_multiple=max(
+            1.0,
+            float(runtime_config.get("high_strength_split_q_multiple", 2.0)),
+        ),
+        high_strength_split_offset_m=max(
+            1.0e-6,
+            float(runtime_config.get("high_strength_split_offset_m", 1.5)),
+        ),
+        high_strength_split_candidate_count=max(
+            1,
+            int(runtime_config.get("high_strength_split_candidate_count", 12)),
+        ),
         residual_decomposition_enable=bool(
             runtime_config.get("residual_decomposition_enable", True)
         ),
@@ -7043,6 +8105,35 @@ def run_live_pf(
             0,
             int(runtime_config.get("weak_source_prune_min_age", 0)),
         ),
+        weak_source_prune_require_observable=bool(
+            runtime_config.get("weak_source_prune_require_observable", True)
+        ),
+        weak_source_prune_min_observable_measurements=max(
+            1,
+            int(
+                runtime_config.get(
+                    "weak_source_prune_min_observable_measurements",
+                    1,
+                )
+            ),
+        ),
+        weak_source_prune_observable_count=max(
+            0.0,
+            float(runtime_config.get("weak_source_prune_observable_count", 0.0)),
+        ),
+        weak_source_prune_observable_fraction=max(
+            0.0,
+            float(runtime_config.get("weak_source_prune_observable_fraction", 0.0)),
+        ),
+        weak_source_prune_visibility_reference_strength=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "weak_source_prune_visibility_reference_strength",
+                    0.0,
+                )
+            ),
+        ),
         conditional_strength_refit=bool(
             runtime_config.get("conditional_strength_refit", True)
         ),
@@ -7120,6 +8211,52 @@ def run_live_pf(
             1.0e-6,
             float(runtime_config.get("report_strength_refit_prior_rel_sigma", 2.0)),
         ),
+        report_strength_absorption_penalty_weight=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "report_strength_absorption_penalty_weight",
+                    0.0,
+                )
+            ),
+        ),
+        report_strength_absorption_q_multiple=max(
+            1.0,
+            float(
+                runtime_config.get(
+                    "report_strength_absorption_q_multiple",
+                    4.0,
+                )
+            ),
+        ),
+        report_surface_local_refine=bool(
+            runtime_config.get("report_surface_local_refine", False)
+        ),
+        report_surface_local_refine_radius_m=max(
+            0.0,
+            float(runtime_config.get("report_surface_local_refine_radius_m", 0.5)),
+        ),
+        report_surface_local_refine_grid_steps=max(
+            0,
+            int(runtime_config.get("report_surface_local_refine_grid_steps", 1)),
+        ),
+        report_surface_local_refine_max_candidates_per_source=max(
+            1,
+            int(
+                runtime_config.get(
+                    "report_surface_local_refine_max_candidates_per_source",
+                    27,
+                )
+            ),
+        ),
+        report_surface_local_refine_max_sources=max(
+            0,
+            int(runtime_config.get("report_surface_local_refine_max_sources", 0)),
+        ),
+        report_surface_local_refine_min_ll_gain=max(
+            0.0,
+            float(runtime_config.get("report_surface_local_refine_min_ll_gain", 0.0)),
+        ),
         report_mle_rescue_enable=bool(
             runtime_config.get("report_mle_rescue_enable", False)
         ),
@@ -7142,6 +8279,111 @@ def run_live_pf(
         report_mle_rescue_min_residual_fraction=max(
             0.0,
             float(runtime_config.get("report_mle_rescue_min_residual_fraction", 0.01)),
+        ),
+        report_mle_rescue_visibility_weight=float(
+            np.clip(
+                float(runtime_config.get("report_mle_rescue_visibility_weight", 0.0)),
+                0.0,
+                1.0,
+            )
+        ),
+        report_mle_rescue_min_visible_measurements=max(
+            1,
+            int(runtime_config.get("report_mle_rescue_min_visible_measurements", 1)),
+        ),
+        report_mle_rescue_visible_count=max(
+            0.0,
+            float(runtime_config.get("report_mle_rescue_visible_count", 0.0)),
+        ),
+        report_mle_rescue_visibility_reference_strength=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "report_mle_rescue_visibility_reference_strength",
+                    0.0,
+                )
+            ),
+        ),
+        runtime_report_rescue_enable=bool(
+            runtime_config.get("runtime_report_rescue_enable", False)
+        ),
+        runtime_report_rescue_particle_fraction=float(
+            np.clip(
+                float(runtime_config.get("runtime_report_rescue_particle_fraction", 0.15)),
+                0.0,
+                1.0,
+            )
+        ),
+        runtime_report_rescue_min_particles_per_source=max(
+            1,
+            int(runtime_config.get("runtime_report_rescue_min_particles_per_source", 4)),
+        ),
+        runtime_report_rescue_weight=float(
+            np.clip(
+                float(runtime_config.get("runtime_report_rescue_weight", 0.10)),
+                0.0,
+                0.5,
+            )
+        ),
+        runtime_report_rescue_jitter_sigma_m=max(
+            0.0,
+            float(runtime_config.get("runtime_report_rescue_jitter_sigma_m", 0.10)),
+        ),
+        runtime_report_rescue_quarantine_enable=bool(
+            runtime_config.get("runtime_report_rescue_quarantine_enable", True)
+        ),
+        runtime_report_rescue_quarantine_weight=float(
+            np.clip(
+                float(
+                    runtime_config.get(
+                        "runtime_report_rescue_quarantine_weight",
+                        0.02,
+                    )
+                ),
+                0.0,
+                0.5,
+            )
+        ),
+        runtime_report_rescue_memory_enable=bool(
+            runtime_config.get("runtime_report_rescue_memory_enable", True)
+        ),
+        runtime_report_rescue_memory_decay=float(
+            np.clip(
+                float(runtime_config.get("runtime_report_rescue_memory_decay", 0.90)),
+                0.0,
+                1.0,
+            )
+        ),
+        runtime_report_rescue_memory_max_sources=max(
+            0,
+            int(runtime_config.get("runtime_report_rescue_memory_max_sources", 0)),
+        ),
+        report_mle_rescue_surface_quota_enable=bool(
+            runtime_config.get("report_mle_rescue_surface_quota_enable", True)
+        ),
+        report_mle_rescue_surface_quota_min_score_fraction=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "report_mle_rescue_surface_quota_min_score_fraction",
+                    0.0,
+                )
+            ),
+        ),
+        report_mle_rescue_surface_quota_per_stratum=max(
+            1,
+            int(runtime_config.get("report_mle_rescue_surface_quota_per_stratum", 1)),
+        ),
+        report_mle_rescue_spatial_quota_enable=bool(
+            runtime_config.get("report_mle_rescue_spatial_quota_enable", True)
+        ),
+        report_mle_rescue_spatial_quota_tile_m=max(
+            1.0e-6,
+            float(runtime_config.get("report_mle_rescue_spatial_quota_tile_m", 2.5)),
+        ),
+        report_mle_rescue_spatial_quota_per_tile=max(
+            1,
+            int(runtime_config.get("report_mle_rescue_spatial_quota_per_tile", 1)),
         ),
         report_cluster_model_selection=bool(
             runtime_config.get("report_cluster_model_selection", True)
@@ -7190,6 +8432,14 @@ def run_live_pf(
         ),
         report_pre_finalize_guard=bool(
             runtime_config.get("report_pre_finalize_guard", True)
+        ),
+        history_estimate_interval=max(
+            0,
+            int(runtime_config.get("history_estimate_interval", 1)),
+        ),
+        candidate_response_cache_max_entries=max(
+            0,
+            int(runtime_config.get("candidate_response_cache_max_entries", 24)),
         ),
         orientation_k=orientation_limit_resolved,
         min_rotations_per_pose=min_rotations_resolved,
@@ -7764,14 +9014,99 @@ def run_live_pf(
     pending_path_segment: dict[str, object] | None = None
     path_segments: list[dict[str, object]] = []
     remaining_measurement_estimates: list[dict[str, Any]] = []
+    soft_pose_extension_used = 0
+    max_pose_stop_unresolved = False
+    max_pose_stop_diagnostics: dict[str, object] = {}
     measurement_live_times_s: list[float] = []
     total_ig_wall_s = 0.0
     total_pf_wall_s = 0.0
     total_prune_wall_s = 0.0
     total_viz_wall_s = 0.0
+    total_path_planning_wall_s = 0.0
     ig_wall_samples_s: list[float] = []
     pf_wall_samples_s: list[float] = []
+    path_planning_wall_samples_s: list[float] = []
     run_wall_start = time.perf_counter()
+
+    def _latest_remaining_estimate_for_planning(
+        preferred: Mapping[str, Any] | object | None = None,
+    ) -> Mapping[str, Any] | object | None:
+        """Return the best available remaining-measurement estimate for planning."""
+        if preferred is not None:
+            return preferred
+        if bool(remaining_measurement_config.enabled) and remaining_measurement_estimates:
+            return remaining_measurement_estimates[-1]
+        return None
+
+    def _report_simple_ready_for_planning(
+        estimate: Mapping[str, Any] | object | None,
+    ) -> bool:
+        """Return whether the current report BIC is simple enough for short programs."""
+        if estimate is None:
+            return False
+        return bool(mission_stop_report_simple_enable) and (
+            _report_model_order_simple_ready_for_stop(
+                estimator,
+                remaining_measurement_estimate=estimate,
+                max_sources_per_isotope=(
+                    mission_stop_report_simple_max_sources_per_isotope
+                ),
+                min_bic_margin=mission_stop_report_simple_min_bic_margin,
+                max_condition_number=(
+                    mission_stop_report_simple_max_condition_number
+                ),
+                max_response_correlation=(
+                    mission_stop_report_simple_max_response_correlation
+                ),
+                residual_budget_threshold=(
+                    mission_stop_report_simple_residual_budget_threshold
+                ),
+                ambiguity_budget_threshold=(
+                    mission_stop_report_simple_ambiguity_budget_threshold
+                ),
+                allow_high_surface_ambiguity=(
+                    mission_stop_report_simple_allow_high_surface_ambiguity
+                ),
+                require_no_birth_residual=False,
+                birth_residual_min_support=mission_stop_birth_residual_min_support,
+            )
+        )
+
+    def _adaptive_dss_selection_config(
+        config: DSSPPConfig,
+        *,
+        residual_burst_active: bool,
+        remaining_estimate: Mapping[str, Any] | object | None,
+        label: str,
+    ) -> DSSPPConfig:
+        """Return the DSS-PP config with adaptive shield-program length applied."""
+        adapted, reason = _adapt_dss_program_length_for_budget(
+            config,
+            enabled=dss_adaptive_program_length_enabled,
+            simple_program_length=dss_adaptive_simple_program_length,
+            residual_program_length=dss_residual_program_length_resolved,
+            residual_burst_active=bool(residual_burst_active),
+            report_simple_ready=_report_simple_ready_for_planning(remaining_estimate),
+            remaining_measurement_estimate=remaining_estimate,
+            residual_budget_threshold=dss_adaptive_residual_budget_threshold,
+            ambiguity_budget_threshold=dss_adaptive_ambiguity_budget_threshold,
+            allow_high_surface_simple=(
+                mission_stop_report_simple_allow_high_surface_ambiguity
+            ),
+        )
+        if (
+            bool(dss_adaptive_program_length_enabled)
+            and reason not in {"disabled", "forced_program", "full"}
+        ):
+            print(
+                "DSS-PP adaptive shield program length: "
+                f"context={label} reason={reason} "
+                f"program_length={int(adapted.program_length)} "
+                f"base={int(config.program_length)} "
+                f"residual={int(dss_residual_program_length_resolved)}"
+            )
+        return adapted
+
     if max_steps is not None and max_steps <= 0:
         max_steps = None
     if max_poses is not None and max_poses <= 0:
@@ -7857,6 +9192,8 @@ def run_live_pf(
         f"count_util_w={float(dss_config.lambda_count_utility):.3f} "
         f"local_orbit_w={float(dss_config.lambda_local_orbit):.3f} "
         f"station_cond_w={float(dss_config.lambda_station_condition):.3f} "
+        f"corr_reduction_w={float(dss_config.lambda_correlation_reduction):.3f} "
+        f"isotope_balance_w={float(dss_config.lambda_isotope_balance):.3f} "
         f"env_sig_w={float(dss_config.lambda_environment_signature):.3f} "
         f"occ_boundary_w={float(dss_config.lambda_occlusion_boundary):.3f} "
         f"turn_w={float(dss_config.lambda_turn_smoothness):.3f} "
@@ -7864,10 +9201,21 @@ def run_live_pf(
         f"remaining_guidance={bool(dss_config.remaining_budget_guidance)} "
         f"remaining_route_w={float(dss_config.remaining_route_weight):.3f} "
         f"remaining_urgency={int(dss_config.remaining_budget_urgency_stations)} "
+        "adaptive_program_len="
+        f"{bool(dss_adaptive_program_length_enabled)} "
+        f"simple_len={int(dss_adaptive_simple_program_length)} "
+        f"residual_len={int(dss_residual_program_length_resolved)} "
+        f"pose_eval_workers={int(pose_selection_workers_resolved)} "
         "same_iso_direct_guard="
         f"{bool(dss_config.same_isotope_direct_separation_guard)} "
         "same_iso_direct_eps="
         f"{float(dss_config.same_isotope_direct_separation_epsilon):.3g} "
+        f"runtime_rescue_modes={bool(dss_config.include_runtime_rescue_modes)} "
+        f"runtime_rescue_mode_w={float(dss_config.runtime_rescue_mode_weight):.2f} "
+        f"high_surface_pair_boost={float(dss_config.high_surface_pair_boost):.2f} "
+        "high_surface_cross_stratum_boost="
+        f"{float(dss_config.high_surface_cross_stratum_boost):.2f} "
+        f"high_surface_z_frac={float(dss_config.high_surface_z_fraction):.2f} "
         f"min_station_sep={float(dss_config.min_station_separation_m):.2f}m "
         f"enforce_min_obs={bool(dss_config.enforce_min_observation)}"
     )
@@ -7877,6 +9225,9 @@ def run_live_pf(
         f"target_spread={float(remaining_measurement_config.target_position_spread_m):.2f}m "
         f"target_card_conf={float(remaining_measurement_config.target_cardinality_confidence):.2f} "
         f"sep_threshold={float(remaining_measurement_config.pairwise_separation_threshold):.2f} "
+        "high_surface_sep_threshold="
+        f"{float(remaining_measurement_config.high_surface_pairwise_separation_threshold):.2f} "
+        f"high_surface_w={float(remaining_measurement_config.high_surface_ambiguity_weight):.2f} "
         f"eta_default={float(remaining_measurement_config.eta_default):.2f}"
     )
     print(
@@ -7920,6 +9271,22 @@ def run_live_pf(
         f"global_rescue_max={int(pf_conf.birth_global_rescue_max_candidates)} "
         f"global_rescue_min_frac={float(pf_conf.birth_global_rescue_min_residual_fraction):.3f} "
         f"global_rescue_dedup={float(pf_conf.birth_global_rescue_dedup_radius_m):.2f} "
+        f"global_rescue_min_support={pf_conf.birth_global_rescue_min_support} "
+        f"global_rescue_min_distinct_poses={pf_conf.birth_global_rescue_min_distinct_poses} "
+        "global_rescue_min_distinct_stations="
+        f"{pf_conf.birth_global_rescue_min_distinct_stations} "
+        f"high_strength_split={bool(pf_conf.high_strength_split_enable)} "
+        f"high_strength_split_qx={float(pf_conf.high_strength_split_q_multiple):.2f} "
+        f"runtime_report_rescue={bool(pf_conf.runtime_report_rescue_enable)} "
+        f"runtime_report_rescue_fraction={float(pf_conf.runtime_report_rescue_particle_fraction):.2f} "
+        f"runtime_report_rescue_min_per_source={int(pf_conf.runtime_report_rescue_min_particles_per_source)} "
+        f"runtime_report_rescue_weight={float(pf_conf.runtime_report_rescue_weight):.2f} "
+        f"runtime_report_rescue_jitter={float(pf_conf.runtime_report_rescue_jitter_sigma_m):.2f} "
+        f"runtime_report_rescue_quarantine={bool(pf_conf.runtime_report_rescue_quarantine_enable)} "
+        f"runtime_report_rescue_quarantine_weight={float(pf_conf.runtime_report_rescue_quarantine_weight):.3f} "
+        f"runtime_report_rescue_memory={bool(pf_conf.runtime_report_rescue_memory_enable)} "
+        f"runtime_report_rescue_memory_decay={float(pf_conf.runtime_report_rescue_memory_decay):.2f} "
+        f"runtime_report_rescue_memory_max={int(pf_conf.runtime_report_rescue_memory_max_sources)} "
         f"max_per_update={pf_conf.birth_max_per_update} "
         f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
         f"residual_layers={bool(pf_conf.residual_decomposition_enable)} "
@@ -7948,13 +9315,28 @@ def run_live_pf(
         f"weak_prune_min_counts={float(pf_conf.weak_source_prune_min_expected_count):.3f} "
         f"weak_prune_min_fraction={float(pf_conf.weak_source_prune_min_fraction):.4f} "
         f"weak_prune_min_age={int(pf_conf.weak_source_prune_min_age)} "
+        f"weak_prune_require_observable={bool(pf_conf.weak_source_prune_require_observable)} "
+        f"weak_prune_min_observable={int(pf_conf.weak_source_prune_min_observable_measurements)} "
         f"report_preserve_cardinality={bool(pf_conf.report_strength_refit_preserve_cardinality)} "
         f"report_prior_weight={float(pf_conf.report_strength_refit_prior_weight):.3f} "
         f"report_prior_rel_sigma={float(pf_conf.report_strength_refit_prior_rel_sigma):.3f} "
+        f"report_absorption_weight={float(pf_conf.report_strength_absorption_penalty_weight):.3f} "
+        f"report_absorption_q_multiple={float(pf_conf.report_strength_absorption_q_multiple):.3f} "
+        f"report_surface_refine={bool(pf_conf.report_surface_local_refine)} "
+        "report_surface_refine_radius="
+        f"{float(pf_conf.report_surface_local_refine_radius_m):.2f}m "
+        "report_surface_refine_candidates="
+        f"{int(pf_conf.report_surface_local_refine_max_candidates_per_source)} "
         f"report_require_posterior_match={bool(pf_conf.report_model_order_require_posterior_match)} "
         f"report_prune_particles={bool(pf_conf.report_model_order_prune_particles)} "
         f"report_exclude_unverified={bool(pf_conf.report_exclude_unverified_sources)} "
-        f"report_mle_rescue={bool(pf_conf.report_mle_rescue_enable)}"
+        f"report_mle_rescue={bool(pf_conf.report_mle_rescue_enable)} "
+        f"report_rescue_visibility_weight={float(pf_conf.report_mle_rescue_visibility_weight):.3f} "
+        f"report_rescue_min_visible={int(pf_conf.report_mle_rescue_min_visible_measurements)} "
+        f"report_rescue_surface_quota={bool(pf_conf.report_mle_rescue_surface_quota_enable)} "
+        f"report_rescue_quota_per_stratum={int(pf_conf.report_mle_rescue_surface_quota_per_stratum)} "
+        f"report_rescue_spatial_quota={bool(pf_conf.report_mle_rescue_spatial_quota_enable)} "
+        f"report_rescue_spatial_tile={float(pf_conf.report_mle_rescue_spatial_quota_tile_m):.2f}m"
     )
     print(
         "PF shield-program update: "
@@ -8031,6 +9413,8 @@ def run_live_pf(
         f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
         f"split_complexity={float(pf_conf.split_complexity_penalty):.3f} "
         f"split_candidates={int(pf_conf.split_residual_candidate_count)} "
+        f"high_strength_split={bool(pf_conf.high_strength_split_enable)} "
+        f"high_strength_qx={float(pf_conf.high_strength_split_q_multiple):.2f} "
         f"merge_corr_min={float(pf_conf.merge_response_corr_min):.3f} "
         f"merge_pairs={int(pf_conf.merge_search_topk_pairs)} "
         f"max_sources={pf_conf.max_sources}"
@@ -8040,7 +9424,12 @@ def run_live_pf(
         f"max_resamples_per_observation={pf_conf.max_resamples_per_observation} "
         f"disable_regularize_on_temper_resample={pf_conf.disable_regularize_on_temper_resample} "
         f"deferred_resample_roughening_scale={pf_conf.deferred_resample_roughening_scale:.3f} "
-        f"cardinality_preserving_resample={bool(pf_conf.cardinality_preserving_resample)}"
+        f"cardinality_preserving_resample={bool(pf_conf.cardinality_preserving_resample)} "
+        f"cardinality_preserving_min_stations={int(pf_conf.cardinality_preserving_min_stations)} "
+        f"mode_preserve_high_extra={int(pf_conf.mode_preserving_high_surface_extra_particles)} "
+        f"mode_preserve_high_z_frac={float(pf_conf.mode_preserving_high_surface_z_fraction):.2f} "
+        "cardinality_preserving_require_confirmed="
+        f"{bool(pf_conf.cardinality_preserving_require_confirmed_structure)}"
     )
     print(
         "Roughening settings: "
@@ -8054,7 +9443,10 @@ def run_live_pf(
         f"max_modes={int(pf_conf.mode_preserving_max_modes)} "
         f"per_mode={int(pf_conf.mode_preserving_particles_per_mode)} "
         f"radius_m={float(pf_conf.mode_preserving_radius_m):.2f} "
-        f"min_weight_fraction={float(pf_conf.mode_preserving_min_weight_fraction):.3g}"
+        f"min_weight_fraction={float(pf_conf.mode_preserving_min_weight_fraction):.3g} "
+        f"cardinality_strata={bool(pf_conf.mode_preserving_cardinality_strata)} "
+        "min_particles_per_cardinality="
+        f"{int(pf_conf.mode_preserving_min_particles_per_cardinality)}"
     )
     print(
         "Planning rollout settings: "
@@ -8107,8 +9499,17 @@ def run_live_pf(
         "require_no_unresolved_discriminative_failures="
         f"{mission_stop_require_no_unresolved_discriminative_failures} "
         f"require_model_order_ready={mission_stop_require_model_order_ready} "
+        "require_remaining_measurement_ready="
+        f"{mission_stop_require_remaining_measurement_ready} "
         "unresolved_fail_min_count="
-        f"{mission_stop_unresolved_discriminative_fail_min_count}"
+        f"{mission_stop_unresolved_discriminative_fail_min_count} "
+        f"report_simple_stop={mission_stop_report_simple_enable} "
+        "report_simple_margin="
+        f"{mission_stop_report_simple_min_bic_margin:.2f} "
+        "report_simple_max_sources_per_iso="
+        f"{mission_stop_report_simple_max_sources_per_isotope} "
+        "report_simple_allow_high_surface="
+        f"{mission_stop_report_simple_allow_high_surface_ambiguity}"
     )
     has_environment_obstacles = _has_environment_obstacles(obstacle_grid)
     reset_usd_path = (
@@ -8302,6 +9703,10 @@ def run_live_pf(
             ),
             "dss_local_orbit_weight": float(dss_config.lambda_local_orbit),
             "dss_station_condition_weight": float(dss_config.lambda_station_condition),
+            "dss_correlation_reduction_weight": float(
+                dss_config.lambda_correlation_reduction
+            ),
+            "dss_isotope_balance_weight": float(dss_config.lambda_isotope_balance),
             "dss_environment_signature_weight": float(
                 dss_config.lambda_environment_signature
             ),
@@ -8344,7 +9749,7 @@ def run_live_pf(
                 )
             remaining_orientations = set(range(total_pairs))
             rotation_limit = max(1, int(estimator.pf_config.orientation_k))
-            if strict_planned_shield_program and active_shield_program:
+            if active_shield_program:
                 rotation_limit = max(rotation_limit, len(active_shield_program))
             baseline_program = select_baseline_shield_program(
                 baseline_shield_policy,
@@ -8361,10 +9766,7 @@ def run_live_pf(
                     "Executing baseline shield program: "
                     f"{used_name} pairs={list(active_shield_program)}"
                 )
-            force_active_shield_program = bool(
-                (strict_planned_shield_program or baseline_program is not None)
-                and active_shield_program
-            )
+            force_active_shield_program = bool(active_shield_program)
             joint_update_records: list[
                 tuple[dict[str, float], int, int, float, dict[str, float] | None]
             ] = []
@@ -8926,9 +10328,7 @@ def run_live_pf(
                     pruned_display_force_refresh = False
                 else:
                     prune_elapsed = 0.0
-                pruned = (
-                    pruned_display_cache if pruned_display_cache is not None else {}
-                )
+                pruned = pruned_display_cache
                 viz_elapsed = 0.0
                 viz_start = time.perf_counter()
                 frame = build_frame_from_pf(
@@ -8968,8 +10368,10 @@ def run_live_pf(
                     frame.spectrum_components_by_isotope = spectrum_components_payload
                 viz_elapsed += time.perf_counter() - viz_start
                 viz_start = time.perf_counter()
-                if hasattr(frame, "estimated_sources") and hasattr(
-                    frame, "estimated_strengths"
+                if (
+                    pruned is not None
+                    and hasattr(frame, "estimated_sources")
+                    and hasattr(frame, "estimated_strengths")
                 ):
                     frame.estimated_sources = {}
                     frame.estimated_strengths = {}
@@ -9133,6 +10535,12 @@ def run_live_pf(
                         finalize_step_index,
                         label=f"pose_{current_pose_idx}_finalize",
                     )
+                    _log_surface_candidate_observability_diagnostics(
+                        estimator,
+                        finalize_step_index,
+                        label=f"pose_{current_pose_idx}_finalize",
+                        max_candidates=256,
+                    )
                     if (
                         last_frame is not None
                         and (
@@ -9231,6 +10639,12 @@ def run_live_pf(
                     joint_step_index,
                     label=f"pose_{current_pose_idx}_joint_update",
                 )
+                _log_surface_candidate_observability_diagnostics(
+                    estimator,
+                    joint_step_index,
+                    label=f"pose_{current_pose_idx}_joint_update",
+                    max_candidates=256,
+                )
                 if (
                     last_frame is not None
                     and (
@@ -9279,10 +10693,55 @@ def run_live_pf(
                 and last_max_ig < ig_threshold_current
                 and (pose_counter + 1) >= mission_stop_min_convergence_poses
             ):
+                remaining_stop_estimate = (
+                    remaining_measurement_estimates[-1]
+                    if (
+                        bool(remaining_measurement_config.enabled)
+                        and remaining_measurement_estimates
+                    )
+                    else None
+                )
+                report_simple_ready_for_low_ig = bool(
+                    mission_stop_report_simple_enable
+                ) and _report_model_order_simple_ready_for_stop(
+                    estimator,
+                    remaining_measurement_estimate=remaining_stop_estimate,
+                    max_sources_per_isotope=(
+                        mission_stop_report_simple_max_sources_per_isotope
+                    ),
+                    min_bic_margin=mission_stop_report_simple_min_bic_margin,
+                    max_condition_number=(
+                        mission_stop_report_simple_max_condition_number
+                    ),
+                    max_response_correlation=(
+                        mission_stop_report_simple_max_response_correlation
+                    ),
+                    residual_budget_threshold=(
+                        mission_stop_report_simple_residual_budget_threshold
+                    ),
+                    ambiguity_budget_threshold=(
+                        mission_stop_report_simple_ambiguity_budget_threshold
+                    ),
+                    allow_high_surface_ambiguity=(
+                        mission_stop_report_simple_allow_high_surface_ambiguity
+                    ),
+                    require_no_birth_residual=False,
+                    birth_residual_min_support=(
+                        mission_stop_birth_residual_min_support
+                    ),
+                )
                 if (
                     (
                         not bool(mission_stop_require_model_order_ready)
                         or _report_model_order_ready_for_stop(estimator)
+                        or report_simple_ready_for_low_ig
+                    )
+                    and (
+                        not bool(mission_stop_require_remaining_measurement_ready)
+                        or _remaining_measurement_ready_for_stop(
+                            remaining_stop_estimate
+                        )
+                        or report_simple_ready_for_low_ig
                     )
                     and estimator.should_stop_exploration(
                         ig_threshold=ig_threshold_current,
@@ -9297,6 +10756,14 @@ def run_live_pf(
             visited_poses.append(pose.copy())
             pose_counter += 1
             if adaptive_mission_stop:
+                remaining_stop_estimate = (
+                    remaining_measurement_estimates[-1]
+                    if (
+                        bool(remaining_measurement_config.enabled)
+                        and remaining_measurement_estimates
+                    )
+                    else None
+                )
                 stop_reason = _adaptive_mission_stop_reason(
                     estimator,
                     current_pose_idx=current_pose_idx,
@@ -9319,13 +10786,144 @@ def run_live_pf(
                         mission_stop_unresolved_discriminative_fail_min_count
                     ),
                     require_model_order_ready=mission_stop_require_model_order_ready,
+                    remaining_measurement_estimate=remaining_stop_estimate,
+                    require_remaining_measurement_ready=(
+                        bool(mission_stop_require_remaining_measurement_ready)
+                        and bool(remaining_measurement_config.enabled)
+                    ),
+                    allow_report_simple_stop=mission_stop_report_simple_enable,
+                    report_simple_max_sources_per_isotope=(
+                        mission_stop_report_simple_max_sources_per_isotope
+                    ),
+                    report_simple_min_bic_margin=(
+                        mission_stop_report_simple_min_bic_margin
+                    ),
+                    report_simple_max_condition_number=(
+                        mission_stop_report_simple_max_condition_number
+                    ),
+                    report_simple_max_response_correlation=(
+                        mission_stop_report_simple_max_response_correlation
+                    ),
+                    report_simple_residual_budget_threshold=(
+                        mission_stop_report_simple_residual_budget_threshold
+                    ),
+                    report_simple_ambiguity_budget_threshold=(
+                        mission_stop_report_simple_ambiguity_budget_threshold
+                    ),
+                    report_simple_allow_high_surface_ambiguity=(
+                        mission_stop_report_simple_allow_high_surface_ambiguity
+                    ),
                 )
                 if stop_reason is not None:
                     print(f"Adaptive mission stop: {stop_reason}.")
                     break
             if max_poses is not None and pose_counter >= max_poses:
-                print(f"Reached max poses ({max_poses}); stopping exploration.")
-                break
+                remaining_stop_estimate = (
+                    remaining_measurement_estimates[-1]
+                    if (
+                        bool(remaining_measurement_config.enabled)
+                        and remaining_measurement_estimates
+                    )
+                    else None
+                )
+                remaining_unresolved = not _remaining_measurement_ready_for_stop(
+                    remaining_stop_estimate
+                )
+                report_simple_ready_at_cap = bool(
+                    mission_stop_report_simple_enable
+                ) and _report_model_order_simple_ready_for_stop(
+                    estimator,
+                    remaining_measurement_estimate=remaining_stop_estimate,
+                    max_sources_per_isotope=(
+                        mission_stop_report_simple_max_sources_per_isotope
+                    ),
+                    min_bic_margin=mission_stop_report_simple_min_bic_margin,
+                    max_condition_number=(
+                        mission_stop_report_simple_max_condition_number
+                    ),
+                    max_response_correlation=(
+                        mission_stop_report_simple_max_response_correlation
+                    ),
+                    residual_budget_threshold=(
+                        mission_stop_report_simple_residual_budget_threshold
+                    ),
+                    ambiguity_budget_threshold=(
+                        mission_stop_report_simple_ambiguity_budget_threshold
+                    ),
+                    allow_high_surface_ambiguity=(
+                        mission_stop_report_simple_allow_high_surface_ambiguity
+                    ),
+                    require_no_birth_residual=False,
+                    birth_residual_min_support=(
+                        mission_stop_birth_residual_min_support
+                    ),
+                )
+                model_order_unresolved = not (
+                    _report_model_order_ready_for_stop(estimator)
+                    or (report_simple_ready_at_cap and not remaining_unresolved)
+                )
+                can_extend = (
+                    bool(mission_stop_soft_extend_on_unresolved)
+                    and soft_pose_extension_used < int(mission_stop_soft_extension_poses)
+                    and (remaining_unresolved or model_order_unresolved)
+                )
+                if can_extend:
+                    requested_extension = 1
+                    if isinstance(remaining_stop_estimate, Mapping):
+                        requested_extension = max(
+                            requested_extension,
+                            int(
+                                remaining_stop_estimate.get(
+                                    "estimated_remaining_stations",
+                                    1,
+                                )
+                            ),
+                        )
+                    extension = min(
+                        requested_extension,
+                        int(mission_stop_soft_extension_poses)
+                        - int(soft_pose_extension_used),
+                    )
+                    if extension > 0:
+                        soft_pose_extension_used += int(extension)
+                        max_poses += int(extension)
+                        print(
+                            "Soft-extending max poses for unresolved model order: "
+                            f"extension={int(extension)} "
+                            f"new_max_poses={int(max_poses)} "
+                            f"remaining_unresolved={bool(remaining_unresolved)} "
+                            f"model_order_unresolved={bool(model_order_unresolved)}"
+                        )
+                    else:
+                        max_pose_stop_unresolved = bool(
+                            remaining_unresolved or model_order_unresolved
+                        )
+                        max_pose_stop_diagnostics = {
+                            "max_poses": int(max_poses),
+                            "remaining_unresolved": bool(remaining_unresolved),
+                            "model_order_unresolved": bool(model_order_unresolved),
+                            "soft_pose_extension_used": int(soft_pose_extension_used),
+                            "soft_pose_extension_limit": int(
+                                mission_stop_soft_extension_poses
+                            ),
+                        }
+                        print(f"Reached max poses ({max_poses}); stopping exploration.")
+                        break
+                else:
+                    max_pose_stop_unresolved = bool(
+                        remaining_unresolved or model_order_unresolved
+                    )
+                    max_pose_stop_diagnostics = {
+                        "max_poses": int(max_poses),
+                        "remaining_unresolved": bool(remaining_unresolved),
+                        "model_order_unresolved": bool(model_order_unresolved),
+                        "soft_pose_extension_used": int(soft_pose_extension_used),
+                        "soft_pose_extension_limit": int(
+                            mission_stop_soft_extension_poses
+                        ),
+                    }
+                    print(f"Reached max poses ({max_poses}); stopping exploration.")
+                    break
             visited_arr = np.vstack(visited_poses) if visited_poses else None
             print("Generating candidate poses for next measurement point...")
             candidates, relaxed_retry, candidate_min_dist = (
@@ -9368,8 +10966,88 @@ def run_live_pf(
                     f"score={baseline_path_selection.score:.6g} "
                     f"pose={next_pose.tolist()}"
                 )
+                if baseline_shield_policy is None:
+                    dss_selection_config = dss_config
+                    residual_burst_active = _has_birth_residual_evidence(
+                        estimator,
+                        min_support=max(
+                            1,
+                            int(estimator.pf_config.birth_residual_min_support),
+                        ),
+                    )
+                    dss_selection_config = _adaptive_dss_selection_config(
+                        dss_selection_config,
+                        residual_burst_active=residual_burst_active,
+                        remaining_estimate=_latest_remaining_estimate_for_planning(),
+                        label="baseline_path_fixed_station",
+                    )
+                    dss_start = time.perf_counter()
+                    dss_result = select_dss_pp_next_station(
+                        estimator=estimator,
+                        candidate_poses_xyz=np.asarray([next_pose], dtype=float),
+                        current_pose_xyz=pose,
+                        current_pair_id=current_shield_pair_id,
+                        visited_poses_xyz=visited_arr,
+                        map_api=planning_map,
+                        bounds_xyz=(bounds_lo, bounds_hi),
+                        config=dss_selection_config,
+                    )
+                    dss_elapsed = time.perf_counter() - dss_start
+                    total_path_planning_wall_s += float(dss_elapsed)
+                    path_planning_wall_samples_s.append(float(dss_elapsed))
+                    planned_program_for_next = tuple(
+                        int(pair_id) for pair_id in dss_result.shield_program.pair_ids
+                    )
+                    dss_diagnostics = dict(dss_result.diagnostics)
+                    dss_first_node = (
+                        dss_result.sequence[0] if dss_result.sequence else None
+                    )
+                    print(
+                        "DSS-PP fixed-station shield program: "
+                        f"program={dss_result.shield_program.name} "
+                        f"pairs={list(planned_program_for_next)} "
+                        f"score={float(dss_result.score):.6g} "
+                        f"signature={float(dss_result.sequence[0].signature_score):.6g} "
+                        "temporal_sep="
+                        f"{float(dss_result.sequence[0].temporal_separation_score):.6g} "
+                        f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
+                        f"compute={dss_elapsed:.3f}s"
+                    )
+                    _log_dss_ranked_node_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_baseline_path_fixed_station",
+                    )
+                    _log_dss_pairwise_ambiguity_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_baseline_path_fixed_station",
+                    )
+                    _log_dss_component_leader_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_baseline_path_fixed_station",
+                    )
             elif path_planner_resolved == "dss_pp":
                 dss_selection_config = dss_config
+                baseline_program_for_planning = select_baseline_shield_program(
+                    baseline_shield_policy,
+                    total_pairs=total_pairs,
+                    program_length=int(dss_config.program_length),
+                    pose_index=pose_counter,
+                    current_pair_id=current_shield_pair_id,
+                )
+                if baseline_program_for_planning is not None:
+                    forced_pairs = tuple(
+                        int(pair_id)
+                        for pair_id in baseline_program_for_planning.pair_ids
+                    )
+                    dss_selection_config = replace(
+                        dss_selection_config,
+                        forced_program_pair_ids=forced_pairs,
+                    )
+                    print(
+                        "DSS-PP scoring forced baseline shield program: "
+                        f"{baseline_program_for_planning.name} "
+                        f"pairs={list(forced_pairs)}"
+                    )
                 remaining_guidance_estimate = None
                 if (
                     bool(dss_selection_config.remaining_budget_guidance)
@@ -9405,6 +11083,10 @@ def run_live_pf(
                         f"{remaining_guidance_estimate.estimated_remaining_station_high} "
                         f"bottleneck={remaining_guidance_estimate.bottleneck}"
                     )
+                    _log_remaining_measurement_detail(
+                        remaining_guidance_estimate,
+                        label=f"pose_{current_pose_idx}_guidance",
+                    )
                 residual_burst_active = _has_birth_residual_evidence(
                     estimator,
                     min_support=max(
@@ -9412,18 +11094,14 @@ def run_live_pf(
                         int(estimator.pf_config.birth_residual_min_support),
                     ),
                 )
-                if residual_burst_active and dss_residual_program_length_resolved > int(
-                    dss_config.program_length
-                ):
-                    dss_selection_config = replace(
-                        dss_selection_config,
-                        program_length=int(dss_residual_program_length_resolved),
-                    )
-                    print(
-                        "DSS-PP residual separation burst: "
-                        f"program_length={int(dss_selection_config.program_length)} "
-                        f"(base={int(dss_config.program_length)})"
-                    )
+                dss_selection_config = _adaptive_dss_selection_config(
+                    dss_selection_config,
+                    residual_burst_active=residual_burst_active,
+                    remaining_estimate=_latest_remaining_estimate_for_planning(
+                        remaining_guidance_estimate
+                    ),
+                    label="next_station",
+                )
                 dss_start = time.perf_counter()
                 dss_result = select_dss_pp_next_station(
                     estimator=estimator,
@@ -9436,6 +11114,8 @@ def run_live_pf(
                     config=dss_selection_config,
                 )
                 dss_elapsed = time.perf_counter() - dss_start
+                total_path_planning_wall_s += float(dss_elapsed)
+                path_planning_wall_samples_s.append(float(dss_elapsed))
                 next_pose = dss_result.next_pose
                 planned_program_for_next = tuple(
                     int(pair_id) for pair_id in dss_result.shield_program.pair_ids
@@ -9460,6 +11140,8 @@ def run_live_pf(
                     f"frontier_gain={float(dss_result.sequence[0].frontier_gain):.6g} "
                     f"local_orbit={float(dss_result.sequence[0].local_orbit_gain):.6g} "
                     f"station_cond={float(dss_result.sequence[0].station_condition_gain):.6g} "
+                    f"corr_reduction={float(dss_result.sequence[0].correlation_reduction_gain):.6g} "
+                    f"isotope_balance={float(dss_result.sequence[0].isotope_balance_gain):.6g} "
                     f"elevation_cond={float(dss_result.sequence[0].elevation_condition_gain):.6g} "
                     f"env_sig={float(dss_result.sequence[0].environment_signature_score):.6g} "
                     f"vertical_env_sig={float(dss_result.sequence[0].vertical_environment_signature_score):.6g} "
@@ -9468,6 +11150,8 @@ def run_live_pf(
                     f"remaining_route_pressure={float(dss_result.sequence[0].remaining_route_pressure):.6g} "
                     f"remaining_route_penalty={float(dss_result.sequence[0].remaining_route_penalty):.6g} "
                     f"remaining_route_gain={float(dss_result.sequence[0].remaining_route_gain):.6g} "
+                    "runtime_rescue_modes="
+                    f"{dss_result.diagnostics.get('runtime_rescue_mode_counts', {})} "
                     f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
                     f"compute={dss_elapsed:.3f}s"
                 )
@@ -9475,7 +11159,16 @@ def run_live_pf(
                     dss_diagnostics,
                     label=f"pose_{current_pose_idx}_next",
                 )
+                _log_dss_pairwise_ambiguity_diagnostics(
+                    dss_diagnostics,
+                    label=f"pose_{current_pose_idx}_next",
+                )
+                _log_dss_component_leader_diagnostics(
+                    dss_diagnostics,
+                    label=f"pose_{current_pose_idx}_next",
+                )
             else:
+                one_step_start = time.perf_counter()
                 next_idx = select_next_pose_from_candidates(
                     estimator=estimator,
                     candidate_poses_xyz=candidates,
@@ -9492,8 +11185,77 @@ def run_live_pf(
                     ),
                     min_observation_aggregate=pf_conf.pose_min_observation_aggregate,
                     min_observation_max_particles=pf_conf.pose_min_observation_max_particles,
+                    worker_count=int(pose_selection_workers_resolved),
                 )
+                one_step_elapsed = time.perf_counter() - one_step_start
+                total_path_planning_wall_s += float(one_step_elapsed)
+                path_planning_wall_samples_s.append(float(one_step_elapsed))
                 next_pose = candidates[next_idx]
+                print(
+                    "One-step path policy selected next station: "
+                    f"idx={int(next_idx)} pose={next_pose.tolist()} "
+                    f"workers={int(pose_selection_workers_resolved)} "
+                    f"compute={one_step_elapsed:.3f}s"
+                )
+                if baseline_shield_policy is None:
+                    dss_selection_config = dss_config
+                    residual_burst_active = _has_birth_residual_evidence(
+                        estimator,
+                        min_support=max(
+                            1,
+                            int(estimator.pf_config.birth_residual_min_support),
+                        ),
+                    )
+                    dss_selection_config = _adaptive_dss_selection_config(
+                        dss_selection_config,
+                        residual_burst_active=residual_burst_active,
+                        remaining_estimate=_latest_remaining_estimate_for_planning(),
+                        label="one_step_fixed_station",
+                    )
+                    dss_start = time.perf_counter()
+                    dss_result = select_dss_pp_next_station(
+                        estimator=estimator,
+                        candidate_poses_xyz=np.asarray([next_pose], dtype=float),
+                        current_pose_xyz=pose,
+                        current_pair_id=current_shield_pair_id,
+                        visited_poses_xyz=visited_arr,
+                        map_api=planning_map,
+                        bounds_xyz=(bounds_lo, bounds_hi),
+                        config=dss_selection_config,
+                    )
+                    dss_elapsed = time.perf_counter() - dss_start
+                    total_path_planning_wall_s += float(dss_elapsed)
+                    path_planning_wall_samples_s.append(float(dss_elapsed))
+                    planned_program_for_next = tuple(
+                        int(pair_id) for pair_id in dss_result.shield_program.pair_ids
+                    )
+                    dss_diagnostics = dict(dss_result.diagnostics)
+                    dss_first_node = (
+                        dss_result.sequence[0] if dss_result.sequence else None
+                    )
+                    print(
+                        "DSS-PP fixed-station shield program: "
+                        f"program={dss_result.shield_program.name} "
+                        f"pairs={list(planned_program_for_next)} "
+                        f"score={float(dss_result.score):.6g} "
+                        f"signature={float(dss_result.sequence[0].signature_score):.6g} "
+                        "temporal_sep="
+                        f"{float(dss_result.sequence[0].temporal_separation_score):.6g} "
+                        f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
+                        f"compute={dss_elapsed:.3f}s"
+                    )
+                    _log_dss_ranked_node_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_one_step_fixed_station",
+                    )
+                    _log_dss_pairwise_ambiguity_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_one_step_fixed_station",
+                    )
+                    _log_dss_component_leader_diagnostics(
+                        dss_diagnostics,
+                        label=f"pose_{current_pose_idx}_one_step_fixed_station",
+                    )
             if bool(remaining_measurement_config.enabled) and estimator.measurements:
                 remaining_program = planned_program_for_next
                 if remaining_program is None:
@@ -9522,6 +11284,10 @@ def run_live_pf(
                 ]
                 remaining_measurement_estimates.append(remaining_payload)
                 print(format_remaining_measurement_estimate(remaining_estimate))
+                _log_remaining_measurement_detail(
+                    remaining_estimate,
+                    label=f"pose_{current_pose_idx}_next",
+                )
             pending_path_segment = _build_robot_path_segment(
                 map_api=planning_map,
                 from_pose_xyz=pose,
@@ -9719,8 +11485,22 @@ def run_live_pf(
     max_ig_wall_s = float(np.max(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
     mean_pf_wall_s = float(np.mean(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
     max_pf_wall_s = float(np.max(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
+    mean_path_planning_wall_s = (
+        float(np.mean(path_planning_wall_samples_s))
+        if path_planning_wall_samples_s
+        else 0.0
+    )
+    max_path_planning_wall_s = (
+        float(np.max(path_planning_wall_samples_s))
+        if path_planning_wall_samples_s
+        else 0.0
+    )
     total_compute_time_s = float(
-        total_ig_wall_s + total_pf_wall_s + total_prune_wall_s + total_viz_wall_s
+        total_ig_wall_s
+        + total_pf_wall_s
+        + total_prune_wall_s
+        + total_viz_wall_s
+        + total_path_planning_wall_s
     )
     wall_clock_runtime_s = float(time.perf_counter() - run_wall_start)
     mission_metrics = {
@@ -9758,6 +11538,10 @@ def run_live_pf(
         "dss_signature_weight": float(dss_config.lambda_signature),
         "dss_differential_weight": float(dss_config.eta_differential),
         "dss_rotation_weight": float(dss_config.lambda_rotation),
+        "dss_correlation_reduction_weight": float(
+            dss_config.lambda_correlation_reduction
+        ),
+        "dss_isotope_balance_weight": float(dss_config.lambda_isotope_balance),
         "dss_environment_signature_weight": float(
             dss_config.lambda_environment_signature
         ),
@@ -9773,6 +11557,9 @@ def run_live_pf(
         "mission_stop_require_model_order_ready": bool(
             mission_stop_require_model_order_ready
         ),
+        "mission_stop_require_remaining_measurement_ready": bool(
+            mission_stop_require_remaining_measurement_ready
+        ),
         "pf_obstacle_attenuation": bool(pf_obstacle_attenuation_enabled),
         "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
         "total_compute_time_s": total_compute_time_s,
@@ -9782,6 +11569,9 @@ def run_live_pf(
         "pf_compute_time_s": float(total_pf_wall_s),
         "mean_pf_update_time_s": mean_pf_wall_s,
         "max_pf_update_time_s": max_pf_wall_s,
+        "path_planning_compute_time_s": float(total_path_planning_wall_s),
+        "mean_path_planning_time_s": mean_path_planning_wall_s,
+        "max_path_planning_time_s": max_path_planning_wall_s,
         "display_prune_time_s": float(total_prune_wall_s),
         "prune_time_s": float(total_prune_wall_s),
         "viz_time_s": float(total_viz_wall_s),
@@ -9812,6 +11602,7 @@ def run_live_pf(
         f"rotation={total_rotation_time_s:.1f}s "
         f"end_to_end={mission_metrics['estimated_end_to_end_time_s']:.1f}s "
         f"compute={total_compute_time_s:.3f}s "
+        f"path_plan={total_path_planning_wall_s:.3f}s "
         f"ig_mean={mean_ig_wall_s:.3f}s "
         f"pf_mean={mean_pf_wall_s:.3f}s "
         f"wall_clock={wall_clock_runtime_s:.2f}s"
@@ -9927,12 +11718,40 @@ def run_live_pf(
         "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
         "obstacle_buildup_coeff": float(pf_obstacle_buildup_coeff),
     }
+    final_surface_observability = estimator.surface_candidate_observability_diagnostics(
+        window=None,
+        max_candidates=int(
+            runtime_config.get("final_surface_observability_candidates", 1024)
+        ),
+    )
     metrics = compute_metrics(
         gt_by_iso,
         est_by_iso,
         match_radius_m=eval_match_radius_m,
     )
     print_metrics_report(metrics)
+    final_isotope_count_diagnostics = _final_isotope_count_residual_diagnostics(
+        estimator,
+        estimates,
+    )
+    for iso, stats in sorted(final_isotope_count_diagnostics.items()):
+        print(
+            f"Final count residual[{iso}]: "
+            f"sources={int(stats.get('reported_source_count', 0))} "
+            f"obs_total={float(stats.get('observed_total_counts', 0.0)):.3f} "
+            f"pred_total={float(stats.get('predicted_total_counts', 0.0)):.3f} "
+            f"pos_resid={float(stats.get('positive_residual_total_counts', 0.0)):.3f} "
+            f"neg_resid={float(stats.get('negative_residual_total_counts', 0.0)):.3f} "
+            f"chi2={float(stats.get('residual_chi2', 0.0)):.3f}"
+        )
+    online_metric_summary = _online_estimate_metric_summary(
+        estimator.history_estimates,
+        gt_by_iso,
+        match_radius_m=float(eval_match_radius_m),
+    )
+    remaining_trace_summary = _remaining_measurement_trace_summary(
+        remaining_measurement_estimates
+    )
     final_model_order_status = _final_model_order_status(estimator)
     final_payload = {
         "measurements_completed": int(step_counter),
@@ -9942,6 +11761,8 @@ def run_live_pf(
             if key != "path_segments"
         },
         "match_metrics": metrics,
+        "online_estimate_metrics": online_metric_summary,
+        "remaining_measurement_trace_summary": remaining_trace_summary,
         "estimated_sources": est_by_iso,
         "remaining_measurement_estimates": remaining_measurement_estimates,
         "last_remaining_measurement_estimate": (
@@ -9949,9 +11770,13 @@ def run_live_pf(
             if not remaining_measurement_estimates
             else remaining_measurement_estimates[-1]
         ),
+        "max_pose_stop_unresolved": bool(max_pose_stop_unresolved),
+        "max_pose_stop_diagnostics": max_pose_stop_diagnostics,
         "random_source_visibility": random_source_visibility_diagnostics,
         "source_surface_diagnostics": source_surface_diagnostics,
         "pf_obstacle_diagnostics": pf_obstacle_diagnostics,
+        "surface_candidate_observability_diagnostics": final_surface_observability,
+        "isotope_count_residual_diagnostics": final_isotope_count_diagnostics,
         "final_estimate_diagnostics": {
             "stages": {
                 stage: _serialize_estimate_stage(stage_estimates)

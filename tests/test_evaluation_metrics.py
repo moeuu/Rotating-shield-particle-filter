@@ -77,3 +77,23 @@ def test_compute_metrics_reports_threshold_precision_recall() -> None:
     assert data["threshold_counts"]["3m"]["tp"] == 2
     assert data["threshold_counts"]["3m"]["precision"] == 2 / 3
     assert data["threshold_counts"]["3m"]["recall"] == 1.0
+
+
+def test_compute_metrics_default_thresholds_include_half_meter() -> None:
+    """Default paper metrics should include 0.5, 1, 2, and 3 m gates."""
+    gt_by_iso = {
+        "Cs-137": [
+            {"pos": [0.0, 0.0, 0.0], "strength": 100.0},
+        ]
+    }
+    est_by_iso = {
+        "Cs-137": [
+            {"pos": [0.4, 0.0, 0.0], "strength": 100.0},
+        ]
+    }
+
+    metrics = compute_metrics(gt_by_iso, est_by_iso, match_radius_m=0.5)
+    threshold_counts = metrics["isotopes"]["Cs-137"]["threshold_counts"]
+
+    assert list(threshold_counts.keys()) == ["0.5m", "1m", "2m", "3m"]
+    assert threshold_counts["0.5m"]["tp"] == 1

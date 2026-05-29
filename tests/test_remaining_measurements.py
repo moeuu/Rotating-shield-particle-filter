@@ -184,3 +184,213 @@ def test_remaining_measurement_estimate_is_json_safe() -> None:
     assert "Cs-137" in estimate.isotope_details
     assert payload["isotope_details"]["Cs-137"]["min_pairwise_separation"] >= 0.0
     json.dumps(payload, allow_nan=False)
+
+
+def test_remaining_measurement_flags_high_surface_ambiguity() -> None:
+    """Ceiling modes with weak pairwise separation should keep the mission open."""
+    isotope = "Cs-137"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array(
+            [[2.0, 2.0, 10.0], [7.0, 2.0, 10.0]],
+            dtype=float,
+        ),
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=2,
+            planning_particles=2,
+            planning_method="top_weight",
+            position_max=(10.0, 10.0, 10.0),
+            source_strength_prior_mean=100.0,
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={isotope: 120.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: 10.0},
+        )
+    )
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[2.0, 2.0, 10.0]], dtype=float),
+                strengths=np.array([250.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[7.0, 2.0, 10.0]], dtype=float),
+                strengths=np.array([250.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        next_pose_xyz=np.array([5.0, 0.5, 0.5], dtype=float),
+        shield_program_pair_ids=(0, 1),
+        live_time_s=1.0,
+        config=RemainingMeasurementConfig(
+            mode_cluster_radius_m=0.25,
+            max_modes_per_isotope=4,
+            max_particles=2,
+            planning_method="top_weight",
+            high_surface_pairwise_separation_threshold=1.0e6,
+            high_surface_absorption_q_multiple=2.0,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.components["high_surface_ambiguity"] > 0.0
+    assert "high_surface_ambiguity" in estimate.unresolved_factors
+    assert estimate.isotope_details[isotope]["high_surface_mode_count"] == 2
+
+
+def test_remaining_measurement_residual_uses_surface_candidate_gain() -> None:
+    """Residual budget should see batched rescue gain from known surface candidates."""
+    estimator = _build_two_mode_estimator()
+    estimator.measurements[0].z_k["Cs-137"] = 5000.0
+    assert estimator.measurements[0].z_variance_k is not None
+    estimator.measurements[0].z_variance_k["Cs-137"] = 100.0
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        next_pose_xyz=np.array([3.0, 2.0, 0.0], dtype=float),
+        shield_program_pair_ids=(0, 1),
+        live_time_s=1.0,
+        config=RemainingMeasurementConfig(
+            mode_cluster_radius_m=0.25,
+            max_modes_per_isotope=4,
+            max_particles=2,
+            planning_method="top_weight",
+            residual_chi2_threshold=9.0,
+            count_variance_floor=1.0,
+            residual_surface_gain_candidate_limit=16,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.gains["residual_surface"] > 0.0
+    assert estimate.gains["residual"] >= estimate.gains["residual_surface"]
+
+
+def test_remaining_measurement_marks_observed_zero_source_isotope_unresolved() -> None:
+    """Observed isotope counts should not be considered resolved by a zero-source MAP."""
+    isotope = "Eu-154"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={isotope: 60.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: 9.0},
+        )
+    )
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        config=RemainingMeasurementConfig(
+            max_particles=2,
+            planning_method="top_weight",
+            unresolved_absent_min_total_counts=25.0,
+            unresolved_absent_min_max_counts=5.0,
+            unresolved_absent_min_snr=2.0,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.components["isotope_absence"] > 0.0
+    assert "isotope_absence" in estimate.unresolved_factors
+    assert estimate.isotope_details[isotope]["map_source_count"] == 0
+    assert estimate.isotope_details[isotope]["unresolved_absent_total_counts"] == 60.0
+
+
+def test_surface_stratified_rescue_keeps_high_surface_candidate() -> None:
+    """Rescue candidate ranking should reserve slots for high surface strata."""
+    candidates = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [5.0, 5.0, 10.0],
+            [0.0, 5.0, 8.0],
+        ],
+        dtype=float,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=candidates,
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            position_max=(10.0, 10.0, 10.0),
+            report_mle_rescue_surface_quota_enable=True,
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    scores = np.array([100.0, 90.0, 5.0, 4.0], dtype=float)
+    selected = estimator._surface_stratified_rescue_indices(
+        candidates,
+        scores,
+        np.ones(scores.size, dtype=bool),
+        max_candidates=3,
+    )
+
+    assert 0 in selected
+    assert 2 in selected

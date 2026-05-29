@@ -16,7 +16,8 @@ Run the core four variants for every RA-L case:
 - `round_robin_shield`
 - `one_step_path`
 
-Run one extra residual-birth ablation only for the mixed-cardinality case:
+Run residual-birth ablation for the case where variable cardinality is the
+central claim:
 
 - `case03_mixed_cardinality` + `no_residual_birth`
 
@@ -35,9 +36,9 @@ This gives 13 full-simulation runs:
   selection, isolating the value of information-driven shield programs.
 - `one_step_path` keeps the same estimator and shield machinery but replaces
   DSS-PP with greedy planning, isolating the value of the planner.
-- `no_residual_birth` is included only for `case03_mixed_cardinality`, where
-  residual birth is most directly tied to mixed-cardinality multi-source
-  discovery.
+- `no_residual_birth` is included for `case03_mixed_cardinality`, where
+  residual/global surface birth and report rescue are most directly tied to
+  variable-cardinality multi-source discovery.
 
 The full 162-run manifest remains available for supplementary or extended
 experiments, but the RA-L paper plan is the 13-run subset above.

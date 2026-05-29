@@ -18,6 +18,7 @@ from measurement.source_surfaces import (
     source_surface_kind,
     source_surface_kinds,
     surface_observable_fractions,
+    surface_response_observability_diagnostics,
 )
 
 
@@ -185,6 +186,58 @@ def test_generate_surface_sources_respects_ground_visibility_filter() -> None:
         == "obstacle_top"
         for source in sources
     )
+
+
+def test_surface_response_observability_diagnostics_are_batched() -> None:
+    """Response observability screening should expose source-set conditioning."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 5),
+        blocked_cells=(),
+    )
+    measurement_points = np.array(
+        [
+            [0.5, 0.5, 0.5],
+            [4.5, 0.5, 0.5],
+            [0.5, 4.5, 0.5],
+            [4.5, 4.5, 0.5],
+        ],
+        dtype=float,
+    )
+    separated = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [5.0, 5.0, 3.0],
+        ],
+        dtype=float,
+    )
+    duplicated = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    separated_stats = surface_response_observability_diagnostics(
+        separated,
+        grid,
+        measurement_points,
+        obstacle_height_m=1.0,
+    )
+    duplicated_stats = surface_response_observability_diagnostics(
+        duplicated,
+        grid,
+        measurement_points,
+        obstacle_height_m=1.0,
+    )
+
+    assert separated_stats["source_count"] == 2
+    assert separated_stats["reference_point_count"] == 4
+    assert float(separated_stats["condition_number"]) >= 1.0
+    assert float(separated_stats["max_pairwise_correlation"]) < 0.999
+    assert float(duplicated_stats["max_pairwise_correlation"]) > 0.999999
 
 
 def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:

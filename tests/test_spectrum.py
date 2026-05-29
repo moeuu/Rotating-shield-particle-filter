@@ -5,7 +5,7 @@ import pytest
 
 from measurement.model import EnvironmentConfig, PointSource
 from spectrum import pipeline
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 
 
 def _response_integral(decomposer: SpectralDecomposer, isotope: str) -> float:
@@ -39,7 +39,9 @@ def test_response_poisson_fuses_visible_photopeak_at_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Visible photopeak evidence should rescue a zero-boundary response fit."""
-    decomposer = SpectralDecomposer()
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_photopeak_fusion=True)
+    )
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
 
     def _fake_photopeak_counts(
@@ -73,7 +75,9 @@ def test_response_poisson_keeps_low_snr_photopeak_with_large_uncertainty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Low-SNR photopeak evidence should remain available with high variance."""
-    decomposer = SpectralDecomposer()
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_photopeak_fusion=True)
+    )
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
 
     def _fake_photopeak_counts(
@@ -101,3 +105,96 @@ def test_response_poisson_keeps_low_snr_photopeak_with_large_uncertainty(
     assert estimates["Cs-137"].variance >= 400.0
     assert estimates["Cs-137"].method == "response_poisson_photopeak_fused_source_equivalent"
     assert estimates["Co-60"].counts == pytest.approx(0.0)
+
+
+def test_response_poisson_keeps_full_spectrum_count_for_weak_photopeak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weak photopeak evidence must not suppress a full-spectrum response fit."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_photopeak_fusion=True)
+    )
+    no_fusion_decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_photopeak_fusion=False)
+    )
+    isotope = "Eu-154"
+    isotope_index = decomposer.isotope_names.index(isotope)
+    spectrum = 80.0 * decomposer.response_matrix[:, isotope_index]
+    reference = no_fusion_decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=[isotope],
+    )[isotope]
+
+    def _fake_photopeak_counts(
+        _spectrum: np.ndarray,
+        *,
+        isotopes: list[str],
+        **_: object,
+    ) -> dict[str, float]:
+        """Return a weak local photopeak estimate below the fusion SNR."""
+        decomposer.last_count_variances = {name: 100.0 for name in isotopes}
+        return {name: (5.0 if name == isotope else 0.0) for name in isotopes}
+
+    monkeypatch.setattr(
+        decomposer,
+        "compute_photopeak_nnls_counts",
+        _fake_photopeak_counts,
+    )
+
+    estimates = decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=[isotope],
+    )
+
+    assert estimates[isotope].counts == pytest.approx(reference.counts, rel=1e-3)
+    assert estimates[isotope].variance >= estimates[isotope].counts
+    assert (
+        estimates[isotope].method
+        == "response_poisson_low_snr_photopeak_retained_source_equivalent"
+    )
+
+
+def test_response_poisson_suppresses_low_support_continuum_crosstalk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weak low-SNR continuum-only components should not become isotope counts."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_photopeak_fusion=True)
+    )
+    cs_index = decomposer.isotope_names.index("Cs-137")
+    eu_index = decomposer.isotope_names.index("Eu-154")
+    spectrum = (
+        10000.0 * decomposer.response_matrix[:, cs_index]
+        + 200.0 * decomposer.response_matrix[:, eu_index]
+    )
+
+    def _fake_photopeak_counts(
+        _spectrum: np.ndarray,
+        *,
+        isotopes: list[str],
+        **_: object,
+    ) -> dict[str, float]:
+        """Return no local Eu photopeak evidence despite a continuum coefficient."""
+        decomposer.last_count_variances = {
+            name: (100.0 if name == "Cs-137" else 1.0)
+            for name in isotopes
+        }
+        return {name: (10000.0 if name == "Cs-137" else 0.0) for name in isotopes}
+
+    monkeypatch.setattr(
+        decomposer,
+        "compute_photopeak_nnls_counts",
+        _fake_photopeak_counts,
+    )
+
+    estimates = decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=["Cs-137", "Eu-154"],
+    )
+
+    assert estimates["Cs-137"].counts == pytest.approx(10000.0, rel=0.05)
+    assert estimates["Eu-154"].counts == pytest.approx(0.0)
+    assert (
+        estimates["Eu-154"].method
+        == "response_poisson_low_snr_photopeak_suppressed_source_equivalent"
+    )

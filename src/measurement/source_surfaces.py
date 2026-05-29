@@ -851,6 +851,84 @@ def surface_observable_fractions(
     return np.mean(visible, axis=1).astype(float, copy=False)
 
 
+def surface_response_observability_diagnostics(
+    positions: NDArray[np.float64],
+    obstacle_grid: ObstacleGrid | None,
+    measurement_points: NDArray[np.float64],
+    *,
+    obstacle_height_m: float = 2.0,
+    detector_height_m: float = 0.5,
+    clear_path_max_m: float = 0.01,
+    box_chunk_size: int = 64,
+) -> dict[str, float | int]:
+    """
+    Return geometry-based response separability diagnostics for source placement.
+
+    This is a random-scenario screening diagnostic, not a PF observation model.
+    It uses clear ground-view rays and inverse-square response proxies to reject
+    source sets whose columns are nearly indistinguishable from the reachable
+    floor measurement manifold.
+    """
+    sources = np.asarray(positions, dtype=float).reshape(-1, 3)
+    detectors = _coerce_visibility_measurement_points(
+        measurement_points,
+        detector_height_m=detector_height_m,
+    )
+    if sources.size == 0 or detectors.size == 0:
+        return {
+            "source_count": int(sources.shape[0]),
+            "reference_point_count": int(detectors.shape[0]),
+            "condition_number": 1.0,
+            "max_pairwise_correlation": 0.0,
+            "weak_source_count": 0,
+        }
+    diff = detectors[:, None, :] - sources[None, :, :]
+    distance2 = np.maximum(np.sum(diff * diff, axis=2), 1.0e-6)
+    response = 1.0 / distance2
+    boxes = _visibility_obstacle_boxes_m(obstacle_grid, obstacle_height_m)
+    if boxes.size:
+        path_lengths = _segment_path_lengths_through_boxes_m(
+            sources,
+            detectors,
+            boxes,
+            box_chunk_size=box_chunk_size,
+        )
+        visible = path_lengths <= max(0.0, float(clear_path_max_m))
+        response = response * visible.T.astype(float)
+    column_norm = np.linalg.norm(response, axis=0)
+    valid = column_norm > 1.0e-12
+    weak_count = int(np.count_nonzero(~valid))
+    if np.count_nonzero(valid) <= 1:
+        return {
+            "source_count": int(sources.shape[0]),
+            "reference_point_count": int(detectors.shape[0]),
+            "condition_number": 1.0 if np.count_nonzero(valid) == 1 else float("inf"),
+            "max_pairwise_correlation": 0.0,
+            "weak_source_count": weak_count,
+        }
+    normalized = response[:, valid] / np.maximum(column_norm[valid], 1.0e-12)
+    try:
+        singular_values = np.linalg.svd(normalized, compute_uv=False)
+        positive = singular_values[singular_values > 1.0e-12]
+        condition = (
+            float(np.max(positive) / max(float(np.min(positive)), 1.0e-12))
+            if positive.size
+            else float("inf")
+        )
+    except np.linalg.LinAlgError:
+        condition = float("inf")
+    corr = np.abs(normalized.T @ normalized)
+    upper = np.triu_indices(corr.shape[0], k=1)
+    max_corr = float(np.max(corr[upper])) if upper[0].size else 0.0
+    return {
+        "source_count": int(sources.shape[0]),
+        "reference_point_count": int(detectors.shape[0]),
+        "condition_number": condition,
+        "max_pairwise_correlation": max_corr,
+        "weak_source_count": weak_count,
+    }
+
+
 def is_ground_observable_source_position(
     position: Sequence[float],
     obstacle_grid: ObstacleGrid | None,

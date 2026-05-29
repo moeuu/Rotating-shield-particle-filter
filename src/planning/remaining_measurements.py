@@ -39,9 +39,18 @@ class RemainingMeasurementConfig:
     separation_weight: float = 1.5
     verification_weight: float = 1.0
     residual_weight: float = 1.0
+    high_surface_ambiguity_weight: float = 1.0
+    high_surface_z_fraction: float = 0.75
+    high_surface_pairwise_separation_threshold: float = 9.0
+    high_surface_absorption_q_multiple: float = 2.0
     dss_information_gain_weight: float = 1.0
     dss_count_utility_weight: float = 0.25
     range_scale: float = 1.35
+    unresolved_absent_min_total_counts: float = 25.0
+    unresolved_absent_min_max_counts: float = 5.0
+    unresolved_absent_min_snr: float = 2.0
+    unresolved_absent_budget_weight: float = 1.0
+    residual_surface_gain_candidate_limit: int = 2048
 
 
 @dataclass(frozen=True)
@@ -228,6 +237,26 @@ def _mode_response_matrix(
     )
 
 
+def _high_surface_mode_mask(
+    estimator: RotatingShieldPFEstimator,
+    positions: NDArray[np.float64],
+    *,
+    config: RemainingMeasurementConfig,
+) -> NDArray[np.bool_]:
+    """Return modes high enough to require explicit vertical disambiguation."""
+    pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if pos_arr.size == 0:
+        return np.zeros(0, dtype=bool)
+    hi = getattr(getattr(estimator, "pf_config", None), "position_max", (0.0, 0.0, 0.0))
+    try:
+        room_z = max(float(np.asarray(hi, dtype=float).reshape(3)[2]), 0.0)
+    except (TypeError, ValueError):
+        room_z = 0.0
+    room_z = max(room_z, float(np.max(pos_arr[:, 2])), 1.0e-9)
+    threshold = float(np.clip(config.high_surface_z_fraction, 0.0, 1.0)) * room_z
+    return pos_arr[:, 2] >= threshold
+
+
 def _state_budget_components(
     estimator: RotatingShieldPFEstimator,
     config: RemainingMeasurementConfig,
@@ -260,7 +289,17 @@ def _state_budget_components(
         "same_isotope_separation": 0.0,
         "pseudo_source_verification": 0.0,
         "residual": 0.0,
+        "isotope_absence": 0.0,
+        "high_surface_ambiguity": 0.0,
     }
+    unresolved_absent = {}
+    evidence_getter = getattr(estimator, "unresolved_isotope_evidence", None)
+    if callable(evidence_getter):
+        unresolved_absent = evidence_getter(
+            min_total_counts=float(config.unresolved_absent_min_total_counts),
+            min_max_count=float(config.unresolved_absent_min_max_counts),
+            min_snr=float(config.unresolved_absent_min_snr),
+        )
     isotope_details: dict[str, dict[str, float | int]] = {}
     mode_arrays: dict[
         str,
@@ -330,6 +369,10 @@ def _state_budget_components(
         separation_budget = 0.0
         min_separation = float("inf")
         unresolved_pairs = 0
+        high_surface_budget = 0.0
+        high_surface_mode_count = 0
+        high_surface_min_separation = float("inf")
+        high_surface_unresolved_pairs = 0
         residual_budget = 0.0
         data = estimator._measurement_data_for_iso(isotope, window=None)
         if data is not None and data.z_k.size and mode_arrays[isotope]:
@@ -354,6 +397,50 @@ def _state_budget_components(
             separation_budget = stats.deficit
             min_separation = stats.min_separation
             unresolved_pairs = stats.unresolved_pairs
+            high_mask = _high_surface_mode_mask(
+                estimator,
+                mode_positions,
+                config=config,
+            )
+            high_surface_mode_count = int(np.count_nonzero(high_mask))
+            if high_surface_mode_count >= 2:
+                high_stats = _pairwise_signature_stats_batched(
+                    response[:, high_mask],
+                    variance,
+                    mode_weights[high_mask],
+                    threshold=max(
+                        float(config.high_surface_pairwise_separation_threshold),
+                        0.0,
+                    ),
+                )
+                high_surface_budget += float(high_stats.deficit)
+                high_surface_min_separation = high_stats.min_separation
+                high_surface_unresolved_pairs = high_stats.unresolved_pairs
+            prior_mean = max(
+                float(
+                    getattr(
+                        getattr(estimator, "pf_config", None),
+                        "source_strength_prior_mean",
+                        0.0,
+                    )
+                ),
+                0.0,
+            )
+            if prior_mean > 0.0 and np.any(high_mask):
+                high_strengths = mode_strengths[high_mask]
+                absorption_threshold = prior_mean * max(
+                    float(config.high_surface_absorption_q_multiple),
+                    1.0,
+                )
+                high_surface_budget += float(
+                    np.sum(
+                        np.maximum(
+                            high_strengths / max(absorption_threshold, 1.0e-12)
+                            - 1.0,
+                            0.0,
+                        )
+                    )
+                )
             background_rate = (
                 float(filt.best_particle().state.background)
                 if filt.continuous_particles
@@ -365,11 +452,17 @@ def _state_budget_components(
             residual_budget = max(residual_chi2 / residual_threshold - 1.0, 0.0)
         else:
             residual_chi2 = 0.0
+        absent_payload = unresolved_absent.get(str(isotope), {})
+        absence_budget = float(absent_payload.get("budget", 0.0))
         components["uncertainty"] += spread_budget + strength_budget
         components["cardinality"] += cardinality_budget
         components["same_isotope_separation"] += separation_budget
         components["pseudo_source_verification"] += verification_budget
         components["residual"] += residual_budget
+        components["isotope_absence"] += (
+            float(config.unresolved_absent_budget_weight) * max(absence_budget, 0.0)
+        )
+        components["high_surface_ambiguity"] += high_surface_budget
         isotope_details[isotope] = {
             "mode_count": int(len(modes)),
             "map_source_count": int(map_count),
@@ -384,7 +477,24 @@ def _state_budget_components(
                 0.0 if not np.isfinite(min_separation) else float(min_separation)
             ),
             "unresolved_pair_count": int(unresolved_pairs),
+            "high_surface_mode_count": int(high_surface_mode_count),
+            "high_surface_min_pairwise_separation": (
+                0.0
+                if not np.isfinite(high_surface_min_separation)
+                else float(high_surface_min_separation)
+            ),
+            "high_surface_unresolved_pair_count": int(
+                high_surface_unresolved_pairs
+            ),
+            "high_surface_ambiguity_budget": float(high_surface_budget),
             "residual_chi2": float(residual_chi2),
+            "unresolved_absent_budget": float(max(absence_budget, 0.0)),
+            "unresolved_absent_total_counts": float(
+                absent_payload.get("total_counts", 0.0)
+            ),
+            "unresolved_absent_count_snr": float(
+                absent_payload.get("count_snr", 0.0)
+            ),
         }
     return components, isotope_details, mode_arrays
 
@@ -447,7 +557,9 @@ def _prediction_gain_components(
         "same_isotope_separation": 0.0,
         "pseudo_source_verification": 0.0,
         "residual": 0.0,
+        "residual_surface": 0.0,
         "dss_information": 0.0,
+        "high_surface_ambiguity": 0.0,
     }
     if next_pose_xyz is not None:
         pose = np.asarray(next_pose_xyz, dtype=float).reshape(3)
@@ -485,6 +597,22 @@ def _prediction_gain_components(
                 threshold=threshold,
             )
             gains["same_isotope_separation"] += stats.weighted_increment
+            high_mask = _high_surface_mode_mask(
+                estimator,
+                mode_positions,
+                config=config,
+            )
+            if int(np.count_nonzero(high_mask)) >= 2:
+                high_stats = _pairwise_signature_stats_batched(
+                    response[:, high_mask],
+                    row_variance,
+                    mode_weights[high_mask],
+                    threshold=max(
+                        float(config.high_surface_pairwise_separation_threshold),
+                        0.0,
+                    ),
+                )
+                gains["high_surface_ambiguity"] += high_stats.weighted_increment
     if dss_node is not None:
         gains["uncertainty"] += max(float(dss_node.information_gain), 0.0)
         gains["dss_information"] += max(float(dss_node.information_gain), 0.0)
@@ -494,14 +622,140 @@ def _prediction_gain_components(
             + float(dss_node.elevation_signature_score),
             0.0,
         )
+        gains["high_surface_ambiguity"] += max(
+            float(dss_node.temporal_separation_score)
+            + float(dss_node.elevation_signature_score)
+            + float(dss_node.correlation_reduction_gain),
+            0.0,
+        )
         gains["residual"] += max(float(dss_node.count_utility), 0.0)
     if dss_diagnostics:
         for key in ("best_information_gain", "information_gain", "eig"):
             if key in dss_diagnostics:
                 gains["dss_information"] += max(float(dss_diagnostics[key]), 0.0)
                 break
+    residual_surface_gain = _residual_surface_gain_estimate(
+        estimator,
+        mode_arrays,
+        config,
+    )
+    gains["residual_surface"] = residual_surface_gain
+    gains["residual"] += residual_surface_gain
     gains["pseudo_source_verification"] += float(program_length)
     return gains, program_length
+
+
+def _residual_surface_gain_estimate(
+    estimator: RotatingShieldPFEstimator,
+    mode_arrays: dict[
+        str,
+        list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
+    ],
+    config: RemainingMeasurementConfig,
+) -> float:
+    """
+    Return a batched estimate of residual reduction available from one surface source.
+
+    The residual budget can be very large after PF posterior collapse.  DSS count
+    utility is a station-local score and is often too small to scale that budget,
+    so this diagnostic computes the best single fixed-surface source that could
+    reduce the current positive residual over the accumulated measurements.  It
+    uses the same PF response model and a batched weighted least-squares strength
+    fit over known source-surface candidates; no transport shortcut is introduced.
+    """
+    pool_all = np.asarray(getattr(estimator, "candidate_sources", np.zeros((0, 3))), dtype=float)
+    if pool_all.size == 0:
+        return 0.0
+    pool_all = pool_all.reshape(-1, 3)
+    limit = int(config.residual_surface_gain_candidate_limit)
+    if limit > 0 and pool_all.shape[0] > limit:
+        sample_indices = np.linspace(
+            0,
+            pool_all.shape[0] - 1,
+            max(1, limit),
+            dtype=np.int64,
+        )
+        pool = pool_all[sample_indices]
+    else:
+        pool = pool_all
+    if pool.size == 0:
+        return 0.0
+    threshold = max(float(config.residual_chi2_threshold), 1.0e-12)
+    variance_floor = max(float(config.count_variance_floor), 1.0e-12)
+    eps = max(float(config.gain_epsilon), 1.0e-12)
+    total_gain = 0.0
+    for isotope, filt in estimator.filters.items():
+        data = estimator._measurement_data_for_iso(isotope, window=None)
+        if data is None or data.z_k.size == 0:
+            continue
+        variances = np.maximum(
+            np.asarray(data.observation_variances, dtype=float).reshape(-1),
+            variance_floor,
+        )
+        if variances.size != data.z_k.size:
+            continue
+        background_rate = (
+            float(filt.best_particle().state.background)
+            if getattr(filt, "continuous_particles", None)
+            else 0.0
+        )
+        prediction = background_rate * np.asarray(data.live_times, dtype=float)
+        arrays = mode_arrays.get(isotope, [])
+        if arrays:
+            mode_positions, mode_strengths, _mode_weights = arrays[0]
+            response = _mode_response_matrix(
+                estimator,
+                isotope,
+                data.detector_positions,
+                data.fe_indices,
+                data.pb_indices,
+                data.live_times,
+                mode_positions,
+                mode_strengths,
+            )
+            prediction = prediction + np.sum(response, axis=1)
+        residual = np.maximum(
+            np.asarray(data.z_k, dtype=float).reshape(-1) - prediction,
+            0.0,
+        )
+        current_chi2 = float(np.sum((residual * residual) / variances))
+        if current_chi2 <= threshold:
+            continue
+        candidate_counts = expected_counts_per_source(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            detector_positions=data.detector_positions,
+            sources=pool,
+            strengths=np.ones(pool.shape[0], dtype=float),
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=estimator.response_scale_for_isotope(isotope),
+        )
+        counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
+        if counts.ndim != 2 or counts.shape != (data.z_k.size, pool.shape[0]):
+            continue
+        weights = 1.0 / np.maximum(variances, eps)
+        numerator = np.sum(weights[:, None] * residual[:, None] * counts, axis=0)
+        denominator = np.sum(weights[:, None] * counts * counts, axis=0)
+        q_hat = np.divide(
+            numerator,
+            np.maximum(denominator, eps),
+            out=np.zeros_like(numerator),
+            where=denominator > eps,
+        )
+        valid = np.isfinite(q_hat) & (q_hat > 0.0)
+        if not np.any(valid):
+            continue
+        trial_residual = np.maximum(
+            residual[:, None] - counts[:, valid] * q_hat[valid][None, :],
+            0.0,
+        )
+        trial_chi2 = np.sum(weights[:, None] * trial_residual * trial_residual, axis=0)
+        reduction = np.maximum(current_chi2 - trial_chi2, 0.0)
+        if reduction.size:
+            total_gain += float(np.max(reduction)) / threshold
+    return float(max(total_gain, 0.0))
 
 
 def _empirical_eta(
@@ -576,12 +830,17 @@ def estimate_remaining_measurement_budget(
         + float(cfg.separation_weight) * components["same_isotope_separation"]
         + float(cfg.verification_weight) * components["pseudo_source_verification"]
         + float(cfg.residual_weight) * components["residual"]
+        + float(cfg.high_surface_ambiguity_weight)
+        * components["high_surface_ambiguity"]
+        + components["isotope_absence"]
     )
     weighted_gain = (
         float(cfg.uncertainty_weight) * gains["uncertainty"]
         + float(cfg.separation_weight) * gains["same_isotope_separation"]
         + float(cfg.verification_weight) * gains["pseudo_source_verification"]
         + float(cfg.residual_weight) * gains["residual"]
+        + float(cfg.high_surface_ambiguity_weight)
+        * gains["high_surface_ambiguity"]
         + float(cfg.dss_information_gain_weight) * gains["dss_information"]
         + float(cfg.dss_count_utility_weight) * gains["residual"]
     )

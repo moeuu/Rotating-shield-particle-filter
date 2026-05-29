@@ -92,11 +92,19 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         "/configs/isaacsim/demo_room.usda"
     )
     assert Path(fixed_config["random_environment_base_usd_path"]).is_absolute()
+    no_shield = json.loads(by_variant["no_shield"].config_path.read_text())
+    assert no_shield["shield_transmission_target"] == 1.0
+    assert no_shield["shield_thickness_scale"] == 0.0
+    assert no_shield["orientation_k"] == 1
+    assert no_shield["min_rotations_per_pose"] == 1
+    assert no_shield["dss_pp"]["program_length"] == 1
+    assert no_shield["dss_pp"]["residual_program_length"] == 1
     obstacle_off = json.loads(
         by_variant["no_obstacle_signature"].config_path.read_text()
     )
     assert obstacle_off["dss_pp"]["environment_signature_weight"] == 0.0
     assert obstacle_off["dss_pp"]["occlusion_boundary_weight"] == 0.0
+    assert obstacle_off["dss_pp"]["vertical_environment_signature_weight"] == 0.0
     pf_obstacle_off = json.loads(
         by_variant["no_pf_obstacle_attenuation"].config_path.read_text()
     )
@@ -115,10 +123,15 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert passive_no_shield["shield_transmission_target"] == 1.0
     assert passive_no_shield["shield_thickness_scale"] == 0.0
+    assert passive_no_shield["orientation_k"] == 1
+    assert passive_no_shield["min_rotations_per_pose"] == 1
+    assert passive_no_shield["dss_pp"]["program_length"] == 1
+    assert passive_no_shield["dss_pp"]["residual_program_length"] == 1
     assert passive_no_shield["baseline_path_policy"]["name"] == "passive_serpentine"
     assert passive_no_shield["baseline_shield_policy"]["name"] == "fixed"
     assert passive_no_shield["thread_count"] >= 1
     assert passive_no_shield["python_worker_count"] >= 1
+    assert passive_no_shield["pose_selection_workers"] >= 1
     assert passive_no_shield["parallel_isotope_updates"] is True
     assert passive_no_shield["parallel_isotope_workers"] >= 1
     assert passive_no_shield["dss_pp"]["program_eval_workers"] >= 1
@@ -136,6 +149,22 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert one_step_fixed["path_planner"] == "one_step"
     assert one_step_fixed["baseline_shield_policy"]["name"] == "fixed"
+    one_step_no_shield = json.loads(
+        by_variant["baseline_onestep_no_shield"].config_path.read_text()
+    )
+    assert one_step_no_shield["path_planner"] == "one_step"
+    assert one_step_no_shield["shield_transmission_target"] == 1.0
+    assert one_step_no_shield["shield_thickness_scale"] == 0.0
+    assert one_step_no_shield["orientation_k"] == 1
+    assert one_step_no_shield["min_rotations_per_pose"] == 1
+    assert one_step_no_shield["dss_pp"]["program_length"] == 1
+    assert one_step_no_shield["dss_pp"]["residual_program_length"] == 1
+    one_step_path = json.loads(
+        by_variant["one_step_path"].config_path.read_text()
+    )
+    assert one_step_path["path_planner"] == "one_step"
+    assert one_step_path["strict_planned_shield_program"] is True
+    assert "baseline_shield_policy" not in one_step_path
     source_payload = json.loads(by_variant["proposed"].source_path.read_text())
     assert len(source_payload["sources"]) == DEFAULT_ABLATION_CASES[0].source_count
     assert "--full-simulation" in by_variant["proposed"].command

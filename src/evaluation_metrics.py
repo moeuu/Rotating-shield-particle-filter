@@ -207,7 +207,7 @@ def compute_metrics(
     est_by_iso: Dict[str, List[Any]],
     *,
     match_radius_m: float,
-    distance_thresholds_m: Sequence[float] = (1.0, 2.0, 3.0),
+    distance_thresholds_m: Sequence[float] = (0.5, 1.0, 2.0, 3.0),
     match_strength_weight: float = 2.0,
     match_distance_weight: float = 1.0,
     outside_radius_penalty: float = 1e3,

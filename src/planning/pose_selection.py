@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Sequence
 import sys
@@ -342,6 +343,7 @@ def select_next_pose_from_candidates(
     min_observation_penalty_scale: float = 1.0,
     min_observation_aggregate: str = "max",
     min_observation_max_particles: int | None = None,
+    worker_count: int | None = None,
 ) -> int:
     """
     Select the next pose from explicit candidate coordinates using an uncertainty criterion.
@@ -359,6 +361,62 @@ def select_next_pose_from_candidates(
     criterion controls whether the uncertainty is computed after rotation
     ("after_rotation") or after a single pose measurement ("after_pose").
     """
+
+    def _evaluate_candidate(
+        item: tuple[int, NDArray[np.float64]],
+    ) -> tuple[int, float, float, dict[str, float], float]:
+        """Return uncertainty, motion cost, and observation penalty for one pose."""
+        idx, pose_eval = item
+        if criterion == "after_rotation":
+            uncertainty_eval = estimator.expected_uncertainty_after_rotation(
+                pose_xyz=pose_eval,
+                live_time_per_rot_s=t_short_s,
+                tau_ig=tau_ig,
+                tmax_s=t_max_s,
+                n_rollouts=rollouts,
+                orient_selection="IG",
+                rng_seed=int(candidate_seeds[idx]),
+            )
+        else:
+            if not hasattr(estimator, "expected_uncertainty_after_pose_xyz"):
+                raise ValueError(
+                    "Estimator missing expected_uncertainty_after_pose_xyz."
+                )
+            rng_local = np.random.default_rng(int(candidate_seeds[idx]))
+            num_samples = max(1, int(rollouts))
+            uncertainty_eval = estimator.expected_uncertainty_after_pose_xyz(
+                pose_xyz=pose_eval,
+                fe_index=0,
+                pb_index=0,
+                live_time_s=t_short_s,
+                num_samples=num_samples,
+                rng=rng_local,
+            )
+        motion_cost_eval = float(np.linalg.norm(pose_eval - current_pose_xyz))
+        if min_observation_counts > 0.0:
+            counts_by_iso_eval = (
+                estimator.expected_observation_counts_by_isotope_at_pose(
+                    pose_eval,
+                    live_time_s=t_short_s,
+                    aggregate=min_observation_aggregate,
+                    max_particles=observation_max_particles,
+                )
+            )
+            observation_penalty_eval = minimum_observation_shortfall(
+                counts_by_iso_eval,
+                min_counts=float(min_observation_counts),
+            )
+        else:
+            counts_by_iso_eval = {}
+            observation_penalty_eval = 0.0
+        return (
+            int(idx),
+            float(uncertainty_eval),
+            float(motion_cost_eval),
+            counts_by_iso_eval,
+            float(observation_penalty_eval),
+        )
+
     def _spinner_worker(
         stop_event: threading.Event,
         base_label: str,
@@ -433,76 +491,87 @@ def select_next_pose_from_candidates(
         spinner = ["|", "/", "-", "\\"]
         last_line_len = 0
         total_candidates = int(len(candidate_poses_xyz))
-        candidate_seeds = seed_rng.integers(0, 2**32 - 1, size=total_candidates, dtype=np.uint32)
-        for idx, pose in enumerate(candidate_poses_xyz):
-            should_report = (
-                verbose
-                and progress_every > 0
-                and ((idx + 1) % progress_every == 0 or (idx + 1) == total_candidates)
+        candidate_seeds = seed_rng.integers(
+            0,
+            2**32 - 1,
+            size=total_candidates,
+            dtype=np.uint32,
+        )
+        gpu_enabled = bool(use_gpu) if use_gpu is not None else False
+        if pf_config is not None:
+            gpu_enabled = bool(getattr(pf_config, "use_gpu", gpu_enabled))
+        if worker_count is None:
+            configured_workers = getattr(pf_config, "pose_selection_workers", None)
+            if configured_workers is None:
+                configured_workers = getattr(pf_config, "ig_workers", 1)
+        else:
+            configured_workers = worker_count
+        try:
+            candidate_workers = max(1, int(configured_workers))
+        except (TypeError, ValueError):
+            candidate_workers = 1
+        if gpu_enabled or total_candidates <= 1:
+            candidate_workers = 1
+        if verbose and total_candidates > 1:
+            worker_note = (
+                "serial" if candidate_workers == 1 else f"{candidate_workers} workers"
             )
-            stop_event = None
-            spinner_thread = None
-            if should_report:
-                pose_preview = np.array2string(pose, precision=3, separator=", ")
-                base_label = (
-                    f"evaluating candidate {idx + 1}/{total_candidates} pose={pose_preview}"
-                )
-                label_width = len(base_label) + len(" t=0000.0s")
-                last_line_len = max(last_line_len, label_width)
-                stop_event = threading.Event()
-                start_time = time.monotonic()
-                spinner_thread = threading.Thread(
-                    target=_spinner_worker,
-                    args=(stop_event, base_label, start_time, last_line_len),
-                    daemon=True,
-                )
-                spinner_thread.start()
-            if criterion == "after_rotation":
-                uncertainty = estimator.expected_uncertainty_after_rotation(
-                    pose_xyz=pose,
-                    live_time_per_rot_s=t_short_s,
-                    tau_ig=tau_ig,
-                    tmax_s=t_max_s,
-                    n_rollouts=rollouts,
-                    orient_selection="IG",
-                    rng_seed=int(candidate_seeds[idx]),
-                )
-            else:
-                if not hasattr(estimator, "expected_uncertainty_after_pose_xyz"):
-                    raise ValueError("Estimator missing expected_uncertainty_after_pose_xyz.")
-                rng_local = np.random.default_rng(int(candidate_seeds[idx]))
-                num_samples = max(1, int(rollouts))
-                uncertainty = estimator.expected_uncertainty_after_pose_xyz(
-                    pose_xyz=pose,
-                    fe_index=0,
-                    pb_index=0,
-                    live_time_s=t_short_s,
-                    num_samples=num_samples,
-                    rng=rng_local,
-                )
-            if spinner_thread is not None and stop_event is not None:
-                stop_event.set()
-                spinner_thread.join()
-            motion_cost = float(np.linalg.norm(pose - current_pose_xyz))
-            uncertainties.append(float(uncertainty))
-            motion_costs.append(motion_cost)
-            if min_observation_counts > 0.0:
-                counts_by_iso = estimator.expected_observation_counts_by_isotope_at_pose(
-                    pose,
-                    live_time_s=t_short_s,
-                    aggregate=min_observation_aggregate,
-                    max_particles=observation_max_particles,
-                )
-                observation_counts_by_candidate.append(counts_by_iso)
-                observation_penalties.append(
-                    minimum_observation_shortfall(
-                        counts_by_iso,
-                        min_counts=float(min_observation_counts),
+            print(f"Candidate evaluation mode: {worker_note}.")
+        if candidate_workers > 1:
+            indexed_candidates = [
+                (idx, np.asarray(pose, dtype=float).copy())
+                for idx, pose in enumerate(candidate_poses_xyz)
+            ]
+            with ThreadPoolExecutor(max_workers=candidate_workers) as executor:
+                results = list(executor.map(_evaluate_candidate, indexed_candidates))
+            results.sort(key=lambda item: int(item[0]))
+            for _, uncertainty, motion_cost, counts_by_iso, obs_penalty in results:
+                uncertainties.append(float(uncertainty))
+                motion_costs.append(float(motion_cost))
+                observation_counts_by_candidate.append(dict(counts_by_iso))
+                observation_penalties.append(float(obs_penalty))
+        else:
+            for idx, pose in enumerate(candidate_poses_xyz):
+                should_report = (
+                    verbose
+                    and progress_every > 0
+                    and (
+                        (idx + 1) % progress_every == 0
+                        or (idx + 1) == total_candidates
                     )
                 )
-            else:
-                observation_counts_by_candidate.append({})
-                observation_penalties.append(0.0)
+                stop_event = None
+                spinner_thread = None
+                if should_report:
+                    pose_preview = np.array2string(pose, precision=3, separator=", ")
+                    base_label = (
+                        f"evaluating candidate {idx + 1}/{total_candidates} "
+                        f"pose={pose_preview}"
+                    )
+                    label_width = len(base_label) + len(" t=0000.0s")
+                    last_line_len = max(last_line_len, label_width)
+                    stop_event = threading.Event()
+                    start_time = time.monotonic()
+                    spinner_thread = threading.Thread(
+                        target=_spinner_worker,
+                        args=(stop_event, base_label, start_time, last_line_len),
+                        daemon=True,
+                    )
+                    spinner_thread.start()
+                (
+                    _idx,
+                    uncertainty,
+                    motion_cost,
+                    counts_by_iso,
+                    obs_penalty,
+                ) = _evaluate_candidate((idx, pose))
+                if spinner_thread is not None and stop_event is not None:
+                    stop_event.set()
+                    spinner_thread.join()
+                uncertainties.append(float(uncertainty))
+                motion_costs.append(float(motion_cost))
+                observation_counts_by_candidate.append(dict(counts_by_iso))
+                observation_penalties.append(float(obs_penalty))
         if verbose and progress_every > 0 and len(candidate_poses_xyz) > 0:
             sys.stdout.write("\n")
             sys.stdout.flush()

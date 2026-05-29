@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from realtime_demo import run_live_pf
+from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from spectrum.runtime_counts import RuntimeCountExtractor
 
 
@@ -89,6 +91,64 @@ def test_runtime_count_extraction_defaults_to_response_poisson() -> None:
     assert RuntimeCountExtractor.validate_count_method("response_poisson") == (
         "response_poisson"
     )
+
+
+def test_response_diagnostics_inflate_runtime_count_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreliable response-regression diagnostics should soften PF observations."""
+    config = SpectrumConfig(
+        response_poisson_diagnostic_reduced_chi2_threshold=2.0,
+        response_poisson_diagnostic_reduced_chi2_scale=0.5,
+        response_poisson_crosstalk_corr_threshold=0.85,
+    )
+    decomposer = SpectralDecomposer(config)
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return counts with diagnostics resembling crosstalk-prone unfolding."""
+        self.last_count_variances = {"Cs-137": 1.0, "Co-60": 1.0}
+        self.last_response_poisson_diagnostics = {
+            "reduced_chi2": 10.0,
+            "design_condition_number": 1.0,
+            "fisher_condition_number": 1.0,
+            "coefficient_correlation_by_isotope": {
+                "Cs-137": 0.95,
+                "Co-60": 0.1,
+            },
+            "low_snr_photopeak_suppression": {
+                "Co-60": {"reason": "retained_poisson"},
+            },
+        }
+        return {"Cs-137": 100.0, "Co-60": 0.0}, {"Cs-137"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=30.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+    )
+
+    assert result.counts["Cs-137"] == pytest.approx(100.0)
+    assert result.variances["Cs-137"] > 1000.0
+    assert result.variances["Co-60"] > 1.0
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert "runtime_diagnostic_variance_floor" in diagnostics
+    assert "transport_detected_counts_Cs-137" not in diagnostics
 
 
 def test_runtime_rejects_peak_window_count_method(tmp_path: Path) -> None:

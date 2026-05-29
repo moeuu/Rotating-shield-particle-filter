@@ -2791,6 +2791,7 @@ def test_cardinality_preserving_resample_keeps_protected_spatial_modes() -> None
         mode_preserving_particles_per_mode=1,
         mode_preserving_radius_m=0.5,
         mode_preserving_min_weight_fraction=0.0,
+        mode_preserving_cardinality_strata=False,
     )
     particles: list[IsotopeParticle] = []
     for idx in range(18):
@@ -3652,6 +3653,172 @@ def test_resampling_can_protect_distinct_low_weight_source_modes() -> None:
     assert filt.last_mode_preserved_count == 2
 
 
+def test_mode_preserving_resample_stratifies_surface_height_modes() -> None:
+    """Surface-prior mode preservation should not merge distinct surface strata."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=2,
+        mode_preserving_resample=True,
+        mode_preserving_max_modes=2,
+        mode_preserving_particles_per_mode=1,
+        mode_preserving_radius_m=2.0,
+        mode_preserving_min_weight_fraction=0.0,
+        mode_preserving_surface_strata=True,
+        mode_preserving_height_bin_m=2.0,
+        mode_preserving_cardinality_strata=False,
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 1.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 1.0, 1.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        ),
+    ]
+
+    protected = filt._source_mode_preserving_indices(np.array([0.5, 0.5]))
+
+    assert set(protected.tolist()) == {0, 1}
+    assert filt.last_mode_preserving_strata_summary
+    selected = filt.last_mode_preserving_selected_strata
+    assert len(selected) == 2
+    assert {entry["height_bin"] for entry in selected} == {0}
+    assert sum(int(entry["protected_count"]) for entry in selected) == 2
+
+
+def test_mode_preserving_resample_adds_high_surface_particles() -> None:
+    """Ceiling and high-wall modes should receive extra protected particles."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=3,
+        mode_preserving_resample=True,
+        mode_preserving_max_modes=1,
+        mode_preserving_particles_per_mode=1,
+        mode_preserving_high_surface_extra_particles=2,
+        mode_preserving_high_surface_z_fraction=0.75,
+        mode_preserving_radius_m=1.0,
+        mode_preserving_min_weight_fraction=0.0,
+        mode_preserving_surface_strata=True,
+        mode_preserving_cardinality_strata=False,
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 1.0, 4.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.1, 1.0, 4.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.9, 1.0, 4.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        ),
+    ]
+
+    protected = filt._source_mode_preserving_indices(np.full(3, 1.0 / 3.0))
+
+    assert set(protected.tolist()) == {0, 1, 2}
+    assert filt.last_mode_preserving_selected_strata[0]["high_surface"] is True
+    assert int(filt.last_mode_preserving_selected_strata[0]["protected_count"]) == 3
+
+
+def test_mode_preserving_resample_protects_source_count_strata() -> None:
+    """Mode-preserving resampling should retain low-mass source-count hypotheses."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=4,
+        mode_preserving_resample=True,
+        mode_preserving_max_modes=1,
+        mode_preserving_particles_per_mode=1,
+        mode_preserving_radius_m=0.5,
+        mode_preserving_min_weight_fraction=0.0,
+        mode_preserving_cardinality_strata=True,
+        mode_preserving_min_particles_per_cardinality=1,
+    )
+    states = [
+        IsotopeState(
+            num_sources=1,
+            positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+            strengths=np.array([100.0], dtype=float),
+            background=0.0,
+        ),
+        IsotopeState(
+            num_sources=2,
+            positions=np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
+            strengths=np.array([100.0, 100.0], dtype=float),
+            background=0.0,
+        ),
+        IsotopeState(
+            num_sources=3,
+            positions=np.array(
+                [[3.0, 0.0, 0.0], [4.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            strengths=np.array([100.0, 100.0, 100.0], dtype=float),
+            background=0.0,
+        ),
+        IsotopeState(
+            num_sources=0,
+            positions=np.zeros((0, 3), dtype=float),
+            strengths=np.zeros(0, dtype=float),
+            background=0.0,
+        ),
+    ]
+    filt.continuous_particles = [
+        IsotopeParticle(state=state, log_weight=0.0)
+        for state in states
+    ]
+    protected = filt._source_mode_preserving_indices(
+        np.array([0.97, 0.02, 0.009, 0.001], dtype=float)
+    )
+
+    assert {0, 1, 2, 3}.issubset(set(protected.tolist()))
+    assert filt.last_mode_preserving_cardinality_summary["3"] == pytest.approx(0.009)
+    selected_counts = {
+        int(entry["num_sources"])
+        for entry in filt.last_mode_preserving_selected_cardinalities
+    }
+    assert {0, 1, 2, 3}.issubset(selected_counts)
+
+
 def test_structural_weight_refresh_preserves_prior_history(monkeypatch) -> None:
     """Moved-particle refresh should apply a likelihood ratio, not reset weights."""
     filt = _build_filter(
@@ -3903,6 +4070,83 @@ def test_report_mle_rescue_adds_residual_surface_candidate() -> None:
     )
     assert rescued_candidates >= 1
     assert diagnostics["selected_count"] == 2
+
+
+def test_report_surface_local_refine_improves_nearby_surface_candidate() -> None:
+    """Report-local surface refinement should move a candidate to a better surface point."""
+    isotope = "Cs-137"
+    initial = np.array([[1.25, 2.0, 4.0]], dtype=float)
+    truth = np.array([[2.0, 2.0, 4.0]], dtype=float)
+    detector_positions = [
+        np.array([2.0, 2.0, 0.0], dtype=float),
+        np.array([0.0, 2.0, 0.0], dtype=float),
+        np.array([4.0, 2.0, 0.0], dtype=float),
+        np.array([2.0, 0.0, 0.0], dtype=float),
+        np.array([2.0, 4.0, 0.0], dtype=float),
+    ]
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=1,
+        birth_enable=True,
+        report_strength_refit=True,
+        report_strength_refit_iters=64,
+        report_surface_local_refine=True,
+        report_surface_local_refine_radius_m=0.75,
+        report_surface_local_refine_grid_steps=1,
+        report_surface_local_refine_max_candidates_per_source=27,
+        report_cluster_model_selection=True,
+        report_cluster_bic_penalty_params=0,
+        source_position_prior="surface",
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(4.0, 4.0, 4.0),
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=initial,
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    for pose in detector_positions:
+        estimator.add_measurement_pose(pose)
+    estimator._ensure_kernel_cache()
+    design = expected_counts_per_source(
+        kernel=estimator.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=np.vstack(detector_positions),
+        sources=truth,
+        strengths=np.ones(1, dtype=float),
+        live_times=np.ones(len(detector_positions), dtype=float),
+        fe_indices=np.zeros(len(detector_positions), dtype=int),
+        pb_indices=np.zeros(len(detector_positions), dtype=int),
+    )
+    counts = design[:, 0] * 120.0
+    estimator.measurements = [
+        MeasurementRecord(
+            z_k={isotope: float(count)},
+            pose_idx=idx,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+        for idx, count in enumerate(counts)
+    ]
+
+    positions, strengths = estimator._refit_reported_strengths(
+        isotope,
+        initial,
+        np.array([100.0], dtype=float),
+    )
+
+    assert positions.shape == (1, 3)
+    assert np.linalg.norm(positions[0] - truth[0]) < np.linalg.norm(initial[0] - truth[0])
+    assert strengths[0] > 0.0
+    diagnostics = estimator.report_model_order_diagnostics()[isotope]
+    assert diagnostics["surface_local_refine_accept_count"] >= 1
 
 
 def test_grid_initialization_repeats_strength_samples_per_cell() -> None:
@@ -4165,6 +4409,71 @@ def test_weak_source_prune_respects_min_age() -> None:
 
     assert state.num_sources == 1
     assert np.allclose(state.positions[0], [0.0, 0.0, 0.0])
+
+
+def test_weak_source_prune_preserves_occluded_floor_sources() -> None:
+    """Weak-source pruning should require observable views before deletion."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        weak_source_prune_min_expected_count=3.0,
+        weak_source_prune_min_fraction=0.0,
+        weak_source_prune_min_age=1,
+        weak_source_prune_require_observable=True,
+        weak_source_prune_min_observable_measurements=1,
+    )
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([5.0, 5.0], dtype=float),
+        background=0.0,
+        ages=np.array([5, 5], dtype=int),
+        low_q_streaks=np.zeros(2, dtype=int),
+        support_scores=np.zeros(2, dtype=float),
+    )
+
+    filt._prune_floor_sources_by_expected_counts(
+        state,
+        np.array([0.0, 0.0], dtype=float),
+        observable_view_counts=np.array([0, 2], dtype=np.int64),
+    )
+
+    assert state.num_sources == 1
+    assert np.allclose(state.positions[0], [0.0, 0.0, 0.0])
+    assert filt.last_weak_source_prune_occlusion_protected == 1
+
+
+def test_batched_weak_prune_observability_matches_serial_counts() -> None:
+    """Batched weak-prune visibility counts should match per-particle counts."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        weak_source_prune_min_expected_count=3.0,
+        weak_source_prune_min_fraction=0.0,
+        source_strength_prior_mean=10.0,
+    )
+    unit_counts = np.array(
+        [
+            [[0.1, 0.4], [1.0, 0.0]],
+            [[0.2, 0.0], [0.1, 0.5]],
+            [[0.0, 0.5], [0.1, 0.5]],
+        ],
+        dtype=float,
+    )
+
+    batched = filt._weak_source_observable_counts_from_unit_response(unit_counts)
+    serial = np.vstack(
+        [
+            filt._weak_source_observable_counts_from_unit_response(unit_counts[:, i, :])
+            for i in range(unit_counts.shape[1])
+        ]
+    )
+
+    assert np.array_equal(batched, serial)
 
 
 def test_batched_refit_respects_suppressed_weak_source_prune() -> None:
@@ -4616,7 +4925,121 @@ def test_birth_gate_counts_distinct_shield_views() -> None:
     assert filt.last_birth_count > 0
 
 
-def test_runtime_global_rescue_birth_uses_surface_candidates() -> None:
+def test_global_rescue_can_use_single_station_tentative_birth() -> None:
+    """Global rescue can relax station support without weakening ordinary birth."""
+    detector_positions = np.array(
+        [[0.5, 1.0, 0.0], [0.5, 1.0, 0.0], [0.5, 1.0, 0.0]],
+        dtype=float,
+    )
+    fe_indices = np.array([0, 1, 2], dtype=int)
+    pb_indices = np.array([0, 1, 2], dtype=int)
+
+    ordinary = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        birth_enable=True,
+        p_kill=0.0,
+        birth_min_sep_m=0.0,
+        birth_detector_min_sep_m=0.0,
+        birth_num_local_jitter=0,
+        birth_residual_min_support=2,
+        birth_min_distinct_poses=2,
+        birth_min_distinct_stations=2,
+    )
+    counts = expected_counts_per_source(
+        kernel=ordinary.continuous_kernel,
+        isotope=ordinary.isotope,
+        detector_positions=detector_positions,
+        sources=ordinary.kernel.sources[:1],
+        strengths=np.array([120.0], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+    ).reshape(-1)
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+    )
+    ordinary.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3)),
+                strengths=np.zeros(0),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+
+    ordinary.apply_birth_death(
+        support_data=None,
+        birth_data=data,
+        candidate_positions=ordinary.kernel.sources,
+    )
+
+    assert ordinary.last_birth_residual_distinct_stations == 1
+    assert ordinary.last_birth_count == 0
+    assert ordinary.continuous_particles[0].state.num_sources == 0
+
+    rescue = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        birth_enable=True,
+        p_kill=0.0,
+        birth_min_sep_m=0.0,
+        birth_detector_min_sep_m=0.0,
+        birth_num_local_jitter=0,
+        birth_residual_min_support=2,
+        birth_min_distinct_poses=2,
+        birth_min_distinct_stations=2,
+        birth_global_rescue_enable=True,
+        birth_global_rescue_min_support=2,
+        birth_global_rescue_min_distinct_poses=2,
+        birth_global_rescue_min_distinct_stations=1,
+        birth_global_rescue_forced_min_delta_ll=-1.0e9,
+        birth_matching_pursuit_max_new_sources=1,
+        birth_matching_pursuit_topk_candidates=1,
+        birth_candidate_support_fraction=0.0,
+        weak_source_prune_min_expected_count=0.0,
+        weak_source_prune_min_fraction=0.0,
+        pseudo_source_verification_enable=False,
+    )
+    rescue.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3)),
+                strengths=np.zeros(0),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+
+    rescue.apply_birth_death(
+        support_data=None,
+        birth_data=data,
+        candidate_positions=np.zeros((0, 3), dtype=float),
+        global_birth_candidates=rescue.kernel.sources[:1],
+    )
+
+    assert rescue.last_birth_residual_distinct_stations == 1
+    assert rescue.last_birth_global_rescue_attempts > 0
+    assert rescue.last_birth_global_rescue_accepts > 0
+    assert rescue.last_birth_count > 0
+    assert rescue.continuous_particles[0].state.num_sources == 1
+
+
+def test_runtime_global_rescue_birth_uses_surface_candidates(monkeypatch) -> None:
     """Runtime global rescue should recover candidates outside the posterior."""
     np.random.seed(11)
     filt = _build_filter(
@@ -4683,6 +5106,24 @@ def test_runtime_global_rescue_birth_uses_surface_candidates() -> None:
             log_weight=0.0,
         )
     ]
+    seen_candidate_counts: list[NDArray[np.float64] | None] = []
+    original_matching_pursuit = filt._apply_matching_pursuit_births_to_state
+
+    def _spy_matching_pursuit(*args: object, **kwargs: object) -> int:
+        """Record whether global rescue receives precomputed candidate counts."""
+        if bool(kwargs.get("global_rescue", False)):
+            candidate_counts = kwargs.get("candidate_unit_counts")
+            if candidate_counts is None:
+                seen_candidate_counts.append(None)
+            else:
+                seen_candidate_counts.append(np.asarray(candidate_counts, dtype=float))
+        return original_matching_pursuit(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt,
+        "_apply_matching_pursuit_births_to_state",
+        _spy_matching_pursuit,
+    )
 
     filt.apply_birth_death(
         support_data=None,
@@ -4692,10 +5133,484 @@ def test_runtime_global_rescue_birth_uses_surface_candidates() -> None:
     )
 
     assert filt.last_birth_global_rescue_candidates == 2
+    assert seen_candidate_counts
+    assert all(item is not None for item in seen_candidate_counts)
+    assert seen_candidate_counts[0].shape == (data.z_k.size, truth_sources.shape[0])
     assert filt.last_birth_global_rescue_attempts > 0
     assert filt.last_birth_global_rescue_accepts > 0
     assert filt.last_birth_count > 0
     assert filt.continuous_particles[0].state.num_sources >= 2
+
+
+def test_structural_update_passes_precomputed_global_rescue_counts() -> None:
+    """Estimator structural updates should pass cached global candidate counts."""
+    config = RotatingShieldPFConfig(conditional_strength_refit=False)
+    estimator = object.__new__(RotatingShieldPFEstimator)
+    estimator.pf_config = config
+    estimator.candidate_sources = np.zeros((0, 3), dtype=float)
+    candidates = np.array(
+        [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]],
+        dtype=float,
+    )
+    candidate_counts = np.array([[0.2, 0.5]], dtype=float)
+    calls: dict[str, object] = {}
+
+    def fake_runtime_candidates(
+        isotope: str,
+        filt: object,
+        data: MeasurementData | None,
+    ) -> NDArray[np.float64]:
+        """Return deterministic global birth candidates."""
+        calls["candidate_request"] = (isotope, filt, data)
+        return candidates
+
+    def fake_candidate_counts(
+        isotope: str,
+        filt: object,
+        data: MeasurementData | None,
+        candidate_positions: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return deterministic precomputed candidate counts."""
+        calls["count_request"] = (isotope, filt, data)
+        np.testing.assert_allclose(candidate_positions, candidates)
+        return candidate_positions, candidate_counts
+
+    def fake_runtime_injection(isotope: str, filt: object) -> int:
+        """Record that runtime report rescue remains chained after birth/death."""
+        calls["injection"] = (isotope, filt)
+        return 0
+
+    class FakeFilter:
+        """Minimal filter object that records structural update inputs."""
+
+        def apply_birth_death(self, **kwargs: object) -> None:
+            """Record the birth/death keyword arguments."""
+            calls["birth_kwargs"] = kwargs
+
+    data = MeasurementData(
+        z_k=np.array([1.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        fe_indices=np.zeros(1, dtype=int),
+        pb_indices=np.zeros(1, dtype=int),
+        live_times=np.ones(1, dtype=float),
+    )
+    filt = FakeFilter()
+    estimator._runtime_global_birth_rescue_candidates = fake_runtime_candidates
+    estimator._global_birth_candidate_counts_for_update = fake_candidate_counts
+    estimator._inject_runtime_report_rescue = fake_runtime_injection
+
+    estimator._run_isotope_structural_update(("Cs-137", filt, None, data, data))
+
+    birth_kwargs = calls["birth_kwargs"]
+    np.testing.assert_allclose(birth_kwargs["global_birth_candidates"], candidates)
+    assert birth_kwargs["global_birth_candidate_counts"] is candidate_counts
+    assert calls["injection"] == ("Cs-137", filt)
+
+
+def test_runtime_report_rescue_injects_multisource_particles() -> None:
+    """Report-rescue models should re-enter the runtime particle population."""
+    np.random.seed(12)
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=4,
+        num_particles=8,
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[float(idx % 4), 0.0, 0.0]], dtype=float),
+                strengths=np.array([50.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(1.0 / 8.0)),
+        )
+        for idx in range(8)
+    ]
+    rescue_positions = np.array(
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 4.0]],
+        dtype=float,
+    )
+    rescue_strengths = np.array([100.0, 80.0, 60.0], dtype=float)
+
+    injected = filt.inject_runtime_report_rescue_particles(
+        rescue_positions,
+        rescue_strengths,
+        particle_fraction=0.25,
+        min_particles_per_source=2,
+        total_weight=0.2,
+        jitter_sigma_m=0.0,
+    )
+    weights = filt.continuous_weights
+    rescued = np.array(
+        [particle.state.num_sources == 3 for particle in filt.continuous_particles],
+        dtype=bool,
+    )
+
+    assert injected == 6
+    assert int(np.count_nonzero(rescued)) == 6
+    assert float(np.sum(weights[rescued])) == pytest.approx(0.2)
+    assert filt.last_runtime_report_rescue_sources == 3
+    assert filt.last_runtime_report_rescue_injected == 6
+
+
+def test_runtime_report_rescue_memory_keeps_missing_modes() -> None:
+    """Runtime rescue memory should retain modes that vanish in one station."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        runtime_report_rescue_enable=True,
+        runtime_report_rescue_memory_enable=True,
+        runtime_report_rescue_memory_decay=0.5,
+        runtime_report_rescue_memory_max_sources=2,
+        report_mle_rescue_dedup_radius_m=0.25,
+        min_strength=1.0,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    first_pos = np.array([[1.0, 0.0, 0.0]], dtype=float)
+    first_q = np.array([30.0], dtype=float)
+
+    merged_pos, merged_q = estimator._merge_runtime_report_rescue_memory(
+        isotope,
+        first_pos,
+        first_q,
+    )
+    replay_pos, replay_q = estimator._merge_runtime_report_rescue_memory(
+        isotope,
+        np.zeros((0, 3), dtype=float),
+        np.zeros(0, dtype=float),
+    )
+
+    assert np.allclose(merged_pos, first_pos)
+    assert np.allclose(merged_q, first_q)
+    assert np.allclose(replay_pos, first_pos)
+    assert np.allclose(replay_q, first_q)
+
+
+def test_report_strength_absorption_guard_is_one_sided() -> None:
+    """Report strength absorption guard should only shrink high outliers."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        source_strength_prior_mean=100.0,
+        report_strength_absorption_penalty_weight=3.0,
+        report_strength_absorption_q_multiple=2.0,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+
+    guarded = estimator._apply_report_strength_absorption_guard(
+        np.array([50.0, 500.0], dtype=float)
+    )
+
+    assert guarded[0] == pytest.approx(50.0)
+    assert guarded[1] == pytest.approx((500.0 + 3.0 * 200.0) / 4.0)
+
+
+def test_visibility_adjusted_rescue_scores_require_visible_support() -> None:
+    """Rescue scoring should reject candidates with no visible measurements."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        source_strength_prior_mean=100.0,
+        report_mle_rescue_visibility_weight=0.5,
+        report_mle_rescue_min_visible_measurements=1,
+        report_mle_rescue_visible_count=10.0,
+        report_mle_rescue_visibility_reference_strength=100.0,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    candidate_counts = np.array(
+        [
+            [0.2, 0.0],
+            [0.1, 0.0],
+        ],
+        dtype=float,
+    )
+    base_scores = np.array([1.0, 10.0], dtype=float)
+
+    adjusted, valid, stats = estimator._visibility_adjusted_rescue_scores(
+        candidate_counts=candidate_counts,
+        residual=np.array([5.0, 3.0], dtype=float),
+        weights=np.ones(2, dtype=float),
+        base_scores=base_scores,
+        eps=1.0e-12,
+    )
+
+    assert valid.tolist() == [True, False]
+    assert adjusted[0] > 0.0
+    assert stats["rescue_visibility_valid_candidates"] == 1
+
+
+def test_surface_rescue_spatial_quota_keeps_separate_ceiling_tiles() -> None:
+    """MLE rescue should reserve candidates across ceiling spatial tiles."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        position_max=(4.0, 4.0, 4.0),
+        report_mle_rescue_surface_quota_enable=True,
+        report_mle_rescue_surface_quota_per_stratum=1,
+        report_mle_rescue_spatial_quota_enable=True,
+        report_mle_rescue_spatial_quota_tile_m=2.0,
+        report_mle_rescue_spatial_quota_per_tile=1,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.zeros((0, 3), dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    pool = np.array(
+        [
+            [0.2, 0.2, 4.0],
+            [0.6, 0.4, 4.0],
+            [3.2, 0.2, 4.0],
+        ],
+        dtype=float,
+    )
+    scores = np.array([100.0, 90.0, 10.0], dtype=float)
+    valid = np.ones(3, dtype=bool)
+    strata = estimator._surface_rescue_strata(pool)
+    spatial_keys = estimator._surface_spatial_rescue_keys(pool, strata)
+
+    selected = estimator._surface_stratified_rescue_indices(
+        pool,
+        scores,
+        valid,
+        max_candidates=2,
+    )
+    selected_cached = estimator._surface_stratified_rescue_indices(
+        pool,
+        scores,
+        valid,
+        max_candidates=2,
+        strata=strata,
+        spatial_keys=spatial_keys,
+    )
+    next_direct = estimator._next_surface_stratified_rescue_index(
+        pool,
+        scores,
+        valid,
+        [0],
+    )
+    next_cached = estimator._next_surface_stratified_rescue_index(
+        pool,
+        scores,
+        valid,
+        [0],
+        strata=strata,
+        spatial_keys=spatial_keys,
+    )
+
+    assert selected.tolist() == [0, 2]
+    assert selected_cached.tolist() == selected.tolist()
+    assert next_cached == next_direct == 2
+
+
+def test_runtime_high_strength_split_candidates_are_surface_projected() -> None:
+    """Over-strong runtime modes should create nearby split rescue candidates."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+        source_strength_prior_mean=100.0,
+        high_strength_split_enable=True,
+        high_strength_split_q_multiple=2.0,
+        high_strength_split_offset_m=1.0,
+        high_strength_split_candidate_count=4,
+        birth_global_rescue_max_candidates=8,
+        birth_global_rescue_dedup_radius_m=0.1,
+        birth_min_sep_m=0.5,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.zeros((0, 3), dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+
+    candidates = estimator._runtime_high_strength_split_candidates(
+        filt,
+        np.array([[2.0, 2.0, 4.0]], dtype=float),
+        np.array([250.0], dtype=float),
+    )
+    low_candidates = estimator._runtime_high_strength_split_candidates(
+        filt,
+        np.array([[2.0, 2.0, 4.0]], dtype=float),
+        np.array([150.0], dtype=float),
+    )
+
+    assert candidates.shape[0] > 0
+    assert np.allclose(candidates[:, 2], 4.0)
+    distances = np.linalg.norm(candidates - np.array([[2.0, 2.0, 4.0]]), axis=1)
+    assert np.min(distances) >= 0.25
+    assert low_candidates.shape[0] == 0
+
+
+def test_runtime_report_rescue_falls_back_for_absent_count_supported_isotope(
+    monkeypatch,
+) -> None:
+    """Count-supported zero-source isotopes should get quarantined surface modes."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]],
+        dtype=float,
+    )
+    detector_positions = np.array(
+        [[1.0, 1.0, 0.0], [5.0, 1.0, 0.0], [1.0, 5.0, 0.0]],
+        dtype=float,
+    )
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=2,
+        birth_enable=True,
+        report_strength_refit=True,
+        report_mle_rescue_enable=True,
+        report_mle_rescue_max_candidates=2,
+        report_mle_rescue_max_residual_candidates=2,
+        report_mle_rescue_min_residual_fraction=0.0,
+        runtime_report_rescue_enable=True,
+        runtime_report_rescue_quarantine_enable=True,
+        structural_update_min_counts=1.0,
+        structural_update_min_snr=0.0,
+        conditional_strength_refit_min_count=1.0,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    for pose in detector_positions:
+        estimator.add_measurement_pose(pose)
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    design = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=candidate_sources[1:2],
+        strengths=np.ones(1, dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+    )
+    counts = np.asarray(design[:, 0] * 200.0, dtype=float)
+    estimator.measurements = [
+        MeasurementRecord(
+            z_k={isotope: float(count)},
+            pose_idx=int(idx),
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+        for idx, count in enumerate(counts)
+    ]
+
+    monkeypatch.setattr(
+        estimator,
+        "_refit_reported_strengths",
+        lambda *_args, **_kwargs: (
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+        ),
+    )
+
+    rescued_pos, rescued_q = estimator._runtime_report_rescue_estimate(isotope, filt)
+
+    assert rescued_pos.shape[0] > 0
+    assert rescued_q.shape == (rescued_pos.shape[0],)
+    assert np.all(rescued_q > 0.0)
+
+
+def test_surface_candidate_observability_diagnostics_are_truth_independent() -> None:
+    """Estimator should report response observability over known surface candidates."""
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 4.0], [4.0, 4.0, 0.0]],
+            dtype=float,
+        ),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.5},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=2,
+            position_max=(4.0, 4.0, 4.0),
+            source_position_prior="surface",
+        ),
+        shield_params=ShieldParams(),
+    )
+    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={"Cs-137": 10.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={"Cs-137": 10.0},
+        )
+    )
+
+    diagnostics = estimator.surface_candidate_observability_diagnostics(
+        max_candidates=3,
+    )
+    stats = diagnostics["Cs-137"]
+
+    assert stats["candidate_count"] == 3
+    assert stats["sampled_candidate_count"] == 3
+    assert stats["measurement_count"] == 1
+    assert stats["surface_counts"]["floor"] >= 1
+    assert "max_abs_correlation" in stats
 
 
 def test_absolute_strength_prior_limits_single_source_absorption() -> None:
@@ -6672,6 +7587,137 @@ def test_report_model_order_parallel_matches_serial_selection() -> None:
     assert serial_diagnostics["selected_count"] == parallel_diagnostics["selected_count"]
     assert np.allclose(serial_positions, parallel_positions, atol=1.0e-9)
     assert np.allclose(serial_strengths, parallel_strengths, rtol=1.0e-9, atol=1.0e-9)
+
+
+def test_report_condition_numbers_batch_matches_scalar() -> None:
+    """Batched report-design condition numbers should match the scalar oracle."""
+    rng = np.random.default_rng(1234)
+    designs = rng.uniform(0.0, 1.0, size=(6, 7, 3))
+    designs[1, :, 2] = 0.0
+    designs[2, :, :] = 0.0
+    designs[3, :, 0] = 0.0
+    eps = 1.0e-9
+
+    scalar = np.asarray(
+        [
+            RotatingShieldPFEstimator._report_design_condition_number(
+                design,
+                eps=eps,
+            )
+            for design in designs
+        ],
+        dtype=float,
+    )
+    batched = RotatingShieldPFEstimator._report_design_condition_numbers_batch(
+        designs,
+        eps=eps,
+    )
+
+    assert np.allclose(batched, scalar, rtol=1.0e-10, atol=1.0e-10)
+    single_source = rng.uniform(0.0, 1.0, size=(4, 7, 1))
+    assert np.allclose(
+        RotatingShieldPFEstimator._report_design_condition_numbers_batch(
+            single_source,
+            eps=eps,
+        ),
+        np.ones(4, dtype=float),
+    )
+
+
+def test_residual_surface_candidate_grid_cache_matches_filtered_oracle() -> None:
+    """Full-grid cached residual rescue scoring should match filtered scoring."""
+    isotope = "Cs-137"
+    sources = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    detector_positions = np.array(
+        [
+            [0.5, 1.0, 0.0],
+            [2.5, 1.0, 0.0],
+            [4.5, 1.0, 0.0],
+        ],
+        dtype=float,
+    )
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=3,
+        report_mle_rescue_surface_quota_enable=False,
+        report_mle_rescue_visibility_weight=0.0,
+        report_mle_rescue_min_visible_measurements=1,
+        report_mle_rescue_visible_count=0.0,
+        report_mle_rescue_dedup_radius_m=0.75,
+        candidate_response_cache_max_entries=8,
+        min_strength=0.01,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=sources,
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    for pose in detector_positions:
+        estimator.add_measurement_pose(pose)
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    data = MeasurementData(
+        z_k=np.array([100.0, 180.0, 120.0], dtype=float),
+        observation_variances=np.array([100.0, 180.0, 120.0], dtype=float),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+    )
+    residual = np.array([30.0, 120.0, 60.0], dtype=float)
+    background = np.zeros(data.z_k.size, dtype=float)
+    existing_positions = np.array([[0.0, 0.0, 0.0]], dtype=float)
+
+    positions, strengths, _stats = estimator._rank_residual_surface_candidates(
+        isotope,
+        filt,
+        data,
+        residual=residual,
+        existing_positions=existing_positions,
+        background=background,
+        eps=1.0e-9,
+        max_candidates=2,
+        min_residual_fraction=0.0,
+        dedup_radius_m=0.75,
+    )
+
+    keep = np.linalg.norm(
+        sources - existing_positions[0][None, :],
+        axis=1,
+    ) > 0.75
+    oracle_pool = sources[keep]
+    oracle_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=isotope,
+        detector_positions=data.detector_positions,
+        sources=oracle_pool,
+        strengths=np.ones(oracle_pool.shape[0], dtype=float),
+        live_times=data.live_times,
+        fe_indices=data.fe_indices,
+        pb_indices=data.pb_indices,
+    )
+    weights = 1.0 / data.observation_variances
+    numerator = (weights * residual) @ oracle_counts
+    denominator = weights @ (oracle_counts * oracle_counts)
+    oracle_strengths = numerator / np.maximum(denominator, 1.0e-9)
+    scores = numerator * np.maximum(oracle_strengths, 0.0)
+    order = np.argsort(scores)[::-1][:2]
+
+    assert np.allclose(positions, oracle_pool[order])
+    assert np.allclose(strengths, oracle_strengths[order])
+    assert estimator._candidate_response_cache
 
 
 def test_report_strength_refit_returns_empty_without_signal_support() -> None:

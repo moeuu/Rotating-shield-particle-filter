@@ -77,8 +77,13 @@ class SpectrumConfig:
     photopeak_outlier_mad_sigma: float = 4.0
     photopeak_mixed_roi_requires_independent_support: bool = True
     photopeak_mixed_roi_support_snr: float = 2.0
+    photopeak_mixed_roi_consistency_enable: bool = True
+    photopeak_mixed_roi_consistency_ratio: float = 1.35
+    photopeak_mixed_roi_consistency_extreme_ratio: float = 2.0
+    photopeak_mixed_roi_consistency_sigma: float = 0.75
+    photopeak_mixed_roi_consistency_reference_percentile: float = 50.0
     response_poisson_photopeak_fusion: bool = True
-    response_poisson_photopeak_min_snr: float = 2.0
+    response_poisson_photopeak_min_snr: float = 8.0
     response_poisson_photopeak_anchor: bool = True
     response_poisson_photopeak_anchor_min_snr: float = 0.25
     response_poisson_photopeak_anchor_weight: float = 1.0
@@ -86,7 +91,22 @@ class SpectrumConfig:
     response_poisson_low_snr_photopeak_anchor: bool = True
     response_poisson_low_snr_photopeak_anchor_weight: float = 1.0
     response_poisson_low_snr_photopeak_anchor_variance_scale: float = 1.0
+    response_poisson_low_snr_suppress_enable: bool = True
+    response_poisson_low_snr_suppress_photo_snr: float = 8.0
+    response_poisson_low_snr_suppress_poisson_snr: float = 3.0
+    response_poisson_low_snr_suppress_fraction: float = 0.05
+    response_poisson_low_snr_suppress_photo_to_poisson_ratio: float = 0.5
+    response_poisson_low_snr_suppress_predicted_photo_snr: float = 0.0
     response_poisson_model_mismatch_variance_scale: float = 1.0
+    response_poisson_crosstalk_variance_enable: bool = True
+    response_poisson_crosstalk_corr_threshold: float = 0.85
+    response_poisson_crosstalk_variance_scale: float = 1.0
+    response_poisson_crosstalk_min_rel_sigma: float = 0.25
+    response_poisson_diagnostic_variance_enable: bool = True
+    response_poisson_diagnostic_reduced_chi2_threshold: float = 2.0
+    response_poisson_diagnostic_reduced_chi2_scale: float = 0.5
+    response_poisson_diagnostic_condition_threshold: float = 1.0e4
+    response_poisson_diagnostic_condition_scale: float = 0.25
     response_continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK
     response_backscatter_fraction: float = BACKSCATTER_FRACTION
     response_efficiency_model: str = "cebr3"
@@ -750,19 +770,6 @@ class SpectralDecomposer:
                 float(self.config.response_poisson_photopeak_anchor_variance_scale),
                 1e-12,
             )
-            low_snr_anchor_enabled = bool(
-                self.config.response_poisson_low_snr_photopeak_anchor
-            )
-            low_snr_anchor_weight = max(
-                float(self.config.response_poisson_low_snr_photopeak_anchor_weight),
-                1e-12,
-            )
-            low_snr_variance_scale = max(
-                float(
-                    self.config.response_poisson_low_snr_photopeak_anchor_variance_scale
-                ),
-                1e-12,
-            )
             full_snr = max(
                 float(self.config.response_poisson_photopeak_min_snr),
                 anchor_min_snr + 1e-6,
@@ -771,13 +778,10 @@ class SpectralDecomposer:
                 anchor_count = max(float(photopeak_counts.get(name, 0.0)), 0.0)
                 anchor_var = max(float(photopeak_variances.get(name, 1.0)), 1.0)
                 anchor_snr = anchor_count / max(float(np.sqrt(anchor_var)), 1e-12)
-                if anchor_count <= 0.0 or anchor_snr < anchor_min_snr:
-                    if low_snr_anchor_enabled:
-                        effective_var = anchor_var * low_snr_variance_scale
-                        effective_var /= max(low_snr_anchor_weight, 1e-6)
-                        anchor_terms.append(
-                            (local_idx, anchor_count, max(effective_var, 1.0))
-                        )
+                if anchor_count <= 0.0 or anchor_snr < full_snr:
+                    # Low-SNR photopeak evidence is retained after the
+                    # full-spectrum fit, but it must not pull a genuine
+                    # full-response solution toward a weak local peak estimate.
                     continue
                 reliability = min((anchor_snr / full_snr) ** 2, 1.0)
                 effective_var = anchor_var * variance_scale
@@ -823,6 +827,33 @@ class SpectralDecomposer:
             fisher[local_idx, local_idx] += 1.0 / variance
         covariance = np.linalg.pinv(fisher, rcond=1e-12)
         variances: Dict[str, float] = {isotope: 1.0 for isotope in requested}
+        coefficient_correlation_by_isotope = {name: 0.0 for name in fit_names}
+        coefficient_correlation_max_abs = 0.0
+        if len(fit_names) > 1:
+            isotope_covariance = np.asarray(
+                covariance[: len(fit_names), : len(fit_names)],
+                dtype=float,
+            )
+            diag = np.maximum(np.diag(isotope_covariance), 0.0)
+            denom = np.sqrt(np.maximum(np.outer(diag, diag), 1.0e-24))
+            corr = np.divide(
+                isotope_covariance,
+                denom,
+                out=np.zeros_like(isotope_covariance, dtype=float),
+                where=denom > 0.0,
+            )
+            abs_corr = np.abs(np.clip(corr, -1.0, 1.0))
+            np.fill_diagonal(abs_corr, 0.0)
+            coefficient_correlation_max_abs = float(np.max(abs_corr))
+            coefficient_correlation_by_isotope = {
+                name: float(np.max(abs_corr[idx]))
+                for idx, name in enumerate(fit_names)
+            }
+        max_fit_coefficient = max(
+            (max(float(coeffs[idx]), 0.0) for idx in range(len(fit_names))),
+            default=0.0,
+        )
+        crosstalk_variance_debug: dict[str, dict[str, float]] = {}
         photopeak_integrals = {
             name: max(float(np.sum(photopeak_response_matrix[:, index])), 0.0)
             for name, index in zip(fit_names, indices)
@@ -833,6 +864,41 @@ class SpectralDecomposer:
             if not np.isfinite(variance) or variance <= 0.0:
                 sensitivity = max(float(np.sum(design[:, idx])), 1e-12)
                 variance = max(value * sensitivity, 1.0) / (sensitivity**2)
+            if bool(self.config.response_poisson_crosstalk_variance_enable):
+                corr_value = float(
+                    coefficient_correlation_by_isotope.get(name, 0.0)
+                )
+                corr_threshold = min(
+                    max(
+                        float(self.config.response_poisson_crosstalk_corr_threshold),
+                        0.0,
+                    ),
+                    0.999,
+                )
+                if corr_value > corr_threshold:
+                    excess = (corr_value - corr_threshold) / max(
+                        1.0 - corr_threshold,
+                        1.0e-6,
+                    )
+                    rel_sigma = max(
+                        float(self.config.response_poisson_crosstalk_min_rel_sigma),
+                        float(self.config.response_poisson_crosstalk_variance_scale)
+                        * excess,
+                    )
+                    reference_count = max(
+                        value,
+                        0.05 * max_fit_coefficient * excess,
+                        1.0,
+                    )
+                    variance_floor = (rel_sigma * reference_count) ** 2
+                    if variance_floor > variance:
+                        crosstalk_variance_debug[name] = {
+                            "coefficient_corr": float(corr_value),
+                            "variance_floor": float(variance_floor),
+                            "rel_sigma": float(rel_sigma),
+                            "reference_count": float(reference_count),
+                        }
+                    variance = max(float(variance), float(variance_floor))
             variances[name] = max(float(variance), value, 1.0)
             estimates[name] = IsotopeCountEstimate(
                 isotope=name,
@@ -850,6 +916,15 @@ class SpectralDecomposer:
             and photopeak_variances is not None
         ):
             min_snr = max(float(self.config.response_poisson_photopeak_min_snr), 0.0)
+            max_poisson_count = max(
+                (
+                    max(float(estimates[name].counts), 0.0)
+                    for name in requested
+                    if name in estimates
+                ),
+                default=0.0,
+            )
+            low_snr_suppression_debug: dict[str, dict[str, float | bool | str]] = {}
             for name in requested:
                 poisson_estimate = estimates.get(name)
                 if poisson_estimate is None:
@@ -859,12 +934,118 @@ class SpectralDecomposer:
                 photo_snr = photo_count / max(float(np.sqrt(photo_var)), 1e-12)
                 poisson_count = max(float(poisson_estimate.counts), 0.0)
                 poisson_var = max(float(poisson_estimate.variance), 1.0)
+                poisson_snr = poisson_count / max(float(np.sqrt(poisson_var)), 1e-12)
+                poisson_fraction = poisson_count / max(max_poisson_count, 1e-12)
+                predicted_photo_snr = poisson_count / max(float(np.sqrt(photo_var)), 1e-12)
                 if (
                     bool(self.config.response_poisson_low_snr_photopeak_anchor)
                     and photo_snr < min_snr
                 ):
                     disagreement_var = max((poisson_count - photo_count) ** 2, 0.0)
                     threshold_var = (max(min_snr, 1.0) ** 2) * photo_var
+                    if poisson_count > 0.0:
+                        suppress_enabled = bool(
+                            self.config.response_poisson_low_snr_suppress_enable
+                        )
+                        suppress_poisson_snr = max(
+                            float(
+                                self.config.response_poisson_low_snr_suppress_poisson_snr
+                            ),
+                            0.0,
+                        )
+                        suppress_photo_snr = max(
+                            float(
+                                self.config.response_poisson_low_snr_suppress_photo_snr
+                            ),
+                            0.0,
+                        )
+                        suppress_fraction = max(
+                            float(
+                                self.config.response_poisson_low_snr_suppress_fraction
+                            ),
+                            0.0,
+                        )
+                        suppress_photo_to_poisson_ratio = max(
+                            float(
+                                self.config
+                                .response_poisson_low_snr_suppress_photo_to_poisson_ratio
+                            ),
+                            0.0,
+                        )
+                        suppress_predicted_photo_snr = max(
+                            float(
+                                self.config.response_poisson_low_snr_suppress_predicted_photo_snr
+                            ),
+                            0.0,
+                        )
+                        photo_to_poisson_ratio = photo_count / max(poisson_count, 1e-12)
+                        uncertain_poisson_fit = poisson_snr < suppress_poisson_snr
+                        missing_expected_photopeaks = (
+                            photo_snr <= suppress_photo_snr
+                            and poisson_fraction <= suppress_fraction
+                            and photo_to_poisson_ratio <= suppress_photo_to_poisson_ratio
+                            and predicted_photo_snr >= suppress_predicted_photo_snr
+                        )
+                        if suppress_enabled and (
+                            uncertain_poisson_fit or missing_expected_photopeaks
+                        ):
+                            fused_var = max(
+                                photo_var,
+                                threshold_var,
+                                poisson_var,
+                                disagreement_var,
+                                photo_count + 1.0,
+                            )
+                            reason = (
+                                "uncertain_poisson_fit"
+                                if uncertain_poisson_fit
+                                else "missing_expected_photopeaks"
+                            )
+                            estimates[name] = IsotopeCountEstimate(
+                                isotope=name,
+                                counts=photo_count,
+                                variance=max(float(fused_var), 1.0),
+                                method="response_poisson_low_snr_photopeak_suppressed",
+                            )
+                            variances[name] = max(float(fused_var), 1.0)
+                            low_snr_suppression_debug[name] = {
+                                "suppressed": True,
+                                "reason": reason,
+                                "photo_count": float(photo_count),
+                                "photo_snr": float(photo_snr),
+                                "poisson_count": float(poisson_count),
+                                "poisson_snr": float(poisson_snr),
+                                "poisson_fraction": float(poisson_fraction),
+                                "photo_to_poisson_ratio": float(photo_to_poisson_ratio),
+                                "predicted_photo_snr": float(predicted_photo_snr),
+                            }
+                            continue
+                        fused_var = max(
+                            photo_var,
+                            threshold_var,
+                            poisson_var,
+                            disagreement_var,
+                            poisson_count + 1.0,
+                        )
+                        estimates[name] = IsotopeCountEstimate(
+                            isotope=name,
+                            counts=poisson_count,
+                            variance=max(float(fused_var), 1.0),
+                            method="response_poisson_low_snr_photopeak_retained",
+                        )
+                        variances[name] = max(float(fused_var), 1.0)
+                        low_snr_suppression_debug[name] = {
+                            "suppressed": False,
+                            "reason": "retained_poisson",
+                            "photo_count": float(photo_count),
+                            "photo_snr": float(photo_snr),
+                            "poisson_count": float(poisson_count),
+                            "poisson_snr": float(poisson_snr),
+                            "poisson_fraction": float(poisson_fraction),
+                            "photo_to_poisson_ratio": float(photo_to_poisson_ratio),
+                            "predicted_photo_snr": float(predicted_photo_snr),
+                        }
+                        continue
                     fused_var = max(
                         photo_var,
                         threshold_var,
@@ -879,6 +1060,16 @@ class SpectralDecomposer:
                         method="response_poisson_photopeak_fused",
                     )
                     variances[name] = max(float(fused_var), 1.0)
+                    low_snr_suppression_debug[name] = {
+                        "suppressed": False,
+                        "reason": "zero_poisson_photopeak_fused",
+                        "photo_count": float(photo_count),
+                        "photo_snr": float(photo_snr),
+                        "poisson_count": float(poisson_count),
+                        "poisson_snr": float(poisson_snr),
+                        "poisson_fraction": float(poisson_fraction),
+                        "predicted_photo_snr": float(predicted_photo_snr),
+                    }
                     continue
                 if photo_count <= 0.0 or photo_snr <= 0.0:
                     continue
@@ -926,6 +1117,8 @@ class SpectralDecomposer:
                     method="response_poisson_photopeak_fused",
                 )
                 variances[name] = fused_var
+        else:
+            low_snr_suppression_debug = {}
         component_spectra: Dict[str, NDArray[np.float64]] = {}
         for name in fit_names:
             estimate = estimates[name]
@@ -1022,10 +1215,31 @@ class SpectralDecomposer:
                 for name in fit_names
                 if name in estimates
             },
+            "photopeak_counts": {
+                name: float(photopeak_counts.get(name, 0.0))
+                for name in fit_names
+            }
+            if photopeak_counts is not None
+            else {},
+            "photopeak_variances": {
+                name: float(photopeak_variances.get(name, 1.0))
+                for name in fit_names
+            }
+            if photopeak_variances is not None
+            else {},
+            "low_snr_photopeak_suppression": low_snr_suppression_debug,
             "component_integrals": {
                 name: float(np.sum(component_spectra.get(name, np.zeros(0))))
                 for name in fit_names
             },
+            "coefficient_correlation_max_abs": float(
+                coefficient_correlation_max_abs
+            ),
+            "coefficient_correlation_by_isotope": {
+                name: float(value)
+                for name, value in coefficient_correlation_by_isotope.items()
+            },
+            "crosstalk_variance_floor": crosstalk_variance_debug,
         }
         return estimates
 
@@ -1403,6 +1617,62 @@ class SpectralDecomposer:
                 else:
                     support_weight = min((independent_snr / support_snr) ** 2, 1.0)
                     weights[mixed_roi] *= max(float(support_weight), 0.0)
+        if (
+            bool(self.config.photopeak_mixed_roi_consistency_enable)
+            and values.size >= 2
+            and np.any(mixed_roi)
+            and np.any(~mixed_roi)
+        ):
+            independent_values = values[~mixed_roi]
+            independent_values = independent_values[np.isfinite(independent_values)]
+            independent_values = independent_values[independent_values >= 0.0]
+            if independent_values.size > 0:
+                percentile = float(
+                    np.clip(
+                        self.config.photopeak_mixed_roi_consistency_reference_percentile,
+                        0.0,
+                        100.0,
+                    )
+                )
+                reference = max(float(np.percentile(independent_values, percentile)), 1.0)
+                independent_variances = variances[~mixed_roi]
+                independent_variances = independent_variances[
+                    np.isfinite(independent_variances) & (independent_variances > 0.0)
+                ]
+                if independent_variances.size:
+                    variance_scale = float(np.sqrt(np.median(independent_variances)))
+                else:
+                    variance_scale = 1.0
+                robust_scale = max(variance_scale, float(np.sqrt(reference)), 1.0)
+                ratio_threshold = max(
+                    float(self.config.photopeak_mixed_roi_consistency_ratio),
+                    1.0,
+                )
+                extreme_ratio = max(
+                    float(self.config.photopeak_mixed_roi_consistency_extreme_ratio),
+                    ratio_threshold,
+                )
+                sigma = max(
+                    float(self.config.photopeak_mixed_roi_consistency_sigma),
+                    1.0e-6,
+                )
+                for idx in np.flatnonzero(mixed_roi):
+                    mixed_value = max(float(values[idx]), 0.0)
+                    if mixed_value <= reference:
+                        continue
+                    ratio = mixed_value / reference
+                    deviation = mixed_value - reference
+                    inconsistent = ratio > ratio_threshold and (
+                        ratio > extreme_ratio or deviation > sigma * robust_scale
+                    )
+                    if not inconsistent:
+                        continue
+                    inflated_variance = max(float(variances[idx]), deviation**2, 1.0)
+                    if inflated_variance <= float(variances[idx]):
+                        continue
+                    penalty = float(variances[idx]) / inflated_variance
+                    variances[idx] = inflated_variance
+                    weights[idx] *= max(penalty, 0.0)
         if values.size >= 3 and float(self.config.photopeak_outlier_mad_sigma) > 0.0:
             median = float(np.median(values))
             mad = float(np.median(np.abs(values - median)))
@@ -1499,6 +1769,8 @@ class SpectralDecomposer:
                         "roi_max_keV": float(estimate.roi_max_keV),
                         "reduced_chi2": float(estimate.reduced_chi2),
                         "signal_to_noise": float(estimate.signal_to_noise),
+                        "mixed_isotope_roi": bool(estimate.mixed_isotope_roi),
+                        "line_count": int(estimate.line_count),
                     }
                     for estimate in estimates
                 ],

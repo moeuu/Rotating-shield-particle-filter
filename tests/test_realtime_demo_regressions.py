@@ -20,6 +20,7 @@ from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
     DeferredPFVisualizer,
     _acquire_spectrum_observation,
+    _adapt_dss_program_length_for_budget,
     _adaptive_mission_stop_reason,
     _all_pf_filters_converged,
     _argv_requests_cui,
@@ -27,6 +28,7 @@ from realtime_demo import (
     _build_intermediate_estimate_trace_payload,
     _build_robot_path_segment,
     _compute_shield_selection_grid,
+    _diagnostic_detail_order,
     _evaluate_spectrum_counts,
     _filter_absent_final_estimates,
     _filter_reachable_candidates,
@@ -46,8 +48,10 @@ from realtime_demo import (
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
     _resolve_display_prune_refresh_interval,
+    _resolve_structural_trial_parallelism,
     _resolve_station_update_modes,
     _particle_surface_diagnostics,
+    _report_model_order_simple_ready_for_stop,
     _select_best_pair_from_scores,
     _should_refresh_display_pruned_estimates,
     _signature_vector_is_dependent,
@@ -56,6 +60,7 @@ from realtime_demo import (
     _source_cardinality_dwell_status,
     run_live_pf,
 )
+from planning.dss_pp import DSSPPConfig
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer
@@ -472,6 +477,51 @@ def test_display_pruned_estimate_refresh_interval_is_clamped() -> None:
     )
 
 
+def test_display_pruned_estimate_disable_overrides_forced_refresh() -> None:
+    """Disabled display pruning should not recompute expensive report previews."""
+    assert (
+        _should_refresh_display_pruned_estimates(
+            step_index=8,
+            refresh_every=0,
+            cache_available=False,
+            force_refresh=True,
+        )
+        is False
+    )
+    assert (
+        _should_refresh_display_pruned_estimates(
+            step_index=8,
+            refresh_every=0,
+            cache_available=True,
+            force_refresh=True,
+        )
+        is False
+    )
+
+
+def test_diagnostic_detail_limit_uses_zero_as_no_details() -> None:
+    """High-detail diagnostic limits should avoid accidental full log dumps."""
+    order = np.array([4, 2, 0, 1, 3], dtype=int)
+
+    assert _diagnostic_detail_order(order, 0).tolist() == []
+    assert _diagnostic_detail_order(order, 2).tolist() == [4, 2]
+    assert _diagnostic_detail_order(order, -1).tolist() == [4, 2, 0, 1, 3]
+
+
+def test_structural_trial_parallelism_reads_runtime_config() -> None:
+    """Full runtime config should reach PF structural-trial parallelism."""
+    workers, min_trials = _resolve_structural_trial_parallelism(
+        {
+            "structural_trial_workers": 32,
+            "structural_trial_parallel_min_trials": 4,
+        }
+    )
+
+    assert workers == 32
+    assert min_trials == 4
+    assert _resolve_structural_trial_parallelism({}) == (1, 8)
+
+
 def test_plot_save_interval_can_disable_intermediate_pf_plots() -> None:
     """PF plot save intervals should allow disabling intermediate figures."""
     assert (
@@ -719,6 +769,74 @@ def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
     assert reason_without_guard == "environment_coverage:1.000"
 
 
+def test_adaptive_mission_waits_for_remaining_measurement_budget() -> None:
+    """Coverage should not stop while the remaining-measurement budget is unresolved."""
+
+    class _DummyFilter:
+        """Minimal filter state without residual or pseudo-source blockers."""
+
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+        last_pseudo_source_fail_reasons: dict[str, int] = {}
+
+    class _DummyEstimator:
+        """Minimal estimator state for adaptive mission stop tests."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 1),
+        blocked_cells=(),
+    )
+    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
+    unresolved_budget = {
+        "unresolved_factors": ["residual"],
+        "estimated_remaining_stations": 3,
+        "current_budget": 10.0,
+    }
+
+    reason = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=grid,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=0.5,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        remaining_measurement_estimate=unresolved_budget,
+    )
+
+    assert reason is None
+
+    reason_without_guard = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=visited,
+        map_api=grid,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=0.5,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        remaining_measurement_estimate=unresolved_budget,
+        require_remaining_measurement_ready=False,
+    )
+
+    assert reason_without_guard == "environment_coverage:1.000"
+
+
 def test_final_model_order_status_marks_unresolved_pseudo_sources_not_ready() -> None:
     """Final model-order status should include pseudo-source structural gates."""
 
@@ -826,6 +944,454 @@ def test_adaptive_mission_waits_for_model_order_readiness() -> None:
     )
 
     assert reason_without_guard == "pf_converged_low_information_gain"
+
+
+def test_adaptive_mission_accepts_strong_simple_report_bic() -> None:
+    """A simple report BIC should stop despite low-weight pseudo-source failures."""
+
+    class _DummyFilter:
+        """Minimal filter with pseudo failures but no residual birth support."""
+
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+        last_pseudo_source_fail_reasons = {"needs_discriminative_views": 3}
+
+    class _DummyEstimator:
+        """Estimator whose strict readiness is false but report BIC is simple."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Populate report diagnostics without changing test state."""
+            return {}
+
+        def report_model_order_ready(self) -> bool:
+            """Return strict unresolved readiness."""
+            return False
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a strong one-source BIC margin."""
+            return {
+                "Cs-137": {
+                    "selected_count": 1,
+                    "criterion_margin_to_simpler": 25.0,
+                    "condition_number": 1.0,
+                    "selected_max_response_correlation": 0.0,
+                    "model_order_ready": False,
+                }
+            }
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    remaining_ready = {
+        "estimated_remaining_stations": 0,
+        "current_budget": 0.0,
+        "unresolved_factors": ["pseudo_source_verification"],
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    reason = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=[np.array([0.0, 0.0, 0.5], dtype=float)],
+        map_api=None,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        remaining_measurement_estimate=remaining_ready,
+    )
+
+    assert reason == "report_simple_model_order"
+
+
+def test_adaptive_mission_simple_report_waits_for_residual_budget() -> None:
+    """A strong simple BIC should not stop while residual evidence remains."""
+
+    class _DummyFilter:
+        """Minimal filter without direct birth gate support."""
+
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+        last_pseudo_source_fail_reasons: dict[str, int] = {}
+
+    class _DummyEstimator:
+        """Estimator with simple BIC but unresolved residual budget."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Populate report diagnostics without changing test state."""
+            return {}
+
+        def report_model_order_ready(self) -> bool:
+            """Return strict unresolved readiness."""
+            return False
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a strong one-source BIC margin."""
+            return {
+                "Cs-137": {
+                    "selected_count": 1,
+                    "criterion_margin_to_simpler": 25.0,
+                    "condition_number": 1.0,
+                    "selected_max_response_correlation": 0.0,
+                }
+            }
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
+            """Return a non-converged local rotation state."""
+            return False
+
+    unresolved_residual = {
+        "estimated_remaining_stations": 2,
+        "current_budget": 10.0,
+        "unresolved_factors": ["residual"],
+        "components": {
+            "residual": 3.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    reason = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=[np.array([0.0, 0.0, 0.5], dtype=float)],
+        map_api=None,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=1.0,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        remaining_measurement_estimate=unresolved_residual,
+    )
+
+    assert reason is None
+
+
+def test_simple_report_stop_can_ignore_only_high_surface_budget() -> None:
+    """Strong simple BIC may ignore high-surface ambiguity but not residuals."""
+
+    class _DummyFilter:
+        """Minimal filter without birth residual evidence."""
+
+        last_birth_residual_gate_passed = False
+        last_birth_residual_support = 0
+
+    class _DummyEstimator:
+        """Estimator with a confident one-source report model."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Populate report diagnostics without side effects."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a strong simple model-order diagnostic."""
+            return {
+                "Cs-137": {
+                    "selected_count": 1,
+                    "criterion_margin_to_simpler": 30.0,
+                    "condition_number": 1.0,
+                    "selected_max_response_correlation": 0.0,
+                }
+            }
+
+    high_surface_only = {
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 4.0,
+        },
+    }
+    residual_unresolved = {
+        "components": {
+            "residual": 4.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 4.0,
+        },
+    }
+
+    blocked = _report_model_order_simple_ready_for_stop(
+        _DummyEstimator(),
+        remaining_measurement_estimate=high_surface_only,
+        allow_high_surface_ambiguity=False,
+    )
+    allowed = _report_model_order_simple_ready_for_stop(
+        _DummyEstimator(),
+        remaining_measurement_estimate=high_surface_only,
+        allow_high_surface_ambiguity=True,
+    )
+    residual_blocked = _report_model_order_simple_ready_for_stop(
+        _DummyEstimator(),
+        remaining_measurement_estimate=residual_unresolved,
+        allow_high_surface_ambiguity=True,
+    )
+
+    assert blocked is False
+    assert allowed is True
+    assert residual_blocked is False
+
+
+def test_simple_report_stop_can_ignore_birth_residual_noise() -> None:
+    """Strong simple report BIC may override residual-birth structural noise."""
+
+    class _DummyFilter:
+        """Minimal filter with stale residual-birth evidence."""
+
+        last_birth_residual_gate_passed = True
+        last_birth_residual_support = 3
+
+    class _DummyEstimator:
+        """Estimator with a confident one-source report model."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Populate report diagnostics without side effects."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a strong simple model-order diagnostic."""
+            return {
+                "Cs-137": {
+                    "selected_count": 1,
+                    "criterion_margin_to_simpler": 30.0,
+                    "condition_number": 1.0,
+                    "selected_max_response_correlation": 0.0,
+                }
+            }
+
+    quiet_budget = {
+        "estimated_remaining_stations": 0,
+        "current_budget": 0.0,
+        "unresolved_factors": [],
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    blocked_by_birth = _report_model_order_simple_ready_for_stop(
+        _DummyEstimator(),
+        remaining_measurement_estimate=quiet_budget,
+        require_no_birth_residual=True,
+        birth_residual_min_support=2,
+    )
+    allowed_for_report = _report_model_order_simple_ready_for_stop(
+        _DummyEstimator(),
+        remaining_measurement_estimate=quiet_budget,
+        require_no_birth_residual=False,
+        birth_residual_min_support=2,
+    )
+
+    assert blocked_by_birth is False
+    assert allowed_for_report is True
+
+
+def test_adaptive_mission_stop_uses_simple_report_over_birth_noise() -> None:
+    """Simple report readiness should stop instead of soft-extending on birth noise."""
+
+    class _DummyFilter:
+        """Minimal filter with stale residual-birth evidence."""
+
+        last_birth_residual_gate_passed = True
+        last_birth_residual_support = 3
+        last_pseudo_source_fail_reasons: dict[str, int] = {
+            "needs_discriminative_views": 2,
+        }
+
+    class _DummyEstimator:
+        """Estimator with strong report BIC and non-converged runtime PF."""
+
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Populate report diagnostics without side effects."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return a strong simple model-order diagnostic."""
+            return {
+                "Cs-137": {
+                    "selected_count": 1,
+                    "criterion_margin_to_simpler": 30.0,
+                    "condition_number": 1.0,
+                    "selected_max_response_correlation": 0.0,
+                }
+            }
+
+        def should_stop_exploration(self, **kwargs: object) -> bool:
+            """Return a non-converged global exploration state."""
+            return False
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 1),
+        blocked_cells=(),
+    )
+    quiet_budget = {
+        "estimated_remaining_stations": 0,
+        "current_budget": 0.0,
+        "unresolved_factors": [],
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    reason = _adaptive_mission_stop_reason(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        current_pose_idx=0,
+        visited_poses_xyz=[np.array([0.5, 0.5, 0.0], dtype=float)],
+        map_api=grid,
+        min_poses=1,
+        coverage_radius_m=10.0,
+        coverage_fraction_threshold=0.5,
+        ig_threshold=1e-3,
+        planning_live_time_s=1.0,
+        require_quiet_birth_residual=True,
+        birth_residual_min_support=2,
+        remaining_measurement_estimate=quiet_budget,
+        require_remaining_measurement_ready=True,
+        allow_report_simple_stop=True,
+    )
+
+    assert reason == "report_simple_model_order"
+
+
+def test_adaptive_dss_program_length_shortens_only_when_budget_is_resolved() -> None:
+    """Adaptive shield programs should shorten only after report/budget readiness."""
+    cfg = DSSPPConfig(program_length=8)
+    quiet_budget = {
+        "estimated_remaining_stations": 0,
+        "current_budget": 0.0,
+        "unresolved_factors": [],
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    shortened, reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=True,
+        remaining_measurement_estimate=quiet_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+    )
+    residual, residual_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=True,
+        remaining_measurement_estimate={
+            **quiet_budget,
+            "components": {**quiet_budget["components"], "residual": 1.0},
+        },
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+    )
+
+    assert int(shortened.program_length) == 2
+    assert reason == "simple_report"
+    assert int(residual.program_length) == 16
+    assert residual_reason == "residual"
+
+    birth_noise, birth_noise_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=True,
+        report_simple_ready=True,
+        remaining_measurement_estimate=quiet_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+    )
+
+    assert int(birth_noise.program_length) == 2
+    assert birth_noise_reason == "simple_report"
+
+
+def test_adaptive_dss_shortens_high_surface_budget_when_report_is_simple() -> None:
+    """High-surface ambiguity alone should not force full programs for simple reports."""
+    cfg = DSSPPConfig(program_length=8)
+    high_surface_budget = {
+        "estimated_remaining_stations": 1,
+        "current_budget": 4.0,
+        "unresolved_factors": ["high_surface_ambiguity"],
+        "components": {
+            "residual": 0.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 4.0,
+        },
+    }
+
+    blocked, blocked_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=True,
+        remaining_measurement_estimate=high_surface_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+        allow_high_surface_simple=False,
+    )
+    shortened, shortened_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=True,
+        remaining_measurement_estimate=high_surface_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+        allow_high_surface_simple=True,
+    )
+
+    assert int(blocked.program_length) == 8
+    assert blocked_reason == "ambiguity"
+    assert int(shortened.program_length) == 2
+    assert shortened_reason == "simple_report"
 
 
 def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
@@ -1846,6 +2412,8 @@ def test_spectrum_runtime_config_exposes_response_poisson_controls() -> None:
             "response_poisson_photopeak_anchor": False,
             "response_poisson_photopeak_anchor_weight": 0.5,
             "response_poisson_model_mismatch_variance_scale": 2.0,
+            "response_poisson_crosstalk_corr_threshold": 0.9,
+            "response_poisson_diagnostic_reduced_chi2_threshold": 3.0,
             "dead_time_tau_s": 0.0,
         }
     )
@@ -1853,6 +2421,10 @@ def test_spectrum_runtime_config_exposes_response_poisson_controls() -> None:
     assert config.response_poisson_photopeak_anchor is False
     assert config.response_poisson_photopeak_anchor_weight == pytest.approx(0.5)
     assert config.response_poisson_model_mismatch_variance_scale == pytest.approx(2.0)
+    assert config.response_poisson_crosstalk_corr_threshold == pytest.approx(0.9)
+    assert config.response_poisson_diagnostic_reduced_chi2_threshold == pytest.approx(
+        3.0
+    )
     assert config.dead_time_tau_s == pytest.approx(0.0)
 
 

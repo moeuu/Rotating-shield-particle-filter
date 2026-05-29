@@ -267,6 +267,15 @@ def main() -> None:
         help="Number of surface-constrained random sources to generate.",
     )
     parser.add_argument(
+        "--random-source-isotopes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated isotope names for surface-constrained random "
+            "source generation. Defaults to all isotopes in the spectrum library."
+        ),
+    )
+    parser.add_argument(
         "--random-source-intensity-cps-1m",
         type=float,
         default=30000.0,
@@ -876,6 +885,7 @@ def main() -> None:
         source_generation_mode=source_generation_mode,
         random_source_seed=args.source_seed,
         random_source_count=args.random_source_count,
+        random_source_isotopes=args.random_source_isotopes,
         random_source_intensity_cps_1m=args.random_source_intensity_cps_1m,
         notification_config=notification_config,
         notify_spectrum=args.notify_spectrum,

@@ -10,13 +10,19 @@ import types
 import numpy as np
 import pytest
 
+import pf.estimator as estimator_module
 from pf.estimator import (
     MeasurementRecord,
     RotatingShieldPFEstimator,
     RotatingShieldPFConfig,
 )
 from pf.likelihood import expected_counts_per_source
-from pf.particle_filter import IsotopeParticle, IsotopeParticleFilter, PFConfig
+from pf.particle_filter import (
+    IsotopeParticle,
+    IsotopeParticleFilter,
+    MeasurementData,
+    PFConfig,
+)
 from pf.state import IsotopeState
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
@@ -407,6 +413,110 @@ def test_deferred_pose_update_defers_history_estimate_recompute(monkeypatch):
     assert len(est.history_estimates) == 0
     assert len(est.measurements) == 1
     assert est._deferred_measurement_count == 1
+
+
+def test_report_history_interval_can_skip_exact_report_recompute():
+    """Report-history recording should be configurable without changing PF state."""
+    est = object.__new__(RotatingShieldPFEstimator)
+    est.pf_config = RotatingShieldPFConfig(history_estimate_interval=0)
+    est.history_estimates = []
+
+    def _forbidden_estimates(self):
+        """Raise when history recording unexpectedly computes a report estimate."""
+        _ = self
+        raise AssertionError("history estimate should be skipped")
+
+    est.estimates = types.MethodType(_forbidden_estimates, est)
+    est._record_history_estimate(1)
+
+    assert est.history_estimates == []
+
+    est.pf_config = RotatingShieldPFConfig(history_estimate_interval=2)
+    calls = []
+
+    def _fake_estimates(self):
+        """Return a minimal estimate payload for history recording."""
+        calls.append(1)
+        _ = self
+        return {"Cs-137": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float))}
+
+    est.estimates = types.MethodType(_fake_estimates, est)
+    est._record_history_estimate(1)
+    est._record_history_estimate(2)
+
+    assert calls == [1]
+    assert len(est.history_estimates) == 1
+
+
+def test_candidate_response_cache_reuses_full_surface_grid(monkeypatch):
+    """Full-grid candidate responses should be cached without changing values."""
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=candidate_sources,
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            max_sources=1,
+            use_gpu=False,
+            candidate_response_cache_max_entries=4,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    data = MeasurementData(
+        z_k=np.array([3.0, 4.0], dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=np.array(
+            [[0.5, 0.0, 0.0], [0.5, 1.0, 0.0]],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1], dtype=np.int64),
+        pb_indices=np.array([1, 0], dtype=np.int64),
+        live_times=np.ones(2, dtype=float),
+    )
+    calls = []
+
+    def _fake_expected_counts_per_source(**kwargs):
+        """Return deterministic response columns and count cache misses."""
+        calls.append(kwargs)
+        detectors = np.asarray(kwargs["detector_positions"], dtype=float)
+        sources = np.asarray(kwargs["sources"], dtype=float)
+        return np.full(
+            (detectors.shape[0], sources.reshape(-1, 3).shape[0]),
+            float(len(calls)),
+            dtype=float,
+        )
+
+    monkeypatch.setattr(
+        estimator_module,
+        "expected_counts_per_source",
+        _fake_expected_counts_per_source,
+    )
+    filt = types.SimpleNamespace(continuous_kernel=object())
+    sources = np.asarray(est.candidate_sources, dtype=float).reshape(-1, 3)
+
+    first = est._cached_expected_counts_per_source(
+        filt=filt,
+        isotope="Cs-137",
+        data=data,
+        sources=sources,
+        strengths=np.ones(sources.shape[0], dtype=float),
+    )
+    first[0, 0] = 99.0
+    second = est._cached_expected_counts_per_source(
+        filt=filt,
+        isotope="Cs-137",
+        data=data,
+        sources=sources,
+        strengths=np.ones(sources.shape[0], dtype=float),
+    )
+
+    assert len(calls) == 1
+    assert second == pytest.approx(np.ones_like(second))
 
 
 def test_deferred_pose_update_runs_convergence_once_at_finalize(monkeypatch):

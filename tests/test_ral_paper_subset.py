@@ -31,7 +31,7 @@ def _manifest_row(case: str, variant: str, seed: str = DEFAULT_SEED) -> dict[str
 
 
 def test_select_paper_subset_uses_thirteen_run_plan() -> None:
-    """The RA-L paper subset should keep 4 core variants plus Case03 birth."""
+    """The RA-L paper subset should keep core variants plus birth ablations."""
     cases = (
         "case01_multi_isotope",
         "case02_three_cs",
@@ -56,7 +56,7 @@ def test_select_paper_subset_uses_thirteen_run_plan() -> None:
         assert (case, "baseline_passive_no_shield") in selected_pairs
         assert (case, "round_robin_shield") in selected_pairs
         assert (case, "one_step_path") in selected_pairs
+    assert ("case02_three_cs", "no_residual_birth") not in selected_pairs
     assert ("case03_mixed_cardinality", "no_residual_birth") in selected_pairs
     assert ("case01_multi_isotope", "no_residual_birth") not in selected_pairs
-    assert ("case02_three_cs", "no_residual_birth") not in selected_pairs
     assert all(row["seed"] == DEFAULT_SEED for row in subset)

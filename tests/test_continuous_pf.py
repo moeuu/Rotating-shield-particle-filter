@@ -416,6 +416,174 @@ def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
     np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+@pytest.mark.parametrize("model", ["poisson", "gaussian", "student_t"])
+def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
+    """Batched sequence likelihoods should equal summed scalar increments."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(
+        num_particles=1,
+        count_likelihood_model=model,
+        transport_model_rel_sigma=0.1,
+        transport_model_abs_sigma=0.5,
+        spectrum_count_rel_sigma=0.05,
+        spectrum_count_abs_sigma=0.25,
+        low_count_abs_sigma=1.0,
+        low_count_transition_counts=20.0,
+        count_likelihood_df=4.0,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    lam_kn = torch.as_tensor(
+        [
+            [37.0, 41.0],
+            [8.0, 12.0],
+            [120.0, 135.0],
+        ],
+        dtype=torch.float64,
+    )
+    z_obs = np.array([39.0, 9.0, 128.0], dtype=float)
+    obs_var = np.array([4.0, 1.5, 16.0], dtype=float)
+
+    actual = filt._log_likelihood_sequence_gpu(lam_kn, z_obs, obs_var)
+    expected = torch.zeros(lam_kn.shape[1], dtype=torch.float64)
+    for idx, z_val in enumerate(z_obs):
+        expected = expected + filt._log_likelihood_increment_gpu(
+            lam_kn[idx],
+            z_obs=float(z_val),
+            observation_count_variance=float(obs_var[idx]),
+        )
+
+    assert torch.allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_pair_sequence_update_uses_batched_gpu_likelihood(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joint shield-program updates should call the batched sequence path once."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(num_particles=1, use_gpu=True, use_tempering=True)
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([1.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    calls: dict[str, object] = {}
+
+    def fake_counts(
+        *,
+        pose_idx: int,
+        fe_indices: np.ndarray,
+        pb_indices: np.ndarray,
+        live_times_s: np.ndarray,
+    ) -> "torch.Tensor":
+        """Record batched expected-count inputs and return a deterministic tensor."""
+        calls["counts"] = (
+            int(pose_idx),
+            tuple(np.asarray(fe_indices, dtype=int)),
+            tuple(np.asarray(pb_indices, dtype=int)),
+            tuple(np.asarray(live_times_s, dtype=float)),
+        )
+        return torch.as_tensor([[10.0], [20.0]], dtype=torch.float64)
+
+    def fake_ll(
+        lam_kn: "torch.Tensor",
+        z_obs: np.ndarray,
+        observation_count_variances: np.ndarray,
+    ) -> "torch.Tensor":
+        """Record batched likelihood inputs and return one particle increment."""
+        calls["ll"] = (
+            tuple(np.asarray(z_obs, dtype=float)),
+            tuple(np.asarray(observation_count_variances, dtype=float)),
+            tuple(lam_kn.shape),
+        )
+        return torch.as_tensor([1.0], dtype=torch.float64)
+
+    def fake_tempered_update_likelihood(
+        ll_fn: object,
+        **_kwargs: object,
+    ) -> tuple[float, bool]:
+        """Evaluate the likelihood callback once without resampling."""
+        ll_t = ll_fn()
+        calls["tempered_ll"] = tuple(ll_t.shape)
+        return 1.0, False
+
+    def fake_gpu_enabled() -> bool:
+        """Pretend that the torch backend is available for this path test."""
+        return True
+
+    def noop_adapt_num_particles(**_kwargs: object) -> None:
+        """Skip adaptive particle-count side effects in this path test."""
+        return None
+
+    def noop_align_continuous_labels() -> None:
+        """Skip label alignment side effects in this path test."""
+        return None
+
+    def noop_advance_adapt_cooldown() -> None:
+        """Skip adaptive cooldown side effects in this path test."""
+        return None
+
+    def noop_maybe_update_convergence(**_kwargs: object) -> None:
+        """Skip convergence side effects in this path test."""
+        return None
+
+    monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
+    monkeypatch.setattr(
+        filt,
+        "_continuous_expected_counts_pair_sequence_torch",
+        fake_counts,
+    )
+    monkeypatch.setattr(filt, "_log_likelihood_sequence_gpu", fake_ll)
+    monkeypatch.setattr(
+        filt,
+        "_tempered_update_likelihood",
+        fake_tempered_update_likelihood,
+    )
+    monkeypatch.setattr(filt, "adapt_num_particles", noop_adapt_num_particles)
+    monkeypatch.setattr(
+        filt,
+        "align_continuous_labels",
+        noop_align_continuous_labels,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_advance_adapt_cooldown",
+        noop_advance_adapt_cooldown,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_maybe_update_convergence",
+        noop_maybe_update_convergence,
+    )
+
+    filt.update_continuous_pair_sequence(
+        z_obs=np.array([8.0, 18.0], dtype=float),
+        pose_idx=0,
+        fe_indices=np.array([1, 2], dtype=int),
+        pb_indices=np.array([3, 4], dtype=int),
+        live_times_s=np.array([1.5, 2.0], dtype=float),
+        observation_count_variances=np.array([2.0, 3.0], dtype=float),
+    )
+
+    assert calls["counts"] == (0, (1, 2), (3, 4), (1.5, 2.0))
+    assert calls["ll"] == ((8.0, 18.0), (2.0, 3.0), (2, 1))
+    assert calls["tempered_ll"] == (1,)
+
+
 def test_low_count_variance_floor_decays_for_informative_counts() -> None:
     """Low-count uncertainty should protect weak spectra without weakening high counts."""
     z_obs = np.array([5.0, 5000.0], dtype=float)
