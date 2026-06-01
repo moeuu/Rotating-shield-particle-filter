@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence, cast
 
 import numpy as np
@@ -26,6 +26,11 @@ from planning.pose_selection import (
     minimum_observation_shortfall,
 )
 from planning.traversability import shortest_grid_path_length
+from runtime_defaults import (
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_ROBOT_SPEED_M_S,
+    DEFAULT_ROTATION_OVERHEAD_S,
+)
 
 
 _DSS_PP_POSE_EVAL_CONTEXT: dict[str, object] | None = None
@@ -65,7 +70,7 @@ class DSSPPConfig:
     max_modes_per_isotope: int = 4
     planning_particles: int | None = None
     planning_method: str | None = None
-    live_time_s: float = 30.0
+    live_time_s: float = DEFAULT_MEASUREMENT_TIME_S
     lambda_eig: float = 1.0
     lambda_signature: float = 1.0
     lambda_distance: float | None = None
@@ -102,8 +107,8 @@ class DSSPPConfig:
     coverage_floor_weight: float = 0.0
     min_station_separation_m: float = 0.0
     detector_aperture_samples: int = 1
-    robot_speed_m_s: float = 0.5
-    rotation_overhead_s: float = 0.5
+    robot_speed_m_s: float = DEFAULT_ROBOT_SPEED_M_S
+    rotation_overhead_s: float = DEFAULT_ROTATION_OVERHEAD_S
     augment_candidates: bool = True
     max_augmented_candidates: int = 256
     ring_radii_m: tuple[float, ...] = (2.0, 3.5, 5.0)
@@ -144,6 +149,10 @@ class DSSPPConfig:
     same_isotope_direct_separation_epsilon: float = 1.0e-9
     include_runtime_rescue_modes: bool = True
     runtime_rescue_mode_weight: float = 0.5
+    include_global_surface_rescue_modes: bool = True
+    global_surface_rescue_mode_weight: float = 0.75
+    weak_mode_weight_floor: float = 0.0
+    dominant_mode_weight_cap: float = 1.0
     high_surface_pair_boost: float = 1.0
     high_surface_cross_stratum_boost: float = 1.0
     high_surface_z_fraction: float = 0.75
@@ -304,6 +313,48 @@ def _normalise_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
     if total <= 0.0:
         return np.ones(arr.size, dtype=float) / float(arr.size)
     return arr / total
+
+
+def _rebalance_signature_mode_weights(
+    modes: Sequence[SignatureMode],
+    *,
+    weak_floor: float,
+    dominant_cap: float,
+) -> list[SignatureMode]:
+    """Return modes with planner-only floor/cap weights for weak-mode visibility."""
+    mode_list = list(modes)
+    count = len(mode_list)
+    if count <= 1:
+        return mode_list
+    weights = _normalise_weights(
+        np.asarray([max(float(mode.weight), 0.0) for mode in mode_list], dtype=float)
+    )
+    floor = max(0.0, min(float(weak_floor), 1.0 / float(count)))
+    if floor > 0.0:
+        weights = np.maximum(weights, floor)
+        weights = _normalise_weights(weights)
+    cap = float(dominant_cap)
+    if cap > 0.0:
+        cap = min(1.0, max(cap, 1.0 / float(count)))
+        for _ in range(count):
+            over = weights > cap
+            if not np.any(over):
+                break
+            excess = float(np.sum(weights[over] - cap))
+            weights[over] = cap
+            under = ~over
+            if not np.any(under) or excess <= 0.0:
+                break
+            under_total = float(np.sum(weights[under]))
+            if under_total <= 0.0:
+                weights[under] += excess / float(np.count_nonzero(under))
+            else:
+                weights[under] += excess * weights[under] / under_total
+        weights = _normalise_weights(weights)
+    return [
+        replace(mode, weight=float(weight))
+        for mode, weight in zip(mode_list, weights)
+    ]
 
 
 def _estimator_room_z(estimator: RotatingShieldPFEstimator) -> float:
@@ -586,6 +637,112 @@ def _cluster_source_samples(
     return modes[: max(1, int(max_modes))]
 
 
+def _rescue_modes_from_payload(
+    isotope: str,
+    entry: tuple[NDArray[np.float64], NDArray[np.float64], float] | None,
+    *,
+    mass: float,
+    eps: float,
+) -> list[SignatureMode]:
+    """Return planner modes represented by a runtime/global rescue payload."""
+    rescue_mass = max(float(mass), 0.0)
+    if entry is None or rescue_mass <= 0.0:
+        return []
+    rescue_pos, rescue_q, _pf_mass = entry
+    rescue_pos_arr = np.asarray(rescue_pos, dtype=float).reshape(-1, 3)
+    rescue_q_arr = np.maximum(
+        np.asarray(rescue_q, dtype=float).reshape(-1),
+        0.0,
+    )
+    valid = (
+        np.isfinite(rescue_pos_arr).all(axis=1)
+        & np.isfinite(rescue_q_arr)
+        & (rescue_q_arr > 0.0)
+    )
+    rescue_pos_arr = rescue_pos_arr[valid]
+    rescue_q_arr = rescue_q_arr[valid]
+    if rescue_pos_arr.shape[0] != rescue_q_arr.size or rescue_q_arr.size == 0:
+        return []
+    total_rescue_q = float(np.sum(rescue_q_arr))
+    if total_rescue_q <= eps:
+        rescue_rel = np.full(
+            rescue_q_arr.size,
+            1.0 / float(rescue_q_arr.size),
+            dtype=float,
+        )
+    else:
+        rescue_rel = rescue_q_arr / total_rescue_q
+    return [
+        SignatureMode(
+            isotope=isotope,
+            position_xyz=np.asarray(pos, dtype=float).reshape(3),
+            strength_cps_1m=float(strength),
+            weight=float(rescue_mass) * float(rel_weight),
+            spread_m=0.0,
+        )
+        for pos, strength, rel_weight in zip(
+            rescue_pos_arr,
+            rescue_q_arr,
+            rescue_rel,
+        )
+    ]
+
+
+def _preserve_external_rescue_modes(
+    modes: Sequence[SignatureMode],
+    rescue_modes: Sequence[SignatureMode],
+    *,
+    radius_m: float,
+    max_modes: int,
+) -> list[SignatureMode]:
+    """
+    Keep distinct runtime rescue hypotheses visible to DSS-PP planning.
+
+    The rescue list is already produced by all-history report/residual scoring.
+    When PF modes fill the planner mode budget, this replaces the lowest-weight
+    duplicate-free planner mode with a distinct rescue hypothesis instead of
+    silently dropping every posterior-external hypothesis.
+    """
+    limit = max(1, int(max_modes))
+    result = list(modes[:limit])
+    if not rescue_modes:
+        return result
+    radius = max(float(radius_m), 0.0)
+    rescue_order = sorted(
+        rescue_modes,
+        key=lambda mode: max(float(mode.weight), 0.0),
+        reverse=True,
+    )
+    for rescue in rescue_order:
+        rescue_pos = np.asarray(rescue.position_xyz, dtype=float).reshape(3)
+        if result:
+            distances = np.asarray(
+                [
+                    float(
+                        np.linalg.norm(
+                            np.asarray(mode.position_xyz, dtype=float).reshape(3)
+                            - rescue_pos
+                        )
+                    )
+                    for mode in result
+                ],
+                dtype=float,
+            )
+            if np.any(distances <= radius):
+                continue
+        if len(result) < limit:
+            result.append(rescue)
+            continue
+        weights = np.asarray(
+            [max(float(mode.weight), 0.0) for mode in result],
+            dtype=float,
+        )
+        weakest_idx = int(np.argmin(weights))
+        result[weakest_idx] = rescue
+    result.sort(key=lambda mode: max(float(mode.weight), 0.0), reverse=True)
+    return result[:limit]
+
+
 def extract_signature_modes(
     estimator: RotatingShieldPFEstimator,
     *,
@@ -596,6 +753,10 @@ def extract_signature_modes(
     tentative_weight_multiplier: float = 1.0,
     include_runtime_rescue_modes: bool = True,
     runtime_rescue_mode_weight: float = 0.5,
+    include_global_surface_rescue_modes: bool = True,
+    global_surface_rescue_mode_weight: float = 0.75,
+    weak_mode_weight_floor: float = 0.0,
+    dominant_mode_weight_cap: float = 1.0,
 ) -> dict[str, list[SignatureMode]]:
     """Extract isotope-wise posterior and runtime-rescue modes for planning."""
     particles = estimator.planning_particles(
@@ -608,6 +769,10 @@ def extract_signature_modes(
         str,
         tuple[NDArray[np.float64], NDArray[np.float64], float],
     ] = {}
+    global_rescue_payload: dict[
+        str,
+        tuple[NDArray[np.float64], NDArray[np.float64], float],
+    ] = {}
     if bool(include_runtime_rescue_modes):
         rescue_getter = getattr(estimator, "runtime_report_rescue_modes", None)
         if callable(rescue_getter):
@@ -615,6 +780,17 @@ def extract_signature_modes(
                 rescue_payload = dict(rescue_getter())
             except (RuntimeError, ValueError, TypeError):
                 rescue_payload = {}
+    if bool(include_global_surface_rescue_modes):
+        global_rescue_getter = getattr(
+            estimator,
+            "planning_surface_rescue_modes",
+            None,
+        )
+        if callable(global_rescue_getter):
+            try:
+                global_rescue_payload = dict(global_rescue_getter())
+            except (RuntimeError, ValueError, TypeError):
+                global_rescue_payload = {}
     exclude_quarantined = bool(
         getattr(
             getattr(estimator, "pf_config", None),
@@ -626,6 +802,7 @@ def extract_signature_modes(
         positions: list[NDArray[np.float64]] = []
         strengths: list[float] = []
         sample_weights: list[float] = []
+        external_rescue_modes: list[SignatureMode] = []
         if isotope in particles:
             states, weights = particles[isotope]
             norm_weights = _normalise_weights(np.asarray(weights, dtype=float))
@@ -684,47 +861,48 @@ def extract_signature_modes(
                     sample_weights.append(
                         float(particle_weight) * float(rel_strength) * multiplier
                     )
-        rescue_entry = rescue_payload.get(isotope)
-        rescue_mass = max(float(runtime_rescue_mode_weight), 0.0)
-        if rescue_entry is not None and rescue_mass > 0.0:
-            rescue_pos, rescue_q, _pf_mass = rescue_entry
-            rescue_pos_arr = np.asarray(rescue_pos, dtype=float).reshape(-1, 3)
-            rescue_q_arr = np.maximum(
-                np.asarray(rescue_q, dtype=float).reshape(-1),
-                0.0,
-            )
-            valid = (
-                np.isfinite(rescue_pos_arr).all(axis=1)
-                & np.isfinite(rescue_q_arr)
-                & (rescue_q_arr > 0.0)
-            )
-            rescue_pos_arr = rescue_pos_arr[valid]
-            rescue_q_arr = rescue_q_arr[valid]
-            if rescue_pos_arr.shape[0] == rescue_q_arr.size and rescue_q_arr.size:
-                total_rescue_q = float(np.sum(rescue_q_arr))
-                if total_rescue_q <= eps:
-                    rescue_rel = np.full(
-                        rescue_q_arr.size,
-                        1.0 / float(rescue_q_arr.size),
-                        dtype=float,
-                    )
-                else:
-                    rescue_rel = rescue_q_arr / total_rescue_q
-                for pos, strength, rel_weight in zip(
-                    rescue_pos_arr,
-                    rescue_q_arr,
-                    rescue_rel,
-                ):
-                    positions.append(np.asarray(pos, dtype=float))
-                    strengths.append(float(strength))
-                    sample_weights.append(float(rescue_mass) * float(rel_weight))
-        modes_by_isotope[isotope] = _cluster_source_samples(
+        rescue_modes = _rescue_modes_from_payload(
+            isotope,
+            rescue_payload.get(isotope),
+            mass=float(runtime_rescue_mode_weight),
+            eps=eps,
+        )
+        global_rescue_modes = _rescue_modes_from_payload(
+            isotope,
+            global_rescue_payload.get(isotope),
+            mass=float(global_surface_rescue_mode_weight),
+            eps=eps,
+        )
+        external_rescue_modes.extend(rescue_modes)
+        external_rescue_modes.extend(global_rescue_modes)
+        for rescue_mode in external_rescue_modes:
+            positions.append(np.asarray(rescue_mode.position_xyz, dtype=float))
+            strengths.append(float(rescue_mode.strength_cps_1m))
+            sample_weights.append(float(rescue_mode.weight))
+        total_sample_weight = float(np.sum(np.maximum(sample_weights, 0.0)))
+        if total_sample_weight > eps:
+            external_rescue_modes = [
+                replace(mode, weight=float(mode.weight) / total_sample_weight)
+                for mode in external_rescue_modes
+            ]
+        modes = _cluster_source_samples(
             isotope,
             positions,
             strengths,
             sample_weights,
             radius_m=mode_cluster_radius_m,
             max_modes=max_modes_per_isotope,
+        )
+        modes = _preserve_external_rescue_modes(
+            modes,
+            external_rescue_modes,
+            radius_m=mode_cluster_radius_m,
+            max_modes=max_modes_per_isotope,
+        )
+        modes_by_isotope[isotope] = _rebalance_signature_mode_weights(
+            modes,
+            weak_floor=weak_mode_weight_floor,
+            dominant_cap=dominant_mode_weight_cap,
         )
     return modes_by_isotope
 
@@ -5149,6 +5327,14 @@ def select_dss_pp_next_station(
         tentative_weight_multiplier=1.0 + max(float(cfg.residual_signature_weight), 0.0),
         include_runtime_rescue_modes=bool(cfg.include_runtime_rescue_modes),
         runtime_rescue_mode_weight=float(cfg.runtime_rescue_mode_weight),
+        include_global_surface_rescue_modes=bool(
+            cfg.include_global_surface_rescue_modes
+        ),
+        global_surface_rescue_mode_weight=float(
+            cfg.global_surface_rescue_mode_weight
+        ),
+        weak_mode_weight_floor=float(cfg.weak_mode_weight_floor),
+        dominant_mode_weight_cap=float(cfg.dominant_mode_weight_cap),
     )
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     base_candidates = candidates.copy()

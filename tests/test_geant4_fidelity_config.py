@@ -66,6 +66,14 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
         assert "net_response_calibration_path" not in payload
         assert "net_response_calibration" not in payload
         assert payload.get("pf_obstacle_attenuation", True) is not False
+        assert payload["online_absent_isotope_pruning"] is True
+        assert int(payload["online_absent_min_poses"]) >= 8
+        assert float(payload["online_absent_coverage_fraction"]) >= 0.75
+        assert int(payload["online_absent_min_measurements"]) >= 8
+        dss_pp = payload.get("dss_pp", {})
+        if isinstance(dss_pp, dict):
+            assert dss_pp.get("one_step_guard_enable", True) is True
+            assert dss_pp.get("one_step_guard_use_gpu") is None
         assert float(payload.get("scatter_gain", 0.0)) == 0.0
         source_bias_mode = str(payload.get("source_bias_mode", "detector_cone"))
         assert source_bias_mode == "detector_cone"
@@ -101,6 +109,8 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["delayed_resample_update"] is False
     assert payload["random_source_visibility_filter"] is True
     assert float(payload["random_source_min_visible_fraction"]) > 0.0
+    assert int(payload["random_source_max_ceiling_sources"]) == 1
+    assert float(payload["random_source_preferred_max_z_m"]) <= 5.0
     assert payload["random_source_response_observability_filter"] is True
     assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.995
     assert float(payload["random_source_response_condition_max"]) >= 1.0
@@ -121,8 +131,9 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_penalty_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_q_multiple"]) >= 1.0
+    assert float(payload["report_strength_absorption_penalty_weight"]) == 0.0
+    assert float(payload["report_strength_observation_overshoot_penalty_weight"]) > 0.0
+    assert float(payload["report_strength_observation_overshoot_sigma"]) > 0.0
     assert payload["report_surface_local_refine"] is True
     assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
     assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
@@ -131,6 +142,7 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
     assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
     assert payload["report_mle_rescue_surface_quota_enable"] is True
+    assert float(payload["report_mle_rescue_surface_quota_min_score_fraction"]) > 0.0
     assert int(payload["report_mle_rescue_surface_quota_per_stratum"]) >= 2
     assert payload["report_mle_rescue_spatial_quota_enable"] is True
     assert float(payload["report_mle_rescue_spatial_quota_tile_m"]) > 0.0
@@ -145,6 +157,9 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert float(payload["runtime_report_rescue_weight"]) > 0.0
     assert payload["runtime_report_rescue_quarantine_enable"] is True
     assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
+    assert float(payload["runtime_report_rescue_candidate_weight"]) > float(
+        payload["runtime_report_rescue_quarantine_weight"]
+    )
     assert payload["runtime_report_rescue_memory_enable"] is True
     assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
     assert payload["weak_source_prune_require_observable"] is True
@@ -152,9 +167,13 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["cardinality_preserving_resample"] is True
     assert int(payload["cardinality_preserving_min_stations"]) == 0
     assert payload["cardinality_preserving_require_confirmed_structure"] is False
-    assert float(payload["source_strength_prior_mean"]) > 0.0
-    assert float(payload["source_strength_prior_weight"]) >= 4.0
+    assert float(payload["source_strength_prior_mean"]) == 0.0
+    assert float(payload["source_strength_prior_weight"]) == 0.0
+    assert float(payload["source_strength_observation_overshoot_penalty_weight"]) > 0.0
+    assert float(payload["report_mle_rescue_visibility_reference_strength"]) == 0.0
+    assert float(payload["weak_source_prune_visibility_reference_strength"]) == 0.0
     assert payload["report_model_order_require_posterior_match"] is False
+    assert float(payload["report_model_order_zero_source_min_bic_margin"]) >= 10.0
     assert payload["report_model_order_prune_particles"] is True
     assert payload["mode_preserving_resample"] is True
     assert int(payload["mode_preserving_max_modes"]) >= 12
@@ -231,6 +250,8 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert payload["delayed_resample_update"] is False
     assert payload["random_source_visibility_filter"] is True
     assert float(payload["random_source_min_visible_fraction"]) > 0.0
+    assert int(payload["random_source_max_ceiling_sources"]) == 1
+    assert float(payload["random_source_preferred_max_z_m"]) <= 5.0
     assert payload["random_source_response_observability_filter"] is True
     assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.995
     assert float(payload["random_source_response_condition_max"]) >= 1.0
@@ -250,8 +271,9 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert payload["report_strength_refit_use_all_measurements"] is True
     assert payload["report_strength_refit_preserve_cardinality"] is False
     assert float(payload["report_strength_refit_prior_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_penalty_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_q_multiple"]) >= 1.0
+    assert float(payload["report_strength_absorption_penalty_weight"]) == 0.0
+    assert float(payload["report_strength_observation_overshoot_penalty_weight"]) > 0.0
+    assert float(payload["report_strength_observation_overshoot_sigma"]) > 0.0
     assert payload["report_surface_local_refine"] is True
     assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
     assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
@@ -260,6 +282,7 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
     assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
     assert payload["report_mle_rescue_surface_quota_enable"] is True
+    assert float(payload["report_mle_rescue_surface_quota_min_score_fraction"]) > 0.0
     assert payload["report_mle_rescue_spatial_quota_enable"] is True
     assert payload["birth_global_rescue_enable"] is True
     assert int(payload["birth_global_rescue_max_candidates"]) >= 8
@@ -271,6 +294,9 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert float(payload["runtime_report_rescue_weight"]) > 0.0
     assert payload["runtime_report_rescue_quarantine_enable"] is True
     assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
+    assert float(payload["runtime_report_rescue_candidate_weight"]) > float(
+        payload["runtime_report_rescue_quarantine_weight"]
+    )
     assert payload["runtime_report_rescue_memory_enable"] is True
     assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
     assert payload["weak_source_prune_require_observable"] is True
@@ -278,9 +304,13 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert payload["cardinality_preserving_resample"] is True
     assert int(payload["cardinality_preserving_min_stations"]) == 0
     assert payload["cardinality_preserving_require_confirmed_structure"] is False
-    assert float(payload["source_strength_prior_mean"]) > 0.0
-    assert float(payload["source_strength_prior_weight"]) >= 4.0
+    assert float(payload["source_strength_prior_mean"]) == 0.0
+    assert float(payload["source_strength_prior_weight"]) == 0.0
+    assert float(payload["source_strength_observation_overshoot_penalty_weight"]) > 0.0
+    assert float(payload["report_mle_rescue_visibility_reference_strength"]) == 0.0
+    assert float(payload["weak_source_prune_visibility_reference_strength"]) == 0.0
     assert payload["report_model_order_require_posterior_match"] is False
+    assert float(payload["report_model_order_zero_source_min_bic_margin"]) >= 10.0
     assert payload["report_model_order_prune_particles"] is True
     assert payload["split_residual_guided"] is True
     assert payload["split_residual_always_try"] is True

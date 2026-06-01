@@ -134,6 +134,8 @@ celerybeat.pid
 
 # Local visualization server state
 results/cui_view/*.pid
+results/run_logs/
+results/ral_ablation/logs/
 
 # SageMath parsed files
 *.sage.py

@@ -55,7 +55,7 @@ from pf.particle_filter import PFConfig
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT / "results" / "baselines" / "legacy_no_shield"
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
-DEFAULT_OBSTACLE_CONFIG = ROOT / "obstacle_layouts" / "demo_obstacles.json"
+DEFAULT_OBSTACLE_CONFIG = ROOT / "obstacle_layouts" / "no_obstacles.json"
 MEASUREMENT_TIME_S = 30.0
 SAVE_EVERY_N_STEPS = 10
 DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 1}

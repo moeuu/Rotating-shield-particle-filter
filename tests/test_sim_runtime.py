@@ -1609,6 +1609,74 @@ def test_create_simulation_runtime_auto_starts_geant4_sidecar(
     runtime.process.wait(timeout=5.0)
 
 
+def test_managed_geant4_sidecar_restart_replays_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed managed Geant4 bridge should restart and replay the scene reset."""
+    import sim.runtime as runtime_module
+
+    calls: list[tuple[str, dict[str, object]]] = []
+    starts: list[dict[str, object]] = []
+    failed_once = False
+
+    def _fake_round_trip(
+        runtime: object,
+        message_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Fail the first step request and record subsequent retry ordering."""
+        nonlocal failed_once
+        calls.append((message_type, dict(payload)))
+        if message_type == "step" and not failed_once:
+            failed_once = True
+            raise ConnectionRefusedError("sidecar stopped")
+        return {"status": message_type}
+
+    def _fake_start_sidecar_process(**kwargs: object) -> tuple[subprocess.Popen[str], None]:
+        """Record restart inputs and return a completed process handle."""
+        starts.append(dict(kwargs))
+        return subprocess.Popen(["true"]), None
+
+    monkeypatch.setattr(
+        runtime_module.TCPSidecarClientRuntime,
+        "_round_trip",
+        _fake_round_trip,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_start_sidecar_process",
+        _fake_start_sidecar_process,
+    )
+    runtime = ManagedGeant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        timeout_s=1.0,
+        process=subprocess.Popen(["true"]),
+        restart_config={
+            "enabled": True,
+            "max_restarts": 1,
+            "script_path": "scripts/run_geant4_bridge.py",
+            "config_path": "config.json",
+            "config": {},
+            "log_path": "sidecar.log",
+            "startup_timeout_s": 1.0,
+            "extra_args": [],
+        },
+    )
+
+    runtime.reset({"sources": ["scene"]})
+    response = runtime._round_trip("step", {"step_id": 12})
+
+    assert response == {"status": "step"}
+    assert starts
+    assert calls == [
+        ("reset", {"sources": ["scene"]}),
+        ("step", {"step_id": 12}),
+        ("reset", {"sources": ["scene"]}),
+        ("step", {"step_id": 12}),
+    ]
+
+
 def test_create_simulation_runtime_auto_starts_isaacsim_sidecar(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

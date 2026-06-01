@@ -209,6 +209,32 @@ class PythonTransportSpectrumModel:
             expected_spectrum=expected,
             extra_metadata=extra_metadata,
         )
+        num_orientations = max(1, int(len(self.orientations)))
+        metadata.setdefault("fe_orientation_index", int(command.fe_orientation_index))
+        metadata.setdefault("pb_orientation_index", int(command.pb_orientation_index))
+        metadata.setdefault("shield_num_orientations", int(num_orientations))
+        metadata.setdefault(
+            "shield_pair_id",
+            int(command.fe_orientation_index) * num_orientations
+            + int(command.pb_orientation_index),
+        )
+        metadata.setdefault(
+            "shield_thickness_fe_cm",
+            float(self.shield_params.thickness_fe_cm),
+        )
+        metadata.setdefault(
+            "shield_thickness_pb_cm",
+            float(self.shield_params.thickness_pb_cm),
+        )
+        metadata.setdefault(
+            "shield_thickness_scale",
+            0.0
+            if (
+                float(self.shield_params.thickness_fe_cm) <= 0.0
+                and float(self.shield_params.thickness_pb_cm) <= 0.0
+            )
+            else 1.0,
+        )
         return SimulationObservation(
             step_id=command.step_id,
             detector_pose_xyz=tuple(float(value) for value in detector_pose_xyz),

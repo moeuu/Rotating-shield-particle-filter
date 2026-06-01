@@ -1,0 +1,1360 @@
+{
+  "backend": "geant4",
+  "environment_mode": "random",
+  "estimated_sources": {
+    "Cs-137": [
+      {
+        "pos": [
+          4.5,
+          1.5,
+          10.0
+        ],
+        "strength": 60275.81307313379
+      },
+      {
+        "pos": [
+          1.0,
+          14.0,
+          1.0
+        ],
+        "strength": 3926.104310703567
+      }
+    ]
+  },
+  "final_absent_isotope_diagnostics": {
+    "Co-60": {
+      "count_supported": false,
+      "kept": false,
+      "max_counts": 0.0,
+      "max_strength": 0.0,
+      "observed_measurements": 0,
+      "pf_supported": false,
+      "reason": "no_final_pf_support",
+      "source_count": 0,
+      "support_measurements": 0,
+      "total_counts": 0.0
+    },
+    "Cs-137": {
+      "count_supported": true,
+      "kept": true,
+      "max_counts": 24053.038229328227,
+      "max_strength": 60275.81307313379,
+      "observed_measurements": 104,
+      "pf_supported": true,
+      "reason": "kept",
+      "source_count": 2,
+      "support_measurements": 104,
+      "total_counts": 1002066.6473839267
+    },
+    "Eu-154": {
+      "count_supported": false,
+      "kept": false,
+      "max_counts": 0.0,
+      "max_strength": 0.0,
+      "observed_measurements": 0,
+      "pf_supported": false,
+      "reason": "no_final_pf_support",
+      "source_count": 0,
+      "support_measurements": 0,
+      "total_counts": 0.0
+    }
+  },
+  "final_estimate_diagnostics": {
+    "model_order_status": {
+      "all_model_order_ready": true,
+      "all_model_order_ready_before_structural_gates": true,
+      "max_condition_number": 1.5126644120652877,
+      "max_response_correlation": 0.3917559125921816,
+      "min_bic_margin_to_simpler": 17.857147414113342,
+      "pseudo_source_verification": {
+        "Cs-137": {
+          "fail_reasons": {},
+          "failed": 0,
+          "pruned": 0,
+          "quarantine_active": 0,
+          "quarantined": 0,
+          "verified": 0
+        }
+      },
+      "unresolved_pseudo_source_reasons": {},
+      "unresolved_structural_evidence": {}
+    },
+    "report_model_order": {
+      "Cs-137": {
+        "background_ll": -1294.3117799610925,
+        "best_by_k": {
+          "0": {
+            "condition_number": 1.0,
+            "criterion": -1294.3117799610925,
+            "indices": [],
+            "ll": -1294.3117799610925
+          },
+          "1": {
+            "condition_number": 1.0,
+            "criterion": -910.7396031285538,
+            "indices": [
+              0
+            ],
+            "ll": -901.450821330271
+          },
+          "10": {
+            "condition_number": 256.2095642066894,
+            "criterion": -959.6353273064079,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "ll": -866.7475093235805
+          },
+          "11": {
+            "condition_number": 280.5859599161764,
+            "criterion": -969.1421433736161,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "ll": -866.9655435925059
+          },
+          "12": {
+            "condition_number": 508.78088502272,
+            "criterion": -979.0939804819989,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "ll": -867.628598902606
+          },
+          "2": {
+            "condition_number": 1.5126644120652877,
+            "criterion": -892.8824557144404,
+            "indices": [
+              0,
+              1
+            ],
+            "ll": -874.3048921178749
+          },
+          "3": {
+            "condition_number": 2.482911061269781,
+            "criterion": -898.9699978401283,
+            "indices": [
+              2,
+              5,
+              9
+            ],
+            "ll": -871.10365244528
+          },
+          "4": {
+            "condition_number": 3.7954751193221967,
+            "criterion": -905.8960122027754,
+            "indices": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "ll": -868.7408850096444
+          },
+          "5": {
+            "condition_number": 6.158207549770937,
+            "criterion": -914.0367543950161,
+            "indices": [
+              1,
+              2,
+              5,
+              7,
+              11
+            ],
+            "ll": -867.5928454036024
+          },
+          "6": {
+            "condition_number": 13.03165140169478,
+            "criterion": -922.8077687786841,
+            "indices": [
+              0,
+              1,
+              2,
+              5,
+              7,
+              11
+            ],
+            "ll": -867.0750779889877
+          },
+          "7": {
+            "condition_number": 18.464617238961708,
+            "criterion": -931.743083426237,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              7,
+              9
+            ],
+            "ll": -866.7216108382578
+          },
+          "8": {
+            "condition_number": 19.223468733542205,
+            "criterion": -941.0160553197143,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              6,
+              7,
+              9
+            ],
+            "ll": -866.7058009334523
+          },
+          "9": {
+            "condition_number": 204.0374487930285,
+            "criterion": -950.3238524183823,
+            "indices": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              7,
+              8,
+              9,
+              10
+            ],
+            "ll": -866.7248162338376
+          }
+        },
+        "best_criterion": -892.8824557144404,
+        "best_ll": -874.3048921178749,
+        "candidate_count": 12,
+        "condition_number": 1.5126644120652877,
+        "criterion_margin_to_simpler": 17.857147414113342,
+        "evaluated_subsets": 4096,
+        "evaluation_mode": "batched_numpy",
+        "global_rescue_best_score": 548370.1340935376,
+        "global_rescue_candidate_count": 8,
+        "global_rescue_candidate_pool": 4898,
+        "global_rescue_final_residual_fraction": 0.02894523243932895,
+        "global_rescue_initial_residual_fraction": 0.9844321732085121,
+        "method": "exhaustive_bic",
+        "mle_rescue_base_candidates": 0,
+        "mle_rescue_candidate_count": 12,
+        "mle_rescue_candidate_limit": 12,
+        "mle_rescue_enabled": true,
+        "mle_rescue_global_candidates": 8,
+        "mle_rescue_posterior_candidates": 0,
+        "mle_rescue_residual_candidates": 8,
+        "model_order_ready": true,
+        "particle_pruned_source_slots": 0,
+        "residual_candidate_best_score": 436.0071441211478,
+        "residual_candidate_count": 8,
+        "residual_candidate_pool": 4857,
+        "residual_fraction": 0.0289609719611923,
+        "residual_reference_sum": 1002066.6473839267,
+        "residual_sum": 29020.824078131875,
+        "selected_count": 2,
+        "selected_indices": [
+          0,
+          1
+        ],
+        "selected_max_response_correlation": 0.3917559125921816,
+        "workers": 32
+      }
+    },
+    "stages": {
+      "final_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              4.5,
+              1.5,
+              10.0
+            ],
+            "strength": 60275.81307313379
+          },
+          {
+            "pos": [
+              1.0,
+              14.0,
+              1.0
+            ],
+            "strength": 3926.104310703567
+          }
+        ]
+      },
+      "final_estimates_before_absent_filter": {
+        "Co-60": [],
+        "Cs-137": [
+          {
+            "pos": [
+              4.5,
+              1.5,
+              10.0
+            ],
+            "strength": 60275.81307313379
+          },
+          {
+            "pos": [
+              1.0,
+              14.0,
+              1.0
+            ],
+            "strength": 3926.104310703567
+          }
+        ],
+        "Eu-154": []
+      },
+      "legacy_pruned_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              4.5,
+              1.5,
+              10.0
+            ],
+            "strength": 60275.81307313379
+          },
+          {
+            "pos": [
+              1.0,
+              14.0,
+              1.0
+            ],
+            "strength": 3926.104310703567
+          }
+        ]
+      },
+      "llr_pruned_estimates": {
+        "Cs-137": [
+          {
+            "pos": [
+              4.5,
+              1.5,
+              10.0
+            ],
+            "strength": 60275.81307313379
+          },
+          {
+            "pos": [
+              1.0,
+              14.0,
+              1.0
+            ],
+            "strength": 3926.104310703567
+          }
+        ]
+      },
+      "raw_estimates": {
+        "Co-60": [],
+        "Cs-137": [
+          {
+            "pos": [
+              4.5,
+              1.5,
+              10.0
+            ],
+            "strength": 60275.81307313379
+          },
+          {
+            "pos": [
+              1.0,
+              14.0,
+              1.0
+            ],
+            "strength": 3926.104310703567
+          }
+        ],
+        "Eu-154": []
+      }
+    }
+  },
+  "ground_truth_sources": {
+    "Cs-137": [
+      {
+        "pos": [
+          9.073338,
+          0.303552,
+          10.0
+        ],
+        "strength": 30000.0
+      },
+      {
+        "pos": [
+          0.0,
+          9.214845,
+          0.180857
+        ],
+        "strength": 30000.0
+      },
+      {
+        "pos": [
+          8.799869,
+          3.070258,
+          10.0
+        ],
+        "strength": 30000.0
+      }
+    ]
+  },
+  "last_counts": {
+    "Co-60": 3.2185395722959505e-13,
+    "Cs-137": 13924.143576970653,
+    "Eu-154": 14.334227146490345
+  },
+  "last_remaining_measurement_estimate": {
+    "bottleneck": "residual",
+    "components": {
+      "cardinality": 2.5723494521962077e-34,
+      "pseudo_source_verification": 0.0,
+      "residual": 33444.43502744695,
+      "same_isotope_separation": 0.0,
+      "uncertainty": 0.0
+    },
+    "current_budget": 33444.43502744695,
+    "current_station_count": 8,
+    "empirical_eta": 0.3,
+    "estimated_remaining_spectra_high": 1584,
+    "estimated_remaining_spectra_low": 1168,
+    "estimated_remaining_station_high": 99,
+    "estimated_remaining_station_low": 73,
+    "estimated_remaining_stations": 99,
+    "gains": {
+      "dss_information": 0.17187441151913596,
+      "pseudo_source_verification": 16.0,
+      "residual": 0.9999662621179263,
+      "same_isotope_separation": 0.0,
+      "uncertainty": 0.17187441151913596
+    },
+    "isotope_details": {
+      "Cs-137": {
+        "cardinality_confidence": 1.0,
+        "cardinality_entropy": 2.5723494521962077e-34,
+        "cardinality_variance": 9.309643105129198e-36,
+        "map_source_count": 1,
+        "min_pairwise_separation": 0.0,
+        "mode_count": 1,
+        "required_verification_views": 2,
+        "residual_chi2": 301008.9152470225,
+        "strength_cv": 0.007754861948771003,
+        "tentative_source_expectation": 1.0,
+        "unresolved_pair_count": 0,
+        "verification_views": 5
+      }
+    },
+    "next_pose": [
+      5.5,
+      3.5,
+      0.5
+    ],
+    "planned_pairs": [
+      9,
+      54,
+      49,
+      9,
+      54,
+      49,
+      9,
+      54,
+      49,
+      9,
+      54,
+      49,
+      9,
+      54,
+      49,
+      9
+    ],
+    "predicted_gain": 17.59370665068568,
+    "program_length": 16,
+    "stop_budget": 0.0,
+    "unresolved_factors": [
+      "residual"
+    ]
+  },
+  "match_metrics": {
+    "isotopes": {
+      "Cs-137": {
+        "counts": {
+          "assigned": 2,
+          "est": 2,
+          "fn": 1,
+          "fp": 0,
+          "gt": 3,
+          "matched": 2,
+          "source_count_abs_error": 1,
+          "source_count_error": -1
+        },
+        "intensity_abs_error": {
+          "max": 30275.813073133788,
+          "mean": 28174.85438121511,
+          "median": 28174.85438121511
+        },
+        "intensity_rel_error_pct": {
+          "max": 100.91937691044596,
+          "mean": 93.91618127071703,
+          "median": 93.91618127071703
+        },
+        "matches": [
+          {
+            "abs_err": 26073.895689296434,
+            "distance": 4.956682724209206,
+            "est_index": 1,
+            "gt_index": 1,
+            "q_hat": 3926.104310703567,
+            "q_true": 30000.0,
+            "rel_err_pct": 86.91298563098812,
+            "within_radius": false
+          },
+          {
+            "abs_err": 30275.813073133788,
+            "distance": 4.577617677758267,
+            "est_index": 0,
+            "gt_index": 2,
+            "q_hat": 60275.81307313379,
+            "q_true": 30000.0,
+            "rel_err_pct": 100.91937691044596,
+            "within_radius": false
+          }
+        ],
+        "position_error": {
+          "max": 4.956682724209206,
+          "mean": 4.767150200983737,
+          "median": 4.767150200983737,
+          "rmse": 4.770916433569078,
+          "target_m": 0.5,
+          "within_target": false
+        },
+        "threshold_counts": {
+          "1m": {
+            "fn": 3,
+            "fp": 2,
+            "precision": 0.0,
+            "radius_m": 1.0,
+            "recall": 0.0,
+            "tp": 0
+          },
+          "2m": {
+            "fn": 3,
+            "fp": 2,
+            "precision": 0.0,
+            "radius_m": 2.0,
+            "recall": 0.0,
+            "tp": 0
+          },
+          "3m": {
+            "fn": 3,
+            "fp": 2,
+            "precision": 0.0,
+            "radius_m": 3.0,
+            "recall": 0.0,
+            "tp": 0
+          }
+        }
+      }
+    },
+    "match_radius_m": 0.5
+  },
+  "measurements_completed": 104,
+  "mission_metrics": {
+    "adaptive_dwell_chunk_s": 2.0,
+    "adaptive_dwell_enabled": false,
+    "adaptive_min_dwell_s": 2.0,
+    "adaptive_ready_min_counts": 100.0,
+    "adaptive_ready_min_isotopes": 1,
+    "adaptive_ready_min_snr": 0.0,
+    "display_prune_time_s": 140.2995813820453,
+    "dss_beam_width": 8,
+    "dss_differential_weight": 1.0,
+    "dss_environment_signature_weight": 2.0,
+    "dss_horizon": 2,
+    "dss_occlusion_boundary_weight": 1.0,
+    "dss_program_length": 8,
+    "dss_remaining_budget_guidance": true,
+    "dss_remaining_route_weight": 2.0,
+    "dss_rotation_weight": 0.15,
+    "dss_same_isotope_direct_separation_epsilon": 1e-09,
+    "dss_same_isotope_direct_separation_guard": true,
+    "dss_signature_weight": 2.0,
+    "estimated_end_to_end_time_s": 3326.1765645041196,
+    "estimated_motion_time_s": 154.17656450411965,
+    "estimated_rotation_time_s": 52.0,
+    "final_absent_isotope_filter": true,
+    "ig_compute_time_s": 0.9131687520130072,
+    "max_live_time_s": 30.0,
+    "max_orientation_selection_time_s": 0.18086862200289033,
+    "max_pf_update_time_s": 25.543540304246562,
+    "mean_live_time_s": 30.0,
+    "mean_orientation_selection_time_s": 0.1141460940016259,
+    "mean_pf_update_time_s": 7.865840481143655,
+    "measurement_live_times_s": [
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0,
+      30.0
+    ],
+    "measurement_time_cap_s": 30.0,
+    "min_live_time_s": 30.0,
+    "mission_stop_require_model_order_ready": true,
+    "nominal_motion_speed_m_s": 0.5,
+    "num_motion_segments": 8,
+    "path_planner": "dss_pp",
+    "pf_compute_time_s": 818.0474100389401,
+    "pf_obstacle_attenuation": true,
+    "pf_obstacle_grid_active": true,
+    "prune_time_s": 140.2995813820453,
+    "rotation_overhead_s_per_measurement": 0.5,
+    "total_compute_time_s": 960.7644319658866,
+    "total_live_time_s": 3120.0,
+    "total_measurements": 104,
+    "total_mission_time_s": 3326.1765645041196,
+    "total_motion_distance_m": 77.08828225205983,
+    "total_move_measure_time_s": 3326.1765645041196,
+    "total_shield_actuation_time_s": 52.0,
+    "total_travel_time_s": 154.17656450411965,
+    "viz_time_s": 1.5042717928881757,
+    "wall_clock_runtime_s": 2423.1741573190084
+  },
+  "output_paths": {
+    "cui_pf_3d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_pf_3d.png",
+    "cui_robot_2d_latest": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/latest_robot_2d.png",
+    "cui_split_view": "/home/moeu/research/Rotating-shield-particle-filter/results/cui_view/latest/index.html",
+    "estimates_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_estimates_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.png",
+    "intermediate_estimate_trace_jsonl": "/home/moeu/research/Rotating-shield-particle-filter/results/estimate_traces/intermediate_estimates_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.jsonl",
+    "last_spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_last_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.png",
+    "pf_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_pf_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.png",
+    "spectrum_plot": "/home/moeu/research/Rotating-shield-particle-filter/results/result_spectrum_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.png",
+    "summary_json": "/home/moeu/research/Rotating-shield-particle-filter/results/result_summary_case02_three_cs_proposed_random_env2026052501_src2026052518_full_30s.json"
+  },
+  "pf_obstacle_diagnostics": {
+    "environment_obstacles_active": true,
+    "obstacle_buildup_coeff": 0.0,
+    "pf_obstacle_attenuation_active": true,
+    "pf_obstacle_grid_active": true
+  },
+  "random_source_visibility": {
+    "enabled": false,
+    "reference_point_count": 0
+  },
+  "remaining_measurement_estimates": [
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 1.5809372138318174,
+        "pseudo_source_verification": 0.0,
+        "residual": 12542.40788191724,
+        "same_isotope_separation": 8.735250332485904,
+        "uncertainty": 0.07334944672199839
+      },
+      "current_budget": 12557.165044076522,
+      "current_station_count": 1,
+      "empirical_eta": 0.7,
+      "estimated_remaining_spectra_high": 16,
+      "estimated_remaining_spectra_low": 8,
+      "estimated_remaining_station_high": 2,
+      "estimated_remaining_station_low": 1,
+      "estimated_remaining_stations": 1,
+      "gains": {
+        "dss_information": 24.188784943094742,
+        "pseudo_source_verification": 8.0,
+        "residual": 1.0,
+        "same_isotope_separation": 110381.18657922864,
+        "uncertainty": 24.188784943094742
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.40368065423409344,
+          "cardinality_entropy": 1.0846178680659109,
+          "cardinality_variance": 0.6524095569166914,
+          "map_source_count": 3,
+          "min_pairwise_separation": 0.011477541981197601,
+          "mode_count": 4,
+          "required_verification_views": 2,
+          "residual_chi2": 112890.67093725516,
+          "strength_cv": 0.5366747233609992,
+          "tentative_source_expectation": 0.0,
+          "unresolved_pair_count": 6,
+          "verification_views": 8
+        }
+      },
+      "next_pose": [
+        0.43252671137452126,
+        17.958826832473278,
+        0.5
+      ],
+      "planned_pairs": [
+        0,
+        56,
+        45,
+        1,
+        2,
+        3,
+        4,
+        6
+      ],
+      "predicted_gain": 165629.4074387292,
+      "program_length": 8,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "cardinality",
+        "residual",
+        "same_isotope_separation",
+        "uncertainty"
+      ]
+    },
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 2.3285351409118296e-11,
+        "pseudo_source_verification": 0.0,
+        "residual": 15.814368348238752,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "current_budget": 15.814368348262036,
+      "current_station_count": 2,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 32,
+      "estimated_remaining_spectra_low": 16,
+      "estimated_remaining_station_high": 2,
+      "estimated_remaining_station_low": 1,
+      "estimated_remaining_stations": 1,
+      "gains": {
+        "dss_information": 14.843945916930004,
+        "pseudo_source_verification": 16.0,
+        "residual": 1.0,
+        "same_isotope_separation": 132614.06510216833,
+        "uncertainty": 14.843945916930004
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.9999999999991868,
+          "cardinality_entropy": 2.3285351409118296e-11,
+          "cardinality_variance": 8.132928909603562e-13,
+          "map_source_count": 3,
+          "min_pairwise_separation": 365.5231571077787,
+          "mode_count": 4,
+          "required_verification_views": 2,
+          "residual_chi2": 151.32931513414877,
+          "strength_cv": 0.3163126951092254,
+          "tentative_source_expectation": 1.9840104421584124,
+          "unresolved_pair_count": 0,
+          "verification_views": 10
+        }
+      },
+      "next_pose": [
+        2.5,
+        10.5,
+        0.5
+      ],
+      "planned_pairs": [
+        0,
+        1,
+        5,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "predicted_gain": 198968.0355450863,
+      "program_length": 16,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "residual"
+      ]
+    },
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 2.8501231641556174e-05,
+        "pseudo_source_verification": 0.0,
+        "residual": 656.32120363192,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "current_budget": 656.3212321331516,
+      "current_station_count": 3,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 16,
+      "estimated_remaining_spectra_low": 8,
+      "estimated_remaining_station_high": 2,
+      "estimated_remaining_station_low": 1,
+      "estimated_remaining_stations": 1,
+      "gains": {
+        "dss_information": 9.871952986059558,
+        "pseudo_source_verification": 8.0,
+        "residual": 1.0,
+        "same_isotope_separation": 818593.5673233527,
+        "uncertainty": 9.871952986059558
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.9999979804454271,
+          "cardinality_entropy": 2.8501231641556174e-05,
+          "cardinality_variance": 2.0195504943035646e-06,
+          "map_source_count": 2,
+          "min_pairwise_separation": 441.9475948802025,
+          "mode_count": 4,
+          "required_verification_views": 2,
+          "residual_chi2": 5915.89083268728,
+          "strength_cv": 0.08703629375981028,
+          "tentative_source_expectation": 0.0,
+          "unresolved_pair_count": 0,
+          "verification_views": 10
+        }
+      },
+      "next_pose": [
+        9.5,
+        12.5,
+        0.5
+      ],
+      "planned_pairs": [
+        0,
+        1,
+        11,
+        8,
+        10,
+        12,
+        13,
+        14
+      ],
+      "predicted_gain": 1227919.3448910012,
+      "program_length": 8,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "cardinality",
+        "residual"
+      ]
+    },
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 8.762359014528194e-23,
+        "pseudo_source_verification": 0.0,
+        "residual": 18531.245779271932,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "current_budget": 18531.245779271932,
+      "current_station_count": 4,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 1584,
+      "estimated_remaining_spectra_low": 1168,
+      "estimated_remaining_station_high": 99,
+      "estimated_remaining_station_low": 73,
+      "estimated_remaining_stations": 99,
+      "gains": {
+        "dss_information": 4.590518815286102e-07,
+        "pseudo_source_verification": 16.0,
+        "residual": 1.0,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 4.590518815286102e-07
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 1.0,
+          "cardinality_entropy": 8.762359014528194e-23,
+          "cardinality_variance": 3.1712034737208054e-24,
+          "map_source_count": 1,
+          "min_pairwise_separation": 0.0,
+          "mode_count": 1,
+          "required_verification_views": 2,
+          "residual_chi2": 166790.2120134474,
+          "strength_cv": 1.6364601190788908e-07,
+          "tentative_source_expectation": 4.318994239001737e-27,
+          "unresolved_pair_count": 0,
+          "verification_views": 10
+        }
+      },
+      "next_pose": [
+        8.204235939355499,
+        8.379865432359722,
+        0.5
+      ],
+      "planned_pairs": [
+        45,
+        18,
+        21,
+        45,
+        18,
+        21,
+        45,
+        18,
+        21,
+        45,
+        18,
+        21,
+        45,
+        18,
+        21,
+        45
+      ],
+      "predicted_gain": 17.250000918103765,
+      "program_length": 16,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "residual"
+      ]
+    },
+    {
+      "bottleneck": "uncertainty",
+      "components": {
+        "cardinality": 0.004389753699703476,
+        "pseudo_source_verification": 0.0,
+        "residual": 0.0,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 87.38434730318254
+      },
+      "current_budget": 87.38873705688223,
+      "current_station_count": 5,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 352,
+      "estimated_remaining_spectra_low": 184,
+      "estimated_remaining_station_high": 44,
+      "estimated_remaining_station_low": 23,
+      "estimated_remaining_stations": 32,
+      "gains": {
+        "dss_information": 0.0,
+        "pseudo_source_verification": 8.0,
+        "residual": 0.9649446005089954,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.9994882157091822,
+          "cardinality_entropy": 0.004389753699703476,
+          "cardinality_variance": 0.0005115223676575001,
+          "map_source_count": 0,
+          "min_pairwise_separation": 0.0,
+          "mode_count": 0,
+          "required_verification_views": 2,
+          "residual_chi2": 0.0,
+          "strength_cv": 44.19217365159127,
+          "tentative_source_expectation": 0.0005117842908178281,
+          "unresolved_pair_count": 0,
+          "verification_views": 3
+        }
+      },
+      "next_pose": [
+        5.017664809765013,
+        13.75,
+        0.5
+      ],
+      "planned_pairs": [
+        9,
+        54,
+        49,
+        9,
+        54,
+        49,
+        9,
+        54
+      ],
+      "predicted_gain": 9.206180750636245,
+      "program_length": 8,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "cardinality",
+        "uncertainty"
+      ]
+    },
+    {
+      "bottleneck": "uncertainty",
+      "components": {
+        "cardinality": 0.0016868241536838115,
+        "pseudo_source_verification": 0.0,
+        "residual": 0.0,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 150.27439660463654
+      },
+      "current_budget": 150.27608342879023,
+      "current_station_count": 6,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 704,
+      "estimated_remaining_spectra_low": 368,
+      "estimated_remaining_station_high": 44,
+      "estimated_remaining_station_low": 23,
+      "estimated_remaining_stations": 32,
+      "gains": {
+        "dss_information": 0.0,
+        "pseudo_source_verification": 16.0,
+        "residual": 0.0,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.999825235496781,
+          "cardinality_entropy": 0.0016868241536838115,
+          "cardinality_variance": 0.0001747339605873839,
+          "map_source_count": 0,
+          "min_pairwise_separation": 0.0,
+          "mode_count": 0,
+          "required_verification_views": 2,
+          "residual_chi2": 0.0,
+          "strength_cv": 75.63719830231827,
+          "tentative_source_expectation": 0.00017476450321896937,
+          "unresolved_pair_count": 0,
+          "verification_views": 5
+        }
+      },
+      "next_pose": [
+        5.5,
+        18.5,
+        0.5
+      ],
+      "planned_pairs": [
+        54,
+        9,
+        14,
+        54,
+        9,
+        14,
+        54,
+        9,
+        14,
+        54,
+        9,
+        14,
+        54,
+        9,
+        14,
+        54
+      ],
+      "predicted_gain": 16.0,
+      "program_length": 16,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "cardinality",
+        "uncertainty"
+      ]
+    },
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 0.0016868247001668474,
+        "pseudo_source_verification": 0.0,
+        "residual": 32710.44605607602,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 150.27436926307624
+      },
+      "current_budget": 32860.7221121638,
+      "current_station_count": 7,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 792,
+      "estimated_remaining_spectra_low": 584,
+      "estimated_remaining_station_high": 99,
+      "estimated_remaining_station_low": 73,
+      "estimated_remaining_stations": 99,
+      "gains": {
+        "dss_information": 12.717562557870865,
+        "pseudo_source_verification": 8.0,
+        "residual": 0.0,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 12.717562557870865
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 0.9998252354336177,
+          "cardinality_entropy": 0.0016868247001668474,
+          "cardinality_variance": 0.00017473402372867726,
+          "map_source_count": 0,
+          "min_pairwise_separation": 0.0,
+          "mode_count": 1,
+          "required_verification_views": 2,
+          "residual_chi2": 294403.0145046842,
+          "strength_cv": 75.63718463153812,
+          "tentative_source_expectation": 0.00017476456638234009,
+          "unresolved_pair_count": 0,
+          "verification_views": 3
+        }
+      },
+      "next_pose": [
+        9.749840162694454,
+        18.11352901160717,
+        0.5
+      ],
+      "planned_pairs": [
+        54,
+        9,
+        14,
+        54,
+        9,
+        14,
+        54,
+        9
+      ],
+      "predicted_gain": 33.43512511574173,
+      "program_length": 8,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "cardinality",
+        "residual",
+        "uncertainty"
+      ]
+    },
+    {
+      "bottleneck": "residual",
+      "components": {
+        "cardinality": 2.5723494521962077e-34,
+        "pseudo_source_verification": 0.0,
+        "residual": 33444.43502744695,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.0
+      },
+      "current_budget": 33444.43502744695,
+      "current_station_count": 8,
+      "empirical_eta": 0.3,
+      "estimated_remaining_spectra_high": 1584,
+      "estimated_remaining_spectra_low": 1168,
+      "estimated_remaining_station_high": 99,
+      "estimated_remaining_station_low": 73,
+      "estimated_remaining_stations": 99,
+      "gains": {
+        "dss_information": 0.17187441151913596,
+        "pseudo_source_verification": 16.0,
+        "residual": 0.9999662621179263,
+        "same_isotope_separation": 0.0,
+        "uncertainty": 0.17187441151913596
+      },
+      "isotope_details": {
+        "Cs-137": {
+          "cardinality_confidence": 1.0,
+          "cardinality_entropy": 2.5723494521962077e-34,
+          "cardinality_variance": 9.309643105129198e-36,
+          "map_source_count": 1,
+          "min_pairwise_separation": 0.0,
+          "mode_count": 1,
+          "required_verification_views": 2,
+          "residual_chi2": 301008.9152470225,
+          "strength_cv": 0.007754861948771003,
+          "tentative_source_expectation": 1.0,
+          "unresolved_pair_count": 0,
+          "verification_views": 5
+        }
+      },
+      "next_pose": [
+        5.5,
+        3.5,
+        0.5
+      ],
+      "planned_pairs": [
+        9,
+        54,
+        49,
+        9,
+        54,
+        49,
+        9,
+        54,
+        49,
+        9,
+        54,
+        49,
+        9,
+        54,
+        49,
+        9
+      ],
+      "predicted_gain": 17.59370665068568,
+      "program_length": 16,
+      "stop_budget": 0.0,
+      "unresolved_factors": [
+        "residual"
+      ]
+    }
+  ],
+  "sim_config_path": "results/ral_ablation_case02_random_2026052501/configs/case02_three_cs_proposed_seed_2026052501.json",
+  "source_surface_diagnostics": {
+    "candidate_grid": {
+      "off_surface_count": 0,
+      "surface_counts": {
+        "ceiling": 861,
+        "floor": 605,
+        "obstacle_side": 896,
+        "obstacle_top": 256,
+        "off_surface": 0,
+        "wall": 2280
+      },
+      "total_candidates": 4898
+    },
+    "estimated_sources": {
+      "Cs-137": {
+        "off_surface_count": 0,
+        "surface_counts": {
+          "ceiling": 1,
+          "floor": 0,
+          "obstacle_side": 1,
+          "obstacle_top": 0,
+          "off_surface": 0,
+          "wall": 0
+        },
+        "total_sources": 2
+      }
+    },
+    "particles": {
+      "Cs-137": {
+        "off_surface_count": 0,
+        "particles": 6130,
+        "raw_source_slots": 0,
+        "report_excluded_source_slots": 0,
+        "report_visible_source_slots": 0,
+        "surface_counts": {
+          "ceiling": 0,
+          "floor": 0,
+          "obstacle_side": 0,
+          "obstacle_top": 0,
+          "off_surface": 0,
+          "wall": 0
+        },
+        "weighted_off_surface_mass": 0.0,
+        "weighted_surface_mass": {
+          "ceiling": 0.0,
+          "floor": 0.0,
+          "obstacle_side": 0.0,
+          "obstacle_top": 0.0,
+          "off_surface": 0.0,
+          "wall": 0.0
+        }
+      }
+    },
+    "source_surface_prior_active": true
+  }
+}

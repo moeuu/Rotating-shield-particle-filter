@@ -835,3 +835,256 @@ def expected_counts_all_pairs_torch(
         + backgrounds.unsqueeze(0)
     )
     return live_time_s * rate
+
+
+def expected_counts_selected_pairs_torch(
+    detector_pos: np.ndarray,
+    positions: "torch.Tensor",
+    strengths: "torch.Tensor",
+    backgrounds: "torch.Tensor",
+    mask: "torch.Tensor",
+    fe_indices: np.ndarray | "torch.Tensor",
+    pb_indices: np.ndarray | "torch.Tensor",
+    mu_fe: float,
+    mu_pb: float,
+    thickness_fe_cm: float,
+    thickness_pb_cm: float,
+    live_time_s: float,
+    device: "torch.device",
+    dtype: "torch.dtype",
+    use_angle_attenuation: bool = False,
+    source_scale: float = 1.0,
+    inner_radius_fe_cm: float = DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
+    inner_radius_pb_cm: float = DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
+    shield_geometry_model: str = SHIELD_GEOMETRY_SPHERICAL_OCTANT,
+    obstacle_boxes_m: np.ndarray | "torch.Tensor" | None = None,
+    obstacle_mu_cm_inv: float = 0.0,
+    obstacle_mu_cm_inv_by_box: np.ndarray | "torch.Tensor" | None = None,
+    detector_radius_m: float = 0.0,
+    detector_aperture_samples: int = 1,
+    buildup_fe_coeff: float = 0.0,
+    buildup_pb_coeff: float = 0.0,
+    obstacle_buildup_coeff: float = 0.0,
+    obstacle_box_chunk_size: int = 64,
+    tol: float = 1e-6,
+) -> "torch.Tensor":
+    """Compute expected counts only for the requested Fe/Pb orientation pairs."""
+    if torch is None:
+        raise RuntimeError("torch is not available")
+    normals_np = generate_octant_orientations()
+    num_orients = int(normals_np.shape[0])
+    fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+    pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+    if fe_arr.size != pb_arr.size:
+        raise ValueError("Fe and Pb index arrays must have matching lengths.")
+    if fe_arr.size == 0:
+        return torch.zeros((0, int(positions.shape[0])), device=device, dtype=dtype)
+    fe_arr = np.mod(fe_arr, num_orients)
+    pb_arr = np.mod(pb_arr, num_orients)
+
+    detector = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 1, 3)
+    direction = detector - positions
+    dist = torch.linalg.norm(direction, dim=-1)
+    dist = torch.where(dist <= tol, torch.full_like(dist, tol), dist)
+    if float(detector_radius_m) > 0.0 and int(detector_aperture_samples) > 1:
+        sample_count = max(int(detector_aperture_samples), 1)
+        axis = direction / dist.unsqueeze(-1)
+        helper_z = torch.zeros_like(axis)
+        helper_z[..., 2] = 1.0
+        helper_y = torch.zeros_like(axis)
+        helper_y[..., 1] = 1.0
+        helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
+        basis_u = torch.linalg.cross(axis, helper, dim=-1)
+        basis_u_norm = torch.linalg.norm(basis_u, dim=-1, keepdim=True)
+        basis_u = basis_u / torch.clamp(basis_u_norm, min=tol)
+        basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
+        indices = torch.arange(sample_count, device=device, dtype=dtype)
+        if sample_count == 1:
+            radii = torch.zeros(1, device=device, dtype=dtype)
+        else:
+            fractions = torch.clamp(
+                (indices - 0.5) / float(sample_count - 1),
+                min=0.0,
+                max=1.0,
+            )
+            radii = torch.sqrt(fractions)
+            radii[0] = 0.0
+        max_radius = torch.minimum(
+            torch.as_tensor(
+                max(float(detector_radius_m), 0.0),
+                device=device,
+                dtype=dtype,
+            ),
+            0.95 * dist,
+        )
+        angles = indices * torch.as_tensor(
+            np.pi * (3.0 - np.sqrt(5.0)),
+            device=device,
+            dtype=dtype,
+        )
+        offsets = (
+            max_radius.unsqueeze(-1).unsqueeze(-1)
+            * radii.view(*([1] * dist.ndim), sample_count, 1)
+            * (
+                torch.cos(angles).view(*([1] * dist.ndim), sample_count, 1)
+                * basis_u.unsqueeze(-2)
+                + torch.sin(angles).view(*([1] * dist.ndim), sample_count, 1)
+                * basis_v.unsqueeze(-2)
+            )
+        )
+        targets = detector.unsqueeze(-2) + offsets
+        sampled_positions = positions.unsqueeze(-2).expand_as(targets)
+        sampled_direction = targets - sampled_positions
+        sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
+        sampled_dist = torch.where(
+            sampled_dist <= tol,
+            torch.full_like(sampled_dist, tol),
+            sampled_dist,
+        )
+        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+    else:
+        sample_count = 1
+        targets = detector.expand_as(positions).unsqueeze(-2)
+        sampled_positions = positions.unsqueeze(-2)
+        sampled_direction = direction.unsqueeze(-2)
+        dir_unit = direction / dist.unsqueeze(-1)
+        dir_unit = dir_unit.unsqueeze(-2)
+
+    geom = _finite_sphere_geometric_term_torch(
+        dist,
+        detector_radius_m=detector_radius_m,
+        tol=tol,
+    )
+    detector_to_source_unit = -dir_unit
+    normals = torch.as_tensor(normals_np, device=device, dtype=dtype)
+    thickness_fe = torch.as_tensor(thickness_fe_cm, device=device, dtype=dtype)
+    thickness_pb = torch.as_tensor(thickness_pb_cm, device=device, dtype=dtype)
+    unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
+    path_lengths: dict[int, tuple["torch.Tensor", "torch.Tensor"]] = {}
+    for orient_idx in unique_orients:
+        orient_int = int(orient_idx)
+        blocked = _rotated_positive_octant_mask_torch(
+            detector_to_source_unit,
+            orient_int,
+            device=device,
+            dtype=dtype,
+            tol=tol,
+        )
+        normal = normals[orient_int]
+        cos_theta = torch.clamp(torch.sum(dir_unit * normal, dim=-1), 0.0, 1.0)
+        if shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT and not use_angle_attenuation:
+            normal_np = -np.asarray(normals_np[orient_int], dtype=float)
+            if sample_count > 1:
+                center = detector.expand_as(positions).unsqueeze(-2)
+                l_fe = _segment_rotated_octant_shell_length_cm_torch(
+                    sampled_positions,
+                    targets,
+                    center,
+                    normal_np,
+                    inner_radius_fe_cm,
+                    inner_radius_fe_cm + thickness_fe_cm,
+                    device,
+                    dtype,
+                    tol,
+                )
+                l_pb = _segment_rotated_octant_shell_length_cm_torch(
+                    sampled_positions,
+                    targets,
+                    center,
+                    normal_np,
+                    inner_radius_pb_cm,
+                    inner_radius_pb_cm + thickness_pb_cm,
+                    device,
+                    dtype,
+                    tol,
+                )
+            else:
+                center = detector.expand_as(positions)
+                target = detector.expand_as(positions)
+                l_fe = _segment_rotated_octant_shell_length_cm_torch(
+                    positions,
+                    target,
+                    center,
+                    normal_np,
+                    inner_radius_fe_cm,
+                    inner_radius_fe_cm + thickness_fe_cm,
+                    device,
+                    dtype,
+                    tol,
+                ).unsqueeze(-1)
+                l_pb = _segment_rotated_octant_shell_length_cm_torch(
+                    positions,
+                    target,
+                    center,
+                    normal_np,
+                    inner_radius_pb_cm,
+                    inner_radius_pb_cm + thickness_pb_cm,
+                    device,
+                    dtype,
+                    tol,
+                ).unsqueeze(-1)
+        elif use_angle_attenuation:
+            l_fe = torch.where(
+                blocked & (cos_theta > tol),
+                thickness_fe / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+            l_pb = torch.where(
+                blocked & (cos_theta > tol),
+                thickness_pb / cos_theta,
+                torch.zeros_like(cos_theta),
+            )
+        else:
+            l_fe = torch.where(blocked, thickness_fe, torch.zeros_like(cos_theta))
+            l_pb = torch.where(blocked, thickness_pb, torch.zeros_like(cos_theta))
+        path_lengths[orient_int] = (l_fe, l_pb)
+
+    l_fe_pairs = torch.stack([path_lengths[int(idx)][0] for idx in fe_arr], dim=0)
+    l_pb_pairs = torch.stack([path_lengths[int(idx)][1] for idx in pb_arr], dim=0)
+    tau_fe = float(mu_fe) * l_fe_pairs
+    tau_pb = float(mu_pb) * l_pb_pairs
+    tau_obstacle = torch.zeros_like(sampled_direction[..., 0])
+    if obstacle_boxes_m is not None and (
+        obstacle_mu_cm_inv_by_box is not None or float(obstacle_mu_cm_inv) > 0.0
+    ):
+        boxes_t = torch.as_tensor(obstacle_boxes_m, device=device, dtype=dtype)
+        if boxes_t.numel() > 0:
+            tau_obstacle = _obstacle_tau_between_points_cm_torch(
+                sampled_positions,
+                targets,
+                boxes_t,
+                obstacle_mu_cm_inv,
+                obstacle_mu_cm_inv_by_box,
+                device=device,
+                dtype=dtype,
+                tol=tol,
+                chunk_size=obstacle_box_chunk_size,
+            )
+    tau_obstacle_pairs = tau_obstacle.unsqueeze(0)
+    buildup = torch.ones_like(tau_fe)
+    buildup = buildup + max(float(buildup_fe_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0))
+    )
+    buildup = buildup + max(float(buildup_pb_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0))
+    )
+    buildup = buildup + max(float(obstacle_buildup_coeff), 0.0) * (
+        1.0 - torch.exp(-torch.clamp(tau_obstacle_pairs, min=0.0))
+    )
+    att = torch.clamp(
+        torch.exp(-(tau_fe + tau_pb + tau_obstacle_pairs)) * buildup,
+        max=1.0,
+    )
+    att = torch.mean(att, dim=-1)
+    strengths_masked = strengths * mask
+    source_scale_t = torch.as_tensor(
+        max(float(source_scale), 0.0),
+        device=device,
+        dtype=dtype,
+    )
+    rate = (
+        source_scale_t
+        * torch.sum(geom.unsqueeze(0) * att * strengths_masked.unsqueeze(0), dim=-1)
+        + backgrounds.unsqueeze(0)
+    )
+    return live_time_s * rate

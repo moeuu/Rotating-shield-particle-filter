@@ -11,6 +11,7 @@ from scipy.special import logsumexp
 from scipy.stats import poisson
 
 from baselines.anderson.kernels import AndersonAttenuationKernel
+from runtime_defaults import DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,9 @@ class AndersonFilterConfig:
     num_sources: int = 1
     position_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: tuple[float, float, float] = (10.0, 20.0, 10.0)
-    init_activity_log_mean: float = float(np.log(30000.0))
+    init_activity_log_mean: float = float(
+        np.log(DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M)
+    )
     init_activity_log_sigma: float = 1.5
     min_activity_cps_1m: float = 1.0
     max_activity_cps_1m: float = 5.0e6

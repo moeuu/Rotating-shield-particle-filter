@@ -293,6 +293,25 @@ class Geant4Application:
         )
         metadata = dict(metadata)
         metadata.setdefault("cache_hit", self._last_cache_hit)
+        metadata.setdefault("fe_orientation_index", int(command.fe_orientation_index))
+        metadata.setdefault("pb_orientation_index", int(command.pb_orientation_index))
+        metadata.setdefault("shield_num_orientations", 8)
+        metadata.setdefault(
+            "shield_pair_id",
+            int(command.fe_orientation_index) * 8 + int(command.pb_orientation_index),
+        )
+        metadata.setdefault(
+            "shield_thickness_scale",
+            float(self.config.shield_thickness.thickness_scale),
+        )
+        metadata.setdefault(
+            "shield_thickness_fe_cm",
+            float(self.config.shield_thickness.thickness_fe_cm),
+        )
+        metadata.setdefault(
+            "shield_thickness_pb_cm",
+            float(self.config.shield_thickness.thickness_pb_cm),
+        )
         energy = self._decomposer.energy_axis
         bin_width_keV = float(self._decomposer.config.bin_width_keV)
         edges = list(energy) + [float(energy[-1] + bin_width_keV)]

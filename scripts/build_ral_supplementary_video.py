@@ -87,13 +87,13 @@ def discover_storyboard_segments(root: Path = ROOT) -> list[VideoSegment]:
             image_path=figure_root / "geant4_obstacle_scatter.png",
         ),
         VideoSegment(
-            title="Obstacle-cluttered PF output",
+            title="MIX-9 PF output",
             caption=(
                 "The final figure summarizes source-term estimates, ground truth, "
-                "and the robot trajectory for the cluttered pilot run."
+                "PF support, and the robot trajectory for the main multi-isotope run."
             ),
             image_path=latex_root
-            / "sections/05_experiments/figures/ral_obstacle_case01_estimates_plot.png",
+            / "sections/05_experiments/figures/ral_result_overview.png",
         ),
     ]
     return [segment for segment in candidates if segment.image_path.exists()]

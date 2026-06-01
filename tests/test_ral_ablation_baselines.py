@@ -15,6 +15,11 @@ from baselines.ral_ablation.config_factory import (
 )
 from baselines.ral_ablation.path_policies import select_baseline_next_pose
 from baselines.ral_ablation.shield_policies import select_baseline_shield_program
+from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
+from pf.estimator import RotatingShieldPFConfig
+from pf.particle_filter import PFConfig
+from realtime_demo import _resolve_rotation_limit_for_active_program
+from runtime_defaults import DEFAULT_MEASUREMENT_TIME_S, DEFAULT_NO_ROTATION_OVERHEAD_S
 
 
 def test_fixed_shield_policy_repeats_one_pair() -> None:
@@ -29,6 +34,12 @@ def test_fixed_shield_policy_repeats_one_pair() -> None:
     assert program.pair_ids == (7,) * 8
 
 
+def test_pf_max_sources_default_is_shared() -> None:
+    """PF entry points should use one shared default source-count support."""
+    assert RotatingShieldPFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
+    assert PFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
+
+
 def test_round_robin_shield_policy_advances_by_pose() -> None:
     """Round-robin ablation should produce deterministic non-adaptive programs."""
     program = select_baseline_shield_program(
@@ -39,6 +50,37 @@ def test_round_robin_shield_policy_advances_by_pose() -> None:
     )
     assert program is not None
     assert program.pair_ids == (6, 7, 0, 1)
+
+
+def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> None:
+    """Baseline shield programs should not be padded by adaptive shield selection."""
+    assert (
+        _resolve_rotation_limit_for_active_program(
+            base_rotation_limit=8,
+            active_shield_program=(2, 3),
+            strict_planned_shield_program=False,
+            baseline_shield_policy={"name": "round_robin"},
+        )
+        == 2
+    )
+    assert (
+        _resolve_rotation_limit_for_active_program(
+            base_rotation_limit=8,
+            active_shield_program=(2, 3),
+            strict_planned_shield_program=True,
+            baseline_shield_policy=None,
+        )
+        == 2
+    )
+    assert (
+        _resolve_rotation_limit_for_active_program(
+            base_rotation_limit=8,
+            active_shield_program=(2, 3),
+            strict_planned_shield_program=False,
+            baseline_shield_policy=None,
+        )
+        == 8
+    )
 
 
 def test_passive_serpentine_path_policy_selects_candidate_near_waypoint() -> None:
@@ -78,12 +120,34 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "proposed" in by_variant
     assert "fixed_shield" in by_variant
     assert "baseline_passive_no_shield" in by_variant
+    assert "baseline_passive_equal_time_no_shield" in by_variant
     assert "baseline_passive_fixed_shield_single_view" in by_variant
     assert "baseline_onestep_fixed_shield" in by_variant
+    assert "eig_only_path" in by_variant
+    assert "no_verification" in by_variant
     assert "no_obstacle_signature" in by_variant
     assert "no_pf_obstacle_attenuation" in by_variant
     assert "volume_source_prior" in by_variant
     fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
+    proposed_config = json.loads(by_variant["proposed"].config_path.read_text())
+    round_robin = json.loads(by_variant["round_robin_shield"].config_path.read_text())
+    assert round_robin["orientation_k"] == proposed_config["orientation_k"]
+    assert (
+        round_robin["min_rotations_per_pose"]
+        == proposed_config["min_rotations_per_pose"]
+    )
+    assert (
+        round_robin["dss_pp"]["program_length"]
+        == proposed_config["dss_pp"]["program_length"]
+    )
+    assert (
+        round_robin["dss_pp"]["residual_program_length"]
+        == proposed_config["dss_pp"]["residual_program_length"]
+    )
+    assert round_robin["strict_planned_shield_program"] is True
+    assert round_robin["dss_pp"]["adaptive_program_length_enable"] is False
+    assert round_robin["baseline_shield_policy"]["name"] == "round_robin"
+    assert "baseline_path_policy" not in round_robin
     assert fixed_config["baseline_shield_policy"]["name"] == "fixed"
     assert fixed_config["cui_split_view_dir"] == DEFAULT_CUI_SPLIT_VIEW_DIR
     assert fixed_config["usd_path"].endswith("/configs/isaacsim/demo_room.usda")
@@ -117,7 +181,13 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert volume_prior["source_surface_prior"] is False
     no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
     assert no_birth["birth_max_per_update"] == 0
-    assert no_birth["pf_max_sources"] == DEFAULT_ABLATION_CASES[0].max_sources
+    assert no_birth.get("pf_max_sources") is None
+    assert no_birth["birth_residual_always_try"] is False
+    assert no_birth["birth_global_rescue_enable"] is False
+    assert no_birth["report_mle_rescue_enable"] is False
+    assert no_birth["runtime_report_rescue_enable"] is False
+    assert no_birth["runtime_report_rescue_candidate_weight"] == 0.0
+    assert no_birth["runtime_report_rescue_memory_enable"] is False
     passive_no_shield = json.loads(
         by_variant["baseline_passive_no_shield"].config_path.read_text()
     )
@@ -135,6 +205,37 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert passive_no_shield["parallel_isotope_updates"] is True
     assert passive_no_shield["parallel_isotope_workers"] >= 1
     assert passive_no_shield["dss_pp"]["program_eval_workers"] >= 1
+    passive_equal_time = json.loads(
+        by_variant["baseline_passive_equal_time_no_shield"].config_path.read_text()
+    )
+    assert passive_equal_time["shield_transmission_target"] == 1.0
+    assert passive_equal_time["shield_thickness_scale"] == 0.0
+    assert passive_equal_time["orientation_k"] == proposed_config["orientation_k"]
+    assert (
+        passive_equal_time["min_rotations_per_pose"]
+        == proposed_config["min_rotations_per_pose"]
+    )
+    assert (
+        passive_equal_time["dss_pp"]["program_length"]
+        == proposed_config["dss_pp"]["program_length"]
+    )
+    assert (
+        passive_equal_time["dss_pp"]["residual_program_length"]
+        == proposed_config["dss_pp"]["residual_program_length"]
+    )
+    assert passive_equal_time["baseline_path_policy"]["name"] == "passive_serpentine"
+    assert passive_equal_time["baseline_shield_policy"]["name"] == "fixed"
+    eig_only = json.loads(by_variant["eig_only_path"].config_path.read_text())
+    assert eig_only["dss_pp"]["signature_weight"] == 0.0
+    assert eig_only["dss_pp"]["temporal_separation_weight"] == 0.0
+    assert eig_only["dss_pp"]["environment_signature_weight"] == 0.0
+    assert eig_only["dss_pp"]["elevation_signature_weight"] == 0.0
+    assert eig_only["dss_pp"]["correlation_reduction_weight"] == 0.0
+    assert eig_only["dss_pp"]["same_isotope_direct_separation_guard"] is False
+    no_verification = json.loads(by_variant["no_verification"].config_path.read_text())
+    assert no_verification["pseudo_source_verification_enable"] is False
+    assert no_verification["source_prune_refit_after_remove"] is False
+    assert no_verification["report_strength_refit_preserve_cardinality"] is True
     single_view = json.loads(
         by_variant["baseline_passive_fixed_shield_single_view"].config_path.read_text()
     )
@@ -149,10 +250,12 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert one_step_fixed["path_planner"] == "one_step"
     assert one_step_fixed["baseline_shield_policy"]["name"] == "fixed"
+    assert "one_step_pose_eval_use_gpu" not in one_step_fixed
     one_step_no_shield = json.loads(
         by_variant["baseline_onestep_no_shield"].config_path.read_text()
     )
     assert one_step_no_shield["path_planner"] == "one_step"
+    assert "one_step_pose_eval_use_gpu" not in one_step_no_shield
     assert one_step_no_shield["shield_transmission_target"] == 1.0
     assert one_step_no_shield["shield_thickness_scale"] == 0.0
     assert one_step_no_shield["orientation_k"] == 1
@@ -164,11 +267,43 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert one_step_path["path_planner"] == "one_step"
     assert one_step_path["strict_planned_shield_program"] is True
+    assert "one_step_pose_eval_use_gpu" not in one_step_path
+    assert one_step_path["orientation_k"] == proposed_config["orientation_k"]
+    assert (
+        one_step_path["min_rotations_per_pose"]
+        == proposed_config["min_rotations_per_pose"]
+    )
+    assert (
+        one_step_path["dss_pp"]["program_length"]
+        == proposed_config["dss_pp"]["program_length"]
+    )
+    assert (
+        one_step_path["dss_pp"]["residual_program_length"]
+        == proposed_config["dss_pp"]["residual_program_length"]
+    )
     assert "baseline_shield_policy" not in one_step_path
     source_payload = json.loads(by_variant["proposed"].source_path.read_text())
     assert len(source_payload["sources"]) == DEFAULT_ABLATION_CASES[0].source_count
+    isotope_counts: dict[str, int] = {}
+    for source in source_payload["sources"]:
+        isotope_counts[source["isotope"]] = isotope_counts.get(source["isotope"], 0) + 1
+    assert isotope_counts == {"Cs-137": 4, "Co-60": 3, "Eu-154": 2}
+    assert source_payload["metadata"]["visibility_filter"] is True
+    assert proposed_config.get("pf_max_sources") is None
+    assert proposed_config.get("init_num_sources_max") is None
     assert "--full-simulation" in by_variant["proposed"].command
+    assert "--max-sources" not in by_variant["proposed"].command
+    assert "--adaptive-dwell" not in by_variant["proposed"].command
+    assert "--measurement-time-s" in by_variant["proposed"].command
+    measurement_time_idx = (
+        by_variant["proposed"].command.index("--measurement-time-s") + 1
+    )
+    assert by_variant["proposed"].command[measurement_time_idx] == (
+        f"{DEFAULT_MEASUREMENT_TIME_S:g}"
+    )
     assert "--rotation-overhead-s" in by_variant[
         "baseline_passive_no_shield_single_view"
     ].command
-    assert "0.0" in by_variant["baseline_passive_no_shield_single_view"].command
+    assert f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}" in by_variant[
+        "baseline_passive_no_shield_single_view"
+    ].command

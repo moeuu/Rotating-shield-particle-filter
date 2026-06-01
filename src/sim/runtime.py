@@ -270,12 +270,82 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         process: subprocess.Popen[str],
         log_handle: object | None = None,
         temp_config_path: Path | None = None,
+        restart_config: dict[str, Any] | None = None,
     ) -> None:
         """Store the client parameters and owned process handles."""
         super().__init__(host=host, port=port, timeout_s=timeout_s)
         self.process = process
         self.log_handle = log_handle
         self.temp_config_path = temp_config_path
+        self.restart_config = {} if restart_config is None else dict(restart_config)
+        self._last_reset_payload: dict[str, Any] | None = None
+        self._restart_count = 0
+
+    def reset(self, payload: dict[str, Any] | None = None) -> None:
+        """Reset the sidecar and retain the payload for crash recovery."""
+        reset_payload = {} if payload is None else dict(payload)
+        self._last_reset_payload = reset_payload
+        self._round_trip("reset", reset_payload)
+
+    def _round_trip(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a request, restarting a crashed managed sidecar when safe."""
+        try:
+            return super()._round_trip(message_type, payload)
+        except OSError:
+            if not self._can_restart_for(message_type):
+                raise
+            self._restart_sidecar()
+            if message_type != "reset":
+                if self._last_reset_payload is None:
+                    raise RuntimeError(
+                        "Managed Geant4 sidecar crashed before any reset payload was recorded."
+                    )
+                super()._round_trip("reset", self._last_reset_payload)
+            return super()._round_trip(message_type, payload)
+
+    def _can_restart_for(self, message_type: str) -> bool:
+        """Return whether a transport failure can be retried without changing semantics."""
+        if message_type == "shutdown":
+            return False
+        if not bool(self.restart_config.get("enabled", True)):
+            return False
+        max_restarts = int(self.restart_config.get("max_restarts", 2))
+        return self._restart_count < max_restarts
+
+    def _restart_sidecar(self) -> None:
+        """Restart the owned Geant4 bridge process using the original config."""
+        script_path = Path(str(self.restart_config["script_path"]))
+        config_path = Path(str(self.restart_config["config_path"]))
+        config = dict(self.restart_config.get("config", {}))
+        log_path = Path(str(self.restart_config["log_path"]))
+        extra_args = list(self.restart_config.get("extra_args", []))
+        startup_timeout_s = float(self.restart_config.get("startup_timeout_s", 30.0))
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5.0)
+        if self.log_handle is not None:
+            close = getattr(self.log_handle, "close", None)
+            if close is not None:
+                close()
+            self.log_handle = None
+        self._restart_count += 1
+        process, log_handle = _start_sidecar_process(
+            script_path=script_path,
+            config_path=config_path,
+            config=config,
+            host=self.host,
+            port=self.port,
+            timeout_s=startup_timeout_s,
+            log_path=log_path,
+            sidecar_name="Geant4",
+            extra_args=extra_args,
+        )
+        self.process = process
+        self.log_handle = log_handle
 
     def close(self) -> None:
         """Shutdown the sidecar and clean up process resources."""
@@ -567,6 +637,18 @@ def _start_geant4_sidecar(
         process=process,
         log_handle=log_handle,
         temp_config_path=temp_config_path,
+        restart_config={
+            "enabled": bool(config.get("sidecar_restart_on_disconnect", True)),
+            "max_restarts": int(config.get("sidecar_max_restarts", 2)),
+            "script_path": script_path.as_posix(),
+            "config_path": config_path.as_posix(),
+            "config": dict(config),
+            "log_path": log_path.as_posix(),
+            "startup_timeout_s": startup_timeout_s,
+            "extra_args": (
+                ["--mock-stage"] if bool(config.get("sidecar_mock_stage", False)) else []
+            ),
+        },
     )
 
 

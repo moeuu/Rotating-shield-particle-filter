@@ -51,6 +51,59 @@ def test_generate_surface_sources_never_places_sources_in_air_or_obstacles() -> 
         )
 
 
+def test_generate_surface_sources_samples_random_intensity_range() -> None:
+    """Random source generation should support randomized source strengths."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
+        isotopes=("Cs-137",),
+        intensity_cps_1m=(100000.0, 200000.0),
+        rng=np.random.default_rng(123),
+        count=4,
+    )
+    strengths = [source.intensity_cps_1m for source in sources]
+    assert all(100000.0 <= value <= 200000.0 for value in strengths)
+    assert len({round(value, 6) for value in strengths}) > 1
+
+
+def test_generate_surface_sources_caps_ceiling_and_prefers_low_z() -> None:
+    """Random scenarios should avoid many ceiling or high-wall truth sources."""
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
+        isotopes=("Cs-137", "Co-60", "Eu-154"),
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(20260530),
+        count=120,
+    )
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    counts = source_surface_kind_counts(positions, env, None)
+
+    assert counts["ceiling"] <= 1
+    assert float(np.max(positions[:, 2])) <= 5.0
+
+
+def test_generate_surface_sources_ceiling_cap_without_low_z_preference() -> None:
+    """Ceiling caps should be independent from the preferred-height filter."""
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
+        isotopes=("Cs-137",),
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(11),
+        count=120,
+        max_ceiling_sources=0,
+        preferred_max_z_m=None,
+    )
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    counts = source_surface_kind_counts(positions, env, None)
+
+    assert counts["ceiling"] == 0
+
+
 def test_surface_observable_fraction_rejects_obstacle_top_sources() -> None:
     """Visibility screening should reject sources hidden by their support obstacle."""
     grid = ObstacleGrid(

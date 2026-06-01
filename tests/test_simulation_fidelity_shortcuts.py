@@ -151,6 +151,107 @@ def test_response_diagnostics_inflate_runtime_count_variance(
     assert "transport_detected_counts_Cs-137" not in diagnostics
 
 
+def test_shield_systematics_inflate_runtime_count_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shielded spectra should carry a configurable response-model variance floor."""
+    config = SpectrumConfig(
+        response_poisson_diagnostic_variance_enable=False,
+        response_poisson_shield_systematic_variance_enable=True,
+        response_poisson_shield_systematic_rel_sigma=0.2,
+        response_poisson_shield_systematic_anchor_pair_ids=(0,),
+    )
+    decomposer = SpectralDecomposer(config)
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return stable counts with intentionally small base variances."""
+        self.last_count_variances = {"Cs-137": 1.0}
+        self.last_response_poisson_diagnostics = {"status": "ok"}
+        return {"Cs-137": 100.0}, {"Cs-137"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=30.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+        transport_metadata={
+            "fe_orientation_index": 1,
+            "pb_orientation_index": 2,
+            "shield_num_orientations": 8,
+            "shield_thickness_scale": 1.0,
+        },
+    )
+
+    assert result.variances["Cs-137"] == pytest.approx(400.0)
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["runtime_shield_systematic_pair_id"] == 10
+    assert diagnostics["runtime_shield_systematic_anchor_pair"] is False
+
+
+def test_shield_systematics_skip_zero_thickness_no_shield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-shield baselines should not receive shield-model mismatch inflation."""
+    config = SpectrumConfig(
+        response_poisson_diagnostic_variance_enable=False,
+        response_poisson_shield_systematic_variance_enable=True,
+        response_poisson_shield_systematic_rel_sigma=0.2,
+    )
+    decomposer = SpectralDecomposer(config)
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return stable counts with intentionally small base variances."""
+        self.last_count_variances = {"Cs-137": 9.0}
+        self.last_response_poisson_diagnostics = {"status": "ok"}
+        return {"Cs-137": 100.0}, {"Cs-137"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=30.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+        transport_metadata={
+            "shield_pair_id": 10,
+            "shield_thickness_scale": 0.0,
+        },
+    )
+
+    assert result.variances["Cs-137"] == pytest.approx(9.0)
+    assert "runtime_shield_systematic_variance_floor" not in (
+        decomposer.last_response_poisson_diagnostics
+    )
+
+
 def test_runtime_rejects_peak_window_count_method(tmp_path: Path) -> None:
     """Runtime simulations should reject lower-fidelity peak-window counting."""
     config_path = tmp_path / "runtime.json"

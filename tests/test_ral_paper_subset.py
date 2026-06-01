@@ -30,19 +30,19 @@ def _manifest_row(case: str, variant: str, seed: str = DEFAULT_SEED) -> dict[str
     }
 
 
-def test_select_paper_subset_uses_thirteen_run_plan() -> None:
-    """The RA-L paper subset should keep core variants plus birth ablations."""
+def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
+    """The RA-L paper subset should keep the four closed-loop MIX-9 runs."""
     cases = (
-        "case01_multi_isotope",
-        "case02_three_cs",
-        "case03_mixed_cardinality",
+        "mix9_multi_isotope_cardinality",
+        "legacy_case_not_selected",
     )
     variants = (
         "proposed",
-        "baseline_passive_no_shield",
+        "baseline_passive_equal_time_no_shield",
         "round_robin_shield",
-        "one_step_path",
+        "eig_only_path",
         "no_residual_birth",
+        "no_verification",
         "no_shield",
     )
     rows = [_manifest_row(case, variant) for case in cases for variant in variants]
@@ -50,13 +50,24 @@ def test_select_paper_subset_uses_thirteen_run_plan() -> None:
     subset = select_paper_subset(rows)
     selected_pairs = {(row["case"], row["variant"]) for row in subset}
 
-    assert len(subset) == 13
-    for case in cases:
-        assert (case, "proposed") in selected_pairs
-        assert (case, "baseline_passive_no_shield") in selected_pairs
-        assert (case, "round_robin_shield") in selected_pairs
-        assert (case, "one_step_path") in selected_pairs
-    assert ("case02_three_cs", "no_residual_birth") not in selected_pairs
-    assert ("case03_mixed_cardinality", "no_residual_birth") in selected_pairs
-    assert ("case01_multi_isotope", "no_residual_birth") not in selected_pairs
+    assert len(subset) == 4
+    assert (
+        "mix9_multi_isotope_cardinality",
+        "proposed",
+    ) in selected_pairs
+    assert (
+        "mix9_multi_isotope_cardinality",
+        "baseline_passive_equal_time_no_shield",
+    ) in selected_pairs
+    assert (
+        "mix9_multi_isotope_cardinality",
+        "round_robin_shield",
+    ) in selected_pairs
+    assert (
+        "mix9_multi_isotope_cardinality",
+        "eig_only_path",
+    ) in selected_pairs
+    assert all(case == "mix9_multi_isotope_cardinality" for case, _ in selected_pairs)
+    assert ("mix9_multi_isotope_cardinality", "no_residual_birth") not in selected_pairs
+    assert ("mix9_multi_isotope_cardinality", "no_verification") not in selected_pairs
     assert all(row["seed"] == DEFAULT_SEED for row in subset)

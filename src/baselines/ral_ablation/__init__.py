@@ -9,6 +9,7 @@ from baselines.ral_ablation.config_factory import (
     build_ablation_plan,
     write_ablation_plan,
 )
+from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 
 __all__ = [
     "AblationCase",
@@ -16,6 +17,7 @@ __all__ = [
     "AblationVariant",
     "DEFAULT_ABLATION_CASES",
     "DEFAULT_ABLATION_VARIANTS",
+    "DEFAULT_MAX_SOURCES_PER_ISOTOPE",
     "build_ablation_plan",
     "write_ablation_plan",
 ]

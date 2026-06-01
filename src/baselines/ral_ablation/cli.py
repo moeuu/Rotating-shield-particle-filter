@@ -8,6 +8,7 @@ from pathlib import Path
 from baselines.ral_ablation.config_factory import (
     DEFAULT_BASE_CONFIG,
     DEFAULT_OUTPUT_DIR,
+    DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
     build_ablation_plan,
     write_ablation_plan,
 )
@@ -32,21 +33,41 @@ def main() -> None:
         "--seeds",
         type=int,
         nargs="+",
-        default=[2026050901, 2026050902, 2026050903],
+        default=[2026050901],
         help="Obstacle/source seed list.",
     )
     parser.add_argument(
         "--intensity-cps-1m",
         type=float,
-        default=30000.0,
-        help="Detector cps@1m assigned to generated sources.",
+        default=None,
+        help="Fixed detector cps@1m assigned to generated sources.",
+    )
+    parser.add_argument(
+        "--intensity-min-cps-1m",
+        type=float,
+        default=float(DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M[0]),
+        help="Minimum detector cps@1m for uniformly sampled generated sources.",
+    )
+    parser.add_argument(
+        "--intensity-max-cps-1m",
+        type=float,
+        default=float(DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M[1]),
+        help="Maximum detector cps@1m for uniformly sampled generated sources.",
     )
     args = parser.parse_args()
+    intensity_spec: float | tuple[float, float]
+    if args.intensity_cps_1m is not None:
+        intensity_spec = float(args.intensity_cps_1m)
+    else:
+        intensity_spec = (
+            float(args.intensity_min_cps_1m),
+            float(args.intensity_max_cps_1m),
+        )
     entries = build_ablation_plan(
         base_config_path=args.base_config,
         output_dir=args.output_dir,
         seeds=tuple(int(seed) for seed in args.seeds),
-        intensity_cps_1m=float(args.intensity_cps_1m),
+        intensity_cps_1m=intensity_spec,
     )
     manifest_path, script_path = write_ablation_plan(entries, output_dir=args.output_dir)
     print(f"Wrote {len(entries)} ablation trials.")

@@ -300,6 +300,10 @@ def _state_budget_components(
             min_max_count=float(config.unresolved_absent_min_max_counts),
             min_snr=float(config.unresolved_absent_min_snr),
         )
+    try:
+        report_diagnostics = estimator.report_model_order_diagnostics()
+    except (RuntimeError, ValueError, TypeError):
+        report_diagnostics = {}
     isotope_details: dict[str, dict[str, float | int]] = {}
     mode_arrays: dict[
         str,
@@ -318,6 +322,25 @@ def _state_budget_components(
         entropy, confidence, map_count, cardinality_var = _weighted_cardinality_stats(
             source_counts,
             weights,
+        )
+        data = estimator._measurement_data_for_iso(isotope, window=None)
+        count_supported, total_counts, max_count, signal_snr = (
+            _measurement_data_count_evidence(data, config)
+        )
+        report_stats = (
+            report_diagnostics.get(str(isotope), {})
+            if isinstance(report_diagnostics, dict)
+            else {}
+        )
+        report_selected_count = (
+            int(report_stats.get("selected_count", 0))
+            if isinstance(report_stats, dict)
+            else 0
+        )
+        active_evidence = bool(
+            count_supported
+            or report_selected_count > 0
+            or str(isotope) in unresolved_absent
         )
         strength_totals = [
             float(
@@ -374,7 +397,40 @@ def _state_budget_components(
         high_surface_min_separation = float("inf")
         high_surface_unresolved_pairs = 0
         residual_budget = 0.0
-        data = estimator._measurement_data_for_iso(isotope, window=None)
+        absent_payload = unresolved_absent.get(str(isotope), {})
+        absence_budget = float(absent_payload.get("budget", 0.0))
+        if not active_evidence:
+            mode_arrays[isotope] = []
+            isotope_details[isotope] = {
+                "mode_count": int(len(modes)),
+                "map_source_count": int(map_count),
+                "active_evidence": 0,
+                "observed_signal_total_counts": float(total_counts),
+                "observed_signal_max_count": float(max_count),
+                "observed_signal_snr": float(signal_snr),
+                "cardinality_confidence": float(confidence),
+                "cardinality_entropy": float(entropy),
+                "cardinality_variance": float(cardinality_var),
+                "strength_cv": float(strength_cv),
+                "tentative_source_expectation": float(tentative_expected),
+                "verification_views": int(verification_views),
+                "required_verification_views": int(required_views),
+                "min_pairwise_separation": 0.0,
+                "unresolved_pair_count": 0,
+                "high_surface_mode_count": 0,
+                "high_surface_min_pairwise_separation": 0.0,
+                "high_surface_unresolved_pair_count": 0,
+                "high_surface_ambiguity_budget": 0.0,
+                "residual_chi2": 0.0,
+                "unresolved_absent_budget": 0.0,
+                "unresolved_absent_total_counts": float(
+                    absent_payload.get("total_counts", 0.0)
+                ),
+                "unresolved_absent_count_snr": float(
+                    absent_payload.get("count_snr", 0.0)
+                ),
+            }
+            continue
         if data is not None and data.z_k.size and mode_arrays[isotope]:
             mode_positions, mode_strengths, mode_weights = mode_arrays[isotope][0]
             response = _mode_response_matrix(
@@ -452,8 +508,6 @@ def _state_budget_components(
             residual_budget = max(residual_chi2 / residual_threshold - 1.0, 0.0)
         else:
             residual_chi2 = 0.0
-        absent_payload = unresolved_absent.get(str(isotope), {})
-        absence_budget = float(absent_payload.get("budget", 0.0))
         components["uncertainty"] += spread_budget + strength_budget
         components["cardinality"] += cardinality_budget
         components["same_isotope_separation"] += separation_budget
@@ -466,6 +520,10 @@ def _state_budget_components(
         isotope_details[isotope] = {
             "mode_count": int(len(modes)),
             "map_source_count": int(map_count),
+            "active_evidence": int(active_evidence),
+            "observed_signal_total_counts": float(total_counts),
+            "observed_signal_max_count": float(max_count),
+            "observed_signal_snr": float(signal_snr),
             "cardinality_confidence": float(confidence),
             "cardinality_entropy": float(entropy),
             "cardinality_variance": float(cardinality_var),
@@ -497,6 +555,42 @@ def _state_budget_components(
             ),
         }
     return components, isotope_details, mode_arrays
+
+
+def _measurement_data_count_evidence(
+    data: object | None,
+    config: RemainingMeasurementConfig,
+) -> tuple[bool, float, float, float]:
+    """Return whether measurement data gives count-supported isotope evidence."""
+    if data is None:
+        return False, 0.0, 0.0, 0.0
+    counts_raw = getattr(data, "z_k", None)
+    if counts_raw is None:
+        return False, 0.0, 0.0, 0.0
+    counts = np.maximum(np.asarray(counts_raw, dtype=float).reshape(-1), 0.0)
+    if counts.size == 0:
+        return False, 0.0, 0.0, 0.0
+    variances = np.maximum(
+        np.asarray(getattr(data, "observation_variances", np.ones_like(counts)), dtype=float)
+        .reshape(-1),
+        1.0,
+    )
+    total_counts = float(np.sum(counts))
+    max_count = float(np.max(counts))
+    signal_snr = float(
+        total_counts / np.sqrt(max(float(np.sum(variances)), 1.0e-12))
+    )
+    total_floor = max(float(config.unresolved_absent_min_total_counts), 0.0)
+    max_floor = max(float(config.unresolved_absent_min_max_counts), 0.0)
+    snr_floor = max(float(config.unresolved_absent_min_snr), 0.0)
+    count_floor_met = total_counts >= total_floor or max_count >= max_floor
+    if snr_floor <= 0.0:
+        supported = count_floor_met
+    elif total_floor <= 0.0 and max_floor <= 0.0:
+        supported = signal_snr >= snr_floor
+    else:
+        supported = count_floor_met and signal_snr >= snr_floor
+    return bool(supported), total_counts, max_count, signal_snr
 
 
 def _weighted_tentative_source_count(

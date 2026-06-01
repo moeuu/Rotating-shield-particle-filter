@@ -32,6 +32,49 @@ def test_net_response_calibration_applies_expected_counts() -> None:
     assert mapped["Co-60"] == 50.0
 
 
+def test_net_response_calibration_supports_shield_pair_scales() -> None:
+    """Calibration should use pair-conditioned response scales when present."""
+    calibration = fit_net_response_calibration(
+        [
+            {
+                "isotope": "Cs-137",
+                "shield_pair_id": 3,
+                "theory_counts": 100.0,
+                "net_counts": 10.0,
+                "weight": 1.0,
+            },
+            {
+                "isotope": "Cs-137",
+                "shield_pair_id": 4,
+                "theory_counts": 100.0,
+                "net_counts": 30.0,
+                "weight": 1.0,
+            },
+            {
+                "isotope": "Cs-137",
+                "shield_pair_id": 4,
+                "theory_counts": 200.0,
+                "net_counts": 60.0,
+                "weight": 1.0,
+            },
+        ]
+    )
+
+    assert calibration.response_scale("Cs-137") == pytest.approx(4.0 / 15.0)
+    assert calibration.response_scale("Cs-137", shield_pair_id=3) == pytest.approx(
+        0.1
+    )
+    assert calibration.response_scale("Cs-137", shield_pair_id=4) == pytest.approx(
+        0.3
+    )
+    mapped = calibration.apply_expected_counts(
+        {"Cs-137": 100.0},
+        shield_pair_id=4,
+    )
+
+    assert mapped["Cs-137"] == pytest.approx(30.0)
+
+
 def test_expected_counts_per_source_scales_only_source_terms() -> None:
     """Per-source expected counts should apply the response scale multiplicatively."""
     kernel = ContinuousKernel(use_gpu=False)

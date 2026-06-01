@@ -1,0 +1,53 @@
+{
+  "metadata": {
+    "case": "case02_three_cs",
+    "description": "Obstacle-cluttered same-isotope three Cs-137 sources.",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+    "obstacle_seed": 2026052501,
+    "sampling": "surface-constrained room/obstacle source placement with ground-visibility filtering",
+    "source_seed": 2026052518,
+    "visibility_filter": {
+      "clear_path_max_m": 0.01,
+      "enabled": true,
+      "mean_source_visible_fraction": 0.43627450980392163,
+      "min_source_visible_fraction": 0.16911764705882354,
+      "min_visible_fraction": 0.1,
+      "reference_point_count": 136,
+      "source_visible_fractions": [
+        0.5514705882352942,
+        0.16911764705882354,
+        0.5882352941176471
+      ]
+    }
+  },
+  "name": "ral_ablation_case02_three_cs_seed_2026052518",
+  "sources": [
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        9.073338,
+        0.303552,
+        10.0
+      ]
+    },
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        0.0,
+        9.214845,
+        0.180857
+      ]
+    },
+    {
+      "intensity_cps_1m": 30000.0,
+      "isotope": "Cs-137",
+      "position": [
+        8.799869,
+        3.070258,
+        10.0
+      ]
+    }
+  ]
+}

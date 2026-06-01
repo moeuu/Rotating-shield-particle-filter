@@ -5,6 +5,10 @@ from __future__ import annotations
 import argparse
 
 from baselines.kemp.runner import KempRunConfig, run_kemp_full_simulation
+from runtime_defaults import (
+    DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+    DEFAULT_MEASUREMENT_TIME_S,
+)
 
 
 def _parse_grid_spacing(value: str) -> tuple[float, float, float]:
@@ -38,10 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obstacle-config", dest="obstacle_config_path", default=None)
     parser.add_argument("--output-dir", default="results/baselines/kemp/latest")
     parser.add_argument("--max-poses", type=int, default=10)
-    parser.add_argument("--dwell-time-s", type=float, default=30.0)
+    parser.add_argument("--dwell-time-s", type=float, default=DEFAULT_MEASUREMENT_TIME_S)
     parser.add_argument("--measurement-spacing-m", type=float, default=4.0)
     parser.add_argument("--num-particles", type=int, default=2000)
-    parser.add_argument("--max-sources", type=int, default=3)
+    parser.add_argument("--max-sources", type=int, default=DEFAULT_MAX_SOURCES_PER_ISOTOPE)
     parser.add_argument("--grid-spacing-m", type=_parse_grid_spacing, default=(0.5, 0.5, 0.5))
     parser.add_argument(
         "--grid-z-levels-m",

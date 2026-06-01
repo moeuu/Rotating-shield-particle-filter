@@ -361,6 +361,72 @@ def test_remaining_measurement_marks_observed_zero_source_isotope_unresolved() -
     assert estimate.isotope_details[isotope]["unresolved_absent_total_counts"] == 60.0
 
 
+def test_remaining_measurement_ignores_low_snr_absent_isotope_counts() -> None:
+    """Low-SNR decomposed counts should not keep an absent isotope unresolved."""
+    isotope = "Eu-154"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={isotope: 91.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: 1.0e8},
+        )
+    )
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        config=RemainingMeasurementConfig(
+            max_particles=2,
+            planning_method="top_weight",
+            unresolved_absent_min_total_counts=25.0,
+            unresolved_absent_min_max_counts=5.0,
+            unresolved_absent_min_snr=2.0,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.components["isotope_absence"] == 0.0
+    assert "isotope_absence" not in estimate.unresolved_factors
+    assert estimate.isotope_details[isotope]["active_evidence"] == 0
+    assert estimate.isotope_details[isotope]["unresolved_absent_total_counts"] == 0.0
+
+
 def test_surface_stratified_rescue_keeps_high_surface_candidate() -> None:
     """Rescue candidate ranking should reserve slots for high surface strata."""
     candidates = np.array(

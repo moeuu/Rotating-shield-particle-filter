@@ -407,6 +407,7 @@ def _run_shot(
                 "pose_z": pose[2],
                 "fe_index": fe_index,
                 "pb_index": pb_index,
+                "shield_pair_id": int(fe_index) * 8 + int(pb_index),
                 "live_time_s": live_time_s,
                 "count_method": count_method,
                 "theory_counts": theory,
@@ -438,7 +439,11 @@ def _add_calibrated_columns(
     }
     for record in records:
         item = dict(record)
-        scale = calibration.response_scale(str(item["isotope"]))
+        pair_id = int(item["shield_pair_id"]) if "shield_pair_id" in item else None
+        scale = calibration.response_scale(
+            str(item["isotope"]),
+            shield_pair_id=pair_id,
+        )
         prediction = scale * float(item["theory_counts"])
         net = float(item["net_counts"])
         item["response_scale"] = scale

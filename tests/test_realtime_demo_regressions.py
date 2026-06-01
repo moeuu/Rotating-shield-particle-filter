@@ -23,6 +23,7 @@ from realtime_demo import (
     _adapt_dss_program_length_for_budget,
     _adaptive_mission_stop_reason,
     _all_pf_filters_converged,
+    _apply_baseline_shield_program_to_dss_config,
     _argv_requests_cui,
     _build_candidate_sources,
     _build_intermediate_estimate_trace_payload,
@@ -34,6 +35,7 @@ from realtime_demo import (
     _filter_reachable_candidates,
     _format_estimate_trace_log_line,
     _format_truth_coverage_log_line,
+    _best_dss_first_step_guard_candidate,
     _final_model_order_status,
     _has_birth_residual_evidence,
     _has_unresolved_discriminative_pseudo_failures,
@@ -42,6 +44,8 @@ from realtime_demo import (
     _isotope_count_balance_penalty,
     _pf_obstacle_attenuation_enabled,
     _pf_obstacle_grid_for_runtime,
+    _online_absent_pruning_supported_isotopes,
+    _prune_online_absent_isotopes,
     _resolve_ig_workers,
     _resolve_mission_max_poses,
     _resolve_plot_save_interval,
@@ -73,6 +77,25 @@ def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
 
     assert _resolve_mission_max_poses(8, runtime_config) == 8
     assert _resolve_mission_max_poses(None, runtime_config) == 10
+
+
+def test_dss_one_step_guard_uses_ranked_node_diagnostics() -> None:
+    """DSS one-step guard should reuse already computed first-step scores."""
+    diagnostics = {
+        "ranked_nodes": [
+            {"pose_index": 5, "pose_xyz": [9.0, 8.0, 0.5], "score": 12.0},
+            {"pose_index": 2, "pose_xyz": [3.0, 2.0, 0.5], "score": 11.0},
+        ],
+    }
+
+    pose_index, score, pose_xyz = _best_dss_first_step_guard_candidate(
+        diagnostics,
+        candidate_poses_xyz=np.zeros((2, 3), dtype=float),
+    )
+
+    assert pose_index == 5
+    assert score == pytest.approx(12.0)
+    np.testing.assert_allclose(pose_xyz, np.array([9.0, 8.0, 0.5]))
 
 
 def test_joint_observation_update_disables_delayed_resample() -> None:
@@ -891,6 +914,85 @@ def test_final_model_order_status_marks_unresolved_pseudo_sources_not_ready() ->
     assert status["all_model_order_ready"] is False
     assert status["all_model_order_ready_before_structural_gates"] is True
     assert status["unresolved_structural_evidence"]["Cs-137"]
+
+
+def test_cardinality_dwell_waits_for_unresolved_structural_evidence() -> None:
+    """Adaptive cardinality dwell should not stop while structural evidence is open."""
+
+    class _DummyEstimator:
+        """Minimal estimator exposing unresolved report-underfit evidence."""
+
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty report estimate."""
+            return {}
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return unresolved report-level evidence."""
+            return {"Cs-137": {"report_underfit": {"reason": "count_supported_zero"}}}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return ready-looking diagnostics that should still be blocked."""
+            return {"Cs-137": {"model_order_ready": True, "selected_count": 0}}
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+    )
+
+    assert ready is False
+    assert reason == "unresolved_structural:Cs-137"
+
+
+def test_cardinality_dwell_ignores_inactive_zero_source_candidates() -> None:
+    """Candidate pools without count support should not activate absent isotopes."""
+
+    class _DummyEstimator:
+        """Minimal estimator with candidate-only zero-source diagnostics."""
+
+        filters: dict[str, object] = {}
+        pf_config = RotatingShieldPFConfig(
+            structural_update_min_counts=25.0,
+            conditional_strength_refit_min_count=5.0,
+            structural_update_min_snr=2.0,
+        )
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty report estimate."""
+            return {}
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return no open structural evidence."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return zero-source diagnostics with candidate pool but no signal."""
+            return {
+                "Eu-154": {
+                    "candidate_count": 10,
+                    "selected_count": 0,
+                    "model_order_ready": True,
+                    "condition_number": 1.0,
+                    "criterion_margin_to_simpler": float("inf"),
+                    "observed_signal_total_counts": 0.0,
+                    "observed_signal_max_count": 0.0,
+                    "observed_signal_snr": 0.0,
+                    "count_supported_zero_source": False,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+    )
+
+    assert ready is True
+    assert reason == "model_order_ready"
 
 
 def test_adaptive_mission_waits_for_model_order_readiness() -> None:
@@ -1949,6 +2051,47 @@ def test_source_cardinality_dwell_can_use_report_order_without_posterior_match()
     assert reason == "model_order_ready"
 
 
+def test_source_cardinality_dwell_can_skip_estimate_refresh() -> None:
+    """Runtime dwell checks should be able to use cached model-order diagnostics."""
+
+    class _DummyConfig:
+        """Minimal PF config for cached report diagnostics."""
+
+        converge_cardinality_var_max = 0.05
+        report_model_order_require_posterior_match = False
+
+    class _DummyEstimator:
+        """Estimator whose heavy report refresh must not be called."""
+
+        pf_config = _DummyConfig()
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Fail if a cached-only dwell check refreshes final estimates."""
+            raise AssertionError("estimates refresh should be skipped")
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return cached no-source report diagnostics."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "model_order_ready": True,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),  # type: ignore[arg-type]
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+        refresh_estimates=False,
+    )
+
+    assert ready is True
+    assert reason == "model_order_ready"
+
+
 def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> None:
     """Coverage can stop a mission once residual birth evidence is quiet."""
 
@@ -2307,6 +2450,240 @@ def test_final_absent_filter_removes_unsupported_isotope() -> None:
     assert diagnostics["Cs-137"]["kept"] is True
     assert diagnostics["Co-60"]["reason"] == "insufficient_spectral_support"
     assert diagnostics["Eu-154"]["reason"] == "no_final_pf_support"
+
+
+class _TinyCoverageMap:
+    """Small traversable map for online absent-isotope pruning tests."""
+
+    grid_shape = (4, 1)
+    cell_size = 1.0
+    origin = (0.0, 0.0)
+    traversable_cells = [(0, 0), (1, 0), (2, 0), (3, 0)]
+
+    @staticmethod
+    def cell_center(cell):
+        """Return the center of one map cell."""
+        return np.array([float(cell[0]) + 0.5, float(cell[1]) + 0.5])
+
+
+class _DummyOnlineAbsentEstimator:
+    """Minimal estimator stub for online absent-isotope pruning."""
+
+    def __init__(self) -> None:
+        """Create a two-isotope estimator with only Cs count support."""
+        self.isotopes = ["Cs-137", "Co-60"]
+        self.measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 120.0, "Co-60": 0.5},
+                pose_idx=i,
+                orient_idx=0,
+                live_time_s=1.0,
+                fe_index=0,
+                pb_index=0,
+                z_variance_k={"Cs-137": 120.0, "Co-60": 1.0},
+            )
+            for i in range(8)
+        ]
+        self.restricted: list[list[str]] = []
+
+    def restrict_isotopes(
+        self,
+        active_isotopes,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        """Record and apply isotope restrictions."""
+        _ = allow_empty
+        self.restricted.append(list(active_isotopes))
+        self.isotopes = list(active_isotopes)
+
+
+def test_online_absent_pruning_waits_for_environment_coverage() -> None:
+    """Online pruning should not drop unsupported isotopes before coverage."""
+    estimator = _DummyOnlineAbsentEstimator()
+    removed = _prune_online_absent_isotopes(
+        estimator,
+        enabled=True,
+        detected_isotopes={"Cs-137"},
+        pruned_isotopes=set(),
+        visited_poses_xyz=[np.array([0.5, 0.5, 0.5])],
+        map_api=_TinyCoverageMap(),
+        min_poses=4,
+        coverage_radius_m=0.6,
+        coverage_fraction_threshold=0.75,
+        min_measurements=8,
+        count_threshold_abs=50.0,
+        min_support_measurements=2,
+        min_total_counts=100.0,
+        snr_threshold=3.0,
+        label="low_coverage",
+    )
+
+    assert removed == set()
+    assert estimator.isotopes == ["Cs-137", "Co-60"]
+    assert estimator.restricted == []
+
+
+def test_online_absent_pruning_support_guard_does_not_protect_all_active() -> None:
+    """Absent pruning should not treat every active isotope as newly supported."""
+    protected = _online_absent_pruning_supported_isotopes(
+        raw_detected={"Cs-137"},
+        last_candidates=set(),
+    )
+
+    assert protected == {"Cs-137"}
+    assert "Co-60" not in protected
+
+
+def test_online_absent_pruning_drops_only_after_covered_and_unsupported() -> None:
+    """Online pruning should remove absent isotopes after support and coverage gates."""
+    estimator = _DummyOnlineAbsentEstimator()
+    pruned: set[str] = set()
+    visited = [
+        np.array([0.5, 0.5, 0.5]),
+        np.array([1.5, 0.5, 0.5]),
+        np.array([2.5, 0.5, 0.5]),
+        np.array([3.5, 0.5, 0.5]),
+    ]
+
+    removed = _prune_online_absent_isotopes(
+        estimator,
+        enabled=True,
+        detected_isotopes={"Cs-137"},
+        pruned_isotopes=pruned,
+        visited_poses_xyz=visited,
+        map_api=_TinyCoverageMap(),
+        min_poses=4,
+        coverage_radius_m=0.6,
+        coverage_fraction_threshold=0.75,
+        min_measurements=8,
+        count_threshold_abs=50.0,
+        min_support_measurements=2,
+        min_total_counts=100.0,
+        snr_threshold=3.0,
+        label="covered",
+    )
+
+    assert removed == {"Co-60"}
+    assert pruned == {"Co-60"}
+    assert estimator.isotopes == ["Cs-137"]
+    assert estimator.restricted == [["Cs-137"]]
+
+
+def test_online_absent_pruning_drops_low_snr_cumulative_crosstalk() -> None:
+    """Cumulative low-SNR isotope leakage should not protect an absent filter."""
+
+    class _DummyLowSnrEstimator:
+        """Estimator with many low-SNR Eu leakage measurements."""
+
+        def __init__(self) -> None:
+            """Create many measurements whose Eu total count exceeds the count floor."""
+            self.isotopes = ["Cs-137", "Eu-154"]
+            self.measurements = [
+                MeasurementRecord(
+                    z_k={"Cs-137": 120.0, "Eu-154": 1.2},
+                    pose_idx=i,
+                    orient_idx=0,
+                    live_time_s=1.0,
+                    fe_index=0,
+                    pb_index=0,
+                    z_variance_k={"Cs-137": 120.0, "Eu-154": 1.0e6},
+                )
+                for i in range(120)
+            ]
+            self.restricted: list[list[str]] = []
+
+        def restrict_isotopes(
+            self,
+            active_isotopes,
+            *,
+            allow_empty: bool = False,
+        ) -> None:
+            """Record and apply isotope restrictions."""
+            _ = allow_empty
+            self.restricted.append(list(active_isotopes))
+            self.isotopes = list(active_isotopes)
+
+    estimator = _DummyLowSnrEstimator()
+    visited = [
+        np.array([0.5, 0.5, 0.5]),
+        np.array([1.5, 0.5, 0.5]),
+        np.array([2.5, 0.5, 0.5]),
+        np.array([3.5, 0.5, 0.5]),
+    ]
+
+    removed = _prune_online_absent_isotopes(
+        estimator,  # type: ignore[arg-type]
+        enabled=True,
+        detected_isotopes={"Cs-137"},
+        pruned_isotopes=set(),
+        visited_poses_xyz=visited,
+        map_api=_TinyCoverageMap(),
+        min_poses=4,
+        coverage_radius_m=0.6,
+        coverage_fraction_threshold=0.75,
+        min_measurements=8,
+        count_threshold_abs=50.0,
+        min_support_measurements=2,
+        min_total_counts=100.0,
+        snr_threshold=3.0,
+        label="low_snr_crosstalk",
+    )
+
+    assert removed == {"Eu-154"}
+    assert estimator.isotopes == ["Cs-137"]
+    assert estimator.restricted == [["Cs-137"]]
+
+
+def test_online_absent_pruning_keeps_newly_detected_isotope() -> None:
+    """Online pruning should protect isotopes with current spectral support."""
+    estimator = _DummyOnlineAbsentEstimator()
+    visited = [
+        np.array([0.5, 0.5, 0.5]),
+        np.array([1.5, 0.5, 0.5]),
+        np.array([2.5, 0.5, 0.5]),
+        np.array([3.5, 0.5, 0.5]),
+    ]
+
+    removed = _prune_online_absent_isotopes(
+        estimator,
+        enabled=True,
+        detected_isotopes={"Cs-137", "Co-60"},
+        pruned_isotopes=set(),
+        visited_poses_xyz=visited,
+        map_api=_TinyCoverageMap(),
+        min_poses=4,
+        coverage_radius_m=0.6,
+        coverage_fraction_threshold=0.75,
+        min_measurements=8,
+        count_threshold_abs=50.0,
+        min_support_measurements=2,
+        min_total_counts=100.0,
+        snr_threshold=3.0,
+        label="detected_guard",
+    )
+
+    assert removed == set()
+    assert estimator.isotopes == ["Cs-137", "Co-60"]
+    assert estimator.restricted == []
+
+
+def test_baseline_shield_program_preserves_adapted_dss_length() -> None:
+    """Shield ablations should not change the adapted spectra-per-station budget."""
+    config = DSSPPConfig(program_length=16, forced_program_pair_ids=None)
+
+    forced_config, baseline_program = _apply_baseline_shield_program_to_dss_config(
+        config,
+        {"name": "round_robin", "start_pair_id": 0, "advance_by_pose": True},
+        total_pairs=64,
+        pose_index=2,
+        current_pair_id=None,
+    )
+
+    assert baseline_program is not None
+    assert len(baseline_program.pair_ids) == 16
+    assert forced_config.program_length == 16
+    assert forced_config.forced_program_pair_ids == baseline_program.pair_ids
 
 
 def test_shield_selection_uses_signature_floor_and_dependency() -> None:

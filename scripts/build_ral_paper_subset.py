@@ -15,15 +15,14 @@ DEFAULT_SUBSET_MANIFEST = (
 )
 DEFAULT_RUN_SCRIPT = ROOT / "results" / "ral_ablation" / "run_paper_subset.sh"
 DEFAULT_SEED = "2026050901"
+PAPER_CASES = ("mix9_multi_isotope_cardinality",)
 CORE_VARIANTS = (
     "proposed",
-    "baseline_passive_no_shield",
+    "baseline_passive_equal_time_no_shield",
     "round_robin_shield",
-    "one_step_path",
+    "eig_only_path",
 )
-CASE_EXTRA_VARIANTS = {
-    "case03_mixed_cardinality": ("no_residual_birth",),
-}
+REPLAY_ABLATION_VARIANTS = ("no_residual_birth", "no_verification")
 MANIFEST_FIELDS = ("case", "variant", "seed", "config_path", "source_path", "command")
 
 
@@ -71,7 +70,16 @@ def _read_manifest(path: Path) -> list[dict[str, str]]:
 
 def selected_variants_for_case(case: str) -> tuple[str, ...]:
     """Return the compact RA-L paper variants for one case."""
-    return CORE_VARIANTS + tuple(CASE_EXTRA_VARIANTS.get(str(case), ()))
+    if str(case) not in PAPER_CASES:
+        return ()
+    return CORE_VARIANTS
+
+
+def replay_variants_for_case(case: str) -> tuple[str, ...]:
+    """Return estimator-side replay variants for one paper case."""
+    if str(case) not in PAPER_CASES:
+        return ()
+    return REPLAY_ABLATION_VARIANTS
 
 
 def select_paper_subset(
@@ -81,17 +89,35 @@ def select_paper_subset(
 ) -> list[dict[str, str]]:
     """Select the compact paper subset while preserving manifest order."""
     seed = str(seed)
-    cases = tuple(dict.fromkeys(row["case"] for row in rows if row["seed"] == seed))
+    cases = tuple(
+        case
+        for case in PAPER_CASES
+        if any(row["case"] == case and row["seed"] == seed for row in rows)
+    )
+    if not cases:
+        formatted_cases = ", ".join(PAPER_CASES)
+        raise ValueError(
+            f"Full manifest has no paper cases for seed {seed}: {formatted_cases}"
+        )
     wanted = {
         (case, variant)
         for case in cases
         for variant in selected_variants_for_case(case)
     }
-    selected = [
+    selected_unsorted = [
         {field: str(row[field]) for field in MANIFEST_FIELDS}
         for row in rows
         if row["seed"] == seed and (row["case"], row["variant"]) in wanted
     ]
+    order = {
+        (case, variant): index
+        for case in cases
+        for index, variant in enumerate(selected_variants_for_case(case))
+    }
+    selected = sorted(
+        selected_unsorted,
+        key=lambda row: order[(row["case"], row["variant"])],
+    )
     found = {(row["case"], row["variant"]) for row in selected}
     missing = sorted(wanted - found)
     if missing:

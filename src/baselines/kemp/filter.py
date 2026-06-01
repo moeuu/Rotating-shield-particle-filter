@@ -12,6 +12,10 @@ from scipy.special import logsumexp
 from scipy.spatial import cKDTree
 
 from baselines.kemp.kernels import DiscreteAttenuationKernel
+from runtime_defaults import (
+    DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+    DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
+)
 
 
 @dataclass(frozen=True)
@@ -31,10 +35,12 @@ class KempFilterConfig:
     """Configure one isotope-specific Kemp log-domain DDPF."""
 
     num_particles: int = 2000
-    max_sources: int = 3
+    max_sources: int = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     init_source_count_min: int = 1
-    init_source_count_max: int = 3
-    init_strength_log_mean: float = float(np.log(30000.0))
+    init_source_count_max: int = DEFAULT_MAX_SOURCES_PER_ISOTOPE
+    init_strength_log_mean: float = float(
+        np.log(DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M)
+    )
     init_strength_log_sigma: float = 1.5
     min_strength_cps_1m: float = 5.0
     max_strength_cps_1m: float = 5.0e6

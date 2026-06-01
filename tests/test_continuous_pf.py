@@ -16,6 +16,77 @@ from pf.particle_filter import IsotopeParticleFilter, PFConfig, IsotopeParticle
 from pf.state import IsotopeState
 
 
+def test_selected_pair_gpu_counts_match_all_pair_selection() -> None:
+    """Selected-pair torch counts should equal all-pair counts indexed afterward."""
+    torch = pytest.importorskip("torch")
+    from measurement.kernels import ShieldParams
+    from pf import gpu_utils
+
+    device = torch.device("cpu")
+    dtype = torch.float64
+    positions = torch.as_tensor(
+        [
+            [[1.0, 0.5, 0.4], [2.0, 1.2, 1.4]],
+            [[0.8, 1.5, 0.9], [2.5, 0.2, 1.8]],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    strengths = torch.as_tensor(
+        [[1000.0, 500.0], [800.0, 300.0]],
+        device=device,
+        dtype=dtype,
+    )
+    backgrounds = torch.as_tensor([2.0, 3.0], device=device, dtype=dtype)
+    mask = torch.ones((2, 2), device=device, dtype=dtype)
+    shield = ShieldParams()
+    detector_pos = np.array([0.0, 0.0, 0.0], dtype=float)
+    fe_indices = np.array([0, 3, 7, 1], dtype=np.int64)
+    pb_indices = np.array([7, 2, 4, 1], dtype=np.int64)
+
+    all_counts = gpu_utils.expected_counts_all_pairs_torch(
+        detector_pos=detector_pos,
+        positions=positions,
+        strengths=strengths,
+        backgrounds=backgrounds,
+        mask=mask,
+        mu_fe=shield.mu_fe,
+        mu_pb=shield.mu_pb,
+        thickness_fe_cm=shield.thickness_fe_cm,
+        thickness_pb_cm=shield.thickness_pb_cm,
+        live_time_s=1.0,
+        device=device,
+        dtype=dtype,
+        inner_radius_fe_cm=shield.inner_radius_fe_cm,
+        inner_radius_pb_cm=shield.inner_radius_pb_cm,
+        shield_geometry_model=shield.shield_geometry_model,
+        use_angle_attenuation=shield.use_angle_attenuation,
+    )
+    selected_counts = gpu_utils.expected_counts_selected_pairs_torch(
+        detector_pos=detector_pos,
+        positions=positions,
+        strengths=strengths,
+        backgrounds=backgrounds,
+        mask=mask,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        mu_fe=shield.mu_fe,
+        mu_pb=shield.mu_pb,
+        thickness_fe_cm=shield.thickness_fe_cm,
+        thickness_pb_cm=shield.thickness_pb_cm,
+        live_time_s=1.0,
+        device=device,
+        dtype=dtype,
+        inner_radius_fe_cm=shield.inner_radius_fe_cm,
+        inner_radius_pb_cm=shield.inner_radius_pb_cm,
+        shield_geometry_model=shield.shield_geometry_model,
+        use_angle_attenuation=shield.use_angle_attenuation,
+    )
+    pair_indices = fe_indices * 8 + pb_indices
+
+    assert torch.allclose(selected_counts, all_counts[pair_indices], rtol=1e-10)
+
+
 def test_geometric_scaling_inverse_square() -> None:
     """Expected counts should follow inverse-square scaling without shielding."""
     src = np.array([[0.0, 0.0, 0.0]])

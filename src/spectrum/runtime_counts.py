@@ -110,6 +110,11 @@ class RuntimeCountExtractor:
             transport_metadata=transport_metadata,
         )
         variances = self._apply_response_diagnostics_floor(counts_out, variances)
+        variances = self._apply_shield_systematic_variance_floor(
+            counts_out,
+            variances,
+            transport_metadata=transport_metadata,
+        )
         return RuntimeCountResult(counts_out, variances, set(detected))
 
     def _apply_spectrum_variance_floor(
@@ -215,6 +220,116 @@ class RuntimeCountExtractor:
                 isotope: float(value) for isotope, value in sorted(floors.items())
             }
             self.decomposer.last_response_poisson_diagnostics = diagnostics
+        return inflated
+
+    def _apply_shield_systematic_variance_floor(
+        self,
+        counts: dict[str, float],
+        variances: dict[str, float],
+        *,
+        transport_metadata: Mapping[str, object] | None,
+    ) -> dict[str, float]:
+        """
+        Inflate count variances for shielded spectra that carry model bias risk.
+
+        Rotating-shield postures are valuable temporal codes for localization,
+        but their spectra are more sensitive to geometry and scattering mismatch
+        than weakly shielded anchor views. This floor keeps those postures in
+        the PF likelihood while preventing them from dominating strength refits.
+        """
+        config = getattr(self.decomposer, "config", None)
+        if config is None or not bool(
+            getattr(
+                config,
+                "response_poisson_shield_systematic_variance_enable",
+                False,
+            )
+        ):
+            return variances
+        if transport_metadata is None:
+            return variances
+        thickness_scale = self._metadata_float(
+            transport_metadata,
+            "shield_thickness_scale",
+        )
+        if thickness_scale is None:
+            return variances
+        zero_threshold = max(
+            float(
+                getattr(
+                    config,
+                    "response_poisson_shield_systematic_zero_thickness_threshold",
+                    1.0e-9,
+                )
+            ),
+            0.0,
+        )
+        if thickness_scale is not None and thickness_scale <= zero_threshold:
+            return variances
+
+        pair_id = self._shield_pair_id_from_metadata(transport_metadata)
+        anchor_pair_ids = self._anchor_pair_ids_from_config()
+        if pair_id is not None and pair_id in anchor_pair_ids:
+            rel_sigma = max(
+                float(
+                    getattr(
+                        config,
+                        "response_poisson_shield_systematic_anchor_rel_sigma",
+                        0.0,
+                    )
+                ),
+                0.0,
+            )
+        else:
+            rel_sigma = max(
+                float(
+                    getattr(
+                        config,
+                        "response_poisson_shield_systematic_rel_sigma",
+                        0.0,
+                    )
+                ),
+                0.0,
+            )
+        if rel_sigma <= 0.0:
+            return variances
+
+        max_count = max(
+            (max(float(value), 0.0) for value in counts.values()),
+            default=0.0,
+        )
+        min_fraction = max(
+            float(
+                getattr(
+                    config,
+                    "response_poisson_shield_systematic_min_count_fraction",
+                    0.05,
+                )
+            ),
+            0.0,
+        )
+        floors: dict[str, float] = {}
+        inflated: dict[str, float] = {}
+        for isotope, count in counts.items():
+            reference = max(float(count), min_fraction * max_count, 1.0)
+            floor = float((rel_sigma * reference) ** 2)
+            floors[isotope] = floor
+            inflated[isotope] = float(max(variances.get(isotope, 1.0), floor, 1.0))
+
+        diagnostics = dict(
+            getattr(self.decomposer, "last_response_poisson_diagnostics", {})
+        )
+        diagnostics["runtime_shield_systematic_variance_floor"] = {
+            isotope: float(value) for isotope, value in sorted(floors.items())
+        }
+        diagnostics["runtime_shield_systematic_pair_id"] = (
+            None if pair_id is None else int(pair_id)
+        )
+        diagnostics["runtime_shield_systematic_rel_sigma"] = float(rel_sigma)
+        diagnostics["runtime_shield_systematic_anchor_pair"] = bool(
+            pair_id is not None and pair_id in anchor_pair_ids
+        )
+        self.decomposer.last_response_poisson_diagnostics = diagnostics
         return inflated
 
     def _diagnostic_relative_sigma(self, diagnostics: Mapping[str, object]) -> float:
@@ -373,6 +488,52 @@ class RuntimeCountExtractor:
         if not np.isfinite(result):
             return None
         return result
+
+    def _metadata_int(self, metadata: Mapping[str, object], key: str) -> int | None:
+        """Return a finite metadata value as int when available."""
+        value = self._metadata_float(metadata, key)
+        if value is None:
+            return None
+        return int(value)
+
+    def _shield_pair_id_from_metadata(
+        self,
+        metadata: Mapping[str, object],
+    ) -> int | None:
+        """Return the flattened shield pair id from observation metadata."""
+        direct = self._metadata_int(metadata, "shield_pair_id")
+        if direct is not None:
+            return direct
+        fe_index = self._metadata_int(metadata, "fe_orientation_index")
+        pb_index = self._metadata_int(metadata, "pb_orientation_index")
+        if fe_index is None or pb_index is None:
+            return None
+        num_orientations = self._metadata_int(metadata, "shield_num_orientations")
+        if num_orientations is None or num_orientations <= 0:
+            num_orientations = 8
+        return int(fe_index) * int(num_orientations) + int(pb_index)
+
+    def _anchor_pair_ids_from_config(self) -> set[int]:
+        """Return configured weakly shielded anchor pair ids."""
+        config = self.decomposer.config
+        raw_value = getattr(
+            config,
+            "response_poisson_shield_systematic_anchor_pair_ids",
+            (),
+        )
+        if raw_value is None:
+            return set()
+        if isinstance(raw_value, (str, bytes)):
+            values = [item for item in str(raw_value).split(",") if item.strip()]
+        else:
+            values = list(raw_value)
+        anchors: set[int] = set()
+        for value in values:
+            try:
+                anchors.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return anchors
 
     @staticmethod
     def _mapping_float(metadata: Mapping[str, object], key: str) -> float | None:

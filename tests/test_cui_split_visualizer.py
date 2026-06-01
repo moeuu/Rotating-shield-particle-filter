@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import matplotlib.axes
 import numpy as np
+from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from measurement.obstacles import ObstacleGrid
 from pf.parallel import Measurement, ParallelIsotopePF
@@ -49,12 +51,102 @@ def test_cui_split_visualizer_writes_robot_and_pf_views(tmp_path) -> None:
     visualizer.update(frame)
 
     assert (tmp_path / "index.html").exists()
+    assert "RA-L experiment overview" in (tmp_path / "index.html").read_text(
+        encoding="utf-8",
+    )
     assert (tmp_path / "latest_robot_2d.png").exists()
+    assert (tmp_path / "latest_experiment_overview.png").exists()
     assert (tmp_path / "latest_pf_3d.png").exists()
     assert (tmp_path / "latest_spectrum.png").exists()
     assert (tmp_path / "robot_2d_step_0003.png").exists()
+    assert (tmp_path / "experiment_overview_step_0003.png").exists()
     assert (tmp_path / "pf_3d_step_0003.png").exists()
     assert (tmp_path / "spectrum_step_0003.png").exists()
+
+
+def test_cui_split_visualizer_preserves_metric_aspect(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The paper overview and 3-D view should use metric-equal axes."""
+    aspect_calls: list[
+        tuple[tuple[float, float], tuple[float, float], object]
+    ] = []
+    box_aspect_calls: list[tuple[float, float, float]] = []
+    xtick_calls: list[np.ndarray] = []
+    ytick_calls: list[np.ndarray] = []
+    original_set_aspect = matplotlib.axes.Axes.set_aspect
+    original_set_box_aspect = Axes3D.set_box_aspect
+    original_set_xticks = matplotlib.axes.Axes.set_xticks
+    original_set_yticks = matplotlib.axes.Axes.set_yticks
+
+    def record_set_aspect(self, aspect, *args, **kwargs):
+        """Record 2-D aspect requests before delegating to Matplotlib."""
+        aspect_calls.append((self.get_xlim(), self.get_ylim(), aspect))
+        return original_set_aspect(self, aspect, *args, **kwargs)
+
+    def record_set_box_aspect(self, aspect, *args, **kwargs):
+        """Record 3-D box aspect requests before delegating to Matplotlib."""
+        if aspect is not None:
+            box_aspect_calls.append(tuple(float(value) for value in aspect))
+        return original_set_box_aspect(self, aspect, *args, **kwargs)
+
+    def record_set_xticks(self, ticks, *args, **kwargs):
+        """Record x-axis ticks before delegating to Matplotlib."""
+        xtick_calls.append(np.asarray(ticks, dtype=float))
+        return original_set_xticks(self, ticks, *args, **kwargs)
+
+    def record_set_yticks(self, ticks, *args, **kwargs):
+        """Record y-axis ticks before delegating to Matplotlib."""
+        ytick_calls.append(np.asarray(ticks, dtype=float))
+        return original_set_yticks(self, ticks, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_aspect", record_set_aspect)
+    monkeypatch.setattr(Axes3D, "set_box_aspect", record_set_box_aspect)
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_xticks", record_set_xticks)
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_yticks", record_set_yticks)
+
+    frame = PFFrame(
+        step_index=0,
+        time=0.0,
+        robot_position=np.array([5.0, 10.0, 0.5], dtype=float),
+        robot_orientation=None,
+        RFe=np.eye(3, dtype=float),
+        RPb=np.eye(3, dtype=float),
+        duration=1.0,
+        counts_by_isotope={"Cs-137": 10.0},
+        particle_positions={"Cs-137": np.array([[5.0, 10.0, 5.0]])},
+        particle_weights={"Cs-137": np.array([1.0], dtype=float)},
+        estimated_sources={"Cs-137": np.array([[5.0, 10.0, 5.0]])},
+        estimated_strengths={"Cs-137": np.array([1000.0], dtype=float)},
+    )
+    visualizer = CUISplitPFVisualizer(
+        isotopes=["Cs-137"],
+        output_dir=tmp_path,
+        world_bounds=(0.0, 10.0, 0.0, 20.0, 0.0, 10.0),
+        true_sources={"Cs-137": np.array([[5.0, 10.0, 5.0]], dtype=float)},
+    )
+
+    visualizer.update(frame)
+
+    assert any(
+        np.allclose(xlim, (0.0, 10.0))
+        and np.allclose(ylim, (0.0, 20.0))
+        and aspect == "equal"
+        for xlim, ylim, aspect in aspect_calls
+    )
+    assert any(
+        np.allclose(xlim, (0.0, 10.0))
+        and np.allclose(ylim, (0.0, 10.0))
+        and aspect == "equal"
+        for xlim, ylim, aspect in aspect_calls
+    )
+    assert any(
+        np.allclose(aspect, (10.0, 20.0, 10.0))
+        for aspect in box_aspect_calls
+    )
+    assert any(np.allclose(ticks, np.arange(0.0, 10.1, 2.0)) for ticks in xtick_calls)
+    assert any(np.allclose(ticks, np.arange(0.0, 20.1, 2.0)) for ticks in ytick_calls)
 
 
 def test_cui_split_visualizer_tracks_stations_and_path_waypoints(tmp_path) -> None:

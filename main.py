@@ -20,6 +20,14 @@ from realtime_demo import (
     run_live_pf,
 )
 from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
+from runtime_defaults import (
+    DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_RANDOM_SOURCE_COUNT,
+    DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
+    DEFAULT_ROBOT_SPEED_M_S,
+    DEFAULT_ROTATION_OVERHEAD_S,
+)
 
 STANDARD_GEANT4_FULL_CONFIG = (
     ROOT
@@ -263,7 +271,7 @@ def main() -> None:
     parser.add_argument(
         "--random-source-count",
         type=int,
-        default=3,
+        default=DEFAULT_RANDOM_SOURCE_COUNT,
         help="Number of surface-constrained random sources to generate.",
     )
     parser.add_argument(
@@ -278,8 +286,20 @@ def main() -> None:
     parser.add_argument(
         "--random-source-intensity-cps-1m",
         type=float,
-        default=30000.0,
+        default=DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
         help="Detector cps@1m assigned to each generated random source.",
+    )
+    parser.add_argument(
+        "--random-source-intensity-min-cps-1m",
+        type=float,
+        default=None,
+        help="Minimum detector cps@1m for uniformly sampled random sources.",
+    )
+    parser.add_argument(
+        "--random-source-intensity-max-cps-1m",
+        type=float,
+        default=None,
+        help="Maximum detector cps@1m for uniformly sampled random sources.",
     )
     parser.add_argument(
         "--obstacle-config",
@@ -408,10 +428,11 @@ def main() -> None:
     parser.add_argument(
         "--max-sources",
         type=int,
-        default=None,
+        default=DEFAULT_MAX_SOURCES_PER_ISOTOPE,
         help=(
-            "Maximum number of sources per isotope. Defaults to no cap with "
-            "--birth, else 1."
+            "Maximum number of sources per isotope. Defaults to "
+            f"{DEFAULT_MAX_SOURCES_PER_ISOTOPE}; use an explicit value only "
+            "for ablation/debug cases."
         ),
     )
     parser.add_argument(
@@ -494,19 +515,19 @@ def main() -> None:
     parser.add_argument(
         "--robot-speed",
         type=float,
-        default=0.5,
+        default=DEFAULT_ROBOT_SPEED_M_S,
         help="Nominal robot travel speed in m/s used for mission-time accounting.",
     )
     parser.add_argument(
         "--rotation-overhead-s",
         type=float,
-        default=0.5,
+        default=DEFAULT_ROTATION_OVERHEAD_S,
         help="Fixed shield actuation overhead per measurement in seconds.",
     )
     parser.add_argument(
         "--measurement-time-s",
         type=float,
-        default=30.0,
+        default=DEFAULT_MEASUREMENT_TIME_S,
         help=(
             "Fixed dwell time, or adaptive dwell cap, per measurement in seconds. "
             "Use <=0 with --adaptive-dwell for no dwell cap."
@@ -747,7 +768,7 @@ def main() -> None:
         parser,
     )
     if args.max_sources is None:
-        args.max_sources = None if args.birth else 1
+        args.max_sources = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     pf_overrides: dict[str, object] = {
         "max_sources": args.max_sources,
         "max_resamples_per_observation": args.temper_max_resamples,
@@ -887,6 +908,8 @@ def main() -> None:
         random_source_count=args.random_source_count,
         random_source_isotopes=args.random_source_isotopes,
         random_source_intensity_cps_1m=args.random_source_intensity_cps_1m,
+        random_source_intensity_min_cps_1m=args.random_source_intensity_min_cps_1m,
+        random_source_intensity_max_cps_1m=args.random_source_intensity_max_cps_1m,
         notification_config=notification_config,
         notify_spectrum=args.notify_spectrum,
         notify_spectrum_every=args.notify_spectrum_every,

@@ -16,6 +16,7 @@
 <body>
   <header>Rotating Shield PF CUI View - auto refresh every 2 s</header>
   <main>
+    <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
     <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
     <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
     <section class="wide"><h2>Processed spectrum decomposition</h2><img id="spectrum" src="latest_spectrum.png"></section>
@@ -23,6 +24,7 @@
   <script>
     function refresh() {
       const t = Date.now();
+      document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
       document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
       document.getElementById("pf").src = "latest_pf_3d.png?t=" + t;
       document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;

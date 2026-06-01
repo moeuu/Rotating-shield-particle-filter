@@ -25,13 +25,54 @@
 
 - Before running RA-L paper ablations, read
   `docs/ral_minimal_ablation_plan.md`.
-- The current RA-L paper subset is 13 full-simulation runs:
-  `proposed`, `baseline_passive_no_shield`, `round_robin_shield`, and
-  `one_step_path` for all three cases, plus `no_residual_birth` only for
-  `case03_mixed_cardinality`.
+- Before changing RA-L manuscript content, acknowledgments, figures, tables, or
+  layout, read `docs/ral_manuscript_policy.md`.
+- Before changing RA-L manuscript figures or layout, read
+  `docs/ral_figure_quality_policy.md`. The manuscript should use the eighth
+  page effectively while staying within the eight-page RA-L limit; do not leave
+  the final page mostly blank when necessary explanation can be restored.
+- The anonymous RA-L manuscript must keep the masked sponsor footnote
+  `This work was in part supported by XXX.` as a first-page `\thanks`
+  acknowledgment. Do not remove it or move it into the main text unless the
+  user explicitly asks for a camera-ready/non-anonymous version.
+- The current RA-L paper subset is four full-simulation runs on
+  `mix9_multi_isotope_cardinality`:
+  `proposed`, `baseline_passive_equal_time_no_shield`, `round_robin_shield`,
+  and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60 + 2 Eu-154` sources.
+  Estimator-only ablations such as `no_residual_birth` and `no_verification`
+  should be run as logged replay unless the user explicitly requests extra
+  full simulations.
 - Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
   `results/ral_ablation/ral_paper_subset_manifest.csv` and
   `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.
+
+
+## RA-L figure quality policy
+
+- Before creating or modifying RA-L manuscript figures, read
+  `docs/ral_figure_quality_policy.md`.
+- After generating any manuscript figure, inspect the rendered image itself
+  before reporting completion. Do not rely only on code, LaTeX source, or file
+  existence.
+- Figures must be revised before completion if text, legends, panel labels,
+  axes, markers, or arrows overlap; if metric aspect ratios are distorted; or
+  if a panel is logically unclear or implies a method/physics behavior that is
+  not actually used.
+- Generated RA-L figure text must be readable at final paper size. Use at least
+  7 pt for labels, ticks, and legends unless a stronger venue rule is known,
+  use a consistent body font size across adjacent result tables, and avoid
+  `\scriptsize` in main-paper result tables unless the table has first been
+  simplified.
+- If a manuscript result claims 3-D localization accuracy, the main result
+  figure must show a 3-D view or paired projections that make height errors
+  visible. Do not show only an x-y map unless the text explicitly says the
+  figure is only a floor-plan diagnostic.
+- Do not use the same rendered scene as the primary panel of multiple figures.
+  Assign each figure a distinct role, such as problem setting, shield mechanism,
+  or experimental result.
+- When using `scripts/build_ral_figures.py`, inspect the PNG review copies in
+  `results/ral_figure_review/` and inspect the compiled PDF page when the figure
+  is included in the paper.
 
 
 ## Compute parallelism policy
@@ -57,6 +98,16 @@
 ## Simulation fidelity policy
 
 - Runtime simulation fidelity must take priority over speed shortcuts.
+- Long full-simulation runs must be launched in a persistent background
+  session such as `tmux` when the user is connected over SSH or asks for log
+  monitoring. Do not run multi-hour RA-L/Geant4 simulations only as a foreground
+  command attached to the current Codex/SSH terminal, because SSH disconnects or
+  tool-session interruptions can terminate `main.py` while leaving Geant4
+  sidecars or CUI servers orphaned.
+- For persistent runs, write stdout/stderr to a timestamped log file, save the
+  PID/session name, and monitor that log from a separate command. If a CUI URL is
+  exposed, relay it immediately and keep the server process tied to the
+  persistent session.
 - "Full simulation" means the standard no-GUI Geant4/PF runtime. Use
   `uv run python main.py --full-simulation` or `uv run python main.py` unless
   the user explicitly asks for another mode. This resolves to

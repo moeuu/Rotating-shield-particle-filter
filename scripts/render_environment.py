@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--obstacle-config",
         type=Path,
-        default=Path("obstacle_layouts/demo_obstacles.json"),
+        default=Path("obstacle_layouts/no_obstacles.json"),
         help="Obstacle layout JSON path (relative to repo root if not absolute).",
     )
     parser.add_argument(

@@ -1127,6 +1127,34 @@ def _sample_surface_position_batch(
     ).reshape(-1, 3)
 
 
+def _surface_candidate_constraint_mask(
+    candidates: NDArray[np.float64],
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    excluded_surface_kinds: Sequence[SourceSurfaceKind] | None,
+    preferred_max_z_m: float | None,
+) -> NDArray[np.bool_]:
+    """Return candidates satisfying random-source placement constraints."""
+    points = np.asarray(candidates, dtype=float).reshape(-1, 3)
+    if points.size == 0:
+        return np.zeros(0, dtype=bool)
+    mask = np.ones(points.shape[0], dtype=bool)
+    if excluded_surface_kinds:
+        kinds = source_surface_kinds(
+            points,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+        )
+        excluded = [str(kind) for kind in excluded_surface_kinds]
+        mask &= ~np.isin(kinds, excluded)
+    if preferred_max_z_m is not None:
+        mask &= points[:, 2] <= float(preferred_max_z_m) + 1.0e-9
+    return mask
+
+
 def sample_observable_surface_position(
     env: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None,
@@ -1139,56 +1167,122 @@ def sample_observable_surface_position(
     clear_path_max_m: float = 0.01,
     batch_size: int = 256,
     max_attempts: int = 4096,
+    excluded_surface_kinds: Sequence[SourceSurfaceKind] | None = None,
+    preferred_max_z_m: float | None = 5.0,
 ) -> tuple[float, float, float]:
     """Sample a surface position with enough clear ground measurement views."""
     min_fraction = max(0.0, float(min_visible_fraction))
-    if min_fraction <= 0.0 or measurement_points is None:
-        return sample_surface_position(
-            env,
-            obstacle_grid,
-            rng,
-            obstacle_height_m=obstacle_height_m,
-        )
-    detectors = _coerce_visibility_measurement_points(
-        np.asarray(measurement_points, dtype=float),
-        detector_height_m=detector_height_m,
-    )
-    if detectors.size == 0:
-        return sample_surface_position(
-            env,
-            obstacle_grid,
-            rng,
-            obstacle_height_m=obstacle_height_m,
-        )
-    remaining = max(1, int(max_attempts))
     sample_batch = max(1, int(batch_size))
-    while remaining > 0:
-        current_batch = min(sample_batch, remaining)
-        candidates = _sample_surface_position_batch(
-            env,
-            obstacle_grid,
-            rng,
-            obstacle_height_m=obstacle_height_m,
-            batch_size=current_batch,
-        )
-        fractions = surface_observable_fractions(
-            candidates,
-            obstacle_grid,
-            detectors,
-            obstacle_height_m=obstacle_height_m,
+    detectors = np.zeros((0, 3), dtype=float)
+    if min_fraction > 0.0 and measurement_points is not None:
+        detectors = _coerce_visibility_measurement_points(
+            np.asarray(measurement_points, dtype=float),
             detector_height_m=detector_height_m,
-            clear_path_max_m=clear_path_max_m,
         )
-        valid = np.flatnonzero(fractions >= min_fraction)
-        if valid.size:
-            selected = int(valid[int(rng.integers(0, valid.size))])
-            point = candidates[selected]
-            return (float(point[0]), float(point[1]), float(point[2]))
-        remaining -= current_batch
+
+    def _draw_with_z_constraint(
+        z_limit: float | None,
+    ) -> tuple[float, float, float] | None:
+        """Draw one candidate under an optional preferred-height constraint."""
+        remaining = max(1, int(max_attempts))
+        while remaining > 0:
+            current_batch = min(sample_batch, remaining)
+            candidates = _sample_surface_position_batch(
+                env,
+                obstacle_grid,
+                rng,
+                obstacle_height_m=obstacle_height_m,
+                batch_size=current_batch,
+            )
+            valid_mask = _surface_candidate_constraint_mask(
+                candidates,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                excluded_surface_kinds=excluded_surface_kinds,
+                preferred_max_z_m=z_limit,
+            )
+            valid = np.flatnonzero(valid_mask)
+            if valid.size and detectors.size:
+                fractions = surface_observable_fractions(
+                    candidates[valid],
+                    obstacle_grid,
+                    detectors,
+                    obstacle_height_m=obstacle_height_m,
+                    detector_height_m=detector_height_m,
+                    clear_path_max_m=clear_path_max_m,
+                )
+                valid = valid[fractions >= min_fraction]
+            if valid.size:
+                selected = int(valid[int(rng.integers(0, valid.size))])
+                point = candidates[selected]
+                return (float(point[0]), float(point[1]), float(point[2]))
+            remaining -= current_batch
+        return None
+
+    preferred = None
+    if preferred_max_z_m is not None:
+        preferred = _draw_with_z_constraint(float(preferred_max_z_m))
+    if preferred is not None:
+        return preferred
+    fallback = _draw_with_z_constraint(None)
+    if fallback is not None:
+        return fallback
+    excluded = sorted(str(kind) for kind in excluded_surface_kinds or ())
+    preference = (
+        "none" if preferred_max_z_m is None else f"{float(preferred_max_z_m):.3f}m"
+    )
     raise ValueError(
-        "No surface-random source position satisfied the ground-visibility "
-        f"constraint after {int(max_attempts)} attempts "
-        f"(min_visible_fraction={min_fraction:.3f})."
+        "No surface-random source position satisfied the placement constraints "
+        f"after {int(max_attempts)} attempts "
+        f"(min_visible_fraction={min_fraction:.3f}, "
+        f"excluded_surface_kinds={excluded}, preferred_max_z={preference})."
+    )
+
+
+def _normalise_max_ceiling_sources(value: int | None) -> int | None:
+    """Return a validated maximum number of random ceiling sources."""
+    if value is None:
+        return None
+    return max(0, int(value))
+
+
+def _sample_constrained_source_position(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    rng: np.random.Generator,
+    *,
+    obstacle_height_m: float,
+    visibility_measurement_points: NDArray[np.float64] | None,
+    visibility_min_fraction: float,
+    visibility_detector_height_m: float,
+    visibility_clear_path_max_m: float,
+    visibility_batch_size: int,
+    visibility_max_attempts_per_source: int,
+    ceiling_count: int,
+    max_ceiling_sources: int | None,
+    preferred_max_z_m: float | None,
+) -> tuple[float, float, float]:
+    """Sample one random source while enforcing scenario-level surface limits."""
+    excluded: list[SourceSurfaceKind] = []
+    if (
+        max_ceiling_sources is not None
+        and int(ceiling_count) >= int(max_ceiling_sources)
+    ):
+        excluded.append("ceiling")
+    return sample_observable_surface_position(
+        env,
+        obstacle_grid,
+        rng,
+        measurement_points=visibility_measurement_points,
+        min_visible_fraction=float(visibility_min_fraction),
+        obstacle_height_m=obstacle_height_m,
+        detector_height_m=visibility_detector_height_m,
+        clear_path_max_m=visibility_clear_path_max_m,
+        batch_size=visibility_batch_size,
+        max_attempts=visibility_max_attempts_per_source,
+        excluded_surface_kinds=excluded,
+        preferred_max_z_m=preferred_max_z_m,
     )
 
 
@@ -1197,7 +1291,7 @@ def generate_surface_sources(
     env: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None,
     isotopes: Sequence[str],
-    intensity_cps_1m: float | Mapping[str, float],
+    intensity_cps_1m: float | Sequence[float] | Mapping[str, float | Sequence[float]],
     rng: np.random.Generator,
     count: int | None = None,
     obstacle_height_m: float = 2.0,
@@ -1207,30 +1301,46 @@ def generate_surface_sources(
     visibility_clear_path_max_m: float = 0.01,
     visibility_batch_size: int = 256,
     visibility_max_attempts_per_source: int = 4096,
+    max_ceiling_sources: int | None = 1,
+    preferred_max_z_m: float | None = 5.0,
 ) -> list[PointSource]:
     """Generate point sources constrained to observable physical surfaces."""
     if not isotopes:
         raise ValueError("At least one isotope is required.")
     source_count = len(isotopes) if count is None else max(1, int(count))
+    ceiling_limit = _normalise_max_ceiling_sources(max_ceiling_sources)
+    ceiling_count = 0
     sources: list[PointSource] = []
     for idx in range(source_count):
         isotope = str(isotopes[idx % len(isotopes)])
-        if isinstance(intensity_cps_1m, Mapping):
-            intensity = float(intensity_cps_1m[isotope])
-        else:
-            intensity = float(intensity_cps_1m)
-        position = sample_observable_surface_position(
+        intensity = _sample_intensity_cps_1m(
+            intensity_cps_1m,
+            isotope=isotope,
+            rng=rng,
+        )
+        position = _sample_constrained_source_position(
             env,
             obstacle_grid,
             rng,
-            measurement_points=visibility_measurement_points,
-            min_visible_fraction=float(visibility_min_fraction),
             obstacle_height_m=obstacle_height_m,
-            detector_height_m=visibility_detector_height_m,
-            clear_path_max_m=visibility_clear_path_max_m,
-            batch_size=visibility_batch_size,
-            max_attempts=visibility_max_attempts_per_source,
+            visibility_measurement_points=visibility_measurement_points,
+            visibility_min_fraction=float(visibility_min_fraction),
+            visibility_detector_height_m=visibility_detector_height_m,
+            visibility_clear_path_max_m=visibility_clear_path_max_m,
+            visibility_batch_size=visibility_batch_size,
+            visibility_max_attempts_per_source=visibility_max_attempts_per_source,
+            ceiling_count=ceiling_count,
+            max_ceiling_sources=ceiling_limit,
+            preferred_max_z_m=preferred_max_z_m,
         )
+        surface_kind = source_surface_kind(
+            position,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+        )
+        if surface_kind == "ceiling":
+            ceiling_count += 1
         sources.append(
             PointSource(
                 isotope=isotope,
@@ -1239,3 +1349,35 @@ def generate_surface_sources(
             )
         )
     return sources
+
+
+def _sample_intensity_cps_1m(
+    intensity_cps_1m: float | Sequence[float] | Mapping[str, float | Sequence[float]],
+    *,
+    isotope: str,
+    rng: np.random.Generator,
+) -> float:
+    """Return a fixed or uniformly sampled detector-cps@1m source strength."""
+    raw_value: object
+    if isinstance(intensity_cps_1m, Mapping):
+        raw_value = intensity_cps_1m[isotope]
+    else:
+        raw_value = intensity_cps_1m
+    if isinstance(raw_value, Sequence) and not isinstance(raw_value, (str, bytes)):
+        if len(raw_value) != 2:
+            raise ValueError("intensity range must contain exactly two values.")
+        lo = float(raw_value[0])
+        hi = float(raw_value[1])
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise ValueError("intensity range values must be finite.")
+        if lo <= 0.0 or hi <= 0.0:
+            raise ValueError("intensity range values must be positive.")
+        if hi < lo:
+            raise ValueError("intensity range maximum must be >= minimum.")
+        if hi == lo:
+            return lo
+        return float(rng.uniform(lo, hi))
+    intensity = float(raw_value)
+    if not np.isfinite(intensity) or intensity <= 0.0:
+        raise ValueError("intensity_cps_1m must be a positive finite value.")
+    return intensity

@@ -9,6 +9,7 @@ from pathlib import Path
 import multiprocessing as mp
 import pickle
 import queue
+import shutil
 import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
@@ -156,6 +157,47 @@ def _coerce_path_waypoints(frame: PFFrame) -> NDArray[np.float64]:
     if arr.ndim != 2 or arr.shape[1] != 3:
         return np.zeros((0, 3), dtype=float)
     return arr
+
+
+def _metric_ticks(vmin: float, vmax: float, step: float = 2.0) -> NDArray[np.float64]:
+    """Return regularly spaced metric ticks covering an axis interval."""
+    lo = float(vmin)
+    hi = float(vmax)
+    spacing = max(float(step), 1.0e-9)
+    start = np.ceil(lo / spacing) * spacing
+    stop = np.floor(hi / spacing) * spacing
+    if stop < start:
+        return np.asarray([lo, hi], dtype=float)
+    ticks = np.arange(start, stop + 0.5 * spacing, spacing, dtype=float)
+    if ticks.size == 0:
+        return np.asarray([lo, hi], dtype=float)
+    return ticks
+
+
+def _apply_metric_ticks_2d(
+    ax: plt.Axes,
+    *,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    step: float = 2.0,
+) -> None:
+    """Apply consistent metric tick spacing to a 2-D axis."""
+    ax.set_xticks(_metric_ticks(float(xlim[0]), float(xlim[1]), step))
+    ax.set_yticks(_metric_ticks(float(ylim[0]), float(ylim[1]), step))
+
+
+def _apply_metric_ticks_3d(
+    ax: plt.Axes,
+    *,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    zlim: tuple[float, float],
+    step: float = 2.0,
+) -> None:
+    """Apply consistent metric tick spacing to a 3-D axis."""
+    ax.set_xticks(_metric_ticks(float(xlim[0]), float(xlim[1]), step))
+    ax.set_yticks(_metric_ticks(float(ylim[0]), float(ylim[1]), step))
+    ax.set_zticks(_metric_ticks(float(zlim[0]), float(zlim[1]), step))
 
 
 def _extend_trajectory_history(
@@ -1337,10 +1379,13 @@ class CUISplitPFVisualizer:
             for i, iso in enumerate(self.isotopes)
         }
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
+        self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self.index_path = self.output_dir / "index.html"
         self._write_index_html()
+        if not self.latest_overview_path.exists():
+            self._save_overview_placeholder(self.latest_overview_path)
         if not self.latest_spectrum_path.exists():
             self._save_spectrum_placeholder(self.latest_spectrum_path)
 
@@ -1353,14 +1398,18 @@ class CUISplitPFVisualizer:
         self._record_measurement_point(frame)
         step = max(0, int(frame.step_index))
         robot_step_path = self.output_dir / f"robot_2d_step_{step:04d}.png"
+        overview_step_path = self.output_dir / f"experiment_overview_step_{step:04d}.png"
         pf_step_path = self.output_dir / f"pf_3d_step_{step:04d}.png"
         spectrum_step_path = self.output_dir / f"spectrum_step_{step:04d}.png"
         self._save_robot_2d(frame, robot_step_path)
-        self._save_robot_2d(frame, self.latest_robot_path)
+        shutil.copyfile(robot_step_path, self.latest_robot_path)
+        self._save_experiment_overview(frame, overview_step_path)
+        shutil.copyfile(overview_step_path, self.latest_overview_path)
         self._save_pf_3d(frame, pf_step_path)
-        self._save_pf_3d(frame, self.latest_pf_path)
+        shutil.copyfile(pf_step_path, self.latest_pf_path)
         self._save_spectrum(frame, spectrum_step_path)
-        self._save_spectrum(frame, self.latest_spectrum_path)
+        if spectrum_step_path.exists():
+            shutil.copyfile(spectrum_step_path, self.latest_spectrum_path)
 
     def _record_path_segment(self, frame: PFFrame) -> None:
         """Store the obstacle-aware segment associated with this frame, if any."""
@@ -1473,6 +1522,7 @@ class CUISplitPFVisualizer:
 <body>
   <header>Rotating Shield PF CUI View - auto refresh every 2 s</header>
   <main>
+    <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
     <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
     <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
     <section class="wide"><h2>Processed spectrum decomposition</h2><img id="spectrum" src="latest_spectrum.png"></section>
@@ -1480,6 +1530,7 @@ class CUISplitPFVisualizer:
   <script>
     function refresh() {
       const t = Date.now();
+      document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
       document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
       document.getElementById("pf").src = "latest_pf_3d.png?t=" + t;
       document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
@@ -1490,6 +1541,24 @@ class CUISplitPFVisualizer:
 </html>
 """
         self.index_path.write_text(html, encoding="utf-8")
+
+    def _save_overview_placeholder(self, output_path: Path) -> None:
+        """Save a placeholder RA-L overview panel until the first frame arrives."""
+        fig, ax = plt.subplots(figsize=(12.0, 5.2))
+        ax.text(
+            0.5,
+            0.5,
+            "RA-L experiment overview will appear after the first measurement",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160)
+        plt.close(fig)
 
     def _save_spectrum_placeholder(self, output_path: Path) -> None:
         """Save a placeholder spectrum panel until the first measurement arrives."""
@@ -1569,6 +1638,150 @@ class CUISplitPFVisualizer:
                 linewidth=0.6,
                 label=f"true {iso}",
             )
+
+    def _plot_estimated_sources_2d(self, ax: plt.Axes, frame: PFFrame) -> None:
+        """Plot estimated source positions on a 2D map view."""
+        for iso in self.isotopes:
+            est = frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float))
+            if np.asarray(est, dtype=float).size == 0:
+                continue
+            est_arr = np.asarray(est, dtype=float).reshape((-1, 3))
+            strengths = np.asarray(
+                frame.estimated_strengths.get(iso, np.zeros(0, dtype=float)),
+                dtype=float,
+            ).reshape(-1)
+            sizes = 110.0 + 0.02 * np.clip(strengths, 0.0, 5000.0)
+            if sizes.size != est_arr.shape[0]:
+                sizes = np.full(est_arr.shape[0], 130.0, dtype=float)
+            ax.scatter(
+                est_arr[:, 0],
+                est_arr[:, 1],
+                marker="x",
+                s=sizes,
+                color=self.colors.get(iso, "black"),
+                linewidths=2.2,
+                label=f"estimate {iso}",
+                zorder=12,
+            )
+
+    def _plot_source_match_segments_2d(self, ax: plt.Axes, frame: PFFrame) -> None:
+        """Draw nearest truth-to-estimate links for same-isotope source matches."""
+        for iso, truth_raw in self.true_sources.items():
+            truth = np.asarray(truth_raw, dtype=float)
+            est = np.asarray(
+                frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
+                dtype=float,
+            )
+            if truth.size == 0 or est.size == 0:
+                continue
+            truth = truth.reshape((-1, 3))
+            est = est.reshape((-1, 3))
+            color = self.colors.get(iso, "black")
+            used_label = False
+            for src in truth:
+                distances = np.linalg.norm(est - src[None, :], axis=1)
+                nearest = est[int(np.argmin(distances))]
+                ax.plot(
+                    [src[0], nearest[0]],
+                    [src[1], nearest[1]],
+                    "--",
+                    color=color,
+                    alpha=0.45,
+                    linewidth=1.0,
+                    label="truth-estimate link" if not used_label else None,
+                    zorder=4,
+                )
+                used_label = True
+
+    def _plot_true_sources_xz(self, ax: plt.Axes) -> None:
+        """Plot true source positions in an x-z elevation projection."""
+        for iso, positions in self.true_sources.items():
+            pos = np.asarray(positions, dtype=float)
+            if pos.size == 0:
+                continue
+            pos = pos.reshape((-1, 3))
+            ax.scatter(
+                pos[:, 0],
+                pos[:, 2],
+                marker="*",
+                s=90,
+                color=self.colors.get(iso, "black"),
+                edgecolor="white",
+                linewidth=0.6,
+                label=f"true {iso}",
+                zorder=10,
+            )
+
+    def _plot_estimated_sources_xz(self, ax: plt.Axes, frame: PFFrame) -> None:
+        """Plot estimated source positions in an x-z elevation projection."""
+        for iso in self.isotopes:
+            est = np.asarray(
+                frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
+                dtype=float,
+            )
+            if est.size == 0:
+                continue
+            est = est.reshape((-1, 3))
+            ax.scatter(
+                est[:, 0],
+                est[:, 2],
+                marker="x",
+                s=120,
+                color=self.colors.get(iso, "black"),
+                linewidths=2.2,
+                label=f"estimate {iso}",
+                zorder=11,
+            )
+
+    def _plot_source_match_segments_xz(self, ax: plt.Axes, frame: PFFrame) -> None:
+        """Draw nearest same-isotope truth-to-estimate links in x-z projection."""
+        for iso, truth_raw in self.true_sources.items():
+            truth = np.asarray(truth_raw, dtype=float)
+            est = np.asarray(
+                frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
+                dtype=float,
+            )
+            if truth.size == 0 or est.size == 0:
+                continue
+            truth = truth.reshape((-1, 3))
+            est = est.reshape((-1, 3))
+            color = self.colors.get(iso, "black")
+            for src in truth:
+                distances = np.linalg.norm(est - src[None, :], axis=1)
+                nearest = est[int(np.argmin(distances))]
+                ax.plot(
+                    [src[0], nearest[0]],
+                    [src[2], nearest[2]],
+                    "--",
+                    color=color,
+                    alpha=0.45,
+                    linewidth=1.0,
+                    zorder=4,
+                )
+
+    def _overview_summary_text(self, frame: PFFrame) -> str:
+        """Return a compact textual source-count summary for the overview panel."""
+        lines = [self._frame_progress_label(frame)]
+        for iso in self.isotopes:
+            truth_count = int(
+                np.asarray(self.true_sources.get(iso, np.zeros((0, 3))), dtype=float)
+                .reshape((-1, 3))
+                .shape[0]
+            ) if iso in self.true_sources else 0
+            est_count = int(
+                np.asarray(
+                    frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float)),
+                    dtype=float,
+                )
+                .reshape((-1, 3))
+                .shape[0]
+            )
+            count_value = float(frame.counts_by_isotope.get(iso, 0.0))
+            lines.append(
+                f"{iso}: truth={truth_count} estimate={est_count} "
+                f"latest_count={count_value:.1f}"
+            )
+        return "\n".join(lines)
 
     def _plot_true_sources_3d(self, ax: plt.Axes) -> None:
         """Plot true source positions on the 3D PF view when available."""
@@ -1666,8 +1879,14 @@ class CUISplitPFVisualizer:
             label="robot",
             zorder=10,
         )
+        self._plot_estimated_sources_2d(ax, frame)
         ax.set_xlim(float(xmin), float(xmax))
         ax.set_ylim(float(ymin), float(ymax))
+        _apply_metric_ticks_2d(
+            ax,
+            xlim=(float(xmin), float(xmax)),
+            ylim=(float(ymin), float(ymax)),
+        )
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
@@ -1680,6 +1899,137 @@ class CUISplitPFVisualizer:
             fontsize=8,
         )
         fig.subplots_adjust(right=0.74)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_experiment_overview(self, frame: PFFrame, output_path: Path) -> None:
+        """Save a paper-oriented overview with map, estimates, and elevation view."""
+        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
+        fig = plt.figure(figsize=(11.2, 8.0))
+        grid = fig.add_gridspec(
+            2,
+            2,
+            width_ratios=(1.0, 1.0),
+            height_ratios=(1.0, 1.0),
+        )
+        map_ax = fig.add_subplot(grid[:, 0])
+        elev_ax = fig.add_subplot(grid[0, 1])
+        info_ax = fig.add_subplot(grid[1, 1])
+        info_ax.axis("off")
+        self._draw_obstacles_2d(map_ax)
+        self._plot_source_match_segments_2d(map_ax, frame)
+        self._plot_true_sources_2d(map_ax)
+        for idx, segment in enumerate(self.path_segments):
+            if segment.shape[0] < 2:
+                continue
+            map_ax.plot(
+                segment[:, 0],
+                segment[:, 1],
+                "-",
+                color="cyan",
+                linewidth=2.0,
+                alpha=0.72,
+                label="traversed path" if idx == 0 else None,
+                zorder=5,
+            )
+        if self.measurement_points:
+            points = np.vstack(self.measurement_points)
+            map_ax.scatter(
+                points[:, 0],
+                points[:, 1],
+                s=48,
+                color="white",
+                edgecolor="cyan",
+                linewidth=1.0,
+                label="measurement station",
+                zorder=9,
+            )
+        robot = np.asarray(frame.robot_position, dtype=float).reshape(3)
+        map_ax.scatter(
+            [robot[0]],
+            [robot[1]],
+            s=125,
+            color="cyan",
+            edgecolor="black",
+            linewidth=1.0,
+            label="robot",
+            zorder=13,
+        )
+        self._plot_estimated_sources_2d(map_ax, frame)
+        map_ax.set_xlim(float(xmin), float(xmax))
+        map_ax.set_ylim(float(ymin), float(ymax))
+        _apply_metric_ticks_2d(
+            map_ax,
+            xlim=(float(xmin), float(xmax)),
+            ylim=(float(ymin), float(ymax)),
+        )
+        map_ax.set_aspect("equal", adjustable="box")
+        map_ax.set_xlabel("x [m]")
+        map_ax.set_ylabel("y [m]")
+        map_ax.set_title("Top-down map: obstacles, path, truth, and estimates")
+        map_ax.grid(True, alpha=0.25)
+
+        self._plot_source_match_segments_xz(elev_ax, frame)
+        self._plot_true_sources_xz(elev_ax)
+        self._plot_estimated_sources_xz(elev_ax, frame)
+        if self.measurement_points:
+            points = np.vstack(self.measurement_points)
+            elev_ax.scatter(
+                points[:, 0],
+                points[:, 2],
+                s=28,
+                color="cyan",
+                edgecolor="black",
+                linewidth=0.4,
+                alpha=0.55,
+                label="station height",
+                zorder=6,
+            )
+        elev_ax.axhline(float(zmin), color="black", linewidth=0.8, alpha=0.45)
+        elev_ax.axhline(float(zmax), color="black", linewidth=0.8, alpha=0.25)
+        elev_ax.set_xlim(float(xmin), float(xmax))
+        elev_ax.set_ylim(float(zmin), float(zmax))
+        _apply_metric_ticks_2d(
+            elev_ax,
+            xlim=(float(xmin), float(xmax)),
+            ylim=(float(zmin), float(zmax)),
+        )
+        elev_ax.set_aspect("equal", adjustable="box")
+        elev_ax.set_xlabel("x [m]")
+        elev_ax.set_ylabel("z [m]")
+        elev_ax.set_title("Elevation projection: height ambiguity")
+        elev_ax.grid(True, alpha=0.25)
+        handles, labels = map_ax.get_legend_handles_labels()
+        elev_handles, elev_labels = elev_ax.get_legend_handles_labels()
+        legend_by_label = dict(zip(labels + elev_labels, handles + elev_handles))
+        if legend_by_label:
+            info_ax.legend(
+                legend_by_label.values(),
+                legend_by_label.keys(),
+                loc="upper left",
+                fontsize=7,
+                frameon=True,
+            )
+        info_ax.text(
+            0.0,
+            0.02,
+            self._overview_summary_text(frame),
+            ha="left",
+            va="bottom",
+            fontsize=8,
+            transform=info_ax.transAxes,
+            wrap=True,
+        )
+        fig.suptitle("RA-L experiment overview", fontsize=13, fontweight="bold")
+        fig.subplots_adjust(
+            left=0.06,
+            right=0.98,
+            top=0.90,
+            bottom=0.08,
+            wspace=0.25,
+            hspace=0.32,
+        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
@@ -1820,6 +2170,22 @@ class CUISplitPFVisualizer:
         ax.set_xlim(float(xmin), float(xmax))
         ax.set_ylim(float(ymin), float(ymax))
         ax.set_zlim(float(zmin), float(zmax))
+        _apply_metric_ticks_3d(
+            ax,
+            xlim=(float(xmin), float(xmax)),
+            ylim=(float(ymin), float(ymax)),
+            zlim=(float(zmin), float(zmax)),
+        )
+        try:
+            ax.set_box_aspect(
+                (
+                    max(float(xmax) - float(xmin), 1.0e-9),
+                    max(float(ymax) - float(ymin), 1.0e-9),
+                    max(float(zmax) - float(zmin), 1.0e-9),
+                )
+            )
+        except AttributeError:
+            pass
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
@@ -1934,6 +2300,7 @@ class AsyncCUISplitPFVisualizer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.output_dir / "index.html"
         self.latest_robot_path = self.output_dir / "latest_robot_2d.png"
+        self.latest_overview_path = self.output_dir / "latest_experiment_overview.png"
         self.latest_pf_path = self.output_dir / "latest_pf_3d.png"
         self.latest_spectrum_path = self.output_dir / "latest_spectrum.png"
         self._closed = False

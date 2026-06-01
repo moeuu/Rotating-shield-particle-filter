@@ -89,6 +89,55 @@ def test_estimator_can_start_without_active_detected_isotopes():
     assert set(est.filters) == {"Cs-137", "Co-60"}
 
 
+def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
+    """Station joint updates should dispatch independent isotopes in parallel."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137", "Co-60"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0, "Co-60": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            parallel_isotope_updates=True,
+            parallel_isotope_workers=2,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    calls = []
+
+    def fake_sequence_update(self, **kwargs):
+        """Record that this isotope received the station sequence update."""
+        calls.append((self.isotope, tuple(np.asarray(kwargs["z_obs"], dtype=float))))
+
+    def fake_birth_death(*_args, **_kwargs):
+        """Skip structural moves so the test isolates dispatch policy."""
+        return None
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair_sequence",
+        fake_sequence_update,
+    )
+    monkeypatch.setattr(est, "_apply_birth_death", fake_birth_death)
+
+    est.update_pair_sequence(
+        [
+            ({"Cs-137": 1.0, "Co-60": 2.0}, 0, 0, 1.0, None),
+            ({"Cs-137": 3.0, "Co-60": 4.0}, 0, 0, 1.0, None),
+        ],
+        pose_idx=0,
+    )
+
+    assert est.last_pair_sequence_update_workers == 2
+    assert {isotope for isotope, _values in calls} == {"Cs-137", "Co-60"}
+
+
 def test_estimator_uses_clustered_output_when_birth_is_enabled():
     """Final PF estimates should honor the clustered-output configuration."""
     est = RotatingShieldPFEstimator(

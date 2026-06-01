@@ -1,0 +1,106 @@
+{
+  "metadata": {
+    "case": "mix9_multi_isotope_cardinality",
+    "description": "Main RA-L task: 4 Cs-137, 3 Co-60, and 2 Eu-154 sources with same-isotope ambiguity inside a multi-isotope STE problem.",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+    "intensity_sampling": {
+      "max_cps_1m": 200000.0,
+      "min_cps_1m": 30000.0,
+      "mode": "uniform"
+    },
+    "isotope_counts": {
+      "Co-60": 3,
+      "Cs-137": 4,
+      "Eu-154": 2
+    },
+    "obstacle_seed": 2026050901,
+    "sampling": "surface-constrained room/obstacle source placement",
+    "source_seed": 2026050918,
+    "visibility_filter": true,
+    "visibility_min_fraction": 0.1
+  },
+  "name": "ral_ablation_mix9_multi_isotope_cardinality_seed_2026050918",
+  "sources": [
+    {
+      "intensity_cps_1m": 63436.76394746877,
+      "isotope": "Cs-137",
+      "position": [
+        6.0,
+        7.554187,
+        0.830793
+      ]
+    },
+    {
+      "intensity_cps_1m": 81185.1129755518,
+      "isotope": "Cs-137",
+      "position": [
+        4.088328,
+        0.0,
+        1.86209
+      ]
+    },
+    {
+      "intensity_cps_1m": 93951.58707490706,
+      "isotope": "Cs-137",
+      "position": [
+        8.0,
+        9.425131,
+        0.089805
+      ]
+    },
+    {
+      "intensity_cps_1m": 126786.25558797094,
+      "isotope": "Cs-137",
+      "position": [
+        2.187646,
+        0.0,
+        1.261955
+      ]
+    },
+    {
+      "intensity_cps_1m": 65287.58376386894,
+      "isotope": "Co-60",
+      "position": [
+        10.0,
+        0.1867,
+        3.82584
+      ]
+    },
+    {
+      "intensity_cps_1m": 129594.89178815932,
+      "isotope": "Co-60",
+      "position": [
+        8.43525,
+        13.990305,
+        0.0
+      ]
+    },
+    {
+      "intensity_cps_1m": 168727.64143367062,
+      "isotope": "Co-60",
+      "position": [
+        9.226139,
+        4.946613,
+        0.0
+      ]
+    },
+    {
+      "intensity_cps_1m": 102179.52086819746,
+      "isotope": "Eu-154",
+      "position": [
+        7.063067,
+        20.0,
+        0.849429
+      ]
+    },
+    {
+      "intensity_cps_1m": 199522.45446964208,
+      "isotope": "Eu-154",
+      "position": [
+        0.0,
+        2.237061,
+        0.393454
+      ]
+    }
+  ]
+}

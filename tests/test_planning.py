@@ -34,6 +34,32 @@ from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_rotation_matrices
 
 
+def test_fast_gpu_rollout_respects_disabled_gpu_override() -> None:
+    """Fast rollout falls back instead of raising when planning disables GPU."""
+    estimator = object.__new__(RotatingShieldPFEstimator)
+    estimator.pf_config = RotatingShieldPFConfig(
+        use_gpu=False,
+        use_fast_gpu_rollout=True,
+    )
+
+    result = estimator._expected_uncertainty_after_rotation_fast(
+        detector_pos=np.array([0.0, 0.0, 0.0], dtype=float),
+        live_time_per_rot_s=1.0,
+        tau_ig=1e-3,
+        tmax_s=1.0,
+        rollouts=1,
+        eig_samples=1,
+        alpha_by_isotope=None,
+        rollout_particles=None,
+        rollout_method=None,
+        use_mean_measurement=True,
+        rng=np.random.default_rng(0),
+        return_debug=False,
+    )
+
+    assert result is None
+
+
 def _build_simple_estimator() -> RotatingShieldPFEstimator:
     """Build a minimal estimator with deterministic particle setup for tests."""
     isotopes = ["Cs-137"]
@@ -540,6 +566,69 @@ def test_pose_selection_parallel_matches_serial_selection() -> None:
     assert parallel_idx == serial_idx == 2
 
 
+def test_pose_selection_gpu_override_allows_parallel_candidate_workers(
+    capsys,
+) -> None:
+    """Explicit CPU planning override should keep worker-parallel evaluation."""
+
+    class _Config:
+        """Minimal PF config that defaults to GPU-enabled planning."""
+
+        lambda_cost = 0.0
+        ig_threshold = 0.0
+        max_dwell_time_s = 2.0
+        short_time_s = 1.0
+        planning_rollout_particles = None
+        planning_particles = None
+        use_gpu = True
+        gpu_device = "cuda"
+        gpu_dtype = "float32"
+        ig_workers = 4
+
+    class _Estimator:
+        """Deterministic estimator that records the active GPU flag."""
+
+        pf_config = _Config()
+
+        def __init__(self) -> None:
+            """Initialize the active GPU-state recorder."""
+            self.use_gpu_seen: list[bool] = []
+
+        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
+            """Return a deterministic uncertainty and record GPU state."""
+            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
+            self.use_gpu_seen.append(bool(self.pf_config.use_gpu))
+            return float((pose[0] - 2.0) ** 2 + 0.1 * pose[1] ** 2)
+
+    estimator = _Estimator()
+    candidates = np.array(
+        [
+            [0.0, 0.0, 0.5],
+            [2.0, 0.2, 0.5],
+            [3.0, 0.0, 0.5],
+        ],
+        dtype=float,
+    )
+    selected = select_next_pose_from_candidates(
+        estimator=estimator,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        lambda_cost=0.0,
+        num_rollouts=1,
+        worker_count=3,
+        rng_seed=123,
+        verbose=True,
+        use_gpu=False,
+        ig_breakdown_k=0,
+    )
+
+    output = capsys.readouterr().out
+    assert selected == 1
+    assert "Candidate evaluation mode: 3 workers." in output
+    assert estimator.use_gpu_seen == [False, False, False]
+    assert estimator.pf_config.use_gpu is True
+
+
 def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:
     """recommend_num_rollouts should pick the smallest rollout meeting the target SE."""
     samples = {
@@ -941,6 +1030,111 @@ def test_extract_signature_modes_adds_runtime_rescue_modes() -> None:
     assert not any(
         np.allclose(mode.position_xyz, rescue_pos[0]) for mode in without_rescue
     )
+
+
+def test_extract_signature_modes_preserves_rescue_when_mode_budget_is_full() -> None:
+    """Runtime rescue modes should not be dropped only because PF modes fill max_k."""
+    est = _build_simple_estimator()
+    filt = est.filters["Cs-137"]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+                tentative_sources=np.array([False], dtype=bool),
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+                tentative_sources=np.array([False], dtype=bool),
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+    rescue_pos = np.array([[6.0, 0.0, 0.0]], dtype=float)
+    rescue_q = np.array([50.0], dtype=float)
+    est._runtime_report_rescue_modes = {"Cs-137": (rescue_pos, rescue_q, 0.1)}
+
+    modes = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        include_runtime_rescue_modes=True,
+        runtime_rescue_mode_weight=0.1,
+    )["Cs-137"]
+
+    assert len(modes) == 2
+    assert any(np.allclose(mode.position_xyz, rescue_pos[0]) for mode in modes)
+
+
+def test_extract_signature_modes_adds_global_surface_rescue_modes() -> None:
+    """DSS-PP should include residual-ranked global surface rescue candidates."""
+    est = _build_simple_estimator()
+    rescue_pos = np.array([[6.0, 0.0, 0.0]], dtype=float)
+    rescue_q = np.array([150.0], dtype=float)
+
+    def rescue_modes():
+        """Return deterministic planning rescue modes."""
+        return {"Cs-137": (rescue_pos, rescue_q, 0.02)}
+
+    est.planning_surface_rescue_modes = rescue_modes
+    with_rescue = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=3,
+        include_runtime_rescue_modes=False,
+        include_global_surface_rescue_modes=True,
+        global_surface_rescue_mode_weight=1.0,
+    )["Cs-137"]
+    without_rescue = dss_pp.extract_signature_modes(
+        est,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=3,
+        include_runtime_rescue_modes=False,
+        include_global_surface_rescue_modes=False,
+    )["Cs-137"]
+
+    assert any(np.allclose(mode.position_xyz, rescue_pos[0]) for mode in with_rescue)
+    assert not any(
+        np.allclose(mode.position_xyz, rescue_pos[0]) for mode in without_rescue
+    )
+
+
+def test_signature_mode_weight_cap_keeps_weak_modes_visible() -> None:
+    """Planner-only mode weights should cap dominant modes without moving them."""
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
+            strength_cps_1m=1000.0,
+            weight=100.0,
+            spread_m=0.1,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([5.0, 0.0, 0.0], dtype=float),
+            strength_cps_1m=100.0,
+            weight=1.0,
+            spread_m=0.1,
+        ),
+    ]
+
+    rebalanced = dss_pp._rebalance_signature_mode_weights(
+        modes,
+        weak_floor=0.2,
+        dominant_cap=0.7,
+    )
+
+    assert max(mode.weight for mode in rebalanced) <= 0.700001
+    assert min(mode.weight for mode in rebalanced) >= 0.199999
+    assert np.allclose(rebalanced[0].position_xyz, modes[0].position_xyz)
 
 
 def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:

@@ -34,6 +34,11 @@ from realtime_demo import (
 from sim import SimulationCommand, create_simulation_runtime, load_runtime_config
 from sim.shield_geometry import resolve_shield_thickness_config
 from spectrum.pipeline import SpectralDecomposer
+from runtime_defaults import (
+    DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
+)
 
 
 @dataclass(frozen=True)
@@ -46,12 +51,12 @@ class KempRunConfig:
     obstacle_config_path: str | None = None
     output_dir: str = "results/baselines/kemp/latest"
     max_poses: int = 10
-    dwell_time_s: float = 30.0
+    dwell_time_s: float = DEFAULT_MEASUREMENT_TIME_S
     measurement_spacing_m: float = 4.0
     shield_fe_index: int = 0
     shield_pb_index: int = 0
     num_particles: int = 2000
-    max_sources: int = 3
+    max_sources: int = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     grid_spacing_m: tuple[float, float, float] = (0.5, 0.5, 0.5)
     grid_z_levels_m: tuple[float, ...] = (
         0.5,
@@ -67,7 +72,9 @@ class KempRunConfig:
     )
     eval_match_radius_m: float = 1.0
     rng_seed: int = 20260502
-    source_strength_log_mean: float = float(np.log(30000.0))
+    source_strength_log_mean: float = float(
+        np.log(DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M)
+    )
     source_strength_log_sigma: float = 1.5
     detector_height_m: float = 0.5
     room_size_xyz: tuple[float, float, float] = (10.0, 20.0, 10.0)

@@ -107,6 +107,14 @@ class SpectrumConfig:
     response_poisson_diagnostic_reduced_chi2_scale: float = 0.5
     response_poisson_diagnostic_condition_threshold: float = 1.0e4
     response_poisson_diagnostic_condition_scale: float = 0.25
+    response_poisson_shield_systematic_variance_enable: bool = False
+    response_poisson_shield_systematic_rel_sigma: float = 0.15
+    response_poisson_shield_systematic_anchor_rel_sigma: float = 0.0
+    response_poisson_shield_systematic_min_count_fraction: float = 0.05
+    response_poisson_shield_systematic_anchor_pair_ids: tuple[int, ...] = field(
+        default_factory=tuple
+    )
+    response_poisson_shield_systematic_zero_thickness_threshold: float = 1.0e-9
     response_continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK
     response_backscatter_fraction: float = BACKSCATTER_FRACTION
     response_efficiency_model: str = "cebr3"

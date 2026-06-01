@@ -4476,6 +4476,56 @@ def test_batched_weak_prune_observability_matches_serial_counts() -> None:
     assert np.array_equal(batched, serial)
 
 
+def test_batched_weak_prune_observability_uses_observed_signal() -> None:
+    """Weak-prune visibility should use observation-supported strength when no fixed reference is configured."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        weak_source_prune_min_expected_count=3.0,
+        weak_source_prune_min_fraction=0.0,
+        source_strength_prior_mean=0.0,
+        weak_source_prune_visibility_reference_strength=0.0,
+    )
+    unit_counts = np.array(
+        [
+            [[0.1, 0.0], [0.0, 0.2]],
+            [[0.2, 0.0], [0.0, 0.1]],
+            [[0.1, 0.0], [0.0, 0.1]],
+        ],
+        dtype=float,
+    )
+    signal_counts = np.array(
+        [
+            [100.0, 60.0],
+            [120.0, 50.0],
+            [80.0, 40.0],
+        ],
+        dtype=float,
+    )
+    variances = np.maximum(signal_counts, 1.0)
+
+    batched = filt._weak_source_observable_counts_from_unit_response(
+        unit_counts,
+        signal_counts=signal_counts,
+        observation_variances=variances,
+    )
+    serial = np.vstack(
+        [
+            filt._weak_source_observable_counts_from_unit_response(
+                unit_counts[:, i, :],
+                signal_counts=signal_counts[:, i],
+                observation_variances=variances[:, i],
+            )
+            for i in range(unit_counts.shape[1])
+        ]
+    )
+
+    assert np.array_equal(batched, serial)
+    assert batched.tolist() == [[3, 0], [0, 3]]
+
+
 def test_batched_refit_respects_suppressed_weak_source_prune() -> None:
     """Batched strength refit should defer weak-source deletion when requested."""
     filt = _build_filter(
@@ -5258,6 +5308,138 @@ def test_runtime_report_rescue_injects_multisource_particles() -> None:
     assert filt.last_runtime_report_rescue_injected == 6
 
 
+def test_runtime_report_rescue_quarantine_does_not_prior_cap_strengths() -> None:
+    """Quarantined rescue injection should not impose a fixed prior-rate cap."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=6,
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+        runtime_report_rescue_weight=0.20,
+        source_strength_prior_mean=100.0,
+        source_strength_absorption_penalty_weight=0.0,
+        source_strength_absorption_q_multiple=2.0,
+        strength_log_sigma=0.0,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(1.0 / 6.0)),
+        )
+        for _ in range(6)
+    ]
+
+    injected = filt.inject_runtime_report_rescue_particles(
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        np.array([1000.0], dtype=float),
+        particle_fraction=0.5,
+        min_particles_per_source=1,
+        total_weight=0.02,
+        jitter_sigma_m=0.0,
+    )
+    rescued_strengths = [
+        float(particle.state.strengths[0])
+        for particle in filt.continuous_particles
+        if particle.state.num_sources == 1
+    ]
+
+    assert injected == 3
+    assert rescued_strengths
+    assert min(rescued_strengths) == pytest.approx(1000.0)
+
+
+def test_runtime_report_rescue_bic_candidate_gets_intermediate_weight() -> None:
+    """BIC-selected report modes should be preserved more strongly than quarantine."""
+    isotope = "Cs-137"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            runtime_report_rescue_enable=True,
+            runtime_report_rescue_quarantine_enable=True,
+            runtime_report_rescue_quarantine_weight=0.02,
+            runtime_report_rescue_candidate_weight=0.06,
+            runtime_report_rescue_weight=0.10,
+            report_model_order_min_bic_margin=2.0,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    estimator._last_report_model_order_diagnostics[isotope] = {
+        "candidate_count": 4,
+        "selected_count": 2,
+        "method": "exhaustive_bic",
+        "model_order_ready": False,
+        "criterion_margin_to_runner_up": 4.0,
+        "criterion_margin_to_simpler": 4.0,
+    }
+
+    weight = estimator._runtime_report_rescue_injection_weight(isotope, 2)
+
+    assert weight == pytest.approx(0.06)
+
+
+def test_runtime_observation_overshoot_guard_uses_observed_counts() -> None:
+    """Runtime overshoot guard should shrink only source responses above data."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        source_strength_observation_overshoot_penalty_weight=3.0,
+        source_strength_observation_overshoot_sigma=0.0,
+        source_strength_observation_overshoot_quantile=0.0,
+        source_strength_observation_overshoot_min_visible_fraction=0.0,
+        source_strength_observation_overshoot_min_visible_measurements=1,
+    )
+    data_low = MeasurementData(
+        z_k=np.array([10.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    data_high = MeasurementData(
+        z_k=np.array([1000.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    strengths = np.array([[100.0]], dtype=float)
+    kernel = np.ones((1, 1, 1), dtype=float)
+    background = np.zeros((1, 1), dtype=float)
+
+    low_guarded = filt._apply_runtime_observation_overshoot_guard(
+        strengths,
+        kernel,
+        data_low,
+        background,
+        eps=1.0e-12,
+    )
+    high_guarded = filt._apply_runtime_observation_overshoot_guard(
+        strengths,
+        kernel,
+        data_high,
+        background,
+        eps=1.0e-12,
+    )
+
+    assert low_guarded[0, 0] == pytest.approx(10.0 + (100.0 - 10.0) / 4.0)
+    assert high_guarded[0, 0] == pytest.approx(100.0)
+
+
 def test_runtime_report_rescue_memory_keeps_missing_modes() -> None:
     """Runtime rescue memory should retain modes that vanish in one station."""
     isotope = "Cs-137"
@@ -5324,6 +5506,47 @@ def test_report_strength_absorption_guard_is_one_sided() -> None:
     assert guarded[1] == pytest.approx((500.0 + 3.0 * 200.0) / 4.0)
 
 
+def test_report_observation_overshoot_guard_uses_observed_counts() -> None:
+    """Report overshoot guard should be data-driven, not fixed to a prior strength."""
+    isotope = "Cs-137"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            report_strength_observation_overshoot_penalty_weight=3.0,
+            report_strength_observation_overshoot_sigma=0.0,
+            report_strength_observation_overshoot_quantile=0.0,
+            report_strength_observation_overshoot_min_visible_fraction=0.0,
+            report_strength_observation_overshoot_min_visible_measurements=1,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    kwargs = {
+        "design": np.ones((1, 1), dtype=float),
+        "background": np.zeros(1, dtype=float),
+        "observation_variances": np.ones(1, dtype=float),
+        "eps": 1.0e-12,
+    }
+
+    low_guarded = estimator._apply_report_observation_overshoot_guard(
+        np.array([100.0], dtype=float),
+        z_obs=np.array([10.0], dtype=float),
+        **kwargs,
+    )
+    high_guarded = estimator._apply_report_observation_overshoot_guard(
+        np.array([100.0], dtype=float),
+        z_obs=np.array([1000.0], dtype=float),
+        **kwargs,
+    )
+
+    assert low_guarded[0] == pytest.approx(10.0 + (100.0 - 10.0) / 4.0)
+    assert high_guarded[0] == pytest.approx(100.0)
+
+
 def test_visibility_adjusted_rescue_scores_require_visible_support() -> None:
     """Rescue scoring should reject candidates with no visible measurements."""
     isotope = "Cs-137"
@@ -5363,6 +5586,49 @@ def test_visibility_adjusted_rescue_scores_require_visible_support() -> None:
     assert valid.tolist() == [True, False]
     assert adjusted[0] > 0.0
     assert stats["rescue_visibility_valid_candidates"] == 1
+
+
+def test_visibility_adjusted_rescue_scores_use_observed_residual_strength() -> None:
+    """Rescue visibility should be data-driven when no fixed reference strength is configured."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        source_strength_prior_mean=0.0,
+        report_mle_rescue_visibility_weight=0.5,
+        report_mle_rescue_min_visible_measurements=1,
+        report_mle_rescue_visible_count=10.0,
+        report_mle_rescue_visibility_reference_strength=0.0,
+        weak_source_prune_visibility_reference_strength=0.0,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    candidate_counts = np.array(
+        [
+            [0.2, 0.0],
+            [0.1, 0.0],
+        ],
+        dtype=float,
+    )
+
+    adjusted, valid, stats = estimator._visibility_adjusted_rescue_scores(
+        candidate_counts=candidate_counts,
+        residual=np.array([100.0, 80.0], dtype=float),
+        weights=np.ones(2, dtype=float),
+        base_scores=np.array([1.0, 10.0], dtype=float),
+        eps=1.0e-12,
+    )
+
+    assert valid.tolist() == [True, False]
+    assert adjusted[0] > 1.0
+    assert stats["rescue_visibility_reference_mode"] == "data_driven_qhat"
+    assert stats["rescue_visibility_reference_strength"] == pytest.approx(0.0)
+    assert stats["rescue_visibility_qhat_median"] > 0.0
 
 
 def test_surface_rescue_spatial_quota_keeps_separate_ceiling_tiles() -> None:
@@ -5476,6 +5742,120 @@ def test_runtime_high_strength_split_candidates_are_surface_projected() -> None:
     distances = np.linalg.norm(candidates - np.array([[2.0, 2.0, 4.0]]), axis=1)
     assert np.min(distances) >= 0.25
     assert low_candidates.shape[0] == 0
+
+
+def test_runtime_high_strength_split_uses_observation_overshoot_without_prior() -> None:
+    """High-strength splitting should use data overshoot when fixed q prior is off."""
+    isotope = "Cs-137"
+    config = RotatingShieldPFConfig(
+        source_position_prior="surface",
+        position_max=(4.0, 4.0, 4.0),
+        source_strength_prior_mean=0.0,
+        source_strength_prior_weight=0.0,
+        high_strength_split_enable=True,
+        high_strength_split_offset_m=1.0,
+        high_strength_split_candidate_count=4,
+        source_strength_observation_overshoot_penalty_weight=3.0,
+        source_strength_observation_overshoot_sigma=0.0,
+        source_strength_observation_overshoot_quantile=0.0,
+        source_strength_observation_overshoot_min_visible_fraction=0.0,
+        source_strength_observation_overshoot_min_visible_measurements=1,
+        birth_global_rescue_max_candidates=8,
+        birth_global_rescue_dedup_radius_m=0.1,
+        birth_min_sep_m=0.5,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.zeros((0, 3), dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    source_pos = np.array([[2.0, 2.0, 4.0]], dtype=float)
+    strength = np.array([250.0], dtype=float)
+    data_low = MeasurementData(
+        z_k=np.array([0.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[2.0, 2.0, 0.5]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    data_high = MeasurementData(
+        z_k=np.array([1.0e9], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[2.0, 2.0, 0.5]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    no_data = estimator._runtime_high_strength_split_candidates(
+        filt,
+        source_pos,
+        strength,
+    )
+    overshoot = estimator._runtime_high_strength_split_candidates(
+        filt,
+        source_pos,
+        strength,
+        data=data_low,
+    )
+    supported = estimator._runtime_high_strength_split_candidates(
+        filt,
+        source_pos,
+        strength,
+        data=data_high,
+    )
+
+    assert no_data.shape[0] == 0
+    assert overshoot.shape[0] > 0
+    assert supported.shape[0] == 0
+
+
+def test_count_supported_zero_source_report_is_unresolved() -> None:
+    """Zero-source BIC reports with signal support should block model-order readiness."""
+    isotope = "Cs-137"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            structural_update_min_counts=10.0,
+            conditional_strength_refit_min_count=10.0,
+            structural_update_min_snr=1.0,
+            report_model_order_zero_source_min_bic_margin=10.0,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator._last_report_model_order_diagnostics[isotope] = {
+        "candidate_count": 2,
+        "selected_count": 0,
+        "model_order_ready": False,
+        "count_supported_zero_source": True,
+        "observed_signal_total_counts": 100.0,
+        "observed_signal_max_count": 100.0,
+        "observed_signal_snr": 5.0,
+        "criterion_margin_to_runner_up": 2.0,
+        "zero_source_ready_margin": 10.0,
+    }
+
+    unresolved = estimator.unresolved_structural_evidence()
+
+    assert estimator.report_model_order_ready() is False
+    assert unresolved[isotope]["report_underfit"]["reason"] == (
+        "count_supported_zero_source"
+    )
 
 
 def test_runtime_report_rescue_falls_back_for_absent_count_supported_isotope(
@@ -7489,6 +7869,90 @@ def test_report_model_order_selection_keeps_supported_three_sources() -> None:
     assert set(diagnostics["best_by_k"]) >= {"0", "1", "2", "3"}
     assert np.allclose(positions[order], sources[np.argsort(sources[:, 0])], atol=1.0e-6)
     assert np.all(strengths > 0.0)
+
+
+def test_report_model_order_respects_configured_max_sources() -> None:
+    """Report-level BIC selection should not exceed the PF source-count cap."""
+    isotope = "Cs-137"
+    sources = np.array(
+        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.5, 3.5, 0.0]],
+        dtype=float,
+    )
+    detector_positions = np.array(
+        [
+            [0.5, 1.0, 0.0],
+            [1.5, 1.0, 0.0],
+            [3.5, 1.0, 0.0],
+            [5.0, 1.5, 0.0],
+            [1.0, 4.5, 0.0],
+            [3.0, 4.0, 0.0],
+        ],
+        dtype=float,
+    )
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        max_sources=2,
+        birth_enable=True,
+        use_clustered_output=True,
+        cluster_min_samples=1,
+        report_strength_refit=True,
+        report_strength_refit_iters=64,
+        report_cluster_model_selection=True,
+        report_cluster_model_selection_max_candidates=12,
+        report_cluster_bic_penalty_params=4,
+        report_model_order_min_bic_margin=0.0,
+        init_num_sources=(1, 1),
+        min_strength=0.01,
+        use_gpu=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=sources,
+        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=config,
+        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
+    )
+    for pose in detector_positions:
+        estimator.add_measurement_pose(pose)
+    estimator._ensure_kernel_cache()
+    true_strengths = np.array([1200.0, 850.0, 650.0], dtype=float)
+    design = expected_counts_per_source(
+        kernel=estimator.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=sources,
+        strengths=np.ones(3, dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+    )
+    counts = design @ true_strengths
+    estimator.measurements = [
+        MeasurementRecord(
+            z_k={isotope: float(count)},
+            pose_idx=idx,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+        for idx, count in enumerate(counts)
+    ]
+
+    positions, strengths = estimator._refit_reported_strengths(
+        isotope,
+        sources,
+        np.array([500.0, 500.0, 500.0], dtype=float),
+    )
+
+    diagnostics = estimator.report_model_order_diagnostics()[isotope]
+    assert positions.shape[0] <= 2
+    assert strengths.shape[0] <= 2
+    assert diagnostics["selected_count"] <= 2
+    assert diagnostics["max_model_sources"] == 2
+    assert "3" not in diagnostics["best_by_k"]
 
 
 def test_report_model_order_parallel_matches_serial_selection() -> None:

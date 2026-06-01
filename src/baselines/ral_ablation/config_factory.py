@@ -14,6 +14,12 @@ import numpy as np
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import build_obstacle_grid
 from measurement.source_surfaces import generate_surface_sources
+from runtime_defaults import (
+    DEFAULT_CUI_SPLIT_VIEW_DIR,
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_NO_ROTATION_OVERHEAD_S,
+    DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BASE_CONFIG = (
@@ -21,7 +27,6 @@ DEFAULT_BASE_CONFIG = (
 )
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
-DEFAULT_CUI_SPLIT_VIEW_DIR = "results/cui_view/latest"
 
 
 @dataclass(frozen=True)
@@ -32,7 +37,7 @@ class AblationCase:
     description: str
     isotopes: tuple[str, ...]
     source_count: int
-    max_sources: int
+    isotope_counts: tuple[tuple[str, int], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -59,25 +64,14 @@ class AblationPlanEntry:
 
 DEFAULT_ABLATION_CASES: tuple[AblationCase, ...] = (
     AblationCase(
-        name="case01_multi_isotope",
-        description="Obstacle-cluttered separated Cs/Co/Eu sources.",
+        name="mix9_multi_isotope_cardinality",
+        description=(
+            "Main RA-L task: 4 Cs-137, 3 Co-60, and 2 Eu-154 sources with "
+            "same-isotope ambiguity inside a multi-isotope STE problem."
+        ),
         isotopes=("Cs-137", "Co-60", "Eu-154"),
-        source_count=3,
-        max_sources=3,
-    ),
-    AblationCase(
-        name="case02_three_cs",
-        description="Obstacle-cluttered same-isotope three Cs-137 sources.",
-        isotopes=("Cs-137",),
-        source_count=3,
-        max_sources=3,
-    ),
-    AblationCase(
-        name="case03_mixed_cardinality",
-        description="Obstacle-cluttered mixed-cardinality 2 Cs, 2 Co, 1 Eu.",
-        isotopes=("Cs-137", "Co-60", "Eu-154"),
-        source_count=5,
-        max_sources=5,
+        source_count=9,
+        isotope_counts=(("Cs-137", 4), ("Co-60", 3), ("Eu-154", 2)),
     ),
 )
 
@@ -104,7 +98,7 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "residual_program_length": 1,
             },
         },
-        cli_args=("--rotation-overhead-s", "0.0"),
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
         name="fixed_shield",
@@ -122,6 +116,10 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "start_pair_id": 0,
                 "advance_by_pose": True,
             },
+            "strict_planned_shield_program": True,
+            "dss_pp": {
+                "adaptive_program_length_enable": False,
+            },
         },
     ),
     AblationVariant(
@@ -130,6 +128,33 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         overrides={
             "path_planner": "one_step",
             "strict_planned_shield_program": True,
+        },
+    ),
+    AblationVariant(
+        name="eig_only_path",
+        description=(
+            "Keep active planning and shield programs but remove explicit "
+            "signature, obstacle-shadow, correlation-reduction, and elevation "
+            "terms from DSS-PP."
+        ),
+        overrides={
+            "dss_pp": {
+                "signature_weight": 0.0,
+                "temporal_separation_weight": 0.0,
+                "temporal_decorrelation_weight": 0.0,
+                "temporal_logdet_weight": 0.0,
+                "temporal_cover_weight": 0.0,
+                "correlation_reduction_weight": 0.0,
+                "same_isotope_direct_separation_guard": False,
+                "environment_signature_weight": 0.0,
+                "occlusion_boundary_weight": 0.0,
+                "vertical_environment_signature_weight": 0.0,
+                "elevation_signature_weight": 0.0,
+                "elevation_condition_weight": 0.0,
+                "station_condition_weight": 0.0,
+                "high_surface_pair_boost": 1.0,
+                "high_surface_cross_stratum_boost": 1.0,
+            },
         },
     ),
     AblationVariant(
@@ -158,7 +183,21 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "residual_program_length": 1,
             },
         },
-        cli_args=("--rotation-overhead-s", "0.0"),
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
+    ),
+    AblationVariant(
+        name="baseline_passive_equal_time_no_shield",
+        description=(
+            "Passive no-shield baseline with the same per-station physical "
+            "live-time budget as the proposed shield program."
+        ),
+        overrides={
+            "shield_transmission_target": 1.0,
+            "shield_thickness_scale": 0.0,
+            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
+            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
+        },
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
         name="baseline_passive_fixed_shield",
@@ -190,7 +229,7 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "residual_program_length": 1,
             },
         },
-        cli_args=("--rotation-overhead-s", "0.0"),
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
         name="baseline_passive_fixed_shield_single_view",
@@ -227,7 +266,7 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "residual_program_length": 1,
             },
         },
-        cli_args=("--rotation-overhead-s", "0.0"),
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
         name="baseline_onestep_fixed_shield",
@@ -258,7 +297,7 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "residual_program_length": 1,
             },
         },
-        cli_args=("--rotation-overhead-s", "0.0"),
+        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
         name="baseline_onestep_fixed_shield_single_view",
@@ -288,10 +327,33 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "birth_use_shield_coded_residual": False,
             "birth_residual_always_try": False,
             "birth_residual_expand_structural_particles": False,
+            "birth_residual_force_proposal_on_gate": False,
+            "birth_residual_suppress_death": False,
             "birth_global_rescue_enable": False,
             "residual_decomposition_enable": False,
             "peak_suppression_enable": False,
             "report_mle_rescue_enable": False,
+            "report_mle_rescue_max_residual_candidates": 0,
+            "runtime_report_rescue_enable": False,
+            "runtime_report_rescue_particle_fraction": 0.0,
+            "runtime_report_rescue_weight": 0.0,
+            "runtime_report_rescue_quarantine_enable": False,
+            "runtime_report_rescue_quarantine_weight": 0.0,
+            "runtime_report_rescue_candidate_weight": 0.0,
+            "runtime_report_rescue_memory_enable": False,
+            "runtime_report_rescue_memory_max_sources": 0,
+        },
+    ),
+    AblationVariant(
+        name="no_verification",
+        description=(
+            "Disable tentative-source verification and refit-after-remove "
+            "report pruning for logged estimator-side replay ablations."
+        ),
+        overrides={
+            "pseudo_source_verification_enable": False,
+            "source_prune_refit_after_remove": False,
+            "report_strength_refit_preserve_cardinality": True,
         },
     ),
     AblationVariant(
@@ -401,12 +463,96 @@ def _resolve_base_config_path(value: object, *, base_config_path: Path) -> str |
     return (base_config_path.parent / raw_path).resolve().as_posix()
 
 
+def _case_isotope_sequence(case: AblationCase) -> tuple[str, ...]:
+    """Return the exact isotope sequence used for source generation."""
+    if case.isotope_counts is None:
+        return tuple(str(isotope) for isotope in case.isotopes)
+    expanded: list[str] = []
+    for isotope, count in case.isotope_counts:
+        source_count = int(count)
+        if source_count < 0:
+            raise ValueError(f"Negative isotope count for {isotope}: {source_count}")
+        expanded.extend([str(isotope)] * source_count)
+    if len(expanded) != int(case.source_count):
+        raise ValueError(
+            f"Case {case.name} isotope_counts expand to {len(expanded)} sources, "
+            f"but source_count is {case.source_count}."
+        )
+    return tuple(expanded)
+
+
+def _case_isotope_count_metadata(case: AblationCase) -> dict[str, int]:
+    """Return isotope-count metadata for generated source layouts."""
+    counts: dict[str, int] = {}
+    if case.isotope_counts is not None:
+        for isotope, count in case.isotope_counts:
+            counts[str(isotope)] = int(count)
+        return counts
+    for idx in range(max(1, int(case.source_count))):
+        isotope = str(case.isotopes[idx % len(case.isotopes)])
+        counts[isotope] = counts.get(isotope, 0) + 1
+    return counts
+
+
+def _free_cell_measurement_points(
+    obstacle_grid: Any,
+    env: EnvironmentConfig,
+) -> np.ndarray:
+    """Return detector-height reference points over reachable free grid cells."""
+    points: list[tuple[float, float, float]] = []
+    origin_x, origin_y = obstacle_grid.origin
+    cell_size = float(obstacle_grid.cell_size)
+    for ix in range(int(obstacle_grid.grid_shape[0])):
+        for iy in range(int(obstacle_grid.grid_shape[1])):
+            if not obstacle_grid.is_cell_free((ix, iy)):
+                continue
+            x = float(origin_x) + (float(ix) + 0.5) * cell_size
+            y = float(origin_y) + (float(iy) + 0.5) * cell_size
+            if 0.0 <= x <= float(env.size_x) and 0.0 <= y <= float(env.size_y):
+                points.append((x, y, float(env.detector_position[2])))
+    if not points:
+        points.append(
+            (
+                float(env.detector_position[0]),
+                float(env.detector_position[1]),
+                float(env.detector_position[2]),
+            )
+        )
+    return np.asarray(points, dtype=float)
+
+
+def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return source-placement options shared with standard random generation."""
+    preferred_raw = base_config.get("random_source_preferred_max_z_m", 5.0)
+    preferred_max_z_m = None if preferred_raw is None else float(preferred_raw)
+    return {
+        "visibility_filter": bool(base_config.get("random_source_visibility_filter", True)),
+        "visibility_min_fraction": float(
+            base_config.get("random_source_min_visible_fraction", 0.1)
+        ),
+        "visibility_clear_path_max_m": float(
+            base_config.get("random_source_clear_path_max_m", 0.01)
+        ),
+        "visibility_batch_size": int(
+            base_config.get("random_source_visibility_batch_size", 256)
+        ),
+        "visibility_max_attempts_per_source": int(
+            base_config.get("random_source_visibility_max_attempts_per_source", 4096)
+        ),
+        "max_ceiling_sources": int(
+            base_config.get("random_source_max_ceiling_sources", 1)
+        ),
+        "preferred_max_z_m": preferred_max_z_m,
+    }
+
+
 def _case_source_layout(
     case: AblationCase,
     *,
     obstacle_seed: int,
     source_seed: int,
-    intensity_cps_1m: float,
+    intensity_cps_1m: float | Sequence[float],
+    source_generation_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate a surface-constrained source layout for one case and seed."""
     env = EnvironmentConfig(
@@ -427,24 +573,46 @@ def _case_source_layout(
         passage_width_m=1.0,
     )
     rng = np.random.default_rng(source_seed)
+    options = dict(source_generation_options or {})
+    visibility_points = None
+    if bool(options.get("visibility_filter", False)):
+        visibility_points = _free_cell_measurement_points(grid, env)
+    isotope_sequence = _case_isotope_sequence(case)
     sources = generate_surface_sources(
         env=env,
         obstacle_grid=grid,
-        isotopes=case.isotopes,
-        intensity_cps_1m=float(intensity_cps_1m),
+        isotopes=isotope_sequence,
+        intensity_cps_1m=intensity_cps_1m,
         rng=rng,
         count=case.source_count,
         obstacle_height_m=2.0,
+        visibility_measurement_points=visibility_points,
+        visibility_min_fraction=float(options.get("visibility_min_fraction", 0.0)),
+        visibility_clear_path_max_m=float(
+            options.get("visibility_clear_path_max_m", 0.01)
+        ),
+        visibility_batch_size=int(options.get("visibility_batch_size", 256)),
+        visibility_max_attempts_per_source=int(
+            options.get("visibility_max_attempts_per_source", 4096)
+        ),
+        max_ceiling_sources=options.get("max_ceiling_sources", 1),
+        preferred_max_z_m=options.get("preferred_max_z_m", 5.0),
     )
     return {
         "name": f"ral_ablation_{case.name}_seed_{source_seed}",
         "metadata": {
             "case": case.name,
             "description": case.description,
+            "isotope_counts": _case_isotope_count_metadata(case),
             "source_seed": int(source_seed),
             "obstacle_seed": int(obstacle_seed),
             "sampling": "surface-constrained room/obstacle source placement",
+            "visibility_filter": bool(options.get("visibility_filter", False)),
+            "visibility_min_fraction": float(
+                options.get("visibility_min_fraction", 0.0)
+            ),
             "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+            "intensity_sampling": _intensity_sampling_metadata(intensity_cps_1m),
         },
         "sources": [
             {
@@ -455,6 +623,22 @@ def _case_source_layout(
             for source in sources
         ],
     }
+
+
+def _intensity_sampling_metadata(
+    intensity_cps_1m: float | Sequence[float],
+) -> dict[str, float | str]:
+    """Return metadata describing source-strength sampling for a case."""
+    if isinstance(intensity_cps_1m, Sequence) and not isinstance(
+        intensity_cps_1m,
+        (str, bytes),
+    ):
+        if len(intensity_cps_1m) != 2:
+            raise ValueError("intensity range must contain exactly two values.")
+        lo = float(intensity_cps_1m[0])
+        hi = float(intensity_cps_1m[1])
+        return {"mode": "uniform", "min_cps_1m": lo, "max_cps_1m": hi}
+    return {"mode": "fixed", "cps_1m": float(intensity_cps_1m)}
 
 
 def _variant_config(
@@ -469,8 +653,6 @@ def _variant_config(
     """Return the runtime config for one ablation variant."""
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
-    config["pf_max_sources"] = int(case.max_sources)
-    config["init_num_sources_max"] = int(case.max_sources)
     config["random_seed_base"] = int(seed)
     # Keep the browser progress page stable across ablation runs. The final
     # result files still use output_tag, so only the live progress view is shared.
@@ -501,11 +683,12 @@ def build_ablation_plan(
     seeds: Sequence[int] = (2026050901, 2026050902, 2026050903),
     cases: Sequence[AblationCase] = DEFAULT_ABLATION_CASES,
     variants: Sequence[AblationVariant] = DEFAULT_ABLATION_VARIANTS,
-    intensity_cps_1m: float = 30000.0,
+    intensity_cps_1m: float | Sequence[float] = DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
 ) -> list[AblationPlanEntry]:
     """Build and write config/source files for RA-L ablation trials."""
     base_config_path = Path(base_config_path).expanduser().resolve()
     base_config = _load_json(base_config_path)
+    source_options = _source_generation_options(base_config)
     entries: list[AblationPlanEntry] = []
     config_dir = Path(output_dir) / "configs"
     source_dir = Path(output_dir) / "sources"
@@ -516,7 +699,8 @@ def build_ablation_plan(
                 case,
                 obstacle_seed=int(seed),
                 source_seed=source_seed,
-                intensity_cps_1m=float(intensity_cps_1m),
+                intensity_cps_1m=intensity_cps_1m,
+                source_generation_options=source_options,
             )
             source_path = source_dir / f"{case.name}_seed_{seed}.json"
             _write_json(source_path, source_payload)
@@ -537,7 +721,6 @@ def build_ablation_plan(
                     source_path=source_path,
                     obstacle_seed=int(seed),
                     output_tag=tag,
-                    max_sources=case.max_sources,
                     extra_args=variant.cli_args,
                 )
                 entries.append(
@@ -559,7 +742,6 @@ def _trial_command(
     source_path: Path,
     obstacle_seed: int,
     output_tag: str,
-    max_sources: int,
     extra_args: Iterable[str] = (),
 ) -> tuple[str, ...]:
     """Return the standard full-simulation command for one ablation trial."""
@@ -578,11 +760,8 @@ def _trial_command(
         "--source-config",
         source_path.as_posix(),
         "--birth",
-        "--max-sources",
-        str(int(max_sources)),
-        "--adaptive-dwell",
         "--measurement-time-s",
-        "30",
+        f"{DEFAULT_MEASUREMENT_TIME_S:g}",
         "--output-tag",
         output_tag,
         *tuple(extra_args),
