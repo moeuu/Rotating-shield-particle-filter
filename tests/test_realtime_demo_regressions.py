@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -69,6 +71,7 @@ from realtime_demo import (
     _should_refresh_display_pruned_estimates,
     _signature_vector_is_dependent,
     _resolve_source_position_bounds,
+    _spectrum_evidence_payload,
     _spectrum_config_from_runtime_config,
     _source_cardinality_dwell_status,
     _remaining_measurement_progress,
@@ -83,6 +86,34 @@ from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from visualization.realtime_viz import PFFrame
+
+
+def test_spectrum_evidence_payload_uses_independent_configured_background() -> None:
+    """Final spectral history must not fix a background fitted to the same data."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_background_rate_cps=12.0)
+    )
+    decomposer.last_response_poisson_background = np.full(
+        decomposer.energy_axis.shape,
+        1.0e6,
+        dtype=float,
+    )
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    payload = _spectrum_evidence_payload(
+        decomposer,
+        spectrum,
+        live_time_s=2.0,
+        spectrum_variance=None,
+        isotopes=("Cs-137",),
+    )
+
+    assert payload is not None
+    assert payload["spectrum_background_source"] == (
+        "configured_rate_and_detector_background_shape"
+    )
+    assert payload["spectrum_background_observation_independent"] is True
+    assert float(np.sum(payload["spectrum_background"])) == pytest.approx(24.0)
 
 
 def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
@@ -570,6 +601,7 @@ def test_runtime_config_can_disable_gpu_without_cuda_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Runtime configs should be able to force CPU-only execution."""
+
     def _fail_cuda_probe() -> bool:
         """Fail if automatic CUDA detection is unexpectedly reached."""
         raise AssertionError("CUDA auto-detection should not run.")
@@ -2431,7 +2463,9 @@ def test_pf_convergence_can_trust_report_model_order_without_posterior_match() -
     assert _all_pf_filters_converged(_DummyEstimator()) is True  # type: ignore[arg-type]
 
 
-def test_source_cardinality_dwell_rejects_unstable_posterior_when_report_collapses() -> None:
+def test_source_cardinality_dwell_rejects_unstable_posterior_when_report_collapses() -> (
+    None
+):
     """Adaptive dwell should not stop when report clusters miss multisource K-mass."""
 
     class _DummyConfig:
@@ -2562,7 +2596,9 @@ def test_source_cardinality_dwell_allows_uncapped_max_sources() -> None:
     assert reason == "model_order_ready"
 
 
-def test_source_cardinality_dwell_can_use_report_order_without_posterior_match() -> None:
+def test_source_cardinality_dwell_can_use_report_order_without_posterior_match() -> (
+    None
+):
     """Adaptive dwell can ignore stable PF/report K mismatch when configured."""
 
     class _DummyConfig:
@@ -2788,10 +2824,10 @@ def test_source_position_support_limits_candidate_grid_z() -> None:
     assert np.max(grid[:, 2]) <= 1.5
 
 
-def test_demo_spectrum_counts_use_detected_isotopes_only(
+def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ensure demo PF measurements include only spectrum-confirmed isotopes."""
+    """Keep PF gating active while retaining configured count history for evaluation."""
     import realtime_demo
 
     class _DummyViz:
@@ -2813,6 +2849,8 @@ def test_demo_spectrum_counts_use_detected_isotopes_only(
             """Skip saving estimate snapshots in tests."""
             return None
 
+    spectrum_template_isotope_sets: list[set[str]] = []
+
     def _fake_update_pair(
         self: RotatingShieldPFEstimator,
         z_k: dict[str, float],
@@ -2821,8 +2859,16 @@ def test_demo_spectrum_counts_use_detected_isotopes_only(
         pb_index: int,
         live_time_s: float,
         z_variance_k: dict[str, float] | None = None,
+        spectrum_payload: dict[str, object] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
+        if spectrum_payload is not None:
+            templates = spectrum_payload.get(
+                "spectrum_response_templates_by_isotope",
+                {},
+            )
+            if isinstance(templates, dict):
+                spectrum_template_isotope_sets.append(set(templates))
         self.measurements.append(
             MeasurementRecord(
                 z_k={iso: float(v) for iso, v in z_k.items()},
@@ -2966,13 +3012,51 @@ def test_demo_spectrum_counts_use_detected_isotopes_only(
     assert metrics["path_segments"][0]["travel_time_s"] == pytest.approx(np.sqrt(2.0))
     assert metrics["mean_orientation_selection_time_s"] >= 0.0
     assert metrics["mean_pf_update_time_s"] >= 0.0
+    assert metrics["median_pf_update_time_s"] >= 0.0
+    assert metrics["p95_pf_update_time_s"] >= 0.0
+    assert metrics["station_count"] == 2
+    assert metrics["detector_pose_station_count"] == 2
+    assert metrics["height_change_count"] == 0
+    assert metrics["station_visit_count"] == 2
+    assert metrics["unique_xy_station_count"] == 2
+    assert metrics["unique_xyz_action_count"] == 2
+    assert metrics["height_transition_count"] == 0
+    assert metrics["wall_clock_runtime_s"] == pytest.approx(
+        metrics["online_wall_clock_s"]
+    )
+    assert metrics["end_to_end_wall_clock_s"] >= metrics["online_wall_clock_s"]
+    assert metrics["final_point_reporting_pipeline_time_s"] >= 0.0
+    assert metrics["final_point_estimate_time_s"] >= 0.0
+    assert metrics["final_point_estimate_time_s"] == pytest.approx(
+        metrics["final_point_reporting_pipeline_time_s"]
+    )
+    assert metrics["final_mle_time_s"] >= metrics["final_point_estimate_time_s"]
+    assert metrics["gpu_memory"]["available"] is False
+    evaluation = estimator.final_run_summary["evaluation_metrics"]
+    assert "p95" in evaluation["accuracy"]["position_error"]
+    assert evaluation["accuracy"]["position_error"]["p95"] is None
+    assert "by_shield_pair" in evaluation["count_bias"]
+    assert "spectrum_bin_heldout_deviance" in evaluation["model_identifiability"]
+    assert "consecutive_matched_cluster_shift_m" in evaluation["cluster_stability"]
+    assert evaluation["operational"]["station_count"] == 2
+    assert evaluation["operational"]["station_visit_count"] == 2
+    assert evaluation["operational"]["online_wall_clock_s"] <= evaluation[
+        "operational"
+    ]["end_to_end_wall_clock_s"]
+    json.dumps(estimator.final_run_summary, allow_nan=False)
+    assert estimator.isotopes == ["Cs-137"]
     for rec in estimator.measurements:
-        assert set(rec.z_k) == {"Cs-137"}
+        assert set(rec.z_k) == set(ANALYSIS_ISOTOPES)
         assert rec.z_variance_k is not None
-        assert set(rec.z_variance_k) == {"Cs-137"}
+        assert set(rec.z_variance_k) == set(ANALYSIS_ISOTOPES)
         assert rec.z_variance_k["Cs-137"] == pytest.approx(2.0)
     assert planning_isotope_args
     assert all(value is None for value in planning_isotope_args)
+    assert spectrum_template_isotope_sets
+    assert all(
+        template_isotopes == set(ANALYSIS_ISOTOPES)
+        for template_isotopes in spectrum_template_isotope_sets
+    )
     estimates = estimator.estimates()
     positions, strengths = estimates.get("Cs-137", (np.zeros((0, 3)), np.zeros(0)))
     assert positions.size > 0
@@ -4042,3 +4126,492 @@ def test_spectrum_isotope_channel_diagnostics_logs_photopeak_details(
     assert "[step 7] spectrum_isotope_channels" in output
     assert "photopeak_over_response" in output
     assert "response_poisson_photopeak_fused" in output
+
+
+def test_detector_height_partner_requires_same_xy_and_distinct_z() -> None:
+    """Height-pair actions should not be confused with revisits or base motion."""
+    low = np.array([1.0, 2.0, 0.5], dtype=float)
+
+    assert realtime_demo_module._is_detector_height_partner(
+        low,
+        np.array([1.0, 2.0, 1.5], dtype=float),
+        xy_tolerance_m=1.0e-6,
+    )
+    assert realtime_demo_module._is_detector_height_partner(
+        low,
+        np.array([1.0 + 5.0e-7, 2.0, 1.5], dtype=float),
+        xy_tolerance_m=1.0e-6,
+    )
+    assert not realtime_demo_module._is_detector_height_partner(
+        low,
+        low,
+        xy_tolerance_m=1.0e-6,
+    )
+    assert not realtime_demo_module._is_detector_height_partner(
+        low,
+        np.array([1.1, 2.0, 1.5], dtype=float),
+        xy_tolerance_m=1.0e-6,
+    )
+
+
+def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances() -> None:
+    """Operational counts should use actual measurement poses and tolerate jitter."""
+    recorded_positions = [
+        (1.0, 2.0, 0.5),
+        (1.0 + 0.4e-6, 2.0, 0.5),
+        (1.0 + 0.5e-6, 2.0, 1.5),
+        (4.0, 2.0, 1.5),
+        (1.0 + 0.3e-6, 2.0, 0.5),
+    ]
+    measurements = [
+        MeasurementRecord(
+            z_k={"Cs-137": 1.0},
+            pose_idx=0,
+            orient_idx=index,
+            live_time_s=1.0,
+            detector_position_xyz_m=position,
+        )
+        for index, position in enumerate(recorded_positions)
+    ]
+    metrics = realtime_demo_module._operational_station_height_metrics(
+        measurements,
+        [np.array([99.0, 99.0, 9.0], dtype=float)],
+        xy_tolerance_m=1.0e-6,
+        z_tolerance_m=1.0e-6,
+    )
+
+    assert metrics["observed_detector_heights_m"] == pytest.approx([0.5, 1.5])
+    assert metrics["station_visit_count"] == 3
+    assert metrics["unique_xy_station_count"] == 2
+    assert metrics["unique_xyz_action_count"] == 3
+    assert metrics["height_pair_station_count"] == 1
+    assert metrics["height_transition_count"] == 2
+    assert metrics["station_count"] == metrics["unique_xy_station_count"]
+    assert metrics["detector_pose_station_count"] == metrics[
+        "unique_xyz_action_count"
+    ]
+    assert metrics["height_change_count"] == metrics["height_transition_count"]
+    assert "position_source" in metrics["station_height_count_definitions"]
+
+
+def test_json_payload_sanitizer_is_recursive_and_strict() -> None:
+    """Final summary sanitization should remove NumPy types and non-finite values."""
+    payload = {
+        "array": np.array([1.0, np.nan, np.inf]),
+        "nested": ({"value": np.float64(-np.inf)}, np.int64(3)),
+        "flags": {np.bool_(True), np.bool_(False)},
+    }
+
+    sanitized = realtime_demo_module._sanitize_json_payload(payload)
+
+    assert sanitized["array"] == [1.0, None, None]
+    assert sanitized["nested"] == [{"value": None}, 3]
+    assert sorted(sanitized["flags"]) == [False, True]
+    json.dumps(sanitized, allow_nan=False)
+
+
+def test_surface_diagnostics_accept_the_posterior_annotation_tolerance() -> None:
+    """Surface summaries should use the same tolerance as posterior annotation."""
+    env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    positions = np.array([[1.0, 1.0, 5.0e-6]], dtype=float)
+
+    loose = realtime_demo_module._surface_count_payload(
+        positions,
+        env,
+        None,
+        obstacle_height_m=1.0,
+        tolerance_m=1.0e-5,
+    )
+    strict = realtime_demo_module._surface_count_payload(
+        positions,
+        env,
+        None,
+        obstacle_height_m=1.0,
+        tolerance_m=1.0e-6,
+    )
+
+    assert loose["surface_counts"]["floor"] == 1
+    assert loose["off_surface_count"] == 0
+    assert strict["surface_counts"]["floor"] == 0
+    assert strict["off_surface_count"] == 1
+
+
+def test_detector_mast_heights_resolve_to_world_z_above_nonzero_ground() -> None:
+    """PF actions should match the controller's ground-plus-mast world height."""
+    ground_z, initial_world_z, mast_actions, world_actions = (
+        realtime_demo_module._resolve_detector_height_world_actions(
+            {
+                "robot_ground_z_m": 0.2,
+                "detector_height_m": 0.6,
+                "detector_height_min_m": 0.5,
+                "detector_height_max_m": 1.5,
+                "detector_height_actions_m": [0.6, 1.4],
+            },
+            room_height_m=2.0,
+        )
+    )
+
+    assert ground_z == pytest.approx(0.2)
+    assert initial_world_z == pytest.approx(0.8)
+    assert mast_actions == pytest.approx([0.6, 1.4])
+    assert world_actions == pytest.approx([0.8, 1.6])
+
+
+def test_surface_map_runtime_configuration_is_explicit_and_validated() -> None:
+    """Surface-map spacing and L1/TV weights should map to the public solver."""
+    runtime_config = {
+        "surface_map_spacing_m": [0.5, 1.0, 2.0],
+        "surface_map_l1_weight": 0.25,
+        "surface_map_tv_weight": 0.5,
+        "surface_map_nuisance_l1_weight": 0.1,
+        "surface_map_nuisance_l2_weight": 0.2,
+        "surface_map_max_iterations": 75,
+        "surface_map_max_spectrum_bins": 12,
+    }
+
+    spacing = realtime_demo_module._surface_map_spacing_from_runtime_config(
+        runtime_config
+    )
+    config = realtime_demo_module._surface_map_config_from_runtime_config(
+        runtime_config
+    )
+
+    assert spacing == pytest.approx((0.5, 1.0, 2.0))
+    assert config.l1_weight == pytest.approx(0.25)
+    assert config.tv_weight == pytest.approx(0.5)
+    assert config.nuisance_l1_weight == pytest.approx(0.1)
+    assert config.nuisance_l2_weight == pytest.approx(0.2)
+    assert config.max_iterations == 75
+    assert config.max_spectrum_bins == 12
+    with pytest.raises(ValueError, match="surface_map_spacing_m"):
+        realtime_demo_module._surface_map_spacing_from_runtime_config(
+            {"surface_map_spacing_m": [1.0, 0.0, 1.0]}
+        )
+
+
+def test_final_surface_map_is_opt_in() -> None:
+    """The memory-intensive full spectral map should remain an explicit action."""
+    payload = realtime_demo_module._fit_final_surface_map(
+        object(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+        None,
+        {},
+        obstacle_height_m=1.0,
+    )
+
+    assert payload == {
+        "enabled": False,
+        "available": False,
+        "reason": "disabled",
+        "fit_time_s": None,
+        "solver_time_s": None,
+        "attempt_time_s": 0.0,
+    }
+
+
+def test_final_surface_map_checks_response_memory_before_fitting() -> None:
+    """The spectral response tensor should not be allocated beyond its cap."""
+
+    class _GuardedEstimator:
+        """Expose enough history to trigger the pre-allocation memory guard."""
+
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=tuple(np.ones(10, dtype=float)),
+            )
+        ]
+
+        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
+            """Fail if the guarded solver is called after exceeding the cap."""
+            raise AssertionError("surface-map solver should not be called")
+
+    payload = realtime_demo_module._fit_final_surface_map(
+        _GuardedEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 2.0,
+            "surface_map_max_response_elements": 1,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["available"] is False
+    assert payload["reason"] == "response_memory_budget_exceeded"
+    assert payload["fit_time_s"] is None
+    assert payload["solver_time_s"] is None
+    assert payload["attempt_time_s"] >= 0.0
+    assert payload["estimated_response_elements"] > 1
+    assert payload["estimated_peak_response_elements"] == (
+        payload["estimated_response_elements"]
+        * payload["response_peak_array_multiplier"]
+    )
+
+
+def test_final_surface_map_memory_guard_counts_pruned_configured_isotopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response guard should count all configured, not only active, isotopes."""
+
+    class _PrunedEstimator:
+        """Expose one active filter from a three-isotope configured analysis."""
+
+        all_isotopes = ["Cs-137", "Co-60", "Eu-154"]
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=(1.0,),
+            )
+        ]
+
+        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
+            """Fail if the all-isotope memory guard underestimates the tensor."""
+            raise AssertionError("surface-map solver should not be called")
+
+    def _fixed_patch_count(*_args: object, **_kwargs: object) -> int:
+        """Return a small deterministic preflight patch count."""
+        return 2
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "estimate_surface_patch_count_upper_bound",
+        _fixed_patch_count,
+    )
+
+    payload = realtime_demo_module._fit_final_surface_map(
+        _PrunedEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 2.0,
+            "surface_map_max_response_elements": 10,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["reason"] == "response_memory_budget_exceeded"
+    assert payload["isotope_count_for_memory_guard"] == 3
+    assert payload["estimated_response_elements"] == 6
+    assert payload["estimated_peak_response_elements"] == 24
+
+
+def test_final_surface_map_memory_guard_uses_configured_spectrum_bin_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preflight response sizing should match the surface solver's bin cap."""
+
+    class _CappedEstimator:
+        """Expose one ten-bin spectrum for a capped preflight estimate."""
+
+        all_isotopes = ["Cs-137"]
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=tuple(np.ones(10, dtype=float)),
+            )
+        ]
+
+        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
+            """Fail if the capped response guard does not stop the solver."""
+            raise AssertionError("surface-map solver should not be called")
+
+    def _fixed_patch_count(*_args: object, **_kwargs: object) -> int:
+        """Return a deterministic preflight patch count."""
+        return 2
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "estimate_surface_patch_count_upper_bound",
+        _fixed_patch_count,
+    )
+
+    payload = realtime_demo_module._fit_final_surface_map(
+        _CappedEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 2.0,
+            "surface_map_max_spectrum_bins": 2,
+            "surface_map_max_response_elements": 1,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["reason"] == "response_memory_budget_exceeded"
+    assert payload["raw_maximum_spectrum_bin_count"] == 10
+    assert payload["maximum_spectrum_bin_count_for_memory_guard"] == 2
+    assert payload["estimated_response_elements"] == 4
+
+
+def test_final_surface_map_checks_patch_count_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An excessively fine surface grid should be rejected before allocation."""
+
+    class _GuardedEstimator:
+        """Expose spectral history for the pre-construction patch guard."""
+
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=(1.0,),
+            )
+        ]
+
+    def _fail_patch_build(*_args: object, **_kwargs: object) -> object:
+        """Fail if patch-array construction is reached after the count guard."""
+        raise AssertionError("surface patches should not be constructed")
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "build_surface_patch_dictionary",
+        _fail_patch_build,
+    )
+    payload = realtime_demo_module._fit_final_surface_map(
+        _GuardedEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 0.1,
+            "surface_map_max_patch_count": 10,
+            "surface_map_max_response_elements": 1_000_000,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["available"] is False
+    assert payload["reason"] == "patch_memory_budget_exceeded"
+    assert payload["fit_time_s"] is None
+    assert payload["solver_time_s"] is None
+    assert payload["attempt_time_s"] >= 0.0
+    assert payload["estimated_patch_count_upper_bound"] > 10
+
+
+def test_final_surface_map_reports_memory_error_as_json_safe_unavailable() -> None:
+    """Late allocation failures should become serializable unavailable payloads."""
+
+    class _MemoryErrorEstimator:
+        """Raise the allocation error that can occur inside response construction."""
+
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=(1.0, 2.0),
+            )
+        ]
+
+        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
+            """Simulate a NumPy allocation failure after passing both guards."""
+            del args, kwargs
+            raise MemoryError
+
+    payload = realtime_demo_module._fit_final_surface_map(
+        _MemoryErrorEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=1.0, size_y=1.0, size_z=1.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 1.0,
+            "surface_map_max_patch_count": 100,
+            "surface_map_max_response_elements": 1_000,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["enabled"] is True
+    assert payload["available"] is False
+    assert payload["reason"] == "surface_map_memory_error"
+    assert payload["error"] == "memory_allocation_failed"
+    assert payload["fit_time_s"] is None
+    assert payload["solver_time_s"] is not None
+    assert payload["attempt_time_s"] >= payload["solver_time_s"]
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_final_surface_map_reports_successful_fit_time() -> None:
+    """A completed all-history fit should expose finite wall-clock duration."""
+
+    class _TimedEstimator:
+        """Return a minimal successful surface-map payload."""
+
+        isotopes = ["Cs-137"]
+        measurements = [
+            MeasurementRecord(
+                z_k={"Cs-137": 1.0},
+                pose_idx=0,
+                orient_idx=0,
+                live_time_s=1.0,
+                spectrum_counts=(1.0,),
+            )
+        ]
+
+        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
+            """Return the successful result timed by the runtime wrapper."""
+            del args, kwargs
+            return {"available": True, "reason": "ok"}
+
+    payload = realtime_demo_module._fit_final_surface_map(
+        _TimedEstimator(),  # type: ignore[arg-type]
+        EnvironmentConfig(size_x=1.0, size_y=1.0, size_z=1.0),
+        None,
+        {
+            "surface_map_reconstruction_enable": True,
+            "surface_map_spacing_m": 1.0,
+            "surface_map_max_patch_count": 100,
+            "surface_map_max_response_elements": 1_000,
+        },
+        obstacle_height_m=1.0,
+    )
+
+    assert payload["available"] is True
+    assert np.isfinite(payload["fit_time_s"])
+    assert payload["fit_time_s"] >= 0.0
+    assert payload["solver_time_s"] == pytest.approx(payload["fit_time_s"])
+    assert payload["attempt_time_s"] >= payload["solver_time_s"]
+
+
+def test_count_error_model_reports_three_distinct_layers() -> None:
+    """Final diagnostics should not collapse bias and model mismatch into variance."""
+    config = RotatingShieldPFConfig(
+        measurement_scale_by_isotope={"Cs-137": 1.01},
+        measurement_scale_by_isotope_and_pair={"Cs-137": {3: 0.99}},
+        sparse_poisson_spectral_nuisance_enable=True,
+    )
+
+    diagnostics = realtime_demo_module._count_error_model_diagnostics(
+        config,
+        obstacle_attenuation_active=True,
+    )
+
+    assert set(diagnostics) == {
+        "statistical_uncertainty",
+        "calibrated_systematic_response",
+        "forward_model_mismatch",
+    }
+    assert diagnostics["calibrated_systematic_response"]["shield_pair_scale_configured"]
+    assert diagnostics["forward_model_mismatch"]["obstacle_attenuation_active"]

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
 
-def _resolve_bounds(bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+def _resolve_bounds(
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return (lo, hi) bounds for candidate generation."""
     if bounds_xyz is None:
         lo = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -22,8 +24,10 @@ def _resolve_bounds(bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] 
     return lo, hi
 
 
-def _resolve_free_space_checker(map_api: object | None) -> Callable[[NDArray[np.float64]], bool]:
-    """Return a callable that checks whether a point is in free space."""
+def _resolve_free_space_checker(
+    map_api: object | None,
+) -> Callable[[NDArray[np.float64]], bool]:
+    """Return the scalar compatibility checker for a planning map."""
     if map_api is None:
         return lambda _: True
     if callable(map_api):
@@ -33,6 +37,19 @@ def _resolve_free_space_checker(map_api: object | None) -> Callable[[NDArray[np.
         if callable(fn):
             return fn
     return lambda _: True
+
+
+def _resolve_free_space_batch_checker(
+    map_api: object | None,
+) -> Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None:
+    """Return a standard batched free-space checker when the map provides one."""
+    if map_api is None:
+        return lambda points: np.ones(np.asarray(points).shape[0], dtype=bool)
+    for attr in ("is_free_batch", "is_free_space_batch"):
+        function = getattr(map_api, attr, None)
+        if callable(function):
+            return function
+    return None
 
 
 def _cell_center_from_map(
@@ -95,18 +112,128 @@ def _filter_candidates(
     visited_poses_xyz: NDArray[np.float64] | None,
     min_dist_from_visited: float,
     is_free_fn: Callable[[NDArray[np.float64]], bool],
+    *,
+    is_free_batch_fn: (
+        Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None
+    ) = None,
+    allow_height_partners: bool = False,
+    height_partner_reference_xyz: NDArray[np.float64] | None = None,
+    height_partner_xy_tolerance_m: float = 1.0e-9,
+    height_partner_z_tolerance_m: float = 1.0e-9,
 ) -> NDArray[np.float64]:
-    """Filter candidate poses by minimum distance and free-space checks."""
+    """Filter candidates while allowing only the current station's height mate."""
     if candidates.size == 0:
         return candidates
     mask = np.ones(candidates.shape[0], dtype=bool)
-    if visited_poses_xyz is not None and visited_poses_xyz.size and min_dist_from_visited > 0.0:
-        diffs = candidates[:, None, :] - visited_poses_xyz[None, :, :]
-        dists = np.linalg.norm(diffs, axis=2)
-        mask &= np.all(dists >= min_dist_from_visited, axis=1)
-    if is_free_fn is not None:
-        mask &= np.array([bool(is_free_fn(pt)) for pt in candidates], dtype=bool)
+    if visited_poses_xyz is not None and visited_poses_xyz.size:
+        visited = np.asarray(visited_poses_xyz, dtype=float).reshape(-1, 3)
+        diffs = candidates[:, None, :] - visited[None, :, :]
+        if allow_height_partners:
+            xy_dist = np.linalg.norm(diffs[:, :, :2], axis=2)
+            z_dist = np.abs(diffs[:, :, 2])
+            xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
+            z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
+            exact_action_visited = np.any(
+                (xy_dist <= xy_tolerance) & (z_dist <= z_tolerance),
+                axis=1,
+            )
+            reference = (
+                visited[-1]
+                if height_partner_reference_xyz is None
+                else np.asarray(height_partner_reference_xyz, dtype=float).reshape(3)
+            )
+            reference_xy_dist = np.linalg.norm(
+                candidates[:, :2] - reference[None, :2],
+                axis=1,
+            )
+            reference_z_dist = np.abs(candidates[:, 2] - reference[2])
+            height_partner = (
+                (reference_xy_dist <= xy_tolerance)
+                & (reference_z_dist > z_tolerance)
+                & ~exact_action_visited
+            )
+            separated = ~exact_action_visited
+            if min_dist_from_visited > 0.0:
+                separated &= (
+                    np.all(xy_dist >= min_dist_from_visited, axis=1)
+                    | height_partner
+                )
+        else:
+            distances = np.linalg.norm(diffs, axis=2)
+            separated = np.all(
+                distances >= max(float(min_dist_from_visited), 0.0),
+                axis=1,
+            )
+        mask &= separated
+    if is_free_batch_fn is not None:
+        free_mask = np.asarray(is_free_batch_fn(candidates), dtype=bool).reshape(-1)
+        if free_mask.size != candidates.shape[0]:
+            raise ValueError("Batched free-space checker returned the wrong length.")
+        mask &= free_mask
+    elif is_free_fn is not None:
+        # Compatibility fallback for third-party map APIs without a batch method.
+        mask &= np.fromiter(
+            (bool(is_free_fn(point)) for point in candidates),
+            dtype=bool,
+            count=candidates.shape[0],
+        )
     return candidates[mask]
+
+
+def resolve_detector_height_actions(
+    detector_heights_m: Sequence[float] | None,
+    *,
+    default_height_m: float,
+    bounds_z: tuple[float, float] | None = None,
+) -> NDArray[np.float64]:
+    """Return sorted unique detector-height actions after validation."""
+    if detector_heights_m is None:
+        values = np.asarray([default_height_m], dtype=float)
+    else:
+        values = np.asarray(tuple(detector_heights_m), dtype=float).reshape(-1)
+    if values.size == 0:
+        raise ValueError("detector_heights_m must contain at least one height.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("detector_heights_m must contain only finite values.")
+    values = np.unique(values)
+    if bounds_z is not None:
+        lower, upper = (float(bounds_z[0]), float(bounds_z[1]))
+        if upper < lower:
+            raise ValueError("bounds_z upper bound must be >= lower bound.")
+        if np.any(values < lower) or np.any(values > upper):
+            raise ValueError("detector_heights_m must lie within bounds_z.")
+    return values.astype(float)
+
+
+def expand_candidate_height_actions(
+    candidates_xyz: NDArray[np.float64],
+    detector_heights_m: Sequence[float],
+) -> NDArray[np.float64]:
+    """Expand candidate xy stations across discrete detector heights in batch."""
+    candidates = np.asarray(candidates_xyz, dtype=float)
+    if candidates.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    if candidates.ndim != 2 or candidates.shape[1] != 3:
+        raise ValueError("candidates_xyz must be shape (N, 3).")
+    heights = resolve_detector_height_actions(
+        detector_heights_m,
+        default_height_m=float(candidates[0, 2]),
+    )
+    expanded = np.repeat(candidates[:, None, :], heights.size, axis=1)
+    expanded[:, :, 2] = heights[None, :]
+    return expanded.reshape(-1, 3)
+
+
+def _stable_unique_candidates(
+    candidates_xyz: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Remove duplicate candidate rows while preserving their first-seen order."""
+    candidates = np.asarray(candidates_xyz, dtype=float)
+    if candidates.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    rounded = np.round(candidates, decimals=12)
+    _, first_indices = np.unique(rounded, axis=0, return_index=True)
+    return candidates[np.sort(first_indices)]
 
 
 def _sample_uniform(
@@ -194,8 +321,17 @@ def generate_candidate_poses(
     visited_poses_xyz: NDArray[np.float64] | None = None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     rng: np.random.Generator | None = None,
+    detector_heights_m: Sequence[float] | None = None,
+    include_current_xy_height_actions: bool = False,
+    height_partner_xy_tolerance_m: float = 1.0e-9,
+    height_partner_z_tolerance_m: float = 1.0e-9,
 ) -> NDArray[np.float64]:
-    """Return (L, 3) candidate poses in free space for the given strategy."""
+    """Return (L, 3) candidate poses in free space for the given strategy.
+
+    When ``detector_heights_m`` is supplied, xy stations are sampled once and
+    expanded over the discrete height actions. Continuous z values are never
+    sampled in that mode.
+    """
     rng = np.random.default_rng() if rng is None else rng
     current_pose_xyz = np.asarray(current_pose_xyz, dtype=float)
     if current_pose_xyz.shape != (3,):
@@ -210,30 +346,81 @@ def generate_candidate_poses(
 
     lo, hi = _resolve_bounds(bounds_xyz)
     is_free_fn = _resolve_free_space_checker(map_api)
+    is_free_batch_fn = _resolve_free_space_batch_checker(map_api)
+    height_actions: NDArray[np.float64] | None = None
+    sample_lo = lo.copy()
+    sample_hi = hi.copy()
+    base_candidate_count = max(int(n_candidates), 1)
+    if detector_heights_m is not None:
+        height_actions = resolve_detector_height_actions(
+            detector_heights_m,
+            default_height_m=float(current_pose_xyz[2]),
+            bounds_z=(float(lo[2]), float(hi[2])),
+        )
+        sample_lo[2] = float(current_pose_xyz[2])
+        sample_hi[2] = float(current_pose_xyz[2])
+        base_candidate_count = max(
+            int(np.ceil(max(int(n_candidates), 1) / height_actions.size)),
+            1,
+        )
 
     if strategy == "ring":
         raw = _generate_ring_candidates(
             current_pose_xyz=current_pose_xyz,
-            lo=lo,
-            hi=hi,
-            n_candidates=max(n_candidates, 1),
+            lo=sample_lo,
+            hi=sample_hi,
+            n_candidates=base_candidate_count,
             min_dist_from_visited=min_dist_from_visited,
         )
     elif strategy == "free_space_sobol":
-        raw = _sample_sobol(rng, lo, hi, max(n_candidates * 3, n_candidates))
+        raw = _sample_sobol(
+            rng,
+            sample_lo,
+            sample_hi,
+            max(base_candidate_count * 3, base_candidate_count),
+        )
     elif strategy == "gaussian":
-        raw = rng.normal(loc=current_pose_xyz, scale=0.75, size=(max(n_candidates * 3, n_candidates), 3))
-        raw = np.clip(raw, lo, hi)
+        sample_count = max(base_candidate_count * 3, base_candidate_count)
+        raw = rng.normal(
+            loc=current_pose_xyz,
+            scale=0.75,
+            size=(sample_count, 3),
+        )
+        raw = np.clip(raw, sample_lo, sample_hi)
     else:
         raise ValueError(f"Unknown candidate generation strategy: {strategy}")
 
-    filtered = _filter_candidates(raw, visited, min_dist_from_visited, is_free_fn)
+    if height_actions is not None:
+        raw = expand_candidate_height_actions(raw, height_actions)
+        if include_current_xy_height_actions:
+            current_height_actions = expand_candidate_height_actions(
+                current_pose_xyz.reshape(1, 3),
+                height_actions,
+            )
+            raw = np.vstack([current_height_actions, raw])
+
+    filtered = _filter_candidates(
+        raw,
+        visited,
+        min_dist_from_visited,
+        is_free_fn,
+        is_free_batch_fn=is_free_batch_fn,
+        allow_height_partners=height_actions is not None,
+        height_partner_reference_xyz=current_pose_xyz,
+        height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
+        height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+    )
     if filtered.shape[0] < n_candidates:
         map_centers = _map_free_cell_centers(
             map_api,
             z_value=float(current_pose_xyz[2]),
         )
         if map_centers.size:
+            if height_actions is not None:
+                map_centers = expand_candidate_height_actions(
+                    map_centers,
+                    height_actions,
+                )
             if visited is not None and visited.size:
                 distances = np.linalg.norm(
                     map_centers[:, None, :2] - visited[None, :, :2],
@@ -246,12 +433,34 @@ def generate_candidate_poses(
                 visited,
                 min_dist_from_visited,
                 is_free_fn,
+                is_free_batch_fn=is_free_batch_fn,
+                allow_height_partners=height_actions is not None,
+                height_partner_reference_xyz=current_pose_xyz,
+                height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
+                height_partner_z_tolerance_m=height_partner_z_tolerance_m,
             )
             if map_centers.size:
                 filtered = np.vstack([filtered, map_centers])
     if filtered.shape[0] < n_candidates:
-        extra = _sample_uniform(rng, lo, hi, max(n_candidates, 1))
-        extra = _filter_candidates(extra, visited, min_dist_from_visited, is_free_fn)
+        extra = _sample_uniform(
+            rng,
+            sample_lo,
+            sample_hi,
+            max(base_candidate_count, 1),
+        )
+        if height_actions is not None:
+            extra = expand_candidate_height_actions(extra, height_actions)
+        extra = _filter_candidates(
+            extra,
+            visited,
+            min_dist_from_visited,
+            is_free_fn,
+            is_free_batch_fn=is_free_batch_fn,
+            allow_height_partners=height_actions is not None,
+            height_partner_reference_xyz=current_pose_xyz,
+            height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
+            height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+        )
         if extra.size:
             filtered = np.vstack([filtered, extra])
-    return filtered[:n_candidates]
+    return _stable_unique_candidates(filtered)[:n_candidates]

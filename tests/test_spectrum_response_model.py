@@ -16,6 +16,24 @@ from spectrum.pipeline import PhotopeakRoiEstimate, SpectralDecomposer, Spectrum
 from spectrum.response_matrix import build_incident_gamma_response_matrix, gaussian_peak
 
 
+def test_configured_background_spectrum_does_not_reuse_observation_fit() -> None:
+    """All-history fixed background must depend only on prior configuration."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_background_rate_cps=12.0)
+    )
+    decomposer.last_response_poisson_background = np.full(
+        decomposer.energy_axis.shape,
+        1.0e6,
+        dtype=float,
+    )
+
+    background = decomposer.configured_background_spectrum(2.5)
+
+    assert background is not None
+    assert float(np.sum(background)) == pytest.approx(30.0)
+    assert float(np.max(background)) < 1.0e6
+
+
 def test_photopeak_nnls_counts_recover_calibrated_peak_counts() -> None:
     """Photopeak NNLS should recover source counts from peaks plus local background."""
     cfg = SpectrumConfig(dead_time_tau_s=0.0)

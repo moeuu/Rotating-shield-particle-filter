@@ -344,6 +344,24 @@ class SpectralDecomposer:
         self._response_poisson_line_photopeak_matrix: NDArray[np.float64] | None = None
         self._response_poisson_line_columns: tuple[ResponsePoissonColumn, ...] | None = None
 
+    def configured_background_spectrum(
+        self,
+        live_time_s: float,
+    ) -> NDArray[np.float64] | None:
+        """Return the independently configured background expectation.
+
+        The returned spectrum depends only on the preconfigured background rate,
+        detector background shape, and live time.  It deliberately does not use
+        ``last_response_poisson_background``, because that quantity is fitted to
+        the same observed spectrum and therefore cannot serve as fixed background
+        data in a later all-history likelihood.
+        """
+        rate_cps = self.config.response_poisson_background_rate_cps
+        if rate_cps is None:
+            return None
+        expected_counts = max(float(rate_cps), 0.0) * max(float(live_time_s), 0.0)
+        return expected_counts * np.asarray(self._background_shape, dtype=float)
+
     def simulate_spectrum(
         self,
         sources: Iterable[PointSource],

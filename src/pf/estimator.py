@@ -23,9 +23,11 @@ from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kinds
+from measurement.surface_patches import SurfacePatchDictionary
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.likelihood import expected_counts_per_source
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
+from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.reporting import dedupe_report_candidates, measurement_vector
 from pf.resampling import systematic_resample
 from pf.sparse_evidence import (
@@ -39,6 +41,13 @@ from pf.sparse_evidence import (
     sparse_poisson_evidence_to_diagnostics,
 )
 from pf.state import IsotopeState
+from pf.surface_map import (
+    ContiguousPoissonBinAggregation,
+    SurfaceMapConfig,
+    aggregate_contiguous_poisson_bins,
+    contiguous_poisson_bin_aggregation,
+    fit_surface_map_poisson,
+)
 
 
 def _weighted_quantile(
@@ -149,6 +158,13 @@ class RotatingShieldPFConfig:
         - runtime_report_rescue_memory_enable: retain recent report-rescue modes across stations
         - runtime_report_rescue_memory_decay: station-to-station rescue-memory score decay
         - runtime_report_rescue_memory_max_sources: max remembered rescue modes per isotope
+        - candidate_verification_independent_evidence_enable: verify queued modes on later stations
+        - candidate_verification_min_xy_separation_m: independent-station x/y separation
+        - candidate_verification_min_height_separation_m: independent detector-height separation
+        - candidate_verification_require_distinct_shield_program: require a new Fe/Pb program
+        - candidate_verification_min_deviance_improvement: positive verification score floor
+        - candidate_verification_min_positive_checks: independent positives needed for promotion
+        - candidate_verification_reject_after_negatives: decisive negatives needed for rejection
         - report_mle_rescue_surface_quota_enable: reserve rescue slots across known surface strata
         - report_mle_rescue_surface_quota_min_score_fraction: score floor for stratum quota candidates
         - report_mle_rescue_surface_quota_per_stratum: reserved rescue slots per surface stratum
@@ -178,6 +194,7 @@ class RotatingShieldPFConfig:
         - weak_source_prune_observable_fraction: per-measurement visible-fraction threshold
         - weak_source_prune_visibility_reference_strength: optional fixed cps@1m for visibility checks
         - conditional_strength_refit: refit strengths at station finalization
+        - conditional_strength_profile_before_likelihood: profile strengths before station likelihood evaluation
         - conditional_strength_refit_window: recent measurements used for strength refit
         - conditional_strength_refit_iters: iterations for conditional strength refit
         - conditional_strength_refit_reweight: reweight particles by profile-likelihood gain
@@ -482,6 +499,18 @@ class RotatingShieldPFConfig:
     candidate_verification_queue_weight: float = 0.05
     candidate_verification_queue_decay: float = 0.85
     candidate_verification_queue_max_sources: int = 0
+    candidate_verification_independent_evidence_enable: bool = False
+    candidate_verification_require_independent_xy: bool = True
+    candidate_verification_min_xy_separation_m: float = 0.5
+    candidate_verification_require_distinct_height: bool = True
+    candidate_verification_min_height_separation_m: float = 0.5
+    candidate_verification_require_distinct_shield_program: bool = True
+    candidate_verification_min_deviance_improvement: float = 4.0
+    candidate_verification_min_positive_checks: int = 1
+    candidate_verification_reject_after_negatives: int = 2
+    candidate_verification_negative_deviance_threshold: float = 0.0
+    candidate_verification_profile_l2: float = 1.0e-6
+    candidate_verification_profile_max_iters: int = 32
     report_mle_rescue_surface_quota_enable: bool = True
     report_mle_rescue_surface_quota_min_score_fraction: float = 0.0
     report_mle_rescue_surface_quota_per_stratum: int = 1
@@ -520,6 +549,7 @@ class RotatingShieldPFConfig:
     weak_source_prune_observable_fraction: float = 0.0
     weak_source_prune_visibility_reference_strength: float = 0.0
     conditional_strength_refit: bool = True
+    conditional_strength_profile_before_likelihood: bool = False
     conditional_strength_refit_window: int = 10
     conditional_strength_refit_iters: int = 3
     conditional_strength_refit_reweight: bool = False
@@ -852,9 +882,7 @@ class RotatingShieldPFConfig:
             2,
             int(self.shield_view_ratio_likelihood_min_views),
         )
-        self.station_view_covariance_enable = bool(
-            self.station_view_covariance_enable
-        )
+        self.station_view_covariance_enable = bool(self.station_view_covariance_enable)
         self.station_view_correlated_spectrum_fraction = max(
             0.0,
             float(self.station_view_correlated_spectrum_fraction),
@@ -1193,6 +1221,49 @@ class RotatingShieldPFConfig:
             0,
             int(self.candidate_verification_queue_max_sources),
         )
+        self.candidate_verification_independent_evidence_enable = bool(
+            self.candidate_verification_independent_evidence_enable
+        )
+        self.candidate_verification_require_independent_xy = bool(
+            self.candidate_verification_require_independent_xy
+        )
+        self.candidate_verification_min_xy_separation_m = max(
+            0.0,
+            float(self.candidate_verification_min_xy_separation_m),
+        )
+        self.candidate_verification_require_distinct_height = bool(
+            self.candidate_verification_require_distinct_height
+        )
+        self.candidate_verification_min_height_separation_m = max(
+            0.0,
+            float(self.candidate_verification_min_height_separation_m),
+        )
+        self.candidate_verification_require_distinct_shield_program = bool(
+            self.candidate_verification_require_distinct_shield_program
+        )
+        self.candidate_verification_min_deviance_improvement = max(
+            0.0,
+            float(self.candidate_verification_min_deviance_improvement),
+        )
+        self.candidate_verification_min_positive_checks = max(
+            1,
+            int(self.candidate_verification_min_positive_checks),
+        )
+        self.candidate_verification_reject_after_negatives = max(
+            1,
+            int(self.candidate_verification_reject_after_negatives),
+        )
+        self.candidate_verification_negative_deviance_threshold = float(
+            self.candidate_verification_negative_deviance_threshold
+        )
+        self.candidate_verification_profile_l2 = max(
+            0.0,
+            float(self.candidate_verification_profile_l2),
+        )
+        self.candidate_verification_profile_max_iters = max(
+            1,
+            int(self.candidate_verification_profile_max_iters),
+        )
         self.report_mle_rescue_surface_quota_enable = bool(
             self.report_mle_rescue_surface_quota_enable
         )
@@ -1322,6 +1393,22 @@ class RotatingShieldPFConfig:
         self.birth_delta_ll_threshold = float(self.birth_delta_ll_threshold)
         self.birth_complexity_penalty = max(0.0, float(self.birth_complexity_penalty))
         self.birth_bic_penalty_params = max(0, int(self.birth_bic_penalty_params))
+        self.conditional_strength_profile_before_likelihood = bool(
+            self.conditional_strength_profile_before_likelihood
+        )
+        self.conditional_strength_refit_reweight = bool(
+            self.conditional_strength_refit_reweight
+        )
+        if (
+            self.conditional_strength_profile_before_likelihood
+            and self.conditional_strength_refit_reweight
+        ):
+            raise ValueError(
+                "conditional_strength_profile_before_likelihood cannot be combined "
+                "with conditional_strength_refit_reweight: the pre-likelihood "
+                "profile changes the strength state without rebasing historical "
+                "particle weights."
+            )
         self.conditional_strength_refit_window = max(
             0,
             int(self.conditional_strength_refit_window),
@@ -1573,9 +1660,7 @@ class RotatingShieldPFConfig:
             1,
             int(self.report_model_order_parallel_min_subsets),
         )
-        self.sparse_poisson_evidence_enable = bool(
-            self.sparse_poisson_evidence_enable
-        )
+        self.sparse_poisson_evidence_enable = bool(self.sparse_poisson_evidence_enable)
         self.sparse_poisson_evidence_authoritative = bool(
             self.sparse_poisson_evidence_authoritative
         )
@@ -1658,6 +1743,8 @@ class RotatingShieldPFConfig:
         self.runtime_report_rescue_verification_queue_only = bool(
             self.runtime_report_rescue_verification_queue_only
         )
+        if self.candidate_verification_independent_evidence_enable:
+            self.runtime_report_rescue_verification_queue_only = True
         if self.runtime_report_rescue_verification_queue_only:
             self.candidate_verification_queue_enable = True
         self.report_pre_finalize_guard = bool(self.report_pre_finalize_guard)
@@ -1710,7 +1797,117 @@ class MeasurementRecord:
     spectrum_counts: tuple[float, ...] | None = None
     spectrum_variance: tuple[float, ...] | None = None
     spectrum_background: tuple[float, ...] | None = None
+    spectrum_background_source: str | None = None
+    spectrum_background_observation_independent: bool = False
     spectrum_response_templates_by_isotope: Dict[str, tuple[float, ...]] | None = None
+    detector_position_xyz_m: tuple[float, float, float] | None = None
+
+
+@dataclass
+class CandidateVerificationProvenance:
+    """Store metadata aligned with one isotope's queued rescue candidates."""
+
+    proposal_measurement_cutoffs: NDArray[np.int64]
+    origin_positions_xyz_m: NDArray[np.float64]
+    origin_fe_programs: Tuple[Tuple[int, ...], ...]
+    origin_pb_programs: Tuple[Tuple[int, ...], ...]
+    origin_shield_programs: Tuple[Tuple[Tuple[int, int], ...], ...]
+    origin_shield_program_masks: NDArray[np.bool_]
+    positive_attempts: NDArray[np.int64]
+    negative_attempts: NDArray[np.int64]
+    last_evaluated_measurement_counts: NDArray[np.int64]
+
+    @property
+    def size(self) -> int:
+        """Return the number of aligned queued candidates."""
+        return int(np.asarray(self.proposal_measurement_cutoffs).size)
+
+    def subset(
+        self,
+        selector: NDArray[np.bool_] | NDArray[np.int64],
+    ) -> "CandidateVerificationProvenance":
+        """Return provenance rows selected by a boolean mask or integer indices."""
+        selection = np.asarray(selector)
+        if selection.dtype == bool:
+            indices = np.flatnonzero(selection)
+        else:
+            indices = selection.astype(np.int64, copy=False).reshape(-1)
+        return CandidateVerificationProvenance(
+            proposal_measurement_cutoffs=np.asarray(
+                self.proposal_measurement_cutoffs,
+                dtype=np.int64,
+            )[indices].copy(),
+            origin_positions_xyz_m=np.asarray(
+                self.origin_positions_xyz_m,
+                dtype=float,
+            )[indices].copy(),
+            origin_fe_programs=tuple(
+                self.origin_fe_programs[int(index)] for index in indices
+            ),
+            origin_pb_programs=tuple(
+                self.origin_pb_programs[int(index)] for index in indices
+            ),
+            origin_shield_programs=tuple(
+                self.origin_shield_programs[int(index)] for index in indices
+            ),
+            origin_shield_program_masks=np.asarray(
+                self.origin_shield_program_masks,
+                dtype=bool,
+            )[indices].copy(),
+            positive_attempts=np.asarray(
+                self.positive_attempts,
+                dtype=np.int64,
+            )[indices].copy(),
+            negative_attempts=np.asarray(
+                self.negative_attempts,
+                dtype=np.int64,
+            )[indices].copy(),
+            last_evaluated_measurement_counts=np.asarray(
+                self.last_evaluated_measurement_counts,
+                dtype=np.int64,
+            )[indices].copy(),
+        )
+
+    @staticmethod
+    def concatenate(
+        first: "CandidateVerificationProvenance",
+        second: "CandidateVerificationProvenance",
+    ) -> "CandidateVerificationProvenance":
+        """Concatenate two aligned provenance payloads."""
+        return CandidateVerificationProvenance(
+            proposal_measurement_cutoffs=np.concatenate(
+                [
+                    first.proposal_measurement_cutoffs,
+                    second.proposal_measurement_cutoffs,
+                ]
+            ).astype(np.int64, copy=False),
+            origin_positions_xyz_m=np.vstack(
+                [first.origin_positions_xyz_m, second.origin_positions_xyz_m]
+            ).astype(float, copy=False),
+            origin_fe_programs=(first.origin_fe_programs + second.origin_fe_programs),
+            origin_pb_programs=(first.origin_pb_programs + second.origin_pb_programs),
+            origin_shield_programs=(
+                first.origin_shield_programs + second.origin_shield_programs
+            ),
+            origin_shield_program_masks=np.vstack(
+                [
+                    first.origin_shield_program_masks,
+                    second.origin_shield_program_masks,
+                ]
+            ).astype(bool, copy=False),
+            positive_attempts=np.concatenate(
+                [first.positive_attempts, second.positive_attempts]
+            ).astype(np.int64, copy=False),
+            negative_attempts=np.concatenate(
+                [first.negative_attempts, second.negative_attempts]
+            ).astype(np.int64, copy=False),
+            last_evaluated_measurement_counts=np.concatenate(
+                [
+                    first.last_evaluated_measurement_counts,
+                    second.last_evaluated_measurement_counts,
+                ]
+            ).astype(np.int64, copy=False),
+        )
 
 
 @dataclass(frozen=True)
@@ -1818,6 +2015,16 @@ class RotatingShieldPFEstimator:
             str,
             Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]],
         ] = {}
+        self._candidate_verification_provenance: Dict[
+            str,
+            CandidateVerificationProvenance,
+        ] = {}
+        self._candidate_verification_station_start: int | None = None
+        self._last_candidate_verification_diagnostics: Dict[str, Dict[str, Any]] = {}
+        self._last_candidate_verification_rejected_positions: Dict[
+            str,
+            NDArray[np.float64],
+        ] = {}
         self._global_birth_rescue_candidate_memory: Dict[
             str,
             Tuple[NDArray[np.float64], NDArray[np.float64]],
@@ -1850,6 +2057,11 @@ class RotatingShieldPFEstimator:
             dict[str, NDArray[np.float64]],
         ] = {}
         self._candidate_response_prefix_cache_order: list[tuple[Any, ...]] = []
+        self._configured_response_kernel_registry: dict[str, ContinuousKernel] = {}
+        self._configured_spectrum_response_registry: dict[
+            tuple[str, int],
+            tuple[float, ...],
+        ] = {}
 
     @staticmethod
     def _copy_estimate_map(
@@ -2493,16 +2705,16 @@ class RotatingShieldPFEstimator:
             if old_key not in self._candidate_response_prefix_cache_order:
                 self._candidate_response_prefix_cache.pop(old_key, None)
 
-    def _cached_expected_counts_per_source(
+    def _cached_expected_counts_for_kernel(
         self,
         *,
-        filt: IsotopeParticleFilter,
+        kernel: ContinuousKernel,
         isotope: str,
         data: MeasurementData,
         sources: NDArray[np.float64],
         strengths: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Return expected counts, reusing deterministic full-grid responses."""
+        """Return batched expected counts from a particle-independent kernel."""
         source_arr = np.asarray(sources, dtype=float).reshape(-1, 3)
         strength_arr = np.asarray(strengths, dtype=float).reshape(-1)
         source_key = self._candidate_response_source_key(source_arr)
@@ -2524,7 +2736,7 @@ class RotatingShieldPFEstimator:
         if cache_enabled:
             cache_key = (
                 str(isotope),
-                int(id(filt.continuous_kernel)),
+                int(id(kernel)),
                 source_key,
                 self._measurement_geometry_digest(data),
                 tuple(scale_arr.round(12).tolist()),
@@ -2532,7 +2744,7 @@ class RotatingShieldPFEstimator:
             cached = self._candidate_response_cache.get(cache_key)
             if cached is not None:
                 return cached.copy()
-            prefix_key = (str(isotope), int(id(filt.continuous_kernel)), source_key)
+            prefix_key = (str(isotope), int(id(kernel)), source_key)
             prefix_payload = self._candidate_response_prefix_cache.get(prefix_key)
             if isinstance(prefix_payload, dict):
                 cached_counts = np.asarray(
@@ -2562,7 +2774,7 @@ class RotatingShieldPFEstimator:
                     )
                 ):
                     suffix_counts = expected_counts_per_source(
-                        kernel=filt.continuous_kernel,
+                        kernel=kernel,
                         isotope=isotope,
                         detector_positions=np.asarray(
                             data.detector_positions,
@@ -2592,7 +2804,7 @@ class RotatingShieldPFEstimator:
                     self._store_candidate_response_cache(cache_key, counts_arr)
                     return counts_arr.copy()
         counts = expected_counts_per_source(
-            kernel=filt.continuous_kernel,
+            kernel=kernel,
             isotope=isotope,
             detector_positions=data.detector_positions,
             sources=source_arr,
@@ -2613,6 +2825,24 @@ class RotatingShieldPFEstimator:
                     counts_arr,
                 )
         return counts_arr
+
+    def _cached_expected_counts_per_source(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        isotope: str,
+        data: MeasurementData,
+        sources: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return expected counts using an active filter's physical kernel."""
+        return self._cached_expected_counts_for_kernel(
+            kernel=filt.continuous_kernel,
+            isotope=isotope,
+            data=data,
+            sources=sources,
+            strengths=strengths,
+        )
 
     def _cached_candidate_grid_counts(
         self,
@@ -3013,6 +3243,9 @@ class RotatingShieldPFEstimator:
                 self.pf_config.weak_source_prune_visibility_reference_strength
             ),
             conditional_strength_refit=self.pf_config.conditional_strength_refit,
+            conditional_strength_profile_before_likelihood=(
+                self.pf_config.conditional_strength_profile_before_likelihood
+            ),
             conditional_strength_refit_window=self.pf_config.conditional_strength_refit_window,
             conditional_strength_refit_iters=self.pf_config.conditional_strength_refit_iters,
             conditional_strength_refit_reweight=self.pf_config.conditional_strength_refit_reweight,
@@ -3317,7 +3550,9 @@ class RotatingShieldPFEstimator:
             [
                 max(
                     float(
-                        z_variance_k.get(isotope, max(float(z_k.get(isotope, 0.0)), 1.0))
+                        z_variance_k.get(
+                            isotope, max(float(z_k.get(isotope, 0.0)), 1.0)
+                        )
                         if z_variance_k is not None
                         else max(float(z_k.get(isotope, 0.0)), 1.0)
                     ),
@@ -3327,9 +3562,8 @@ class RotatingShieldPFEstimator:
             ],
             dtype=float,
         )
-        if (
-            z_covariance_k is None
-            or not bool(self.pf_config.observation_covariance_projection_enable)
+        if z_covariance_k is None or not bool(
+            self.pf_config.observation_covariance_projection_enable
         ):
             return (
                 {
@@ -3355,9 +3589,7 @@ class RotatingShieldPFEstimator:
                 },
                 None,
             )
-        offdiag_abs = np.sum(np.abs(covariance), axis=1) - np.abs(
-            np.diag(covariance)
-        )
+        offdiag_abs = np.sum(np.abs(covariance), axis=1) - np.abs(np.diag(covariance))
         projected = np.maximum(
             base_variances,
             np.diag(covariance)
@@ -3520,7 +3752,102 @@ class RotatingShieldPFEstimator:
             "spectrum_counts": spectrum_counts,
             "spectrum_variance": spectrum_variance,
             "spectrum_background": spectrum_background,
+            "spectrum_background_source": str(
+                payload.get("spectrum_background_source", "unspecified")
+            ),
+            "spectrum_background_observation_independent": bool(
+                payload.get(
+                    "spectrum_background_observation_independent",
+                    False,
+                )
+            ),
             "spectrum_response_templates_by_isotope": templates,
+        }
+
+    def register_configured_isotope_spectrum_responses(
+        self,
+        templates_by_isotope: Mapping[str, object],
+    ) -> tuple[str, ...]:
+        """Retain configured spectral responses independently of active PF filters.
+
+        Entries are keyed by isotope and spectrum-bin count so an exact response is
+        reused only for histories with the same binning.  Partial registration is
+        allowed because response providers may populate configured isotopes in
+        batches; unknown isotopes are rejected to prevent silent model mismatch.
+        """
+        configured = set(self.configured_isotope_order())
+        registered: list[str] = []
+        for isotope, values in templates_by_isotope.items():
+            isotope_key = str(isotope)
+            if isotope_key not in configured:
+                raise ValueError(
+                    f"Cannot register spectrum response for unconfigured isotope "
+                    f"{isotope_key!r}."
+                )
+            response = self._sanitize_spectrum_vector(
+                values,
+                name=f"configured_spectrum_response[{isotope_key}]",
+            )
+            if response is None:
+                continue
+            self._configured_spectrum_response_registry[
+                (isotope_key, len(response))
+            ] = response
+            registered.append(isotope_key)
+        return tuple(registered)
+
+    def configured_isotope_spectrum_response(
+        self,
+        isotope: str,
+        *,
+        bin_count: int,
+    ) -> NDArray[np.float64] | None:
+        """Return a copied configured spectral response for an exact binning."""
+        isotope_key = str(isotope)
+        if isotope_key not in self.configured_isotope_order():
+            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
+        response = self._configured_spectrum_response_registry.get(
+            (isotope_key, int(bin_count))
+        )
+        if response is None:
+            return None
+        return np.asarray(response, dtype=float).copy()
+
+    def _complete_spectrum_payload_with_configured_responses(
+        self,
+        payload: Mapping[str, object] | None,
+    ) -> dict[str, object] | None:
+        """Register exact templates and fill configured responses of equal binning."""
+        if payload is None:
+            return None
+        counts = payload.get("spectrum_counts")
+        if counts is None:
+            return dict(payload)
+        bin_count = int(np.asarray(counts, dtype=float).size)
+        raw_templates = payload.get("spectrum_response_templates_by_isotope", {})
+        templates = (
+            {str(key): value for key, value in raw_templates.items()}
+            if isinstance(raw_templates, Mapping)
+            else {}
+        )
+        configured = set(self.configured_isotope_order())
+        configured_templates = {
+            isotope: values
+            for isotope, values in templates.items()
+            if isotope in configured
+        }
+        self.register_configured_isotope_spectrum_responses(configured_templates)
+        completed = dict(templates)
+        for isotope in self.configured_isotope_order():
+            response = self.configured_isotope_spectrum_response(
+                isotope,
+                bin_count=bin_count,
+            )
+            if response is not None:
+                completed[isotope] = tuple(float(value) for value in response)
+        return {
+            **dict(payload),
+            "spectrum_response_templates_by_isotope": completed,
         }
 
     @staticmethod
@@ -3540,7 +3867,9 @@ class RotatingShieldPFEstimator:
         if isotope_key not in templates_raw:
             return None
         counts = np.asarray(counts_raw, dtype=float).reshape(-1)
-        target_template = np.asarray(templates_raw[isotope_key], dtype=float).reshape(-1)
+        target_template = np.asarray(templates_raw[isotope_key], dtype=float).reshape(
+            -1
+        )
         if counts.size == 0 or target_template.size != counts.size:
             return None
         background_raw = spectrum_payload.get("spectrum_background")
@@ -3610,7 +3939,10 @@ class RotatingShieldPFEstimator:
         )
         stacked: dict[str, NDArray[np.float64]] = {}
         for key in required_keys:
-            rows = [np.asarray(payload[key], dtype=float).reshape(-1) for payload in concrete]
+            rows = [
+                np.asarray(payload[key], dtype=float).reshape(-1)
+                for payload in concrete
+            ]
             if any(row.size != bin_count for row in rows):
                 return None
             stacked[key] = np.vstack(rows)
@@ -3670,7 +4002,10 @@ class RotatingShieldPFEstimator:
             float(live_time_s),
             None
             if z_variance_k is None
-            else {str(isotope): float(value) for isotope, value in dict(z_variance_k).items()},
+            else {
+                str(isotope): float(value)
+                for isotope, value in dict(z_variance_k).items()
+            },
             None
             if z_covariance_k is None
             else {
@@ -3909,6 +4244,73 @@ class RotatingShieldPFEstimator:
             line_mu_by_isotope=self.line_mu_by_isotope,
             transport_response_model=self.transport_response_model,
         )
+
+    def configured_isotope_order(self) -> tuple[str, ...]:
+        """Return the stable configured isotope order, including inactive PFs."""
+        return tuple(dict.fromkeys(str(isotope) for isotope in self.all_isotopes))
+
+    def configured_isotope_response_kernel(self, isotope: str) -> ContinuousKernel:
+        """Return a shared physical response kernel without creating a PF filter."""
+        isotope_key = str(isotope)
+        configured = self.configured_isotope_order()
+        if isotope_key not in configured:
+            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
+        kernel = self._configured_response_kernel_registry.get(isotope_key)
+        if kernel is not None:
+            return kernel
+        shared_kernel = next(
+            iter(self._configured_response_kernel_registry.values()),
+            None,
+        )
+        if shared_kernel is None:
+            shared_kernel = self.continuous_kernel()
+        for configured_isotope in configured:
+            self._configured_response_kernel_registry.setdefault(
+                configured_isotope,
+                shared_kernel,
+            )
+        return self._configured_response_kernel_registry[isotope_key]
+
+    def configured_isotope_response_counts(
+        self,
+        isotope: str,
+        data: MeasurementData,
+        source_positions: NDArray[np.float64],
+        strengths: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return batched configured-isotope responses independent of PF state.
+
+        Measurement rows and source positions are evaluated by the same continuous
+        transport, obstacle, aperture, shield, and calibrated response-scale model
+        used by active PF filters.  Candidate positions remain batched; no particle
+        state or active-isotope gate is read.
+        """
+        positions = np.asarray(source_positions, dtype=float).reshape(-1, 3)
+        if strengths is None:
+            strength_values = np.ones(positions.shape[0], dtype=float)
+        else:
+            strength_values = np.asarray(strengths, dtype=float).reshape(-1)
+        if strength_values.size != positions.shape[0]:
+            raise ValueError("strengths must contain one value per source position.")
+        return self._cached_expected_counts_for_kernel(
+            kernel=self.configured_isotope_response_kernel(str(isotope)),
+            isotope=str(isotope),
+            data=data,
+            sources=positions,
+            strengths=strength_values,
+        )
+
+    def configured_isotope_measurement_history(
+        self,
+        isotope: str,
+        *,
+        window: int | None = None,
+    ) -> MeasurementData | None:
+        """Return count/geometry history for a configured, possibly inactive isotope."""
+        isotope_key = str(isotope)
+        if isotope_key not in self.configured_isotope_order():
+            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
+        return self._measurement_data_for_iso(isotope_key, window)
 
     def _continuous_kernel(self) -> ContinuousKernel:
         """Build a ContinuousKernel matching the estimator observation model."""
@@ -4619,7 +5021,11 @@ class RotatingShieldPFEstimator:
                 z_covariance_k,
             )
         )
-        sanitized_spectrum_payload = self._sanitize_spectrum_payload(spectrum_payload)
+        sanitized_spectrum_payload = (
+            self._complete_spectrum_payload_with_configured_responses(
+                self._sanitize_spectrum_payload(spectrum_payload)
+            )
+        )
         if self._defer_resample_birth:
             self.last_strength_prior_diagnostics = {}
         else:
@@ -4656,6 +5062,9 @@ class RotatingShieldPFEstimator:
                 **({} if pf_spectrum_payload is None else pf_spectrum_payload),
             )
         self._invalidate_report_cache()
+        measurement_index = len(self.measurements)
+        if not self._defer_resample_birth:
+            self._candidate_verification_station_start = measurement_index
         self.measurements.append(
             MeasurementRecord(
                 z_k={iso: float(v) for iso, v in z_k.items()},
@@ -4684,6 +5093,26 @@ class RotatingShieldPFEstimator:
                     if sanitized_spectrum_payload is None
                     else sanitized_spectrum_payload.get("spectrum_background")
                 ),
+                spectrum_background_source=(
+                    None
+                    if sanitized_spectrum_payload is None
+                    else str(
+                        sanitized_spectrum_payload.get(
+                            "spectrum_background_source",
+                            "unspecified",
+                        )
+                    )
+                ),
+                spectrum_background_observation_independent=(
+                    False
+                    if sanitized_spectrum_payload is None
+                    else bool(
+                        sanitized_spectrum_payload.get(
+                            "spectrum_background_observation_independent",
+                            False,
+                        )
+                    )
+                ),
                 spectrum_response_templates_by_isotope=(
                     None
                     if sanitized_spectrum_payload is None
@@ -4710,6 +5139,7 @@ class RotatingShieldPFEstimator:
         """Start a station-level update that delays only structural moves."""
         self._defer_resample_birth = True
         self._deferred_measurement_count = 0
+        self._candidate_verification_station_start = len(self.measurements)
 
     def finalize_deferred_pose_update(self) -> int:
         """
@@ -4787,6 +5217,9 @@ class RotatingShieldPFEstimator:
                 z_covariance_k,
                 spectrum_payload,
             ) = self._normalize_pair_sequence_record(record)
+            spectrum_payload = self._complete_spectrum_payload_with_configured_responses(
+                spectrum_payload
+            )
             effective_variance_k, sanitized_covariance_k = (
                 self._project_observation_covariance_to_variance(
                     z_k,
@@ -4982,6 +5415,26 @@ class RotatingShieldPFEstimator:
                         if spectrum_payload is None
                         else spectrum_payload.get("spectrum_background")
                     ),
+                    spectrum_background_source=(
+                        None
+                        if spectrum_payload is None
+                        else str(
+                            spectrum_payload.get(
+                                "spectrum_background_source",
+                                "unspecified",
+                            )
+                        )
+                    ),
+                    spectrum_background_observation_independent=(
+                        False
+                        if spectrum_payload is None
+                        else bool(
+                            spectrum_payload.get(
+                                "spectrum_background_observation_independent",
+                                False,
+                            )
+                        )
+                    ),
                     spectrum_response_templates_by_isotope=(
                         None
                         if spectrum_payload is None
@@ -4993,6 +5446,7 @@ class RotatingShieldPFEstimator:
             )
         stage_wall["append_measurements"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
+        self._candidate_verification_station_start = int(base_measurement_count)
         self.refresh_sparse_poisson_evidence()
         stage_wall["sparse_poisson_refresh"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
@@ -5135,6 +5589,7 @@ class RotatingShieldPFEstimator:
                 step_idx=len(self.measurements),
             )
         self._invalidate_report_cache()
+        self._candidate_verification_station_start = len(self.measurements)
         self.measurements.append(
             MeasurementRecord(
                 z_k={iso: float(v) for iso, v in z_k.items()},
@@ -5148,6 +5603,7 @@ class RotatingShieldPFEstimator:
                 else {iso: float(v) for iso, v in effective_variance_k.items()},
                 z_covariance_k=sanitized_covariance_k,
                 ig_value=None,
+                detector_position_xyz_m=tuple(float(value) for value in detector_pos),
             )
         )
         self.refresh_sparse_poisson_evidence()
@@ -5186,7 +5642,11 @@ class RotatingShieldPFEstimator:
                 variance_list.append(
                     max(float(rec.z_variance_k.get(isotope, 1.0)), 1.0)
                 )
-            poses.append(self.poses[rec.pose_idx])
+            poses.append(
+                self.poses[rec.pose_idx]
+                if rec.detector_position_xyz_m is None
+                else rec.detector_position_xyz_m
+            )
             live_times.append(float(rec.live_time_s))
             if rec.fe_index is not None and rec.pb_index is not None:
                 fe_indices.append(int(rec.fe_index))
@@ -5215,6 +5675,12 @@ class RotatingShieldPFEstimator:
             background_rate = float(filt.best_particle().state.background)
         elif filt is not None:
             level = filt.config.background_level
+            if isinstance(level, dict):
+                background_rate = float(level.get(isotope, 0.0))
+            else:
+                background_rate = float(level)
+        else:
+            level = self.pf_config.background_level
             if isinstance(level, dict):
                 background_rate = float(level.get(isotope, 0.0))
             else:
@@ -7008,27 +7474,102 @@ class RotatingShieldPFEstimator:
         self,
         required_isotopes: Sequence[str],
     ) -> dict[str, object] | None:
-        """Return aligned spectrum-bin histories and templates for evidence."""
-        required = tuple(str(isotope) for isotope in required_isotopes)
+        """Return aligned spectral history using configured response retention.
+
+        Exact per-record templates take precedence.  When an inactive isotope is
+        absent from a later payload, an explicitly registered response with the
+        same binning fills that row.  This keeps all-history final reconstruction
+        independent of active PF filters without changing spectrum or transport
+        semantics.
+        """
+        required = tuple(dict.fromkeys(str(isotope) for isotope in required_isotopes))
+        configured = set(self.configured_isotope_order())
+
+        def _clean_template(values: object, count_bins: int) -> tuple[float, ...] | None:
+            """Return one finite non-negative response with exact binning."""
+            try:
+                array = np.asarray(values, dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                return None
+            if array.size != int(count_bins):
+                return None
+            array = np.maximum(np.where(np.isfinite(array), array, 0.0), 0.0)
+            return tuple(float(value) for value in array)
+
+        response_registry = dict(self._configured_spectrum_response_registry)
+        for record in self.measurements:
+            if record.spectrum_counts is None:
+                continue
+            count_bins = len(record.spectrum_counts)
+            templates = record.spectrum_response_templates_by_isotope or {}
+            for isotope, values in templates.items():
+                isotope_key = str(isotope)
+                if isotope_key not in configured:
+                    continue
+                clean = _clean_template(values, count_bins)
+                if clean is not None:
+                    response_registry[(isotope_key, count_bins)] = clean
+
         selected_records: list[MeasurementRecord] = []
+        resolved_templates: list[dict[str, tuple[float, ...]]] = []
+        template_source_counts = {
+            isotope: {"record": 0, "configured_registry": 0}
+            for isotope in required
+        }
+        background_source_counts: dict[str, int] = {}
+        rejected_fitted_background_count = 0
         bin_count: int | None = None
         for record in self.measurements:
             if record.spectrum_counts is None:
                 continue
-            templates = record.spectrum_response_templates_by_isotope or {}
-            if any(isotope not in templates for isotope in required):
-                continue
             count_bins = len(record.spectrum_counts)
+            if bin_count is not None and count_bins != bin_count:
+                continue
+            if record.spectrum_background is not None and len(
+                record.spectrum_background
+            ) != count_bins:
+                continue
+            direct = record.spectrum_response_templates_by_isotope or {}
+            resolved: dict[str, tuple[float, ...]] = {}
+            direct_keys: set[str] = set()
+            for isotope, values in direct.items():
+                clean = _clean_template(values, count_bins)
+                if clean is None:
+                    continue
+                isotope_key = str(isotope)
+                resolved[isotope_key] = clean
+                direct_keys.add(isotope_key)
+            for isotope in self.configured_isotope_order():
+                if isotope in resolved:
+                    continue
+                registered = response_registry.get((isotope, count_bins))
+                if registered is not None:
+                    resolved[isotope] = registered
+            if any(isotope not in resolved for isotope in required):
+                continue
             if bin_count is None:
                 bin_count = count_bins
-            if count_bins != bin_count:
-                continue
-            if record.spectrum_background is not None:
-                if len(record.spectrum_background) != bin_count:
-                    continue
-            if not all(len(templates[isotope]) == bin_count for isotope in required):
-                continue
             selected_records.append(record)
+            resolved_templates.append(resolved)
+            if bool(
+                getattr(
+                    record,
+                    "spectrum_background_observation_independent",
+                    False,
+                )
+            ):
+                background_source = str(
+                    getattr(record, "spectrum_background_source", None)
+                    or "unspecified_independent"
+                )
+                background_source_counts[background_source] = (
+                    background_source_counts.get(background_source, 0) + 1
+                )
+            elif record.spectrum_background is not None:
+                rejected_fitted_background_count += 1
+            for isotope in required:
+                source = "record" if isotope in direct_keys else "configured_registry"
+                template_source_counts[isotope][source] += 1
         if not selected_records or bin_count is None:
             return None
         counts = np.asarray(
@@ -7038,29 +7579,28 @@ class RotatingShieldPFEstimator:
         backgrounds = np.asarray(
             [
                 record.spectrum_background
-                if record.spectrum_background is not None
+                if (
+                    record.spectrum_background is not None
+                    and bool(
+                        getattr(
+                            record,
+                            "spectrum_background_observation_independent",
+                            False,
+                        )
+                    )
+                )
                 else tuple(0.0 for _ in range(bin_count))
                 for record in selected_records
             ],
             dtype=float,
         )
-        template_keys = set(
-            selected_records[0].spectrum_response_templates_by_isotope or {}
-        )
-        for record in selected_records[1:]:
-            template_keys &= set(record.spectrum_response_templates_by_isotope or {})
+        template_keys = set(resolved_templates[0])
+        for templates in resolved_templates[1:]:
+            template_keys &= set(templates)
         templates_by_isotope: dict[str, NDArray[np.float64]] = {}
         for isotope in sorted(template_keys | set(required)):
-            rows = []
-            valid = True
-            for record in selected_records:
-                templates = record.spectrum_response_templates_by_isotope or {}
-                if isotope not in templates or len(templates[isotope]) != bin_count:
-                    valid = False
-                    break
-                rows.append(templates[isotope])
-            if valid:
-                templates_by_isotope[str(isotope)] = np.asarray(rows, dtype=float)
+            rows = [templates[isotope] for templates in resolved_templates]
+            templates_by_isotope[str(isotope)] = np.asarray(rows, dtype=float)
         if any(isotope not in templates_by_isotope for isotope in required):
             return None
         return {
@@ -7074,20 +7614,26 @@ class RotatingShieldPFEstimator:
                 0.0,
             ),
             "templates_by_isotope": templates_by_isotope,
+            "template_source_counts_by_isotope": template_source_counts,
+            "background_source_counts": background_source_counts,
+            "fixed_background_observation_independent": True,
+            "rejected_observation_fitted_background_count": int(
+                rejected_fitted_background_count
+            ),
         }
 
-    def _spectral_nuisance_matrix(
+    def _spectral_nuisance_basis(
         self,
         history: Mapping[str, object],
         *,
         target_isotope: str | None,
-    ) -> NDArray[np.float64] | None:
-        """Return low-dimensional spectrum nuisance columns for evidence."""
+    ) -> tuple[NDArray[np.float64] | None, list[Dict[str, Any]]]:
+        """Return spectral nuisance columns and aligned physical metadata."""
         if not bool(self.pf_config.sparse_poisson_spectral_nuisance_enable):
-            return None
+            return None, []
         counts = np.asarray(history.get("spectrum_counts"), dtype=float)
         if counts.ndim != 2 or counts.size == 0:
-            return None
+            return None, []
         records = list(history.get("records", []))
         live_times = np.asarray(
             [float(getattr(record, "live_time_s", 1.0)) for record in records],
@@ -7095,16 +7641,92 @@ class RotatingShieldPFEstimator:
         )
         if live_times.size != counts.shape[0]:
             live_times = np.ones(counts.shape[0], dtype=float)
-        columns: list[NDArray[np.float64]] = []
+        matrix_blocks: list[NDArray[np.float64]] = []
+        column_metadata: list[Dict[str, Any]] = []
         background = np.asarray(history.get("background_spectrum"), dtype=float)
-        if background.shape == counts.shape and float(np.sum(background)) > 0.0:
-            columns.append(background.reshape(-1))
-        else:
-            flat = np.broadcast_to(
-                live_times[:, None] / max(int(counts.shape[1]), 1),
-                counts.shape,
+        pose_indices = np.asarray(
+            [int(getattr(record, "pose_idx", index)) for index, record in enumerate(records)],
+            dtype=np.int64,
+        )
+        if pose_indices.size != counts.shape[0]:
+            pose_indices = np.arange(counts.shape[0], dtype=np.int64)
+        visit_starts = np.ones(counts.shape[0], dtype=bool)
+        if counts.shape[0] > 1:
+            visit_starts[1:] = pose_indices[1:] != pose_indices[:-1]
+        visit_ids = np.cumsum(visit_starts, dtype=np.int64) - 1
+        visit_count = int(visit_ids[-1]) + 1
+        visit_indicator = (
+            visit_ids[:, None] == np.arange(visit_count, dtype=np.int64)[None, :]
+        ).astype(float)
+        if background.shape == counts.shape:
+            clean_background = np.maximum(
+                np.where(np.isfinite(background), background, 0.0),
+                0.0,
             )
-            columns.append(flat.reshape(-1))
+        else:
+            clean_background = np.zeros_like(counts, dtype=float)
+        configured_rows = np.sum(clean_background, axis=1) > 0.0
+        configured_basis = (
+            clean_background[:, :, None]
+            * visit_indicator[:, None, :]
+        ).reshape(counts.size, visit_count)
+        matrix_blocks.append(configured_basis)
+        column_metadata.extend(
+            {
+                "name": f"station_{visit_id}_configured_background_excess_scale",
+                "kind": "station_configured_background_spectrum",
+                "station_visit_id": int(visit_id),
+                "coefficient_unit": "dimensionless",
+                "column_unit": "counts",
+                "normalization": "independent_configured_background_counts",
+                "baseline_included_separately": True,
+                "nonnegative_coefficient": True,
+            }
+            for visit_id in range(visit_count)
+        )
+        group_widths = np.asarray(
+            history.get("spectrum_bin_group_widths", []),
+            dtype=float,
+        ).reshape(-1)
+        original_bin_count = int(
+            history.get("spectrum_original_bin_count", counts.shape[1])
+        )
+        if (
+            group_widths.size == counts.shape[1]
+            and original_bin_count > 0
+            and np.all(group_widths > 0.0)
+            and np.isclose(float(np.sum(group_widths)), original_bin_count)
+        ):
+            bin_weights = group_widths / float(original_bin_count)
+        else:
+            bin_weights = np.full(
+                counts.shape[1],
+                1.0 / max(int(counts.shape[1]), 1),
+                dtype=float,
+            )
+        unknown_row_basis = (
+            live_times[:, None]
+            * bin_weights[None, :]
+            * (~configured_rows)[:, None]
+        )
+        unknown_basis = (
+            unknown_row_basis[:, :, None]
+            * visit_indicator[:, None, :]
+        ).reshape(counts.size, visit_count)
+        matrix_blocks.append(unknown_basis)
+        column_metadata.extend(
+            {
+                "name": f"station_{visit_id}_flat_background_count_rate",
+                "kind": "station_flat_spectrum_background",
+                "station_visit_id": int(visit_id),
+                "coefficient_unit": "counts_per_second",
+                "column_unit": "seconds_per_bin",
+                "normalization": "unit_integral_across_spectrum_bins",
+                "baseline_included_separately": False,
+                "nonnegative_coefficient": True,
+            }
+            for visit_id in range(visit_count)
+        )
         templates = history.get("templates_by_isotope", {})
         if target_isotope is not None and isinstance(templates, Mapping):
             target = str(target_isotope)
@@ -7119,22 +7741,58 @@ class RotatingShieldPFEstimator:
                     0.0,
                 )
                 if float(np.sum(column)) > 0.0:
-                    columns.append(column.reshape(-1))
-        active_columns = [
-            np.maximum(np.where(np.isfinite(column), column, 0.0), 0.0)
-            for column in columns
-            if column.size == counts.size and float(np.sum(column)) > 0.0
+                    matrix_blocks.append(column.reshape(-1, 1))
+                    column_metadata.append(
+                        {
+                            "name": f"{isotope}_template_crosstalk_rate",
+                            "kind": "isotope_template_crosstalk",
+                            "isotope": str(isotope),
+                            "coefficient_unit": "counts_per_second",
+                            "column_unit": "seconds_times_template_weight",
+                            "normalization": "as_recorded_response_template",
+                            "baseline_included_separately": False,
+                            "nonnegative_coefficient": True,
+                        }
+                    )
+        if not matrix_blocks:
+            return None, []
+        matrix = np.concatenate(matrix_blocks, axis=1)
+        matrix = np.maximum(np.where(np.isfinite(matrix), matrix, 0.0), 0.0)
+        active_mask = np.sum(matrix, axis=0) > 0.0
+        if not np.any(active_mask):
+            return None, []
+        active_indices = np.flatnonzero(active_mask)
+        active_metadata = [
+            {"index": output_index, **column_metadata[int(source_index)]}
+            for output_index, source_index in enumerate(active_indices)
         ]
-        if not active_columns:
-            return None
-        return np.column_stack(active_columns)
+        return matrix[:, active_mask], active_metadata
 
-    def _spectral_response_tensor_for_isotopes(
+    def _spectral_nuisance_matrix(
+        self,
+        history: Mapping[str, object],
+        *,
+        target_isotope: str | None,
+    ) -> NDArray[np.float64] | None:
+        """Return low-dimensional spectrum nuisance columns for evidence."""
+        matrix, _ = self._spectral_nuisance_basis(
+            history,
+            target_isotope=target_isotope,
+        )
+        return matrix
+
+    def _spectral_response_tensor_at_positions(
         self,
         history: Mapping[str, object],
         isotope_names: Sequence[str],
+        source_positions: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], dict[str, MeasurementData]]:
-        """Return MxBxCxI spectrum response tensor and isotope data arrays."""
+        """Return a batched MxBxCxI response from configured shared kernels.
+
+        The configured isotope loop is deliberately small; measurements, spectrum
+        bins, and candidate positions remain vectorized.  No active-filter or PF
+        particle state is read.
+        """
         counts = np.asarray(history.get("spectrum_counts"), dtype=float)
         if counts.ndim != 2:
             raise ValueError("spectrum_counts history must be measurements x bins.")
@@ -7142,7 +7800,7 @@ class RotatingShieldPFEstimator:
         templates = history.get("templates_by_isotope", {})
         if not isinstance(templates, Mapping):
             raise ValueError("spectrum template history is missing.")
-        candidate_pool = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
+        candidate_pool = np.asarray(source_positions, dtype=float).reshape(-1, 3)
         isotope_tuple = tuple(str(isotope) for isotope in isotope_names)
         tensor = np.zeros(
             (
@@ -7155,8 +7813,7 @@ class RotatingShieldPFEstimator:
         )
         data_by_isotope: dict[str, MeasurementData] = {}
         for isotope_index, isotope in enumerate(isotope_tuple):
-            filt = self.filters.get(isotope)
-            if filt is None:
+            if isotope not in self.configured_isotope_order():
                 continue
             data = self._measurement_data_for_iso(
                 isotope,
@@ -7168,10 +7825,11 @@ class RotatingShieldPFEstimator:
             template = np.asarray(templates[str(isotope)], dtype=float)
             if template.shape != counts.shape:
                 continue
-            design = self._cached_candidate_grid_counts(
-                filt=filt,
+            design = self.configured_isotope_response_counts(
                 isotope=isotope,
                 data=data,
+                source_positions=candidate_pool,
+                strengths=np.ones(candidate_pool.shape[0], dtype=float),
             )
             tensor[:, :, :, isotope_index] = (
                 np.maximum(np.asarray(design, dtype=float), 0.0)[:, None, :]
@@ -7181,6 +7839,19 @@ class RotatingShieldPFEstimator:
             )
             data_by_isotope[isotope] = data
         return tensor, data_by_isotope
+
+    def _spectral_response_tensor_for_isotopes(
+        self,
+        history: Mapping[str, object],
+        isotope_names: Sequence[str],
+    ) -> tuple[NDArray[np.float64], dict[str, MeasurementData]]:
+        """Return the legacy candidate-grid spectrum response tensor."""
+        candidate_pool = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
+        return self._spectral_response_tensor_at_positions(
+            history,
+            isotope_names,
+            candidate_pool,
+        )
 
     def _sparse_offgrid_bounds(
         self,
@@ -7222,7 +7893,10 @@ class RotatingShieldPFEstimator:
         ).reshape(-1, 3)
         if selected_positions.size == 0:
             return None
-        if max(float(self.pf_config.sparse_poisson_offgrid_refine_radius_m), 0.0) <= 0.0:
+        if (
+            max(float(self.pf_config.sparse_poisson_offgrid_refine_radius_m), 0.0)
+            <= 0.0
+        ):
             return None
         refined = refine_sparse_poisson_evidence_offgrid(
             np.maximum(np.asarray(counts, dtype=float).reshape(-1), 0.0),
@@ -7285,7 +7959,10 @@ class RotatingShieldPFEstimator:
         background: NDArray[np.float64],
     ) -> dict[str, Any] | None:
         """Return count-level off-grid sparse evidence refinement diagnostics."""
-        def _response_at_positions(positions: NDArray[np.float64]) -> NDArray[np.float64]:
+
+        def _response_at_positions(
+            positions: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
             """Evaluate all selected source positions as one batched response matrix."""
             pos = filt._project_positions_to_source_prior(
                 np.asarray(positions, dtype=float).reshape(-1, 3)
@@ -7349,7 +8026,9 @@ class RotatingShieldPFEstimator:
                 target_isotope=str(isotope),
             )
 
-        def _response_at_positions(positions: NDArray[np.float64]) -> NDArray[np.float64]:
+        def _response_at_positions(
+            positions: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
             """Evaluate selected positions as a flattened spectrum-bin response."""
             pos = filt._project_positions_to_source_prior(
                 np.asarray(positions, dtype=float).reshape(-1, 3)
@@ -7399,7 +8078,10 @@ class RotatingShieldPFEstimator:
         """Return joint multi-isotope off-grid refinement diagnostics."""
         if not bool(self.pf_config.sparse_poisson_offgrid_refine_enable):
             return None
-        if max(float(self.pf_config.sparse_poisson_offgrid_refine_radius_m), 0.0) <= 0.0:
+        if (
+            max(float(self.pf_config.sparse_poisson_offgrid_refine_radius_m), 0.0)
+            <= 0.0
+        ):
             return None
         counts = np.asarray(history.get("spectrum_counts"), dtype=float)
         if counts.ndim != 2 or counts.size == 0:
@@ -7426,7 +8108,9 @@ class RotatingShieldPFEstimator:
         label_arr = np.asarray(labels, dtype=object)
         nuisance = self._spectral_nuisance_matrix(history, target_isotope=None)
 
-        def _response_at_positions(positions: NDArray[np.float64]) -> NDArray[np.float64]:
+        def _response_at_positions(
+            positions: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
             """
             Evaluate joint source slots as one flattened spectrum response matrix.
 
@@ -7480,7 +8164,9 @@ class RotatingShieldPFEstimator:
             nuisance_response_matrix=nuisance,
             bounds=self._sparse_offgrid_bounds(initial_positions),
             config=self._sparse_poisson_evidence_config(
-                nuisance_parameter_count=0 if nuisance is None else int(nuisance.shape[1])
+                nuisance_parameter_count=0
+                if nuisance is None
+                else int(nuisance.shape[1])
             ),
             max_iter=int(self.pf_config.sparse_poisson_offgrid_refine_max_iter),
         )
@@ -7711,8 +8397,7 @@ class RotatingShieldPFEstimator:
             counts.reshape(-1),
             response_by_isotope,
             max_sources_by_isotope={
-                isotope: self._report_max_sources_per_isotope()
-                for isotope in isotopes
+                isotope: self._report_max_sources_per_isotope() for isotope in isotopes
             },
             background=np.asarray(history["background_spectrum"], dtype=float).reshape(
                 -1
@@ -7816,9 +8501,8 @@ class RotatingShieldPFEstimator:
             if not isinstance(current, dict):
                 continue
             current["joint_multi_isotope_evidence"] = copy.deepcopy(payload)
-            if (
-                bool(payload.get("available", False))
-                and bool(self.pf_config.sparse_poisson_evidence_authoritative)
+            if bool(payload.get("available", False)) and bool(
+                self.pf_config.sparse_poisson_evidence_authoritative
             ):
                 original = copy.deepcopy(current)
                 current["single_isotope_sparse_poisson_evidence"] = original
@@ -7863,7 +8547,9 @@ class RotatingShieldPFEstimator:
         if not bool(self.pf_config.sparse_poisson_evidence_enable):
             self._last_sparse_poisson_evidence_diagnostics.clear()
             self._last_joint_sparse_poisson_evidence_diagnostics = {}
-            self.last_sparse_poisson_refresh_wall_s = time.perf_counter() - refresh_start
+            self.last_sparse_poisson_refresh_wall_s = (
+                time.perf_counter() - refresh_start
+            )
             self.last_sparse_poisson_refresh_stage_wall_s = {
                 "disabled": float(self.last_sparse_poisson_refresh_wall_s),
             }
@@ -7871,7 +8557,9 @@ class RotatingShieldPFEstimator:
         if not self.filters:
             self._last_sparse_poisson_evidence_diagnostics.clear()
             self._last_joint_sparse_poisson_evidence_diagnostics = {}
-            self.last_sparse_poisson_refresh_wall_s = time.perf_counter() - refresh_start
+            self.last_sparse_poisson_refresh_wall_s = (
+                time.perf_counter() - refresh_start
+            )
             self.last_sparse_poisson_refresh_stage_wall_s = {
                 "no_filters": float(self.last_sparse_poisson_refresh_wall_s),
             }
@@ -8055,7 +8743,9 @@ class RotatingShieldPFEstimator:
             if not np.isfinite(runner_up_margin) or runner_up_margin < zero_margin:
                 return False
         if selected_count > 1:
-            condition_limit = float(self.pf_config.sparse_poisson_evidence_condition_max)
+            condition_limit = float(
+                self.pf_config.sparse_poisson_evidence_condition_max
+            )
             condition = float(payload.get("condition_number", 0.0))
             if condition_limit > 0.0 and np.isfinite(condition):
                 if condition > condition_limit:
@@ -8063,9 +8753,7 @@ class RotatingShieldPFEstimator:
             corr_limit = float(
                 self.pf_config.sparse_poisson_evidence_max_response_correlation
             )
-            response_corr = float(
-                payload.get("selected_max_response_correlation", 0.0)
-            )
+            response_corr = float(payload.get("selected_max_response_correlation", 0.0))
             if corr_limit > 0.0 and np.isfinite(response_corr):
                 if response_corr > corr_limit:
                     return False
@@ -8077,6 +8765,10 @@ class RotatingShieldPFEstimator:
         payload: Mapping[str, Any],
     ) -> int:
         """Drop queued rescue candidates contradicted by decisive sparse evidence."""
+        if bool(self.pf_config.candidate_verification_independent_evidence_enable):
+            # In independent-verification mode, sparse evidence proposes candidates;
+            # only post-proposal station attempts may promote or reject them.
+            return 0
         if not (
             bool(self.pf_config.sparse_poisson_evidence_authoritative)
             or bool(self.pf_config.runtime_report_rescue_verification_queue_only)
@@ -8095,7 +8787,9 @@ class RotatingShieldPFEstimator:
         score_arr = np.asarray(mem_score, dtype=float).reshape(-1)
         if pos_arr.size == 0:
             self._candidate_verification_queue.pop(str(isotope), None)
+            self._candidate_verification_provenance.pop(str(isotope), None)
             return 0
+        provenance = self._candidate_verification_provenance.get(str(isotope))
         selected_positions = np.asarray(
             payload.get("selected_positions", []),
             dtype=float,
@@ -8103,6 +8797,7 @@ class RotatingShieldPFEstimator:
         if selected_positions.size == 0:
             removed = int(pos_arr.shape[0])
             self._candidate_verification_queue.pop(str(isotope), None)
+            self._candidate_verification_provenance.pop(str(isotope), None)
             return removed
         radius = max(float(self.pf_config.report_mle_rescue_dedup_radius_m), 0.0)
         if radius <= 0.0:
@@ -8117,12 +8812,17 @@ class RotatingShieldPFEstimator:
             return 0
         if not np.any(keep):
             self._candidate_verification_queue.pop(str(isotope), None)
+            self._candidate_verification_provenance.pop(str(isotope), None)
             return removed
         self._candidate_verification_queue[str(isotope)] = (
             pos_arr[keep].copy(),
             q_arr[keep].copy(),
             score_arr[keep].copy(),
         )
+        if provenance is not None and provenance.size == pos_arr.shape[0]:
+            self._candidate_verification_provenance[str(isotope)] = provenance.subset(
+                keep
+            )
         return removed
 
     def _merge_sparse_poisson_diagnostics(
@@ -8245,9 +8945,8 @@ class RotatingShieldPFEstimator:
         stage_wall["spectral_sparse_fit"] = time.perf_counter() - stage_start
         if spectral_payload is not None:
             count_payload = copy.deepcopy(payload)
-            if (
-                bool(self.pf_config.sparse_poisson_spectral_evidence_primary)
-                and bool(spectral_payload.get("available", False))
+            if bool(self.pf_config.sparse_poisson_spectral_evidence_primary) and bool(
+                spectral_payload.get("available", False)
             ):
                 spectral_payload["count_sparse_poisson_evidence"] = count_payload
                 payload = spectral_payload
@@ -8399,7 +9098,9 @@ class RotatingShieldPFEstimator:
             selected_count = int(payload.get("selected_count", 0))
         except (TypeError, ValueError):
             return None
-        positions = np.asarray(payload.get("selected_positions", []), dtype=float).reshape(
+        positions = np.asarray(
+            payload.get("selected_positions", []), dtype=float
+        ).reshape(
             -1,
             3,
         )
@@ -10124,6 +10825,537 @@ class RotatingShieldPFEstimator:
             ),
         )
 
+    def _candidate_verification_station_context(self) -> dict[str, Any]:
+        """Return detector and shield metadata for the current station."""
+        end = int(len(self.measurements))
+        start_value = self._candidate_verification_station_start
+        if start_value is None or int(start_value) < 0 or int(start_value) >= end:
+            start = max(0, end - 1)
+        else:
+            start = int(start_value)
+        records = list(self.measurements[start:end])
+        detector_positions = [
+            np.asarray(
+                self.poses[record.pose_idx]
+                if record.detector_position_xyz_m is None
+                else record.detector_position_xyz_m,
+                dtype=float,
+            ).reshape(3)
+            for record in records
+            if record.detector_position_xyz_m is not None
+            or 0 <= int(record.pose_idx) < len(self.poses)
+        ]
+        detector_position = (
+            np.asarray(detector_positions[-1], dtype=float)
+            if detector_positions
+            else np.full(3, np.nan, dtype=float)
+        )
+        fe_program = tuple(
+            sorted(
+                {
+                    int(
+                        record.orient_idx
+                        if record.fe_index is None
+                        else record.fe_index
+                    )
+                    for record in records
+                }
+            )
+        )
+        pb_program = tuple(
+            sorted(
+                {
+                    int(
+                        record.orient_idx
+                        if record.pb_index is None
+                        else record.pb_index
+                    )
+                    for record in records
+                }
+            )
+        )
+        shield_program = tuple(
+            sorted(
+                {
+                    (
+                        int(
+                            record.orient_idx
+                            if record.fe_index is None
+                            else record.fe_index
+                        ),
+                        int(
+                            record.orient_idx
+                            if record.pb_index is None
+                            else record.pb_index
+                        ),
+                    )
+                    for record in records
+                }
+            )
+        )
+        num_orientations = max(1, int(self.num_orientations))
+        program_mask = np.zeros(num_orientations * num_orientations, dtype=bool)
+        if shield_program:
+            pairs = np.asarray(shield_program, dtype=int).reshape(-1, 2)
+            valid = (
+                (pairs[:, 0] >= 0)
+                & (pairs[:, 0] < num_orientations)
+                & (pairs[:, 1] >= 0)
+                & (pairs[:, 1] < num_orientations)
+            )
+            codes = pairs[valid, 0] * num_orientations + pairs[valid, 1]
+            program_mask[codes] = True
+        return {
+            "start": start,
+            "end": end,
+            "records": records,
+            "detector_position": detector_position,
+            "fe_program": fe_program,
+            "pb_program": pb_program,
+            "shield_program": shield_program,
+            "shield_program_mask": program_mask,
+        }
+
+    def _new_candidate_verification_provenance(
+        self,
+        candidate_count: int,
+    ) -> CandidateVerificationProvenance:
+        """Create proposal provenance for candidates from the current station."""
+        count = max(0, int(candidate_count))
+        context = self._candidate_verification_station_context()
+        cutoff = int(context["end"])
+        position = np.asarray(context["detector_position"], dtype=float).reshape(3)
+        program_mask = np.asarray(
+            context["shield_program_mask"],
+            dtype=bool,
+        ).reshape(1, -1)
+        fe_program = tuple(int(value) for value in context["fe_program"])
+        pb_program = tuple(int(value) for value in context["pb_program"])
+        shield_program = tuple(
+            (int(pair[0]), int(pair[1])) for pair in context["shield_program"]
+        )
+        return CandidateVerificationProvenance(
+            proposal_measurement_cutoffs=np.full(count, cutoff, dtype=np.int64),
+            origin_positions_xyz_m=np.repeat(position[None, :], count, axis=0),
+            origin_fe_programs=tuple(fe_program for _ in range(count)),
+            origin_pb_programs=tuple(pb_program for _ in range(count)),
+            origin_shield_programs=tuple(shield_program for _ in range(count)),
+            origin_shield_program_masks=np.repeat(program_mask, count, axis=0),
+            positive_attempts=np.zeros(count, dtype=np.int64),
+            negative_attempts=np.zeros(count, dtype=np.int64),
+            last_evaluated_measurement_counts=np.full(
+                count,
+                cutoff,
+                dtype=np.int64,
+            ),
+        )
+
+    def _candidate_verification_memory_provenance(
+        self,
+        isotope: str,
+        candidate_count: int,
+    ) -> CandidateVerificationProvenance:
+        """Return aligned provenance, synthesizing it for legacy tuple queues."""
+        provenance = self._candidate_verification_provenance.get(str(isotope))
+        if provenance is not None and provenance.size == int(candidate_count):
+            return provenance
+        synthesized = self._new_candidate_verification_provenance(candidate_count)
+        self._candidate_verification_provenance[str(isotope)] = synthesized
+        return synthesized
+
+    @staticmethod
+    def _profile_candidate_deviance_scores_batch(
+        filt: IsotopeParticleFilter,
+        observed_counts: NDArray[np.float64],
+        baseline_counts: NDArray[np.float64],
+        candidate_unit_counts: NDArray[np.float64],
+        row_mask: NDArray[np.bool_],
+        observation_variances: NDArray[np.float64],
+        *,
+        l2: float,
+        max_iters: int,
+        q_max: float,
+        eps: float = 1.0e-12,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Profile candidates with the configured robust count likelihood.
+
+        Candidate columns and all likelihood evaluations are vectorized.  The
+        bounded one-dimensional search only loops over a fixed number of solver
+        iterations, never over candidates or measurement rows.
+        """
+        floor = max(float(eps), 1.0e-12)
+        observed_raw = np.asarray(observed_counts, dtype=float).reshape(-1)
+        baseline_raw = np.asarray(baseline_counts, dtype=float).reshape(-1)
+        variances_raw = np.asarray(observation_variances, dtype=float).reshape(-1)
+        design_raw = np.asarray(candidate_unit_counts, dtype=float)
+        active = np.asarray(row_mask, dtype=bool)
+        if design_raw.ndim != 2 or design_raw.shape[0] != observed_raw.size:
+            raise ValueError("candidate_unit_counts must have shape (K, C).")
+        if baseline_raw.size != observed_raw.size:
+            raise ValueError("baseline_counts must have one value per row.")
+        if variances_raw.size != observed_raw.size:
+            raise ValueError("observation_variances must have one value per row.")
+        if active.shape != design_raw.shape:
+            raise ValueError("row_mask must match candidate_unit_counts.")
+        candidate_count = int(design_raw.shape[1])
+        if candidate_count == 0:
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+
+        finite_rows = (
+            np.isfinite(observed_raw)
+            & np.isfinite(baseline_raw)
+            & np.isfinite(variances_raw)
+        )
+        observed = np.where(finite_rows, np.maximum(observed_raw, 0.0), 0.0)
+        baseline = np.where(
+            finite_rows,
+            np.maximum(baseline_raw, floor),
+            floor,
+        )
+        variances = np.where(
+            finite_rows,
+            np.maximum(variances_raw, 0.0),
+            0.0,
+        )
+        active &= finite_rows[:, None] & np.isfinite(design_raw)
+        design = np.where(active, np.maximum(design_raw, 0.0), 0.0)
+        active &= design > floor
+        design = np.where(active, design, 0.0)
+        has_rows = np.any(active, axis=0)
+        regularization = max(float(l2), 0.0)
+
+        inverse_variance = 1.0 / np.maximum(variances[:, None], 1.0)
+        numerator = np.sum(
+            design * (observed[:, None] - baseline[:, None]) * inverse_variance,
+            axis=0,
+        )
+        denominator = (
+            np.sum(design * design * inverse_variance, axis=0) + regularization
+        )
+        initial = np.maximum(
+            numerator / np.maximum(denominator, floor),
+            0.0,
+        )
+        configured_max = float(q_max)
+        if np.isfinite(configured_max) and configured_max > 0.0:
+            upper = np.full(candidate_count, configured_max, dtype=float)
+        else:
+            residual = np.maximum(observed[:, None] - baseline[:, None], 0.0)
+            response_ratios = np.divide(
+                residual,
+                design,
+                out=np.zeros_like(design),
+                where=design > floor,
+            )
+            upper = np.maximum(
+                2.0 * np.max(response_ratios, axis=0),
+                2.0 * initial,
+            )
+            upper = np.maximum(upper, 1.0)
+        initial = np.minimum(initial, upper)
+
+        def _penalized_objective(
+            candidate_strengths: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
+            """Return batched penalized log likelihoods for G x C strengths."""
+            strength_grid = np.asarray(candidate_strengths, dtype=float)
+            if strength_grid.ndim == 1:
+                strength_grid = strength_grid[None, :]
+            if strength_grid.ndim != 2 or strength_grid.shape[1] != candidate_count:
+                raise ValueError("candidate strength grid must have shape (G, C).")
+            fitted = np.maximum(
+                baseline[:, None, None]
+                + design[:, None, :] * strength_grid[None, :, :],
+                floor,
+            )
+            grid_count = int(strength_grid.shape[0])
+            log_likelihood = filt._count_log_likelihood_matrix_np(
+                observed,
+                fitted.reshape(observed.size, grid_count * candidate_count),
+                observation_count_variance=variances,
+            ).reshape(grid_count, candidate_count)
+            return log_likelihood - 0.5 * regularization * strength_grid**2
+
+        lower = np.zeros(candidate_count, dtype=float)
+        golden_ratio = (np.sqrt(5.0) - 1.0) / 2.0
+        left = upper - golden_ratio * (upper - lower)
+        right = lower + golden_ratio * (upper - lower)
+        left_score = _penalized_objective(left)[0]
+        right_score = _penalized_objective(right)[0]
+        for _ in range(max(1, int(max_iters))):
+            keep_left = left_score >= right_score
+            lower = np.where(keep_left, lower, left)
+            upper = np.where(keep_left, right, upper)
+            left = upper - golden_ratio * (upper - lower)
+            right = lower + golden_ratio * (upper - lower)
+            left_score = _penalized_objective(left)[0]
+            right_score = _penalized_objective(right)[0]
+
+        midpoint = 0.5 * (lower + upper)
+        strength_options = np.vstack(
+            [
+                np.zeros(candidate_count, dtype=float),
+                initial,
+                lower,
+                left,
+                midpoint,
+                right,
+                upper,
+            ]
+        )
+        option_scores = _penalized_objective(strength_options)
+        best_indices = np.argmax(option_scores, axis=0)
+        columns = np.arange(candidate_count, dtype=int)
+        strengths = strength_options[best_indices, columns]
+        best_scores = option_scores[best_indices, columns]
+        baseline_scores = option_scores[0]
+        improvements = 2.0 * (best_scores - baseline_scores)
+        finite_results = has_rows & np.isfinite(strengths) & np.isfinite(improvements)
+        return (
+            np.where(finite_results, strengths, 0.0),
+            np.where(finite_results, np.maximum(improvements, 0.0), 0.0),
+        )
+
+    def _candidate_verification_baseline_counts(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+        data: MeasurementData,
+    ) -> NDArray[np.float64]:
+        """Return current-state expected counts for verification rows."""
+        live_times = np.asarray(data.live_times, dtype=float).reshape(-1)
+        if not filt.continuous_particles:
+            return np.maximum(
+                self._background_counts_for_report_refit(isotope, live_times),
+                1.0e-12,
+            )
+        state = filt.state_without_quarantined_sources(filt.best_particle().state)
+        baseline = np.maximum(float(state.background), 0.0) * live_times
+        if state.num_sources > 0:
+            source_counts = self._cached_expected_counts_per_source(
+                filt=filt,
+                isotope=isotope,
+                data=data,
+                sources=np.asarray(state.positions, dtype=float).reshape(-1, 3),
+                strengths=np.maximum(
+                    np.asarray(state.strengths, dtype=float).reshape(-1),
+                    0.0,
+                ),
+            )
+            baseline = baseline + np.sum(
+                np.asarray(source_counts, dtype=float),
+                axis=1,
+            )
+        return np.maximum(np.asarray(baseline, dtype=float), 1.0e-12)
+
+    def _evaluate_candidate_verification_queue(
+        self,
+        isotope: str,
+        filt: IsotopeParticleFilter,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], int]:
+        """Promote or reject queued candidates using an independent station."""
+        empty_positions = np.zeros((0, 3), dtype=float)
+        empty_strengths = np.zeros(0, dtype=float)
+        self._last_candidate_verification_rejected_positions.pop(
+            str(isotope),
+            None,
+        )
+        if not bool(self.pf_config.candidate_verification_independent_evidence_enable):
+            return empty_positions, empty_strengths, 0
+        memory = self._candidate_verification_queue.get(str(isotope))
+        if memory is None:
+            return empty_positions, empty_strengths, 0
+        positions, strengths, scores = memory
+        positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+        strengths = np.maximum(np.asarray(strengths, dtype=float).reshape(-1), 0.0)
+        scores = np.maximum(np.asarray(scores, dtype=float).reshape(-1), 0.0)
+        if positions.shape[0] == 0:
+            return empty_positions, empty_strengths, 0
+        provenance = self._candidate_verification_memory_provenance(
+            str(isotope),
+            positions.shape[0],
+        )
+        context = self._candidate_verification_station_context()
+        records = context["records"]
+        station_end = int(context["end"])
+        if not records or station_end <= 0:
+            return empty_positions, empty_strengths, 0
+
+        current_position = np.asarray(
+            context["detector_position"],
+            dtype=float,
+        ).reshape(3)
+        origin_positions = np.asarray(
+            provenance.origin_positions_xyz_m,
+            dtype=float,
+        ).reshape(-1, 3)
+        finite_origins = np.all(np.isfinite(origin_positions), axis=1)
+        xy_independent = finite_origins & (
+            np.linalg.norm(
+                origin_positions[:, :2] - current_position[None, :2],
+                axis=1,
+            )
+            >= float(self.pf_config.candidate_verification_min_xy_separation_m)
+        )
+        if not bool(self.pf_config.candidate_verification_require_independent_xy):
+            xy_independent = np.ones(positions.shape[0], dtype=bool)
+        height_independent = finite_origins & (
+            np.abs(origin_positions[:, 2] - float(current_position[2]))
+            >= float(self.pf_config.candidate_verification_min_height_separation_m)
+        )
+        if not bool(self.pf_config.candidate_verification_require_distinct_height):
+            height_independent = np.ones(positions.shape[0], dtype=bool)
+        current_program_mask = np.asarray(
+            context["shield_program_mask"],
+            dtype=bool,
+        ).reshape(1, -1)
+        program_independent = np.any(
+            np.asarray(provenance.origin_shield_program_masks, dtype=bool)
+            != current_program_mask,
+            axis=1,
+        )
+        if not bool(
+            self.pf_config.candidate_verification_require_distinct_shield_program
+        ):
+            program_independent = np.ones(positions.shape[0], dtype=bool)
+        has_new_measurements = (
+            station_end
+            > np.asarray(provenance.proposal_measurement_cutoffs, dtype=np.int64)
+        ) & (
+            station_end
+            > np.asarray(
+                provenance.last_evaluated_measurement_counts,
+                dtype=np.int64,
+            )
+        )
+        eligible = (
+            has_new_measurements
+            & xy_independent
+            & height_independent
+            & program_independent
+        )
+        if not np.any(eligible):
+            self._last_candidate_verification_diagnostics[str(isotope)] = {
+                "candidate_count": int(positions.shape[0]),
+                "eligible_count": 0,
+                "promoted_count": 0,
+                "rejected_count": 0,
+            }
+            return empty_positions, empty_strengths, 0
+
+        data = self._measurement_data_for_iso(
+            str(isotope),
+            window=None,
+            records=records,
+        )
+        if data is None or data.z_k.size == 0:
+            return empty_positions, empty_strengths, 0
+        baseline = self._candidate_verification_baseline_counts(
+            str(isotope),
+            filt,
+            data,
+        )
+        unit_counts = self._cached_expected_counts_per_source(
+            filt=filt,
+            isotope=str(isotope),
+            data=data,
+            sources=positions,
+            strengths=np.ones(positions.shape[0], dtype=float),
+        )
+        global_rows = np.arange(
+            int(context["start"]),
+            station_end,
+            dtype=np.int64,
+        )
+        after_cutoff = (
+            global_rows[:, None]
+            >= np.asarray(
+                provenance.proposal_measurement_cutoffs,
+                dtype=np.int64,
+            )[None, :]
+        )
+        row_mask = after_cutoff & eligible[None, :]
+        fitted_strengths, deviance_improvements = (
+            self._profile_candidate_deviance_scores_batch(
+                filt,
+                np.asarray(data.z_k, dtype=float),
+                baseline,
+                np.asarray(unit_counts, dtype=float),
+                row_mask,
+                np.asarray(data.observation_variances, dtype=float),
+                l2=float(self.pf_config.candidate_verification_profile_l2),
+                max_iters=int(self.pf_config.candidate_verification_profile_max_iters),
+                q_max=float(filt.config.birth_q_max),
+            )
+        )
+        provenance.last_evaluated_measurement_counts[eligible] = station_end
+        positive = (
+            eligible
+            & (
+                deviance_improvements
+                >= float(self.pf_config.candidate_verification_min_deviance_improvement)
+            )
+            & (fitted_strengths > max(float(self.pf_config.min_strength), 0.0))
+        )
+        negative = (
+            eligible
+            & ~positive
+            & (
+                deviance_improvements
+                <= float(
+                    self.pf_config.candidate_verification_negative_deviance_threshold
+                )
+            )
+        )
+        provenance.positive_attempts[positive] += 1
+        provenance.negative_attempts[negative] += 1
+        promoted = provenance.positive_attempts >= int(
+            self.pf_config.candidate_verification_min_positive_checks
+        )
+        rejected = ~promoted & (
+            provenance.negative_attempts
+            >= int(self.pf_config.candidate_verification_reject_after_negatives)
+        )
+        promoted_strengths = np.where(
+            fitted_strengths[promoted] > max(float(self.pf_config.min_strength), 0.0),
+            fitted_strengths[promoted],
+            strengths[promoted],
+        )
+        promoted_positions = positions[promoted].copy()
+        rejected_positions = positions[rejected].copy()
+        if rejected_positions.size:
+            self._last_candidate_verification_rejected_positions[str(isotope)] = (
+                rejected_positions
+            )
+        self._last_candidate_verification_diagnostics[str(isotope)] = {
+            "candidate_count": int(positions.shape[0]),
+            "eligible_count": int(np.count_nonzero(eligible)),
+            "positive_count": int(np.count_nonzero(positive)),
+            "negative_count": int(np.count_nonzero(negative)),
+            "promoted_count": int(np.count_nonzero(promoted)),
+            "rejected_count": int(np.count_nonzero(rejected)),
+            "fitted_strengths": fitted_strengths.tolist(),
+            "deviance_improvements": deviance_improvements.tolist(),
+        }
+        keep = ~(promoted | rejected)
+        if np.any(keep):
+            self._candidate_verification_queue[str(isotope)] = (
+                positions[keep].copy(),
+                strengths[keep].copy(),
+                scores[keep].copy(),
+            )
+            self._candidate_verification_provenance[str(isotope)] = provenance.subset(
+                keep
+            )
+        else:
+            self._candidate_verification_queue.pop(str(isotope), None)
+            self._candidate_verification_provenance.pop(str(isotope), None)
+        return (
+            promoted_positions,
+            np.asarray(promoted_strengths, dtype=float),
+            int(np.count_nonzero(rejected)),
+        )
+
     def _candidate_verification_queue_should_track(
         self,
         isotope: str,
@@ -10152,6 +11384,7 @@ class RotatingShieldPFEstimator:
             q_arr = np.zeros(0, dtype=float)
         if not bool(self.pf_config.candidate_verification_queue_enable):
             self._candidate_verification_queue.pop(isotope, None)
+            self._candidate_verification_provenance.pop(isotope, None)
             return pos_arr, q_arr
 
         memory = self._candidate_verification_queue.get(isotope)
@@ -10160,12 +11393,17 @@ class RotatingShieldPFEstimator:
             mem_pos = np.zeros((0, 3), dtype=float)
             mem_q = np.zeros(0, dtype=float)
             mem_score = np.zeros(0, dtype=float)
+            mem_provenance = self._new_candidate_verification_provenance(0)
         else:
             mem_pos, mem_q, mem_score = memory
             mem_pos = np.asarray(mem_pos, dtype=float).reshape(-1, 3)
             mem_q = np.maximum(np.asarray(mem_q, dtype=float).reshape(-1), 0.0)
             mem_score = (
                 np.maximum(np.asarray(mem_score, dtype=float).reshape(-1), 0.0) * decay
+            )
+            mem_provenance = self._candidate_verification_memory_provenance(
+                isotope,
+                mem_pos.shape[0],
             )
         valid_mem = (
             np.isfinite(mem_pos).all(axis=1)
@@ -10177,6 +11415,7 @@ class RotatingShieldPFEstimator:
         mem_pos = mem_pos[valid_mem]
         mem_q = mem_q[valid_mem]
         mem_score = mem_score[valid_mem]
+        mem_provenance = mem_provenance.subset(valid_mem)
         valid_current = (
             np.isfinite(pos_arr).all(axis=1)
             & np.isfinite(q_arr)
@@ -10185,28 +11424,87 @@ class RotatingShieldPFEstimator:
         pos_arr = pos_arr[valid_current]
         q_arr = q_arr[valid_current]
         current_score = q_arr.copy()
+        current_provenance = self._new_candidate_verification_provenance(
+            pos_arr.shape[0]
+        )
+        radius = max(float(self.pf_config.report_mle_rescue_dedup_radius_m), 0.0)
+        if mem_pos.size and pos_arr.size and radius > 0.0:
+            distances = np.linalg.norm(
+                pos_arr[:, None, :] - mem_pos[None, :, :],
+                axis=2,
+            )
+            nearest_memory = np.argmin(distances, axis=1)
+            inherited = np.min(distances, axis=1) <= radius
+            if np.any(inherited):
+                current_indices = np.flatnonzero(inherited)
+                memory_indices = nearest_memory[inherited]
+                inherited_provenance = mem_provenance.subset(memory_indices)
+                current_provenance.proposal_measurement_cutoffs[current_indices] = (
+                    inherited_provenance.proposal_measurement_cutoffs
+                )
+                current_provenance.origin_positions_xyz_m[current_indices] = (
+                    inherited_provenance.origin_positions_xyz_m
+                )
+                current_provenance.origin_shield_program_masks[current_indices] = (
+                    inherited_provenance.origin_shield_program_masks
+                )
+                current_provenance.positive_attempts[current_indices] = (
+                    inherited_provenance.positive_attempts
+                )
+                current_provenance.negative_attempts[current_indices] = (
+                    inherited_provenance.negative_attempts
+                )
+                current_provenance.last_evaluated_measurement_counts[
+                    current_indices
+                ] = inherited_provenance.last_evaluated_measurement_counts
+                fe_programs = list(current_provenance.origin_fe_programs)
+                pb_programs = list(current_provenance.origin_pb_programs)
+                shield_programs = list(current_provenance.origin_shield_programs)
+                for output_index, inherited_index in zip(
+                    current_indices,
+                    range(inherited_provenance.size),
+                ):
+                    fe_programs[int(output_index)] = (
+                        inherited_provenance.origin_fe_programs[inherited_index]
+                    )
+                    pb_programs[int(output_index)] = (
+                        inherited_provenance.origin_pb_programs[inherited_index]
+                    )
+                    shield_programs[int(output_index)] = (
+                        inherited_provenance.origin_shield_programs[inherited_index]
+                    )
+                current_provenance.origin_fe_programs = tuple(fe_programs)
+                current_provenance.origin_pb_programs = tuple(pb_programs)
+                current_provenance.origin_shield_programs = tuple(shield_programs)
         if mem_pos.size and pos_arr.size:
             merged_pos = np.vstack([pos_arr, mem_pos])
             merged_q = np.concatenate([q_arr, mem_q])
             merged_score = np.concatenate([current_score, mem_score])
+            merged_provenance = CandidateVerificationProvenance.concatenate(
+                current_provenance,
+                mem_provenance,
+            )
         elif pos_arr.size:
             merged_pos = pos_arr
             merged_q = q_arr
             merged_score = current_score
+            merged_provenance = current_provenance
         elif mem_pos.size:
             merged_pos = mem_pos
             merged_q = mem_q
             merged_score = mem_score
+            merged_provenance = mem_provenance
         else:
             self._candidate_verification_queue.pop(isotope, None)
+            self._candidate_verification_provenance.pop(isotope, None)
             return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
 
         order = np.argsort(merged_score)[::-1]
-        radius = max(float(self.pf_config.report_mle_rescue_dedup_radius_m), 0.0)
         limit = self._candidate_verification_queue_limit()
         kept_pos: list[NDArray[np.float64]] = []
         kept_q: list[float] = []
         kept_score: list[float] = []
+        kept_indices: list[int] = []
         for idx in order:
             if len(kept_pos) >= limit:
                 break
@@ -10218,8 +11516,10 @@ class RotatingShieldPFEstimator:
             kept_pos.append(np.asarray(pos, dtype=float))
             kept_q.append(float(merged_q[int(idx)]))
             kept_score.append(float(merged_score[int(idx)]))
+            kept_indices.append(int(idx))
         if not kept_pos:
             self._candidate_verification_queue.pop(isotope, None)
+            self._candidate_verification_provenance.pop(isotope, None)
             return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
         final_pos = np.vstack(kept_pos)
         final_q = np.asarray(kept_q, dtype=float)
@@ -10228,6 +11528,9 @@ class RotatingShieldPFEstimator:
             final_pos.copy(),
             final_q.copy(),
             final_score.copy(),
+        )
+        self._candidate_verification_provenance[isotope] = merged_provenance.subset(
+            np.asarray(kept_indices, dtype=np.int64)
         )
         return final_pos, final_q
 
@@ -10498,6 +11801,79 @@ class RotatingShieldPFEstimator:
             positions,
             strengths,
         )
+        if bool(self.pf_config.runtime_report_rescue_verification_queue_only):
+            promoted_positions, promoted_strengths, _rejected = (
+                self._evaluate_candidate_verification_queue(isotope, filt)
+            )
+            rejected_positions = (
+                self._last_candidate_verification_rejected_positions.get(
+                    str(isotope),
+                    np.zeros((0, 3), dtype=float),
+                )
+            )
+            excluded_positions = np.vstack(
+                [
+                    np.asarray(promoted_positions, dtype=float).reshape(-1, 3),
+                    np.asarray(rejected_positions, dtype=float).reshape(-1, 3),
+                ]
+            )
+            if excluded_positions.size and positions.size:
+                radius = max(
+                    float(self.pf_config.report_mle_rescue_dedup_radius_m),
+                    0.0,
+                )
+                if radius <= 0.0:
+                    radius = max(float(self.pf_config.cluster_eps_m), 1.0e-6)
+                distances = np.linalg.norm(
+                    np.asarray(positions, dtype=float)[:, None, :]
+                    - excluded_positions[None, :, :],
+                    axis=2,
+                )
+                keep_new = np.min(distances, axis=1) > radius
+                positions = np.asarray(positions, dtype=float)[keep_new]
+                strengths = np.asarray(strengths, dtype=float)[keep_new]
+            if positions.size and strengths.size:
+                self._merge_candidate_verification_queue(
+                    isotope,
+                    positions,
+                    strengths,
+                )
+            if promoted_positions.size and promoted_strengths.size:
+                injection_weight = float(self.pf_config.runtime_report_rescue_weight)
+                self._runtime_report_rescue_modes[isotope] = (
+                    promoted_positions.copy(),
+                    promoted_strengths.copy(),
+                    float(max(injection_weight, 0.0)),
+                )
+                if injection_weight <= 0.0:
+                    return 0
+                injected = filt.inject_runtime_report_rescue_particles(
+                    promoted_positions,
+                    promoted_strengths,
+                    particle_fraction=(
+                        self._runtime_report_rescue_injection_fraction(injection_weight)
+                    ),
+                    min_particles_per_source=(
+                        self.pf_config.runtime_report_rescue_min_particles_per_source
+                    ),
+                    total_weight=injection_weight,
+                    jitter_sigma_m=(
+                        self.pf_config.runtime_report_rescue_jitter_sigma_m
+                    ),
+                    combine_sources=True,
+                )
+                if injected > 0:
+                    self._invalidate_report_cache()
+                return int(injected)
+            if positions.size and strengths.size:
+                self._runtime_report_rescue_modes[isotope] = (
+                    np.asarray(positions, dtype=float).copy(),
+                    np.asarray(strengths, dtype=float).copy(),
+                    0.0,
+                )
+            else:
+                self._runtime_report_rescue_modes.pop(isotope, None)
+            return 0
         if positions.size == 0 or strengths.size == 0:
             self._runtime_report_rescue_modes.pop(isotope, None)
             return 0
@@ -10505,18 +11881,11 @@ class RotatingShieldPFEstimator:
             isotope,
             int(np.asarray(positions, dtype=float).reshape(-1, 3).shape[0]),
         )
-        if bool(self.pf_config.runtime_report_rescue_verification_queue_only):
-            self._merge_candidate_verification_queue(isotope, positions, strengths)
-            self._runtime_report_rescue_modes[isotope] = (
-                positions.copy(),
-                strengths.copy(),
-                0.0,
-            )
-            return 0
         if self._candidate_verification_queue_should_track(isotope, injection_weight):
             self._merge_candidate_verification_queue(isotope, positions, strengths)
         elif bool(self.pf_config.candidate_verification_queue_enable):
             self._candidate_verification_queue.pop(isotope, None)
+            self._candidate_verification_provenance.pop(isotope, None)
         self._runtime_report_rescue_modes[isotope] = (
             positions.copy(),
             strengths.copy(),
@@ -10718,9 +12087,7 @@ class RotatingShieldPFEstimator:
         filt: IsotopeParticleFilter,
     ) -> tuple[bool, int]:
         """Expose authoritative sparse-evidence cardinality to PF resampling."""
-        ready, selected_count = self._authoritative_sparse_evidence_cardinality(
-            isotope
-        )
+        ready, selected_count = self._authoritative_sparse_evidence_cardinality(isotope)
         setter = getattr(filt, "set_external_protected_cardinalities", None)
         if callable(setter):
             setter({selected_count} if ready else set())
@@ -10734,9 +12101,7 @@ class RotatingShieldPFEstimator:
         data: MeasurementData | None = None,
     ) -> tuple[bool, NDArray[np.float64], NDArray[np.float64]]:
         """Return evidence-selected source positions and strengths for PF sync."""
-        ready, selected_count = self._authoritative_sparse_evidence_cardinality(
-            isotope
-        )
+        ready, selected_count = self._authoritative_sparse_evidence_cardinality(isotope)
         if not ready:
             return False, np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
         payload = self._last_sparse_poisson_evidence_diagnostics.get(str(isotope))
@@ -10797,7 +12162,22 @@ class RotatingShieldPFEstimator:
                 )
             )
             sync_method = getattr(filt, "sync_particles_to_evidence_sources", None)
-            if sync_ready and callable(sync_method):
+            independent_verification = bool(
+                self.pf_config.candidate_verification_independent_evidence_enable
+            )
+            if sync_ready and independent_verification:
+                if evidence_positions.size and evidence_strengths.size:
+                    self._merge_candidate_verification_queue(
+                        isotope,
+                        evidence_positions,
+                        evidence_strengths,
+                    )
+                timing = getattr(filt, "last_structural_timing_s", {})
+                if isinstance(timing, dict):
+                    timing["sparse_evidence_cardinality_ready"] = 1.0
+                    timing["sparse_evidence_selected_count"] = float(evidence_count)
+                    timing["sparse_evidence_queued_for_verification"] = 1.0
+            elif sync_ready and callable(sync_method):
                 sync_method(
                     evidence_positions,
                     evidence_strengths,
@@ -11358,6 +12738,267 @@ class RotatingShieldPFEstimator:
             elif post_count >= pre_count:
                 self._pre_finalize_guard_estimates.pop(isotope, None)
 
+    @staticmethod
+    def _aggregate_surface_map_spectrum_history(
+        history: Mapping[str, object],
+        *,
+        max_spectrum_bins: int,
+    ) -> tuple[dict[str, object], ContiguousPoissonBinAggregation]:
+        """Aggregate every full-spectrum field with one contiguous Poisson grouping.
+
+        Measurements and isotope templates stay batched.  The only Python loop is
+        over the small configured isotope template mapping; no spectrum bins,
+        measurements, patches, or response columns are iterated in Python.
+        """
+        counts = np.asarray(history.get("spectrum_counts"), dtype=float)
+        if counts.ndim != 2 or counts.shape[1] < 1:
+            raise ValueError("surface-map spectrum history must be measurements x bins.")
+        aggregation = contiguous_poisson_bin_aggregation(
+            int(counts.shape[1]),
+            int(max_spectrum_bins),
+        )
+        aggregated: dict[str, object] = dict(history)
+        aggregated["spectrum_counts"] = aggregate_contiguous_poisson_bins(
+            counts,
+            aggregation,
+            axis=1,
+        )
+        background = np.asarray(history.get("background_spectrum"), dtype=float)
+        if background.shape != counts.shape:
+            raise ValueError("surface-map background spectrum must match counts.")
+        aggregated["background_spectrum"] = aggregate_contiguous_poisson_bins(
+            background,
+            aggregation,
+            axis=1,
+        )
+        templates = history.get("templates_by_isotope", {})
+        if not isinstance(templates, Mapping):
+            raise ValueError("surface-map isotope templates are missing.")
+        aggregated_templates: dict[str, NDArray[np.float64]] = {}
+        for isotope, values in templates.items():
+            template = np.asarray(values, dtype=float)
+            if template.shape != counts.shape:
+                raise ValueError(
+                    f"surface-map template for {isotope} must match counts."
+                )
+            aggregated_templates[str(isotope)] = aggregate_contiguous_poisson_bins(
+                template,
+                aggregation,
+                axis=1,
+            )
+        aggregated["templates_by_isotope"] = aggregated_templates
+        aggregated["spectrum_original_bin_count"] = int(
+            aggregation.original_bin_count
+        )
+        aggregated["spectrum_bin_group_widths"] = aggregation.group_widths.copy()
+        aggregated["spectrum_bin_group_starts"] = aggregation.group_starts.copy()
+        aggregated["spectrum_bin_group_ends"] = aggregation.group_ends.copy()
+        return aggregated, aggregation
+
+    @staticmethod
+    def _surface_patch_metadata_payload(
+        patches: SurfacePatchDictionary,
+    ) -> Dict[str, Any]:
+        """Return JSON-safe surface geometry and graph metadata."""
+        return {
+            **dict(patches.geometry_metadata),
+            "centers_xyz": np.asarray(patches.centers_xyz, dtype=float).tolist(),
+            "areas_m2": np.asarray(patches.areas_m2, dtype=float).tolist(),
+            "kinds": [str(value) for value in patches.kinds],
+            "face_ids": [str(value) for value in patches.face_ids],
+            "normals_xyz": np.asarray(patches.normals_xyz, dtype=float).tolist(),
+            "local_uv_m": np.asarray(patches.local_uv_m, dtype=float).tolist(),
+            "adjacency_edges": np.asarray(
+                patches.adjacency_edges,
+                dtype=np.int64,
+            ).tolist(),
+            "shared_edge_lengths_m": np.asarray(
+                patches.shared_edge_lengths_m,
+                dtype=float,
+            ).tolist(),
+        }
+
+    @staticmethod
+    def _json_finite_float(value: float) -> float | None:
+        """Return a finite JSON number or ``None`` for an undefined diagnostic."""
+        scalar = float(value)
+        return scalar if np.isfinite(scalar) else None
+
+    def fit_surface_map(
+        self,
+        patches: SurfacePatchDictionary,
+        config: SurfaceMapConfig | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Fit a PF-independent all-history spectral surface intensity map.
+
+        Patch centers are evaluated directly with the same continuous physical
+        response used by the PF.  The configured isotope registry and recorded
+        spectrum history are authoritative: active filters, PF particles, and
+        online prune state are not read for candidate selection, isotope columns,
+        initialization, response evaluation, or optimization.
+        """
+        isotope_order = self.configured_isotope_order()
+        active_isotopes = tuple(str(isotope) for isotope in self.isotopes)
+        payload: Dict[str, Any] = {
+            "available": False,
+            "reason": "not_evaluated",
+            "isotope_order": list(isotope_order),
+            "active_isotopes_at_fit": list(active_isotopes),
+            "inactive_isotopes_evaluated": [
+                isotope for isotope in isotope_order if isotope not in active_isotopes
+            ],
+            "response_source": "shared_configured_isotope_kernel_registry",
+            "pf_particle_state_independent": True,
+            "patch_count": int(patches.patch_count),
+            "patch_metadata": self._surface_patch_metadata_payload(patches),
+        }
+        if not isotope_order:
+            payload["reason"] = "no_configured_isotopes"
+            return payload
+        if int(patches.patch_count) <= 0:
+            payload["reason"] = "empty_surface_patch_dictionary"
+            return payload
+        solver_config = SurfaceMapConfig() if config is None else config
+        raw_history = self._spectrum_history_arrays(isotope_order)
+        if raw_history is None:
+            payload["reason"] = "no_aligned_spectral_history"
+            return payload
+        history, spectrum_aggregation = self._aggregate_surface_map_spectrum_history(
+            raw_history,
+            max_spectrum_bins=int(solver_config.max_spectrum_bins),
+        )
+
+        counts = np.asarray(history["spectrum_counts"], dtype=float)
+        response, data_by_isotope = self._spectral_response_tensor_at_positions(
+            history,
+            isotope_order,
+            np.asarray(patches.centers_xyz, dtype=float),
+        )
+        missing_responses = [
+            isotope for isotope in isotope_order if isotope not in data_by_isotope
+        ]
+        if missing_responses:
+            payload["reason"] = "continuous_response_unavailable"
+            payload["missing_isotopes"] = missing_responses
+            return payload
+        nuisance_response, nuisance_basis_metadata = self._spectral_nuisance_basis(
+            history,
+            target_isotope=None,
+        )
+        result = fit_surface_map_poisson(
+            counts,
+            response,
+            np.asarray(patches.areas_m2, dtype=float),
+            adjacency_edges=np.asarray(patches.adjacency_edges, dtype=np.int64),
+            adjacency_weights=np.asarray(
+                patches.shared_edge_lengths_m,
+                dtype=float,
+            ),
+            background=np.asarray(history["background_spectrum"], dtype=float),
+            nuisance_response=nuisance_response,
+            config=solver_config,
+        )
+        payload.update(
+            {
+                "available": True,
+                "reason": "ok",
+                "spectrum_measurement_count": int(counts.shape[0]),
+                "spectrum_bin_count": int(counts.shape[1]),
+                "spectrum_original_bin_count": int(
+                    spectrum_aggregation.original_bin_count
+                ),
+                "spectrum_aggregation": {
+                    "method": "contiguous_full_spectrum_poisson_sum",
+                    "max_spectrum_bins": int(solver_config.max_spectrum_bins),
+                    "original_bin_count": int(
+                        spectrum_aggregation.original_bin_count
+                    ),
+                    "aggregated_bin_count": int(
+                        spectrum_aggregation.aggregated_bin_count
+                    ),
+                    "group_start_indices": np.asarray(
+                        spectrum_aggregation.group_starts,
+                        dtype=np.int64,
+                    ).tolist(),
+                    "group_end_indices_exclusive": np.asarray(
+                        spectrum_aggregation.group_ends,
+                        dtype=np.int64,
+                    ).tolist(),
+                    "group_widths": np.asarray(
+                        spectrum_aggregation.group_widths,
+                        dtype=np.int64,
+                    ).tolist(),
+                    "covers_all_original_bins_once": True,
+                    "poisson_sum_preserving": True,
+                    "bin_selection_applied": False,
+                },
+                "densities_cps_1m_m2": np.asarray(
+                    result.densities_cps_1m_m2,
+                    dtype=float,
+                ).tolist(),
+                "integrated_strengths_cps_1m": np.asarray(
+                    result.integrated_strengths_cps_1m,
+                    dtype=float,
+                ).tolist(),
+                "nuisance": {
+                    "parameter_count": int(result.nuisance_coefficients.size),
+                    "coefficients": np.asarray(
+                        result.nuisance_coefficients,
+                        dtype=float,
+                    ).tolist(),
+                    "basis": nuisance_basis_metadata,
+                },
+                "background_model": {
+                    "fixed_background_source_counts": copy.deepcopy(
+                        history.get("background_source_counts", {})
+                    ),
+                    "fixed_background_observation_independent": bool(
+                        history.get(
+                            "fixed_background_observation_independent",
+                            False,
+                        )
+                    ),
+                    "rejected_observation_fitted_background_count": int(
+                        history.get(
+                            "rejected_observation_fitted_background_count",
+                            0,
+                        )
+                    ),
+                    "unknown_or_excess_background_fit": (
+                        "nonnegative_station_visit_nuisance"
+                    ),
+                },
+                "objective": {
+                    "total": float(result.objective),
+                    "poisson_nll": float(result.poisson_nll),
+                    "l1_penalty": float(result.l1_penalty),
+                    "tv_penalty": float(result.tv_penalty),
+                    "nuisance_penalty": float(result.nuisance_penalty),
+                },
+                "deviance": float(result.deviance),
+                "convergence": {
+                    "converged": bool(result.converged),
+                    "iterations": int(result.iterations),
+                    "relative_change": self._json_finite_float(result.relative_change),
+                    "relative_objective_change": self._json_finite_float(
+                        result.relative_objective_change
+                    ),
+                    "kkt_residual": self._json_finite_float(result.kkt_residual),
+                },
+                "regularization": {
+                    "l1_weight": float(solver_config.l1_weight),
+                    "tv_weight": float(solver_config.tv_weight),
+                    "nuisance_l1_weight": float(solver_config.nuisance_l1_weight),
+                    "nuisance_l2_weight": float(solver_config.nuisance_l2_weight),
+                },
+                "template_source_counts_by_isotope": copy.deepcopy(
+                    history.get("template_source_counts_by_isotope", {})
+                ),
+            }
+        )
+        return payload
+
     def estimates(
         self,
         *,
@@ -11404,6 +13045,90 @@ class RotatingShieldPFEstimator:
             self._report_estimate_cache[cache_key] = self._copy_estimate_map(estimates)
         return self._copy_estimate_map(estimates)
 
+    def posterior_source_uncertainty(
+        self,
+        reported_estimates: Mapping[
+            str,
+            Tuple[NDArray[np.float64], NDArray[np.float64]],
+        ]
+        | None = None,
+        *,
+        match_radius_m: float | None = None,
+        surface_tolerance_m: float = 1.0e-5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return JSON-safe posterior 3-D diagnostics for reported source modes.
+
+        Particle source slots are matched to the nearest reported mode in one
+        batched distance calculation.  Existence mass is unconditional particle
+        mass, while location, covariance, z quantiles, ellipsoid, and surface
+        probabilities are conditional on a matched source being present.  Each
+        mode includes availability flags so downstream evaluation can exclude
+        unsupported summaries; the ellipsoid payload identifies itself as a
+        Gaussian-equivalent covariance summary rather than an empirical credible
+        region.
+        """
+        estimate_map = (
+            self.estimates() if reported_estimates is None else dict(reported_estimates)
+        )
+        radius = (
+            max(float(self.pf_config.cluster_eps_m), 1.0e-6)
+            if match_radius_m is None
+            else float(match_radius_m)
+        )
+        environment = self._source_prior_environment()
+        output: Dict[str, List[Dict[str, Any]]] = {}
+        for isotope, estimate in estimate_map.items():
+            positions = np.asarray(estimate[0], dtype=float)
+            strengths = np.asarray(estimate[1], dtype=float).reshape(-1)
+            if positions.size == 0:
+                positions = np.zeros((0, 3), dtype=float)
+            if positions.ndim != 2 or positions.shape[1] != 3:
+                raise ValueError("reported estimate positions must have shape (M, 3).")
+            if strengths.size != positions.shape[0]:
+                raise ValueError(
+                    "reported estimate strengths must have one value per mode."
+                )
+            if np.any(~np.isfinite(strengths)):
+                raise ValueError("reported estimate strengths must be finite.")
+
+            filt = self.filters.get(isotope)
+            if filt is None or not filt.continuous_particles:
+                packed_positions = np.zeros((0, 0, 3), dtype=float)
+                packed_mask = np.zeros((0, 0), dtype=bool)
+                weights = np.zeros(0, dtype=float)
+            else:
+                from pf import gpu_utils
+                import torch
+
+                report_states = [
+                    filt.state_without_report_excluded_sources(particle.state)
+                    for particle in filt.continuous_particles
+                ]
+                positions_tensor, _, _, mask_tensor = gpu_utils.pack_states(
+                    report_states,
+                    device=torch.device("cpu"),
+                    dtype=torch.float64,
+                )
+                packed_positions = positions_tensor.detach().cpu().numpy()
+                packed_mask = mask_tensor.detach().cpu().numpy().astype(bool)
+                weights = np.asarray(filt.continuous_weights, dtype=float)
+
+            diagnostics = posterior_mode_uncertainty_batched(
+                packed_positions,
+                packed_mask,
+                weights,
+                positions,
+                environment=environment,
+                obstacle_grid=self.obstacle_grid,
+                obstacle_height_m=self.obstacle_height_m,
+                match_radius_m=radius,
+                surface_tolerance_m=surface_tolerance_m,
+            )
+            for mode_index, diagnostic in enumerate(diagnostics):
+                diagnostic["reported_strength_cps_1m"] = float(strengths[mode_index])
+            output[isotope] = diagnostics
+        return output
+
     def _guarded_report_estimate(
         self,
         isotope: str,
@@ -11441,6 +13166,10 @@ class RotatingShieldPFEstimator:
     def report_model_order_diagnostics(self) -> Dict[str, Dict[str, Any]]:
         """Return the latest report-level model-order diagnostics."""
         return copy.deepcopy(self._last_report_model_order_diagnostics)
+
+    def candidate_verification_diagnostics(self) -> Dict[str, Dict[str, Any]]:
+        """Return the latest independent rescue-candidate verification results."""
+        return copy.deepcopy(self._last_candidate_verification_diagnostics)
 
     def sparse_poisson_evidence_diagnostics(self) -> Dict[str, Dict[str, Any]]:
         """Return the latest all-history sparse Poisson evidence diagnostics."""
@@ -12112,6 +13841,12 @@ class RotatingShieldPFEstimator:
                     )
                     .reshape(-1, 3)
                     .shape[0]
+                ),
+                "candidate_verification": dict(
+                    self._last_candidate_verification_diagnostics.get(
+                        str(iso),
+                        {},
+                    )
                 ),
                 "birth_structural_eligible": int(
                     getattr(filt, "last_birth_structural_eligible", 0)

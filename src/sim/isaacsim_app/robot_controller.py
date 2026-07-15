@@ -10,11 +10,17 @@ import numpy as np
 
 from measurement.shielding import generate_octant_orientations
 from sim.isaacsim_app.scene_builder import StagePrimPaths
-from sim.isaacsim_app.stage_backend import PrimPose, StageBackend, yaw_to_quaternion_wxyz
+from sim.isaacsim_app.stage_backend import (
+    PrimPose,
+    StageBackend,
+    yaw_to_quaternion_wxyz,
+)
 from sim.protocol import SimulationCommand
 
 
-def _normalize_vector(vector_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
+def _normalize_vector(
+    vector_xyz: tuple[float, float, float],
+) -> tuple[float, float, float]:
     """Normalize a 3D vector and fall back to +X for degenerate inputs."""
     vector = np.asarray(vector_xyz, dtype=float)
     norm = float(np.linalg.norm(vector))
@@ -71,17 +77,28 @@ class RobotState:
     """Track the latest robot and shield command state."""
 
     pose_xyz: tuple[float, float, float] = (1.0, 1.0, 0.0)
+    detector_world_z_m: float = 0.5
     base_yaw_rad: float = 0.0
     fe_orientation_index: int = 0
     pb_orientation_index: int = 0
 
+    @property
+    def detector_pose_xyz(self) -> tuple[float, float, float]:
+        """Return the detector world position represented by this state."""
+        return (
+            float(self.pose_xyz[0]),
+            float(self.pose_xyz[1]),
+            float(self.detector_world_z_m),
+        )
+
     def apply_command(self, command: SimulationCommand, *, ground_z_m: float) -> None:
-        """Update the robot state from a new command."""
+        """Update the grounded base and detector height from a command."""
         self.pose_xyz = (
             float(command.target_pose_xyz[0]),
             float(command.target_pose_xyz[1]),
             float(ground_z_m),
         )
+        self.detector_world_z_m = float(command.target_pose_xyz[2])
         self.base_yaw_rad = float(command.target_base_yaw_rad)
         self.fe_orientation_index = int(command.fe_orientation_index)
         self.pb_orientation_index = int(command.pb_orientation_index)
@@ -115,26 +132,32 @@ class RobotController:
         self.animation_dt_s = max(float(animation_dt_s), 1e-3)
         self.animation_time_scale = max(float(animation_time_scale), 0.0)
         self.max_animation_steps = max(int(max_animation_steps), 1)
-        self.state = RobotState()
+        self.state = RobotState(
+            pose_xyz=(1.0, 1.0, self.ground_z_m),
+            detector_world_z_m=self.ground_z_m + self.detector_height_m,
+        )
         self._shield_normals = [
-            tuple(float(v) for v in normal)
-            for normal in generate_octant_orientations()
+            tuple(float(v) for v in normal) for normal in generate_octant_orientations()
         ]
 
     def reset(self) -> None:
         """Reset the cached robot state and publish the initial robot pose."""
-        self.state = RobotState(pose_xyz=(1.0, 1.0, self.ground_z_m))
+        self.state = RobotState(
+            pose_xyz=(1.0, 1.0, self.ground_z_m),
+            detector_world_z_m=self.ground_z_m + self.detector_height_m,
+        )
         self._apply_pose_and_shields(
-            pose_xyz=self.state.pose_xyz,
+            base_pose_xyz=self.state.pose_xyz,
+            detector_world_z_m=self.state.detector_world_z_m,
             base_yaw_rad=self.state.base_yaw_rad,
             fe_orientation_index=self.state.fe_orientation_index,
             pb_orientation_index=self.state.pb_orientation_index,
         )
 
     def apply_command(self, command: SimulationCommand) -> None:
-        """Update the robot prims to match a step command."""
-        start_pose = np.asarray(self.state.pose_xyz, dtype=float)
-        target_pose = np.asarray(
+        """Move the grounded base and detector mast to a commanded detector pose."""
+        start_base_pose = np.asarray(self.state.pose_xyz, dtype=float)
+        target_base_pose = np.asarray(
             (
                 float(command.target_pose_xyz[0]),
                 float(command.target_pose_xyz[1]),
@@ -142,7 +165,9 @@ class RobotController:
             ),
             dtype=float,
         )
-        distance_m = float(np.linalg.norm(target_pose - start_pose))
+        start_detector_pose = np.asarray(self.state.detector_pose_xyz, dtype=float)
+        target_detector_pose = np.asarray(command.target_pose_xyz, dtype=float)
+        distance_m = float(np.linalg.norm(target_detector_pose - start_detector_pose))
         travel_time_s = float(command.travel_time_s)
         if travel_time_s <= 0.0 and distance_m > 0.0:
             travel_time_s = distance_m / self.motion_speed_m_s
@@ -153,15 +178,26 @@ class RobotController:
                 self.max_animation_steps,
             )
         motion_yaw = _movement_yaw_rad(
-            start_pose,
-            target_pose,
+            start_base_pose,
+            target_base_pose,
             fallback_yaw_rad=float(command.target_base_yaw_rad),
         )
         for idx in range(1, steps + 1):
             frac = float(idx) / float(steps)
-            interp_pose = start_pose + frac * (target_pose - start_pose)
+            interp_base_pose = start_base_pose + frac * (
+                target_base_pose - start_base_pose
+            )
+            interp_detector_z_m = float(
+                start_detector_pose[2]
+                + frac * (target_detector_pose[2] - start_detector_pose[2])
+            )
             self._apply_pose_and_shields(
-                pose_xyz=(float(interp_pose[0]), float(interp_pose[1]), float(interp_pose[2])),
+                base_pose_xyz=(
+                    float(interp_base_pose[0]),
+                    float(interp_base_pose[1]),
+                    float(interp_base_pose[2]),
+                ),
+                detector_world_z_m=interp_detector_z_m,
                 base_yaw_rad=motion_yaw,
                 fe_orientation_index=int(command.fe_orientation_index),
                 pb_orientation_index=int(command.pb_orientation_index),
@@ -178,20 +214,32 @@ class RobotController:
     def _apply_pose_and_shields(
         self,
         *,
-        pose_xyz: tuple[float, float, float],
+        base_pose_xyz: tuple[float, float, float],
+        detector_world_z_m: float,
         base_yaw_rad: float,
         fe_orientation_index: int,
         pb_orientation_index: int,
     ) -> None:
-        """Apply one robot pose and shield orientation sample to the stage."""
+        """Apply one grounded base pose and mast-height sample to the stage."""
+        detector_local_z_m = float(detector_world_z_m) - float(base_pose_xyz[2])
+        fe_translation = (
+            float(self.fe_offset_xyz[0]),
+            float(self.fe_offset_xyz[1]),
+            detector_local_z_m + float(self.fe_offset_xyz[2]) - self.detector_height_m,
+        )
+        pb_translation = (
+            float(self.pb_offset_xyz[0]),
+            float(self.pb_offset_xyz[1]),
+            detector_local_z_m + float(self.pb_offset_xyz[2]) - self.detector_height_m,
+        )
         self.stage_backend.set_local_pose(
             self.prim_paths.robot_root,
-            translation_xyz=pose_xyz,
+            translation_xyz=base_pose_xyz,
             orientation_wxyz=yaw_to_quaternion_wxyz(base_yaw_rad),
         )
         self.stage_backend.set_local_pose(
             self.prim_paths.detector_path,
-            translation_xyz=(0.0, 0.0, self.detector_height_m),
+            translation_xyz=(0.0, 0.0, detector_local_z_m),
             orientation_wxyz=(1.0, 0.0, 0.0, 0.0),
         )
         # PF octant indices describe the incoming source-to-detector direction.
@@ -207,13 +255,17 @@ class RobotController:
         local_octant_center = _normalize_vector((1.0, 1.0, 1.0))
         self.stage_backend.set_local_pose(
             self.prim_paths.fe_shield_path,
-            translation_xyz=self.fe_offset_xyz,
-            orientation_wxyz=_rotation_between_vectors_wxyz(local_octant_center, fe_normal),
+            translation_xyz=fe_translation,
+            orientation_wxyz=_rotation_between_vectors_wxyz(
+                local_octant_center, fe_normal
+            ),
         )
         self.stage_backend.set_local_pose(
             self.prim_paths.pb_shield_path,
-            translation_xyz=self.pb_offset_xyz,
-            orientation_wxyz=_rotation_between_vectors_wxyz(local_octant_center, pb_normal),
+            translation_xyz=pb_translation,
+            orientation_wxyz=_rotation_between_vectors_wxyz(
+                local_octant_center, pb_normal
+            ),
         )
         self.stage_backend.step()
 

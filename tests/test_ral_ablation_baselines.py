@@ -85,6 +85,16 @@ def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> Non
         )
         == 8
     )
+    assert (
+        _resolve_rotation_limit_for_active_program(
+            base_rotation_limit=8,
+            active_shield_program=(2, 3),
+            strict_planned_shield_program=False,
+            baseline_shield_policy=None,
+            force_strict_program=True,
+        )
+        == 2
+    )
 
 
 def test_passive_serpentine_path_policy_selects_candidate_near_waypoint() -> None:

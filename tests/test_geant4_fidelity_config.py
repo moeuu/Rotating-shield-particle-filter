@@ -7,6 +7,7 @@ import math
 import re
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from measurement.kernels import ShieldParams
@@ -751,6 +752,67 @@ def test_standard_transport_response_model_does_not_stack_legacy_scales() -> Non
         assert payload.get("pf_transport_response_model_path")
         assert "measurement_scale_by_isotope" not in payload
         assert "measurement_scale_by_isotope_and_pair" not in payload
+
+
+def test_standard_pre_likelihood_profile_does_not_reweight_old_history() -> None:
+    """Standard profiling must keep post-refit historical reweighting disabled."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    payload = _load_geant4_runtime_config(config_path)
+
+    assert payload.get("conditional_strength_profile_before_likelihood") is True
+    assert payload.get("conditional_strength_refit_reweight") is False
+
+
+def test_standard_full_simulation_enables_guarded_surface_reconstruction() -> None:
+    """Standard final L1+TV fitting must run only inside explicit memory guards."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    payload = _load_geant4_runtime_config(config_path)
+
+    assert payload.get("surface_map_reconstruction_enable") is True
+    assert int(payload.get("surface_map_max_patch_count", 0)) > 0
+    assert int(payload.get("surface_map_max_response_elements", 0)) > 0
+    assert int(payload.get("surface_map_max_spectrum_bins", 0)) == 32
+    spacing = np.asarray(payload.get("surface_map_spacing_m"), dtype=float)
+    assert spacing.shape == (3,)
+    assert np.all(np.isfinite(spacing) & (spacing > 0.0))
+    assert int(payload.get("surface_map_max_iterations", 0)) > 0
+
+
+def test_standard_runtime_declares_reproducible_evaluation_bins() -> None:
+    """Evaluation thresholds should be explicit in the standard runtime config."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    payload = _load_geant4_runtime_config(config_path)
+
+    assert payload.get("evaluation_close_pair_distance_m") == pytest.approx(2.0)
+    assert payload.get(
+        "evaluation_close_pair_min_estimated_separation_m"
+    ) == pytest.approx(0.5)
+    assert payload.get("evaluation_cluster_match_gate_m") == pytest.approx(0.5)
+    assert payload.get("evaluation_cluster_stability_window") == 5
+    assert payload.get("evaluation_count_regime_lower_edges") == [
+        0.0,
+        10.0,
+        100.0,
+        1000.0,
+    ]
 
 
 def test_standard_variance_reduction_uses_conservative_line_basis_margin() -> None:

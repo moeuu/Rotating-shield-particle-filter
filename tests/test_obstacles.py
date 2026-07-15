@@ -34,6 +34,31 @@ def test_obstacle_grid_roundtrip_and_is_free(tmp_path: Path) -> None:
     assert loaded.is_free((-1.0, -1.0, 0.0)) is True
 
 
+def test_obstacle_grid_batch_free_space_matches_scalar() -> None:
+    """Batched obstacle lookup should preserve scalar outside-grid semantics."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 2),
+        blocked_cells=((0, 1), (2, 0)),
+    )
+    points = np.asarray(
+        [
+            [-0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 1.5, 2.0],
+            [2.5, 0.5, 0.0],
+            [3.5, 0.5, 0.0],
+        ],
+        dtype=float,
+    )
+
+    batch = grid.is_free_batch(points)
+    scalar = np.asarray([grid.is_free(point) for point in points], dtype=bool)
+
+    assert np.array_equal(batch, scalar)
+
+
 def test_generate_obstacle_grid_respects_keep_free_points() -> None:
     """Keep-free points should never be blocked."""
     rng = np.random.default_rng(1)

@@ -132,6 +132,39 @@ class ObstacleGrid:
             return True
         return idx not in self._blocked_set
 
+    def is_free_batch(self, points: Sequence[Sequence[float]]) -> np.ndarray:
+        """Return free-space flags for a batch of world-space points."""
+        points_array = np.asarray(points, dtype=float)
+        if points_array.size == 0:
+            return np.zeros(0, dtype=bool)
+        if points_array.ndim != 2 or points_array.shape[1] < 2:
+            raise ValueError("points must have shape (N, D) with D >= 2.")
+        if np.any(~np.isfinite(points_array[:, :2])):
+            raise ValueError("point coordinates must be finite.")
+        relative_xy = points_array[:, :2] - np.asarray(
+            self.origin,
+            dtype=float,
+        )[None, :]
+        cell_indices = np.floor(relative_xy / float(self.cell_size)).astype(
+            np.int64,
+        )
+        inside = (
+            (cell_indices[:, 0] >= 0)
+            & (cell_indices[:, 1] >= 0)
+            & (cell_indices[:, 0] < int(self.grid_shape[0]))
+            & (cell_indices[:, 1] < int(self.grid_shape[1]))
+        )
+        free = np.ones(points_array.shape[0], dtype=bool)
+        if not np.any(inside) or not self.blocked_cells:
+            return free
+        cell_codes = (
+            cell_indices[:, 0] * int(self.grid_shape[1]) + cell_indices[:, 1]
+        )
+        blocked = np.asarray(self.blocked_cells, dtype=np.int64).reshape(-1, 2)
+        blocked_codes = blocked[:, 0] * int(self.grid_shape[1]) + blocked[:, 1]
+        free[inside] = ~np.isin(cell_codes[inside], blocked_codes)
+        return free
+
     def is_cell_free(self, cell: tuple[int, int]) -> bool:
         """Return True if the grid cell is inside bounds and not blocked."""
         ix, iy = (int(cell[0]), int(cell[1]))

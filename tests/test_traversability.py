@@ -124,6 +124,34 @@ def test_traversability_map_roundtrip_and_render(tmp_path: Path) -> None:
     assert not loaded.is_free((0.5, 1.5))
 
 
+def test_traversability_batch_free_space_matches_scalar() -> None:
+    """Batched traversability lookup should reject points outside the map."""
+    traversable = TraversabilityMap(
+        origin=(1.0, 2.0),
+        cell_size=0.5,
+        grid_shape=(3, 2),
+        traversable_cells=((0, 0), (2, 1)),
+    )
+    points = np.asarray(
+        [
+            [0.9, 2.1, 0.5],
+            [1.1, 2.1, 0.5],
+            [1.6, 2.1, 1.5],
+            [2.1, 2.6, 0.5],
+            [2.6, 2.6, 0.5],
+        ],
+        dtype=float,
+    )
+
+    batch = traversable.is_free_batch(points)
+    scalar = np.asarray(
+        [traversable.is_free(point) for point in points],
+        dtype=bool,
+    )
+
+    assert np.array_equal(batch, scalar)
+
+
 def test_traversability_map_projects_stage_solids() -> None:
     """USD/Isaac solid geometry should project into the same map API."""
     solids = [

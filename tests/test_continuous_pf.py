@@ -6,7 +6,10 @@ import math
 import numpy as np
 import pytest
 
-from measurement.continuous_kernels import ContinuousKernel, expected_counts_single_isotope
+from measurement.continuous_kernels import (
+    ContinuousKernel,
+    expected_counts_single_isotope,
+)
 from measurement.kernels import ShieldParams
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
@@ -209,7 +212,9 @@ def test_gpu_pair_counts_match_continuous_kernel_with_line_obstacles() -> None:
         live_time_s=1.0,
     )
 
-    assert float(gpu_counts[0].detach().cpu().item()) == pytest.approx(cpu_counts, rel=1e-12)
+    assert float(gpu_counts[0].detach().cpu().item()) == pytest.approx(
+        cpu_counts, rel=1e-12
+    )
 
 
 def test_continuous_kernel_packed_gpu_pairs_are_consistent() -> None:
@@ -256,7 +261,9 @@ def test_continuous_kernel_packed_gpu_pairs_are_consistent() -> None:
         device=device,
         dtype=dtype,
     )
-    strengths = torch.as_tensor([[100.0, 40.0], [70.0, 30.0]], device=device, dtype=dtype)
+    strengths = torch.as_tensor(
+        [[100.0, 40.0], [70.0, 30.0]], device=device, dtype=dtype
+    )
     backgrounds = torch.as_tensor([0.5, 0.25], device=device, dtype=dtype)
     mask = torch.ones((2, 2), device=device, dtype=dtype)
     fe_indices = np.array([0, 3, 7], dtype=np.int64)
@@ -391,7 +398,9 @@ def test_transport_response_model_matches_cpu_and_gpu_paths() -> None:
         live_time_s=1.0,
     )
 
-    assert float(gpu_counts[0].detach().cpu().item()) == pytest.approx(cpu_counts, rel=1e-12)
+    assert float(gpu_counts[0].detach().cpu().item()) == pytest.approx(
+        cpu_counts, rel=1e-12
+    )
 
 
 def test_transport_response_model_can_exceed_unattenuated_cap_cpu_and_torch() -> None:
@@ -992,7 +1001,10 @@ def test_shield_attenuation_factor_both_materials() -> None:
 
     shield_params = ShieldParams()
     expected_ratio = np.exp(
-        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+        -(
+            shield_params.mu_fe * shield_params.thickness_fe_cm
+            + shield_params.mu_pb * shield_params.thickness_pb_cm
+        )
     )
     assert np.isclose(lam_blocked, expected_ratio * lam_free, rtol=1e-6)
 
@@ -1006,15 +1018,27 @@ def test_poisson_weight_update_prefers_higher_lambda() -> None:
     dummy_kernel.num_sources = 1
     pf = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
     # Override continuous particles with deterministic states
-    p_hi = IsotopeState(num_sources=1, positions=np.array([[1.0, 0.0, 0.0]]), strengths=np.array([1.0]), background=0.0)
-    p_lo = IsotopeState(num_sources=1, positions=np.array([[5.0, 0.0, 0.0]]), strengths=np.array([1.0]), background=0.0)
+    p_hi = IsotopeState(
+        num_sources=1,
+        positions=np.array([[1.0, 0.0, 0.0]]),
+        strengths=np.array([1.0]),
+        background=0.0,
+    )
+    p_lo = IsotopeState(
+        num_sources=1,
+        positions=np.array([[5.0, 0.0, 0.0]]),
+        strengths=np.array([1.0]),
+        background=0.0,
+    )
     pf.continuous_particles = [
         IsotopeParticle(state=p_hi, log_weight=np.log(0.5)),
         IsotopeParticle(state=p_lo, log_weight=np.log(0.5)),
     ]
     pf.kernel = dummy_kernel
     z_obs = 1.0
-    pf.update_continuous_pair(z_obs=z_obs, pose_idx=0, fe_index=0, pb_index=0, live_time_s=1.0)
+    pf.update_continuous_pair(
+        z_obs=z_obs, pose_idx=0, fe_index=0, pb_index=0, live_time_s=1.0
+    )
     weights = pf.continuous_weights
     assert weights[0] > weights[1]
 
@@ -1043,12 +1067,16 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
         dtype=float,
     )
 
-    ll = filt._log_likelihood_sequence_gpu(
-        torch.as_tensor(lam, dtype=torch.float64),
-        z_obs,
-        obs_var,
-        observation_count_covariance=obs_cov,
-    ).cpu().numpy()
+    ll = (
+        filt._log_likelihood_sequence_gpu(
+            torch.as_tensor(lam, dtype=torch.float64),
+            z_obs,
+            obs_var,
+            observation_count_covariance=obs_cov,
+        )
+        .cpu()
+        .numpy()
+    )
 
     expected = []
     obs_offdiag = obs_cov.copy()
@@ -1525,11 +1553,16 @@ def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
     filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
     lam = torch.as_tensor([37.0, 41.0], dtype=torch.float64)
 
-    actual = filt._log_likelihood_increment_gpu(
-        lam,
-        z_obs=39.0,
-        observation_count_variance=4.0,
-    ).detach().cpu().numpy()
+    actual = (
+        filt._log_likelihood_increment_gpu(
+            lam,
+            z_obs=39.0,
+            observation_count_variance=4.0,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
     expected = np.array(
         [
             count_log_likelihood(
@@ -1958,6 +1991,297 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
     assert calls["tempered_ll"] == (1,)
 
 
+def test_pair_sequence_profiles_strengths_before_likelihood(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile strengths before every likelihood and after final adaptation."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(
+        num_particles=1,
+        use_gpu=True,
+        use_tempering=True,
+        conditional_strength_profile_before_likelihood=True,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 1.5], dtype=float)]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0], dtype=float)]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([1.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    calls: list[tuple[str, float, float]] = []
+
+    def fake_profile(
+        data: MeasurementData,
+        **kwargs: object,
+    ) -> None:
+        """Set strength from the current position and record profile ordering."""
+        assert kwargs["reweight_override"] is False
+        assert kwargs["suppress_prune_after_refit"] is True
+        np.testing.assert_allclose(data.detector_positions[:, 2], [1.5, 1.5])
+        state = filt.continuous_particles[0].state
+        position_x = float(state.positions[0, 0])
+        state.strengths[:] = 10.0 * position_x
+        calls.append(("profile", position_x, float(state.strengths[0])))
+
+    def fake_counts(**_kwargs: object) -> "torch.Tensor":
+        """Observe the profiled strength when the likelihood is evaluated."""
+        state = filt.continuous_particles[0].state
+        position_x = float(state.positions[0, 0])
+        strength = float(state.strengths[0])
+        calls.append(("likelihood", position_x, strength))
+        return torch.full((2, 1), float(strength), dtype=torch.float64)
+
+    def fake_tempered(
+        ll_fn: object,
+        **kwargs: object,
+    ) -> tuple[float, bool]:
+        """Simulate roughening and the subsequent likelihood recomputation."""
+        ll_fn()
+        state = filt.continuous_particles[0].state
+        state.positions[0, 0] = 2.0
+        state.strengths[0] = -1.0
+        calls.append(("roughen", 2.0, -1.0))
+        refresh = kwargs["refresh_state_after_resample"]
+        assert callable(refresh)
+        refresh()
+        ll_fn()
+        return 1.0, True
+
+    def fake_adapt(**_kwargs: object) -> None:
+        """Simulate final particle adaptation changing the sampled position."""
+        state = filt.continuous_particles[0].state
+        state.positions[0, 0] = 3.0
+        state.strengths[0] = -1.0
+        calls.append(("adapt", 3.0, -1.0))
+
+    monkeypatch.setattr(filt, "_gpu_enabled", lambda: True)
+    monkeypatch.setattr(filt, "refit_strengths_for_particles", fake_profile)
+    monkeypatch.setattr(
+        filt,
+        "_continuous_expected_counts_pair_sequence_torch",
+        fake_counts,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_log_likelihood_sequence_gpu",
+        lambda lam, *_args, **_kwargs: torch.zeros(lam.shape[1]),
+    )
+    monkeypatch.setattr(filt, "_tempered_update_likelihood", fake_tempered)
+    monkeypatch.setattr(filt, "adapt_num_particles", fake_adapt)
+    monkeypatch.setattr(filt, "align_continuous_labels", lambda: None)
+    monkeypatch.setattr(filt, "_advance_adapt_cooldown", lambda: None)
+    monkeypatch.setattr(filt, "_maybe_update_convergence", lambda **_kwargs: None)
+
+    filt.update_continuous_pair_sequence(
+        z_obs=np.array([20.0, 30.0], dtype=float),
+        pose_idx=0,
+        fe_indices=np.array([0, 0], dtype=int),
+        pb_indices=np.array([0, 0], dtype=int),
+        live_times_s=np.array([1.0, 1.0], dtype=float),
+        observation_count_variances=np.array([2.0, 3.0], dtype=float),
+    )
+
+    assert calls == [
+        ("profile", 1.0, 10.0),
+        ("likelihood", 1.0, 10.0),
+        ("roughen", 2.0, -1.0),
+        ("profile", 2.0, 20.0),
+        ("likelihood", 2.0, 20.0),
+        ("adapt", 3.0, -1.0),
+        ("profile", 3.0, 30.0),
+    ]
+    assert filt.continuous_particles[0].state.strengths[0] == pytest.approx(30.0)
+
+
+def test_tempering_refreshes_profile_state_after_roughening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tempering must refresh deterministic state before likelihood recomputation."""
+    torch = pytest.importorskip("torch")
+    filt = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=None,
+        config=PFConfig(
+            num_particles=1,
+            target_ess_ratio=2.0,
+            resample_threshold=2.0,
+            max_resamples_per_observation=1,
+            temper_resample_cooldown_steps=0,
+        ),
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([10.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    calls: list[tuple[str, float, float]] = []
+
+    def likelihood() -> "torch.Tensor":
+        """Record the position and strength used by each likelihood evaluation."""
+        state = filt.continuous_particles[0].state
+        calls.append(
+            (
+                "likelihood",
+                float(state.positions[0, 0]),
+                float(state.strengths[0]),
+            )
+        )
+        return torch.zeros(1, dtype=torch.float64)
+
+    def fake_resample(**_kwargs: object) -> None:
+        """Replace the particle with an intentionally stale roughened state."""
+        state = filt.continuous_particles[0].state
+        state.positions[0, 0] = 2.0
+        state.strengths[0] = -1.0
+        filt.last_resample_ess = True
+        calls.append(("roughen", 2.0, -1.0))
+
+    def refresh_profile() -> None:
+        """Condition strength on the newly roughened particle position."""
+        state = filt.continuous_particles[0].state
+        position_x = float(state.positions[0, 0])
+        state.strengths[0] = 10.0 * position_x
+        calls.append(("profile", position_x, float(state.strengths[0])))
+
+    monkeypatch.setattr(filt, "_maybe_resample_continuous", fake_resample)
+
+    _, resampled = filt._tempered_update_likelihood(
+        likelihood,
+        refresh_state_after_resample=refresh_profile,
+    )
+
+    assert resampled is True
+    assert calls == [
+        ("likelihood", 1.0, 10.0),
+        ("roughen", 2.0, -1.0),
+        ("profile", 2.0, 20.0),
+        ("likelihood", 2.0, 20.0),
+    ]
+
+
+def test_non_tempered_pair_sequence_reprofiles_after_resample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-tempered final roughening must not leave stale strength state."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(
+        num_particles=1,
+        use_gpu=True,
+        use_tempering=False,
+        conditional_strength_profile_before_likelihood=True,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 1.5], dtype=float)]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0], dtype=float)]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([-1.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    calls: list[tuple[str, float, float]] = []
+
+    def fake_profile(_data: MeasurementData, **_kwargs: object) -> None:
+        """Profile strength as a deterministic function of position."""
+        state = filt.continuous_particles[0].state
+        position_x = float(state.positions[0, 0])
+        state.strengths[0] = 10.0 * position_x
+        calls.append(("profile", position_x, float(state.strengths[0])))
+
+    def fake_counts(**_kwargs: object) -> "torch.Tensor":
+        """Record state used for the sole non-tempered likelihood."""
+        state = filt.continuous_particles[0].state
+        calls.append(
+            (
+                "likelihood",
+                float(state.positions[0, 0]),
+                float(state.strengths[0]),
+            )
+        )
+        return torch.full((1, 1), float(state.strengths[0]), dtype=torch.float64)
+
+    def fake_resample(**_kwargs: object) -> None:
+        """Simulate the final non-tempered roughening operation."""
+        state = filt.continuous_particles[0].state
+        state.positions[0, 0] = 2.0
+        state.strengths[0] = -1.0
+        filt.last_resample_ess = True
+        calls.append(("roughen", 2.0, -1.0))
+
+    monkeypatch.setattr(filt, "_gpu_enabled", lambda: True)
+    monkeypatch.setattr(filt, "refit_strengths_for_particles", fake_profile)
+    monkeypatch.setattr(
+        filt,
+        "_continuous_expected_counts_pair_sequence_torch",
+        fake_counts,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_log_likelihood_sequence_gpu",
+        lambda lam, *_args, **_kwargs: torch.zeros(lam.shape[1]),
+    )
+    monkeypatch.setattr(filt, "_maybe_resample_continuous", fake_resample)
+    monkeypatch.setattr(filt, "adapt_num_particles", lambda **_kwargs: None)
+    monkeypatch.setattr(filt, "align_continuous_labels", lambda: None)
+    monkeypatch.setattr(filt, "_advance_adapt_cooldown", lambda: None)
+    monkeypatch.setattr(filt, "_maybe_update_convergence", lambda **_kwargs: None)
+
+    filt.update_continuous_pair_sequence(
+        z_obs=np.array([20.0], dtype=float),
+        pose_idx=0,
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times_s=np.array([1.0], dtype=float),
+        observation_count_variances=np.array([2.0], dtype=float),
+    )
+
+    assert calls == [
+        ("profile", 1.0, 10.0),
+        ("likelihood", 1.0, 10.0),
+        ("roughen", 2.0, -1.0),
+        ("profile", 2.0, 20.0),
+    ]
+    assert filt.continuous_particles[0].state.strengths[0] == pytest.approx(20.0)
+
+
+def test_pre_likelihood_profile_rejects_historical_refit_reweight() -> None:
+    """Pre-profile state updates must not rebase weights against old data."""
+    with pytest.raises(ValueError, match="cannot be combined"):
+        PFConfig(
+            conditional_strength_profile_before_likelihood=True,
+            conditional_strength_refit_reweight=True,
+        )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        RotatingShieldPFConfig(
+            conditional_strength_profile_before_likelihood=True,
+            conditional_strength_refit_reweight=True,
+        )
+
+
 def test_identical_source_state_gpu_compression_preserves_sequence_counts() -> None:
     """Duplicate source states should share response work without changing counts."""
     torch = pytest.importorskip("torch")
@@ -2246,9 +2570,18 @@ def test_resampling_increases_neff() -> None:
     dummy_kernel.num_sources = 1
     pf = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
     pf.continuous_particles = [
-        IsotopeParticle(state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0), log_weight=np.log(0.99)),
-        IsotopeParticle(state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0), log_weight=np.log(0.005)),
-        IsotopeParticle(state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0), log_weight=np.log(0.005)),
+        IsotopeParticle(
+            state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0),
+            log_weight=np.log(0.99),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0),
+            log_weight=np.log(0.005),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(0, np.zeros((0, 3)), np.zeros(0), 0.0),
+            log_weight=np.log(0.005),
+        ),
     ]
     before = 1.0 / np.sum(pf.continuous_weights**2)
     pf._maybe_resample_continuous()

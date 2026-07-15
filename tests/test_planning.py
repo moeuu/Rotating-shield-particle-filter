@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import planning.candidate_generation as candidate_generation
 import planning.dss_pp as dss_pp
 import planning.shield_rotation as shield_rotation
 from measurement.kernels import ShieldParams
@@ -30,7 +31,11 @@ from planning.dss_pp import (
     build_shield_program_library,
     select_dss_pp_next_station,
 )
-from planning.candidate_generation import generate_candidate_poses
+from planning.candidate_generation import (
+    expand_candidate_height_actions,
+    generate_candidate_poses,
+    resolve_detector_height_actions,
+)
 from planning.shield_rotation import rotation_policy_step, select_best_orientation
 from planning.shield_rotation import select_separation_orientations
 from planning.traversability import TraversabilityMap
@@ -70,7 +75,9 @@ def _build_simple_estimator() -> RotatingShieldPFEstimator:
     candidate_sources = np.array([[1.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=2, max_sources=1, resample_threshold=0.5)
+    config = RotatingShieldPFConfig(
+        num_particles=2, max_sources=1, resample_threshold=0.5
+    )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=candidate_sources,
@@ -89,13 +96,19 @@ def _build_simple_estimator() -> RotatingShieldPFEstimator:
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([10.0]), background=0.0
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([10.0]),
+                background=0.0,
             ),
             log_weight=np.log(0.5),
         ),
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([1.0]), background=0.0
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([1.0]),
+                background=0.0,
             ),
             log_weight=np.log(0.5),
         ),
@@ -143,7 +156,11 @@ def test_select_best_orientation_prefers_unblocked_direction() -> None:
     blocked_mask = []
     for R in mats:
         idx = octant_index_from_rotation(R)
-        blocked_mask.append(oct_shield.blocks_ray(detector_position=detector, source_position=source, octant_index=idx))
+        blocked_mask.append(
+            oct_shield.blocks_ray(
+                detector_position=detector, source_position=source, octant_index=idx
+            )
+        )
 
     scores = []
     for oid, (RFe, RPb) in enumerate(zip(mats, mats)):
@@ -259,7 +276,9 @@ def test_shield_selection_batch_grids_match_pairwise_scores() -> None:
                 )
 
 
-def test_orientation_expected_information_gain_grid_cpu_fallback_matches_pairwise() -> None:
+def test_orientation_expected_information_gain_grid_cpu_fallback_matches_pairwise() -> (
+    None
+):
     """All-pair EIG grid should preserve the pairwise CPU EIG calculation."""
     estimator = _build_simple_estimator()
     planning_particles = estimator.planning_particles()
@@ -305,10 +324,14 @@ def test_select_next_pose_balances_information_and_cost() -> None:
         def __init__(self) -> None:
             self.poses = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=float)
 
-        def expected_uncertainty(self, pose_idx: int, live_time_s: float = 1.0) -> float:
+        def expected_uncertainty(
+            self, pose_idx: int, live_time_s: float = 1.0
+        ) -> float:
             return [2.0, 0.5][pose_idx]
 
-        def max_orientation_information_gain(self, pose_idx: int, live_time_s: float = 1.0) -> float:
+        def max_orientation_information_gain(
+            self, pose_idx: int, live_time_s: float = 1.0
+        ) -> float:
             return [0.0, 0.4][pose_idx]
 
     est = DummyEstimator()
@@ -395,6 +418,245 @@ def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() ->
     assert any(np.allclose(candidate, [8.5, 8.5, 0.5]) for candidate in candidates)
 
 
+def test_candidate_filter_prefers_batched_free_space_path() -> None:
+    """Standard maps should filter candidate arrays without scalar callbacks."""
+
+    class BatchPlanningMap:
+        """Expose both paths while making an accidental scalar call fail."""
+
+        def __init__(self) -> None:
+            """Initialize batch-call accounting."""
+            self.batch_calls = 0
+
+        def is_free(self, _point: np.ndarray) -> bool:
+            """Reject use of the compatibility-only scalar path."""
+            raise AssertionError("scalar free-space path must not be selected")
+
+        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
+            """Accept candidates whose x coordinate is at least one metre."""
+            self.batch_calls += 1
+            return np.asarray(points, dtype=float)[:, 0] >= 1.0
+
+    planning_map = BatchPlanningMap()
+    candidates = np.asarray(
+        [[0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 1.5]],
+        dtype=float,
+    )
+
+    filtered = candidate_generation._filter_candidates(
+        candidates,
+        visited_poses_xyz=None,
+        min_dist_from_visited=0.0,
+        is_free_fn=candidate_generation._resolve_free_space_checker(planning_map),
+        is_free_batch_fn=(
+            candidate_generation._resolve_free_space_batch_checker(planning_map)
+        ),
+    )
+
+    assert planning_map.batch_calls == 1
+    assert np.allclose(filtered, candidates[1:])
+
+
+def test_candidate_height_expansion_matches_scalar_oracle() -> None:
+    """Discrete height actions should be a vectorized Cartesian expansion."""
+    candidates = np.array(
+        [[1.0, 2.0, 0.5], [3.0, 4.0, 0.5]],
+        dtype=float,
+    )
+    heights = resolve_detector_height_actions(
+        [1.5, 0.5, 1.5],
+        default_height_m=0.5,
+        bounds_z=(0.0, 2.0),
+    )
+
+    expanded = expand_candidate_height_actions(candidates, heights)
+    expected = np.asarray(
+        [
+            [candidate[0], candidate[1], height]
+            for candidate in candidates
+            for height in heights
+        ],
+        dtype=float,
+    )
+
+    assert np.allclose(expanded, expected)
+
+
+def test_candidate_generation_keeps_same_xy_alternate_height_action() -> None:
+    """A height partner should bypass horizontal station-spacing rejection."""
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    candidates = generate_candidate_poses(
+        current_pose_xyz=current,
+        n_candidates=8,
+        strategy="free_space_sobol",
+        min_dist_from_visited=3.0,
+        visited_poses_xyz=current.reshape(1, 3),
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 1.5], dtype=float),
+        ),
+        rng=np.random.default_rng(11),
+        detector_heights_m=[0.5, 1.5],
+        include_current_xy_height_actions=True,
+    )
+
+    assert any(np.allclose(candidate, [1.0, 1.0, 1.5]) for candidate in candidates)
+    assert not any(np.allclose(candidate, current) for candidate in candidates)
+
+
+def test_dss_station_spacing_preserves_height_partner_only() -> None:
+    """DSS station filtering should preserve a distinct-height revisit."""
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [
+            [1.0, 1.0, 0.5],
+            [1.0, 1.0, 1.5],
+            [1.5, 1.0, 0.5],
+            [5.0, 1.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    filtered, removed = dss_pp._filter_station_separation(
+        candidates,
+        visited,
+        min_separation_m=3.0,
+    )
+    penalties = dss_pp._station_revisit_penalties_batch(
+        candidates,
+        visited,
+        min_separation_m=3.0,
+    )
+
+    assert removed == 2
+    assert np.allclose(filtered, [[1.0, 1.0, 1.5], [5.0, 1.0, 0.5]])
+    assert penalties[1] == pytest.approx(0.0)
+    assert penalties[0] > 0.0
+
+
+def test_height_partner_filter_rejects_already_visited_actions_and_uses_xy_spacing() -> (
+    None
+):
+    """Visited heights must not reopen duplicates or hide short horizontal moves."""
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
+        dtype=float,
+    )
+    candidates = np.array(
+        [
+            [1.0, 1.0, 0.5],
+            [1.0, 1.0, 1.5],
+            [1.0, 1.0, 2.5],
+            [3.9, 1.0, 2.5],
+            [4.1, 1.0, 1.5],
+        ],
+        dtype=float,
+    )
+
+    filtered = candidate_generation._filter_candidates(
+        candidates,
+        visited,
+        3.0,
+        lambda _candidate: True,
+        allow_height_partners=True,
+    )
+
+    assert np.allclose(
+        filtered,
+        [[1.0, 1.0, 2.5], [4.1, 1.0, 1.5]],
+    )
+
+
+def test_height_partner_filter_uses_current_station_and_shared_tolerance() -> None:
+    """Only the current station may reopen spacing for an alternate height."""
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [5.0, 5.0, 0.5]],
+        dtype=float,
+    )
+    current = visited[-1]
+    candidates = np.array(
+        [
+            [1.0, 1.0, 1.5],
+            [5.0 + 5.0e-7, 5.0, 1.5],
+            [9.0, 9.0, 1.5],
+        ],
+        dtype=float,
+    )
+
+    filtered = candidate_generation._filter_candidates(
+        candidates,
+        visited,
+        3.0,
+        lambda _candidate: True,
+        allow_height_partners=True,
+        height_partner_reference_xyz=current,
+        height_partner_xy_tolerance_m=1.0e-6,
+    )
+
+    assert np.allclose(filtered, candidates[1:])
+
+
+def test_dss_height_partner_mask_uses_current_station_and_shared_tolerance() -> None:
+    """Planner pairing must match runtime xy tolerance at the current station."""
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [5.0, 5.0, 0.5]],
+        dtype=float,
+    )
+    candidates = np.array(
+        [[1.0, 1.0, 1.5], [5.0 + 5.0e-7, 5.0, 1.5]],
+        dtype=float,
+    )
+
+    shared_tolerance_mask = dss_pp._height_partner_mask_batch(
+        candidates,
+        visited,
+        reference_pose_xyz=visited[-1],
+        xy_tolerance_m=1.0e-6,
+    )
+    strict_tolerance_mask = dss_pp._height_partner_mask_batch(
+        candidates,
+        visited,
+        reference_pose_xyz=visited[-1],
+        xy_tolerance_m=1.0e-9,
+    )
+
+    assert shared_tolerance_mask.tolist() == [False, True]
+    assert strict_tolerance_mask.tolist() == [False, False]
+
+
+def test_dss_height_partner_requires_an_unvisited_height_action() -> None:
+    """DSS should waive revisit costs only for a genuinely new height action."""
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
+        dtype=float,
+    )
+    candidates = np.array(
+        [
+            [1.0, 1.0, 0.5],
+            [1.0, 1.0, 1.5],
+            [1.0, 1.0, 2.5],
+            [5.0, 1.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    filtered, removed = dss_pp._filter_station_separation(
+        candidates,
+        visited,
+        min_separation_m=3.0,
+    )
+    penalties = dss_pp._station_revisit_penalties_batch(
+        candidates,
+        visited,
+        min_separation_m=3.0,
+    )
+
+    assert removed == 2
+    assert np.allclose(filtered, [[1.0, 1.0, 2.5], [5.0, 1.0, 0.5]])
+    assert np.all(penalties[:2] > 0.0)
+    assert penalties[2] == pytest.approx(0.0)
+
+
 def test_estimate_lambda_cost_range_scales_motion() -> None:
     """Range-based lambda should match uncertainty and motion-cost ranges."""
     uncertainties = np.array([1.0, 2.0, 4.0], dtype=float)
@@ -410,10 +672,13 @@ def test_minimum_observation_shortfall_is_zero_only_when_all_isotopes_visible() 
         {"Cs-137": 5.0, "Co-60": 5.0},
         min_counts=5.0,
     ) == pytest.approx(0.0)
-    assert minimum_observation_shortfall(
-        {"Cs-137": 5.0, "Co-60": 0.0},
-        min_counts=5.0,
-    ) > 0.0
+    assert (
+        minimum_observation_shortfall(
+            {"Cs-137": 5.0, "Co-60": 0.0},
+            min_counts=5.0,
+        )
+        > 0.0
+    )
 
 
 def test_pose_selection_prefers_all_isotope_observability() -> None:
@@ -726,13 +991,19 @@ def test_orientation_expected_information_gain_positive_when_strengths_differ() 
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([10.0]), background=0.0
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([10.0]),
+                background=0.0,
             ),
             log_weight=np.log(0.5),
         ),
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([1.0]), background=0.0
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([1.0]),
+                background=0.0,
             ),
             log_weight=np.log(0.5),
         ),
@@ -808,7 +1079,9 @@ def test_short_time_update_uses_default_duration() -> None:
     est._ensure_kernel_cache()
     mats = generate_octant_rotation_matrices()
     z_k = {"Cs-137": 5.0}
-    est.short_time_update(z_k=z_k, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=None)
+    est.short_time_update(
+        z_k=z_k, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=None
+    )
     import pytest
 
     assert est.measurements[-1].live_time_s == pytest.approx(0.25, rel=1e-12)
@@ -822,7 +1095,9 @@ def test_should_stop_shield_rotation_by_dwell_time() -> None:
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=5, max_sources=1, max_dwell_time_s=0.5, ig_threshold=1e6)
+    config = RotatingShieldPFConfig(
+        num_particles=5, max_sources=1, max_dwell_time_s=0.5, ig_threshold=1e6
+    )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=candidate_sources,
@@ -835,8 +1110,12 @@ def test_should_stop_shield_rotation_by_dwell_time() -> None:
     est._ensure_kernel_cache()
     mats = generate_octant_rotation_matrices()
     # Two short updates totaling > max_dwell_time_s
-    est.short_time_update(z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3)
-    est.short_time_update(z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3)
+    est.short_time_update(
+        z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3
+    )
+    est.short_time_update(
+        z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3
+    )
     assert est.should_stop_shield_rotation(
         pose_idx=0,
         ig_threshold=config.ig_threshold,
@@ -870,15 +1149,27 @@ def test_expected_uncertainty_after_pose_is_finite() -> None:
 
     filt.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([2.0]), background=0.1),
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([2.0]),
+                background=0.1,
+            ),
             log_weight=np.log(0.5),
         ),
         IsotopeParticle(
-            state=IsotopeState(num_sources=1, positions=np.array([[0.0, 0.0, 0.0]]), strengths=np.array([5.0]), background=0.1),
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]]),
+                strengths=np.array([5.0]),
+                background=0.1,
+            ),
             log_weight=np.log(0.5),
         ),
     ]
-    U = est.expected_uncertainty_after_pose(pose_idx=0, orient_idx=0, live_time_s=1.0, num_samples=10)
+    U = est.expected_uncertainty_after_pose(
+        pose_idx=0, orient_idx=0, live_time_s=1.0, num_samples=10
+    )
     assert np.isfinite(U)
     assert U >= 0.0
 
@@ -1407,18 +1698,11 @@ def test_dss_pp_expected_bic_gap_batch_matches_scalar_oracle() -> None:
         sqrt_weight = 1.0 / np.sqrt(np.maximum(expected_counts, 1.0))
         best_deviance = np.inf
         for removed_idx in range(program_matrix.shape[1]):
-            keep = [
-                idx
-                for idx in range(program_matrix.shape[1])
-                if idx != removed_idx
-            ]
+            keep = [idx for idx in range(program_matrix.shape[1]) if idx != removed_idx]
             design = program_matrix[:, keep]
             weighted_design = design * sqrt_weight[:, None]
             weighted_expected = expected_counts * sqrt_weight
-            normal = (
-                weighted_design.T @ weighted_design
-                + 1.0e-9 * np.eye(len(keep))
-            )
+            normal = weighted_design.T @ weighted_design + 1.0e-9 * np.eye(len(keep))
             rhs = weighted_design.T @ weighted_expected
             coeff = np.maximum(np.linalg.pinv(normal) @ rhs, 0.0)
             fitted = np.sum(design * coeff.reshape(1, -1), axis=1)
@@ -2100,9 +2384,10 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     assert result.shield_program.pair_ids
     assert result.diagnostics["node_count"] > 0
     assert result.diagnostics["ranked_nodes"]
-    assert result.diagnostics["ranked_nodes"][0]["score"] >= result.diagnostics[
-        "ranked_nodes"
-    ][-1]["score"]
+    assert (
+        result.diagnostics["ranked_nodes"][0]["score"]
+        >= result.diagnostics["ranked_nodes"][-1]["score"]
+    )
     assert np.allclose(result.next_pose, candidates[result.next_pose_index])
     assert "component_leaders" in result.diagnostics
     assert "score" in result.diagnostics["component_leaders"]
@@ -2173,18 +2458,288 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
             lambda_rotation=0.0,
             augment_candidates=False,
         ),
+        height_partner_forced_program_pair_ids=(0,),
     )
 
     assert result.shield_program.pair_ids == forced_pairs
     assert result.shield_program.kind == "forced_baseline"
     assert result.diagnostics["program_count"] == 1
-    assert {
-        tuple(node["pair_ids"]) for node in result.diagnostics["ranked_nodes"]
-    } == {forced_pairs}
+    assert result.diagnostics["height_partner_forced_program_requested"] is True
+    assert result.diagnostics["height_partner_forced_program_applied"] is False
+    assert {tuple(node["pair_ids"]) for node in result.diagnostics["ranked_nodes"]} == {
+        forced_pairs
+    }
     pair_diag = result.diagnostics["selected_pairwise_ambiguity"]["Cs-137"]
     assert pair_diag["mode_count"] == 2
     assert pair_diag["program_measurements"] == len(result.shield_program.pair_ids)
     assert pair_diag["bottleneck_pairs"]
+
+
+def _build_height_partner_program_test_estimator() -> RotatingShieldPFEstimator:
+    """Build a two-mode estimator for height-partner program ranking tests."""
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array(
+            [[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]],
+            dtype=float,
+        ),
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            use_gpu=False,
+            planning_particles=None,
+            init_num_sources=(1, 1),
+        ),
+        shield_params=ShieldParams(),
+    )
+    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.filters["Cs-137"].continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
+                strengths=np.array([2000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        ),
+    ]
+    return estimator
+
+
+def test_forced_height_program_information_uses_exact_pairs_and_length() -> None:
+    """Forced-program information must reflect its executed views and duration."""
+    estimator = SimpleNamespace(
+        isotopes=["Cs-137"],
+        pf_config=SimpleNamespace(alpha_weights={"Cs-137": 1.0}),
+    )
+    pair_cache = {
+        "Cs-137": (
+            np.array([[2.0, 8.0], [5.0, 5.0]], dtype=float),
+            [0.5, 0.5],
+        )
+    }
+    informative = dss_pp._program_conditioned_information_gain(
+        estimator=estimator,
+        pair_cache=pair_cache,
+        program=dss_pp.ShieldProgram("informative", (0,), "forced_height_partner"),
+    )
+    repeated = dss_pp._program_conditioned_information_gain(
+        estimator=estimator,
+        pair_cache=pair_cache,
+        program=dss_pp.ShieldProgram(
+            "repeated",
+            (0, 0),
+            "forced_height_partner",
+        ),
+    )
+    uninformative = dss_pp._program_conditioned_information_gain(
+        estimator=estimator,
+        pair_cache=pair_cache,
+        program=dss_pp.ShieldProgram(
+            "uninformative",
+            (1,),
+            "forced_height_partner",
+        ),
+    )
+
+    assert informative > 0.0
+    assert repeated > informative
+    assert uninformative == pytest.approx(0.0)
+
+
+def test_height_optimized_twin_does_not_scale_first_action_penalty() -> None:
+    """A non-executable height twin must not affect first-action normalization."""
+
+    def _node(
+        pose_index: int,
+        pose_xyz: np.ndarray,
+        program_kind: str,
+        static_score: float,
+        observation_penalty: float,
+    ) -> dss_pp.DSSPPNode:
+        """Build one compact DSS node for observation-policy testing."""
+        return dss_pp.DSSPPNode(
+            pose_index=pose_index,
+            pose_xyz=pose_xyz,
+            program=dss_pp.ShieldProgram(program_kind, (0,), program_kind),
+            score=static_score,
+            static_score=static_score,
+            distance_weight=0.0,
+            observation_penalty_weight=0.0,
+            information_gain=0.0,
+            signature_score=0.0,
+            temporal_separation_score=0.0,
+            observation_penalty=observation_penalty,
+            count_balance_penalty=0.0,
+            differential_penalty=0.0,
+            dose_score=0.0,
+            count_utility=0.0,
+            coverage_gain=0.0,
+            revisit_penalty=0.0,
+            bearing_diversity_gain=0.0,
+            frontier_gain=0.0,
+            turn_penalty=0.0,
+            local_orbit_gain=0.0,
+            station_condition_gain=0.0,
+            correlation_reduction_gain=0.0,
+            isotope_balance_gain=0.0,
+            environment_signature_score=0.0,
+            occlusion_boundary_gain=0.0,
+            elevation_signature_score=0.0,
+            elevation_condition_gain=0.0,
+            vertical_environment_signature_score=0.0,
+        )
+
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    height = np.array([1.0, 1.0, 1.5], dtype=float)
+    normal = np.array([4.0, 1.0, 0.5], dtype=float)
+    forced = _node(0, height, "forced_height_partner", 1.0, 0.25)
+    optimized_twin = _node(0, height, "optimized", 1.0e6, 1.0)
+    normal_node = _node(1, normal, "optimized", 0.0, 0.75)
+    first_nodes, _ = dss_pp._split_height_partner_first_action_nodes(
+        [forced, optimized_twin, normal_node],
+        visited_poses_xyz=current.reshape(1, 3),
+        current_pose_xyz=current,
+        enabled=True,
+    )
+    estimator = SimpleNamespace(normals=np.array([[1.0, 0.0, 0.0]]))
+    config = DSSPPConfig(
+        eta_observation=1.0,
+        enforce_min_observation=False,
+        lambda_distance=0.0,
+        lambda_rotation=0.0,
+        lambda_time=0.0,
+    )
+
+    rescored = dss_pp._apply_node_observation_policy(
+        first_nodes,
+        current_pose_xyz=current,
+        current_pair_id=None,
+        estimator=estimator,
+        map_api=None,
+        config=config,
+    )
+    expected = dss_pp._apply_node_observation_policy(
+        [forced, normal_node],
+        current_pose_xyz=current,
+        current_pair_id=None,
+        estimator=estimator,
+        map_api=None,
+        config=config,
+    )
+
+    assert {node.program.kind for node in first_nodes} == {
+        "forced_height_partner",
+        "optimized",
+    }
+    assert [node.score for node in rescored] == pytest.approx(
+        [node.score for node in expected]
+    )
+    assert [node.observation_penalty_weight for node in rescored] == pytest.approx(
+        [node.observation_penalty_weight for node in expected]
+    )
+
+
+@pytest.mark.parametrize("worker_count", [1, 2])
+def test_dss_pp_scores_forced_height_partner_program_before_ranking(
+    worker_count: int,
+) -> None:
+    """Height-pair reuse must alter planner ranking before action selection."""
+    estimator = _build_height_partner_program_test_estimator()
+    visited = np.array([[2.0, 2.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [[2.0, 2.0, 1.5], [2.0, 6.0, 0.5]],
+        dtype=float,
+    )
+    config = DSSPPConfig(
+        horizon=2,
+        beam_width=4,
+        max_programs=8,
+        program_length=4,
+        temporal_cover_programs=1,
+        live_time_s=1.0,
+        lambda_eig=1.0,
+        lambda_signature=1.0,
+        lambda_distance=0.0,
+        eta_observation=1.0,
+        eta_differential=0.0,
+        lambda_rotation=0.0,
+        augment_candidates=False,
+        candidate_preselect_enable=False,
+        same_isotope_direct_separation_guard=False,
+        program_eval_workers=worker_count,
+        diagnostic_ranked_node_limit=100,
+    )
+
+    unrestricted = select_dss_pp_next_station(
+        estimator=estimator,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=visited[0],
+        visited_poses_xyz=visited,
+        config=config,
+    )
+    forced_pairs = (63, 63, 63, 63)
+    constrained = select_dss_pp_next_station(
+        estimator=estimator,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=visited[0],
+        visited_poses_xyz=visited,
+        config=config,
+        height_partner_forced_program_pair_ids=forced_pairs,
+    )
+
+    assert np.allclose(unrestricted.next_pose, candidates[0])
+    assert np.allclose(constrained.next_pose, candidates[1])
+    height_nodes = [
+        node
+        for node in constrained.diagnostics["ranked_nodes"]
+        if np.allclose(node["pose_xyz"], candidates[0])
+    ]
+    normal_nodes = [
+        node
+        for node in constrained.diagnostics["ranked_nodes"]
+        if np.allclose(node["pose_xyz"], candidates[1])
+    ]
+    assert {tuple(node["pair_ids"]) for node in height_nodes} == {forced_pairs}
+    assert {node["program_kind"] for node in height_nodes} == {"forced_height_partner"}
+    assert normal_nodes
+    assert all(node["program_kind"] != "forced_height_partner" for node in normal_nodes)
+    assert constrained.diagnostics["height_partner_forced_candidate_count"] == 1
+    assert constrained.diagnostics["height_partner_forced_node_count"] == 1
+    assert constrained.diagnostics["height_partner_forced_program_applied"] is True
+    assert len(constrained.sequence) == 2
+    assert constrained.sequence[1].program.kind != "forced_height_partner"
+
+
+def test_height_partner_program_is_not_forced_for_visited_exact_action() -> None:
+    """A previously sampled height must not qualify via another sampled height."""
+    candidates = np.array(
+        [[2.0, 2.0, 0.5], [2.0, 2.0, 1.5], [2.0, 2.0, 2.5]],
+        dtype=float,
+    )
+    visited = np.array(
+        [[2.0, 2.0, 0.5], [2.0, 2.0, 1.5]],
+        dtype=float,
+    )
+
+    mask = dss_pp._height_partner_mask_batch(candidates, visited)
+
+    assert mask.tolist() == [False, False, True]
 
 
 def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
@@ -2953,7 +3508,11 @@ def test_dss_pp_batched_station_features_match_scalar_oracle() -> None:
     )
     visited = np.array([[0.0, 0.0, 1.0], [2.0, 6.0, 1.0]], dtype=float)
     centers = np.array(
-        [[x, y, 1.0] for x in np.linspace(0.5, 8.5, 4) for y in np.linspace(0.5, 8.5, 4)],
+        [
+            [x, y, 1.0]
+            for x in np.linspace(0.5, 8.5, 4)
+            for y in np.linspace(0.5, 8.5, 4)
+        ],
         dtype=float,
     )
     config = DSSPPConfig(
@@ -3087,7 +3646,9 @@ def test_dss_pp_batched_station_features_match_scalar_oracle() -> None:
             scalar_correlation.append(0.0)
         if balance_rows:
             balance = np.asarray(balance_rows, dtype=float)
-            scalar_balance.append(float(0.75 * np.min(balance) + 0.25 * np.mean(balance)))
+            scalar_balance.append(
+                float(0.75 * np.min(balance) + 0.25 * np.mean(balance))
+            )
         else:
             scalar_balance.append(0.0)
     scalar_correlation = np.asarray(scalar_correlation, dtype=float)

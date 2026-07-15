@@ -101,6 +101,44 @@ class TraversabilityMap:
             return False
         return idx in self._traversable_set
 
+    def is_free_batch(self, points: Sequence[Sequence[float]]) -> np.ndarray:
+        """Return traversability flags for a batch of world-space points."""
+        points_array = np.asarray(points, dtype=float)
+        if points_array.size == 0:
+            return np.zeros(0, dtype=bool)
+        if points_array.ndim != 2 or points_array.shape[1] < 2:
+            raise ValueError("points must have shape (N, D) with D >= 2.")
+        if np.any(~np.isfinite(points_array[:, :2])):
+            raise ValueError("point coordinates must be finite.")
+        relative_xy = points_array[:, :2] - np.asarray(
+            self.origin,
+            dtype=float,
+        )[None, :]
+        cell_indices = np.floor(relative_xy / float(self.cell_size)).astype(
+            np.int64,
+        )
+        inside = (
+            (cell_indices[:, 0] >= 0)
+            & (cell_indices[:, 1] >= 0)
+            & (cell_indices[:, 0] < int(self.grid_shape[0]))
+            & (cell_indices[:, 1] < int(self.grid_shape[1]))
+        )
+        free = np.zeros(points_array.shape[0], dtype=bool)
+        if not np.any(inside) or not self.traversable_cells:
+            return free
+        cell_codes = (
+            cell_indices[:, 0] * int(self.grid_shape[1]) + cell_indices[:, 1]
+        )
+        traversable = np.asarray(
+            self.traversable_cells,
+            dtype=np.int64,
+        ).reshape(-1, 2)
+        traversable_codes = (
+            traversable[:, 0] * int(self.grid_shape[1]) + traversable[:, 1]
+        )
+        free[inside] = np.isin(cell_codes[inside], traversable_codes)
+        return free
+
     def shortest_path_cells(
         self,
         start_point: Sequence[float],

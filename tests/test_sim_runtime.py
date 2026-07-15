@@ -20,7 +20,10 @@ from measurement.obstacles import ObstacleGrid
 from pf.estimator import MeasurementRecord, RotatingShieldPFEstimator
 from realtime_demo import _has_environment_obstacles, run_live_pf
 from sim.geant4_app.app import Geant4Application
-from sim.geant4_app.bridge_server import Geant4BridgeServerConfig, serve_forever as serve_geant4_forever
+from sim.geant4_app.bridge_server import (
+    Geant4BridgeServerConfig,
+    serve_forever as serve_geant4_forever,
+)
 from sim.geant4_app.io_format import read_response_file
 from sim.geant4_app.scene_export import ExportedDetectorModel, export_scene_for_geant4
 from sim.isaacsim_app.app import IsaacSimAppConfig, IsaacSimApplication
@@ -34,7 +37,13 @@ from sim.isaacsim_app.geometry import (
 )
 from sim.isaacsim_app.materials import composition_mass_attenuation_at_energy
 from sim.isaacsim_app.bridge_server import BridgeServerConfig, serve_forever
-from sim.isaacsim_app.scene_builder import SceneBuilder, SceneDescription, SourceDescription, StagePrimPaths
+from sim.isaacsim_app.robot_controller import RobotController
+from sim.isaacsim_app.scene_builder import (
+    SceneBuilder,
+    SceneDescription,
+    SourceDescription,
+    StagePrimPaths,
+)
 from sim.isaacsim_app.stage_backend import (
     FakeStageBackend,
     apply_camera_gesture_bindings_to_module,
@@ -89,8 +98,8 @@ def _write_fake_external_geant4(path: Path) -> Path:
                 "set -euo pipefail",
                 "RESPONSE=''",
                 "while [[ $# -gt 0 ]]; do",
-                "  case \"$1\" in",
-                "    --response) RESPONSE=\"$2\"; shift 2 ;;",
+                '  case "$1" in',
+                '    --response) RESPONSE="$2"; shift 2 ;;',
                 "    *) shift ;;",
                 "  esac",
                 "done",
@@ -111,29 +120,29 @@ def _write_fake_persistent_geant4(path: Path) -> Path:
                 "#!/bin/bash",
                 "set -euo pipefail",
                 "PERSISTENT=0",
-                "for arg in \"$@\"; do",
-                "  if [[ \"$arg\" == \"--persistent\" ]]; then PERSISTENT=1; fi",
+                'for arg in "$@"; do',
+                '  if [[ "$arg" == "--persistent" ]]; then PERSISTENT=1; fi',
                 "done",
-                "if [[ \"$PERSISTENT\" != \"1\" ]]; then",
+                'if [[ "$PERSISTENT" != "1" ]]; then',
                 "  echo 'expected --persistent' >&2",
                 "  exit 2",
                 "fi",
                 "RUN_INDEX=0",
                 "while IFS= read -r LINE; do",
-                "  if [[ \"$LINE\" == \"SHUTDOWN\"* ]]; then",
+                '  if [[ "$LINE" == "SHUTDOWN"* ]]; then',
                 "    echo 'SIMBRIDGE_OK shutdown'",
                 "    exit 0",
                 "  fi",
                 "  RESPONSE=''",
                 "  for TOKEN in $LINE; do",
-                "    case \"$TOKEN\" in",
-                "      response=*) RESPONSE=\"${TOKEN#response=}\" ;;",
+                '    case "$TOKEN" in',
+                '      response=*) RESPONSE="${TOKEN#response=}" ;;',
                 "    esac",
                 "  done",
-                "  RESPONSE=\"${RESPONSE//%20/ }\"",
+                '  RESPONSE="${RESPONSE//%20/ }"',
                 "  RUN_INDEX=$((RUN_INDEX + 1))",
-                "  printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' \"$RUN_INDEX\" > \"$RESPONSE\"",
-                "  echo \"SIMBRIDGE_OK response=$RESPONSE\"",
+                '  printf \'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n\' "$RUN_INDEX" > "$RESPONSE"',
+                '  echo "SIMBRIDGE_OK response=$RESPONSE"',
                 "done",
             ]
         ),
@@ -282,7 +291,9 @@ def test_analytic_runtime_uses_python_transport_obstacle_attenuation() -> None:
     assert blocked_observation.metadata["backend"] == "analytic"
     assert blocked_observation.metadata["transport_backend"] == "python"
     assert float(blocked_observation.metadata["total_obstacle_path_cm"]) > 0.0
-    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+    assert sum(blocked_observation.spectrum_counts) < sum(
+        clear_observation.spectrum_counts
+    )
 
 
 def test_analytic_runtime_uses_python_transport_spherical_shield() -> None:
@@ -321,7 +332,9 @@ def test_analytic_runtime_uses_python_transport_spherical_shield() -> None:
 
     assert float(blocked_observation.metadata["total_fe_path_cm"]) > 0.0
     assert float(blocked_observation.metadata["total_pb_path_cm"]) > 0.0
-    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+    assert sum(blocked_observation.spectrum_counts) < sum(
+        clear_observation.spectrum_counts
+    )
 
 
 def test_mock_gui_uses_shared_python_transport_obstacles() -> None:
@@ -366,7 +379,9 @@ def test_mock_gui_uses_shared_python_transport_obstacles() -> None:
     assert blocked_observation.metadata["backend"] == "isaacsim-mock"
     assert blocked_observation.metadata["transport_backend"] == "python"
     assert float(blocked_observation.metadata["total_obstacle_path_cm"]) > 0.0
-    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+    assert sum(blocked_observation.spectrum_counts) < sum(
+        clear_observation.spectrum_counts
+    )
 
 
 def test_isaacsim_config_parses_camera_gesture_bindings() -> None:
@@ -423,7 +438,9 @@ def test_isaacsim_config_parses_view_helpers() -> None:
     assert config.lighting.dome_intensity == pytest.approx(150.0)
     assert config.lighting.interior_light_position_xyz == pytest.approx((2.5, 2.5, 3.0))
     assert len(config.lighting.interior_lights) == 1
-    assert config.lighting.interior_lights[0].position_xyz == pytest.approx((0.0, 0.0, 3.0))
+    assert config.lighting.interior_lights[0].position_xyz == pytest.approx(
+        (0.0, 0.0, 3.0)
+    )
     assert config.lighting.interior_lights[0].intensity == pytest.approx(5000.0)
     assert config.lighting.interior_lights[0].radius_m == pytest.approx(0.05)
     assert config.preserve_viewport_on_reset is True
@@ -569,10 +586,12 @@ def test_real_application_loads_scene_into_stage_backend() -> None:
     assert backend.opened_usd_path == "demo_room.usda"
     assert "/World/SimBridge/Obstacles/Obstacle_0000" in backend.prims
     assert "/World/SimBridge/Sources/Cs_137_00" in backend.prims
-    assert backend.prims["/World/SimBridge/Sources/Cs_137_00"].scale_xyz == pytest.approx((0.16, 0.16, 0.16))
-    assert backend.prims["/World/SimBridge/Sources/Cs_137_00"].metadata["color_rgb"] == pytest.approx(
-        (1.0, 0.05, 0.05)
-    )
+    assert backend.prims[
+        "/World/SimBridge/Sources/Cs_137_00"
+    ].scale_xyz == pytest.approx((0.16, 0.16, 0.16))
+    assert backend.prims["/World/SimBridge/Sources/Cs_137_00"].metadata[
+        "color_rgb"
+    ] == pytest.approx((1.0, 0.05, 0.05))
     assert "/World/SimBridge/Robot/Body" in backend.prims
     assert "/World/SimBridge/Robot/WheelFrontLeft" in backend.prims
     assert observation.metadata["backend"] == "isaacsim"
@@ -631,16 +650,23 @@ def test_real_application_authors_view_helpers() -> None:
 
     assert "/World/SimBridge/Obstacles/Obstacle_0000" not in backend.prims
     assert backend.prims["/World/SimBridge/View/DomeLight"].prim_type == "DomeLight"
-    assert backend.prims["/World/SimBridge/View/InteriorLight"].prim_type == "SphereLight"
-    assert backend.prims["/World/SimBridge/View/InteriorLight_00"].prim_type == "SphereLight"
+    assert (
+        backend.prims["/World/SimBridge/View/InteriorLight"].prim_type == "SphereLight"
+    )
+    assert (
+        backend.prims["/World/SimBridge/View/InteriorLight_00"].prim_type
+        == "SphereLight"
+    )
     camera = backend.prims["/World/SimBridge/View/InitialCamera"]
     assert camera.prim_type == "Camera"
     assert camera.pose.translation_xyz == pytest.approx((2.8, -2.6, 1.6))
     assert camera.metadata["target_xyz"] == pytest.approx((1.0, 1.0, 0.65))
-    assert backend.prims["/World/Environment/Floor"].metadata["visual_color_rgb"] == pytest.approx(
-        (0.42, 0.46, 0.5)
-    )
-    assert backend.prims["/World/Environment/Floor"].metadata["visual_emissive_scale"] == pytest.approx(0.25)
+    assert backend.prims["/World/Environment/Floor"].metadata[
+        "visual_color_rgb"
+    ] == pytest.approx((0.42, 0.46, 0.5))
+    assert backend.prims["/World/Environment/Floor"].metadata[
+        "visual_emissive_scale"
+    ] == pytest.approx(0.25)
 
 
 def test_real_application_preserves_viewport_helpers_on_reused_stage() -> None:
@@ -678,7 +704,12 @@ def test_real_application_preserves_viewport_helpers_on_reused_stage() -> None:
     app.close()
 
     assert backend.open_stage_calls == ["demo_room.usda"]
-    assert backend.prims["/World/SimBridge/View/InitialCamera"].metadata["user_view_marker"] == "kept"
+    assert (
+        backend.prims["/World/SimBridge/View/InitialCamera"].metadata[
+            "user_view_marker"
+        ]
+        == "kept"
+    )
     assert "/World/SimBridge/Robot/Body" in backend.prims
     assert "/World/SimBridge/Sources/Cs_137_00" in backend.prims
 
@@ -848,7 +879,9 @@ def test_isaacsim_application_replays_radiation_tracks() -> None:
 
     assert backend.live_particle_paths
     assert "/World/SimBridge/Radiation/Tracks/Track_0000" in backend.prims
-    assert not any(path.startswith("/World/SimBridge/Radiation/Live") for path in backend.prims)
+    assert not any(
+        path.startswith("/World/SimBridge/Radiation/Live") for path in backend.prims
+    )
 
 
 def test_radiation_visualization_samples_isotropic_non_detected_tracks() -> None:
@@ -929,7 +962,9 @@ def test_radiation_visualization_anchors_scatter_inside_obstacle() -> None:
         mode="test",
     )
     tracks = metadata["radiation_tracks"]
-    attenuated_tracks = [track for track in tracks if track["visual_kind"] == "attenuated"]
+    attenuated_tracks = [
+        track for track in tracks if track["visual_kind"] == "attenuated"
+    ]
     primary_tracks = [track for track in tracks if track["visual_kind"] == "primary"]
 
     assert tracks
@@ -937,13 +972,26 @@ def test_radiation_visualization_anchors_scatter_inside_obstacle() -> None:
     assert len(primary_tracks) > len(attenuated_tracks)
     assert all(not bool(track["detected"]) for track in tracks)
     assert all("scatter_anchor_xyz" in track for track in attenuated_tracks)
-    attenuated_endpoints = np.asarray([track["points_xyz"][-1] for track in attenuated_tracks], dtype=float)
-    assert float(np.min(np.linalg.norm(attenuated_endpoints - np.asarray((3.5, 3.5, 0.8125)), axis=1))) < 0.3
+    attenuated_endpoints = np.asarray(
+        [track["points_xyz"][-1] for track in attenuated_tracks], dtype=float
+    )
+    assert (
+        float(
+            np.min(
+                np.linalg.norm(
+                    attenuated_endpoints - np.asarray((3.5, 3.5, 0.8125)), axis=1
+                )
+            )
+        )
+        < 0.3
+    )
     assert max(track["attenuated_fraction"] for track in attenuated_tracks) > 0.99
     source = np.asarray((5.0, 5.0, 1.0), dtype=float)
     detector_direction = np.asarray((1.0, 1.0, 0.5), dtype=float) - source
     detector_direction /= np.linalg.norm(detector_direction)
-    end_vectors = np.asarray([track["points_xyz"][-1] for track in tracks], dtype=float) - source
+    end_vectors = (
+        np.asarray([track["points_xyz"][-1] for track in tracks], dtype=float) - source
+    )
     end_vectors /= np.linalg.norm(end_vectors, axis=1)[:, None]
     direction_dots = end_vectors @ detector_direction
     assert float(np.min(direction_dots)) < -0.5
@@ -1012,11 +1060,19 @@ def test_radiation_visualization_can_limit_environment_obstacle_paths() -> None:
 
     tracks = metadata["radiation_tracks"]
     anchored_tracks = [track for track in tracks if "scatter_anchor_xyz" in track]
-    attenuated_tracks = [track for track in tracks if track["visual_kind"] == "attenuated"]
+    attenuated_tracks = [
+        track for track in tracks if track["visual_kind"] == "attenuated"
+    ]
     scatter_tracks = [track for track in tracks if track["visual_kind"] == "scatter"]
-    anchors = np.asarray([track["scatter_anchor_xyz"] for track in anchored_tracks], dtype=float)
-    lower = np.asarray(slab_center, dtype=float) - 0.5 * np.asarray(slab_size, dtype=float)
-    upper = np.asarray(slab_center, dtype=float) + 0.5 * np.asarray(slab_size, dtype=float)
+    anchors = np.asarray(
+        [track["scatter_anchor_xyz"] for track in anchored_tracks], dtype=float
+    )
+    lower = np.asarray(slab_center, dtype=float) - 0.5 * np.asarray(
+        slab_size, dtype=float
+    )
+    upper = np.asarray(slab_center, dtype=float) + 0.5 * np.asarray(
+        slab_size, dtype=float
+    )
 
     assert anchored_tracks
     assert attenuated_tracks
@@ -1083,6 +1139,172 @@ def test_robot_controller_interpolates_travel_between_measurement_points() -> No
     assert len(backend.robot_poses) >= 2
     assert backend.robot_poses[-1] == pytest.approx((3.0, 1.0, 0.0))
     assert backend.robot_poses[0][0] < backend.robot_poses[-1][0]
+
+
+def test_robot_controller_interpolates_detector_height_with_shields() -> None:
+    """Detector-height commands should lift detector and shields above a grounded base."""
+
+    class _RecordingStageBackend(FakeStageBackend):
+        """Record local base, detector, and shield translations."""
+
+        def __init__(self) -> None:
+            """Initialize translation histories by prim path."""
+            super().__init__()
+            self.translations: dict[str, list[tuple[float, float, float]]] = {}
+
+        def set_local_pose(
+            self,
+            path: str,
+            *,
+            translation_xyz: tuple[float, float, float] | None = None,
+            orientation_wxyz: tuple[float, float, float, float] | None = None,
+            scale_xyz: tuple[float, float, float] | None = None,
+        ) -> None:
+            """Record authored translations while preserving fake-stage behavior."""
+            super().set_local_pose(
+                path,
+                translation_xyz=translation_xyz,
+                orientation_wxyz=orientation_wxyz,
+                scale_xyz=scale_xyz,
+            )
+            if translation_xyz is not None:
+                self.translations.setdefault(path, []).append(
+                    tuple(float(value) for value in translation_xyz)
+                )
+
+    backend = _RecordingStageBackend()
+    scene = SceneDescription()
+    SceneBuilder(backend, detector_height_m=0.6).load_scene(scene)
+    controller = RobotController(
+        backend,
+        scene.prim_paths,
+        detector_height_m=0.6,
+        fe_offset_xyz=(0.25, 0.0, 0.7),
+        pb_offset_xyz=(-0.3, 0.0, 0.45),
+        ground_z_m=0.2,
+        motion_speed_m_s=1.0,
+        animation_dt_s=0.25,
+    )
+    controller.reset()
+
+    assert controller.detector_world_pose().translation_xyz == pytest.approx(
+        (1.0, 1.0, 0.8)
+    )
+    assert backend.get_world_pose(
+        scene.prim_paths.fe_shield_path
+    ).translation_xyz == pytest.approx((1.25, 1.0, 0.9))
+    assert backend.get_world_pose(
+        scene.prim_paths.pb_shield_path
+    ).translation_xyz == pytest.approx((0.7, 1.0, 0.65))
+    backend.translations = {}
+
+    controller.apply_command(
+        SimulationCommand(
+            step_id=0,
+            target_pose_xyz=(1.0, 1.0, 1.8),
+            target_base_yaw_rad=0.0,
+            fe_orientation_index=0,
+            pb_orientation_index=0,
+            dwell_time_s=1.0,
+            travel_time_s=1.0,
+        )
+    )
+
+    root_samples = backend.translations[scene.prim_paths.robot_root]
+    detector_samples = backend.translations[scene.prim_paths.detector_path]
+    assert len(detector_samples) == 4
+    assert all(sample[2] == pytest.approx(0.2) for sample in root_samples)
+    assert np.all(np.diff([sample[2] for sample in detector_samples]) > 0.0)
+    assert controller.state.pose_xyz == pytest.approx((1.0, 1.0, 0.2))
+    assert controller.state.detector_pose_xyz == pytest.approx((1.0, 1.0, 1.8))
+    assert controller.detector_world_pose().translation_xyz == pytest.approx(
+        (1.0, 1.0, 1.8)
+    )
+    assert backend.get_world_pose(
+        scene.prim_paths.fe_shield_path
+    ).translation_xyz == pytest.approx((1.25, 1.0, 1.9))
+    assert backend.get_world_pose(
+        scene.prim_paths.pb_shield_path
+    ).translation_xyz == pytest.approx((0.7, 1.0, 1.65))
+
+
+def test_geant4_application_forwards_commanded_detector_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Geant4 requests and observations should use the commanded detector height."""
+    import sim.geant4_app.app as geant4_app_module
+
+    class _RecordingGeant4Engine:
+        """Record the transport request received from Geant4Application."""
+
+        def __init__(self) -> None:
+            """Initialize request history and lifecycle flags."""
+            self.requests: list[object] = []
+            self.closed = False
+
+        def load_scene(self, scene: object) -> bool:
+            """Accept the exported scene without reporting a cache hit."""
+            del scene
+            return False
+
+        def simulate(self, request: object) -> tuple[np.ndarray, dict[str, object]]:
+            """Record one request and return an empty Geant4 spectrum."""
+            self.requests.append(request)
+            spectrum = np.zeros_like(SpectralDecomposer().energy_axis, dtype=float)
+            return spectrum, {"backend": "geant4"}
+
+        def close(self) -> None:
+            """Record that the application closed the engine."""
+            self.closed = True
+
+    engine = _RecordingGeant4Engine()
+
+    def _build_recording_engine(*args: object, **kwargs: object) -> object:
+        """Return the recording engine in place of a native Geant4 engine."""
+        del args, kwargs
+        return engine
+
+    monkeypatch.setattr(
+        geant4_app_module,
+        "build_geant4_engine",
+        _build_recording_engine,
+    )
+    backend = FakeStageBackend()
+    app = Geant4Application(
+        app_config={
+            "use_mock_stage": True,
+            "detector_height_m": 0.5,
+        },
+        stage_backend=backend,
+    )
+    scene = SceneDescription()
+    app.reset(scene)
+
+    assert app.robot_controller.detector_world_pose().translation_xyz == pytest.approx(
+        (1.0, 1.0, 0.5)
+    )
+    observation = app.step(
+        SimulationCommand(
+            step_id=4,
+            target_pose_xyz=(2.0, 3.0, 1.75),
+            target_base_yaw_rad=0.0,
+            fe_orientation_index=1,
+            pb_orientation_index=2,
+            dwell_time_s=1.0,
+        )
+    )
+    app.close()
+
+    assert len(engine.requests) == 1
+    request = engine.requests[0]
+    assert request.detector_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
+    assert request.fe_shield_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
+    assert request.pb_shield_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
+    assert observation.detector_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
+    assert backend.get_world_pose(
+        scene.prim_paths.robot_root
+    ).translation_xyz == pytest.approx((2.0, 3.0, 0.0))
+    assert engine.closed is True
 
 
 def test_scene_builder_can_skip_python_obstacle_authoring() -> None:
@@ -1225,8 +1447,12 @@ def test_geant4_scene_export_is_stable() -> None:
     assert export_one.scene_hash == export_two.scene_hash
     assert export_one.to_dict() == export_two.to_dict()
     assert export_one.fe_shield.shape == SHIELD_SHAPE_SPHERICAL_OCTANT
-    assert export_one.fe_shield.inner_radius_m == pytest.approx(FE_SHIELD_INNER_RADIUS_M)
-    assert export_one.pb_shield.inner_radius_m == pytest.approx(PB_SHIELD_INNER_RADIUS_M)
+    assert export_one.fe_shield.inner_radius_m == pytest.approx(
+        FE_SHIELD_INNER_RADIUS_M
+    )
+    assert export_one.pb_shield.inner_radius_m == pytest.approx(
+        PB_SHIELD_INNER_RADIUS_M
+    )
     assert export_one.fe_shield.thickness_cm == pytest.approx(FE_SHIELD_THICKNESS_CM)
 
 
@@ -1242,7 +1468,9 @@ def test_shield_transmission_target_scales_geant4_export() -> None:
         stage_backend=backend,
     )
     scene = SceneDescription(usd_path="demo_room.usda")
-    shield_thickness = resolve_shield_thickness_config({"shield_transmission_target": 0.5})
+    shield_thickness = resolve_shield_thickness_config(
+        {"shield_transmission_target": 0.5}
+    )
 
     app.reset(scene)
     exported = export_scene_for_geant4(
@@ -1289,7 +1517,9 @@ def test_geant4_scene_export_groups_walls_without_name_list() -> None:
     )
     app.close()
 
-    groups_by_path = {volume.path: volume.transport_group for volume in exported.static_volumes}
+    groups_by_path = {
+        volume.path: volume.transport_group for volume in exported.static_volumes
+    }
     assert groups_by_path["/World/Environment/NorthWall"] == "wall"
     assert groups_by_path["/World/Environment/SouthWall"] == "wall"
     assert groups_by_path["/World/Environment/EastWall"] == "wall"
@@ -1328,7 +1558,9 @@ def test_geant4_scene_export_can_mark_wall_group_as_absorber(tmp_path: Path) -> 
     )
     app.close()
 
-    modes_by_path = {volume.path: volume.transport_mode for volume in exported.static_volumes}
+    modes_by_path = {
+        volume.path: volume.transport_mode for volume in exported.static_volumes
+    }
     assert modes_by_path["/World/Environment/NorthWall"] == "absorber"
     assert modes_by_path["/World/Environment/PillarMesh"] == "geant4"
     assert modes_by_path["/World/SimBridge/Obstacles/Obstacle_0000"] == "geant4"
@@ -1347,7 +1579,9 @@ def test_stage_backend_exports_cuboid_mesh_as_box_for_geant4() -> None:
 
     solids = {
         solid.path: solid
-        for solid in backend.list_solid_prims(path_prefixes=("/World/Environment/PillarMesh",))
+        for solid in backend.list_solid_prims(
+            path_prefixes=("/World/Environment/PillarMesh",)
+        )
     }
 
     pillar = solids["/World/Environment/PillarMesh"]
@@ -1405,7 +1639,10 @@ def test_geant4_application_reuses_geometry_cache_on_same_scene(tmp_path: Path) 
     assert second_observation.metadata["backend"] == "geant4"
     assert int(second_observation.metadata["num_primaries"]) >= 0
     assert len(second_observation.metadata["radiation_tracks"]) > 0
-    assert second_observation.metadata["radiation_visualization"]["sampled_track_count"] > 0
+    assert (
+        second_observation.metadata["radiation_visualization"]["sampled_track_count"]
+        > 0
+    )
     visualization = second_observation.metadata["radiation_visualization"]
     assert visualization["playback_duration_s"] == pytest.approx(1.0)
     assert "emission_time_s" in second_observation.metadata["radiation_tracks"][0]
@@ -1581,7 +1818,9 @@ def test_create_simulation_runtime_auto_starts_geant4_sidecar(
         )
 
     monkeypatch.setattr(runtime_module, "_tcp_server_available", _fake_tcp_available)
-    monkeypatch.setattr(runtime_module, "_start_geant4_sidecar", _fake_start_geant4_sidecar)
+    monkeypatch.setattr(
+        runtime_module, "_start_geant4_sidecar", _fake_start_geant4_sidecar
+    )
 
     runtime = create_simulation_runtime(
         "geant4",
@@ -1632,7 +1871,9 @@ def test_managed_geant4_sidecar_restart_replays_reset(
             raise ConnectionRefusedError("sidecar stopped")
         return {"status": message_type}
 
-    def _fake_start_sidecar_process(**kwargs: object) -> tuple[subprocess.Popen[str], None]:
+    def _fake_start_sidecar_process(
+        **kwargs: object,
+    ) -> tuple[subprocess.Popen[str], None]:
         """Record restart inputs and return a completed process handle."""
         starts.append(dict(kwargs))
         return subprocess.Popen(["true"]), None
@@ -1711,7 +1952,9 @@ def test_create_simulation_runtime_auto_starts_isaacsim_sidecar(
         )
 
     monkeypatch.setattr(runtime_module, "_tcp_server_available", _fake_tcp_available)
-    monkeypatch.setattr(runtime_module, "_start_isaacsim_sidecar", _fake_start_isaacsim_sidecar)
+    monkeypatch.setattr(
+        runtime_module, "_start_isaacsim_sidecar", _fake_start_isaacsim_sidecar
+    )
 
     runtime = create_simulation_runtime(
         "isaacsim",
@@ -1835,8 +2078,12 @@ def test_create_simulation_runtime_pairs_geant4_with_isaacsim(
         )
 
     monkeypatch.setattr(runtime_module, "_tcp_server_available", _fake_tcp_available)
-    monkeypatch.setattr(runtime_module, "_start_geant4_sidecar", _fake_start_geant4_sidecar)
-    monkeypatch.setattr(runtime_module, "_start_isaacsim_sidecar", _fake_start_isaacsim_sidecar)
+    monkeypatch.setattr(
+        runtime_module, "_start_geant4_sidecar", _fake_start_geant4_sidecar
+    )
+    monkeypatch.setattr(
+        runtime_module, "_start_isaacsim_sidecar", _fake_start_isaacsim_sidecar
+    )
 
     runtime = create_simulation_runtime(
         "geant4",
@@ -2091,10 +2338,10 @@ def test_external_geant4_engine_reads_file_protocol(tmp_path: Path) -> None:
                 "REQUEST=''",
                 "RESPONSE=''",
                 "while [[ $# -gt 0 ]]; do",
-                "  case \"$1\" in",
-                "    --scene) SCENE=\"$2\"; shift 2 ;;",
-                "    --request) REQUEST=\"$2\"; shift 2 ;;",
-                "    --response) RESPONSE=\"$2\"; shift 2 ;;",
+                '  case "$1" in',
+                '    --scene) SCENE="$2"; shift 2 ;;',
+                '    --request) REQUEST="$2"; shift 2 ;;',
+                '    --response) RESPONSE="$2"; shift 2 ;;',
                 "    *) shift ;;",
                 "  esac",
                 "done",
@@ -2247,7 +2494,9 @@ def test_real_application_obstacle_geometry_reduces_counts() -> None:
     app_blocked.close()
 
     assert float(blocked_observation.metadata["total_obstacle_path_cm"]) > 0.0
-    assert sum(blocked_observation.spectrum_counts) < sum(clear_observation.spectrum_counts)
+    assert sum(blocked_observation.spectrum_counts) < sum(
+        clear_observation.spectrum_counts
+    )
 
 
 def test_real_application_stage_wall_geometry_reduces_counts() -> None:
@@ -2312,7 +2561,9 @@ def test_real_application_stage_wall_geometry_reduces_counts() -> None:
     assert float(outside_observation.metadata["total_stage_path_cm"]) > float(
         inside_observation.metadata["total_stage_path_cm"]
     )
-    assert sum(outside_observation.spectrum_counts) < sum(inside_observation.spectrum_counts)
+    assert sum(outside_observation.spectrum_counts) < sum(
+        inside_observation.spectrum_counts
+    )
 
 
 def test_real_application_prim_material_overrides_path_rules() -> None:
@@ -2323,7 +2574,9 @@ def test_real_application_prim_material_overrides_path_rules() -> None:
         app_config={
             "usd_path": "demo_room.usda",
             "detector_height_m": 0.5,
-            "stage_material_rules": [{"path_prefix": "/World/Environment", "material": "concrete"}],
+            "stage_material_rules": [
+                {"path_prefix": "/World/Environment", "material": "concrete"}
+            ],
         },
         stage_backend=backend,
     )
@@ -2357,7 +2610,9 @@ def test_real_application_prim_material_overrides_path_rules() -> None:
     app.close()
 
     assert float(baseline_observation.metadata["total_stage_path_cm"]) > 0.0
-    assert sum(override_observation.spectrum_counts) > sum(baseline_observation.spectrum_counts)
+    assert sum(override_observation.spectrum_counts) > sum(
+        baseline_observation.spectrum_counts
+    )
 
 
 def test_real_application_material_shader_inputs_override_default_mu() -> None:
@@ -2393,12 +2648,16 @@ def test_real_application_material_shader_inputs_override_default_mu() -> None:
     )
     app.reset(scene)
     baseline_observation = app.step(command)
-    backend.prims["/World/Looks/ConcreteMaterial"].metadata["shader_inputs"]["simbridge_mass_att_cs_137_cm2_g"] = 0.0
+    backend.prims["/World/Looks/ConcreteMaterial"].metadata["shader_inputs"][
+        "simbridge_mass_att_cs_137_cm2_g"
+    ] = 0.0
     override_observation = app.step(command)
     app.close()
 
     assert float(baseline_observation.metadata["total_stage_path_cm"]) > 0.0
-    assert sum(override_observation.spectrum_counts) > sum(baseline_observation.spectrum_counts)
+    assert sum(override_observation.spectrum_counts) > sum(
+        baseline_observation.spectrum_counts
+    )
 
 
 def test_real_application_material_preset_fills_missing_attenuation() -> None:
@@ -2442,7 +2701,9 @@ def test_real_application_material_preset_fills_missing_attenuation() -> None:
     app.close()
 
     assert float(preset_observation.metadata["total_stage_path_cm"]) > 0.0
-    assert sum(preset_observation.spectrum_counts) < sum(air_observation.spectrum_counts)
+    assert sum(preset_observation.spectrum_counts) < sum(
+        air_observation.spectrum_counts
+    )
 
 
 def test_real_application_material_composition_fills_missing_attenuation() -> None:
@@ -2479,16 +2740,22 @@ def test_real_application_material_composition_fills_missing_attenuation() -> No
     app.reset(scene)
     backend.prims["/World/Environment/NorthWall"].metadata["material"] = "custom_alloy"
     backend.prims["/World/Environment/NorthWall"].metadata["density_g_cm3"] = 7.5
-    backend.prims["/World/Environment/NorthWall"].metadata["composition_by_mass"] = "Fe=0.9,C=0.1"
+    backend.prims["/World/Environment/NorthWall"].metadata["composition_by_mass"] = (
+        "Fe=0.9,C=0.1"
+    )
     composition_observation = app.step(command)
     backend.prims["/World/Environment/NorthWall"].metadata["material"] = "air"
     backend.prims["/World/Environment/NorthWall"].metadata.pop("density_g_cm3", None)
-    backend.prims["/World/Environment/NorthWall"].metadata.pop("composition_by_mass", None)
+    backend.prims["/World/Environment/NorthWall"].metadata.pop(
+        "composition_by_mass", None
+    )
     air_observation = app.step(command)
     app.close()
 
     assert float(composition_observation.metadata["total_stage_path_cm"]) > 0.0
-    assert sum(composition_observation.spectrum_counts) < sum(air_observation.spectrum_counts)
+    assert sum(composition_observation.spectrum_counts) < sum(
+        air_observation.spectrum_counts
+    )
 
 
 def test_composition_mass_attenuation_at_energy_decreases_with_energy() -> None:
@@ -2526,11 +2793,11 @@ def test_real_application_energy_dependent_wall_attenuation_hardens_spectrum() -
         obstacle_grid_shape=(10, 20),
         obstacle_cells=[],
         sources=[
-                SourceDescription(
-                    isotope="Eu-154",
-                    position_xyz=(5.0, 20.5, 1.0),
-                    intensity_cps_1m=5.0e10,
-                )
+            SourceDescription(
+                isotope="Eu-154",
+                position_xyz=(5.0, 20.5, 1.0),
+                intensity_cps_1m=5.0e10,
+            )
         ],
         usd_path="demo_room.usda",
     )
@@ -2554,8 +2821,12 @@ def test_real_application_energy_dependent_wall_attenuation_hardens_spectrum() -
     clear_counts = np.asarray(clear_observation.spectrum_counts, dtype=float)
     low_mask = (energy_axis >= 680.0) & (energy_axis <= 940.0)
     high_mask = (energy_axis >= 1180.0) & (energy_axis <= 1400.0)
-    blocked_ratio = float(np.sum(blocked_counts[high_mask]) / max(np.sum(blocked_counts[low_mask]), 1.0))
-    clear_ratio = float(np.sum(clear_counts[high_mask]) / max(np.sum(clear_counts[low_mask]), 1.0))
+    blocked_ratio = float(
+        np.sum(blocked_counts[high_mask]) / max(np.sum(blocked_counts[low_mask]), 1.0)
+    )
+    clear_ratio = float(
+        np.sum(clear_counts[high_mask]) / max(np.sum(clear_counts[low_mask]), 1.0)
+    )
 
     assert float(blocked_observation.metadata["total_stage_path_cm"]) > 0.0
     assert blocked_ratio > clear_ratio
@@ -2600,7 +2871,9 @@ def test_real_application_mesh_geometry_reduces_counts() -> None:
     app.close()
 
     assert float(with_mesh_observation.metadata["total_stage_path_cm"]) > 0.0
-    assert sum(without_mesh_observation.spectrum_counts) > sum(with_mesh_observation.spectrum_counts)
+    assert sum(without_mesh_observation.spectrum_counts) > sum(
+        with_mesh_observation.spectrum_counts
+    )
 
 
 def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2634,7 +2907,9 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
                 fe_orientation_index=command.fe_orientation_index,
                 pb_orientation_index=command.pb_orientation_index,
                 spectrum_counts=np.zeros_like(energy, dtype=float).tolist(),
-                energy_bin_edges_keV=np.concatenate([energy, [energy[-1] + step]]).tolist(),
+                energy_bin_edges_keV=np.concatenate(
+                    [energy, [energy[-1] + step]]
+                ).tolist(),
                 metadata={"backend": "fake"},
             )
 
@@ -2685,7 +2960,9 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
             )
         )
 
-    def _fake_estimates(self: RotatingShieldPFEstimator) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    def _fake_estimates(
+        self: RotatingShieldPFEstimator,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """Return a non-empty estimate for each isotope."""
         positions = np.array([[0.5, 0.5, 0.5]], dtype=float)
         strengths = np.array([1.0], dtype=float)
@@ -2752,7 +3029,9 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         """Pretend GPU is disabled to avoid CUDA checks in tests."""
         return False
 
-    monkeypatch.setattr(realtime_demo, "create_simulation_runtime", lambda *args, **kwargs: runtime)
+    monkeypatch.setattr(
+        realtime_demo, "create_simulation_runtime", lambda *args, **kwargs: runtime
+    )
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
@@ -2761,9 +3040,15 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         "_compute_shield_selection_grid",
         _fake_shield_selection_grid,
     )
-    monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
-    monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
-    monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
+    monkeypatch.setattr(
+        realtime_demo, "generate_candidate_poses", _fake_candidate_poses
+    )
+    monkeypatch.setattr(
+        realtime_demo, "select_next_pose_from_candidates", _fake_next_pose
+    )
+    monkeypatch.setattr(
+        SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
+    )
     monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
@@ -2851,7 +3136,9 @@ def test_run_live_pf_random_environment_uses_blender_usd(
                 fe_orientation_index=command.fe_orientation_index,
                 pb_orientation_index=command.pb_orientation_index,
                 spectrum_counts=np.zeros_like(energy, dtype=float).tolist(),
-                energy_bin_edges_keV=np.concatenate([energy, [energy[-1] + step]]).tolist(),
+                energy_bin_edges_keV=np.concatenate(
+                    [energy, [energy[-1] + step]]
+                ).tolist(),
                 metadata={"backend": "fake"},
             )
 
@@ -2987,8 +3274,14 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         return generated_usd
 
     runtime = _FakeRuntime()
-    monkeypatch.setattr(realtime_demo, "create_simulation_runtime", lambda *args, **kwargs: runtime)
-    monkeypatch.setattr(realtime_demo, "generate_blender_environment_usd", _fake_generate_blender_environment_usd)
+    monkeypatch.setattr(
+        realtime_demo, "create_simulation_runtime", lambda *args, **kwargs: runtime
+    )
+    monkeypatch.setattr(
+        realtime_demo,
+        "generate_blender_environment_usd",
+        _fake_generate_blender_environment_usd,
+    )
     monkeypatch.setattr(realtime_demo, "RealTimePFVisualizer", _DummyViz)
     monkeypatch.setattr(realtime_demo, "build_frame_from_pf", _fake_frame)
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
@@ -2997,9 +3290,15 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         "_compute_shield_selection_grid",
         _fake_shield_selection_grid,
     )
-    monkeypatch.setattr(realtime_demo, "generate_candidate_poses", _fake_candidate_poses)
-    monkeypatch.setattr(realtime_demo, "select_next_pose_from_candidates", _fake_next_pose)
-    monkeypatch.setattr(SpectralDecomposer, "isotope_counts_with_detection", _fake_counts)
+    monkeypatch.setattr(
+        realtime_demo, "generate_candidate_poses", _fake_candidate_poses
+    )
+    monkeypatch.setattr(
+        realtime_demo, "select_next_pose_from_candidates", _fake_next_pose
+    )
+    monkeypatch.setattr(
+        SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
+    )
     monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)

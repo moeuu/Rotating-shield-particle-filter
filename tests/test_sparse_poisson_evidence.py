@@ -57,6 +57,8 @@ def test_sparse_poisson_evidence_selects_two_sources() -> None:
     assert evidence.bic_gap_to_simpler > 0.0
     assert evidence.bic_margin_to_runner_up > 0.0
     assert np.isfinite(evidence.heldout_deviance_by_count[2])
+    assert evidence.heldout_observation_count == 3
+    assert evidence.holdout_stride == 3
 
 
 def test_sparse_poisson_evidence_rejects_duplicate_column() -> None:
@@ -102,6 +104,8 @@ def test_sparse_poisson_diagnostics_are_json_safe() -> None:
     json.dumps(payload, allow_nan=False)
     assert payload["method"] == "all_history_sparse_poisson"
     assert payload["selected_count"] == 1
+    assert payload["heldout_observation_count"] == 0
+    assert payload["holdout_stride"] == 0
 
 
 def test_sparse_poisson_spectral_evidence_uses_bin_tensor_metadata() -> None:

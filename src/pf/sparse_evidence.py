@@ -53,6 +53,8 @@ class SparsePoissonEvidence:
     evaluated_candidate_count: int
     candidate_indices: tuple[int, ...]
     method: str = "all_history_sparse_poisson"
+    heldout_observation_count: int = 0
+    holdout_stride: int = 0
     selected_nuisance_strengths: tuple[float, ...] = ()
     selected_column_metadata: tuple[dict[str, Any], ...] = ()
     ambiguity_clusters: tuple[dict[str, Any], ...] = ()
@@ -134,6 +136,8 @@ def _empty_evidence(reason: str, *, max_sources: int = 0) -> SparsePoissonEviden
         n_candidates=0,
         evaluated_candidate_count=0,
         candidate_indices=(),
+        heldout_observation_count=0,
+        holdout_stride=0,
     )
 
 
@@ -934,6 +938,10 @@ def fit_sparse_poisson_evidence(
         n_candidates=int(response_all.shape[1]),
         evaluated_candidate_count=int(evaluated_count),
         candidate_indices=tuple(int(idx) for idx in candidate_indices),
+        heldout_observation_count=int(
+            np.count_nonzero(_heldout_mask(z.size, int(config.holdout_stride)))
+        ),
+        holdout_stride=int(config.holdout_stride),
         selected_nuisance_strengths=tuple(
             float(value) for value in best_nuisance_strengths
         ),
@@ -1642,6 +1650,8 @@ def sparse_poisson_evidence_to_diagnostics(
         "heldout_deviance_by_count": [
             _json_float(value) for value in evidence.heldout_deviance_by_count
         ],
+        "heldout_observation_count": int(evidence.heldout_observation_count),
+        "holdout_stride": int(evidence.holdout_stride),
         "bic_gap_to_simpler": _json_float(evidence.bic_gap_to_simpler),
         "bic_gap_to_more_complex": _json_float(evidence.bic_gap_to_more_complex),
         "bic_gap_to_previous_count": _json_float(evidence.bic_gap_to_previous_count),
