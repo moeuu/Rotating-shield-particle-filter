@@ -19,6 +19,7 @@ from measurement.source_surfaces import (
     source_surface_kinds,
     surface_observable_fractions,
     surface_response_observability_diagnostics,
+    transport_interior_mask,
 )
 
 
@@ -65,6 +66,32 @@ def test_generate_surface_sources_samples_random_intensity_range() -> None:
     strengths = [source.intensity_cps_1m for source in sources]
     assert all(100000.0 <= value <= 200000.0 for value in strengths)
     assert len({round(value, 6) for value in strengths}) > 1
+
+
+def test_generate_surface_sources_separates_same_isotope_sources() -> None:
+    """Random source generation should space repeated isotopes apart."""
+    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
+    min_distance_m = 3.0
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
+        isotopes=("Cs-137", "Cs-137", "Co-60", "Cs-137", "Co-60"),
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(20260603),
+        count=5,
+        preferred_max_z_m=None,
+        same_isotope_min_distance_m=min_distance_m,
+    )
+
+    for isotope in {"Cs-137", "Co-60"}:
+        positions = np.asarray(
+            [source.position for source in sources if source.isotope == isotope],
+            dtype=float,
+        )
+        for left in range(positions.shape[0]):
+            for right in range(left + 1, positions.shape[0]):
+                distance = float(np.linalg.norm(positions[left] - positions[right]))
+                assert distance >= min_distance_m - 1.0e-9
 
 
 def test_generate_surface_sources_caps_ceiling_and_prefers_low_z() -> None:
@@ -283,6 +310,7 @@ def test_surface_response_observability_diagnostics_are_batched() -> None:
         duplicated,
         grid,
         measurement_points,
+        isotopes=("Cs-137", "Cs-137"),
         obstacle_height_m=1.0,
     )
 
@@ -291,6 +319,11 @@ def test_surface_response_observability_diagnostics_are_batched() -> None:
     assert float(separated_stats["condition_number"]) >= 1.0
     assert float(separated_stats["max_pairwise_correlation"]) < 0.999
     assert float(duplicated_stats["max_pairwise_correlation"]) > 0.999999
+    assert int(duplicated_stats["same_isotope_pair_count"]) == 1
+    assert (
+        float(duplicated_stats["same_isotope_max_pairwise_correlation"])
+        > 0.999999
+    )
 
 
 def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:
@@ -309,6 +342,34 @@ def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:
     assert source_surface_kind((3.0, 4.5, 1.0), env, grid) == "obstacle_side"
     assert source_surface_kind((1.5, 1.5, 0.0), env, grid) == "floor"
     assert source_surface_kind((5.0, 20.0, 4.0), env, grid) == "wall"
+
+
+def test_transport_component_interior_is_not_allowed_source_support() -> None:
+    """Known transport-box interiors should not become source support."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1),),
+    ).with_transport_model(
+        boxes_m=((1.2, 1.2, 0.2, 1.8, 1.8, 1.4),),
+        mu_by_isotope={"Cs-137": (0.1,)},
+    )
+    points = np.asarray(
+        [
+            (1.5, 1.5, 0.8),
+            (1.0, 1.5, 0.8),
+            (0.5, 0.5, 0.0),
+        ],
+        dtype=float,
+    )
+
+    mask = transport_interior_mask(points, grid)
+
+    assert mask.tolist() == [True, False, False]
+    assert not is_allowed_source_surface_position((1.5, 1.5, 0.8), env, grid)
+    assert is_allowed_source_surface_position((1.0, 1.5, 0.8), env, grid)
 
 
 def test_source_surface_kinds_matches_scalar_classification() -> None:

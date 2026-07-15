@@ -22,7 +22,9 @@ class AndersonKernelConfig:
     obstacle_height_m: float = 2.0
     obstacle_buildup_coeff: float = 0.0
     detector_radius_m: float = 0.0
+    detector_aperture_radius_m: float | None = None
     detector_aperture_samples: int = 1
+    transport_response_model: dict[str, object] | None = None
     use_gpu: bool = False
     gpu_device: str = "cuda"
     gpu_dtype: str = "float64"
@@ -53,6 +55,7 @@ class AndersonAttenuationKernel:
         obstacle_mu_by_isotope: dict[str, float] | None = None,
         obstacle_grid: ObstacleGrid | None = None,
         shield_params: ShieldParams | None = None,
+        line_mu_by_isotope: dict[str, object] | None = None,
         config: AndersonKernelConfig | None = None,
     ) -> None:
         """Initialize the shared physical response model."""
@@ -72,7 +75,10 @@ class AndersonAttenuationKernel:
             obstacle_mu_by_isotope=obstacle_mu_by_isotope,
             obstacle_buildup_coeff=float(self.config.obstacle_buildup_coeff),
             detector_radius_m=float(self.config.detector_radius_m),
+            detector_aperture_radius_m=self.config.detector_aperture_radius_m,
             detector_aperture_samples=int(self.config.detector_aperture_samples),
+            line_mu_by_isotope=line_mu_by_isotope,
+            transport_response_model=self.config.transport_response_model,
         )
 
     @classmethod
@@ -84,6 +90,7 @@ class AndersonAttenuationKernel:
         mu_by_isotope: dict[str, object] | None = None,
         obstacle_mu_by_isotope: dict[str, float] | None = None,
         obstacle_grid: ObstacleGrid | None = None,
+        line_mu_by_isotope: dict[str, object] | None = None,
         config: AndersonKernelConfig | None = None,
     ) -> "AndersonAttenuationKernel":
         """Build a kernel from a repository environment definition."""
@@ -93,6 +100,7 @@ class AndersonAttenuationKernel:
             mu_by_isotope=mu_by_isotope,
             obstacle_mu_by_isotope=obstacle_mu_by_isotope,
             obstacle_grid=obstacle_grid,
+            line_mu_by_isotope=line_mu_by_isotope,
             config=config,
         )
 

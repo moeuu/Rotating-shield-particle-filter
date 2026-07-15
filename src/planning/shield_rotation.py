@@ -86,21 +86,14 @@ def _filter_planning_isotopes(
 
 def _continuous_kernel_for_estimator(estimator: RotatingShieldPFEstimator):
     """Build a ContinuousKernel matching the estimator observation model."""
-    from measurement.continuous_kernels import ContinuousKernel
+    return estimator.continuous_kernel()
 
-    return ContinuousKernel(
-        mu_by_isotope=estimator.mu_by_isotope,
-        shield_params=estimator.shield_params,
-        obstacle_grid=getattr(estimator, "obstacle_grid", None),
-        obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
-        obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
-        obstacle_buildup_coeff=float(getattr(estimator, "obstacle_buildup_coeff", 0.0)),
-        detector_radius_m=float(getattr(estimator, "detector_radius_m", 0.0)),
-        detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
-        use_gpu=bool(getattr(estimator.pf_config, "use_gpu", False)),
-        gpu_device=str(getattr(estimator.pf_config, "gpu_device", "cuda")),
-        gpu_dtype=str(getattr(estimator.pf_config, "gpu_dtype", "float32")),
-    )
+
+def _candidate_octant_indices(candidates: np.ndarray) -> list[int]:
+    """Return octant indices for candidate shield rotation matrices."""
+    from measurement.shielding import octant_index_from_rotation
+
+    return [octant_index_from_rotation(np.asarray(rotation, dtype=float)) for rotation in candidates]
 
 
 def _surrogate_scores(
@@ -169,10 +162,8 @@ def _surrogate_scores_cpu(
     eps: float,
 ) -> Dict[int, float]:
     """Compute surrogate orientation scores on CPU with the estimator kernel."""
-    from measurement.shielding import octant_index_from_rotation
-
-    fe_indices = [octant_index_from_rotation(R) for R in RFe_candidates]
-    pb_indices = [octant_index_from_rotation(R) for R in RPb_candidates]
+    fe_indices = _candidate_octant_indices(RFe_candidates)
+    pb_indices = _candidate_octant_indices(RPb_candidates)
     scores: Dict[int, float] = {}
     num_pb = len(RPb_candidates)
     for fe_pos, fe_idx in enumerate(fe_indices):
@@ -228,19 +219,19 @@ def _surrogate_scores_gpu(
         return {}
     detector_pos = np.asarray(estimator.poses[pose_idx], dtype=float)
     kernel = _continuous_kernel_for_estimator(estimator)
-    mu_by_iso = {iso: kernel._mu_values(isotope=iso) for iso in packed}
-    shield_params = kernel.shield_params
+    fe_indices = _candidate_octant_indices(RFe_candidates)
+    pb_indices = _candidate_octant_indices(RPb_candidates)
     scores: Dict[int, float] = {}
     num_pb = len(RPb_candidates)
-    for fe_idx in range(len(RFe_candidates)):
-        for pb_idx in range(len(RPb_candidates)):
-            oid = fe_idx * num_pb + pb_idx
+    for fe_pos, fe_idx in enumerate(fe_indices):
+        for pb_pos, pb_idx in enumerate(pb_indices):
+            oid = fe_pos * num_pb + pb_pos
             if allowed_indices is not None and oid not in allowed_indices:
                 continue
             score = 0.0
             for iso, (positions, strengths, backgrounds, mask, weights_t) in packed.items():
-                mu_fe, mu_pb = mu_by_iso[iso]
-                lam_t = gpu_utils.expected_counts_pair_torch(
+                lam_t = kernel.expected_counts_pair_for_packed_states_torch(
+                    isotope=iso,
                     detector_pos=detector_pos,
                     positions=positions,
                     strengths=strengths,
@@ -248,23 +239,14 @@ def _surrogate_scores_gpu(
                     mask=mask,
                     fe_index=fe_idx,
                     pb_index=pb_idx,
-                    mu_fe=mu_fe,
-                    mu_pb=mu_pb,
-                    thickness_fe_cm=shield_params.thickness_fe_cm,
-                    thickness_pb_cm=shield_params.thickness_pb_cm,
-                    inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
-                    inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
-                    shield_geometry_model=shield_params.shield_geometry_model,
-                    use_angle_attenuation=shield_params.use_angle_attenuation,
                     live_time_s=live_time_s,
+                    source_scale=estimator.response_scale_for_isotope(
+                        iso,
+                        fe_index=fe_idx,
+                        pb_index=pb_idx,
+                    ),
                     device=device,
                     dtype=dtype,
-                    source_scale=estimator.response_scale_for_isotope(iso),
-                    detector_radius_m=kernel.detector_radius_m,
-                    detector_aperture_samples=kernel.detector_aperture_samples,
-                    buildup_fe_coeff=shield_params.buildup_fe_coeff,
-                    buildup_pb_coeff=shield_params.buildup_pb_coeff,
-                    **kernel.obstacle_gpu_kwargs(iso),
                 )
                 if metric == "var_log_lambda":
                     vals = torch_mod.log(lam_t + eps)
@@ -405,22 +387,29 @@ def _eig_scores_gpu(
     alphas = {k: v / alpha_sum for k, v in alphas.items()}
     eps = 1e-12
     num_pb = len(RPb_candidates)
+    fe_indices = _candidate_octant_indices(RFe_candidates)
+    pb_indices = _candidate_octant_indices(RPb_candidates)
     if num_samples is None:
         num_samples = estimator.pf_config.eig_num_samples
     num_samples = int(num_samples)
-    mu_by_iso = {iso: kernel._mu_values(isotope=iso) for iso in packed}
-    shield_params = kernel.shield_params
-    cache: Dict[str, Tuple[object, object, object, object, object, object, object, object, object]] = {}
+    cache: Dict[str, Tuple[object, object, object, object, object, object, object]] = {}
     for iso, (positions, strengths, backgrounds, mask, weights_t) in packed.items():
         log_weights_t = torch_mod.log(weights_t + eps)
         H_prior = -torch_mod.sum(weights_t * log_weights_t)
-        mu_fe, mu_pb = mu_by_iso[iso]
-        cache[iso] = (positions, strengths, backgrounds, mask, weights_t, log_weights_t, H_prior, mu_fe, mu_pb)
+        cache[iso] = (
+            positions,
+            strengths,
+            backgrounds,
+            mask,
+            weights_t,
+            log_weights_t,
+            H_prior,
+        )
 
     scores: Dict[int, float] = {}
     for oid in candidate_ids:
-        fe_idx = oid // num_pb
-        pb_idx = oid % num_pb
+        fe_idx = fe_indices[oid // num_pb]
+        pb_idx = pb_indices[oid % num_pb]
         total_ig = 0.0
         for iso, (
             positions,
@@ -430,10 +419,9 @@ def _eig_scores_gpu(
             weights_t,
             log_weights_t,
             H_prior,
-            mu_fe,
-            mu_pb,
         ) in cache.items():
-            lam_t = gpu_utils.expected_counts_pair_torch(
+            lam_t = kernel.expected_counts_pair_for_packed_states_torch(
+                isotope=iso,
                 detector_pos=detector_pos,
                 positions=positions,
                 strengths=strengths,
@@ -441,23 +429,14 @@ def _eig_scores_gpu(
                 mask=mask,
                 fe_index=fe_idx,
                 pb_index=pb_idx,
-                mu_fe=mu_fe,
-                mu_pb=mu_pb,
-                thickness_fe_cm=shield_params.thickness_fe_cm,
-                thickness_pb_cm=shield_params.thickness_pb_cm,
-                inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
-                inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
-                shield_geometry_model=shield_params.shield_geometry_model,
-                use_angle_attenuation=shield_params.use_angle_attenuation,
                 live_time_s=live_time_s,
+                source_scale=estimator.response_scale_for_isotope(
+                    iso,
+                    fe_index=fe_idx,
+                    pb_index=pb_idx,
+                ),
                 device=device,
                 dtype=dtype,
-                source_scale=estimator.response_scale_for_isotope(iso),
-                detector_radius_m=kernel.detector_radius_m,
-                detector_aperture_samples=kernel.detector_aperture_samples,
-                buildup_fe_coeff=shield_params.buildup_fe_coeff,
-                buildup_pb_coeff=shield_params.buildup_pb_coeff,
-                **kernel.obstacle_gpu_kwargs(iso),
             )
             if num_samples <= 0:
                 H_post_mean = torch_mod.zeros((), device=device, dtype=dtype)

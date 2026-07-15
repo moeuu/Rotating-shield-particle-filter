@@ -12,8 +12,8 @@ from typing import Any
 from measurement.obstacles import ObstacleGrid
 from measurement.obstacle_assets import (
     KnownObstacleInstance,
+    environment_transport_model,
     generate_manchester_obstacle_instances,
-    known_obstacle_transport_model,
     known_obstacle_traversability_rects,
     obstacle_instances_to_dicts,
 )
@@ -170,7 +170,19 @@ def attach_known_obstacle_transport_model(
     grid: ObstacleGrid,
     *,
     instances: tuple[KnownObstacleInstance, ...],
+    room_size_xyz: tuple[float, float, float] | None = None,
+    include_room_boundaries: bool = False,
+    room_boundary_thickness_m: float = 0.1,
 ) -> ObstacleGrid:
     """Return an obstacle grid whose PF transport uses known obstacle components."""
-    boxes_m, mu_by_isotope = known_obstacle_transport_model(instances)
-    return grid.with_transport_model(boxes_m=boxes_m, mu_by_isotope=mu_by_isotope)
+    boxes_m, mu_by_isotope, line_mu_by_isotope = environment_transport_model(
+        instances,
+        room_size_xyz=room_size_xyz,
+        include_room_boundaries=include_room_boundaries,
+        room_boundary_thickness_m=room_boundary_thickness_m,
+    )
+    return grid.with_transport_model(
+        boxes_m=boxes_m,
+        mu_by_isotope=mu_by_isotope,
+        line_mu_by_isotope=line_mu_by_isotope,
+    )

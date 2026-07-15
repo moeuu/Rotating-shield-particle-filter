@@ -543,6 +543,9 @@ def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]
             base_config.get("random_source_max_ceiling_sources", 1)
         ),
         "preferred_max_z_m": preferred_max_z_m,
+        "same_isotope_min_distance_m": float(
+            base_config.get("random_source_same_isotope_min_distance_m", 2.0)
+        ),
     }
 
 
@@ -597,6 +600,9 @@ def _case_source_layout(
         ),
         max_ceiling_sources=options.get("max_ceiling_sources", 1),
         preferred_max_z_m=options.get("preferred_max_z_m", 5.0),
+        same_isotope_min_distance_m=float(
+            options.get("same_isotope_min_distance_m", 2.0)
+        ),
     )
     return {
         "name": f"ral_ablation_{case.name}_seed_{source_seed}",
@@ -610,6 +616,9 @@ def _case_source_layout(
             "visibility_filter": bool(options.get("visibility_filter", False)),
             "visibility_min_fraction": float(
                 options.get("visibility_min_fraction", 0.0)
+            ),
+            "same_isotope_min_distance_m": float(
+                options.get("same_isotope_min_distance_m", 2.0)
             ),
             "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
             "intensity_sampling": _intensity_sampling_metadata(intensity_cps_1m),

@@ -63,8 +63,8 @@ Common options:
 --max-steps 5              # stop after a fixed number of measurements
 --max-poses 3              # stop after a fixed number of robot poses
 --source-config PATH       # load sources from JSON, default source_layouts/demo_sources.json
---obstacle-config PATH     # load blocked cells from JSON, default obstacle_layouts/no_obstacles.json
---environment-mode random  # generate a fresh obstacle map for this run
+--obstacle-config PATH     # fixed-mode obstacle JSON, default obstacle_layouts/Ex5_obstacles.json
+--environment-mode random  # default: generate a fresh obstacle map for this run
 --obstacle-seed 7          # make fixed generation or random mode reproducible
 --passage-width-m 1.0      # reserve a robot-passable corridor in random maps
 --robot-radius-m 0.35      # clearance radius used for 2D traversability maps

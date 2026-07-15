@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 from pathlib import Path
-import shutil
-import subprocess
 from typing import Any, Iterable
 
 import matplotlib
@@ -22,109 +19,48 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, FancyArrowPatch, Rectangle, Wedge
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-
-ROOT = Path(__file__).resolve().parents[1]
-LATEX_ROOT = ROOT.parent / "latex" / "projects" / "ieee-ra-l-letter"
-FIG1_PATH = LATEX_ROOT / "sections/01_introduction/figures/ral_problem_shield_code.pdf"
-FIG2_PATH = LATEX_ROOT / "sections/03_system_model/figures/ral_method_loop.pdf"
-EXPERIMENT_FIG_PATH = (
-    LATEX_ROOT / "sections/05_experiments/figures/ral_result_overview.png"
-)
-REVIEW_DIR = ROOT / "results" / "ral_figure_review"
-ISAAC_FIGURE_DIR = ROOT / "results" / "ral_isaac_figures"
-ISAAC_PROBLEM_RENDER = ISAAC_FIGURE_DIR / "capture_problem_setting" / "rgb_0000.png"
-ISAAC_DETECTOR_RENDER = ISAAC_FIGURE_DIR / "capture_detector_module" / "rgb_0000.png"
-ISAAC_STATION_RENDER = ISAAC_FIGURE_DIR / "capture_simulation_environment" / "rgb_0000.png"
-ISAAC_SHIELD_PROGRAM_RENDERS = (
-    ISAAC_FIGURE_DIR / "capture_shield_selection_00" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_01" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_02" / "rgb_0000.png",
-    ISAAC_FIGURE_DIR / "capture_shield_selection_03" / "rgb_0000.png",
-)
-FIG_TITLE_SIZE = 8.2
-FIG_LABEL_SIZE = 7.2
-FIG_TICK_SIZE = 7.0
-FIG_PANEL_SIZE = 9.0
-ISOTOPE_COLORS = {
-    "Cs-137": "#d62728",
-    "Co-60": "#1f77b4",
-    "Eu-154": "#2ca02c",
-}
-
-
-@dataclass(frozen=True)
-class SummaryBundle:
-    """Parsed result summary and its filesystem context."""
-
-    path: Path
-    payload: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class AblationRow:
-    """Compact metrics for one ablation variant."""
-
-    label: str
-    spectra: int
-    true_positive: int
-    false_positive: int
-    false_negative: int
-    mean_position_error_m: float
-    mean_strength_error_pct: float
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    """Read one UTF-8 JSON file."""
-    with Path(path).open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _save_figure(fig: plt.Figure, output_path: Path) -> Path:
-    """Save a matplotlib figure to disk with deterministic layout settings."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, bbox_inches="tight", dpi=300)
-    plt.close(fig)
-    return output_path
-
-
-def _write_review_image(figure_path: Path, review_dir: Path) -> Path | None:
-    """Write a raster review copy for visual inspection when possible."""
-    figure_path = Path(figure_path)
-    review_dir = Path(review_dir)
-    review_dir.mkdir(parents=True, exist_ok=True)
-    output_path = review_dir / f"{figure_path.stem}.png"
-    if figure_path.suffix.lower() == ".png":
-        shutil.copyfile(figure_path, output_path)
-        return output_path
-    if figure_path.suffix.lower() != ".pdf":
-        return None
-    pdftoppm = shutil.which("pdftoppm")
-    if pdftoppm is None:
-        return None
-    subprocess.run(
-        [
-            pdftoppm,
-            "-png",
-            "-singlefile",
-            "-r",
-            "220",
-            figure_path.as_posix(),
-            output_path.with_suffix("").as_posix(),
-        ],
-        check=True,
+try:
+    from scripts.ral_figure_common import (
+        EXPERIMENT_FIG_PATH,
+        FIG1_PATH,
+        FIG2_PATH,
+        FIG_LABEL_SIZE,
+        FIG_PANEL_SIZE,
+        FIG_TICK_SIZE,
+        FIG_TITLE_SIZE,
+        ISAAC_DETECTOR_RENDER,
+        ISAAC_PROBLEM_RENDER,
+        ISAAC_SHIELD_PROGRAM_RENDERS,
+        ISOTOPE_COLORS,
+        REVIEW_DIR,
+        ROOT,
+        AblationRow,
+        SummaryBundle,
+        read_json,
+        save_figure,
+        write_review_images,
     )
-    return output_path
-
-
-def _write_review_images(figure_paths: Iterable[Path], review_dir: Path) -> list[Path]:
-    """Write review images for all generated figures."""
-    outputs: list[Path] = []
-    for figure_path in figure_paths:
-        review_image = _write_review_image(figure_path, review_dir)
-        if review_image is not None:
-            outputs.append(review_image)
-    return outputs
+except ModuleNotFoundError:
+    from ral_figure_common import (
+        EXPERIMENT_FIG_PATH,
+        FIG1_PATH,
+        FIG2_PATH,
+        FIG_LABEL_SIZE,
+        FIG_PANEL_SIZE,
+        FIG_TICK_SIZE,
+        FIG_TITLE_SIZE,
+        ISAAC_DETECTOR_RENDER,
+        ISAAC_PROBLEM_RENDER,
+        ISAAC_SHIELD_PROGRAM_RENDERS,
+        ISOTOPE_COLORS,
+        REVIEW_DIR,
+        ROOT,
+        AblationRow,
+        SummaryBundle,
+        read_json,
+        save_figure,
+        write_review_images,
+    )
 
 
 def _panel_label(ax: Axes, label: str) -> None:
@@ -376,7 +312,7 @@ def render_problem_setting(output_path: Path = FIG1_PATH) -> Path:
     ax_sig.tick_params(labelsize=6)
     ax_sig.grid(True, lw=0.35, alpha=0.45)
     ax_sig.legend(fontsize=5.0, loc="upper right", frameon=True, handlelength=1.4)
-    return _save_figure(fig, output_path)
+    return save_figure(fig, output_path)
 
 
 def _draw_box(
@@ -563,7 +499,7 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
     for spine in ax_next.spines.values():
         spine.set_linewidth(0.65)
 
-    return _save_figure(fig, output_path)
+    return save_figure(fig, output_path)
 
 
 def _summary_tag(summary_path: Path) -> str:
@@ -580,7 +516,7 @@ def _candidate_manifest_paths(summary: SummaryBundle) -> Iterable[Path]:
     candidates: list[Path] = []
     if direct_config.is_file():
         try:
-            config = _read_json(direct_config)
+            config = read_json(direct_config)
         except json.JSONDecodeError:
             config = {}
         usd_path = Path(str(config.get("usd_path", ""))).expanduser()
@@ -601,7 +537,7 @@ def _find_environment_manifest(summary: SummaryBundle) -> dict[str, Any] | None:
     """Find and read the environment manifest associated with a summary."""
     for candidate in _candidate_manifest_paths(summary):
         try:
-            return _read_json(candidate)
+            return read_json(candidate)
         except json.JSONDecodeError:
             continue
     return None
@@ -1524,7 +1460,7 @@ def _plot_convergence(
             ls="--",
             alpha=0.55,
         )
-    else:
+    if not stations:
         ax.text(
             0.5,
             0.5,
@@ -1604,6 +1540,43 @@ def _plot_signature_heatmap(
     matrix, row_labels, col_labels, title, rho_text = _extract_signature_heatmap(summary)
     ax.set_title(title, fontsize=FIG_TITLE_SIZE)
     if matrix is None:
+        isotope_metrics = (
+            summary.payload.get("match_metrics", {}).get("isotopes", {})
+        )
+        rows: list[list[str]] = []
+        row_labels: list[str] = []
+        for isotope in ("Cs-137", "Co-60", "Eu-154"):
+            metrics = isotope_metrics.get(isotope, {})
+            if not metrics:
+                continue
+            counts = metrics.get("counts", {})
+            position = metrics.get("position_error", {})
+            strength = metrics.get("intensity_rel_error_pct", {})
+            rows.append(
+                [
+                    f"{int(counts.get('est', 0))}/{int(counts.get('gt', 0))}",
+                    f"{float(position.get('mean', np.nan)):.2f}",
+                    f"{float(strength.get('mean', np.nan)):.1f}",
+                ]
+            )
+            row_labels.append(isotope)
+        if rows:
+            ax.axis("off")
+            table = ax.table(
+                cellText=rows,
+                rowLabels=row_labels,
+                colLabels=["$\\hat r/r$", "mean\n$e_p$ [m]", "mean\n$e_q$ [%]"],
+                cellLoc="center",
+                rowLoc="center",
+                loc="center",
+                bbox=[0.08, 0.22, 0.88, 0.58],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(max(5.5, FIG_TICK_SIZE - 0.7))
+            table.scale(1.0, 1.18)
+            ax.set_title("Final isotope-wise metrics", fontsize=FIG_TITLE_SIZE)
+            _panel_label(ax, panel)
+            return
         ax.text(
             0.5,
             0.54,
@@ -1781,25 +1754,23 @@ def render_experiment_summary(
     """Render the main proposed-method PF result figure from summaries."""
     if not summary_paths:
         raise ValueError("At least one summary JSON is required.")
-    bundles = [SummaryBundle(path=Path(path), payload=_read_json(Path(path))) for path in summary_paths]
+    bundles = [SummaryBundle(path=Path(path), payload=read_json(Path(path))) for path in summary_paths]
     mix9 = _select_summary(bundles, "mix9")
     if mix9 is not None:
         manifest = _find_environment_manifest(mix9)
-        fig = plt.figure(figsize=(7.15, 5.12))
+        fig = plt.figure(figsize=(7.15, 2.90))
         grid = fig.add_gridspec(
-            2,
-            2,
-            height_ratios=(1.05, 0.96),
-            width_ratios=(1.08, 1.0),
-            hspace=0.31,
-            wspace=0.26,
+            1,
+            3,
+            width_ratios=(0.72, 1.18, 1.24),
+            wspace=0.30,
         )
         _plot_result_projection(
             fig.add_subplot(grid[0, 0]),
             mix9,
             manifest,
             projection="xy",
-            title="(a) proposed MIX-9: floor audit",
+            title="(a) Floor projection",
             panel="",
         )
         _plot_result_projection(
@@ -1807,26 +1778,25 @@ def render_experiment_summary(
             mix9,
             manifest,
             projection="yz",
-            title="(b) depth-height projection",
+            title="(b) Depth-height projection",
             panel="",
         )
-        _plot_convergence(fig.add_subplot(grid[1, 0]), mix9, panel="(c)")
-        _plot_signature_heatmap(fig.add_subplot(grid[1, 1]), mix9, panel="(d)")
+        _plot_signature_heatmap(fig.add_subplot(grid[0, 2]), mix9, panel="(c)")
         handles = _combined_legend_handles([mix9])
         fig.legend(
             handles=handles,
             loc="lower center",
             bbox_to_anchor=(0.5, -0.012),
             ncol=min(6, len(handles)),
-            fontsize=6.6,
+            fontsize=5.7,
             frameon=True,
             framealpha=0.96,
             borderpad=0.24,
             handletextpad=0.30,
             columnspacing=0.72,
         )
-        fig.subplots_adjust(left=0.055, right=0.992, top=0.965, bottom=0.155)
-        return _save_figure(fig, output_path)
+        fig.subplots_adjust(left=0.055, right=0.992, top=0.925, bottom=0.245)
+        return save_figure(fig, output_path)
     raise ValueError("The RA-L experiment figure requires a MIX-9 summary JSON.")
 
 
@@ -1901,7 +1871,7 @@ def main() -> None:
         generated.append(experiment)
         print(f"Wrote {experiment}")
     if generated and not args.no_review_images:
-        review_images = _write_review_images(generated, args.review_output_dir)
+        review_images = write_review_images(generated, args.review_output_dir)
         for review_image in review_images:
             print(f"Wrote review image {review_image}")
 

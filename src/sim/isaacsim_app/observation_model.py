@@ -5,6 +5,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from measurement.detector_geometry import (
+    detector_outer_radius_cm as detector_outer_radius_cm_from_model,
+)
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
@@ -77,14 +80,6 @@ def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
     )
 
 
-def _detector_outer_radius_cm(detector_model: dict[str, object] | None) -> float:
-    """Return detector housing outer radius from a detector-model payload."""
-    payload = {} if detector_model is None else dict(detector_model)
-    crystal_radius_m = float(payload.get("crystal_radius_m", 0.038))
-    housing_thickness_m = float(payload.get("housing_thickness_m", 0.0015))
-    return 100.0 * (crystal_radius_m + housing_thickness_m)
-
-
 class MockObservationModel(ObservationModel):
     """Generate bridge observations without requiring Isaac Sim installation."""
 
@@ -106,7 +101,7 @@ class MockObservationModel(ObservationModel):
             HVL_TVL_TABLE_MM,
             isotopes=list(decomposer.isotope_names),
         )
-        detector_outer_radius_cm = _detector_outer_radius_cm(detector_model)
+        detector_outer_radius_cm = detector_outer_radius_cm_from_model(detector_model)
         fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
             thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
             detector_outer_radius_cm=detector_outer_radius_cm,
@@ -176,7 +171,7 @@ class IsaacSimObservationModel(ObservationModel):
             HVL_TVL_TABLE_MM,
             isotopes=list(self.decomposer.isotope_names),
         )
-        detector_outer_radius_cm = _detector_outer_radius_cm(detector_model)
+        detector_outer_radius_cm = detector_outer_radius_cm_from_model(detector_model)
         fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
             thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
             detector_outer_radius_cm=detector_outer_radius_cm,

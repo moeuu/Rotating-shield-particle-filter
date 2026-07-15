@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import numpy as np
+from numpy.typing import NDArray
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,8 @@ def fit_net_response_calibration(
     *,
     isotopes: Iterable[str] | None = None,
     min_theory_counts: float = 1.0,
+    min_pair_fit_points: int = 1,
+    pair_shrinkage_count: float = 0.0,
     metadata: Mapping[str, Any] | None = None,
 ) -> NetResponseCalibration:
     """
@@ -130,6 +133,13 @@ def fit_net_response_calibration(
     Each record must contain ``isotope``, ``theory_counts``, and ``net_counts``.
     A record may optionally provide ``weight``. Without an explicit weight, the
     fit uses inverse Poisson variance, ``1 / max(net_counts, 1)``.
+
+    Optional shield-pair scales form a hierarchical calibration: isotope-wise
+    scales are always fitted first, and pair-conditioned scales are fitted only
+    when a pair has enough support. ``pair_shrinkage_count`` adds pseudo-counts
+    at the isotope-wise scale so poorly supported pair estimates shrink toward
+    the physically shared detector-response normalization instead of overfitting
+    a few noisy spectra.
     """
     grouped: dict[str, list[tuple[float, float, float]]] = {}
     grouped_by_pair: dict[str, dict[int, list[tuple[float, float, float]]]] = {}
@@ -172,16 +182,36 @@ def fit_net_response_calibration(
             "net_counts_sum": float(net_sum),
         }
         pair_stats: dict[str, float] = {}
+        min_pair_points = max(int(min_pair_fit_points), 1)
+        shrink_count = max(float(pair_shrinkage_count), 0.0)
         for pair_id, pair_values in sorted(grouped_by_pair.get(isotope, {}).items()):
+            if len(pair_values) < min_pair_points:
+                pair_stats[f"pair_{int(pair_id)}_num_fit_points"] = float(
+                    len(pair_values)
+                )
+                pair_stats[f"pair_{int(pair_id)}_skipped_min_points"] = 1.0
+                continue
             pair_fit = _fit_through_origin_scale(pair_values)
             if pair_fit is None:
                 continue
             pair_scale, _, pair_relative_error, _, _ = pair_fit
+            raw_pair_scale = max(float(pair_scale), 0.0)
+            if shrink_count > 0.0 and raw_pair_scale > 0.0 and scale > 0.0:
+                data_weight = float(len(pair_values))
+                shrink_alpha = data_weight / (data_weight + shrink_count)
+                pair_scale = float(
+                    np.exp(
+                        shrink_alpha * np.log(raw_pair_scale)
+                        + (1.0 - shrink_alpha) * np.log(max(scale, 1.0e-12))
+                    )
+                )
             scale_by_isotope_and_pair.setdefault(isotope, {})[int(pair_id)] = max(
                 float(pair_scale),
                 0.0,
             )
             pair_stats[f"pair_{int(pair_id)}_scale"] = max(float(pair_scale), 0.0)
+            pair_stats[f"pair_{int(pair_id)}_raw_scale"] = raw_pair_scale
+            pair_stats[f"pair_{int(pair_id)}_shrinkage_count"] = shrink_count
             pair_stats[f"pair_{int(pair_id)}_num_fit_points"] = float(
                 len(pair_values)
             )
@@ -193,11 +223,18 @@ def fit_net_response_calibration(
         if pair_stats:
             fit_statistics[isotope].update(pair_stats)
 
+    fit_metadata = dict(metadata or {})
+    fit_metadata.update(
+        {
+            "min_pair_fit_points": float(max(int(min_pair_fit_points), 1)),
+            "pair_shrinkage_count": float(max(float(pair_shrinkage_count), 0.0)),
+        }
+    )
     return NetResponseCalibration(
         scale_by_isotope=scale_by_isotope,
         scale_by_isotope_and_pair=scale_by_isotope_and_pair,
         fit_statistics=fit_statistics,
-        metadata=dict(metadata or {}),
+        metadata=fit_metadata,
     )
 
 

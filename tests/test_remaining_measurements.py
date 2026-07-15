@@ -10,6 +10,7 @@ import pytest
 from measurement.kernels import ShieldParams
 from pf.estimator import MeasurementRecord, RotatingShieldPFConfig
 from pf.estimator import RotatingShieldPFEstimator
+from pf.likelihood import expected_counts_per_source
 from pf.particle_filter import IsotopeParticle
 from pf.state import IsotopeState
 from planning.remaining_measurements import RemainingMeasurementConfig
@@ -186,6 +187,42 @@ def test_remaining_measurement_estimate_is_json_safe() -> None:
     json.dumps(payload, allow_nan=False)
 
 
+def test_remaining_measurement_uses_report_residual_and_correlation() -> None:
+    """Report-level residual and response correlation should keep views unresolved."""
+    estimator = _build_two_mode_estimator()
+    estimator._last_report_model_order_diagnostics["Cs-137"] = {
+        "selected_count": 2,
+        "model_order_ready": False,
+        "selected_max_response_correlation": 0.96,
+        "selected_positive_residual_fraction": 0.08,
+        "selected_positive_residual_chi2": 42.0,
+        "selected_strengths": [900.0, 100.0],
+    }
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        config=RemainingMeasurementConfig(
+            max_particles=2,
+            planning_method="top_weight",
+            report_response_correlation_threshold=0.9,
+            report_positive_residual_fraction_threshold=0.02,
+            report_strength_concentration_threshold=0.75,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.components["report_response_correlation"] > 0.0
+    assert estimate.components["report_residual"] > 0.0
+    assert estimate.components["strength_absorption"] > 0.0
+    assert "report_response_correlation" in estimate.unresolved_factors
+    assert "report_residual" in estimate.unresolved_factors
+    details = estimate.isotope_details["Cs-137"]
+    assert details["report_positive_residual_fraction"] == pytest.approx(0.08)
+    assert details["report_strength_concentration"] == pytest.approx(0.9)
+
+
 def test_remaining_measurement_flags_high_surface_ambiguity() -> None:
     """Ceiling modes with weak pairwise separation should keep the mission open."""
     isotope = "Cs-137"
@@ -293,6 +330,105 @@ def test_remaining_measurement_residual_uses_surface_candidate_gain() -> None:
 
     assert estimate.gains["residual_surface"] > 0.0
     assert estimate.gains["residual"] >= estimate.gains["residual_surface"]
+
+
+def test_remaining_measurement_reuses_guidance_state_cache() -> None:
+    """Post-DSS estimates should reuse the immediately previous guidance state."""
+    estimator = _build_two_mode_estimator()
+    estimator.measurements[0].z_k["Cs-137"] = 5000.0
+    assert estimator.measurements[0].z_variance_k is not None
+    estimator.measurements[0].z_variance_k["Cs-137"] = 100.0
+    config = RemainingMeasurementConfig(
+        mode_cluster_radius_m=0.25,
+        max_modes_per_isotope=4,
+        max_particles=2,
+        planning_method="top_weight",
+        residual_chi2_threshold=9.0,
+        count_variance_floor=1.0,
+        residual_surface_gain_candidate_limit=16,
+        eta_default=0.7,
+        max_reported_stations=20,
+    )
+
+    guidance = estimate_remaining_measurement_budget(
+        estimator,
+        shield_program_pair_ids=(0,),
+        live_time_s=1.0,
+        config=config,
+        current_station_count=1,
+        update_history=False,
+    )
+    report = estimate_remaining_measurement_budget(
+        estimator,
+        next_pose_xyz=np.array([3.0, 2.0, 0.0], dtype=float),
+        shield_program_pair_ids=(0, 1),
+        live_time_s=1.0,
+        config=config,
+        current_station_count=1,
+        update_history=True,
+    )
+
+    assert guidance.timings["state_cache_hit"] == 0.0
+    assert report.timings["state_cache_hit"] == 1.0
+    assert getattr(estimator, "_remaining_measurement_state_cache", None) is None
+    assert report.gains["residual_surface"] == pytest.approx(
+        guidance.gains["residual_surface"]
+    )
+
+
+def test_candidate_response_prefix_cache_matches_direct_kernel() -> None:
+    """Incremental candidate response cache should match direct full-history counts."""
+    estimator = _build_two_mode_estimator()
+    isotope = "Cs-137"
+    filt = estimator.filters[isotope]
+    data_one = estimator._measurement_data_for_iso(isotope, window=None)
+    assert data_one is not None
+
+    counts_one = estimator._cached_candidate_grid_counts(
+        filt=filt,
+        isotope=isotope,
+        data=data_one,
+    )
+    estimator.add_measurement_pose(np.array([3.0, 2.0, 0.0], dtype=float))
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={isotope: 80.0},
+            pose_idx=1,
+            orient_idx=1,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=1,
+            z_variance_k={isotope: 80.0},
+        )
+    )
+    data_two = estimator._measurement_data_for_iso(isotope, window=None)
+    assert data_two is not None
+
+    cached_counts = estimator._cached_candidate_grid_counts(
+        filt=filt,
+        isotope=isotope,
+        data=data_two,
+    )
+    direct_counts = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=isotope,
+        detector_positions=data_two.detector_positions,
+        sources=estimator.candidate_sources,
+        strengths=np.ones(estimator.candidate_sources.shape[0], dtype=float),
+        live_times=data_two.live_times,
+        fe_indices=data_two.fe_indices,
+        pb_indices=data_two.pb_indices,
+        source_scale=estimator.response_scales_for_measurements(
+            isotope,
+            data_two.fe_indices,
+            data_two.pb_indices,
+        ),
+    )
+
+    assert cached_counts.shape == direct_counts.shape
+    assert np.allclose(cached_counts, direct_counts)
+    assert np.allclose(cached_counts[: counts_one.shape[0]], counts_one)
+    assert getattr(estimator, "_candidate_response_prefix_cache")
 
 
 def test_remaining_measurement_marks_observed_zero_source_isotope_unresolved() -> None:
@@ -425,6 +561,129 @@ def test_remaining_measurement_ignores_low_snr_absent_isotope_counts() -> None:
     assert "isotope_absence" not in estimate.unresolved_factors
     assert estimate.isotope_details[isotope]["active_evidence"] == 0
     assert estimate.isotope_details[isotope]["unresolved_absent_total_counts"] == 0.0
+
+
+def test_remaining_measurement_keeps_unready_zero_source_report_active() -> None:
+    """Report-unready zero-source models should still require more views."""
+    isotope = "Eu-154"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.measurements.append(
+        MeasurementRecord(
+            z_k={isotope: 91.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+            z_variance_k={isotope: 1.0e8},
+        )
+    )
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[5.0, 5.0, 10.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+    estimator._last_report_model_order_diagnostics[isotope] = {
+        "selected_count": 0,
+        "count_supported_zero_source": True,
+        "model_order_ready": False,
+    }
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        config=RemainingMeasurementConfig(
+            max_particles=2,
+            planning_method="top_weight",
+            unresolved_absent_min_total_counts=25.0,
+            unresolved_absent_min_max_counts=5.0,
+            unresolved_absent_min_snr=2.0,
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.isotope_details[isotope]["active_evidence"] == 1
+    assert estimate.components["cardinality"] > 0.0
+    assert "cardinality" in estimate.unresolved_factors
+
+
+def test_remaining_measurement_keeps_candidate_missing_ready_active() -> None:
+    """Candidate diagnostics without explicit readiness should remain active evidence."""
+    isotope = "Eu-154"
+    estimator = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
+        shield_normals=np.eye(3, dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator._last_report_model_order_diagnostics[isotope] = {
+        "candidate_count": 2,
+        "selected_count": 0,
+    }
+    filt = estimator.filters[isotope]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[5.0, 5.0, 10.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        ),
+    ]
+
+    estimate = estimate_remaining_measurement_budget(
+        estimator,
+        config=RemainingMeasurementConfig(
+            max_particles=2,
+            planning_method="top_weight",
+            eta_default=0.7,
+            max_reported_stations=20,
+        ),
+        current_station_count=1,
+    )
+
+    assert estimate.isotope_details[isotope]["active_evidence"] == 1
 
 
 def test_surface_stratified_rescue_keeps_high_surface_candidate() -> None:

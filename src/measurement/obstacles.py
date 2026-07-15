@@ -27,6 +27,9 @@ class ObstacleGrid:
     blocked_cells: tuple[tuple[int, int], ...]
     transport_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
     transport_mu_by_isotope: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         """Normalize inputs and validate bounds."""
@@ -66,12 +69,29 @@ class ObstacleGrid:
                     "transport_mu_by_isotope entries must match transport_boxes_m length."
                 )
             transport_mu[str(isotope)] = mu_values
+        transport_line_mu: dict[str, tuple[tuple[float, ...], ...]] = {}
+        for isotope, rows in self.transport_line_mu_by_isotope.items():
+            parsed_rows: list[tuple[float, ...]] = []
+            for row in rows:
+                mu_values = tuple(float(value) for value in row)
+                if len(mu_values) != len(transport_boxes):
+                    raise ValueError(
+                        "transport_line_mu_by_isotope rows must match "
+                        "transport_boxes_m length."
+                    )
+                parsed_rows.append(mu_values)
+            transport_line_mu[str(isotope)] = tuple(parsed_rows)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "cell_size", cell_size)
         object.__setattr__(self, "grid_shape", grid_shape)
         object.__setattr__(self, "blocked_cells", blocked)
         object.__setattr__(self, "transport_boxes_m", transport_boxes)
         object.__setattr__(self, "transport_mu_by_isotope", transport_mu)
+        object.__setattr__(
+            self,
+            "transport_line_mu_by_isotope",
+            transport_line_mu,
+        )
         object.__setattr__(self, "_blocked_set", frozenset(blocked))
 
     @property
@@ -193,11 +213,27 @@ class ObstacleGrid:
         }
         return normalized.get(_normalize_isotope_key(isotope))
 
+    def transport_line_mu_values(
+        self,
+        isotope: str,
+    ) -> tuple[tuple[float, ...], ...] | None:
+        """Return per-line, per-box attenuation coefficients for an isotope."""
+        if not self.transport_line_mu_by_isotope:
+            return None
+        if isotope in self.transport_line_mu_by_isotope:
+            return self.transport_line_mu_by_isotope[isotope]
+        normalized = {
+            _normalize_isotope_key(key): values
+            for key, values in self.transport_line_mu_by_isotope.items()
+        }
+        return normalized.get(_normalize_isotope_key(isotope))
+
     def with_transport_model(
         self,
         *,
         boxes_m: Iterable[Sequence[float]],
         mu_by_isotope: dict[str, Sequence[float]],
+        line_mu_by_isotope: dict[str, Sequence[Sequence[float]]] | None = None,
     ) -> "ObstacleGrid":
         """Return a copy with known obstacle transport components attached."""
         return ObstacleGrid(
@@ -209,6 +245,12 @@ class ObstacleGrid:
             transport_mu_by_isotope={
                 str(isotope): tuple(float(value) for value in values)
                 for isotope, values in mu_by_isotope.items()
+            },
+            transport_line_mu_by_isotope={
+                str(isotope): tuple(
+                    tuple(float(value) for value in row) for row in rows
+                )
+                for isotope, rows in (line_mu_by_isotope or {}).items()
             },
         )
 
@@ -235,6 +277,10 @@ class ObstacleGrid:
                 isotope: [float(value) for value in values]
                 for isotope, values in sorted(self.transport_mu_by_isotope.items())
             },
+            "transport_line_mu_by_isotope": {
+                isotope: [[float(value) for value in row] for row in rows]
+                for isotope, rows in sorted(self.transport_line_mu_by_isotope.items())
+            },
         }
 
     def save(self, path: Path) -> None:
@@ -254,6 +300,7 @@ class ObstacleGrid:
         blocked_cells = data.get("blocked_cells", [])
         transport_boxes = data.get("transport_boxes_m", [])
         transport_mu_by_isotope = data.get("transport_mu_by_isotope", {})
+        transport_line_mu_by_isotope = data.get("transport_line_mu_by_isotope", {})
         if grid_shape is None:
             raise ValueError("Obstacle layout missing 'grid_shape'.")
         if not isinstance(blocked_cells, list):
@@ -262,6 +309,8 @@ class ObstacleGrid:
             raise ValueError("transport_boxes_m must be a list.")
         if not isinstance(transport_mu_by_isotope, dict):
             raise ValueError("transport_mu_by_isotope must be a dict.")
+        if not isinstance(transport_line_mu_by_isotope, dict):
+            raise ValueError("transport_line_mu_by_isotope must be a dict.")
         return cls(
             origin=(float(origin[0]), float(origin[1])),
             cell_size=float(cell_size),
@@ -274,6 +323,12 @@ class ObstacleGrid:
             transport_mu_by_isotope={
                 str(isotope): tuple(float(value) for value in values)
                 for isotope, values in transport_mu_by_isotope.items()
+            },
+            transport_line_mu_by_isotope={
+                str(isotope): tuple(
+                    tuple(float(value) for value in row) for row in rows
+                )
+                for isotope, rows in transport_line_mu_by_isotope.items()
             },
         )
 

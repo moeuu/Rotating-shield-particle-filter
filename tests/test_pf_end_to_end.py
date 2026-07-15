@@ -136,6 +136,840 @@ def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
 
     assert est.last_pair_sequence_update_workers == 2
     assert {isotope for isotope, _values in calls} == {"Cs-137", "Co-60"}
+    report_summary = est.best_report_summary()
+    assert report_summary["snapshot_count"] == 1
+    assert report_summary["last"]["label"] == "measurement_2"
+
+
+def test_update_pair_sequence_records_stage_timings(monkeypatch):
+    """Station joint updates should expose stage-level wall-time diagnostics."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+
+    def fake_sequence_update(self, **_kwargs):
+        """Avoid heavy likelihood work while preserving dispatch."""
+        return None
+
+    def fake_birth_death(*_args, **_kwargs):
+        """Avoid structural moves while preserving stage timing."""
+        return None
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair_sequence",
+        fake_sequence_update,
+    )
+    monkeypatch.setattr(est, "_apply_birth_death", fake_birth_death)
+
+    est.update_pair_sequence(
+        [({"Cs-137": 1.0}, 0, 0, 1.0, None)],
+        pose_idx=0,
+    )
+
+    stages = est.last_pair_sequence_stage_wall_s
+    assert stages["isotope_sequence_update"] >= 0.0
+    assert stages["sparse_poisson_refresh"] >= 0.0
+    assert stages["birth_death"] >= 0.0
+    assert stages["report_snapshot"] >= 0.0
+    assert stages["total"] >= stages["isotope_sequence_update"]
+
+
+def test_update_pair_sequence_passes_view_covariance(monkeypatch):
+    """Station joint updates should pass same-shield-program view covariance."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_sequence_update(self, **kwargs):
+        """Record the covariance matrix received by the isotope PF."""
+        captured[self.isotope] = np.asarray(
+            kwargs["observation_count_covariance"],
+            dtype=float,
+        )
+
+    def fake_birth_death(*_args, **_kwargs):
+        """Skip structural moves so this test isolates covariance routing."""
+        return None
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair_sequence",
+        fake_sequence_update,
+    )
+    monkeypatch.setattr(est, "_apply_birth_death", fake_birth_death)
+    view_covariance = np.array([[10.0, 3.0], [3.0, 20.0]], dtype=float)
+
+    est.update_pair_sequence(
+        [
+            ({"Cs-137": 1.0}, 0, 0, 1.0, {"Cs-137": 10.0}),
+            ({"Cs-137": 3.0}, 0, 0, 1.0, {"Cs-137": 20.0}),
+        ],
+        pose_idx=0,
+        z_view_covariance_by_isotope={"Cs-137": view_covariance},
+    )
+
+    assert np.allclose(captured["Cs-137"], view_covariance)
+
+
+def test_update_pair_sequence_records_spectrum_payload(monkeypatch):
+    """Station sequence records should preserve direct spectrum-bin payloads."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            sparse_poisson_evidence_enable=False,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+
+    def fake_sequence_update(self, **_kwargs):
+        """Avoid stochastic PF updates while preserving measurement history."""
+        return None
+
+    def fake_birth_death(*_args, **_kwargs):
+        """Skip structural moves so this test isolates history storage."""
+        return None
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair_sequence",
+        fake_sequence_update,
+    )
+    monkeypatch.setattr(est, "_apply_birth_death", fake_birth_death)
+    spectrum_payload = {
+        "spectrum_counts": np.array([10.0, 3.0, 1.0], dtype=float),
+        "spectrum_variance": np.array([10.0, 3.0, 1.0], dtype=float),
+        "spectrum_background": np.array([1.0, 1.0, 1.0], dtype=float),
+        "spectrum_response_templates_by_isotope": {
+            "Cs-137": np.array([1.0, 0.2, 0.0], dtype=float)
+        },
+    }
+
+    est.update_pair_sequence(
+        [
+            (
+                {"Cs-137": 10.0},
+                0,
+                0,
+                1.0,
+                {"Cs-137": 10.0},
+                None,
+                spectrum_payload,
+            ),
+        ],
+        pose_idx=0,
+    )
+
+    record = est.measurements[-1]
+    assert record.spectrum_counts == pytest.approx((10.0, 3.0, 1.0))
+    assert record.spectrum_background == pytest.approx((1.0, 1.0, 1.0))
+    assert record.spectrum_response_templates_by_isotope is not None
+    assert record.spectrum_response_templates_by_isotope["Cs-137"] == pytest.approx(
+        (1.0, 0.2, 0.0)
+    )
+
+
+def test_update_pair_projects_isotope_covariance_to_pf_variance(monkeypatch):
+    """Same-spectrum isotope covariance should widen independent PF variances."""
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137", "Co-60"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0, "Co-60": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            use_gpu=False,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    observed_variances = {}
+
+    def fake_update(self, **kwargs):
+        """Record the scalar variance that the independent isotope PF receives."""
+        observed_variances[self.isotope] = float(
+            kwargs["observation_count_variance"]
+        )
+
+    def fake_birth_death(*_args, **_kwargs):
+        """Skip structural moves so this test isolates covariance projection."""
+        return None
+
+    monkeypatch.setattr(IsotopeParticleFilter, "update_continuous_pair", fake_update)
+    monkeypatch.setattr(est, "_apply_birth_death", fake_birth_death)
+
+    est.update_pair(
+        z_k={"Cs-137": 100.0, "Co-60": 80.0},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 25.0, "Co-60": 16.0},
+        z_covariance_k={
+            "Cs-137": {"Cs-137": 25.0, "Co-60": -12.0},
+            "Co-60": {"Cs-137": -12.0, "Co-60": 16.0},
+        },
+    )
+
+    assert observed_variances["Cs-137"] == pytest.approx(37.0)
+    assert observed_variances["Co-60"] == pytest.approx(28.0)
+    assert est.measurements[-1].z_variance_k == pytest.approx(
+        {"Cs-137": 37.0, "Co-60": 28.0}
+    )
+    assert est.measurements[-1].z_covariance_k is not None
+    assert est.measurements[-1].z_covariance_k["Cs-137"]["Co-60"] == pytest.approx(
+        -12.0
+    )
+
+
+def test_runtime_report_rescue_queue_only_does_not_inject_particles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue-only report rescue should retain candidates without PF injection."""
+    isotope = "Cs-137"
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=2,
+            runtime_report_rescue_verification_queue_only=True,
+            runtime_report_rescue_memory_enable=False,
+            candidate_verification_queue_weight=0.07,
+            report_best_so_far_enable=False,
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    est.add_measurement_pose(np.array([0.0, 0.0, 0.0], dtype=float))
+    est._ensure_kernel_cache()
+    filt = est.filters[isotope]
+    positions = np.array([[1.0, 2.0, 0.5], [3.0, 1.0, 0.5]], dtype=float)
+    strengths = np.array([120.0, 80.0], dtype=float)
+
+    def fake_rescue_estimate(
+        rescue_isotope: str,
+        _filt: IsotopeParticleFilter,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return deterministic rescue candidates for queue-only routing."""
+        assert rescue_isotope == isotope
+        return positions.copy(), strengths.copy()
+
+    def forbidden_injection(*_args: object, **_kwargs: object) -> int:
+        """Fail if queue-only mode tries to inject particles."""
+        raise AssertionError("queue-only rescue must not inject PF particles")
+
+    monkeypatch.setattr(est, "_runtime_report_rescue_estimate", fake_rescue_estimate)
+    monkeypatch.setattr(
+        filt,
+        "inject_runtime_report_rescue_particles",
+        forbidden_injection,
+    )
+
+    injected = est._inject_runtime_report_rescue(isotope, filt)
+
+    assert injected == 0
+    queued = est._candidate_verification_queue[isotope]
+    np.testing.assert_allclose(queued[0], positions)
+    np.testing.assert_allclose(queued[1], strengths)
+    modes = est.runtime_report_rescue_modes()[isotope]
+    np.testing.assert_allclose(modes[0], positions)
+    np.testing.assert_allclose(modes[1], strengths)
+    assert modes[2] == pytest.approx(0.07)
+
+
+def test_sparse_evidence_prunes_contradicted_verification_queue_candidates() -> None:
+    """Decisive sparse evidence should delete queued candidates it rejects."""
+    isotope = "Cs-137"
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=2,
+            sparse_poisson_evidence_authoritative=True,
+            candidate_verification_queue_enable=True,
+            report_mle_rescue_dedup_radius_m=0.25,
+            report_best_so_far_enable=False,
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    near = np.array([1.0, 1.0, 0.5], dtype=float)
+    far = np.array([3.0, 3.0, 0.5], dtype=float)
+    est._candidate_verification_queue[isotope] = (
+        np.vstack([near, far]),
+        np.array([100.0, 90.0], dtype=float),
+        np.array([100.0, 90.0], dtype=float),
+    )
+    payload = {
+        "model_order_ready": True,
+        "selected_positions": [near.tolist()],
+    }
+
+    removed = est._prune_candidate_verification_queue_with_sparse_evidence(
+        isotope,
+        payload,
+    )
+
+    assert removed == 1
+    queued = est._candidate_verification_queue[isotope]
+    np.testing.assert_allclose(queued[0], near.reshape(1, 3))
+    np.testing.assert_allclose(queued[1], np.array([100.0], dtype=float))
+
+
+def test_update_pair_refreshes_sparse_poisson_evidence_without_report_call():
+    """All-history sparse evidence should refresh immediately after observations."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=2,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            sparse_poisson_evidence_enable=True,
+            sparse_poisson_evidence_authoritative=True,
+            sparse_poisson_evidence_min_bic_margin=0.0,
+            sparse_poisson_evidence_parameter_count_per_source=1,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    detector_positions = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    for pose in detector_positions:
+        est.add_measurement_pose(pose)
+    est._ensure_kernel_cache()
+    expected = expected_counts_per_source(
+        kernel=est.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=candidate_sources[:1],
+        strengths=np.array([200.0], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        source_scale=1.0,
+    )
+
+    for pose_idx, count in enumerate(np.sum(expected, axis=1)):
+        est.update_pair(
+            z_k={isotope: float(count)},
+            pose_idx=pose_idx,
+            fe_index=0,
+            pb_index=0,
+            live_time_s=1.0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+
+    diagnostics = est.sparse_poisson_evidence_diagnostics()
+    payload = diagnostics[isotope]
+    assert payload["available"] is True
+    assert payload["method"] == "all_history_sparse_poisson"
+    assert payload["measurement_count"] == detector_positions.shape[0]
+    assert payload["selected_count"] == 1
+    assert payload["model_order_ready"] is True
+
+
+def test_sparse_evidence_requires_independent_station_support_for_authority():
+    """Sparse evidence should not become authoritative from one shield-only station."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=2,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            sparse_poisson_evidence_enable=True,
+            sparse_poisson_evidence_authoritative=True,
+            sparse_poisson_evidence_min_bic_margin=0.0,
+            sparse_poisson_evidence_min_distinct_stations=2,
+            sparse_poisson_evidence_parameter_count_per_source=1,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    station = np.array([1.0, 0.0, 0.0], dtype=float)
+    est.add_measurement_pose(station)
+    est._ensure_kernel_cache()
+    detector_positions = np.repeat(station.reshape(1, 3), repeats=3, axis=0)
+    expected = expected_counts_per_source(
+        kernel=est.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=candidate_sources[:1],
+        strengths=np.array([200.0], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        source_scale=1.0,
+    )
+
+    for count in np.sum(expected, axis=1):
+        est.update_pair(
+            z_k={isotope: float(count)},
+            pose_idx=0,
+            fe_index=0,
+            pb_index=0,
+            live_time_s=1.0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+
+    payload = est.sparse_poisson_evidence_diagnostics()[isotope]
+    assert payload["available"] is True
+    assert payload["distinct_station_count"] == 1
+    assert payload["min_distinct_stations_for_ready"] == 2
+    assert payload["model_order_ready"] is False
+
+
+def test_sparse_evidence_zero_strengths_are_refit_for_report_and_sync():
+    """Authoritative evidence positions should not disappear due to zero seed strength."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=2,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            report_strength_refit=True,
+            report_strength_refit_prior_weight=4.0,
+            sparse_poisson_evidence_authoritative=True,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    detector_positions = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    for pose in detector_positions:
+        est.add_measurement_pose(pose)
+    est._ensure_kernel_cache()
+    true_strength = 180.0
+    counts = expected_counts_per_source(
+        kernel=est.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=candidate_sources[:1],
+        strengths=np.array([true_strength], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        source_scale=1.0,
+    ).reshape(-1)
+    data = MeasurementData(
+        z_k=counts,
+        observation_variances=np.maximum(counts, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+    )
+    est._last_sparse_poisson_evidence_diagnostics = {
+        isotope: {
+            "available": True,
+            "model_order_ready": True,
+            "selected_count": 1,
+            "selected_positions": [candidate_sources[0].tolist()],
+            "selected_strengths": [0.0],
+        }
+    }
+    background = est._background_counts_for_report_refit(isotope, data.live_times)
+
+    report_override = est._sparse_poisson_report_override(
+        isotope,
+        filt=est.filters[isotope],
+        data=data,
+        background=background,
+    )
+    sync_ready, sync_positions, sync_strengths = est._authoritative_sparse_evidence_sources(
+        isotope,
+        filt=est.filters[isotope],
+        data=data,
+    )
+
+    assert report_override is not None
+    report_positions, report_strengths = report_override
+    np.testing.assert_allclose(report_positions, candidate_sources[:1])
+    assert report_strengths.shape == (1,)
+    assert report_strengths[0] > est.pf_config.min_strength
+    assert report_strengths[0] == pytest.approx(true_strength, rel=0.15)
+    assert sync_ready is True
+    np.testing.assert_allclose(sync_positions, candidate_sources[:1])
+    assert sync_strengths[0] == pytest.approx(report_strengths[0], rel=1.0e-6)
+
+
+def test_sparse_evidence_report_override_requires_ready_model_order():
+    """Authoritative report override should wait for decisive sparse evidence."""
+    isotope = "Cs-137"
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            sparse_poisson_evidence_authoritative=True,
+            report_best_so_far_enable=False,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    est._last_sparse_poisson_evidence_diagnostics = {
+        isotope: {
+            "available": True,
+            "model_order_ready": False,
+            "selected_count": 1,
+            "selected_positions": [[0.0, 0.0, 0.0]],
+            "selected_strengths": [100.0],
+        }
+    }
+
+    assert est._sparse_poisson_report_override(isotope) is None
+
+
+def test_update_pair_prefers_spectrum_bin_sparse_evidence_when_available():
+    """Sparse evidence should use direct spectrum bins when payloads are available."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            sparse_poisson_evidence_enable=True,
+            sparse_poisson_evidence_authoritative=True,
+            sparse_poisson_evidence_min_bic_margin=0.0,
+            sparse_poisson_evidence_parameter_count_per_source=1,
+            sparse_poisson_spectral_evidence_enable=True,
+            sparse_poisson_spectral_evidence_primary=True,
+            sparse_poisson_spectral_nuisance_enable=False,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    detector_positions = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    for pose in detector_positions:
+        est.add_measurement_pose(pose)
+    est._ensure_kernel_cache()
+    scalar_counts = expected_counts_per_source(
+        kernel=est.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=candidate_sources[:1],
+        strengths=np.array([150.0], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        source_scale=1.0,
+    ).reshape(-1)
+    template = np.array([1.0, 0.25, 0.02], dtype=float)
+
+    for pose_idx, count in enumerate(scalar_counts):
+        spectrum = count * template
+        est.update_pair(
+            z_k={isotope: float(count)},
+            pose_idx=pose_idx,
+            fe_index=0,
+            pb_index=0,
+            live_time_s=1.0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+            spectrum_payload={
+                "spectrum_counts": spectrum,
+                "spectrum_background": np.zeros_like(template),
+                "spectrum_response_templates_by_isotope": {isotope: template},
+            },
+        )
+
+    payload = est.sparse_poisson_evidence_diagnostics()[isotope]
+    assert payload["available"] is True
+    assert payload["method"] == "spectral_bin_sparse_poisson"
+    assert payload["selected_count"] == 1
+    assert payload["spectrum_measurement_count"] == detector_positions.shape[0]
+    assert payload["spectrum_bin_count"] == template.size
+    assert payload["selected_indices"] == [0]
+    assert "count_sparse_poisson_evidence" in payload
+
+
+def test_sparse_poisson_offgrid_refinement_improves_selected_position():
+    """Sparse evidence should profile coarse candidates in continuous space."""
+    isotope = "Cs-137"
+    candidate_sources = np.array(
+        [[0.1, 0.1, 0.1], [2.5, 2.5, 0.5]],
+        dtype=float,
+    )
+    true_source = np.array([[0.45, 0.5, 0.4]], dtype=float)
+    est = RotatingShieldPFEstimator(
+        isotopes=[isotope],
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            sparse_poisson_evidence_enable=True,
+            sparse_poisson_evidence_authoritative=True,
+            sparse_poisson_evidence_min_bic_margin=0.0,
+            sparse_poisson_spectral_evidence_enable=False,
+            sparse_poisson_offgrid_refine_enable=True,
+            sparse_poisson_offgrid_refine_radius_m=0.8,
+            sparse_poisson_offgrid_refine_max_iter=96,
+            position_min=(0.0, 0.0, 0.0),
+            position_max=(3.0, 3.0, 2.0),
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    detector_positions = np.array(
+        [
+            [1.5, 0.2, 0.2],
+            [0.2, 1.6, 0.2],
+            [1.4, 1.4, 0.8],
+            [2.0, 0.6, 0.6],
+            [0.6, 2.0, 0.7],
+        ],
+        dtype=float,
+    )
+    for pose in detector_positions:
+        est.add_measurement_pose(pose)
+    est._ensure_kernel_cache()
+    true_counts = expected_counts_per_source(
+        kernel=est.filters[isotope].continuous_kernel,
+        isotope=isotope,
+        detector_positions=detector_positions,
+        sources=true_source,
+        strengths=np.array([220.0], dtype=float),
+        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
+        source_scale=1.0,
+    ).reshape(-1)
+
+    for pose_idx, count in enumerate(true_counts):
+        est.update_pair(
+            z_k={isotope: float(count)},
+            pose_idx=pose_idx,
+            fe_index=0,
+            pb_index=0,
+            live_time_s=1.0,
+            z_variance_k={isotope: max(float(count), 1.0)},
+        )
+
+    payload = est.sparse_poisson_evidence_diagnostics()[isotope]
+    coarse_distance = float(np.linalg.norm(candidate_sources[0] - true_source[0]))
+    refined_position = np.asarray(payload["selected_positions"], dtype=float).reshape(
+        -1,
+        3,
+    )[0]
+    refined_distance = float(np.linalg.norm(refined_position - true_source[0]))
+
+    assert payload["available"] is True
+    assert payload["selected_indices"] == [0]
+    assert payload["offgrid_refined"] is True
+    assert payload["offgrid_refinement"]["accepted"] is True
+    assert refined_distance < coarse_distance
+
+
+def test_joint_sparse_poisson_evidence_projects_multi_isotope_cardinality():
+    """Joint spectrum-bin evidence should project cardinality back to isotopes."""
+    isotopes = ["Cs-137", "Co-60"]
+    candidate_sources = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=isotopes,
+        candidate_sources=candidate_sources,
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0, "Co-60": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            birth_enable=False,
+            conditional_strength_refit=False,
+            history_estimate_interval=0,
+            report_best_so_far_enable=False,
+            sparse_poisson_evidence_enable=True,
+            sparse_poisson_evidence_authoritative=True,
+            sparse_poisson_evidence_min_bic_margin=0.0,
+            sparse_poisson_evidence_parameter_count_per_source=1,
+            sparse_poisson_spectral_evidence_enable=True,
+            sparse_poisson_spectral_evidence_primary=True,
+            sparse_poisson_spectral_nuisance_enable=False,
+            sparse_poisson_joint_evidence_enable=True,
+            use_gpu=True,
+            gpu_device="cpu",
+        ),
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+    )
+    detector_positions = np.array(
+        [[1.0, 0.0, 0.0], [3.0, 1.0, 0.0], [0.0, 2.0, 0.0]],
+        dtype=float,
+    )
+    for pose in detector_positions:
+        est.add_measurement_pose(pose)
+    est._ensure_kernel_cache()
+    live_times = np.ones(detector_positions.shape[0], dtype=float)
+    fe_indices = np.zeros(detector_positions.shape[0], dtype=int)
+    pb_indices = np.zeros(detector_positions.shape[0], dtype=int)
+    cs_counts = expected_counts_per_source(
+        kernel=est.filters["Cs-137"].continuous_kernel,
+        isotope="Cs-137",
+        detector_positions=detector_positions,
+        sources=candidate_sources[:1],
+        strengths=np.array([120.0], dtype=float),
+        live_times=live_times,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        source_scale=1.0,
+    ).reshape(-1)
+    co_counts = expected_counts_per_source(
+        kernel=est.filters["Co-60"].continuous_kernel,
+        isotope="Co-60",
+        detector_positions=detector_positions,
+        sources=candidate_sources[1:2],
+        strengths=np.array([90.0], dtype=float),
+        live_times=live_times,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        source_scale=1.0,
+    ).reshape(-1)
+    cs_template = np.array([1.0, 0.2, 0.0, 0.0], dtype=float)
+    co_template = np.array([0.0, 0.0, 0.3, 1.0], dtype=float)
+
+    for pose_idx, (cs_count, co_count) in enumerate(zip(cs_counts, co_counts)):
+        spectrum = cs_count * cs_template + co_count * co_template
+        est.update_pair(
+            z_k={"Cs-137": float(cs_count), "Co-60": float(co_count)},
+            pose_idx=pose_idx,
+            fe_index=0,
+            pb_index=0,
+            live_time_s=1.0,
+            z_variance_k={
+                "Cs-137": max(float(cs_count), 1.0),
+                "Co-60": max(float(co_count), 1.0),
+            },
+            spectrum_payload={
+                "spectrum_counts": spectrum,
+                "spectrum_background": np.zeros_like(spectrum),
+                "spectrum_response_templates_by_isotope": {
+                    "Cs-137": cs_template,
+                    "Co-60": co_template,
+                },
+            },
+        )
+
+    diagnostics = est.sparse_poisson_evidence_diagnostics()
+    joint_payload = diagnostics["joint_multi_isotope"]
+    assert joint_payload["available"] is True
+    assert joint_payload["method"] == "joint_multi_isotope_sparse_poisson"
+    assert joint_payload["selected_counts_by_isotope"] == {
+        "Cs-137": 1,
+        "Co-60": 1,
+    }
+    assert diagnostics["Cs-137"]["method"] == (
+        "joint_multi_isotope_sparse_poisson_projection"
+    )
+    assert diagnostics["Co-60"]["selected_indices"] == [1]
 
 
 def test_estimator_uses_clustered_output_when_birth_is_enabled():
@@ -981,3 +1815,56 @@ def test_adaptive_strength_prior_floor_does_not_increase_strength():
     after = float(est.filters["Cs-137"].continuous_particles[0].state.strengths[0])
     assert after <= before
     assert diagnostics["Cs-137"]["floor_only_target"] == pytest.approx(1.0)
+
+
+def test_pair_sequence_adaptive_strength_prior_counts_pending_records(monkeypatch):
+    """Same-station sequences should consume the adaptive-prior step budget once."""
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        min_particles=1,
+        max_particles=1,
+        max_sources=1,
+        use_gpu=False,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(1.0, 1.0, 1.0),
+        init_num_sources=(1, 1),
+        init_grid_spacing_m=1.0,
+        adaptive_strength_prior=True,
+        adaptive_strength_prior_steps=2,
+        background_level=0.0,
+    )
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.5, 0.5, 0.5]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        pf_config=config,
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+    )
+    est.add_measurement_pose(np.array([1.5, 0.5, 0.5], dtype=float))
+    calls: list[int | None] = []
+
+    def fake_adapt_strength_prior_to_observation(**kwargs):
+        """Record adaptive-prior calls without running the heavy count kernel."""
+        calls.append(kwargs.get("completed_measurement_count"))
+        return {}
+
+    monkeypatch.setattr(
+        est,
+        "adapt_strength_prior_to_observation",
+        fake_adapt_strength_prior_to_observation,
+    )
+    monkeypatch.setattr(est, "_run_isotope_pair_sequence_update", lambda task: None)
+    monkeypatch.setattr(est, "refresh_sparse_poisson_evidence", lambda: None)
+    monkeypatch.setattr(est, "_apply_birth_death", lambda *args, **kwargs: None)
+    monkeypatch.setattr(est, "record_report_snapshot", lambda *args, **kwargs: None)
+
+    records = [
+        ({"Cs-137": 10.0 + offset}, offset % 8, offset % 8, 1.0, None)
+        for offset in range(8)
+    ]
+
+    est.update_pair_sequence(records, pose_idx=0)
+
+    assert calls == [0, 1]
+    assert len(est.measurements) == 8

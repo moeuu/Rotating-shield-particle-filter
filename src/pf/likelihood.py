@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import NDArray
 
 from measurement.continuous_kernels import ContinuousKernel
+
+if TYPE_CHECKING:
+    import torch
+
+
+DEFAULT_GEANT4_COUNT_LIKELIHOOD_MODEL = "student_t"
+DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA = 0.10
+DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA = 5.0
+DEFAULT_GEANT4_SPECTRUM_COUNT_REL_SIGMA = 0.05
+DEFAULT_GEANT4_SPECTRUM_COUNT_ABS_SIGMA = 5.0
+DEFAULT_GEANT4_LOW_COUNT_ABS_SIGMA = 20.0
+DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS = 100.0
+DEFAULT_GEANT4_COUNT_LIKELIHOOD_DF = 5.0
 
 
 def normalize_count_likelihood_model(model: str) -> str:
@@ -82,6 +97,61 @@ def count_likelihood_variance(
         + obs_var
     )
     return np.maximum(variance, float(epsilon))
+
+
+def count_likelihood_variance_torch(
+    z_k: "torch.Tensor",
+    lambda_k: "torch.Tensor",
+    *,
+    transport_model_rel_sigma: float = 0.0,
+    transport_model_abs_sigma: float = 0.0,
+    spectrum_count_rel_sigma: float = 0.0,
+    spectrum_count_abs_sigma: float = 0.0,
+    low_count_abs_sigma: float = 0.0,
+    low_count_transition_counts: float = 0.0,
+    observation_count_variance: float | "torch.Tensor" = 0.0,
+    epsilon: float = 1e-12,
+) -> "torch.Tensor":
+    """Return torch observation variance equivalent to count_likelihood_variance."""
+    import torch
+
+    if torch.is_tensor(lambda_k):
+        lam_arr = lambda_k.to(dtype=torch.float64)
+    else:
+        lam_arr = torch.as_tensor(lambda_k, dtype=torch.float64)
+    lam_arr = torch.clamp(lam_arr, min=float(epsilon))
+    z_arr = torch.clamp(
+        torch.as_tensor(z_k, device=lam_arr.device, dtype=torch.float64),
+        min=0.0,
+    )
+    obs_var = torch.clamp(
+        torch.as_tensor(
+            observation_count_variance,
+            device=lam_arr.device,
+            dtype=torch.float64,
+        ),
+        min=0.0,
+    )
+    transport_rel = max(float(transport_model_rel_sigma), 0.0)
+    transport_abs = max(float(transport_model_abs_sigma), 0.0)
+    spectrum_rel = max(float(spectrum_count_rel_sigma), 0.0)
+    spectrum_abs = max(float(spectrum_count_abs_sigma), 0.0)
+    low_count_abs = max(float(low_count_abs_sigma), 0.0)
+    low_count_transition = max(float(low_count_transition_counts), 0.0)
+    scale_ref = torch.maximum(z_arr, lam_arr)
+    low_count_weight = torch.zeros_like(scale_ref)
+    if low_count_abs > 0.0 and low_count_transition > 0.0:
+        low_count_weight = low_count_transition / (scale_ref + low_count_transition)
+    variance = (
+        lam_arr
+        + (transport_rel * lam_arr) ** 2
+        + transport_abs**2
+        + (spectrum_rel * scale_ref) ** 2
+        + spectrum_abs**2
+        + (low_count_abs * low_count_weight) ** 2
+        + obs_var
+    )
+    return torch.clamp(variance, min=float(epsilon))
 
 
 def count_log_likelihood(
@@ -267,14 +337,15 @@ def expected_counts_per_source(
     fe_indices: NDArray[np.int64] | None = None,
     pb_indices: NDArray[np.int64] | None = None,
     orient_indices: NDArray[np.int64] | None = None,
-    source_scale: float = 1.0,
+    source_scale: float | NDArray[np.float64] = 1.0,
 ) -> NDArray[np.float64]:
     """
     Return per-source expected counts Λ_{k,m} for each measurement k.
 
     Supports either paired Fe/Pb indices or single orientation indices.
     source_scale maps ideal source counts into the measurement domain while
-    leaving the additive background term to the caller.
+    leaving the additive background term to the caller. It may be a scalar or a
+    length-``num_meas`` vector for shield-pair-conditioned calibration.
     """
     if sources.size == 0:
         return np.zeros((len(live_times), 0), dtype=float)
@@ -283,16 +354,34 @@ def expected_counts_per_source(
     num_meas = int(len(live_times))
     num_sources = int(sources.shape[0])
     lambda_m = np.zeros((num_meas, num_sources), dtype=float)
+    scale_arr = _source_scale_vector(source_scale, num_meas)
+    if fe_indices is None or pb_indices is None:
+        if orient_indices is None:
+            raise ValueError("Either fe_indices/pb_indices or orient_indices must be provided.")
+        fe_indices_use = np.asarray(orient_indices, dtype=int)
+        pb_indices_use = fe_indices_use
+    else:
+        fe_indices_use = np.asarray(fe_indices, dtype=int)
+        pb_indices_use = np.asarray(pb_indices, dtype=int)
+    if hasattr(kernel, "kernel_values_selected_pairs_for_detectors"):
+        values = kernel.kernel_values_selected_pairs_for_detectors(
+            isotope=isotope,
+            detector_positions=np.asarray(detector_positions, dtype=float),
+            sources=np.asarray(sources, dtype=float),
+            fe_indices=fe_indices_use,
+            pb_indices=pb_indices_use,
+        )
+        values_arr = np.asarray(values, dtype=float)
+        if values_arr.shape != (num_meas, num_sources):
+            raise ValueError(
+                "Batched selected-pair kernel returned shape "
+                f"{values_arr.shape}, expected {(num_meas, num_sources)}."
+            )
+        strengths_arr = np.asarray(strengths, dtype=float)
+        scale = np.asarray(live_times, dtype=float) * scale_arr
+        return scale[:, None] * values_arr * strengths_arr[None, :]
     if getattr(kernel, "use_gpu", False) and hasattr(kernel, "kernel_values_pair"):
-        if fe_indices is None or pb_indices is None:
-            if orient_indices is None:
-                raise ValueError("Either fe_indices/pb_indices or orient_indices must be provided.")
-            fe_indices_use = np.asarray(orient_indices, dtype=int)
-            pb_indices_use = fe_indices_use
-        else:
-            fe_indices_use = np.asarray(fe_indices, dtype=int)
-            pb_indices_use = np.asarray(pb_indices, dtype=int)
-        scale = np.asarray(live_times, dtype=float) * max(float(source_scale), 0.0)
+        scale = np.asarray(live_times, dtype=float) * scale_arr
         strengths_arr = np.asarray(strengths, dtype=float)
         for k in range(num_meas):
             values = kernel.kernel_values_pair(
@@ -325,5 +414,20 @@ def expected_counts_per_source(
                 )
             else:
                 raise ValueError("Either fe_indices/pb_indices or orient_indices must be provided.")
-            lambda_m[k, m] = live_time * max(float(source_scale), 0.0) * kernel_val * float(strengths[m])
+            lambda_m[k, m] = live_time * scale_arr[k] * kernel_val * float(strengths[m])
     return lambda_m
+
+
+def _source_scale_vector(
+    source_scale: float | NDArray[np.float64],
+    num_meas: int,
+) -> NDArray[np.float64]:
+    """Return a non-negative source-response scale per measurement."""
+    arr = np.asarray(source_scale, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return np.ones(max(int(num_meas), 0), dtype=float)
+    if arr.size == 1:
+        return np.full(max(int(num_meas), 0), max(float(arr[0]), 0.0), dtype=float)
+    if arr.size != int(num_meas):
+        raise ValueError("source_scale vector must match the number of measurements.")
+    return np.maximum(arr.astype(float, copy=False), 0.0)

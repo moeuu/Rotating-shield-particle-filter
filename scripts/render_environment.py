@@ -19,7 +19,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from measurement.obstacles import load_or_generate_obstacle_grid, ObstacleGrid
+from measurement.obstacles import ObstacleGrid, build_obstacle_grid
+from runtime_defaults import DEFAULT_ENVIRONMENT_MODE, DEFAULT_FIXED_OBSTACLE_CONFIG
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,8 +29,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--obstacle-config",
         type=Path,
-        default=Path("obstacle_layouts/no_obstacles.json"),
-        help="Obstacle layout JSON path (relative to repo root if not absolute).",
+        default=Path(DEFAULT_FIXED_OBSTACLE_CONFIG),
+        help=(
+            "Obstacle layout JSON path for fixed mode "
+            "(relative to repo root if not absolute)."
+        ),
+    )
+    parser.add_argument(
+        "--environment-mode",
+        type=str,
+        default=DEFAULT_ENVIRONMENT_MODE,
+        choices=("fixed", "random"),
+        help=(
+            "Environment generation mode: fixed loads the obstacle JSON, "
+            "random creates a fresh obstacle layout in memory "
+            f"(default: {DEFAULT_ENVIRONMENT_MODE})."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -121,8 +136,9 @@ def main() -> None:
     args = parser.parse_args()
     obstacle_path = _resolve_path(args.obstacle_config)
     output_path = _resolve_path(args.output)
-    grid = load_or_generate_obstacle_grid(
-        obstacle_path,
+    grid = build_obstacle_grid(
+        mode=args.environment_mode,
+        path=obstacle_path,
         size_x=args.size_x,
         size_y=args.size_y,
         cell_size=args.cell_size,

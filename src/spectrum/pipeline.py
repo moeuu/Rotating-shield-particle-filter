@@ -25,6 +25,7 @@ from spectrum.response_matrix import (
     COMPTON_CONTINUUM_TO_PEAK,
     backscatter_energy,
     compton_edge_energy,
+    compton_continuum_shape,
     detector_response_kernel_for_incident_gamma,
     build_incident_gamma_response_matrix,
     build_response_matrix,
@@ -82,31 +83,55 @@ class SpectrumConfig:
     photopeak_mixed_roi_consistency_extreme_ratio: float = 2.0
     photopeak_mixed_roi_consistency_sigma: float = 0.75
     photopeak_mixed_roi_consistency_reference_percentile: float = 50.0
-    response_poisson_photopeak_fusion: bool = True
+    response_poisson_photopeak_fusion: bool = False
     response_poisson_photopeak_min_snr: float = 8.0
-    response_poisson_photopeak_anchor: bool = True
+    response_poisson_photopeak_anchor: bool = False
     response_poisson_photopeak_anchor_min_snr: float = 0.25
     response_poisson_photopeak_anchor_weight: float = 1.0
     response_poisson_photopeak_anchor_variance_scale: float = 1.0
-    response_poisson_low_snr_photopeak_anchor: bool = True
+    response_poisson_low_snr_photopeak_anchor: bool = False
     response_poisson_low_snr_photopeak_anchor_weight: float = 1.0
     response_poisson_low_snr_photopeak_anchor_variance_scale: float = 1.0
     response_poisson_low_snr_suppress_enable: bool = True
+    response_poisson_low_snr_suppress_count: bool = True
     response_poisson_low_snr_suppress_photo_snr: float = 8.0
     response_poisson_low_snr_suppress_poisson_snr: float = 3.0
     response_poisson_low_snr_suppress_fraction: float = 0.05
-    response_poisson_low_snr_suppress_photo_to_poisson_ratio: float = 0.5
+    response_poisson_low_snr_suppress_photo_to_poisson_ratio: float = 0.2
     response_poisson_low_snr_suppress_predicted_photo_snr: float = 0.0
     response_poisson_model_mismatch_variance_scale: float = 1.0
     response_poisson_crosstalk_variance_enable: bool = True
     response_poisson_crosstalk_corr_threshold: float = 0.85
     response_poisson_crosstalk_variance_scale: float = 1.0
     response_poisson_crosstalk_min_rel_sigma: float = 0.25
+    response_poisson_crosstalk_count_guard_enable: bool = True
+    response_poisson_crosstalk_count_guard_reduced_chi2: float = 4.0
+    response_poisson_crosstalk_count_guard_ratio: float = 1.35
+    response_poisson_crosstalk_count_guard_extreme_ratio: float = 2.0
+    response_poisson_crosstalk_count_guard_photo_snr: float = 1.5
+    response_poisson_crosstalk_count_guard_adjust_count: bool = True
+    response_poisson_crosstalk_count_guard_adjust_high_chi2_count: bool = False
+    response_poisson_crosstalk_count_guard_weak_channel_fraction: float = 0.5
+    response_poisson_crosstalk_count_guard_dominance_ratio: float = 20.0
+    response_poisson_crosstalk_count_guard_low_chi2_dominance: bool = True
+    response_poisson_underallocation_count_guard_enable: bool = True
+    response_poisson_underallocation_count_guard_ratio: float = 1.05
+    response_poisson_underallocation_count_guard_photo_snr: float = 8.0
     response_poisson_diagnostic_variance_enable: bool = True
     response_poisson_diagnostic_reduced_chi2_threshold: float = 2.0
     response_poisson_diagnostic_reduced_chi2_scale: float = 0.5
     response_poisson_diagnostic_condition_threshold: float = 1.0e4
     response_poisson_diagnostic_condition_scale: float = 0.25
+    response_poisson_count_variance_ceiling_enable: bool = True
+    response_poisson_count_variance_max_rel_sigma: float = 0.15
+    response_poisson_count_variance_max_abs_sigma: float = 40.0
+    response_poisson_count_variance_preserve_diagnostic_floors: bool = True
+    response_poisson_count_variance_preserve_guard_floors: bool = True
+    response_poisson_line_resolved_fit: bool = True
+    response_poisson_line_min_intensity: float | None = None
+    response_poisson_line_resolved_bic_margin: float = 0.0
+    response_poisson_background_rate_cps: float | None = None
+    response_poisson_background_anchor_weight: float = 1.0
     response_poisson_shield_systematic_variance_enable: bool = False
     response_poisson_shield_systematic_rel_sigma: float = 0.15
     response_poisson_shield_systematic_anchor_rel_sigma: float = 0.0
@@ -207,6 +232,28 @@ class PhotopeakRoiEstimate:
 
 
 @dataclass(frozen=True)
+class PhotopeakChannelEstimate:
+    """Store a diagnostic line/photopeak-channel count observation."""
+
+    isotope: str
+    energy_keV: float
+    label: str
+    source_equivalent_counts: float
+    source_equivalent_variance: float
+    line_equivalent_counts: float
+    line_equivalent_variance: float
+    observed_peak_counts: float
+    observed_peak_variance: float
+    line_weight: float
+    peak_sensitivity: float
+    roi_min_keV: float
+    roi_max_keV: float
+    reduced_chi2: float
+    signal_to_noise: float = 0.0
+    mixed_isotope_roi: bool = False
+
+
+@dataclass(frozen=True)
 class IsotopeCountEstimate:
     """Store an isotope count estimate and its observation variance."""
 
@@ -214,6 +261,16 @@ class IsotopeCountEstimate:
     counts: float
     variance: float
     method: str
+
+
+@dataclass(frozen=True)
+class ResponsePoissonColumn:
+    """Describe one signal column used by response-Poisson regression."""
+
+    isotope: str
+    energy_keV: float | None
+    line_weight: float
+    label: str
 
 
 class SpectralDecomposer:
@@ -272,15 +329,20 @@ class SpectralDecomposer:
         self.isotope_names = list(self.library.keys())
         self.last_peak_window_debug: Dict[str, Dict[str, object]] = {}
         self.last_photopeak_nnls_debug: Dict[str, Dict[str, object]] = {}
+        self.last_photopeak_channel_debug: dict[str, object] = {}
         self.last_response_poisson_components: Dict[str, NDArray[np.float64]] = {}
         self.last_response_poisson_background: NDArray[np.float64] | None = None
         self.last_response_poisson_fit: NDArray[np.float64] | None = None
         self.last_response_poisson_diagnostics: dict[str, object] = {}
         self.last_count_variances: Dict[str, float] = {}
+        self.last_count_covariance: dict[str, dict[str, float]] = {}
         self._incident_gamma_response_matrix: NDArray[np.float64] | None = None
         self._incident_gamma_isotope_response_matrix: NDArray[np.float64] | None = None
         self._incident_gamma_photopeak_response_matrix: NDArray[np.float64] | None = None
         self._photopeak_response_matrix: NDArray[np.float64] | None = None
+        self._response_poisson_line_matrix: NDArray[np.float64] | None = None
+        self._response_poisson_line_photopeak_matrix: NDArray[np.float64] | None = None
+        self._response_poisson_line_columns: tuple[ResponsePoissonColumn, ...] | None = None
 
     def simulate_spectrum(
         self,
@@ -510,11 +572,278 @@ class SpectralDecomposer:
             return self._get_incident_gamma_isotope_response_matrix()
         return self.response_matrix
 
+    def count_response_templates(
+        self,
+        isotopes: Sequence[str] | None = None,
+    ) -> Dict[str, NDArray[np.float64]]:
+        """Return detector spectrum templates in the active count convention."""
+        matrix = np.asarray(self._count_response_matrix(), dtype=float)
+        if isotopes is None:
+            names = tuple(str(name) for name in self.isotope_names)
+        else:
+            names = tuple(str(name) for name in isotopes)
+        templates: Dict[str, NDArray[np.float64]] = {}
+        for isotope in names:
+            if isotope not in self.isotope_names:
+                continue
+            index = int(self.isotope_names.index(isotope))
+            templates[isotope] = np.asarray(matrix[:, index], dtype=float).copy()
+        return templates
+
     def _count_photopeak_response_matrix(self) -> NDArray[np.float64]:
         """Return the photopeak matrix matching the active spectrum count unit."""
         if bool(self.config.use_incident_gamma_response_matrix):
             return self._get_incident_gamma_photopeak_response_matrix()
         return self._get_photopeak_response_matrix()
+
+    def _response_poisson_line_intensity_threshold(self) -> float:
+        """Return the minimum branch weight used by line-resolved Poisson fits."""
+        configured = self.config.response_poisson_line_min_intensity
+        if configured is None:
+            configured = self.config.photopeak_min_line_intensity
+        return max(float(configured), 0.0)
+
+    def _single_line_response_column(
+        self,
+        energy_keV: float,
+    ) -> NDArray[np.float64]:
+        """Return the detector-response column for one gamma line without branch weight."""
+        energy = float(energy_keV)
+        if bool(self.config.use_incident_gamma_response_matrix):
+            return detector_response_kernel_for_incident_gamma(
+                self.energy_axis,
+                energy,
+                self.resolution_fn,
+                self.efficiency_fn,
+                float(self.config.bin_width_keV),
+                continuum_to_peak=float(self.config.response_continuum_to_peak),
+                backscatter_fraction=float(self.config.response_backscatter_fraction),
+            )
+
+        sigma = max(float(self.resolution_fn(energy)), 1e-6)
+        peak = gaussian_peak(self.energy_axis, center=energy, sigma=sigma)
+        peak_area = float(np.sum(peak) * float(self.config.bin_width_keV))
+        continuum_shape = np.zeros_like(self.energy_axis, dtype=float)
+        if compton_edge_energy(energy) > 0.0:
+            continuum_shape = compton_continuum_shape(
+                self.energy_axis,
+                energy,
+                shape="exponential",
+            )
+            continuum_sum = float(np.sum(continuum_shape))
+            if continuum_sum > 0.0:
+                continuum_shape = continuum_shape / continuum_sum
+        efficiency = max(float(self.efficiency_fn(energy)), 0.0)
+        column = (
+            peak * float(self.config.bin_width_keV) * efficiency
+            + max(float(self.config.response_continuum_to_peak), 0.0)
+            * peak_area
+            * continuum_shape
+            * efficiency
+        )
+        if energy > 200.0 and float(self.config.response_backscatter_fraction) > 0.0:
+            e_back = backscatter_energy(energy)
+            sigma_back = max(float(self.resolution_fn(e_back)), 1e-6)
+            back = gaussian_peak(self.energy_axis, center=e_back, sigma=sigma_back)
+            back_norm = float(np.sum(back) * float(self.config.bin_width_keV))
+            if back_norm > 0.0:
+                area_back = max(float(self.config.response_backscatter_fraction), 0.0) * peak_area
+                column += (
+                    back
+                    * (area_back / back_norm)
+                    * max(float(self.efficiency_fn(e_back)), 0.0)
+                )
+        return np.clip(np.asarray(column, dtype=float), a_min=0.0, a_max=None)
+
+    def _single_line_photopeak_column(
+        self,
+        energy_keV: float,
+    ) -> NDArray[np.float64]:
+        """Return the photopeak-only response column for one gamma line."""
+        energy = float(energy_keV)
+        sigma = max(float(self.resolution_fn(energy)), 1e-6)
+        if bool(self.config.use_incident_gamma_response_matrix):
+            peak_weight = self._incident_gamma_photopeak_fraction(energy)
+        else:
+            peak_weight = max(float(self.efficiency_fn(energy)), 0.0)
+        peak = (
+            gaussian_peak(self.energy_axis, center=energy, sigma=sigma)
+            * float(self.config.bin_width_keV)
+            * peak_weight
+        )
+        return np.clip(np.asarray(peak, dtype=float), a_min=0.0, a_max=None)
+
+    def _get_response_poisson_line_basis(
+        self,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        tuple[ResponsePoissonColumn, ...],
+    ]:
+        """Return cached line-level design and photopeak matrices for Poisson fits."""
+        if (
+            self._response_poisson_line_matrix is not None
+            and self._response_poisson_line_photopeak_matrix is not None
+            and self._response_poisson_line_columns is not None
+        ):
+            return (
+                self._response_poisson_line_matrix,
+                self._response_poisson_line_photopeak_matrix,
+                self._response_poisson_line_columns,
+            )
+
+        columns: list[NDArray[np.float64]] = []
+        photopeak_columns: list[NDArray[np.float64]] = []
+        specs: list[ResponsePoissonColumn] = []
+        min_intensity = self._response_poisson_line_intensity_threshold()
+        max_energy = float(np.max(self.energy_axis)) if self.energy_axis.size else 0.0
+        for isotope in self.isotope_names:
+            line_entries = get_analysis_lines_with_intensity(
+                isotope,
+                self.library,
+                max_energy_keV=max_energy,
+            )
+            if not line_entries and isotope in self.library:
+                line_entries = [
+                    (float(line.energy_keV), float(line.intensity))
+                    for line in self.library[isotope].lines
+                    if float(line.energy_keV) <= max_energy
+                ]
+            for energy_keV, intensity in line_entries:
+                line_weight = self._line_weight(isotope, float(intensity))
+                if line_weight < min_intensity:
+                    continue
+                response_column = self._single_line_response_column(float(energy_keV))
+                photopeak_column = self._single_line_photopeak_column(float(energy_keV))
+                if float(np.sum(response_column)) <= 0.0:
+                    continue
+                columns.append(line_weight * response_column)
+                photopeak_columns.append(line_weight * photopeak_column)
+                specs.append(
+                    ResponsePoissonColumn(
+                        isotope=isotope,
+                        energy_keV=float(energy_keV),
+                        line_weight=float(line_weight),
+                        label=f"{isotope}@{float(energy_keV):.1f}keV",
+                    )
+                )
+
+        if columns:
+            matrix = np.column_stack(columns)
+            photopeak_matrix = np.column_stack(photopeak_columns)
+        else:
+            matrix = np.zeros((self.energy_axis.size, 0), dtype=float)
+            photopeak_matrix = np.zeros((self.energy_axis.size, 0), dtype=float)
+        self._response_poisson_line_matrix = np.clip(matrix, a_min=0.0, a_max=None)
+        self._response_poisson_line_photopeak_matrix = np.clip(
+            photopeak_matrix,
+            a_min=0.0,
+            a_max=None,
+        )
+        self._response_poisson_line_columns = tuple(specs)
+        return (
+            self._response_poisson_line_matrix,
+            self._response_poisson_line_photopeak_matrix,
+            self._response_poisson_line_columns,
+        )
+
+    def _response_poisson_signal_basis(
+        self,
+        isotopes: Sequence[str],
+        response_matrix: NDArray[np.float64],
+        photopeak_response_matrix: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        tuple[ResponsePoissonColumn, ...],
+    ]:
+        """Return signal design columns for requested isotopes in runtime count units."""
+        requested = [str(isotope) for isotope in isotopes]
+        if bool(self.config.response_poisson_line_resolved_fit):
+            line_matrix, line_photopeak_matrix, line_specs = (
+                self._get_response_poisson_line_basis()
+            )
+            keep = [
+                idx
+                for idx, spec in enumerate(line_specs)
+                if spec.isotope in requested
+            ]
+            if keep:
+                return (
+                    np.asarray(line_matrix[:, keep], dtype=float),
+                    np.asarray(line_photopeak_matrix[:, keep], dtype=float),
+                    tuple(line_specs[idx] for idx in keep),
+                )
+
+        indices = [
+            self.isotope_names.index(isotope)
+            for isotope in requested
+            if isotope in self.isotope_names
+        ]
+        columns = [
+            ResponsePoissonColumn(
+                isotope=self.isotope_names[index],
+                energy_keV=None,
+                line_weight=1.0,
+                label=self.isotope_names[index],
+            )
+            for index in indices
+        ]
+        return (
+            np.asarray(response_matrix[:, indices], dtype=float),
+            np.asarray(photopeak_response_matrix[:, indices], dtype=float),
+            tuple(columns),
+        )
+
+    def _response_poisson_isotope_signal_basis(
+        self,
+        isotopes: Sequence[str],
+        response_matrix: NDArray[np.float64],
+        photopeak_response_matrix: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        tuple[ResponsePoissonColumn, ...],
+    ]:
+        """Return isotope-level response columns for BIC fallback and diagnostics."""
+        indices = [
+            self.isotope_names.index(str(isotope))
+            for isotope in isotopes
+            if str(isotope) in self.isotope_names
+        ]
+        columns = tuple(
+            ResponsePoissonColumn(
+                isotope=self.isotope_names[index],
+                energy_keV=None,
+                line_weight=1.0,
+                label=self.isotope_names[index],
+            )
+            for index in indices
+        )
+        return (
+            np.asarray(response_matrix[:, indices], dtype=float),
+            np.asarray(photopeak_response_matrix[:, indices], dtype=float),
+            columns,
+        )
+
+    def _response_poisson_bic_score(
+        self,
+        observed: NDArray[np.float64],
+        design: NDArray[np.float64],
+    ) -> tuple[float, float, float]:
+        """Return BIC, Poisson NLL, and condition for a nonnegative design fit."""
+        clipped_design = np.clip(np.asarray(design, dtype=float), a_min=0.0, a_max=None)
+        coeffs = np.maximum(nnls_solve(clipped_design, observed), 0.0)
+        mu = np.maximum(clipped_design @ coeffs, 1.0e-12)
+        nll = float(np.sum(mu - observed * np.log(mu)))
+        bic = 2.0 * nll + float(clipped_design.shape[1]) * np.log(
+            max(float(observed.size), 2.0)
+        )
+        try:
+            condition = float(np.linalg.cond(clipped_design))
+        except np.linalg.LinAlgError:
+            condition = float("inf")
+        return float(bic), float(nll), float(condition)
 
     def efficiency(self, energy_keV: float) -> float:
         """Return the detector full-energy peak efficiency ε(E)."""
@@ -646,8 +975,16 @@ class SpectralDecomposer:
         ]
         if not indices:
             return counts
-        design_columns = [response_matrix[:, index] for index in indices]
         fit_names = [self.isotope_names[index] for index in indices]
+        signal_matrix, _, _ = self._response_poisson_isotope_signal_basis(
+            fit_names,
+            response_matrix,
+            response_matrix,
+        )
+        design_columns = [
+            signal_matrix[:, column_index]
+            for column_index in range(signal_matrix.shape[1])
+        ]
         if include_background:
             design_columns.append(np.asarray(background_shape, dtype=float))
         design = np.column_stack(design_columns)
@@ -738,18 +1075,145 @@ class SpectralDecomposer:
             }
             return estimates
         fit_names = [self.isotope_names[index] for index in indices]
-        design_columns = [response_matrix[:, index] for index in indices]
+        signal_matrix, signal_photopeak_matrix, signal_columns = (
+            self._response_poisson_signal_basis(
+                fit_names,
+                response_matrix,
+                photopeak_response_matrix,
+            )
+        )
+        isotope_signal_matrix, isotope_photopeak_matrix, isotope_columns = (
+            self._response_poisson_isotope_signal_basis(
+                fit_names,
+                response_matrix,
+                photopeak_response_matrix,
+            )
+        )
+        if signal_matrix.shape[0] != observed.size:
+            signal_matrix = signal_matrix[: observed.size, :]
+            signal_photopeak_matrix = signal_photopeak_matrix[: observed.size, :]
+        if isotope_signal_matrix.shape[0] != observed.size:
+            isotope_signal_matrix = isotope_signal_matrix[: observed.size, :]
+            isotope_photopeak_matrix = isotope_photopeak_matrix[: observed.size, :]
+        if signal_matrix.shape[1] == 0:
+            self.last_count_variances = {isotope: 1.0 for isotope in requested}
+            self.last_response_poisson_components = {}
+            self.last_response_poisson_background = None
+            self.last_response_poisson_fit = None
+            self.last_response_poisson_diagnostics = {
+                "status": "no_response_poisson_signal_columns",
+                "requested_isotopes": requested,
+            }
+            return estimates
+        line_model_selection: dict[str, float | bool | str] = {
+            "requested": bool(self.config.response_poisson_line_resolved_fit),
+            "selected": False,
+            "reason": "isotope_basis",
+        }
+        if signal_matrix.shape[1] > isotope_signal_matrix.shape[1] > 0:
+            def _with_background(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+                """Return a temporary design matrix for BIC model selection."""
+                columns = [matrix[:, col] for col in range(matrix.shape[1])]
+                if include_background:
+                    columns.append(np.asarray(background_shape, dtype=float))
+                return np.clip(np.column_stack(columns), a_min=0.0, a_max=None)
+
+            line_design_for_bic = _with_background(signal_matrix)
+            isotope_design_for_bic = _with_background(isotope_signal_matrix)
+            line_bic, line_nll, line_cond = self._response_poisson_bic_score(
+                observed,
+                line_design_for_bic,
+            )
+            iso_bic, iso_nll, iso_cond = self._response_poisson_bic_score(
+                observed,
+                isotope_design_for_bic,
+            )
+            margin = max(
+                float(self.config.response_poisson_line_resolved_bic_margin),
+                0.0,
+            )
+            line_model_selection = {
+                "requested": True,
+                "line_bic": float(line_bic),
+                "isotope_bic": float(iso_bic),
+                "line_nll": float(line_nll),
+                "isotope_nll": float(iso_nll),
+                "line_condition_number": float(line_cond),
+                "isotope_condition_number": float(iso_cond),
+                "bic_delta_line_minus_isotope": float(line_bic - iso_bic),
+                "selected": bool(line_bic + margin < iso_bic),
+                "reason": (
+                    "line_bic_selected"
+                    if line_bic + margin < iso_bic
+                    else "isotope_bic_selected"
+                ),
+            }
+            if not bool(line_model_selection["selected"]):
+                signal_matrix = isotope_signal_matrix
+                signal_photopeak_matrix = isotope_photopeak_matrix
+                signal_columns = isotope_columns
+        signal_count = int(signal_matrix.shape[1])
+        signal_indices_by_isotope = {
+            name: [
+                idx
+                for idx, spec in enumerate(signal_columns)
+                if spec.isotope == name
+            ]
+            for name in fit_names
+        }
+        aggregation_weights_by_isotope: dict[str, NDArray[np.float64]] = {}
+        for name, local_indices in signal_indices_by_isotope.items():
+            weights = np.asarray(
+                [max(float(signal_columns[idx].line_weight), 0.0) for idx in local_indices],
+                dtype=float,
+            )
+            total_weight = float(np.sum(weights))
+            if weights.size == 0:
+                aggregation_weights_by_isotope[name] = np.zeros(0, dtype=float)
+            elif total_weight > 0.0:
+                aggregation_weights_by_isotope[name] = weights / total_weight
+            else:
+                aggregation_weights_by_isotope[name] = np.full(
+                    weights.size,
+                    1.0 / float(weights.size),
+                    dtype=float,
+                )
+        design_columns = [signal_matrix[:, col_idx] for col_idx in range(signal_count)]
         if include_background:
             design_columns.append(np.asarray(background_shape, dtype=float))
         design = np.clip(np.column_stack(design_columns), a_min=0.0, a_max=None)
         initial = np.maximum(nnls_solve(design, observed), 0.0)
+        background_anchor_term: tuple[int, float, float] | None = None
+        if include_background and self.config.response_poisson_background_rate_cps is not None:
+            background_rate = max(
+                float(self.config.response_poisson_background_rate_cps),
+                0.0,
+            )
+            anchor_weight = max(
+                float(self.config.response_poisson_background_anchor_weight),
+                0.0,
+            )
+            if anchor_weight > 0.0:
+                target_background = background_rate * max(float(live_time_s), 0.0)
+                background_variance = max(target_background, 1.0) / anchor_weight
+                background_anchor_term = (
+                    signal_count,
+                    float(target_background),
+                    float(background_variance),
+                )
         photopeak_counts: dict[str, float] | None = None
         photopeak_variances: dict[str, float] | None = None
-        anchor_terms: list[tuple[int, float, float]] = []
-        use_photopeak_model = include_background and bool(
+        anchor_terms: list[tuple[tuple[int, ...], NDArray[np.float64], float, float]] = []
+        use_photopeak_fusion = include_background and bool(
             self.config.response_poisson_photopeak_fusion
         )
-        if use_photopeak_model:
+        need_photopeak_diagnostics = include_background and (
+            use_photopeak_fusion
+            or bool(self.config.response_poisson_photopeak_anchor)
+            or bool(self.config.response_poisson_low_snr_photopeak_anchor)
+            or bool(self.config.response_poisson_crosstalk_count_guard_enable)
+        )
+        if need_photopeak_diagnostics:
             photopeak_counts = self.compute_photopeak_nnls_counts(
                 observed,
                 live_time_s=float(live_time_s),
@@ -760,7 +1224,7 @@ class SpectralDecomposer:
                 for isotope in requested
             }
         if (
-            use_photopeak_model
+            need_photopeak_diagnostics
             and bool(self.config.response_poisson_photopeak_anchor)
             and float(self.config.response_poisson_photopeak_anchor_weight) > 0.0
             and photopeak_counts is not None
@@ -794,7 +1258,21 @@ class SpectralDecomposer:
                 reliability = min((anchor_snr / full_snr) ** 2, 1.0)
                 effective_var = anchor_var * variance_scale
                 effective_var /= max(anchor_weight * reliability, 1e-6)
-                anchor_terms.append((local_idx, anchor_count, max(effective_var, 1.0)))
+                local_indices = tuple(signal_indices_by_isotope.get(name, ()))
+                if not local_indices:
+                    continue
+                anchor_weights = aggregation_weights_by_isotope.get(
+                    name,
+                    np.zeros(0, dtype=float),
+                )
+                anchor_terms.append(
+                    (
+                        local_indices,
+                        np.asarray(anchor_weights, dtype=float),
+                        anchor_count,
+                        max(effective_var, 1.0),
+                    )
+                )
 
         from scipy.optimize import minimize
 
@@ -805,19 +1283,31 @@ class SpectralDecomposer:
             mu = np.maximum(design @ coeffs, epsilon)
             poisson_nll = float(np.sum(mu - observed * np.log(mu)))
             if not anchor_terms:
-                return poisson_nll
+                if background_anchor_term is None:
+                    return poisson_nll
             anchor_nll = 0.0
-            for local_idx, target, variance in anchor_terms:
-                diff = float(coeffs[local_idx]) - target
+            for local_indices, weights, target, variance in anchor_terms:
+                aggregate = float(np.dot(weights, coeffs[list(local_indices)]))
+                diff = aggregate - target
                 anchor_nll += 0.5 * diff * diff / variance
+            if background_anchor_term is not None:
+                bg_idx, bg_target, bg_variance = background_anchor_term
+                diff = float(coeffs[bg_idx]) - bg_target
+                anchor_nll += 0.5 * diff * diff / bg_variance
             return float(poisson_nll + anchor_nll)
 
         def gradient(coeffs: NDArray[np.float64]) -> NDArray[np.float64]:
             """Return the Poisson negative log-likelihood gradient."""
             mu = np.maximum(design @ coeffs, epsilon)
             grad = np.asarray(design.T @ (1.0 - observed / mu), dtype=float)
-            for local_idx, target, variance in anchor_terms:
-                grad[local_idx] += (float(coeffs[local_idx]) - target) / variance
+            for local_indices, weights, target, variance in anchor_terms:
+                aggregate = float(np.dot(weights, coeffs[list(local_indices)]))
+                diff = aggregate - target
+                for offset, local_idx in enumerate(local_indices):
+                    grad[local_idx] += diff * float(weights[offset]) / variance
+            if background_anchor_term is not None:
+                bg_idx, bg_target, bg_variance = background_anchor_term
+                grad[bg_idx] += (float(coeffs[bg_idx]) - bg_target) / bg_variance
             return grad
 
         result = minimize(
@@ -831,17 +1321,49 @@ class SpectralDecomposer:
         coeffs = np.maximum(coeffs, 0.0)
         fitted = np.maximum(design @ coeffs, epsilon)
         fisher = design.T @ (design / fitted[:, np.newaxis])
-        for local_idx, _, variance in anchor_terms:
-            fisher[local_idx, local_idx] += 1.0 / variance
+        for local_indices, weights, _, variance in anchor_terms:
+            for row_offset, row_idx in enumerate(local_indices):
+                for col_offset, col_idx in enumerate(local_indices):
+                    fisher[row_idx, col_idx] += (
+                        float(weights[row_offset])
+                        * float(weights[col_offset])
+                        / variance
+                    )
+        if background_anchor_term is not None:
+            bg_idx, _, bg_variance = background_anchor_term
+            fisher[bg_idx, bg_idx] += 1.0 / bg_variance
         covariance = np.linalg.pinv(fisher, rcond=1e-12)
         variances: Dict[str, float] = {isotope: 1.0 for isotope in requested}
         coefficient_correlation_by_isotope = {name: 0.0 for name in fit_names}
         coefficient_correlation_max_abs = 0.0
-        if len(fit_names) > 1:
-            isotope_covariance = np.asarray(
-                covariance[: len(fit_names), : len(fit_names)],
-                dtype=float,
+        isotope_counts: dict[str, float] = {}
+        isotope_covariance = np.zeros((len(fit_names), len(fit_names)), dtype=float)
+        for row_iso_idx, row_name in enumerate(fit_names):
+            row_indices = signal_indices_by_isotope.get(row_name, [])
+            row_weights = aggregation_weights_by_isotope.get(
+                row_name,
+                np.zeros(0, dtype=float),
             )
+            if row_indices:
+                isotope_counts[row_name] = max(
+                    float(np.dot(row_weights, coeffs[row_indices])),
+                    0.0,
+                )
+            else:
+                isotope_counts[row_name] = 0.0
+            for col_iso_idx, col_name in enumerate(fit_names):
+                col_indices = signal_indices_by_isotope.get(col_name, [])
+                col_weights = aggregation_weights_by_isotope.get(
+                    col_name,
+                    np.zeros(0, dtype=float),
+                )
+                if not row_indices or not col_indices:
+                    continue
+                block = covariance[np.ix_(row_indices, col_indices)]
+                isotope_covariance[row_iso_idx, col_iso_idx] = float(
+                    row_weights @ block @ col_weights
+                )
+        if len(fit_names) > 1:
             diag = np.maximum(np.diag(isotope_covariance), 0.0)
             denom = np.sqrt(np.maximum(np.outer(diag, diag), 1.0e-24))
             corr = np.divide(
@@ -858,19 +1380,37 @@ class SpectralDecomposer:
                 for idx, name in enumerate(fit_names)
             }
         max_fit_coefficient = max(
-            (max(float(coeffs[idx]), 0.0) for idx in range(len(fit_names))),
+            (max(float(isotope_counts.get(name, 0.0)), 0.0) for name in fit_names),
             default=0.0,
         )
         crosstalk_variance_debug: dict[str, dict[str, float]] = {}
-        photopeak_integrals = {
-            name: max(float(np.sum(photopeak_response_matrix[:, index])), 0.0)
-            for name, index in zip(fit_names, indices)
-        }
+        photopeak_integrals = {name: 0.0 for name in fit_names}
+        for name, local_indices in signal_indices_by_isotope.items():
+            local_integral = 0.0
+            for local_idx in local_indices:
+                local_integral += float(np.sum(signal_photopeak_matrix[:, local_idx]))
+            photopeak_integrals[name] = max(float(local_integral), 0.0)
         for idx, name in enumerate(fit_names):
-            value = max(float(coeffs[idx]), 0.0)
-            variance = float(covariance[idx, idx])
+            value = max(float(isotope_counts.get(name, 0.0)), 0.0)
+            variance = float(isotope_covariance[idx, idx])
             if not np.isfinite(variance) or variance <= 0.0:
-                sensitivity = max(float(np.sum(design[:, idx])), 1e-12)
+                local_indices = signal_indices_by_isotope.get(name, [])
+                weights = aggregation_weights_by_isotope.get(
+                    name,
+                    np.zeros(0, dtype=float),
+                )
+                sensitivity = 0.0
+                if local_indices:
+                    sensitivity = float(
+                        np.dot(
+                            weights,
+                            [
+                                max(float(np.sum(design[:, local_idx])), 1e-12)
+                                for local_idx in local_indices
+                            ],
+                        )
+                    )
+                sensitivity = max(sensitivity, 1e-12)
                 variance = max(value * sensitivity, 1.0) / (sensitivity**2)
             if bool(self.config.response_poisson_crosstalk_variance_enable):
                 corr_value = float(
@@ -918,8 +1458,12 @@ class SpectralDecomposer:
                     else "response_poisson"
                 ),
             )
+        low_snr_suppression_debug: dict[str, dict[str, float | bool | str]] = {}
+        low_snr_anchor_enabled = bool(
+            self.config.response_poisson_low_snr_photopeak_anchor
+        )
         if (
-            use_photopeak_model
+            (use_photopeak_fusion or low_snr_anchor_enabled)
             and photopeak_counts is not None
             and photopeak_variances is not None
         ):
@@ -932,7 +1476,6 @@ class SpectralDecomposer:
                 ),
                 default=0.0,
             )
-            low_snr_suppression_debug: dict[str, dict[str, float | bool | str]] = {}
             for name in requested:
                 poisson_estimate = estimates.get(name)
                 if poisson_estimate is None:
@@ -1009,6 +1552,32 @@ class SpectralDecomposer:
                                 if uncertain_poisson_fit
                                 else "missing_expected_photopeaks"
                             )
+                            if not bool(
+                                self.config.response_poisson_low_snr_suppress_count
+                            ):
+                                estimates[name] = IsotopeCountEstimate(
+                                    isotope=name,
+                                    counts=poisson_count,
+                                    variance=max(float(fused_var), 1.0),
+                                    method=(
+                                        "response_poisson_low_snr_photopeak_uncertain"
+                                    ),
+                                )
+                                variances[name] = max(float(fused_var), 1.0)
+                                low_snr_suppression_debug[name] = {
+                                    "suppressed": False,
+                                    "reason": f"{reason}_count_retained",
+                                    "photo_count": float(photo_count),
+                                    "photo_snr": float(photo_snr),
+                                    "poisson_count": float(poisson_count),
+                                    "poisson_snr": float(poisson_snr),
+                                    "poisson_fraction": float(poisson_fraction),
+                                    "photo_to_poisson_ratio": float(
+                                        photo_to_poisson_ratio
+                                    ),
+                                    "predicted_photo_snr": float(predicted_photo_snr),
+                                }
+                                continue
                             estimates[name] = IsotopeCountEstimate(
                                 isotope=name,
                                 counts=photo_count,
@@ -1035,9 +1604,10 @@ class SpectralDecomposer:
                             disagreement_var,
                             poisson_count + 1.0,
                         )
+                        fused_count = poisson_count
                         estimates[name] = IsotopeCountEstimate(
                             isotope=name,
-                            counts=poisson_count,
+                            counts=max(float(fused_count), 0.0),
                             variance=max(float(fused_var), 1.0),
                             method="response_poisson_low_snr_photopeak_retained",
                         )
@@ -1052,6 +1622,7 @@ class SpectralDecomposer:
                             "poisson_fraction": float(poisson_fraction),
                             "photo_to_poisson_ratio": float(photo_to_poisson_ratio),
                             "predicted_photo_snr": float(predicted_photo_snr),
+                            "fused_count": float(fused_count),
                         }
                         continue
                     fused_var = max(
@@ -1078,6 +1649,8 @@ class SpectralDecomposer:
                         "poisson_fraction": float(poisson_fraction),
                         "predicted_photo_snr": float(predicted_photo_snr),
                     }
+                    continue
+                if not use_photopeak_fusion:
                     continue
                 if photo_count <= 0.0 or photo_snr <= 0.0:
                     continue
@@ -1125,24 +1698,38 @@ class SpectralDecomposer:
                     method="response_poisson_photopeak_fused",
                 )
                 variances[name] = fused_var
-        else:
-            low_snr_suppression_debug = {}
+        residual = np.asarray(observed, dtype=float) - np.asarray(fitted, dtype=float)
+        fit_variance = np.maximum(np.asarray(fitted, dtype=float), 1.0)
+        dof = max(1, int(observed.size) - int(coeffs.size))
+        reduced_chi2 = float(np.sum((residual * residual) / fit_variance) / dof)
+        crosstalk_count_guard_debug = self._apply_response_poisson_count_guard(
+            estimates,
+            variances,
+            photopeak_counts,
+            photopeak_variances,
+            reduced_chi2=reduced_chi2,
+            requested=requested,
+        )
         component_spectra: Dict[str, NDArray[np.float64]] = {}
         for name in fit_names:
             estimate = estimates[name]
-            column_index = self.isotope_names.index(name)
-            photopeak_column = np.clip(
-                np.asarray(photopeak_response_matrix[:, column_index], dtype=float),
-                a_min=0.0,
-                a_max=None,
-            )
+            local_indices = signal_indices_by_isotope.get(name, [])
             photopeak_integral = float(photopeak_integrals.get(name, 0.0))
-            if photopeak_integral <= 0.0:
+            component = np.zeros_like(observed, dtype=float)
+            for local_idx in local_indices:
+                component += (
+                    max(float(coeffs[local_idx]), 0.0)
+                    * np.asarray(signal_photopeak_matrix[:, local_idx], dtype=float)
+                )
+            raw_component_total = float(np.sum(component))
+            poisson_count = max(float(isotope_counts.get(name, 0.0)), 0.0)
+            final_count = max(float(estimate.counts), 0.0)
+            if raw_component_total > 0.0 and poisson_count > 0.0:
+                component *= final_count / max(poisson_count, 1e-12)
+            if photopeak_integral <= 0.0 or float(np.sum(component)) <= 0.0:
                 component_spectra[name] = np.zeros_like(observed, dtype=float)
             else:
-                component_spectra[name] = (
-                    max(float(estimate.counts), 0.0) * photopeak_column
-                )
+                component_spectra[name] = np.clip(component, a_min=0.0, a_max=None)
             source_equivalent_variance = max(
                 float(estimate.variance),
                 max(float(estimate.counts), 0.0),
@@ -1155,9 +1742,9 @@ class SpectralDecomposer:
                 method=f"{estimate.method}_source_equivalent",
             )
             variances[name] = source_equivalent_variance
-        if include_background and coeffs.size > len(fit_names):
+        if include_background and coeffs.size > signal_count:
             self.last_response_poisson_background = (
-                max(float(coeffs[len(fit_names)]), 0.0)
+                max(float(coeffs[signal_count]), 0.0)
                 * np.asarray(background_shape, dtype=float)
             )
         else:
@@ -1165,9 +1752,32 @@ class SpectralDecomposer:
         self.last_response_poisson_components = component_spectra
         self.last_response_poisson_fit = np.asarray(fitted, dtype=float)
         self.last_count_variances = dict(variances)
-        residual = np.asarray(observed, dtype=float) - np.asarray(fitted, dtype=float)
-        fit_variance = np.maximum(np.asarray(fitted, dtype=float), 1.0)
-        dof = max(1, int(observed.size) - int(coeffs.size))
+        covariance_by_isotope: dict[str, dict[str, float]] = {}
+        if fit_names:
+            raw_diag = np.maximum(np.diag(isotope_covariance), 0.0)
+            raw_denom = np.sqrt(np.maximum(np.outer(raw_diag, raw_diag), 1.0e-24))
+            raw_corr = np.divide(
+                isotope_covariance,
+                raw_denom,
+                out=np.zeros_like(isotope_covariance, dtype=float),
+                where=raw_denom > 0.0,
+            )
+            raw_corr = np.clip(raw_corr, -1.0, 1.0)
+            for row_idx, row_name in enumerate(fit_names):
+                row: dict[str, float] = {}
+                row_var = max(float(variances.get(row_name, 1.0)), 1.0)
+                for col_idx, col_name in enumerate(fit_names):
+                    col_var = max(float(variances.get(col_name, 1.0)), 1.0)
+                    if row_idx == col_idx:
+                        value = row_var
+                    else:
+                        value = (
+                            float(raw_corr[row_idx, col_idx])
+                            * float(np.sqrt(row_var * col_var))
+                        )
+                    row[col_name] = float(value if np.isfinite(value) else 0.0)
+                covariance_by_isotope[row_name] = row
+        self.last_count_covariance = covariance_by_isotope
         try:
             design_condition = float(np.linalg.cond(design))
         except np.linalg.LinAlgError:
@@ -1185,9 +1795,18 @@ class SpectralDecomposer:
             "fit_isotopes": fit_names,
             "include_background": bool(include_background),
             "anchor_term_count": int(len(anchor_terms)),
+            "background_anchor": (
+                {}
+                if background_anchor_term is None
+                else {
+                    "coefficient_index": int(background_anchor_term[0]),
+                    "target_counts": float(background_anchor_term[1]),
+                    "variance": float(background_anchor_term[2]),
+                }
+            ),
             "design_condition_number": float(design_condition),
             "fisher_condition_number": float(fisher_condition),
-            "reduced_chi2": float(np.sum((residual * residual) / fit_variance) / dof),
+            "reduced_chi2": float(reduced_chi2),
             "residual_l2": float(np.linalg.norm(residual)),
             "residual_l1": float(np.sum(np.abs(residual))),
             "positive_residual_sum": float(np.sum(np.maximum(residual, 0.0))),
@@ -1199,8 +1818,39 @@ class SpectralDecomposer:
                 if self.last_response_poisson_background is None
                 else np.sum(self.last_response_poisson_background)
             ),
+            "line_resolved_fit": bool(
+                self.config.response_poisson_line_resolved_fit
+                and any(spec.energy_keV is not None for spec in signal_columns)
+            ),
+            "line_model_selection": line_model_selection,
+            "signal_column_count": int(signal_count),
+            "signal_columns": [
+                {
+                    "isotope": spec.isotope,
+                    "energy_keV": (
+                        None if spec.energy_keV is None else float(spec.energy_keV)
+                    ),
+                    "line_weight": float(spec.line_weight),
+                    "label": spec.label,
+                }
+                for spec in signal_columns
+            ],
             "coefficients": {
-                name: float(coeffs[idx]) for idx, name in enumerate(fit_names)
+                name: float(isotope_counts.get(name, 0.0)) for name in fit_names
+            },
+            "line_coefficients": {
+                spec.label: float(coeffs[idx])
+                for idx, spec in enumerate(signal_columns)
+            },
+            "aggregation_weights": {
+                name: [
+                    float(value)
+                    for value in aggregation_weights_by_isotope.get(
+                        name,
+                        np.zeros(0, dtype=float),
+                    )
+                ]
+                for name in fit_names
             },
             "counts": {
                 name: float(estimates[name].counts)
@@ -1210,6 +1860,7 @@ class SpectralDecomposer:
             "variances": {
                 name: float(variances.get(name, 1.0)) for name in fit_names
             },
+            "count_covariance": covariance_by_isotope,
             "snr": {
                 name: float(
                     estimates[name].counts
@@ -1236,6 +1887,7 @@ class SpectralDecomposer:
             if photopeak_variances is not None
             else {},
             "low_snr_photopeak_suppression": low_snr_suppression_debug,
+            "crosstalk_count_guard": crosstalk_count_guard_debug,
             "component_integrals": {
                 name: float(np.sum(component_spectra.get(name, np.zeros(0))))
                 for name in fit_names
@@ -1250,6 +1902,469 @@ class SpectralDecomposer:
             "crosstalk_variance_floor": crosstalk_variance_debug,
         }
         return estimates
+
+    def _apply_response_poisson_count_guard(
+        self,
+        estimates: Dict[str, IsotopeCountEstimate],
+        variances: Dict[str, float],
+        photopeak_counts: dict[str, float] | None,
+        photopeak_variances: dict[str, float] | None,
+        *,
+        reduced_chi2: float,
+        requested: Sequence[str],
+    ) -> dict[str, dict[str, float | str | bool]]:
+        """
+        Guard continuum-crosstalk disagreements with photopeak evidence.
+
+        The full-spectrum response fit is the primary estimator. This guard is
+        activated when a high-SNR local photopeak estimate contradicts a much
+        larger full-response coefficient and either the whole-spectrum fit is
+        inconsistent or the isotope is a weak coefficient under a much stronger
+        dominant channel. The second case handles coefficient crosstalk that
+        can fit the spectrum with a small global residual. The two positive
+        count estimates are fused in log-count space, and the disagreement
+        inflates the observation variance. Extreme high-chi2 weak-channel
+        disagreements relax the photopeak SNR cap because the global residual
+        independently argues against the full-response coefficient.
+        """
+        if not bool(self.config.response_poisson_crosstalk_count_guard_enable):
+            return {}
+        if photopeak_counts is None or photopeak_variances is None:
+            return {}
+        chi2_threshold = max(
+            float(self.config.response_poisson_crosstalk_count_guard_reduced_chi2),
+            1.0,
+        )
+        ratio_threshold = max(
+            float(self.config.response_poisson_crosstalk_count_guard_ratio),
+            1.0,
+        )
+        extreme_ratio = max(
+            float(self.config.response_poisson_crosstalk_count_guard_extreme_ratio),
+            ratio_threshold,
+        )
+        min_snr = max(
+            float(self.config.response_poisson_crosstalk_count_guard_photo_snr),
+            0.0,
+        )
+        weak_channel_fraction = max(
+            float(
+                self.config.response_poisson_crosstalk_count_guard_weak_channel_fraction
+            ),
+            0.0,
+        )
+        dominance_ratio_threshold = max(
+            float(self.config.response_poisson_crosstalk_count_guard_dominance_ratio),
+            1.0,
+        )
+        allow_low_chi2_dominance = bool(
+            self.config.response_poisson_crosstalk_count_guard_low_chi2_dominance
+        )
+        underallocation_guard_enabled = bool(
+            self.config.response_poisson_underallocation_count_guard_enable
+        )
+        underallocation_ratio_threshold = max(
+            float(self.config.response_poisson_underallocation_count_guard_ratio),
+            1.0,
+        )
+        underallocation_min_snr = max(
+            float(self.config.response_poisson_underallocation_count_guard_photo_snr),
+            0.0,
+        )
+        high_chi2 = bool(
+            np.isfinite(reduced_chi2) and float(reduced_chi2) >= chi2_threshold
+        )
+        requested_counts = [
+            max(float(estimates[name].counts), 0.0)
+            for name in requested
+            if name in estimates
+        ]
+        dominant_count = max(requested_counts, default=0.0)
+        single_channel_fit = len(requested_counts) <= 1
+        debug: dict[str, dict[str, float | str | bool]] = {}
+        for name in requested:
+            estimate = estimates.get(name)
+            if estimate is None:
+                continue
+            poisson_count = max(float(estimate.counts), 0.0)
+            photo_count = max(float(photopeak_counts.get(name, 0.0)), 0.0)
+            photo_var = max(float(photopeak_variances.get(name, 1.0)), 1.0)
+            if poisson_count <= 0.0 or photo_count <= 0.0:
+                continue
+            photo_snr = photo_count / max(np.sqrt(photo_var), 1.0e-12)
+            ratio = poisson_count / max(photo_count, 1.0e-12)
+            if photo_snr <= 0.0:
+                continue
+            photo_to_poisson_ratio = photo_count / max(poisson_count, 1.0e-12)
+            if (
+                underallocation_guard_enabled
+                and high_chi2
+                and photo_snr > 0.0
+                and photo_to_poisson_ratio >= underallocation_ratio_threshold
+            ):
+                disagreement_var = (photo_count - poisson_count) ** 2
+                disagreement_fraction = max(
+                    (photo_count - poisson_count) / max(photo_count, 1.0e-12),
+                    0.0,
+                )
+                if np.isfinite(reduced_chi2):
+                    chi2_mismatch_weight = 1.0 - np.sqrt(
+                        min(
+                            max(
+                                chi2_threshold / max(float(reduced_chi2), 1.0e-12),
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                    )
+                else:
+                    chi2_mismatch_weight = 0.0
+                snr_reliability = min(
+                    max(
+                        photo_snr / max(underallocation_min_snr, 1.0e-12),
+                        0.0,
+                    ),
+                    1.0,
+                )
+                ratio_photo_weight = 1.0 - (
+                    underallocation_ratio_threshold
+                    / max(photo_to_poisson_ratio, underallocation_ratio_threshold)
+                ) ** 2
+                blend_evidence = 1.0
+                for weight in (
+                    disagreement_fraction,
+                    ratio_photo_weight,
+                    chi2_mismatch_weight,
+                ):
+                    blend_evidence *= 1.0 - min(max(float(weight), 0.0), 1.0)
+                blend_weight = min(
+                    max(float((1.0 - blend_evidence) * snr_reliability), 0.0),
+                    1.0,
+                )
+                guarded_count = float(
+                    np.exp(
+                        (1.0 - blend_weight) * np.log(max(poisson_count, 1.0e-12))
+                        + blend_weight * np.log(max(photo_count, 1.0e-12))
+                    )
+                )
+                guarded_variance = max(
+                    float(estimate.variance),
+                    float(variances.get(name, 1.0)),
+                    photo_var,
+                    disagreement_var,
+                    guarded_count + 1.0,
+                    photo_count + 1.0,
+                    1.0,
+                )
+                weak_channel = bool(
+                    single_channel_fit
+                    or dominant_count <= 0.0
+                    or poisson_count
+                    <= weak_channel_fraction * max(dominant_count, 1.0e-12)
+                )
+                estimates[name] = IsotopeCountEstimate(
+                    isotope=name,
+                    counts=guarded_count,
+                    variance=guarded_variance,
+                    method="response_poisson_photopeak_underallocation_blend",
+                )
+                variances[name] = guarded_variance
+                debug[str(name)] = {
+                    "reason": "high_chi2_photopeak_underallocation_log_blend",
+                    "adjust_count": True,
+                    "reduced_chi2": float(reduced_chi2),
+                    "chi2_threshold": float(chi2_threshold),
+                    "poisson_count": float(poisson_count),
+                    "photopeak_count": float(photo_count),
+                    "guarded_count": float(guarded_count),
+                    "output_count": float(guarded_count),
+                    "blend_weight": float(blend_weight),
+                    "disagreement_fraction": float(disagreement_fraction),
+                    "chi2_mismatch_weight": float(chi2_mismatch_weight),
+                    "ratio_photo_weight": float(ratio_photo_weight),
+                    "dominance_weight": 0.0,
+                    "dominance_blend_weight": 0.0,
+                    "extreme_dominant_boost": 0.0,
+                    "chi2_pressure_weight": 1.0,
+                    "dominance_pressure_weight": 0.0,
+                    "combined_crosstalk_weight": 0.0,
+                    "snr_reliability": float(snr_reliability),
+                    "high_chi2": True,
+                    "dominant_crosstalk": False,
+                    "combined_crosstalk": False,
+                    "underallocation": True,
+                    "dominance_ratio": float(
+                        dominant_count / max(poisson_count, 1.0e-12)
+                    ),
+                    "dominance_ratio_threshold": float(dominance_ratio_threshold),
+                    "weak_channel": bool(weak_channel),
+                    "weak_channel_fraction": float(weak_channel_fraction),
+                    "dominant_count": float(dominant_count),
+                    "photopeak_variance": float(photo_var),
+                    "photopeak_snr": float(photo_snr),
+                    "photo_to_poisson_ratio": float(photo_to_poisson_ratio),
+                    "poisson_to_photopeak_ratio": float(ratio),
+                    "ratio_threshold": float(underallocation_ratio_threshold),
+                    "extreme_ratio": float(extreme_ratio),
+                    "guarded_variance": float(guarded_variance),
+                }
+                continue
+            if ratio < ratio_threshold:
+                continue
+            disagreement_var = (poisson_count - photo_count) ** 2
+            disagreement_fraction = max(
+                (poisson_count - photo_count) / max(poisson_count, 1.0e-12),
+                0.0,
+            )
+            if np.isfinite(reduced_chi2):
+                chi2_mismatch_weight = 1.0 - np.sqrt(
+                    min(
+                        max(
+                            chi2_threshold / max(float(reduced_chi2), 1.0e-12),
+                            0.0,
+                        ),
+                        1.0,
+                    )
+                )
+            else:
+                chi2_mismatch_weight = 0.0
+            snr_reliability = photo_snr / max(photo_snr + min_snr, 1.0e-12)
+            weak_channel = bool(
+                single_channel_fit
+                or dominant_count <= 0.0
+                or poisson_count
+                <= weak_channel_fraction * max(dominant_count, 1.0e-12)
+            )
+            dominance_ratio = dominant_count / max(poisson_count, 1.0e-12)
+            dominant_crosstalk = bool(
+                allow_low_chi2_dominance
+                and weak_channel
+                and not single_channel_fit
+                and dominance_ratio >= dominance_ratio_threshold
+            )
+            ratio_photo_weight = 1.0 - (
+                ratio_threshold / max(ratio, ratio_threshold)
+            ) ** 2
+            chi2_pressure_weight = (
+                min(max(float(reduced_chi2) / chi2_threshold, 0.0), 1.0)
+                if np.isfinite(reduced_chi2)
+                else 0.0
+            )
+            dominance_pressure_weight = (
+                min(max(dominance_ratio / dominance_ratio_threshold, 0.0), 1.0)
+                if (
+                    allow_low_chi2_dominance
+                    and weak_channel
+                    and not single_channel_fit
+                )
+                else 0.0
+            )
+            combined_trigger_residual = 1.0
+            for weight in (
+                disagreement_fraction,
+                ratio_photo_weight,
+                chi2_pressure_weight,
+                dominance_pressure_weight,
+            ):
+                combined_trigger_residual *= 1.0 - min(max(float(weight), 0.0), 1.0)
+            combined_crosstalk_weight = min(
+                max(float((1.0 - combined_trigger_residual) * snr_reliability), 0.0),
+                1.0,
+            )
+            combined_crosstalk = bool(
+                allow_low_chi2_dominance
+                and weak_channel
+                and not single_channel_fit
+                and combined_crosstalk_weight >= 0.8
+            )
+            if not high_chi2 and not dominant_crosstalk and not combined_crosstalk:
+                continue
+            # Fuse independent crosstalk evidence in log-count space instead
+            # of replacing the full-response count.  The photopeak estimate is
+            # a partial spectral view, so the guard still keeps some
+            # full-response information, but strong disagreement, high global
+            # misfit, and an extreme count ratio should compound rather than
+            # mask one another through a simple max().
+            evidence_weights = [
+                float(disagreement_fraction),
+                float(ratio_photo_weight),
+            ]
+            if high_chi2:
+                evidence_weights.append(float(chi2_mismatch_weight))
+            blend_evidence = 1.0
+            for weight in evidence_weights:
+                blend_evidence *= 1.0 - min(max(float(weight), 0.0), 1.0)
+            blend_weight = min(
+                max(float((1.0 - blend_evidence) * snr_reliability), 0.0),
+                1.0,
+            )
+            if weak_channel:
+                dominance_weight = (
+                    1.0 - dominance_ratio_threshold / max(dominance_ratio, 1.0e-12)
+                    if dominant_crosstalk
+                    else 0.0
+                )
+                dominance_blend_weight = float(
+                    dominance_weight
+                    * max(float(disagreement_fraction), float(ratio_photo_weight))
+                )
+                weak_evidence_weights = list(evidence_weights)
+                weak_evidence_weights.append(float(dominance_blend_weight))
+                weak_blend_evidence = 1.0
+                for weight in weak_evidence_weights:
+                    weak_blend_evidence *= 1.0 - min(max(float(weight), 0.0), 1.0)
+                blend_weight = min(
+                    max(
+                        blend_weight,
+                        float((1.0 - weak_blend_evidence) * snr_reliability),
+                    ),
+                    1.0,
+                )
+            else:
+                dominance_weight = 0.0
+                dominance_blend_weight = 0.0
+            extreme_dominant_boost = 0.0
+            if high_chi2 and dominant_crosstalk and ratio >= extreme_ratio:
+                extreme_dominant_boost = min(
+                    max(float(chi2_mismatch_weight * ratio_photo_weight), 0.0),
+                    1.0,
+                )
+                blend_weight = min(
+                    max(
+                        1.0
+                        - (1.0 - blend_weight) * (1.0 - extreme_dominant_boost),
+                        0.0,
+                    ),
+                    1.0,
+                )
+            high_chi2_ratio_boost = 0.0
+            if high_chi2:
+                high_chi2_ratio_boost = min(
+                    max(
+                        float(
+                            np.sqrt(
+                                max(
+                                    float(disagreement_fraction)
+                                    * float(ratio_photo_weight),
+                                    0.0,
+                                )
+                            )
+                            * chi2_pressure_weight
+                            * snr_reliability
+                        ),
+                        0.0,
+                    ),
+                    1.0,
+                )
+                blend_weight = min(
+                    max(
+                        1.0
+                        - (1.0 - blend_weight) * (1.0 - high_chi2_ratio_boost),
+                        0.0,
+                    ),
+                    1.0,
+                )
+            guarded_count = float(
+                np.exp(
+                    (1.0 - blend_weight) * np.log(max(poisson_count, 1.0e-12))
+                    + blend_weight * np.log(max(photo_count, 1.0e-12))
+                )
+            )
+            crosstalk_floor = 0.0
+            if weak_channel and dominant_crosstalk and not single_channel_fit:
+                crosstalk_floor = float(
+                    poisson_count / np.sqrt(max(dominance_ratio_threshold, 1.0))
+                )
+                guarded_count = max(guarded_count, crosstalk_floor)
+            if high_chi2:
+                reason = (
+                    "high_chi2_extreme_full_response_photopeak_log_blend"
+                    if ratio > extreme_ratio
+                    else "high_chi2_full_response_photopeak_log_blend"
+                )
+            elif dominant_crosstalk:
+                reason = "dominant_channel_crosstalk_photopeak_log_blend"
+            else:
+                reason = "combined_crosstalk_photopeak_log_blend"
+            guarded_variance = max(
+                float(estimate.variance),
+                float(variances.get(name, 1.0)),
+                photo_var,
+                disagreement_var,
+                (poisson_count - crosstalk_floor) ** 2
+                if crosstalk_floor > 0.0
+                else 0.0,
+                guarded_count + 1.0,
+                photo_count + 1.0,
+                1.0,
+            )
+            adjust_high_chi2_count = bool(
+                self.config
+                .response_poisson_crosstalk_count_guard_adjust_high_chi2_count
+            )
+            count_adjustable_crosstalk = bool(
+                high_chi2 or dominant_crosstalk
+            )
+            adjust_count = bool(
+                self.config.response_poisson_crosstalk_count_guard_adjust_count
+            ) and (
+                (weak_channel and count_adjustable_crosstalk)
+                or (high_chi2 and adjust_high_chi2_count)
+            )
+            output_count = guarded_count if adjust_count else poisson_count
+            output_method = (
+                "response_poisson_photopeak_crosstalk_blend"
+                if adjust_count
+                else "response_poisson_photopeak_crosstalk_uncertain"
+            )
+            estimates[name] = IsotopeCountEstimate(
+                isotope=name,
+                counts=output_count,
+                variance=guarded_variance,
+                method=output_method,
+            )
+            variances[name] = guarded_variance
+            debug[str(name)] = {
+                "reason": reason,
+                "adjust_count": bool(adjust_count),
+                "reduced_chi2": float(reduced_chi2),
+                "chi2_threshold": float(chi2_threshold),
+                "poisson_count": float(poisson_count),
+                "photopeak_count": float(photo_count),
+                "guarded_count": float(guarded_count),
+                "output_count": float(output_count),
+                "crosstalk_count_floor": float(crosstalk_floor),
+                "blend_weight": float(blend_weight),
+                "disagreement_fraction": float(disagreement_fraction),
+                "chi2_mismatch_weight": float(chi2_mismatch_weight),
+                "ratio_photo_weight": float(ratio_photo_weight),
+                "dominance_weight": float(dominance_weight),
+                "dominance_blend_weight": float(dominance_blend_weight),
+                "extreme_dominant_boost": float(extreme_dominant_boost),
+                "high_chi2_ratio_boost": float(high_chi2_ratio_boost),
+                "chi2_pressure_weight": float(chi2_pressure_weight),
+                "dominance_pressure_weight": float(dominance_pressure_weight),
+                "combined_crosstalk_weight": float(combined_crosstalk_weight),
+                "snr_reliability": float(snr_reliability),
+                "high_chi2": bool(high_chi2),
+                "dominant_crosstalk": bool(dominant_crosstalk),
+                "combined_crosstalk": bool(combined_crosstalk),
+                "count_adjustable_crosstalk": bool(count_adjustable_crosstalk),
+                "adjust_high_chi2_count": bool(adjust_high_chi2_count),
+                "dominance_ratio": float(dominance_ratio),
+                "dominance_ratio_threshold": float(dominance_ratio_threshold),
+                "weak_channel": bool(weak_channel),
+                "weak_channel_fraction": float(weak_channel_fraction),
+                "dominant_count": float(dominant_count),
+                "photopeak_variance": float(photo_var),
+                "photopeak_snr": float(photo_snr),
+                "photo_to_poisson_ratio": float(photo_to_poisson_ratio),
+                "poisson_to_photopeak_ratio": float(ratio),
+                "ratio_threshold": float(ratio_threshold),
+                "extreme_ratio": float(extreme_ratio),
+                "guarded_variance": float(guarded_variance),
+            }
+        return debug
 
     def compute_response_poisson_counts(
         self,
@@ -1553,6 +2668,195 @@ class SpectralDecomposer:
         )
         return estimates, debug
 
+    def _fit_photopeak_channel_roi(
+        self,
+        spectrum: NDArray[np.float64],
+        energy_axis: NDArray[np.float64],
+        lines: list[PhotopeakFitLine],
+    ) -> tuple[list[PhotopeakChannelEstimate], dict[str, object]]:
+        """
+        Fit one ROI with separate line/photopeak channels.
+
+        This diagnostic path keeps each gamma line as its own observation
+        channel instead of collapsing the ROI to one isotope coefficient.  The
+        fitted coefficient is the isotope source-equivalent count inferred from
+        that line; multiplying by ``line_weight`` gives the line-split count
+        convention used by Geant4 line metadata.  The design is assembled over
+        the fixed analysis-line list and solved as a batched matrix problem.
+        """
+        if not lines:
+            return [], {}
+        roi_min = max(
+            float(np.min(energy_axis)),
+            min(line.energy_keV - line.half_width_keV for line in lines),
+        )
+        roi_max = min(
+            float(np.max(energy_axis)),
+            max(line.energy_keV + line.half_width_keV for line in lines),
+        )
+        mask = (energy_axis >= roi_min) & (energy_axis <= roi_max)
+        roi_energy = energy_axis[mask]
+        observed = spectrum[mask]
+        mixed_isotope_roi = len({line.isotope for line in lines}) > 1
+        background_design = self._local_background_design(roi_energy)
+        debug: dict[str, object] = {
+            "roi_min_keV": float(roi_min),
+            "roi_max_keV": float(roi_max),
+            "num_bins": int(roi_energy.size),
+            "line_energies_keV": [float(line.energy_keV) for line in lines],
+            "line_isotopes": [line.isotope for line in lines],
+            "status": "skipped",
+        }
+        min_bins = len(lines) + background_design.shape[1] + 1
+        if roi_energy.size < min_bins:
+            return [], debug
+
+        bin_width = (
+            float(np.median(np.diff(roi_energy)))
+            if roi_energy.size > 1
+            else float(self.config.bin_width_keV)
+        )
+        efficiency_floor = float(self.config.photopeak_efficiency_floor)
+        fit_lines: list[PhotopeakFitLine] = []
+        peak_columns: list[NDArray[np.float64]] = []
+        line_weights: list[float] = []
+        peak_sensitivities: list[float] = []
+        for line in lines:
+            peak_scale = max(float(self.efficiency(line.energy_keV)), 0.0)
+            if bool(self.config.use_incident_gamma_response_matrix):
+                peak_scale = self._incident_gamma_photopeak_fraction(line.energy_keV)
+            if peak_scale <= efficiency_floor:
+                continue
+            peak = gaussian_peak(
+                roi_energy,
+                center=float(line.energy_keV),
+                sigma=float(line.sigma_keV),
+            )
+            line_weight = self._line_weight(line.isotope, float(line.intensity))
+            column = line_weight * peak_scale * peak * bin_width
+            sensitivity = float(np.sum(column))
+            if sensitivity <= 0.0:
+                continue
+            fit_lines.append(line)
+            peak_columns.append(np.asarray(column, dtype=float))
+            line_weights.append(float(line_weight))
+            peak_sensitivities.append(float(sensitivity))
+        if not peak_columns:
+            debug["status"] = "no_peak_columns"
+            return [], debug
+
+        design = np.column_stack([*peak_columns, background_design])
+        weights = 1.0 / np.sqrt(np.maximum(observed, 1.0))
+        weighted_design = design * weights[:, np.newaxis]
+        weighted_observed = observed * weights
+        lower = np.concatenate(
+            [
+                np.zeros(len(fit_lines), dtype=float),
+                np.full(background_design.shape[1], -np.inf, dtype=float),
+            ]
+        )
+        upper = np.full(design.shape[1], np.inf, dtype=float)
+
+        from scipy.optimize import lsq_linear
+
+        result = lsq_linear(
+            weighted_design,
+            weighted_observed,
+            bounds=(lower, upper),
+            lsmr_tol="auto",
+        )
+        coeffs = np.asarray(result.x, dtype=float)
+        fitted = design @ coeffs
+        residual = observed - fitted
+        weighted_residual = residual * weights
+        dof = max(int(roi_energy.size) - int(design.shape[1]), 1)
+        reduced_chi2 = float(np.sum(weighted_residual**2) / dof)
+        covariance = np.linalg.pinv(
+            weighted_design.T @ weighted_design,
+            rcond=1e-12,
+        )
+        covariance *= max(reduced_chi2, 1.0)
+
+        estimates: list[PhotopeakChannelEstimate] = []
+        source_variances: list[float] = []
+        for idx, line in enumerate(fit_lines):
+            source_count = max(float(coeffs[idx]), 0.0)
+            source_variance = float(covariance[idx, idx])
+            if not np.isfinite(source_variance) or source_variance <= 0.0:
+                sensitivity = max(float(peak_sensitivities[idx]), 1e-12)
+                source_variance = max(source_count * sensitivity, 1.0) / (
+                    sensitivity**2
+                )
+            source_variance = max(float(source_variance), 1e-12)
+            line_weight = max(float(line_weights[idx]), 0.0)
+            peak_sensitivity = max(float(peak_sensitivities[idx]), 0.0)
+            line_count = source_count * line_weight
+            line_variance = source_variance * line_weight * line_weight
+            peak_count = source_count * peak_sensitivity
+            peak_variance = source_variance * peak_sensitivity * peak_sensitivity
+            window_snr = line_window_evidence(
+                energy_axis,
+                spectrum,
+                line_keV=float(line.energy_keV),
+                half_window_keV=max(
+                    float(self.config.detect_half_window_keV),
+                    float(line.half_width_keV),
+                ),
+                sideband_keV=max(
+                    float(self.config.detect_sideband_keV),
+                    float(line.half_width_keV) * 2.0,
+                ),
+            ).snr
+            fit_snr = source_count / np.sqrt(max(source_variance, 1e-12))
+            signal_to_noise = max(float(fit_snr), float(window_snr), 0.0)
+            source_variances.append(source_variance)
+            estimates.append(
+                PhotopeakChannelEstimate(
+                    isotope=line.isotope,
+                    energy_keV=float(line.energy_keV),
+                    label=f"{line.isotope}@{float(line.energy_keV):.1f}keV",
+                    source_equivalent_counts=float(source_count),
+                    source_equivalent_variance=float(source_variance),
+                    line_equivalent_counts=float(line_count),
+                    line_equivalent_variance=float(max(line_variance, 1e-12)),
+                    observed_peak_counts=float(peak_count),
+                    observed_peak_variance=float(max(peak_variance, 1e-12)),
+                    line_weight=float(line_weight),
+                    peak_sensitivity=float(peak_sensitivity),
+                    roi_min_keV=float(roi_min),
+                    roi_max_keV=float(roi_max),
+                    reduced_chi2=float(reduced_chi2),
+                    signal_to_noise=float(signal_to_noise),
+                    mixed_isotope_roi=bool(mixed_isotope_roi),
+                )
+            )
+
+        debug.update(
+            {
+                "status": "fit",
+                "fit_success": bool(result.success),
+                "fit_message": str(result.message),
+                "fit_channels": [
+                    f"{line.isotope}@{float(line.energy_keV):.1f}keV"
+                    for line in fit_lines
+                ],
+                "source_count_estimates": [
+                    float(value) for value in coeffs[: len(fit_lines)]
+                ],
+                "source_count_variances": source_variances,
+                "line_weights": [float(value) for value in line_weights],
+                "peak_sensitivities": [
+                    float(value) for value in peak_sensitivities
+                ],
+                "background_coefficients": [
+                    float(value) for value in coeffs[len(fit_lines) :]
+                ],
+                "reduced_chi2": float(reduced_chi2),
+                "residual_sum": float(np.sum(residual)),
+            }
+        )
+        return estimates, debug
+
     def _combine_photopeak_estimate_moments(
         self,
         estimates: list[PhotopeakRoiEstimate],
@@ -1789,6 +3093,94 @@ class SpectralDecomposer:
         self.last_photopeak_nnls_debug["_rois"] = {"fits": roi_debug}
         self.last_count_variances = dict(count_variances)
         return counts
+
+    def compute_photopeak_channel_estimates(
+        self,
+        spectrum: NDArray[np.float64],
+        *,
+        live_time_s: float,
+        isotopes: Sequence[str],
+    ) -> tuple[PhotopeakChannelEstimate, ...]:
+        """
+        Return diagnostic line/photopeak-channel observations.
+
+        This method is intentionally separate from runtime PF count extraction.
+        It exposes Kemp-style per-line photopeak channels with covariance-like
+        variances so saved spectra can be replayed and compared before any PF
+        integration is considered.
+        """
+        requested = [str(isotope) for isotope in isotopes]
+        energy_axis = np.asarray(self.energy_axis, dtype=float)
+        observed = np.asarray(spectrum, dtype=float)
+        self.last_photopeak_channel_debug = {
+            "requested_isotopes": list(requested),
+            "roi_fits": [],
+            "channels": [],
+        }
+        if observed.size == 0 or energy_axis.size == 0:
+            return ()
+        if observed.size != energy_axis.size:
+            min_len = min(observed.size, energy_axis.size)
+            logger.warning(
+                "Spectrum length (%d) != energy axis length (%d); truncating to %d",
+                observed.size,
+                energy_axis.size,
+                min_len,
+            )
+            observed = observed[:min_len]
+            energy_axis = energy_axis[:min_len]
+        dead_time_scale = self._dead_time_scale(observed, live_time_s)
+        observed = np.clip(observed * dead_time_scale, a_min=0.0, a_max=None)
+        lines = self._photopeak_analysis_lines(requested, energy_axis)
+        groups = self._group_photopeak_fit_lines(lines)
+        estimates: list[PhotopeakChannelEstimate] = []
+        roi_debug: list[dict[str, object]] = []
+        for group in groups:
+            group_estimates, debug = self._fit_photopeak_channel_roi(
+                observed,
+                energy_axis,
+                group,
+            )
+            if debug:
+                roi_debug.append(debug)
+            estimates.extend(group_estimates)
+        self.last_photopeak_channel_debug = {
+            "requested_isotopes": list(requested),
+            "dead_time_scale": float(dead_time_scale),
+            "roi_fits": roi_debug,
+            "channels": [
+                {
+                    "isotope": estimate.isotope,
+                    "energy_keV": float(estimate.energy_keV),
+                    "label": estimate.label,
+                    "source_equivalent_counts": float(
+                        estimate.source_equivalent_counts
+                    ),
+                    "source_equivalent_variance": float(
+                        estimate.source_equivalent_variance
+                    ),
+                    "line_equivalent_counts": float(
+                        estimate.line_equivalent_counts
+                    ),
+                    "line_equivalent_variance": float(
+                        estimate.line_equivalent_variance
+                    ),
+                    "observed_peak_counts": float(estimate.observed_peak_counts),
+                    "observed_peak_variance": float(
+                        estimate.observed_peak_variance
+                    ),
+                    "line_weight": float(estimate.line_weight),
+                    "peak_sensitivity": float(estimate.peak_sensitivity),
+                    "roi_min_keV": float(estimate.roi_min_keV),
+                    "roi_max_keV": float(estimate.roi_max_keV),
+                    "reduced_chi2": float(estimate.reduced_chi2),
+                    "signal_to_noise": float(estimate.signal_to_noise),
+                    "mixed_isotope_roi": bool(estimate.mixed_isotope_roi),
+                }
+                for estimate in estimates
+            ],
+        }
+        return tuple(estimates)
 
     def compute_photopeak_nnls_estimates(
         self,

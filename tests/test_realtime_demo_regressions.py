@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import realtime_demo as realtime_demo_module
 from measurement.obstacles import ObstacleGrid
 from measurement.model import EnvironmentConfig
 from pf.estimator import (
@@ -30,9 +31,11 @@ from realtime_demo import (
     _build_robot_path_segment,
     _compute_shield_selection_grid,
     _diagnostic_detail_order,
+    _evaluate_spectrum_count_result,
     _evaluate_spectrum_counts,
     _filter_absent_final_estimates,
     _filter_reachable_candidates,
+    _format_pf_timing_item,
     _format_estimate_trace_log_line,
     _format_truth_coverage_log_line,
     _best_dss_first_step_guard_candidate,
@@ -42,15 +45,21 @@ from realtime_demo import (
     _inflate_low_signal_variances,
     _is_adaptive_spectrum_ready,
     _isotope_count_balance_penalty,
+    _log_spectrum_isotope_channel_diagnostics,
+    _log_precision_degradation_diagnostics,
+    _log_particle_cloud_diagnostics,
+    _log_surface_candidate_observability_diagnostics,
     _pf_obstacle_attenuation_enabled,
     _pf_obstacle_grid_for_runtime,
     _online_absent_pruning_supported_isotopes,
     _prune_online_absent_isotopes,
     _resolve_ig_workers,
+    _resolve_runtime_use_gpu,
     _resolve_mission_max_poses,
     _resolve_plot_save_interval,
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
+    _resolve_candidate_isotopes,
     _resolve_display_prune_refresh_interval,
     _resolve_structural_trial_parallelism,
     _resolve_station_update_modes,
@@ -62,12 +71,17 @@ from realtime_demo import (
     _resolve_source_position_bounds,
     _spectrum_config_from_runtime_config,
     _source_cardinality_dwell_status,
+    _remaining_measurement_progress,
     run_live_pf,
+)
+from mission_control import (
+    report_model_order_ready_for_stop,
+    sparse_cardinality_evidence_gap_unresolved,
 )
 from planning.dss_pp import DSSPPConfig
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from visualization.realtime_viz import PFFrame
 
 
@@ -109,9 +123,104 @@ def test_joint_observation_update_disables_delayed_resample() -> None:
         True,
         False,
     )
+
+
+def test_candidate_isotope_config_restricts_pf_labels() -> None:
+    """Runtime candidate-isotope config should restrict online PF labels."""
+    isotopes = _resolve_candidate_isotopes(
+        {"candidate_isotopes": ["Cs-137"]},
+        ["Cs-137", "Co-60", "Eu-154"],
+    )
+
+    assert isotopes == ("Cs-137",)
+
+
+def test_candidate_isotope_config_rejects_unknown_labels() -> None:
+    """Runtime candidate-isotope config should fail on unknown labels."""
+    with pytest.raises(ValueError, match="candidate_isotopes contains"):
+        _resolve_candidate_isotopes(
+            {"candidate_isotopes": ["Unknown"]},
+            ["Cs-137", "Co-60"],
+        )
     assert _resolve_station_update_modes(
         {"joint_observation_update": True, "delayed_resample_update": True}
     ) == (True, False)
+
+
+def test_remaining_measurement_progress_uses_full_history_residual() -> None:
+    """Soft extension progress should accept residual-budget improvement."""
+    estimates = [
+        {
+            "components": {"residual": 5.0},
+            "current_budget": 12.0,
+            "estimated_remaining_stations": 3,
+        },
+        {
+            "components": {"residual": 4.0},
+            "current_budget": 12.5,
+            "estimated_remaining_stations": 3,
+        },
+    ]
+
+    progress = _remaining_measurement_progress(estimates)
+
+    assert progress["available"] is True
+    assert progress["has_progress"] is True
+    assert progress["residual_improved"] is True
+    assert progress["budget_improved"] is False
+    assert progress["remaining_stations_improved"] is False
+
+
+def test_remaining_measurement_progress_rejects_stalled_budget() -> None:
+    """Soft extension progress should reject stalled residual and budget signals."""
+    estimates = [
+        {
+            "components": {"residual": 5.0},
+            "current_budget": 12.0,
+            "estimated_remaining_stations": 3,
+        },
+        {
+            "components": {"residual": 5.5},
+            "current_budget": 12.0,
+            "estimated_remaining_stations": 3,
+        },
+    ]
+
+    progress = _remaining_measurement_progress(estimates)
+
+    assert progress["available"] is True
+    assert progress["has_progress"] is False
+    assert progress["residual_improved"] is False
+    assert progress["budget_improved"] is False
+    assert progress["remaining_stations_improved"] is False
+
+
+def test_remaining_measurement_progress_requires_full_history_improvement() -> None:
+    """Soft extension progress should not accept a rebound above the best residual."""
+    estimates = [
+        {
+            "components": {"residual": 5.0},
+            "current_budget": 12.0,
+            "estimated_remaining_stations": 3,
+        },
+        {
+            "components": {"residual": 3.0},
+            "current_budget": 9.0,
+            "estimated_remaining_stations": 2,
+        },
+        {
+            "components": {"residual": 4.0},
+            "current_budget": 10.0,
+            "estimated_remaining_stations": 2,
+        },
+    ]
+
+    progress = _remaining_measurement_progress(estimates)
+
+    assert progress["available"] is True
+    assert progress["has_progress"] is False
+    assert progress["residual_recent_improved"] is False
+    assert progress["best_previous_residual_budget"] == pytest.approx(3.0)
 
 
 def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
@@ -457,6 +566,30 @@ def test_python_worker_auto_uses_all_logical_cpus(
     assert _resolve_ig_workers(12) == 12
 
 
+def test_runtime_config_can_disable_gpu_without_cuda_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime configs should be able to force CPU-only execution."""
+    def _fail_cuda_probe() -> bool:
+        """Fail if automatic CUDA detection is unexpectedly reached."""
+        raise AssertionError("CUDA auto-detection should not run.")
+
+    monkeypatch.setattr("realtime_demo._default_use_gpu", _fail_cuda_probe)
+
+    assert _resolve_runtime_use_gpu({"use_gpu": False}) is False
+    assert _resolve_runtime_use_gpu({"use_gpu": "off"}) is False
+    assert _resolve_runtime_use_gpu({"use_gpu": 1}) is True
+
+
+def test_runtime_gpu_default_uses_cuda_auto_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing use_gpu should preserve the historical auto-detect behavior."""
+    monkeypatch.setattr("realtime_demo._default_use_gpu", lambda: True)
+
+    assert _resolve_runtime_use_gpu({}) is True
+
+
 def test_cui_split_view_defaults_to_saved_runs() -> None:
     """Saved runs should expose the URL-served CUI progress view by default."""
     assert _resolve_cui_split_view_enabled({}, save_outputs=True) is True
@@ -529,6 +662,220 @@ def test_diagnostic_detail_limit_uses_zero_as_no_details() -> None:
     assert _diagnostic_detail_order(order, 0).tolist() == []
     assert _diagnostic_detail_order(order, 2).tolist() == [4, 2]
     assert _diagnostic_detail_order(order, -1).tolist() == [4, 2, 0, 1, 3]
+
+
+def test_pf_timing_formatter_keeps_counters_unitless() -> None:
+    """PF timing logs should not print diagnostic counters as seconds."""
+    assert _format_pf_timing_item("total", 1.25) == "total=1.250s"
+    assert (
+        _format_pf_timing_item("sparse_evidence_synced_particles", 6130.0)
+        == "sparse_evidence_synced_particles=6130"
+    )
+    assert (
+        _format_pf_timing_item("sparse_evidence_cardinality_ready", 1.0)
+        == "sparse_evidence_cardinality_ready=1"
+    )
+
+
+def test_precision_diagnostics_skip_birth_candidate_grid_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime precision diagnostics should not score all birth candidates by default."""
+    calls: list[str] = []
+
+    def noop(*args: object, **kwargs: object) -> None:
+        """Replace lightweight diagnostic callbacks during this routing test."""
+        _ = (args, kwargs)
+
+    def record_birth(*args: object, **kwargs: object) -> None:
+        """Record whether the expensive birth-candidate diagnostic is invoked."""
+        _ = (args, kwargs)
+        calls.append("birth")
+
+    for name in (
+        "_log_spectrum_response_poisson_diagnostics",
+        "_log_current_map_prediction_residuals",
+        "_log_truth_observability_diagnostics",
+        "_log_posterior_truth_mass_diagnostics",
+        "_log_particle_cloud_diagnostics",
+        "_log_source_event_diagnostics",
+    ):
+        monkeypatch.setattr(realtime_demo_module, name, noop)
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_log_birth_candidate_diagnostics",
+        record_birth,
+    )
+
+    _log_precision_degradation_diagnostics(
+        object(),
+        object(),
+        None,
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=0,
+        candidate_log_limit=64,
+        particle_log_limit=0,
+    )
+    assert calls == []
+
+    _log_precision_degradation_diagnostics(
+        object(),
+        object(),
+        None,
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=0,
+        candidate_log_limit=64,
+        particle_log_limit=0,
+        birth_candidate_diagnostics_enabled=True,
+    )
+    assert calls == ["birth"]
+
+
+def test_precision_diagnostics_use_compact_spectrum_log_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime precision diagnostics should avoid full response JSON by default."""
+    calls: list[str] = []
+
+    def noop(*args: object, **kwargs: object) -> None:
+        """Replace unrelated diagnostics during this routing test."""
+        _ = (args, kwargs)
+
+    def record_compact(*args: object, **kwargs: object) -> None:
+        """Record compact spectrum-channel diagnostic routing."""
+        _ = (args, kwargs)
+        calls.append("compact")
+
+    def record_full(*args: object, **kwargs: object) -> None:
+        """Record full response-Poisson diagnostic routing."""
+        _ = (args, kwargs)
+        calls.append("full")
+
+    for name in (
+        "_log_current_map_prediction_residuals",
+        "_log_truth_observability_diagnostics",
+        "_log_posterior_truth_mass_diagnostics",
+        "_log_particle_cloud_diagnostics",
+        "_log_source_event_diagnostics",
+        "_log_birth_candidate_diagnostics",
+    ):
+        monkeypatch.setattr(realtime_demo_module, name, noop)
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_log_spectrum_isotope_channel_diagnostics",
+        record_compact,
+    )
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_log_spectrum_response_poisson_diagnostics",
+        record_full,
+    )
+
+    _log_precision_degradation_diagnostics(
+        object(),
+        object(),
+        None,
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=0,
+        candidate_log_limit=0,
+        particle_log_limit=0,
+    )
+    _log_precision_degradation_diagnostics(
+        object(),
+        object(),
+        None,
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=0,
+        candidate_log_limit=0,
+        particle_log_limit=0,
+        full_spectrum_response_diagnostics_enabled=True,
+    )
+
+    assert calls == ["compact", "full"]
+
+
+def test_surface_observability_diagnostics_skip_zero_candidates() -> None:
+    """Surface observability diagnostics should be fully skipped at zero cap."""
+
+    class _Estimator:
+        """Estimator whose observability diagnostic must not be invoked."""
+
+        def surface_candidate_observability_diagnostics(
+            self,
+            *,
+            window: int | None = None,
+            max_candidates: int = 256,
+        ) -> dict[str, dict[str, object]]:
+            """Fail when the zero-candidate guard is not honored."""
+            _ = (window, max_candidates)
+            raise AssertionError("surface observability should be skipped.")
+
+    _log_surface_candidate_observability_diagnostics(
+        _Estimator(),  # type: ignore[arg-type]
+        step_index=0,
+        label="guard",
+        max_candidates=0,
+    )
+
+
+def test_particle_cloud_diagnostics_zero_limit_skips_details(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Particle cloud diagnostics should skip slot and particle detail at zero limit."""
+
+    class _State:
+        """Minimal particle state exposing source cardinality."""
+
+        num_sources = 1
+
+    class _Particle:
+        """Minimal continuous particle wrapper."""
+
+        state = _State()
+        log_weight = 0.0
+
+    class _Filter:
+        """Minimal isotope filter exposing particle weights."""
+
+        continuous_particles = [_Particle(), _Particle()]
+        continuous_weights = np.asarray([0.75, 0.25], dtype=float)
+
+    class _Estimator:
+        """Minimal estimator exposing one isotope filter."""
+
+        filters = {"Cs-137": _Filter()}
+
+    _log_particle_cloud_diagnostics(
+        _Estimator(),  # type: ignore[arg-type]
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=3,
+        particle_log_limit=0,
+    )
+
+    output = capsys.readouterr().out
+    assert "particle_cloud[Cs-137]" in output
+    assert "particle_slot_cloud" not in output
+    assert "particle_source" not in output
 
 
 def test_structural_trial_parallelism_reads_runtime_config() -> None:
@@ -694,6 +1041,10 @@ def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
             """Return a non-converged local rotation state."""
             return False
 
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this non-model-order test."""
+            return True
+
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -748,6 +1099,10 @@ def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
+
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this discriminative-failure test."""
+            return True
 
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -814,6 +1169,10 @@ def test_adaptive_mission_waits_for_remaining_measurement_budget() -> None:
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
+
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this remaining-budget test."""
+            return True
 
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -916,6 +1275,32 @@ def test_final_model_order_status_marks_unresolved_pseudo_sources_not_ready() ->
     assert status["unresolved_structural_evidence"]["Cs-137"]
 
 
+def test_final_model_order_status_marks_missing_diagnostics_not_ready() -> None:
+    """Final model-order status should not treat absent evidence as ready."""
+
+    class _DummyEstimator:
+        """Minimal estimator before report diagnostics have been generated."""
+
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty report estimate."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return no model-order diagnostics."""
+            return {}
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return no separately tracked structural evidence."""
+            return {}
+
+    status = _final_model_order_status(_DummyEstimator())
+
+    assert status["all_model_order_ready"] is False
+    assert status["all_model_order_ready_before_structural_gates"] is False
+
+
 def test_cardinality_dwell_waits_for_unresolved_structural_evidence() -> None:
     """Adaptive cardinality dwell should not stop while structural evidence is open."""
 
@@ -945,6 +1330,80 @@ def test_cardinality_dwell_waits_for_unresolved_structural_evidence() -> None:
 
     assert ready is False
     assert reason == "unresolved_structural:Cs-137"
+
+
+def test_cardinality_dwell_waits_for_model_order_diagnostics() -> None:
+    """Adaptive cardinality dwell should wait until report evidence exists."""
+
+    class _DummyEstimator:
+        """Minimal estimator before report diagnostics have been generated."""
+
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an empty report estimate."""
+            return {}
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return no separately tracked structural evidence."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return no report-level model-order diagnostics."""
+            return {}
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+    )
+
+    assert ready is False
+    assert reason == "no_model_order_diagnostics"
+
+
+def test_cardinality_dwell_requires_explicit_model_order_ready() -> None:
+    """Active multi-source diagnostics need an explicit ready flag."""
+
+    class _DummyEstimator:
+        """Minimal estimator with active diagnostics missing readiness."""
+
+        filters: dict[str, object] = {}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return a two-source report estimate."""
+            return {
+                "Cs-137": (
+                    np.zeros((2, 3), dtype=float),
+                    np.ones(2, dtype=float),
+                )
+            }
+
+        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
+            """Return no separately tracked structural evidence."""
+            return {}
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return active diagnostics without an explicit readiness decision."""
+            return {
+                "Cs-137": {
+                    "candidate_count": 3,
+                    "selected_count": 2,
+                    "condition_number": 1.0,
+                    "criterion_margin_to_simpler": 20.0,
+                }
+            }
+
+    ready, reason = _source_cardinality_dwell_status(
+        _DummyEstimator(),
+        min_candidate_count=2,
+        max_condition_number=100.0,
+        min_bic_margin=2.0,
+    )
+
+    assert ready is False
+    assert reason == "Cs-137:model_order"
 
 
 def test_cardinality_dwell_ignores_inactive_zero_source_candidates() -> None:
@@ -1450,6 +1909,116 @@ def test_adaptive_dss_program_length_shortens_only_when_budget_is_resolved() -> 
     assert birth_noise_reason == "simple_report"
 
 
+def test_sparse_cardinality_evidence_gap_unresolved_checks_nested_payload() -> None:
+    """Sparse cardinality gaps should mark only weak evidence as unresolved."""
+    unresolved = {
+        "Cs-137": {
+            "sparse_poisson_evidence": {
+                "available": True,
+                "model_order_ready": False,
+                "criterion_margin_to_runner_up": 2.0,
+            }
+        }
+    }
+    weak_gap = {
+        "Co-60": {
+            "available": True,
+            "model_order_ready": True,
+            "criterion_margin_to_runner_up": 4.0,
+            "criterion_margin_to_simpler": 12.0,
+        }
+    }
+    resolved = {
+        "Eu-154": {
+            "available": True,
+            "model_order_ready": True,
+            "criterion_margin_to_runner_up": 12.0,
+            "criterion_margin_to_simpler": 14.0,
+        }
+    }
+    missing_ready = {
+        "Cs-137": {
+            "available": True,
+            "criterion_margin_to_runner_up": 12.0,
+            "criterion_margin_to_simpler": 14.0,
+        }
+    }
+
+    assert sparse_cardinality_evidence_gap_unresolved(unresolved, gap_target=10.0)
+    assert sparse_cardinality_evidence_gap_unresolved(weak_gap, gap_target=10.0)
+    assert sparse_cardinality_evidence_gap_unresolved(missing_ready, gap_target=10.0)
+    assert not sparse_cardinality_evidence_gap_unresolved(resolved, gap_target=10.0)
+
+
+def test_report_model_order_ready_fallback_waits_for_diagnostics() -> None:
+    """Mission-stop fallback should not treat missing diagnostics as ready."""
+
+    class _MissingDiagnosticsEstimator:
+        """Estimator exposing no model-order diagnostics."""
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return no model-order diagnostics."""
+            return {}
+
+    class _ActiveMissingReadyEstimator:
+        """Estimator exposing active diagnostics with no ready flag."""
+
+        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
+            """Return active diagnostics without an explicit readiness decision."""
+            return {"Cs-137": {"candidate_count": 3, "selected_count": 2}}
+
+    assert report_model_order_ready_for_stop(_MissingDiagnosticsEstimator()) is False
+    assert report_model_order_ready_for_stop(_ActiveMissingReadyEstimator()) is False
+
+
+def test_adaptive_dss_residual_extension_requires_cardinality_gap() -> None:
+    """Residual budgets alone should not trigger long programs under the new guard."""
+    cfg = DSSPPConfig(program_length=8)
+    residual_budget = {
+        "estimated_remaining_stations": 1,
+        "current_budget": 4.0,
+        "unresolved_factors": ["residual"],
+        "components": {
+            "residual": 1.0,
+            "isotope_absence": 0.0,
+            "same_isotope_separation": 0.0,
+            "high_surface_ambiguity": 0.0,
+        },
+    }
+
+    blocked, blocked_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=False,
+        remaining_measurement_estimate=residual_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+        residual_extension_requires_cardinality_evidence=True,
+        cardinality_evidence_unresolved=False,
+    )
+    extended, extended_reason = _adapt_dss_program_length_for_budget(
+        cfg,
+        enabled=True,
+        simple_program_length=2,
+        residual_program_length=16,
+        residual_burst_active=False,
+        report_simple_ready=False,
+        remaining_measurement_estimate=residual_budget,
+        residual_budget_threshold=1.0e-9,
+        ambiguity_budget_threshold=1.0e-9,
+        residual_extension_requires_cardinality_evidence=True,
+        cardinality_evidence_unresolved=True,
+    )
+
+    assert int(blocked.program_length) == 8
+    assert blocked_reason == "residual_without_cardinality_gap"
+    assert int(extended.program_length) == 16
+    assert extended_reason == "residual"
+
+
 def test_adaptive_dss_shortens_high_surface_budget_when_report_is_simple() -> None:
     """High-surface ambiguity alone should not force full programs for simple reports."""
     cfg = DSSPPConfig(program_length=8)
@@ -1512,6 +2081,10 @@ def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
             """Return a non-converged local rotation state."""
             return False
 
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this min-pose test."""
+            return True
+
     visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
 
     reason = _adaptive_mission_stop_reason(
@@ -1572,6 +2145,10 @@ def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
+
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this convergence-flag test."""
+            return True
 
     visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
     estimator = _DummyEstimator()
@@ -2113,6 +2690,10 @@ def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> 
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
+
+        def report_model_order_ready(self) -> bool:
+            """Return settled model-order status for this coverage-stop test."""
+            return True
 
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -2788,8 +3369,10 @@ def test_spectrum_runtime_config_exposes_response_poisson_controls() -> None:
         {
             "response_poisson_photopeak_anchor": False,
             "response_poisson_photopeak_anchor_weight": 0.5,
+            "response_poisson_low_snr_suppress_count": False,
             "response_poisson_model_mismatch_variance_scale": 2.0,
             "response_poisson_crosstalk_corr_threshold": 0.9,
+            "response_poisson_underallocation_count_guard_ratio": 1.1,
             "response_poisson_diagnostic_reduced_chi2_threshold": 3.0,
             "dead_time_tau_s": 0.0,
         }
@@ -2797,12 +3380,32 @@ def test_spectrum_runtime_config_exposes_response_poisson_controls() -> None:
 
     assert config.response_poisson_photopeak_anchor is False
     assert config.response_poisson_photopeak_anchor_weight == pytest.approx(0.5)
+    assert config.response_poisson_low_snr_suppress_count is False
     assert config.response_poisson_model_mismatch_variance_scale == pytest.approx(2.0)
     assert config.response_poisson_crosstalk_corr_threshold == pytest.approx(0.9)
+    assert config.response_poisson_underallocation_count_guard_ratio == pytest.approx(
+        1.1
+    )
     assert config.response_poisson_diagnostic_reduced_chi2_threshold == pytest.approx(
         3.0
     )
     assert config.dead_time_tau_s == pytest.approx(0.0)
+
+
+def test_spectrum_runtime_config_uses_geant4_background_cps() -> None:
+    """Geant4 executable background cps should anchor response-Poisson background."""
+    config = _spectrum_config_from_runtime_config(
+        {
+            "detector_scoring_mode": "incident_gamma_energy",
+            "source_rate_model": "detector_cps_1m",
+            "executable_args": ["--background-cps", "12.0"],
+        }
+    )
+
+    assert config.response_poisson_background_rate_cps == pytest.approx(12.0)
+    assert config.response_efficiency_model == "unit"
+    assert config.use_incident_gamma_response_matrix is True
+    assert config.normalize_line_intensities is True
 
 
 def test_incident_gamma_runtime_uses_detector_response_folding() -> None:
@@ -3269,11 +3872,110 @@ def test_partial_ready_variance_inflation_marks_unresolved_isotopes() -> None:
     assert inflated["Eu-154"] >= 10000.0
 
 
+def test_spectrum_counts_filter_to_candidate_isotopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PF count extraction should drop channels outside candidate_isotopes."""
+    decomposer = SpectralDecomposer()
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return deterministic multi-isotope counts for candidate filtering."""
+        return {"Cs-137": 100.0, "Co-60": 200.0}, {"Cs-137", "Co-60"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+    decomposer.last_count_variances = {"Cs-137": 10.0, "Co-60": 20.0}
+
+    counts, variances, detected = _evaluate_spectrum_counts(
+        decomposer,
+        spectrum,
+        live_time_s=1.0,
+        spectrum_count_method="response_poisson",
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+        candidate_isotopes=("Cs-137",),
+    )
+
+    assert counts == {"Cs-137": 100.0}
+    assert variances == {"Cs-137": 10.0}
+    assert detected == {"Cs-137"}
+
+
+def test_spectrum_count_result_filters_candidate_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PF count extraction should preserve covariance for retained isotopes only."""
+    decomposer = SpectralDecomposer()
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return deterministic counts and response-Poisson covariance."""
+        self.last_count_variances = {
+            "Cs-137": 16.0,
+            "Co-60": 25.0,
+            "Eu-154": 36.0,
+        }
+        self.last_count_covariance = {
+            "Cs-137": {"Cs-137": 16.0, "Co-60": -10.0, "Eu-154": 4.0},
+            "Co-60": {"Cs-137": -10.0, "Co-60": 25.0, "Eu-154": -3.0},
+            "Eu-154": {"Cs-137": 4.0, "Co-60": -3.0, "Eu-154": 36.0},
+        }
+        return (
+            {"Cs-137": 100.0, "Co-60": 200.0, "Eu-154": 300.0},
+            {"Cs-137", "Co-60", "Eu-154"},
+        )
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = _evaluate_spectrum_count_result(
+        decomposer,
+        spectrum,
+        live_time_s=1.0,
+        spectrum_count_method="response_poisson",
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+        candidate_isotopes=("Cs-137", "Co-60"),
+    )
+
+    assert set(result.counts) == {"Cs-137", "Co-60"}
+    assert set(result.variances) == {"Cs-137", "Co-60"}
+    assert result.covariance is not None
+    assert set(result.covariance) == {"Cs-137", "Co-60"}
+    assert result.covariance["Cs-137"]["Co-60"] == pytest.approx(-10.0)
+    assert "Eu-154" not in result.covariance["Cs-137"]
+
+
 def test_effective_entries_add_count_variance_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Weighted effective entries should soften high-count PF observations."""
-    decomposer = SpectralDecomposer()
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(response_poisson_count_variance_ceiling_enable=False)
+    )
     spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
     spectrum[0] = 1000.0
 
@@ -3309,3 +4011,34 @@ def test_effective_entries_add_count_variance_floor(
     assert counts["Cs-137"] == pytest.approx(1000.0)
     assert variances["Cs-137"] == pytest.approx(40000.0)
     assert detected == {"Cs-137"}
+
+
+def test_spectrum_isotope_channel_diagnostics_logs_photopeak_details(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Compact spectrum diagnostics should expose per-isotope photopeak evidence."""
+
+    class _DummyDecomposer:
+        """Store deterministic response-Poisson diagnostics for logging."""
+
+        last_response_poisson_diagnostics = {
+            "counts": {"Cs-137": 120.0},
+            "variances": {"Cs-137": 16.0},
+            "photopeak_counts": {"Cs-137": 100.0},
+            "photopeak_variances": {"Cs-137": 25.0},
+            "snr": {"Cs-137": 30.0},
+            "methods": {"Cs-137": "response_poisson_photopeak_fused"},
+            "coefficient_correlation_by_isotope": {"Cs-137": 0.2},
+        }
+
+    _log_spectrum_isotope_channel_diagnostics(
+        _DummyDecomposer(),  # type: ignore[arg-type]
+        step_index=7,
+        selected_counts={"Cs-137": 120.0},
+        selected_variances={"Cs-137": 18.0},
+    )
+
+    output = capsys.readouterr().out
+    assert "[step 7] spectrum_isotope_channels" in output
+    assert "photopeak_over_response" in output
+    assert "response_poisson_photopeak_fused" in output

@@ -44,6 +44,84 @@ def test_discrete_kernel_prefers_near_source() -> None:
     assert theta[near_idx] > theta[far_idx]
 
 
+def test_kemp_kernel_preserves_detector_observation_geometry() -> None:
+    """Kemp baseline should pass shared detector aperture geometry to the kernel."""
+    env = EnvironmentConfig(
+        size_x=4.0,
+        size_y=4.0,
+        size_z=2.0,
+        detector_position=(1.0, 1.0, 0.5),
+    )
+    kernel = DiscreteAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        mu_by_isotope=None,
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+        obstacle_grid=None,
+        config=KempKernelConfig(
+            grid_spacing_m=(1.0, 1.0, 1.0),
+            grid_margin_m=0.5,
+            z_levels_m=(0.5,),
+            detector_radius_m=0.05,
+            detector_aperture_radius_m=0.052,
+            detector_aperture_samples=33,
+            use_gpu=False,
+        ),
+    )
+
+    assert kernel._kernel.detector_radius_m == pytest.approx(0.05)
+    assert kernel._kernel.detector_aperture_radius_m == pytest.approx(0.052)
+    assert kernel._kernel.detector_aperture_samples == 33
+
+
+def test_kemp_kernel_preserves_transport_response_model() -> None:
+    """Kemp baseline should pass the shared transport sidecar to the kernel."""
+    env = EnvironmentConfig(
+        size_x=4.0,
+        size_y=4.0,
+        size_z=2.0,
+        detector_position=(1.0, 1.0, 0.5),
+    )
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {"Cs-137": {"scale": 2.0}},
+    }
+    base = DiscreteAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        mu_by_isotope=None,
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+        obstacle_grid=None,
+        config=KempKernelConfig(
+            grid_spacing_m=(1.0, 1.0, 1.0),
+            grid_margin_m=0.5,
+            z_levels_m=(0.5,),
+            use_gpu=False,
+        ),
+    )
+    adjusted = DiscreteAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        mu_by_isotope=None,
+        shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
+        obstacle_grid=None,
+        config=KempKernelConfig(
+            grid_spacing_m=(1.0, 1.0, 1.0),
+            grid_margin_m=0.5,
+            z_levels_m=(0.5,),
+            transport_response_model=transport_model,
+            use_gpu=False,
+        ),
+    )
+
+    detector = (1.0, 1.0, 0.5)
+    base_vector = base.kernel_vector("Cs-137", detector, 0, 0)
+    adjusted_vector = adjusted.kernel_vector("Cs-137", detector, 0, 0)
+
+    assert adjusted._kernel.transport_response_model == transport_model
+    assert np.allclose(adjusted_vector, 2.0 * base_vector)
+
+
 def test_kemp_cpu_parallel_kernel_matches_serial() -> None:
     """CPU-worker kernel evaluation should preserve the serial response."""
     serial = _build_test_kernel(cpu_workers=1)
@@ -71,11 +149,12 @@ def test_kemp_empty_obstacle_grid_disables_config_usd_fallback() -> None:
         env=env,
         sources=sources,
         obstacle_grid=empty_grid,
-        runtime_config={},
+        runtime_config={"obstacle_material": "air"},
     )
 
     assert payload["usd_path"] == ""
     assert payload["use_config_usd_fallback"] is False
+    assert payload["obstacle_material"] == "air"
     assert payload["obstacle_cells"] == []
 
 

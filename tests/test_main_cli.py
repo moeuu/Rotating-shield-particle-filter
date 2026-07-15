@@ -152,7 +152,7 @@ def test_main_no_notify_overrides_spectrum_notifications(monkeypatch) -> None:
 
 
 def test_main_default_max_poses_uses_runtime_config(monkeypatch) -> None:
-    """The standard full-simulation CLI should not impose its own pose cap."""
+    """The standard CLI should use runtime pose cap and random obstacles by default."""
     module = _load_main_module()
     captured: dict[str, object] = {}
 
@@ -166,6 +166,11 @@ def test_main_default_max_poses_uses_runtime_config(monkeypatch) -> None:
     module.main()
 
     assert captured["max_poses"] is None
+    assert captured["environment_mode"] == "random"
+    assert str(captured["obstacle_layout_path"]).endswith(
+        "obstacle_layouts/Ex5_obstacles.json"
+    )
+    assert captured["source_generation_mode"] == "surface_random"
 
 
 def test_main_explicit_source_config_keeps_fixed_sources_in_random_environment(

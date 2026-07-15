@@ -133,6 +133,130 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
     assert "Cs-137" in diagnostics["snr"]
 
 
+def test_response_poisson_selects_line_basis_for_shield_changed_line_ratio() -> None:
+    """Line-resolved regression should handle shield-induced line-ratio changes."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            dead_time_tau_s=0.0,
+            response_poisson_line_resolved_fit=True,
+            response_poisson_photopeak_fusion=False,
+        )
+    )
+    line_matrix, _, line_columns = decomposer._get_response_poisson_line_basis()
+    co_indices = [
+        idx
+        for idx, column in enumerate(line_columns)
+        if column.isotope == "Co-60"
+    ]
+    assert len(co_indices) == 2
+    line_counts = np.array([1000.0, 500.0], dtype=float)
+    weights = np.array(
+        [line_columns[idx].line_weight for idx in co_indices],
+        dtype=float,
+    )
+    weights /= float(np.sum(weights))
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for coefficient, column_index in zip(line_counts, co_indices):
+        spectrum += coefficient * line_matrix[:, column_index]
+
+    estimates = decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=["Co-60"],
+        include_background=False,
+    )
+
+    expected_count = float(np.dot(weights, line_counts))
+    assert estimates["Co-60"].counts == pytest.approx(expected_count, rel=1e-4)
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["line_resolved_fit"] is True
+    assert diagnostics["line_model_selection"]["selected"] is True
+    assert diagnostics["line_model_selection"]["reason"] == "line_bic_selected"
+
+
+def test_response_poisson_incident_gamma_line_basis_preserves_count_units() -> None:
+    """Incident-gamma line fits should return weighted source-equivalent counts."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            dead_time_tau_s=0.0,
+            response_efficiency_model="unit",
+            use_incident_gamma_response_matrix=True,
+            normalize_line_intensities=True,
+            response_poisson_line_resolved_fit=True,
+            response_poisson_photopeak_fusion=False,
+        )
+    )
+    line_matrix, _, line_columns = decomposer._get_response_poisson_line_basis()
+    co_indices = [
+        idx
+        for idx, column in enumerate(line_columns)
+        if column.isotope == "Co-60"
+    ]
+    assert len(co_indices) == 2
+    line_counts = np.array([1000.0, 500.0], dtype=float)
+    weights = np.array(
+        [line_columns[idx].line_weight for idx in co_indices],
+        dtype=float,
+    )
+    weights /= float(np.sum(weights))
+    spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for coefficient, column_index in zip(line_counts, co_indices):
+        spectrum += coefficient * line_matrix[:, column_index]
+
+    estimates = decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=["Co-60"],
+        include_background=False,
+    )
+
+    assert estimates["Co-60"].counts == pytest.approx(
+        float(np.dot(weights, line_counts)),
+        rel=1e-4,
+    )
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["line_resolved_fit"] is True
+    assert diagnostics["line_model_selection"]["selected"] is True
+    assert diagnostics["line_model_selection"]["reason"] == "line_bic_selected"
+
+
+def test_response_poisson_anchors_known_geant4_background_rate() -> None:
+    """Known Geant4 background cps should prevent free background overfitting."""
+    config = SpectrumConfig(
+        dead_time_tau_s=0.0,
+        response_efficiency_model="unit",
+        use_incident_gamma_response_matrix=True,
+        normalize_line_intensities=True,
+        response_poisson_background_rate_cps=12.0,
+        response_poisson_photopeak_fusion=False,
+    )
+    decomposer = SpectralDecomposer(config)
+    live_time_s = 30.0
+    background_counts = 12.0 * live_time_s
+    isotope = "Co-60"
+    truth_count = 4200.0
+    index = decomposer.isotope_names.index(isotope)
+    spectrum = (
+        truth_count * decomposer._count_response_matrix()[:, index]
+        + background_counts * decomposer._background_shape
+    )
+
+    estimates = decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=[isotope],
+        include_background=True,
+        live_time_s=live_time_s,
+    )
+
+    assert estimates[isotope].counts == pytest.approx(truth_count, rel=1e-3)
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["background_anchor"]["target_counts"] == pytest.approx(
+        background_counts
+    )
+    assert diagnostics["background_total_counts"] == pytest.approx(
+        background_counts,
+        rel=0.03,
+    )
+
+
 def test_response_poisson_recovers_weak_peaks_under_co_dominant_continuum() -> None:
     """Quadratic photopeak anchors should preserve weak nuclides under strong Co-60."""
     config = SpectrumConfig(

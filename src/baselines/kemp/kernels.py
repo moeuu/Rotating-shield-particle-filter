@@ -33,7 +33,11 @@ class KempKernelConfig:
     obstacle_height_m: float = 2.0
     obstacle_buildup_coeff: float = 0.0
     detector_radius_m: float = 0.0
+    detector_aperture_radius_m: float | None = None
     detector_aperture_samples: int = 1
+    source_extent_radius_m: float = 0.0
+    source_extent_samples: int = 1
+    transport_response_model: dict[str, object] | None = None
     use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float64"
@@ -92,6 +96,8 @@ class DiscreteAttenuationKernel:
         shield_params: ShieldParams,
         obstacle_grid: ObstacleGrid | None,
         config: KempKernelConfig,
+        obstacle_mu_by_isotope: dict[str, float] | None = None,
+        line_mu_by_isotope: dict[str, object] | None = None,
     ) -> None:
         """Store the discrete grid and shared physical attenuation model."""
         sources = np.asarray(source_grid, dtype=float)
@@ -111,9 +117,15 @@ class DiscreteAttenuationKernel:
             gpu_dtype=str(config.gpu_dtype),
             obstacle_grid=obstacle_grid,
             obstacle_height_m=float(config.obstacle_height_m),
+            obstacle_mu_by_isotope=obstacle_mu_by_isotope,
             obstacle_buildup_coeff=float(config.obstacle_buildup_coeff),
             detector_radius_m=float(config.detector_radius_m),
+            detector_aperture_radius_m=config.detector_aperture_radius_m,
             detector_aperture_samples=int(config.detector_aperture_samples),
+            source_extent_radius_m=float(config.source_extent_radius_m),
+            source_extent_samples=int(config.source_extent_samples),
+            line_mu_by_isotope=line_mu_by_isotope,
+            transport_response_model=config.transport_response_model,
         )
 
     def _kernel_values_pair(
@@ -173,6 +185,8 @@ class DiscreteAttenuationKernel:
         shield_params: ShieldParams,
         obstacle_grid: ObstacleGrid | None,
         config: KempKernelConfig,
+        obstacle_mu_by_isotope: dict[str, float] | None = None,
+        line_mu_by_isotope: dict[str, object] | None = None,
     ) -> "DiscreteAttenuationKernel":
         """Build a discrete kernel from an environment definition."""
         source_grid = build_source_grid(env, config)
@@ -182,6 +196,8 @@ class DiscreteAttenuationKernel:
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
             obstacle_grid=obstacle_grid,
+            obstacle_mu_by_isotope=obstacle_mu_by_isotope,
+            line_mu_by_isotope=line_mu_by_isotope,
             config=config,
         )
 

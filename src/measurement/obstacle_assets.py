@@ -140,19 +140,188 @@ def known_obstacle_transport_model(
     dict[str, tuple[float, ...]],
 ]:
     """Return component boxes and per-isotope linear attenuation values."""
-    boxes: list[tuple[float, float, float, float, float, float]] = []
-    component_materials: list[str] = []
+    return transport_model_from_components(
+        _components_from_instances(instances),
+        isotopes=isotopes,
+    )
+
+
+def known_obstacle_line_transport_model(
+    instances: Iterable[KnownObstacleInstance],
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> dict[str, tuple[tuple[float, ...], ...]]:
+    """
+    Return gamma-line-resolved obstacle attenuation values.
+
+    The row order follows ``spectrum.library.default_library`` for each isotope
+    and therefore matches ``line_resolved_shield_mu_by_isotope``.  Each row
+    contains per-transport-box linear attenuation coefficients in 1/cm.
+    """
+    return line_transport_model_from_components(
+        _components_from_instances(instances),
+        isotopes=isotopes,
+    )
+
+
+def _components_from_instances(
+    instances: Iterable[KnownObstacleInstance],
+) -> tuple[ObstacleComponent, ...]:
+    """Return transport components from known obstacle instances."""
+    components: list[ObstacleComponent] = []
     for instance in instances:
-        for component in instance.components:
-            boxes.append(component.box_m)
-            component_materials.append(component.material)
+        components.extend(instance.components)
+    return tuple(components)
+
+
+def transport_model_from_components(
+    components: Iterable[ObstacleComponent],
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> tuple[
+    tuple[tuple[float, float, float, float, float, float], ...],
+    dict[str, tuple[float, ...]],
+]:
+    """Return boxes and isotope attenuation values for transport components."""
+    component_tuple = tuple(components)
+    boxes = tuple(component.box_m for component in component_tuple)
+    component_materials = tuple(component.material for component in component_tuple)
     mu_by_isotope: dict[str, tuple[float, ...]] = {}
     for isotope in isotopes:
         mu_by_isotope[str(isotope)] = tuple(
             material_mu_cm_inv(material, str(isotope))
             for material in component_materials
         )
-    return tuple(boxes), mu_by_isotope
+    return boxes, mu_by_isotope
+
+
+def line_transport_model_from_components(
+    components: Iterable[ObstacleComponent],
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> dict[str, tuple[tuple[float, ...], ...]]:
+    """Return gamma-line-resolved attenuation values for transport components."""
+    component_tuple = tuple(components)
+    component_materials = tuple(component.material for component in component_tuple)
+    if not component_materials:
+        return {}
+    library = default_library()
+    line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = {}
+    for isotope in isotopes:
+        nuclide = _lookup_nuclide(library, str(isotope))
+        if nuclide is None:
+            continue
+        rows: list[tuple[float, ...]] = []
+        for line in nuclide.lines:
+            if max(float(line.intensity), 0.0) <= 0.0:
+                continue
+            rows.append(
+                tuple(
+                    material_mu_cm_inv_at_energy(
+                        material,
+                        float(line.energy_keV),
+                        isotope=str(isotope),
+                    )
+                    for material in component_materials
+                )
+            )
+        if rows:
+            line_mu_by_isotope[str(isotope)] = tuple(rows)
+    return line_mu_by_isotope
+
+
+def room_boundary_transport_components(
+    room_size_xyz: tuple[float, float, float],
+    *,
+    thickness_m: float = 0.1,
+    material: str = "concrete",
+) -> tuple[ObstacleComponent, ...]:
+    """Return transport components for the authored room floor, walls, and ceiling."""
+    size_x, size_y, size_z = (float(value) for value in room_size_xyz)
+    wall_height = max(0.1, size_z)
+    t = max(float(thickness_m), 0.0)
+    if t <= 0.0:
+        return ()
+    return (
+        _component(
+            "RoomBoundary_floor",
+            center_xy=(0.5 * size_x, 0.5 * size_y),
+            z_center=-0.5 * t,
+            size_xyz=(size_x, size_y, t),
+            material=material,
+        ),
+        _component(
+            "RoomBoundary_north_wall",
+            center_xy=(0.5 * size_x, size_y + 0.5 * t),
+            z_center=0.5 * wall_height,
+            size_xyz=(size_x, t, wall_height),
+            material=material,
+        ),
+        _component(
+            "RoomBoundary_south_wall",
+            center_xy=(0.5 * size_x, -0.5 * t),
+            z_center=0.5 * wall_height,
+            size_xyz=(size_x, t, wall_height),
+            material=material,
+        ),
+        _component(
+            "RoomBoundary_east_wall",
+            center_xy=(size_x + 0.5 * t, 0.5 * size_y),
+            z_center=0.5 * wall_height,
+            size_xyz=(t, size_y, wall_height),
+            material=material,
+        ),
+        _component(
+            "RoomBoundary_west_wall",
+            center_xy=(-0.5 * t, 0.5 * size_y),
+            z_center=0.5 * wall_height,
+            size_xyz=(t, size_y, wall_height),
+            material=material,
+        ),
+        _component(
+            "RoomBoundary_ceiling",
+            center_xy=(0.5 * size_x, 0.5 * size_y),
+            z_center=size_z + 0.5 * t,
+            size_xyz=(size_x, size_y, t),
+            material=material,
+        ),
+    )
+
+
+def environment_transport_model(
+    instances: Iterable[KnownObstacleInstance],
+    *,
+    room_size_xyz: tuple[float, float, float] | None = None,
+    include_room_boundaries: bool = False,
+    room_boundary_thickness_m: float = 0.1,
+    room_boundary_material: str = "concrete",
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> tuple[
+    tuple[tuple[float, float, float, float, float, float], ...],
+    dict[str, tuple[float, ...]],
+    dict[str, tuple[tuple[float, ...], ...]],
+]:
+    """Return a complete PF/Geant4 environment transport model."""
+    components = list(_components_from_instances(instances))
+    if include_room_boundaries:
+        if room_size_xyz is None:
+            raise ValueError("room_size_xyz is required for room boundary transport.")
+        components.extend(
+            room_boundary_transport_components(
+                room_size_xyz,
+                thickness_m=room_boundary_thickness_m,
+                material=room_boundary_material,
+            )
+        )
+    boxes_m, mu_by_isotope = transport_model_from_components(
+        components,
+        isotopes=isotopes,
+    )
+    line_mu_by_isotope = line_transport_model_from_components(
+        components,
+        isotopes=isotopes,
+    )
+    return boxes_m, mu_by_isotope, line_mu_by_isotope
 
 
 def known_obstacle_traversability_rects(
@@ -179,20 +348,45 @@ def material_mu_cm_inv(material: str, isotope: str) -> float:
     return float(concrete.get(isotope, 0.0))
 
 
+def material_mu_cm_inv_at_energy(
+    material: str,
+    energy_keV: float,
+    *,
+    isotope: str,
+) -> float:
+    """Return material linear attenuation at a gamma-line energy in 1/cm."""
+    normalized = normalize_material_name(str(material))
+    preset = resolve_material_preset(normalized)
+    if preset is not None and preset.density_g_cm3 is not None:
+        mass_att = composition_mass_attenuation_at_energy(
+            preset.composition_by_mass,
+            float(energy_keV),
+        )
+        if mass_att is not None:
+            return float(preset.density_g_cm3) * float(mass_att)
+    return material_mu_cm_inv(normalized, isotope)
+
+
+def _lookup_nuclide(library: dict[str, object], isotope: str) -> object | None:
+    """Return a nuclide entry using tolerant isotope-name matching."""
+    nuclide = library.get(str(isotope))
+    if nuclide is not None:
+        return nuclide
+    normalized = "".join(ch for ch in str(isotope).upper() if ch.isalnum())
+    for name, candidate in library.items():
+        candidate_key = "".join(ch for ch in str(name).upper() if ch.isalnum())
+        if candidate_key == normalized:
+            return candidate
+    return None
+
+
 def _line_weighted_mass_attenuation(
     composition_by_mass: dict[str, float],
     isotope: str,
 ) -> float | None:
     """Return gamma-line-weighted mass attenuation for a nuclide."""
     library = default_library()
-    nuclide = library.get(str(isotope))
-    if nuclide is None:
-        normalized = "".join(ch for ch in str(isotope).upper() if ch.isalnum())
-        for name, candidate in library.items():
-            candidate_key = "".join(ch for ch in str(name).upper() if ch.isalnum())
-            if candidate_key == normalized:
-                nuclide = candidate
-                break
+    nuclide = _lookup_nuclide(library, str(isotope))
     if nuclide is None:
         return None
     if len(nuclide.lines) < 2:

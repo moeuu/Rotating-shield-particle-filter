@@ -2502,6 +2502,15 @@ def test_composition_mass_attenuation_at_energy_decreases_with_energy() -> None:
     assert float(high_energy_mass_att) < float(low_energy_mass_att)
 
 
+def test_fe_pb_attenuation_uses_xcom_high_energy_values() -> None:
+    """Fe/Pb mass attenuation values should match NIST XCOM anchor points."""
+    fe_at_1250 = composition_mass_attenuation_at_energy({"Fe": 1.0}, 1250.0)
+    pb_at_1000 = composition_mass_attenuation_at_energy({"Pb": 1.0}, 1000.0)
+
+    assert fe_at_1250 == pytest.approx(0.05350)
+    assert pb_at_1000 == pytest.approx(0.07102)
+
+
 def test_real_application_energy_dependent_wall_attenuation_hardens_spectrum() -> None:
     """Energy-dependent wall attenuation should increase the high-to-low line ratio."""
     backend = FakeStageBackend()
@@ -2949,7 +2958,10 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     generated_usd = tmp_path / "generated.usda"
     config_path = tmp_path / "configs" / "isaacsim" / "manchester_random.json"
     config_path.parent.mkdir(parents=True)
-    config_path.write_text('{"usd_path": "../../base_manchester.usda"}\n', encoding="utf-8")
+    config_path.write_text(
+        '{"usd_path": "../../base_manchester.usda", "obstacle_material": "air"}\n',
+        encoding="utf-8",
+    )
     expected_base_usd = (tmp_path / "base_manchester.usda").resolve()
 
     def _fake_generate_blender_environment_usd(**kwargs: object) -> Path:
@@ -3017,12 +3029,14 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     assert estimator is not None
     assert blender_calls
     assert blender_calls[0]["base_usd_path"] == expected_base_usd
+    assert blender_calls[0]["obstacle_material"] == "air"
     assert blender_calls[0]["traversability_output_path"] == generated_usd.with_suffix(
         ".traversability.json"
     )
     assert runtime.reset_payload is not None
     assert runtime.reset_payload["usd_path"] == generated_usd.as_posix()
     assert runtime.reset_payload["author_obstacle_prims"] is True
+    assert runtime.reset_payload["obstacle_material"] == "air"
     assert runtime.reset_payload["obstacle_cells"]
     map_path = Path(str(runtime.reset_payload["traversability_map_path"]))
     map_png_path = Path(str(runtime.reset_payload["traversability_map_png_path"]))

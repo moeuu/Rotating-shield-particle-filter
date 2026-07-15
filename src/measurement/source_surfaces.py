@@ -42,6 +42,30 @@ def _is_xy_in_blocked_cell(
     return idx is not None and not grid.is_cell_free(idx)
 
 
+def transport_interior_mask(
+    positions: NDArray[np.float64],
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    tolerance_m: float = 1.0e-6,
+) -> NDArray[np.bool_]:
+    """Return True for positions strictly inside known obstacle transport boxes."""
+    points = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if obstacle_grid is None or not getattr(obstacle_grid, "has_transport_model", False):
+        return np.zeros(points.shape[0], dtype=bool)
+    boxes = np.asarray(obstacle_grid.transport_boxes(), dtype=float).reshape(-1, 6)
+    if boxes.size == 0:
+        return np.zeros(points.shape[0], dtype=bool)
+    tol = max(float(tolerance_m), 0.0)
+    lower = boxes[:, :3] + tol
+    upper = boxes[:, 3:] - tol
+    valid_boxes = np.all(upper > lower, axis=1)
+    if not np.any(valid_boxes):
+        return np.zeros(points.shape[0], dtype=bool)
+    inside_lower = points[:, None, :] > lower[None, valid_boxes, :]
+    inside_upper = points[:, None, :] < upper[None, valid_boxes, :]
+    return np.any(np.all(inside_lower & inside_upper, axis=2), axis=1)
+
+
 def _is_exposed_obstacle_side(
     grid: ObstacleGrid,
     cell: tuple[int, int],
@@ -349,6 +373,8 @@ def build_surface_candidate_sources(
     ]
     candidates = _dedupe_positions(np.vstack(parts))
     candidates = _filter_position_bounds(candidates, env, position_min, position_max)
+    if candidates.size:
+        candidates = candidates[~transport_interior_mask(candidates, obstacle_grid)]
     candidates = _dedupe_positions(candidates)
     if candidates.size == 0:
         raise ValueError("Surface candidate grid is empty; check bounds and spacing.")
@@ -723,6 +749,9 @@ def is_allowed_source_surface_position(
     tolerance_m: float = 1.0e-6,
 ) -> bool:
     """Return True when a source position lies on an allowed physical surface."""
+    point = np.asarray(position, dtype=float).reshape(1, 3)
+    if bool(transport_interior_mask(point, obstacle_grid, tolerance_m=tolerance_m)[0]):
+        return False
     return (
         source_surface_kind(
             position,
@@ -856,6 +885,7 @@ def surface_response_observability_diagnostics(
     obstacle_grid: ObstacleGrid | None,
     measurement_points: NDArray[np.float64],
     *,
+    isotopes: Sequence[str] | None = None,
     obstacle_height_m: float = 2.0,
     detector_height_m: float = 0.5,
     clear_path_max_m: float = 0.01,
@@ -880,6 +910,8 @@ def surface_response_observability_diagnostics(
             "reference_point_count": int(detectors.shape[0]),
             "condition_number": 1.0,
             "max_pairwise_correlation": 0.0,
+            "same_isotope_pair_count": 0,
+            "same_isotope_max_pairwise_correlation": 0.0,
             "weak_source_count": 0,
         }
     diff = detectors[:, None, :] - sources[None, :, :]
@@ -904,6 +936,8 @@ def surface_response_observability_diagnostics(
             "reference_point_count": int(detectors.shape[0]),
             "condition_number": 1.0 if np.count_nonzero(valid) == 1 else float("inf"),
             "max_pairwise_correlation": 0.0,
+            "same_isotope_pair_count": 0,
+            "same_isotope_max_pairwise_correlation": 0.0,
             "weak_source_count": weak_count,
         }
     normalized = response[:, valid] / np.maximum(column_norm[valid], 1.0e-12)
@@ -920,11 +954,30 @@ def surface_response_observability_diagnostics(
     corr = np.abs(normalized.T @ normalized)
     upper = np.triu_indices(corr.shape[0], k=1)
     max_corr = float(np.max(corr[upper])) if upper[0].size else 0.0
+    same_pair_count = 0
+    same_max_corr = 0.0
+    if isotopes is not None:
+        labels = np.asarray([str(value) for value in isotopes], dtype=object).reshape(-1)
+        if labels.size == sources.shape[0]:
+            valid_indices = np.flatnonzero(valid)
+            full_corr = np.zeros((sources.shape[0], sources.shape[0]), dtype=float)
+            full_corr[np.ix_(valid_indices, valid_indices)] = corr
+            for label in np.unique(labels):
+                indices = np.flatnonzero(labels == label)
+                if indices.size < 2:
+                    continue
+                same_upper = np.triu_indices(indices.size, k=1)
+                same_pair_count += int(same_upper[0].size)
+                values = full_corr[np.ix_(indices, indices)][same_upper]
+                if values.size:
+                    same_max_corr = max(same_max_corr, float(np.max(values)))
     return {
         "source_count": int(sources.shape[0]),
         "reference_point_count": int(detectors.shape[0]),
         "condition_number": condition,
         "max_pairwise_correlation": max_corr,
+        "same_isotope_pair_count": int(same_pair_count),
+        "same_isotope_max_pairwise_correlation": float(same_max_corr),
         "weak_source_count": weak_count,
     }
 
@@ -1135,12 +1188,15 @@ def _surface_candidate_constraint_mask(
     obstacle_height_m: float,
     excluded_surface_kinds: Sequence[SourceSurfaceKind] | None,
     preferred_max_z_m: float | None,
+    min_distance_points: NDArray[np.float64] | None = None,
+    min_distance_m: float = 0.0,
 ) -> NDArray[np.bool_]:
     """Return candidates satisfying random-source placement constraints."""
     points = np.asarray(candidates, dtype=float).reshape(-1, 3)
     if points.size == 0:
         return np.zeros(0, dtype=bool)
     mask = np.ones(points.shape[0], dtype=bool)
+    mask &= ~transport_interior_mask(points, obstacle_grid)
     if excluded_surface_kinds:
         kinds = source_surface_kinds(
             points,
@@ -1152,6 +1208,13 @@ def _surface_candidate_constraint_mask(
         mask &= ~np.isin(kinds, excluded)
     if preferred_max_z_m is not None:
         mask &= points[:, 2] <= float(preferred_max_z_m) + 1.0e-9
+    distance_floor = max(0.0, float(min_distance_m))
+    if distance_floor > 0.0 and min_distance_points is not None:
+        anchors = np.asarray(min_distance_points, dtype=float).reshape(-1, 3)
+        if anchors.size:
+            deltas = points[:, None, :] - anchors[None, :, :]
+            distances = np.linalg.norm(deltas, axis=2)
+            mask &= np.min(distances, axis=1) >= distance_floor - 1.0e-9
     return mask
 
 
@@ -1169,10 +1232,16 @@ def sample_observable_surface_position(
     max_attempts: int = 4096,
     excluded_surface_kinds: Sequence[SourceSurfaceKind] | None = None,
     preferred_max_z_m: float | None = 5.0,
+    min_distance_points: NDArray[np.float64] | None = None,
+    min_distance_m: float = 0.0,
 ) -> tuple[float, float, float]:
     """Sample a surface position with enough clear ground measurement views."""
     min_fraction = max(0.0, float(min_visible_fraction))
     sample_batch = max(1, int(batch_size))
+    distance_floor = max(0.0, float(min_distance_m))
+    distance_points = None
+    if min_distance_points is not None:
+        distance_points = np.asarray(min_distance_points, dtype=float).reshape(-1, 3)
     detectors = np.zeros((0, 3), dtype=float)
     if min_fraction > 0.0 and measurement_points is not None:
         detectors = _coerce_visibility_measurement_points(
@@ -1201,6 +1270,8 @@ def sample_observable_surface_position(
                 obstacle_height_m=obstacle_height_m,
                 excluded_surface_kinds=excluded_surface_kinds,
                 preferred_max_z_m=z_limit,
+                min_distance_points=distance_points,
+                min_distance_m=distance_floor,
             )
             valid = np.flatnonzero(valid_mask)
             if valid.size and detectors.size:
@@ -1262,6 +1333,8 @@ def _sample_constrained_source_position(
     ceiling_count: int,
     max_ceiling_sources: int | None,
     preferred_max_z_m: float | None,
+    min_distance_points: NDArray[np.float64] | None,
+    min_distance_m: float,
 ) -> tuple[float, float, float]:
     """Sample one random source while enforcing scenario-level surface limits."""
     excluded: list[SourceSurfaceKind] = []
@@ -1283,6 +1356,8 @@ def _sample_constrained_source_position(
         max_attempts=visibility_max_attempts_per_source,
         excluded_surface_kinds=excluded,
         preferred_max_z_m=preferred_max_z_m,
+        min_distance_points=min_distance_points,
+        min_distance_m=min_distance_m,
     )
 
 
@@ -1303,12 +1378,14 @@ def generate_surface_sources(
     visibility_max_attempts_per_source: int = 4096,
     max_ceiling_sources: int | None = 1,
     preferred_max_z_m: float | None = 5.0,
+    same_isotope_min_distance_m: float = 0.0,
 ) -> list[PointSource]:
     """Generate point sources constrained to observable physical surfaces."""
     if not isotopes:
         raise ValueError("At least one isotope is required.")
     source_count = len(isotopes) if count is None else max(1, int(count))
     ceiling_limit = _normalise_max_ceiling_sources(max_ceiling_sources)
+    same_isotope_distance = max(0.0, float(same_isotope_min_distance_m))
     ceiling_count = 0
     sources: list[PointSource] = []
     for idx in range(source_count):
@@ -1318,6 +1395,14 @@ def generate_surface_sources(
             isotope=isotope,
             rng=rng,
         )
+        same_isotope_positions = np.asarray(
+            [
+                source.position
+                for source in sources
+                if str(source.isotope) == isotope
+            ],
+            dtype=float,
+        ).reshape(-1, 3)
         position = _sample_constrained_source_position(
             env,
             obstacle_grid,
@@ -1332,6 +1417,8 @@ def generate_surface_sources(
             ceiling_count=ceiling_count,
             max_ceiling_sources=ceiling_limit,
             preferred_max_z_m=preferred_max_z_m,
+            min_distance_points=same_isotope_positions,
+            min_distance_m=same_isotope_distance,
         )
         surface_kind = source_surface_kind(
             position,

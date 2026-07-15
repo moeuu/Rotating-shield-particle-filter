@@ -19,10 +19,9 @@ from baselines.kemp.filter import KempFilterConfig
 from baselines.kemp.kernels import DiscreteAttenuationKernel, KempKernelConfig
 from baselines.kemp.parallel import KempParallelConfig, KempParallelLogDDPF
 from evaluation_metrics import compute_metrics
-from measurement.kernels import ShieldParams
 from measurement.model import EnvironmentConfig, PointSource
 from measurement.obstacles import ObstacleGrid
-from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+from measurement.observation_model import build_runtime_observation_model
 from realtime_demo import (
     _analysis_spectrum_array,
     _analysis_spectrum_variance,
@@ -32,7 +31,6 @@ from realtime_demo import (
     load_sources_from_json,
 )
 from sim import SimulationCommand, create_simulation_runtime, load_runtime_config
-from sim.shield_geometry import resolve_shield_thickness_config
 from spectrum.pipeline import SpectralDecomposer
 from runtime_defaults import (
     DEFAULT_MAX_SOURCES_PER_ISOTOPE,
@@ -205,24 +203,25 @@ def _scene_reset_payload(
             }
             for source in sources
         ],
-        "obstacle_origin_xy": [0.0, 0.0] if obstacle_grid is None else list(obstacle_grid.origin),
-        "obstacle_cell_size_m": 1.0 if obstacle_grid is None else float(obstacle_grid.cell_size),
-        "obstacle_material": "concrete",
-        "obstacle_grid_shape": [0, 0] if obstacle_grid is None else list(obstacle_grid.grid_shape),
-        "obstacle_cells": [] if obstacle_grid is None else list(obstacle_grid.blocked_cells),
+        "obstacle_origin_xy": (
+            [0.0, 0.0] if obstacle_grid is None else list(obstacle_grid.origin)
+        ),
+        "obstacle_cell_size_m": (
+            1.0 if obstacle_grid is None else float(obstacle_grid.cell_size)
+        ),
+        "obstacle_material": str(runtime_config.get("obstacle_material", "concrete")),
+        "obstacle_grid_shape": (
+            [0, 0] if obstacle_grid is None else list(obstacle_grid.grid_shape)
+        ),
+        "obstacle_cells": (
+            [] if obstacle_grid is None else list(obstacle_grid.blocked_cells)
+        ),
         "author_obstacle_prims": obstacle_grid is not None,
-        "author_room_boundary_prims": bool(runtime_config.get("author_room_boundary_prims", True)),
+        "author_room_boundary_prims": bool(
+            runtime_config.get("author_room_boundary_prims", True)
+        ),
         "use_config_usd_fallback": has_environment_obstacles,
     }
-
-
-def _build_shield_params(runtime_config: dict[str, Any]) -> ShieldParams:
-    """Build shield parameters from the shared runtime config."""
-    thickness = resolve_shield_thickness_config(runtime_config)
-    return ShieldParams(
-        thickness_fe_cm=float(thickness.thickness_fe_cm),
-        thickness_pb_cm=float(thickness.thickness_pb_cm),
-    )
 
 
 def _true_sources_by_isotope(
@@ -304,26 +303,37 @@ def run_kemp_full_simulation(config: KempRunConfig) -> KempRunResult:
     spectrum_config = _spectrum_config_from_runtime_config(runtime_config)
     decomposer = SpectralDecomposer(spectrum_config=spectrum_config)
     isotopes = list(decomposer.isotope_names)
-    shield_params = _build_shield_params(runtime_config)
-    mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
-    detector_model = runtime_config.get("detector_model", {})
-    detector_radius_m = 0.0
-    if isinstance(detector_model, dict):
-        detector_radius_m = float(detector_model.get("crystal_radius_m", 0.0)) + float(
-            detector_model.get("housing_thickness_m", 0.0)
-        )
+    observation_model = build_runtime_observation_model(
+        runtime_config,
+        isotopes=isotopes,
+    )
     kernel = DiscreteAttenuationKernel.from_environment(
         env=env,
         isotopes=isotopes,
-        mu_by_isotope=mu_by_isotope,
-        shield_params=shield_params,
+        mu_by_isotope=observation_model.mu_by_isotope,
+        shield_params=observation_model.shield_params,
         obstacle_grid=obstacle_grid,
+        obstacle_mu_by_isotope=observation_model.obstacle_mu_by_isotope,
+        line_mu_by_isotope=observation_model.line_mu_by_isotope,
         config=KempKernelConfig(
             grid_spacing_m=tuple(config.grid_spacing_m),
             z_levels_m=tuple(config.grid_z_levels_m),
-            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
-            detector_radius_m=detector_radius_m,
-            detector_aperture_samples=1,
+            obstacle_height_m=float(observation_model.obstacle_height_m),
+            obstacle_buildup_coeff=(
+                float(observation_model.obstacle_buildup_coeff)
+                if obstacle_grid is not None
+                else 0.0
+            ),
+            detector_radius_m=float(observation_model.detector_geometry.count_radius_m),
+            detector_aperture_radius_m=float(
+                observation_model.detector_geometry.aperture_radius_m
+            ),
+            detector_aperture_samples=int(
+                observation_model.detector_geometry.aperture_samples
+            ),
+            source_extent_radius_m=float(observation_model.source_extent_radius_m),
+            source_extent_samples=int(observation_model.source_extent_samples),
+            transport_response_model=observation_model.transport_response_model,
             use_gpu=True,
             gpu_dtype="float64",
         ),
@@ -345,8 +355,8 @@ def run_kemp_full_simulation(config: KempRunConfig) -> KempRunResult:
         config.sim_backend,
         sources=sources,
         decomposer=decomposer,
-        mu_by_isotope=mu_by_isotope,
-        shield_params=shield_params,
+        mu_by_isotope=observation_model.mu_by_isotope,
+        shield_params=observation_model.shield_params,
         runtime_config=runtime_config,
         runtime_config_path=runtime_config_path,
     )

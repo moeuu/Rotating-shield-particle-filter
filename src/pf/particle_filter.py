@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Sequence, Tuple
 from collections import deque
 import os
 import time
@@ -24,15 +24,18 @@ from measurement.source_surfaces import (
     source_surface_kinds,
 )
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
+from pf.diagnostics import build_source_event_record, reset_step_diagnostics
 from pf.likelihood import (
     count_log_likelihood,
+    count_likelihood_variance,
+    count_likelihood_variance_torch,
     delta_log_likelihood_remove,
     delta_log_likelihood_update,
     expected_counts_per_source,
     normalize_count_likelihood_model,
 )
 from pf.state import IsotopeState
-from pf.resampling import systematic_resample
+from pf.resampling import systematic_resample, systematic_resample_count
 
 if TYPE_CHECKING:
     import torch
@@ -61,6 +64,7 @@ class PFConfig:
     background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
     measurement_scale_by_isotope: dict[str, float] | None = None
+    measurement_scale_by_isotope_and_pair: dict[str, dict[int, float]] | None = None
     count_likelihood_model: str = "poisson"
     transport_model_rel_sigma: float | dict[str, float] = 0.0
     transport_model_abs_sigma: float | dict[str, float] = 0.0
@@ -69,6 +73,21 @@ class PFConfig:
     low_count_abs_sigma: float | dict[str, float] = 0.0
     low_count_transition_counts: float | dict[str, float] = 0.0
     count_likelihood_df: float = 5.0
+    shield_contrast_likelihood_enable: bool = False
+    shield_contrast_likelihood_weight: float = 1.0
+    shield_contrast_log_sigma_floor: float = 0.5
+    shield_contrast_log_sigma_ceiling: float = 2.0
+    shield_contrast_min_count: float = 25.0
+    shield_contrast_min_views: int = 2
+    shield_contrast_likelihood_df: float = 5.0
+    shield_view_ratio_likelihood_enable: bool = False
+    shield_view_ratio_likelihood_weight: float = 1.0
+    shield_view_ratio_likelihood_concentration: float = 128.0
+    shield_view_ratio_likelihood_min_total_count: float = 25.0
+    shield_view_ratio_likelihood_min_views: int = 2
+    station_view_covariance_enable: bool = False
+    station_view_correlated_spectrum_fraction: float = 0.0
+    spectrum_likelihood_bin_chunk: int = 512
     min_strength: float = 0.01
     p_birth: float = 0.05
     p_kill: float = 0.1
@@ -96,6 +115,8 @@ class PFConfig:
     birth_bic_penalty_params: int = 4
     structural_update_min_counts: float = 0.0
     structural_update_min_snr: float = 0.0
+    structural_update_count_min_snr: float = 0.0
+    structural_update_max_rel_sigma: float = 0.0
     birth_min_distinct_poses: int = 1
     birth_residual_clip_quantile: float = 0.95
     birth_residual_gate_p_value: float = 0.05
@@ -122,11 +143,14 @@ class PFConfig:
     birth_residual_suppress_death: bool = True
     birth_matching_pursuit_max_new_sources: int = 3
     birth_matching_pursuit_topk_candidates: int = 16
+    birth_orthogonalize_residual_candidates: bool = False
+    birth_orthogonal_candidate_corr_max: float = 0.98
     birth_jitter_topk_candidates: int | None = 512
     birth_global_rescue_enable: bool = False
     birth_global_rescue_max_candidates: int = 8
     birth_global_rescue_min_residual_fraction: float = 0.005
     birth_global_rescue_dedup_radius_m: float = 0.5
+    birth_global_rescue_force_proposal_on_gate: bool = False
     birth_global_rescue_forced_min_delta_ll: float = 0.0
     birth_global_rescue_min_support: int | None = None
     birth_global_rescue_min_distinct_poses: int | None = None
@@ -244,12 +268,22 @@ class PFConfig:
     mode_preserving_residual_boost: float = 1.0
     mode_preserving_cardinality_strata: bool = True
     mode_preserving_min_particles_per_cardinality: int = 2
+    mode_preserving_report_cardinality_strata: bool = True
+    mode_preserving_report_cardinality_extra_particles: int = 0
+    mode_preserving_dynamic_cardinality_allocation: bool = False
+    mode_preserving_dynamic_cardinality_extra_particles: int = 0
+    mode_preserving_dynamic_cardinality_min_mass: float = 0.02
+    mode_preserving_dynamic_cardinality_entropy_min: float = 0.5
+    mode_preserving_dynamic_spatial_allocation: bool = False
+    mode_preserving_dynamic_spatial_extra_particles: int = 0
+    mode_preserving_dynamic_spatial_min_score_fraction: float = 0.005
     adapt_cooldown_steps: int = 0
     # Continuous PF priors (Sec. 3.3.2)
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     source_position_prior: str = "volume"
     roughening_k: float = 0.5
+    surface_rejuvenation_enable: bool = True
     min_sigma_pos: float = 0.05
     max_sigma_pos: float = 1.5
     roughening_decay: float = 0.5
@@ -382,7 +416,13 @@ class IsotopeParticleFilter:
         obstacle_mu_by_isotope: dict[str, float] | None = None,
         obstacle_buildup_coeff: float = 0.0,
         detector_radius_m: float = 0.0,
+        detector_aperture_radius_m: float | None = None,
         detector_aperture_samples: int = 1,
+        detector_aperture_sampling: str = "solid_angle_cone",
+        source_extent_radius_m: float = 0.0,
+        source_extent_samples: int = 1,
+        line_mu_by_isotope: dict[str, object] | None = None,
+        transport_response_model: dict[str, object] | None = None,
     ) -> None:
         """Initialize particle state, priors, and continuous measurement kernels."""
         self.isotope = isotope
@@ -394,7 +434,15 @@ class IsotopeParticleFilter:
         self.obstacle_mu_by_isotope = obstacle_mu_by_isotope
         self.obstacle_buildup_coeff = max(float(obstacle_buildup_coeff), 0.0)
         self.detector_radius_m = max(float(detector_radius_m), 0.0)
+        if detector_aperture_radius_m is None:
+            detector_aperture_radius_m = self.detector_radius_m
+        self.detector_aperture_radius_m = max(float(detector_aperture_radius_m), 0.0)
         self.detector_aperture_samples = max(int(detector_aperture_samples), 1)
+        self.detector_aperture_sampling = str(detector_aperture_sampling)
+        self.source_extent_radius_m = max(float(source_extent_radius_m), 0.0)
+        self.source_extent_samples = max(int(source_extent_samples), 1)
+        self.line_mu_by_isotope = line_mu_by_isotope
+        self.transport_response_model = transport_response_model
         self._surface_candidate_cache: dict[float, NDArray[np.float64]] = {}
         mu_by_isotope = getattr(kernel, "mu_by_isotope", None) if kernel is not None else None
         shield_params = getattr(kernel, "shield_params", ShieldParams()) if kernel is not None else ShieldParams()
@@ -419,6 +467,8 @@ class IsotopeParticleFilter:
         self.last_mode_preserving_selected_strata: list[dict[str, object]] = []
         self.last_mode_preserving_cardinality_summary: dict[str, float] = {}
         self.last_mode_preserving_selected_cardinalities: list[dict[str, object]] = []
+        self.last_mode_preserving_dynamic_spatial_summary: list[dict[str, object]] = []
+        self._external_protected_cardinalities: set[int] = set()
         self.last_birth_residual_chi2 = 0.0
         self.last_birth_residual_p_value = 1.0
         self.last_birth_residual_support = 0
@@ -484,12 +534,34 @@ class IsotopeParticleFilter:
         )
         self._init_continuous_particles()
 
+    def set_external_protected_cardinalities(
+        self,
+        cardinalities: Sequence[int] | set[int] | None,
+    ) -> None:
+        """Set externally supported source counts to preserve during resampling."""
+        if cardinalities is None:
+            self._external_protected_cardinalities = set()
+            return
+        protected: set[int] = set()
+        for value in cardinalities:
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                continue
+            if count >= 0:
+                protected.add(count)
+        self._external_protected_cardinalities = protected
+
     def _build_continuous_kernel(
         self,
         mu_by_isotope: dict[str, object] | None,
         shield_params: ShieldParams,
     ) -> ContinuousKernel:
         """Build the continuous kernel with the filter's environment attenuation settings."""
+        kernel_kwargs: dict[str, object] = {}
+        orientations = getattr(self.kernel, "orientations", None)
+        if orientations is not None and len(orientations) > 1:
+            kernel_kwargs["orientations"] = orientations
         return ContinuousKernel(
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
@@ -501,15 +573,79 @@ class IsotopeParticleFilter:
             obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
             obstacle_buildup_coeff=self.obstacle_buildup_coeff,
             detector_radius_m=self.detector_radius_m,
+            detector_aperture_radius_m=self.detector_aperture_radius_m,
             detector_aperture_samples=self.detector_aperture_samples,
+            detector_aperture_sampling=self.detector_aperture_sampling,
+            source_extent_radius_m=self.source_extent_radius_m,
+            source_extent_samples=self.source_extent_samples,
+            line_mu_by_isotope=self.line_mu_by_isotope,
+            transport_response_model=self.transport_response_model,
+            **kernel_kwargs,
         )
 
-    def _measurement_source_scale(self) -> float:
+    def _measurement_source_scale(
+        self,
+        *,
+        fe_index: int | None = None,
+        pb_index: int | None = None,
+        shield_pair_id: int | None = None,
+    ) -> float:
         """Return the isotope-specific source response scale for PF likelihoods."""
+        pair_id = self._measurement_shield_pair_id(
+            fe_index=fe_index,
+            pb_index=pb_index,
+            shield_pair_id=shield_pair_id,
+        )
+        pair_scales = self.config.measurement_scale_by_isotope_and_pair
+        if pair_id is not None and isinstance(pair_scales, Mapping):
+            isotope_pair_scales = pair_scales.get(str(self.isotope), {})
+            if isinstance(isotope_pair_scales, Mapping):
+                value = isotope_pair_scales.get(int(pair_id))
+                if value is None:
+                    value = isotope_pair_scales.get(str(int(pair_id)))  # type: ignore[arg-type]
+                if value is not None:
+                    return max(float(value), 0.0)
         scales = self.config.measurement_scale_by_isotope
         if not isinstance(scales, dict):
             return 1.0
         return max(float(scales.get(self.isotope, 1.0)), 0.0)
+
+    def _measurement_source_scale_vector(
+        self,
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+    ) -> NDArray[np.float64]:
+        """Return one source response scale for each measurement pair."""
+        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+        if fe_arr.size != pb_arr.size:
+            raise ValueError("fe_indices and pb_indices must have matching length.")
+        return np.asarray(
+            [
+                self._measurement_source_scale(
+                    fe_index=int(fe),
+                    pb_index=int(pb),
+                )
+                for fe, pb in zip(fe_arr, pb_arr)
+            ],
+            dtype=float,
+        )
+
+    def _measurement_shield_pair_id(
+        self,
+        *,
+        fe_index: int | None = None,
+        pb_index: int | None = None,
+        shield_pair_id: int | None = None,
+    ) -> int | None:
+        """Return the configured shield-pair id when orientation indices exist."""
+        if shield_pair_id is not None:
+            return int(shield_pair_id)
+        if fe_index is None or pb_index is None:
+            return None
+        orientations = getattr(self.kernel, "orientations", None)
+        num_orientations = len(orientations) if orientations is not None else 8
+        return int(fe_index) * max(int(num_orientations), 1) + int(pb_index)
 
     @staticmethod
     def _measurement_vector(
@@ -577,6 +713,14 @@ class IsotopeParticleFilter:
             return None
         min_count = max(float(self.config.structural_update_min_counts), 0.0)
         min_snr = max(float(self.config.structural_update_min_snr), 0.0)
+        count_min_snr = max(
+            float(getattr(self.config, "structural_update_count_min_snr", 0.0)),
+            0.0,
+        )
+        max_rel_sigma = max(
+            float(getattr(self.config, "structural_update_max_rel_sigma", 0.0)),
+            0.0,
+        )
         if min_count <= 0.0 and min_snr <= 0.0:
             return data
         counts = np.asarray(data.z_k, dtype=float).reshape(-1)
@@ -586,9 +730,23 @@ class IsotopeParticleFilter:
             "observation_variances",
             min_value=1.0e-12,
         )
-        count_ok = counts >= min_count if min_count > 0.0 else np.zeros_like(counts, dtype=bool)
-        snr = np.maximum(counts, 0.0) / np.sqrt(variances)
-        snr_ok = snr >= min_snr if min_snr > 0.0 else np.zeros_like(counts, dtype=bool)
+        count_ok = (
+            counts >= min_count
+            if min_count > 0.0
+            else np.zeros_like(counts, dtype=bool)
+        )
+        sigma = np.sqrt(variances)
+        snr = np.maximum(counts, 0.0) / sigma
+        if min_count > 0.0 and count_min_snr > 0.0:
+            count_ok &= snr >= count_min_snr
+        if min_count > 0.0 and max_rel_sigma > 0.0:
+            rel_sigma = sigma / np.maximum(np.maximum(counts, 0.0), 1.0)
+            count_ok &= rel_sigma <= max_rel_sigma
+        snr_ok = (
+            snr >= min_snr
+            if min_snr > 0.0
+            else np.zeros_like(counts, dtype=bool)
+        )
         finite = np.isfinite(counts) & np.isfinite(snr)
         keep = finite & (count_ok | snr_ok)
         if not np.any(keep):
@@ -667,26 +825,17 @@ class IsotopeParticleFilter:
         z_col = z_arr[:, None]
         if model == "poisson":
             return np.sum(z_col * np.log(lam) - lam, axis=0)
-        transport_rel = float(kwargs["transport_model_rel_sigma"])
-        transport_abs = float(kwargs["transport_model_abs_sigma"])
-        spectrum_rel = float(kwargs["spectrum_count_rel_sigma"])
-        spectrum_abs = float(kwargs["spectrum_count_abs_sigma"])
-        low_count_abs = float(kwargs["low_count_abs_sigma"])
-        low_count_transition = float(kwargs["low_count_transition_counts"])
-        scale_ref = np.maximum(np.maximum(z_col, 0.0), lam)
-        low_count_weight = 0.0
-        if low_count_abs > 0.0 and low_count_transition > 0.0:
-            low_count_weight = low_count_transition / (scale_ref + low_count_transition)
-        variance = (
-            lam
-            + (transport_rel * lam) ** 2
-            + transport_abs**2
-            + (spectrum_rel * scale_ref) ** 2
-            + spectrum_abs**2
-            + (low_count_abs * low_count_weight) ** 2
-            + np.maximum(obs_var[:, None], 0.0)
+        variance = count_likelihood_variance(
+            z_col,
+            lam,
+            transport_model_rel_sigma=float(kwargs["transport_model_rel_sigma"]),
+            transport_model_abs_sigma=float(kwargs["transport_model_abs_sigma"]),
+            spectrum_count_rel_sigma=float(kwargs["spectrum_count_rel_sigma"]),
+            spectrum_count_abs_sigma=float(kwargs["spectrum_count_abs_sigma"]),
+            low_count_abs_sigma=float(kwargs["low_count_abs_sigma"]),
+            low_count_transition_counts=float(kwargs["low_count_transition_counts"]),
+            observation_count_variance=obs_var[:, None],
         )
-        variance = np.maximum(variance, 1.0e-12)
         residual = z_col - lam
         if model == "gaussian":
             terms = -0.5 * ((residual**2) / variance + np.log(variance))
@@ -895,10 +1044,6 @@ class IsotopeParticleFilter:
             observation_count_variance=observation_count_variance,
             **self._count_likelihood_kwargs(),
         )
-
-    def _obstacle_gpu_kwargs(self) -> dict[str, object]:
-        """Return obstacle attenuation kwargs for GPU expected-count kernels."""
-        return self.continuous_kernel.obstacle_gpu_kwargs(self.isotope)
 
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
         """Attach a kernel and refresh the continuous-kernel configuration."""
@@ -1137,57 +1282,7 @@ class IsotopeParticleFilter:
 
     def reset_step_stats(self) -> None:
         """Reset per-step diagnostic counters."""
-        self.last_ess = None
-        self.last_ess_pre = None
-        self.last_ess_post = None
-        self.last_resample_ess = False
-        self.last_resample_count = 0
-        self.last_birth_count = 0
-        self.last_kill_count = 0
-        self.last_n_after_adapt = None
-        self.last_temper_steps = []
-        self.last_temper_resample_count = 0
-        self.last_mode_preserved_count = 0
-        self.last_mode_preserving_strata_summary = {}
-        self.last_mode_preserving_selected_strata = []
-        self.last_mode_preserving_cardinality_summary = {}
-        self.last_mode_preserving_selected_cardinalities = []
-        self.last_birth_residual_chi2 = 0.0
-        self.last_birth_residual_p_value = 1.0
-        self.last_birth_residual_support = 0
-        self.last_birth_residual_distinct_poses = 0
-        self.last_birth_residual_distinct_stations = 0
-        self.last_birth_residual_gate_passed = False
-        self.last_birth_residual_refit_fraction = 1.0
-        self.last_birth_residual_refit_gate_passed = True
-        self.last_birth_residual_layer = "none"
-        self.last_birth_residual_layer_count = 0
-        self.last_birth_forced_attempts = 0
-        self.last_birth_forced_accepts = 0
-        self.last_birth_forced_mask_relaxations = 0
-        self.last_birth_forced_no_candidate = 0
-        self.last_birth_forced_rejected = 0
-        self.last_birth_forced_best_delta = -np.inf
-        self.last_birth_global_rescue_candidates = 0
-        self.last_birth_global_rescue_attempts = 0
-        self.last_birth_global_rescue_accepts = 0
-        self.last_birth_global_rescue_rejected = 0
-        self.last_birth_global_rescue_best_delta = -np.inf
-        self.last_runtime_report_rescue_candidates = 0
-        self.last_runtime_report_rescue_sources = 0
-        self.last_runtime_report_rescue_injected = 0
-        self.last_runtime_report_rescue_weight = 0.0
-        self.last_weak_source_prune_occlusion_protected = 0
-        self.last_birth_structural_eligible = 0
-        self.last_pseudo_source_verified = 0
-        self.last_pseudo_source_failed = 0
-        self.last_pseudo_source_pruned = 0
-        self.last_pseudo_source_quarantined = 0
-        self.last_pseudo_source_quarantine_active = 0
-        self.last_pseudo_source_fail_reasons = {}
-        self.last_source_event_diagnostics = []
-        self.last_structural_timing_s = {}
-        self._resample_count_in_observation = 0
+        reset_step_diagnostics(self)
 
     def _advance_adapt_cooldown(self) -> None:
         """Decrement the adapt cooldown counter after each update."""
@@ -1211,32 +1306,16 @@ class IsotopeParticleFilter:
     ) -> None:
         """Record a source-slot birth, death, quarantine, or verification event."""
         self._ensure_source_metadata(st)
-        idx = int(source_idx)
-        if idx < 0 or idx >= int(st.num_sources):
+        record = build_source_event_record(
+            event=event,
+            isotope=self.isotope,
+            state=st,
+            source_idx=int(source_idx),
+            reason=reason,
+            extra=extra,
+        )
+        if record is None:
             return
-        record: dict[str, object] = {
-            "event": str(event),
-            "isotope": str(self.isotope),
-            "reason": str(reason),
-            "source_index": idx,
-            "position": [float(value) for value in st.positions[idx]],
-            "strength": float(st.strengths[idx]),
-            "age": int(st.ages[idx]) if st.ages is not None else None,
-            "low_q_streak": int(st.low_q_streaks[idx])
-            if st.low_q_streaks is not None
-            else None,
-            "support_score": float(st.support_scores[idx])
-            if st.support_scores is not None
-            else None,
-            "tentative": bool(st.tentative_sources[idx])
-            if st.tentative_sources is not None
-            else None,
-            "verification_fail_streak": int(st.verification_fail_streaks[idx])
-            if st.verification_fail_streaks is not None
-            else None,
-        }
-        if extra:
-            record.update(extra)
         self.last_source_event_diagnostics.append(record)
 
     def _gpu_enabled(self) -> bool:
@@ -1245,15 +1324,18 @@ class IsotopeParticleFilter:
 
         if not self.config.use_gpu:
             raise RuntimeError("GPU-only mode: enable use_gpu in PFConfig.")
-        if not gpu_utils.torch_available():
-            raise RuntimeError("GPU-only mode requires CUDA-enabled torch.")
+        if not gpu_utils.torch_device_available(self.config.gpu_device):
+            raise RuntimeError("GPU-only mode requires torch on the requested device.")
         return True
 
     def _can_use_gpu(self) -> bool:
-        """Return whether this filter can use CUDA for PF math."""
+        """Return whether this filter can use the configured torch device."""
         from pf import gpu_utils
 
-        return bool(self.config.use_gpu and gpu_utils.torch_available())
+        return bool(
+            self.config.use_gpu
+            and gpu_utils.torch_device_available(self.config.gpu_device)
+        )
 
     def _ll_proxy_pair(
         self,
@@ -1268,7 +1350,10 @@ class IsotopeParticleFilter:
             return 0.0
         state = self.best_particle().state
         lam_rate = float(state.background)
-        source_scale = self._measurement_source_scale()
+        source_scale = self._measurement_source_scale(
+            fe_index=fe_index,
+            pb_index=pb_index,
+        )
         if state.num_sources > 0:
             for pos, strength in zip(state.positions[:state.num_sources], state.strengths[:state.num_sources]):
                 kernel_val = self.continuous_kernel.kernel_value_pair(
@@ -1545,35 +1630,58 @@ class IsotopeParticleFilter:
             return torch.zeros(0, device=device, dtype=dtype)
         states = [p.state for p in self.continuous_particles]
         positions, strengths, backgrounds, mask = gpu_utils.pack_states(states, device=device, dtype=dtype)
-        mu_fe, mu_pb = self.continuous_kernel._mu_values(isotope=self.isotope)
-        shield_params = self.continuous_kernel.shield_params
         detector_pos = np.asarray(self.kernel.poses[pose_idx], dtype=float)
-        return gpu_utils.expected_counts_pair_torch(
-            detector_pos=detector_pos,
-            positions=positions,
-            strengths=strengths,
-            backgrounds=backgrounds,
-            mask=mask,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            mu_fe=mu_fe,
-            mu_pb=mu_pb,
-            thickness_fe_cm=shield_params.thickness_fe_cm,
-            thickness_pb_cm=shield_params.thickness_pb_cm,
-            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
-            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
-            shield_geometry_model=shield_params.shield_geometry_model,
-            use_angle_attenuation=shield_params.use_angle_attenuation,
-            live_time_s=live_time_s,
+        (
+            packed_positions,
+            packed_strengths,
+            packed_mask,
+            inverse,
+        ) = self._compress_identical_packed_sources_torch(
+            positions,
+            strengths,
+            mask,
+        )
+        if inverse is None:
+            return self.continuous_kernel.expected_counts_pair_for_packed_states_torch(
+                isotope=self.isotope,
+                detector_pos=detector_pos,
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_index=fe_index,
+                pb_index=pb_index,
+                live_time_s=live_time_s,
+                source_scale=self._measurement_source_scale(
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                ),
+                device=device,
+                dtype=dtype,
+            )
+        zero_backgrounds = torch.zeros(
+            int(packed_positions.shape[0]),
             device=device,
             dtype=dtype,
-            source_scale=self._measurement_source_scale(),
-            detector_radius_m=self.continuous_kernel.detector_radius_m,
-            detector_aperture_samples=self.continuous_kernel.detector_aperture_samples,
-            buildup_fe_coeff=shield_params.buildup_fe_coeff,
-            buildup_pb_coeff=shield_params.buildup_pb_coeff,
-            **self._obstacle_gpu_kwargs(),
         )
+        source_counts = self.continuous_kernel.expected_counts_pair_for_packed_states_torch(
+            isotope=self.isotope,
+            detector_pos=detector_pos,
+            positions=packed_positions,
+            strengths=packed_strengths,
+            backgrounds=zero_backgrounds,
+            mask=packed_mask,
+            fe_index=fe_index,
+            pb_index=pb_index,
+            live_time_s=live_time_s,
+            source_scale=self._measurement_source_scale(
+                fe_index=fe_index,
+                pb_index=pb_index,
+            ),
+            device=device,
+            dtype=dtype,
+        )
+        return source_counts.index_select(0, inverse) + float(live_time_s) * backgrounds
 
     def _continuous_expected_counts_pair_sequence_torch(
         self,
@@ -1603,34 +1711,140 @@ class IsotopeParticleFilter:
             device=device,
             dtype=dtype,
         )
-        mu_fe, mu_pb = self.continuous_kernel._mu_values(isotope=self.isotope)
-        shield_params = self.continuous_kernel.shield_params
         detector_pos = np.asarray(self.kernel.poses[pose_idx], dtype=float)
-        unit_live_counts = gpu_utils.expected_counts_selected_pairs_torch(
-            detector_pos=detector_pos,
-            positions=positions,
-            strengths=strengths,
-            backgrounds=backgrounds,
-            mask=mask,
-            fe_indices=fe_arr,
-            pb_indices=pb_arr,
-            mu_fe=mu_fe,
-            mu_pb=mu_pb,
-            thickness_fe_cm=shield_params.thickness_fe_cm,
-            thickness_pb_cm=shield_params.thickness_pb_cm,
-            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
-            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
-            shield_geometry_model=shield_params.shield_geometry_model,
-            use_angle_attenuation=shield_params.use_angle_attenuation,
-            live_time_s=1.0,
+        (
+            packed_positions,
+            packed_strengths,
+            packed_mask,
+            inverse,
+        ) = self._compress_identical_packed_sources_torch(
+            positions,
+            strengths,
+            mask,
+        )
+        if inverse is None:
+            unit_live_counts = (
+                self.continuous_kernel.expected_counts_selected_pairs_for_packed_states_torch(
+                    isotope=self.isotope,
+                    detector_pos=detector_pos,
+                    positions=positions,
+                    strengths=strengths,
+                    backgrounds=backgrounds,
+                    mask=mask,
+                    fe_indices=fe_arr,
+                    pb_indices=pb_arr,
+                    live_time_s=1.0,
+                    source_scale=self._measurement_source_scale_vector(fe_arr, pb_arr),
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+        else:
+            zero_backgrounds = torch.zeros(
+                int(packed_positions.shape[0]),
+                device=device,
+                dtype=dtype,
+            )
+            source_unit_counts = (
+                self.continuous_kernel.expected_counts_selected_pairs_for_packed_states_torch(
+                    isotope=self.isotope,
+                    detector_pos=detector_pos,
+                    positions=packed_positions,
+                    strengths=packed_strengths,
+                    backgrounds=zero_backgrounds,
+                    mask=packed_mask,
+                    fe_indices=fe_arr,
+                    pb_indices=pb_arr,
+                    live_time_s=1.0,
+                    source_scale=self._measurement_source_scale_vector(fe_arr, pb_arr),
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+            unit_live_counts = source_unit_counts.index_select(1, inverse)
+            unit_live_counts = unit_live_counts + backgrounds.unsqueeze(0)
+        live_t = torch.as_tensor(live_arr, device=device, dtype=dtype).view(-1, 1)
+        return unit_live_counts * live_t
+
+    def _compress_identical_packed_sources_torch(
+        self,
+        positions: "torch.Tensor",
+        strengths: "torch.Tensor",
+        mask: "torch.Tensor",
+    ) -> tuple[
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor",
+        "torch.Tensor | None",
+    ]:
+        """Return one source row plus inverse when all packed source states match."""
+        import torch
+
+        particle_count = int(positions.shape[0])
+        if particle_count <= 1:
+            return positions, strengths, mask, None
+        if positions.ndim != 3 or strengths.ndim != 2 or mask.ndim != 2:
+            return positions, strengths, mask, None
+        flat = torch.cat(
+            (
+                positions.reshape(particle_count, -1),
+                strengths.reshape(particle_count, -1),
+                mask.reshape(particle_count, -1),
+            ),
+            dim=1,
+        )
+        if flat.numel() == 0:
+            return positions, strengths, mask, None
+        identical = bool(torch.all(flat == flat[:1]).detach().cpu().item())
+        if not identical:
+            return positions, strengths, mask, None
+        inverse = torch.zeros(particle_count, device=positions.device, dtype=torch.long)
+        return positions[:1], strengths[:1], mask[:1], inverse
+
+    def _continuous_expected_counts_pair_sequence_torch_uncompressed(
+        self,
+        pose_idx: int,
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        live_times_s: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Compute same-station expected counts without duplicate-state compression."""
+        from pf import gpu_utils
+        import torch
+
+        device = gpu_utils.resolve_device(self.config.gpu_device)
+        dtype = gpu_utils.resolve_dtype(self.config.gpu_dtype)
+        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+        live_arr = np.asarray(live_times_s, dtype=float).reshape(-1)
+        if not (fe_arr.size == pb_arr.size == live_arr.size):
+            raise ValueError(
+                "Fe, Pb, and live-time arrays must have matching lengths."
+            )
+        if fe_arr.size == 0 or not self.continuous_particles or self.kernel is None:
+            return torch.zeros((0, 0), device=device, dtype=dtype)
+        states = [p.state for p in self.continuous_particles]
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
+            states,
             device=device,
             dtype=dtype,
-            source_scale=self._measurement_source_scale(),
-            detector_radius_m=self.continuous_kernel.detector_radius_m,
-            detector_aperture_samples=self.continuous_kernel.detector_aperture_samples,
-            buildup_fe_coeff=shield_params.buildup_fe_coeff,
-            buildup_pb_coeff=shield_params.buildup_pb_coeff,
-            **self._obstacle_gpu_kwargs(),
+        )
+        detector_pos = np.asarray(self.kernel.poses[pose_idx], dtype=float)
+        unit_live_counts = (
+            self.continuous_kernel.expected_counts_selected_pairs_for_packed_states_torch(
+                isotope=self.isotope,
+                detector_pos=detector_pos,
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+                live_time_s=1.0,
+                source_scale=self._measurement_source_scale_vector(fe_arr, pb_arr),
+                device=device,
+                dtype=dtype,
+            )
         )
         live_t = torch.as_tensor(live_arr, device=device, dtype=dtype).view(-1, 1)
         return unit_live_counts * live_t
@@ -1668,21 +1882,17 @@ class IsotopeParticleFilter:
         low_count_abs = self._isotope_float_config(self.config.low_count_abs_sigma)
         low_count_transition = self._isotope_float_config(self.config.low_count_transition_counts)
         obs_var = max(float(observation_count_variance), 0.0)
-        z_nonnegative = torch.clamp(z, min=0.0)
-        scale_ref = torch.maximum(lam_t, z_nonnegative)
-        low_count_weight = 0.0
-        if low_count_abs > 0.0 and low_count_transition > 0.0:
-            low_count_weight = low_count_transition / (scale_ref + low_count_transition)
-        variance = (
-            lam_t
-            + (float(transport_rel) * lam_t) ** 2
-            + float(transport_abs) ** 2
-            + (float(spectrum_rel) * scale_ref) ** 2
-            + float(spectrum_abs) ** 2
-            + (float(low_count_abs) * low_count_weight) ** 2
-            + obs_var
+        variance = count_likelihood_variance_torch(
+            z,
+            lam_t,
+            transport_model_rel_sigma=float(transport_rel),
+            transport_model_abs_sigma=float(transport_abs),
+            spectrum_count_rel_sigma=float(spectrum_rel),
+            spectrum_count_abs_sigma=float(spectrum_abs),
+            low_count_abs_sigma=float(low_count_abs),
+            low_count_transition_counts=float(low_count_transition),
+            observation_count_variance=obs_var,
         )
-        variance = torch.clamp(variance, min=1e-12)
         residual = z - lam_t
         if model == "gaussian":
             return -0.5 * ((residual**2) / variance + torch.log(variance))
@@ -1695,6 +1905,7 @@ class IsotopeParticleFilter:
         lam_kn: "torch.Tensor",
         z_obs: NDArray[np.float64],
         observation_count_variances: NDArray[np.float64],
+        observation_count_covariance: NDArray[np.float64] | None = None,
     ) -> "torch.Tensor":
         """Return summed per-particle log-likelihoods for a measurement sequence."""
         import torch
@@ -1718,7 +1929,22 @@ class IsotopeParticleFilter:
             str(self.config.count_likelihood_model)
         )
         if model in {"poisson", ""}:
-            return torch.sum(z * torch.log(lam) - lam, dim=0)
+            count_ll = torch.sum(z * torch.log(lam) - lam, dim=0)
+            return count_ll + self._shield_shape_sequence_log_likelihood_gpu(
+                lam,
+                z_arr,
+                var_arr,
+            )
+        if self._sequence_covariance_enabled(
+            z_arr.size,
+            observation_count_covariance,
+        ):
+            return self._log_likelihood_sequence_covariance_gpu(
+                lam,
+                z_arr,
+                var_arr,
+                observation_count_covariance=observation_count_covariance,
+            )
 
         transport_rel = self._isotope_float_config(
             self.config.transport_model_rel_sigma
@@ -1744,27 +1970,26 @@ class IsotopeParticleFilter:
             ).view(-1, 1),
             min=0.0,
         )
-        z_nonnegative = torch.clamp(z, min=0.0)
-        scale_ref = torch.maximum(lam, z_nonnegative)
-        low_count_weight = 0.0
-        if low_count_abs > 0.0 and low_count_transition > 0.0:
-            low_count_weight = low_count_transition / (
-                scale_ref + low_count_transition
-            )
-        variance = (
-            lam
-            + (float(transport_rel) * lam) ** 2
-            + float(transport_abs) ** 2
-            + (float(spectrum_rel) * scale_ref) ** 2
-            + float(spectrum_abs) ** 2
-            + (float(low_count_abs) * low_count_weight) ** 2
-            + obs_var
+        variance = count_likelihood_variance_torch(
+            z,
+            lam,
+            transport_model_rel_sigma=float(transport_rel),
+            transport_model_abs_sigma=float(transport_abs),
+            spectrum_count_rel_sigma=float(spectrum_rel),
+            spectrum_count_abs_sigma=float(spectrum_abs),
+            low_count_abs_sigma=float(low_count_abs),
+            low_count_transition_counts=float(low_count_transition),
+            observation_count_variance=obs_var,
         )
-        variance = torch.clamp(variance, min=1e-12)
         residual = z - lam
         if model == "gaussian":
             ll = -0.5 * ((residual**2) / variance + torch.log(variance))
-            return torch.sum(ll, dim=0)
+            count_ll = torch.sum(ll, dim=0)
+            return count_ll + self._shield_shape_sequence_log_likelihood_gpu(
+                lam,
+                z_arr,
+                var_arr,
+            )
 
         df = max(float(self.config.count_likelihood_df), 1.0 + 1e-12)
         ll = (
@@ -1773,7 +1998,662 @@ class IsotopeParticleFilter:
             * torch.log1p((residual**2) / (df * variance))
             - 0.5 * torch.log(variance)
         )
-        return torch.sum(ll, dim=0)
+        count_ll = torch.sum(ll, dim=0)
+        return count_ll + self._shield_shape_sequence_log_likelihood_gpu(
+            lam,
+            z_arr,
+            var_arr,
+        )
+
+    def _sequence_covariance_enabled(
+        self,
+        sequence_length: int,
+        observation_count_covariance: NDArray[np.float64] | None,
+    ) -> bool:
+        """Return whether same-station view covariance should be evaluated."""
+        if int(sequence_length) < 2:
+            return False
+        if observation_count_covariance is not None:
+            return True
+        return bool(self.config.station_view_covariance_enable) and (
+            float(self.config.station_view_correlated_spectrum_fraction) > 0.0
+        )
+
+    def _spectral_bin_sequence_log_likelihood_gpu(
+        self,
+        expected_spectrum_kbn: "torch.Tensor",
+        observed_spectrum_kb: NDArray[np.float64],
+        observation_spectrum_variance_kb: NDArray[np.float64] | None = None,
+    ) -> "torch.Tensor":
+        """Return direct spectrum-bin log likelihoods for each particle."""
+        import torch
+
+        expected = expected_spectrum_kbn.to(dtype=torch.float64)
+        if expected.ndim == 2:
+            expected = expected.unsqueeze(0)
+        if expected.ndim != 3:
+            raise ValueError("expected_spectrum_kbn must have shape K x B x N.")
+        observed_arr = np.asarray(observed_spectrum_kb, dtype=float)
+        if observed_arr.ndim == 1:
+            observed_arr = observed_arr.reshape(1, -1)
+        if observed_arr.shape != tuple(expected.shape[:2]):
+            raise ValueError("observed_spectrum_kb must match K x B expected bins.")
+        expected = torch.clamp(expected, min=1.0e-12)
+        observed = torch.as_tensor(
+            np.maximum(np.where(np.isfinite(observed_arr), observed_arr, 0.0), 0.0),
+            device=expected.device,
+            dtype=torch.float64,
+        ).unsqueeze(-1)
+        model = normalize_count_likelihood_model(str(self.config.count_likelihood_model))
+        if model in {"poisson", ""} and observation_spectrum_variance_kb is None:
+            return torch.sum(observed * torch.log(expected) - expected, dim=(0, 1))
+
+        if observation_spectrum_variance_kb is None:
+            obs_var = torch.zeros_like(observed)
+        else:
+            obs_var_arr = np.asarray(observation_spectrum_variance_kb, dtype=float)
+            if obs_var_arr.ndim == 1:
+                obs_var_arr = obs_var_arr.reshape(1, -1)
+            if obs_var_arr.shape != tuple(expected.shape[:2]):
+                raise ValueError("observation_spectrum_variance_kb must match K x B.")
+            obs_var = torch.as_tensor(
+                np.maximum(np.where(np.isfinite(obs_var_arr), obs_var_arr, 0.0), 0.0),
+                device=expected.device,
+                dtype=torch.float64,
+            ).unsqueeze(-1)
+        spectrum_rel = self._isotope_float_config(self.config.spectrum_count_rel_sigma)
+        spectrum_abs = self._isotope_float_config(self.config.spectrum_count_abs_sigma)
+        variance = torch.clamp(
+            expected
+            + obs_var
+            + (float(spectrum_rel) * expected) ** 2
+            + float(spectrum_abs) ** 2,
+            min=1.0e-12,
+        )
+        residual = observed - expected
+        if model == "gaussian":
+            ll = -0.5 * ((residual**2) / variance + torch.log(variance))
+        else:
+            df = max(float(self.config.count_likelihood_df), 1.0 + 1.0e-12)
+            ll = (
+                -0.5
+                * (df + 1.0)
+                * torch.log1p((residual**2) / (df * variance))
+                - 0.5 * torch.log(variance)
+        )
+        return torch.sum(ll, dim=(0, 1))
+
+    @staticmethod
+    def _spectrum_update_arrays(
+        observed_spectrum: NDArray[np.float64] | None,
+        response_template: NDArray[np.float64] | None,
+        background_spectrum: NDArray[np.float64] | None,
+        spectrum_variance: NDArray[np.float64] | None,
+        *,
+        sequence_length: int,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64] | None,
+    ] | None:
+        """Return validated spectrum-bin arrays for a PF likelihood update."""
+        if observed_spectrum is None or response_template is None:
+            return None
+        rows = max(1, int(sequence_length))
+        observed = np.asarray(observed_spectrum, dtype=float)
+        if observed.ndim == 1:
+            observed = observed.reshape(1, -1)
+        template = np.asarray(response_template, dtype=float)
+        if template.ndim == 1:
+            template = np.broadcast_to(template.reshape(1, -1), observed.shape)
+        background = (
+            np.zeros_like(observed, dtype=float)
+            if background_spectrum is None
+            else np.asarray(background_spectrum, dtype=float)
+        )
+        if background.ndim == 1:
+            background = np.broadcast_to(background.reshape(1, -1), observed.shape)
+        variance = None
+        if spectrum_variance is not None:
+            variance = np.asarray(spectrum_variance, dtype=float)
+            if variance.ndim == 1:
+                variance = np.broadcast_to(variance.reshape(1, -1), observed.shape)
+        if observed.shape[0] != rows:
+            raise ValueError("observed_spectrum row count must match sequence length.")
+        if template.shape != observed.shape:
+            raise ValueError("response_template must match observed spectrum bins.")
+        if background.shape != observed.shape:
+            raise ValueError("background_spectrum must match observed spectrum bins.")
+        if variance is not None and variance.shape != observed.shape:
+            raise ValueError("spectrum_variance must match observed spectrum bins.")
+        observed = np.maximum(np.where(np.isfinite(observed), observed, 0.0), 0.0)
+        template = np.maximum(np.where(np.isfinite(template), template, 0.0), 0.0)
+        background = np.maximum(
+            np.where(np.isfinite(background), background, 0.0),
+            0.0,
+        )
+        if variance is not None:
+            variance = np.maximum(np.where(np.isfinite(variance), variance, 0.0), 0.0)
+        return observed, template, background, variance
+
+    def _spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+        self,
+        lam_kn: "torch.Tensor",
+        observed_spectrum_kb: NDArray[np.float64],
+        response_template_kb: NDArray[np.float64],
+        background_spectrum_kb: NDArray[np.float64],
+        observation_spectrum_variance_kb: NDArray[np.float64] | None = None,
+    ) -> "torch.Tensor":
+        """Return direct spectrum-bin log likelihoods without a full KxBxN tensor."""
+        import torch
+
+        lam = lam_kn.to(dtype=torch.float64)
+        if lam.ndim == 1:
+            lam = lam.view(1, -1)
+        if lam.ndim != 2:
+            raise ValueError("lam_kn must have shape K x N.")
+        observed_arr = np.asarray(observed_spectrum_kb, dtype=float)
+        if observed_arr.ndim == 1:
+            observed_arr = observed_arr.reshape(1, -1)
+        if observed_arr.ndim != 2 or observed_arr.shape[0] != int(lam.shape[0]):
+            raise ValueError("observed_spectrum_kb rows must match lambda rows.")
+        template_arr = np.asarray(response_template_kb, dtype=float)
+        if template_arr.ndim == 1:
+            template_arr = np.broadcast_to(
+                template_arr.reshape(1, -1),
+                observed_arr.shape,
+            )
+        background_arr = np.asarray(background_spectrum_kb, dtype=float)
+        if background_arr.ndim == 1:
+            background_arr = np.broadcast_to(
+                background_arr.reshape(1, -1),
+                observed_arr.shape,
+            )
+        if template_arr.shape != observed_arr.shape:
+            raise ValueError("response_template_kb must match observed spectrum bins.")
+        if background_arr.shape != observed_arr.shape:
+            raise ValueError("background_spectrum_kb must match observed spectrum bins.")
+        variance_arr = None
+        if observation_spectrum_variance_kb is not None:
+            variance_arr = np.asarray(observation_spectrum_variance_kb, dtype=float)
+            if variance_arr.ndim == 1:
+                variance_arr = np.broadcast_to(
+                    variance_arr.reshape(1, -1),
+                    observed_arr.shape,
+                )
+            if variance_arr.shape != observed_arr.shape:
+                raise ValueError("observation_spectrum_variance_kb must match bins.")
+        observed_all = torch.as_tensor(
+            np.maximum(np.where(np.isfinite(observed_arr), observed_arr, 0.0), 0.0),
+            device=lam.device,
+            dtype=torch.float64,
+        )
+        template_all = torch.as_tensor(
+            np.maximum(np.where(np.isfinite(template_arr), template_arr, 0.0), 0.0),
+            device=lam.device,
+            dtype=torch.float64,
+        )
+        background_all = torch.as_tensor(
+            np.maximum(
+                np.where(np.isfinite(background_arr), background_arr, 0.0),
+                0.0,
+            ),
+            device=lam.device,
+            dtype=torch.float64,
+        )
+        variance_all = None
+        if variance_arr is not None:
+            variance_all = torch.as_tensor(
+                np.maximum(np.where(np.isfinite(variance_arr), variance_arr, 0.0), 0.0),
+                device=lam.device,
+                dtype=torch.float64,
+            )
+        model = normalize_count_likelihood_model(str(self.config.count_likelihood_model))
+        rel_sigma = self._isotope_float_config(self.config.spectrum_count_rel_sigma)
+        abs_sigma = self._isotope_float_config(self.config.spectrum_count_abs_sigma)
+        chunk = max(1, int(getattr(self.config, "spectrum_likelihood_bin_chunk", 512)))
+        bin_count = int(observed_all.shape[1])
+        total_ll = torch.zeros(int(lam.shape[1]), device=lam.device, dtype=torch.float64)
+        for start in range(0, bin_count, chunk):
+            stop = min(start + chunk, bin_count)
+            expected = torch.clamp(
+                lam[:, None, :] * template_all[:, start:stop, None]
+                + background_all[:, start:stop, None],
+                min=1.0e-12,
+            )
+            observed = observed_all[:, start:stop, None]
+            if model in {"poisson", ""} and variance_all is None:
+                total_ll = total_ll + torch.sum(
+                    observed * torch.log(expected) - expected,
+                    dim=(0, 1),
+                )
+                continue
+            if variance_all is None:
+                obs_var = torch.zeros_like(observed)
+            else:
+                obs_var = variance_all[:, start:stop, None]
+            variance = torch.clamp(
+                expected
+                + obs_var
+                + (float(rel_sigma) * expected) ** 2
+                + float(abs_sigma) ** 2,
+                min=1.0e-12,
+            )
+            residual = observed - expected
+            if model == "gaussian":
+                ll = -0.5 * ((residual**2) / variance + torch.log(variance))
+            else:
+                df = max(float(self.config.count_likelihood_df), 1.0 + 1.0e-12)
+                ll = (
+                    -0.5
+                    * (df + 1.0)
+                    * torch.log1p((residual**2) / (df * variance))
+                    - 0.5 * torch.log(variance)
+                )
+            total_ll = total_ll + torch.sum(ll, dim=(0, 1))
+        return total_ll
+
+    def _expected_spectrum_sequence_torch(
+        self,
+        lam_kn: "torch.Tensor",
+        response_template_kb: NDArray[np.float64],
+        background_spectrum_kb: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Return KxBxN expected spectra from particle count rates."""
+        import torch
+
+        lam = lam_kn.to(dtype=torch.float64)
+        if lam.ndim == 1:
+            lam = lam.view(1, -1)
+        template = torch.as_tensor(
+            response_template_kb,
+            device=lam.device,
+            dtype=torch.float64,
+        )
+        background = torch.as_tensor(
+            background_spectrum_kb,
+            device=lam.device,
+            dtype=torch.float64,
+        )
+        if template.ndim == 1:
+            template = template.view(1, -1)
+        if background.ndim == 1:
+            background = background.view(1, -1)
+        if template.shape[0] != lam.shape[0] or background.shape[0] != lam.shape[0]:
+            raise ValueError("spectrum template rows must match lambda rows.")
+        expected = lam[:, None, :] * template[:, :, None] + background[:, :, None]
+        return torch.clamp(expected, min=1.0e-12)
+
+    def _log_likelihood_sequence_covariance_gpu(
+        self,
+        lam_kn: "torch.Tensor",
+        z_obs: NDArray[np.float64],
+        observation_count_variances: NDArray[np.float64],
+        *,
+        observation_count_covariance: NDArray[np.float64] | None,
+    ) -> "torch.Tensor":
+        """Return a batched multivariate count likelihood for a shield sequence."""
+        import torch
+
+        lam = torch.clamp(lam_kn.to(dtype=torch.float64), min=1.0e-12)
+        z_arr = np.asarray(z_obs, dtype=float).reshape(-1)
+        var_arr = np.asarray(observation_count_variances, dtype=float).reshape(-1)
+        if z_arr.size != int(lam.shape[0]) or var_arr.size != int(lam.shape[0]):
+            raise ValueError("Observation arrays must match the sequence length.")
+        z = torch.as_tensor(
+            z_arr,
+            device=lam.device,
+            dtype=torch.float64,
+        ).view(-1, 1)
+        variance = self._sequence_diagonal_variance_torch(lam, z, var_arr)
+        covariance_nkk = torch.diag_embed(variance.T)
+        covariance_nkk = covariance_nkk + self._sequence_observation_offdiag_torch(
+            observation_count_covariance,
+            sequence_length=z_arr.size,
+            device=lam.device,
+        )
+        covariance_nkk = covariance_nkk + self._sequence_common_mode_offdiag_torch(
+            lam,
+        )
+        covariance_nkk = self._regularize_sequence_covariance_torch(
+            covariance_nkk,
+            variance.T,
+        )
+        residual = (z - lam).T.unsqueeze(-1)
+        chol = torch.linalg.cholesky(covariance_nkk)
+        solved = torch.cholesky_solve(residual, chol)
+        quad = torch.sum(residual * solved, dim=(1, 2))
+        logdet = 2.0 * torch.sum(
+            torch.log(torch.diagonal(chol, dim1=1, dim2=2)),
+            dim=1,
+        )
+        model = normalize_count_likelihood_model(
+            str(self.config.count_likelihood_model)
+        )
+        if model == "gaussian":
+            count_ll = -0.5 * (quad + logdet)
+        else:
+            df = max(float(self.config.count_likelihood_df), 1.0 + 1.0e-12)
+            dim = float(z_arr.size)
+            count_ll = -0.5 * (df + dim) * torch.log1p(quad / df) - 0.5 * logdet
+        return count_ll + self._shield_shape_sequence_log_likelihood_gpu(
+            lam,
+            z_arr,
+            var_arr,
+        )
+
+    def _sequence_diagonal_variance_torch(
+        self,
+        lam_kn: "torch.Tensor",
+        z_kn: "torch.Tensor",
+        observation_count_variances: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Return KxN diagonal variances for same-station sequence likelihood."""
+        import torch
+
+        transport_rel = self._isotope_float_config(
+            self.config.transport_model_rel_sigma
+        )
+        transport_abs = self._isotope_float_config(
+            self.config.transport_model_abs_sigma
+        )
+        spectrum_rel = self._isotope_float_config(
+            self.config.spectrum_count_rel_sigma
+        )
+        spectrum_abs = self._isotope_float_config(
+            self.config.spectrum_count_abs_sigma
+        )
+        low_count_abs = self._isotope_float_config(self.config.low_count_abs_sigma)
+        low_count_transition = self._isotope_float_config(
+            self.config.low_count_transition_counts
+        )
+        obs_var = torch.clamp(
+            torch.as_tensor(
+                observation_count_variances,
+                device=lam_kn.device,
+                dtype=torch.float64,
+            ).view(-1, 1),
+            min=0.0,
+        )
+        return count_likelihood_variance_torch(
+            z_kn,
+            lam_kn,
+            transport_model_rel_sigma=float(transport_rel),
+            transport_model_abs_sigma=float(transport_abs),
+            spectrum_count_rel_sigma=float(spectrum_rel),
+            spectrum_count_abs_sigma=float(spectrum_abs),
+            low_count_abs_sigma=float(low_count_abs),
+            low_count_transition_counts=float(low_count_transition),
+            observation_count_variance=obs_var,
+        )
+
+    def _sequence_observation_offdiag_torch(
+        self,
+        observation_count_covariance: NDArray[np.float64] | None,
+        *,
+        sequence_length: int,
+        device: "torch.device",
+    ) -> "torch.Tensor":
+        """Return fixed off-diagonal observation covariance for one sequence."""
+        import torch
+
+        size = int(sequence_length)
+        if observation_count_covariance is None:
+            return torch.zeros((1, size, size), device=device, dtype=torch.float64)
+        covariance = np.asarray(observation_count_covariance, dtype=float)
+        if covariance.shape != (size, size):
+            raise ValueError(
+                "observation_count_covariance must be shaped sequence x sequence."
+            )
+        covariance = 0.5 * (covariance + covariance.T)
+        np.fill_diagonal(covariance, 0.0)
+        return torch.as_tensor(
+            covariance,
+            device=device,
+            dtype=torch.float64,
+        ).view(1, size, size)
+
+    def _sequence_common_mode_offdiag_torch(
+        self,
+        lam_kn: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return particle-wise off-diagonal covariance from common spectrum error."""
+        import torch
+
+        fraction = max(
+            0.0,
+            float(self.config.station_view_correlated_spectrum_fraction),
+        )
+        if not bool(self.config.station_view_covariance_enable) or fraction <= 0.0:
+            size = int(lam_kn.shape[0])
+            return torch.zeros(
+                (int(lam_kn.shape[1]), size, size),
+                device=lam_kn.device,
+                dtype=torch.float64,
+            )
+        spectrum_rel = fraction * self._isotope_float_config(
+            self.config.spectrum_count_rel_sigma
+        )
+        spectrum_abs = fraction * self._isotope_float_config(
+            self.config.spectrum_count_abs_sigma
+        )
+        if spectrum_rel <= 0.0 and spectrum_abs <= 0.0:
+            size = int(lam_kn.shape[0])
+            return torch.zeros(
+                (int(lam_kn.shape[1]), size, size),
+                device=lam_kn.device,
+                dtype=torch.float64,
+            )
+        lam_nk = lam_kn.T
+        common = (float(spectrum_rel) ** 2) * (
+            lam_nk[:, :, None] * lam_nk[:, None, :]
+        )
+        if spectrum_abs > 0.0:
+            common = common + float(spectrum_abs) ** 2
+        diag = torch.arange(int(lam_kn.shape[0]), device=lam_kn.device)
+        common[:, diag, diag] = 0.0
+        return common
+
+    def _regularize_sequence_covariance_torch(
+        self,
+        covariance_nkk: "torch.Tensor",
+        diagonal_nk: "torch.Tensor",
+    ) -> "torch.Tensor":
+        """Return a positive-definite covariance batch for Cholesky solves."""
+        import torch
+
+        size = int(covariance_nkk.shape[1])
+        eye = torch.eye(size, device=covariance_nkk.device, dtype=torch.float64)
+        diag_scale = torch.clamp(torch.mean(diagonal_nk, dim=1), min=1.0)
+        jitter = 1.0e-9 * diag_scale
+        regularized = covariance_nkk
+        for _ in range(6):
+            candidate = regularized + jitter.view(-1, 1, 1) * eye.view(1, size, size)
+            _chol, info = torch.linalg.cholesky_ex(candidate)
+            if bool(torch.all(info == 0)):
+                return candidate
+            jitter = jitter * 10.0
+            regularized = covariance_nkk
+        fallback = torch.diag_embed(torch.clamp(diagonal_nk, min=1.0e-12))
+        return fallback + jitter.view(-1, 1, 1) * eye.view(1, size, size)
+
+    def _shield_shape_sequence_log_likelihood_gpu(
+        self,
+        lam_kn: "torch.Tensor",
+        z_obs: NDArray[np.float64],
+        observation_count_variances: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Return same-station shield signature likelihood terms."""
+        return self._shield_contrast_sequence_log_likelihood_gpu(
+            lam_kn,
+            z_obs,
+            observation_count_variances,
+        ) + self._shield_view_ratio_sequence_log_likelihood_gpu(lam_kn, z_obs)
+
+    def _shield_contrast_sequence_log_likelihood_gpu(
+        self,
+        lam_kn: "torch.Tensor",
+        z_obs: NDArray[np.float64],
+        observation_count_variances: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Return a robust same-station shield-signature likelihood term."""
+        import torch
+
+        lam = lam_kn.to(dtype=torch.float64)
+        if lam.ndim != 2:
+            raise ValueError("Sequence expected counts must have shape K x N.")
+        particle_count = int(lam.shape[1]) if lam.ndim == 2 else 0
+        zeros = torch.zeros(particle_count, device=lam.device, dtype=torch.float64)
+        if not bool(getattr(self.config, "shield_contrast_likelihood_enable", False)):
+            return zeros
+        weight = max(
+            float(getattr(self.config, "shield_contrast_likelihood_weight", 1.0)),
+            0.0,
+        )
+        min_views = max(
+            int(getattr(self.config, "shield_contrast_min_views", 2)),
+            2,
+        )
+        if weight <= 0.0 or int(lam.shape[0]) < min_views or particle_count == 0:
+            return zeros
+
+        z_arr = np.asarray(z_obs, dtype=float).reshape(-1)
+        var_arr = np.asarray(observation_count_variances, dtype=float).reshape(-1)
+        if z_arr.size != int(lam.shape[0]) or var_arr.size != int(lam.shape[0]):
+            raise ValueError("Observation arrays must match the sequence length.")
+        min_count = max(
+            float(getattr(self.config, "shield_contrast_min_count", 25.0)),
+            1.0e-6,
+        )
+        sigma_floor = max(
+            float(getattr(self.config, "shield_contrast_log_sigma_floor", 0.5)),
+            1.0e-6,
+        )
+        sigma_ceiling = max(
+            float(getattr(self.config, "shield_contrast_log_sigma_ceiling", 2.0)),
+            sigma_floor,
+        )
+        df = max(
+            float(getattr(self.config, "shield_contrast_likelihood_df", 5.0)),
+            1.0 + 1.0e-12,
+        )
+
+        z = torch.as_tensor(
+            z_arr,
+            device=lam.device,
+            dtype=torch.float64,
+        ).view(-1, 1)
+        obs_var = torch.clamp(
+            torch.as_tensor(
+                var_arr,
+                device=lam.device,
+                dtype=torch.float64,
+            ).view(-1, 1),
+            min=0.0,
+        )
+        z_safe = torch.clamp(z, min=min_count)
+        lam_safe = torch.clamp(lam, min=min_count)
+        log_z = torch.log(z_safe)
+        log_lam = torch.log(lam_safe)
+        log_var = obs_var / torch.clamp(z_safe**2, min=1.0e-12)
+        log_var = torch.clamp(
+            log_var + sigma_floor**2,
+            min=sigma_floor**2,
+            max=sigma_ceiling**2,
+        )
+        view_weight = torch.reciprocal(log_var)
+        weight_sum = torch.clamp(
+            torch.sum(view_weight, dim=0, keepdim=True),
+            min=1e-12,
+        )
+        obs_center = log_z - (
+            torch.sum(view_weight * log_z, dim=0, keepdim=True) / weight_sum
+        )
+        pred_center = log_lam - torch.sum(
+            view_weight * log_lam,
+            dim=0,
+            keepdim=True,
+        ) / weight_sum
+        residual = obs_center - pred_center
+        terms = -0.5 * (df + 1.0) * torch.log1p(
+            (residual**2) / (df * log_var)
+        )
+        terms -= 0.5 * torch.log(log_var)
+        return float(weight) * torch.sum(terms, dim=0)
+
+    def _shield_view_ratio_sequence_log_likelihood_gpu(
+        self,
+        lam_kn: "torch.Tensor",
+        z_obs: NDArray[np.float64],
+    ) -> "torch.Tensor":
+        """Return a Dirichlet-multinomial shield-view ratio likelihood term."""
+        import torch
+
+        lam = lam_kn.to(dtype=torch.float64)
+        if lam.ndim != 2:
+            raise ValueError("Sequence expected counts must have shape K x N.")
+        particle_count = int(lam.shape[1]) if lam.ndim == 2 else 0
+        zeros = torch.zeros(particle_count, device=lam.device, dtype=torch.float64)
+        if not bool(
+            getattr(self.config, "shield_view_ratio_likelihood_enable", False)
+        ):
+            return zeros
+        weight = max(
+            float(getattr(self.config, "shield_view_ratio_likelihood_weight", 1.0)),
+            0.0,
+        )
+        concentration = max(
+            float(
+                getattr(
+                    self.config,
+                    "shield_view_ratio_likelihood_concentration",
+                    128.0,
+                )
+            ),
+            1.0e-6,
+        )
+        min_total = max(
+            float(
+                getattr(
+                    self.config,
+                    "shield_view_ratio_likelihood_min_total_count",
+                    25.0,
+                )
+            ),
+            0.0,
+        )
+        min_views = max(
+            int(getattr(self.config, "shield_view_ratio_likelihood_min_views", 2)),
+            2,
+        )
+        if (
+            weight <= 0.0
+            or int(lam.shape[0]) < min_views
+            or particle_count == 0
+        ):
+            return zeros
+        z_arr = np.asarray(z_obs, dtype=float).reshape(-1)
+        if z_arr.size != int(lam.shape[0]):
+            raise ValueError("Observation arrays must match the sequence length.")
+        z_arr = np.maximum(np.where(np.isfinite(z_arr), z_arr, 0.0), 0.0)
+        total = float(np.sum(z_arr))
+        if total < min_total or not np.isfinite(total):
+            return zeros
+        z = torch.as_tensor(
+            z_arr,
+            device=lam.device,
+            dtype=torch.float64,
+        ).view(-1, 1)
+        lam_safe = torch.clamp(lam, min=1.0e-12)
+        lam_total = torch.clamp(torch.sum(lam_safe, dim=0, keepdim=True), min=1.0e-12)
+        probabilities = lam_safe / lam_total
+        alpha = torch.clamp(concentration * probabilities, min=1.0e-12)
+        alpha0 = torch.clamp(torch.sum(alpha, dim=0), min=1.0e-12)
+        total_t = torch.as_tensor(total, device=lam.device, dtype=torch.float64)
+        ll = torch.lgamma(alpha0) - torch.lgamma(alpha0 + total_t)
+        ll = ll + torch.sum(torch.lgamma(alpha + z) - torch.lgamma(alpha), dim=0)
+        return float(weight) * ll
 
     def _normalized_log_weights_torch(self, logw: "torch.Tensor") -> "torch.Tensor":
         """Normalize log-weights using logsumexp in float64."""
@@ -2061,7 +2941,10 @@ class IsotopeParticleFilter:
             raise RuntimeError("Continuous PF update requires an attached kernel.")
         detector_pos = np.asarray(self.kernel.poses[int(pose_idx)], dtype=float)
         lam = np.zeros(len(self.continuous_particles), dtype=float)
-        source_scale = self._measurement_source_scale()
+        source_scale = self._measurement_source_scale(
+            fe_index=orient_idx,
+            pb_index=orient_idx,
+        )
         for particle_idx, particle in enumerate(self.continuous_particles):
             state = particle.state
             rate = float(state.background)
@@ -2107,7 +2990,10 @@ class IsotopeParticleFilter:
         """Compute Fe/Pb pair expected counts at an explicit pose on CPU."""
         detector_arr = np.asarray(detector_pos, dtype=float)
         lam = np.zeros(len(self.continuous_particles), dtype=float)
-        source_scale = self._measurement_source_scale()
+        source_scale = self._measurement_source_scale(
+            fe_index=fe_index,
+            pb_index=pb_index,
+        )
         for particle_idx, particle in enumerate(self.continuous_particles):
             state = particle.state
             rate = float(state.background)
@@ -2173,10 +3059,9 @@ class IsotopeParticleFilter:
             device=device,
             dtype=dtype,
         )
-        mu_fe, mu_pb = self.continuous_kernel._mu_values(isotope=self.isotope)
-        shield_params = self.continuous_kernel.shield_params
         det_pos = np.asarray(detector_pos, dtype=float)
-        return gpu_utils.expected_counts_pair_torch(
+        return self.continuous_kernel.expected_counts_pair_for_packed_states_torch(
+            isotope=self.isotope,
             detector_pos=det_pos,
             positions=positions,
             strengths=strengths,
@@ -2184,23 +3069,13 @@ class IsotopeParticleFilter:
             mask=mask,
             fe_index=fe_index,
             pb_index=pb_index,
-            mu_fe=mu_fe,
-            mu_pb=mu_pb,
-            thickness_fe_cm=shield_params.thickness_fe_cm,
-            thickness_pb_cm=shield_params.thickness_pb_cm,
-            inner_radius_fe_cm=shield_params.inner_radius_fe_cm,
-            inner_radius_pb_cm=shield_params.inner_radius_pb_cm,
-            shield_geometry_model=shield_params.shield_geometry_model,
-            use_angle_attenuation=shield_params.use_angle_attenuation,
             live_time_s=live_time_s,
+            source_scale=self._measurement_source_scale(
+                fe_index=fe_index,
+                pb_index=pb_index,
+            ),
             device=device,
             dtype=dtype,
-            source_scale=self._measurement_source_scale(),
-            detector_radius_m=self.continuous_kernel.detector_radius_m,
-            detector_aperture_samples=self.continuous_kernel.detector_aperture_samples,
-            buildup_fe_coeff=shield_params.buildup_fe_coeff,
-            buildup_pb_coeff=shield_params.buildup_pb_coeff,
-            **self._obstacle_gpu_kwargs(),
         )
 
     def _continuous_expected_counts_pair_at_pose(
@@ -2236,6 +3111,10 @@ class IsotopeParticleFilter:
         observation_count_variance: float = 0.0,
         step_idx: int | None = None,
         defer_resample: bool = False,
+        spectrum_counts: NDArray[np.float64] | None = None,
+        spectrum_response_template: NDArray[np.float64] | None = None,
+        spectrum_background: NDArray[np.float64] | None = None,
+        spectrum_variance: NDArray[np.float64] | None = None,
     ) -> None:
         """
         Count-likelihood weight update using Fe/Pb orientation indices.
@@ -2262,6 +3141,28 @@ class IsotopeParticleFilter:
                 live_time_s=live_time_s,
             )
 
+        spectrum_arrays = self._spectrum_update_arrays(
+            spectrum_counts,
+            spectrum_response_template,
+            spectrum_background,
+            spectrum_variance,
+            sequence_length=1,
+        )
+
+        def _spectral_ll_fn() -> "torch.Tensor":
+            """Return direct spectrum-bin likelihood increments for one view."""
+            if spectrum_arrays is None:
+                raise RuntimeError("spectrum_arrays must be available.")
+            observed, template, background, variance = spectrum_arrays
+            lam_t_inner = _lam_fn()
+            return self._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+                lam_t_inner,
+                observed,
+                template,
+                background,
+                variance,
+            )
+
         roughening_scale = 1.0
         disable_regularize = False
         if defer_resample:
@@ -2270,7 +3171,13 @@ class IsotopeParticleFilter:
                 float(self.config.deferred_resample_roughening_scale),
             )
             disable_regularize = roughening_scale <= 0.0
-        if self.config.use_tempering:
+        if self.config.use_tempering and spectrum_arrays is not None:
+            ess_pre, resampled_any = self._tempered_update_likelihood(
+                ll_fn=_spectral_ll_fn,
+                disable_regularize_on_resample=disable_regularize,
+                roughening_scale_on_resample=roughening_scale,
+            )
+        elif self.config.use_tempering:
             debug_timing = _pf_debug_timing_enabled()
             debug_start = time.perf_counter()
             if debug_timing:
@@ -2294,6 +3201,20 @@ class IsotopeParticleFilter:
                     f"resampled={resampled_any} ess={float(ess_pre):.3f}",
                     flush=True,
                 )
+        elif spectrum_arrays is not None:
+            ll_t = _spectral_ll_fn()
+            if ll_t.numel() == 0:
+                ess_pre = 0.0
+            else:
+                logw_prev = self._current_log_weights_torch(ll_t.device)
+                logw = self._normalized_log_weights_torch(logw_prev + ll_t)
+                self._assign_logw_from_torch(logw)
+                ess_pre = self._ess_from_logw_torch(logw)
+            self._maybe_resample_continuous(
+                disable_regularize=disable_regularize,
+                roughening_scale=roughening_scale,
+            )
+            resampled_any = bool(self.last_resample_ess)
         else:
             lam_t = _lam_fn()
             logw = self._update_continuous_weights_gpu(
@@ -2397,15 +3318,22 @@ class IsotopeParticleFilter:
         pb_indices: NDArray[np.int64],
         live_times_s: NDArray[np.float64],
         observation_count_variances: NDArray[np.float64] | None = None,
+        observation_count_covariance: NDArray[np.float64] | None = None,
         step_idx: int | None = None,
+        spectrum_counts: NDArray[np.float64] | None = None,
+        spectrum_response_template: NDArray[np.float64] | None = None,
+        spectrum_background: NDArray[np.float64] | None = None,
+        spectrum_variance: NDArray[np.float64] | None = None,
     ) -> None:
         """
         Jointly update weights using a same-pose shield-orientation sequence.
 
-        The measurement model is the product of conditionally independent count
-        likelihoods for the shield program. Updating them jointly avoids
-        resampling, roughening, or birth/death moves between postures from the
-        same physical station.
+        The measurement model evaluates the shield program as one station-level
+        observation. When covariance is supplied or configured, same-station
+        shield-view correlations are handled by a batched multivariate
+        likelihood; otherwise the update reduces to the product likelihood over
+        views. Updating views jointly avoids resampling, roughening, or
+        birth/death moves between postures from the same physical station.
         """
         if self._should_skip_converged_update():
             self.updates_skipped += 1
@@ -2422,12 +3350,26 @@ class IsotopeParticleFilter:
             var_arr = np.zeros_like(z_arr, dtype=float)
         else:
             var_arr = np.asarray(observation_count_variances, dtype=float).ravel()
+        covariance = None
+        if observation_count_covariance is not None:
+            covariance = np.asarray(observation_count_covariance, dtype=float)
+            if covariance.shape != (z_arr.size, z_arr.size):
+                raise ValueError(
+                    "observation_count_covariance must be shaped K x K."
+                )
         if not (
             z_arr.size == fe_arr.size == pb_arr.size == live_arr.size == var_arr.size
         ):
             raise ValueError("Joint PF update arrays must have matching lengths.")
         if z_arr.size == 0:
             return
+        spectrum_arrays = self._spectrum_update_arrays(
+            spectrum_counts,
+            spectrum_response_template,
+            spectrum_background,
+            spectrum_variance,
+            sequence_length=z_arr.size,
+        )
 
         def _ll_fn() -> "torch.Tensor":
             """Return summed per-particle log-likelihood for the shield sequence."""
@@ -2437,10 +3379,25 @@ class IsotopeParticleFilter:
                 pb_indices=pb_arr,
                 live_times_s=live_arr,
             )
+            if spectrum_arrays is not None:
+                observed, template, background_spectrum, variance = spectrum_arrays
+                spectrum_ll = self._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+                    lam_kn,
+                    observed,
+                    template,
+                    background_spectrum,
+                    variance,
+                )
+                return spectrum_ll + self._shield_shape_sequence_log_likelihood_gpu(
+                    lam_kn,
+                    z_arr,
+                    var_arr,
+                )
             return self._log_likelihood_sequence_gpu(
                 lam_kn,
                 z_arr,
                 var_arr,
+                observation_count_covariance=covariance,
             )
 
         if self.config.use_tempering:
@@ -2577,6 +3534,7 @@ class IsotopeParticleFilter:
         min_particles_per_source: int,
         total_weight: float,
         jitter_sigma_m: float,
+        combine_sources: bool = True,
     ) -> int:
         """Inject bounded report-rescue particles into the continuous PF population."""
         if not self.continuous_particles:
@@ -2590,7 +3548,7 @@ class IsotopeParticleFilter:
             return 0
         pos_arr = pos_arr[finite]
         q_arr = q_arr[finite]
-        if self.config.max_sources is not None:
+        if combine_sources and self.config.max_sources is not None:
             max_sources = max(0, int(self.config.max_sources))
             if max_sources <= 0:
                 return 0
@@ -2657,38 +3615,72 @@ class IsotopeParticleFilter:
             background = self._background_level()
         jitter_sigma = max(0.0, float(jitter_sigma_m))
         strength_log_sigma = min(max(float(self.config.strength_log_sigma), 0.0), 0.25)
-        for local_idx, particle_idx in enumerate(replace_indices):
-            if jitter_sigma > 0.0 and local_idx > 0:
-                jitter = np.random.normal(scale=jitter_sigma, size=pos_arr.shape)
-                pos_new = self._project_positions_to_source_prior(pos_arr + jitter)
-            else:
-                pos_new = pos_arr.copy()
-            if strength_log_sigma > 0.0 and local_idx > 0:
-                q_new = q_arr * np.exp(
-                    np.random.normal(scale=strength_log_sigma, size=q_arr.shape)
-                )
-                if q_max > 0.0:
-                    q_new = np.clip(q_new, q_min, q_max)
-                else:
-                    q_new = np.maximum(q_new, q_min)
-                q_new = np.maximum(q_new, q_min)
-            else:
-                q_new = q_arr.copy()
-            state = IsotopeState(
-                num_sources=source_count,
-                positions=pos_new.astype(float, copy=True),
-                strengths=q_new.astype(float, copy=True),
+        try:
+            base_state = self.best_particle().state.copy()
+        except ValueError:
+            base_state = IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
                 background=background,
-                ages=np.zeros(source_count, dtype=np.int64),
-                low_q_streaks=np.zeros(source_count, dtype=np.int64),
-                support_scores=np.ones(source_count, dtype=float),
-                tentative_sources=np.ones(source_count, dtype=bool),
-                verification_fail_streaks=np.full(
-                    source_count,
-                    quarantine_streak,
-                    dtype=np.int64,
-                ),
             )
+        for local_idx, particle_idx in enumerate(replace_indices):
+            if combine_sources:
+                if jitter_sigma > 0.0 and local_idx > 0:
+                    jitter = np.random.normal(scale=jitter_sigma, size=pos_arr.shape)
+                    pos_new = self._project_positions_to_source_prior(pos_arr + jitter)
+                else:
+                    pos_new = pos_arr.copy()
+                if strength_log_sigma > 0.0 and local_idx > 0:
+                    q_new = q_arr * np.exp(
+                        np.random.normal(scale=strength_log_sigma, size=q_arr.shape)
+                    )
+                    if q_max > 0.0:
+                        q_new = np.clip(q_new, q_min, q_max)
+                    else:
+                        q_new = np.maximum(q_new, q_min)
+                    q_new = np.maximum(q_new, q_min)
+                else:
+                    q_new = q_arr.copy()
+                state = IsotopeState(
+                    num_sources=source_count,
+                    positions=pos_new.astype(float, copy=True),
+                    strengths=q_new.astype(float, copy=True),
+                    background=background,
+                    ages=np.zeros(source_count, dtype=np.int64),
+                    low_q_streaks=np.zeros(source_count, dtype=np.int64),
+                    support_scores=np.ones(source_count, dtype=float),
+                    tentative_sources=np.ones(source_count, dtype=bool),
+                    verification_fail_streaks=np.full(
+                        source_count,
+                        quarantine_streak,
+                        dtype=np.int64,
+                    ),
+                )
+            else:
+                candidate_idx = int(local_idx % source_count)
+                candidate_pos = pos_arr[candidate_idx : candidate_idx + 1].copy()
+                candidate_q = q_arr[candidate_idx : candidate_idx + 1].copy()
+                if jitter_sigma > 0.0 and local_idx > 0:
+                    candidate_pos = self._project_positions_to_source_prior(
+                        candidate_pos
+                        + np.random.normal(scale=jitter_sigma, size=candidate_pos.shape)
+                    )
+                if strength_log_sigma > 0.0 and local_idx > 0:
+                    candidate_q = candidate_q * np.exp(
+                        np.random.normal(scale=strength_log_sigma, size=candidate_q.shape)
+                    )
+                    if q_max > 0.0:
+                        candidate_q = np.clip(candidate_q, q_min, q_max)
+                    else:
+                        candidate_q = np.maximum(candidate_q, q_min)
+                state = self._state_with_single_quarantined_candidate(
+                    base_state,
+                    candidate_pos.reshape(3),
+                    float(candidate_q[0]),
+                    quarantine_streak=quarantine_streak,
+                    background=background,
+                )
             self.continuous_particles[int(particle_idx)] = IsotopeParticle(
                 state=state,
                 log_weight=rescue_log_weight,
@@ -2700,6 +3692,125 @@ class IsotopeParticleFilter:
         self.last_runtime_report_rescue_injected = int(inject_count)
         self.last_runtime_report_rescue_weight = float(rescue_mass)
         return int(inject_count)
+
+    def _state_with_single_quarantined_candidate(
+        self,
+        base_state: IsotopeState,
+        candidate_pos: NDArray[np.float64],
+        candidate_strength: float,
+        *,
+        quarantine_streak: int,
+        background: float,
+    ) -> IsotopeState:
+        """Return a copy of ``base_state`` with one tentative candidate added."""
+        state = base_state.copy()
+        count = max(int(state.num_sources), 0)
+        positions = np.asarray(state.positions, dtype=float).reshape(-1, 3)[:count]
+        strengths = np.asarray(state.strengths, dtype=float).reshape(-1)[:count]
+        ages = self._metadata_vector(state.ages, count, 1, np.int64)
+        low_q = self._metadata_vector(state.low_q_streaks, count, 0, np.int64)
+        support = self._metadata_vector(state.support_scores, count, 1.0, float)
+        tentative = self._metadata_vector(state.tentative_sources, count, False, bool)
+        fail = self._metadata_vector(
+            state.verification_fail_streaks,
+            count,
+            0,
+            np.int64,
+        )
+        candidate = np.asarray(candidate_pos, dtype=float).reshape(1, 3)
+        candidate = self._project_positions_to_source_prior(candidate).reshape(3)
+        candidate_q = max(float(candidate_strength), max(float(self.config.min_strength), 0.0))
+        if float(self.config.birth_q_max) > 0.0:
+            candidate_q = min(candidate_q, float(self.config.birth_q_max))
+        dedup_radius = max(float(getattr(self.config, "birth_global_rescue_dedup_radius_m", 0.0)), 0.0)
+        if count > 0:
+            distances = np.linalg.norm(positions - candidate[None, :], axis=1)
+            nearest = int(np.argmin(distances))
+            if dedup_radius > 0.0 and float(distances[nearest]) <= dedup_radius:
+                positions = positions.copy()
+                strengths = strengths.copy()
+                strengths[nearest] = max(float(strengths[nearest]), candidate_q)
+                tentative = tentative.copy()
+                fail = fail.copy()
+                support = support.copy()
+                tentative[nearest] = True
+                fail[nearest] = max(int(fail[nearest]), int(quarantine_streak))
+                support[nearest] = max(float(support[nearest]), 0.25)
+                return IsotopeState(
+                    num_sources=count,
+                    positions=positions,
+                    strengths=strengths,
+                    background=float(background),
+                    ages=ages,
+                    low_q_streaks=low_q,
+                    support_scores=support,
+                    tentative_sources=tentative,
+                    verification_fail_streaks=fail,
+                )
+        max_sources = None
+        if self.config.max_sources is not None:
+            max_sources = max(0, int(self.config.max_sources))
+        if max_sources is not None and max_sources <= 0:
+            return IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=float(background),
+            )
+        if max_sources is None or count < max_sources:
+            positions = np.vstack([positions, candidate.reshape(1, 3)])
+            strengths = np.concatenate([strengths, np.array([candidate_q], dtype=float)])
+            ages = np.concatenate([ages, np.array([0], dtype=np.int64)])
+            low_q = np.concatenate([low_q, np.array([0], dtype=np.int64)])
+            support = np.concatenate([support, np.array([0.25], dtype=float)])
+            tentative = np.concatenate([tentative, np.array([True], dtype=bool)])
+            fail = np.concatenate(
+                [fail, np.array([int(quarantine_streak)], dtype=np.int64)]
+            )
+        elif count > 0:
+            replace = int(np.argmin(strengths))
+            positions = positions.copy()
+            strengths = strengths.copy()
+            ages = ages.copy()
+            low_q = low_q.copy()
+            support = support.copy()
+            tentative = tentative.copy()
+            fail = fail.copy()
+            positions[replace] = candidate
+            strengths[replace] = candidate_q
+            ages[replace] = 0
+            low_q[replace] = 0
+            support[replace] = 0.25
+            tentative[replace] = True
+            fail[replace] = int(quarantine_streak)
+        count_new = int(strengths.size)
+        return IsotopeState(
+            num_sources=count_new,
+            positions=positions.astype(float, copy=True).reshape(count_new, 3),
+            strengths=strengths.astype(float, copy=True).reshape(count_new),
+            background=float(background),
+            ages=ages.astype(np.int64, copy=True).reshape(count_new),
+            low_q_streaks=low_q.astype(np.int64, copy=True).reshape(count_new),
+            support_scores=support.astype(float, copy=True).reshape(count_new),
+            tentative_sources=tentative.astype(bool, copy=True).reshape(count_new),
+            verification_fail_streaks=fail.astype(np.int64, copy=True).reshape(count_new),
+        )
+
+    @staticmethod
+    def _metadata_vector(
+        values: NDArray[np.float64] | NDArray[np.int64] | NDArray[np.bool_] | None,
+        count: int,
+        default: float | int | bool,
+        dtype: object,
+    ) -> NDArray:
+        """Return a metadata vector with the requested length and dtype."""
+        if values is None:
+            return np.full(count, default, dtype=dtype)
+        arr = np.asarray(values, dtype=dtype).reshape(-1)
+        if arr.size < count:
+            pad = np.full(count - arr.size, default, dtype=dtype)
+            arr = np.concatenate([arr, pad])
+        return arr[:count].astype(dtype, copy=True)
 
     def _runtime_strength_absorption_soft_cap(self) -> float:
         """Return the runtime source-strength soft cap in cps, or zero if disabled."""
@@ -2723,6 +3834,7 @@ class IsotopeParticleFilter:
         weights: NDArray[np.float64],
     ) -> NDArray[np.int64]:
         """Return particle indices that preserve distinct posterior source modes."""
+        self.last_mode_preserving_dynamic_spatial_summary = []
         if not bool(self.config.mode_preserving_resample):
             self.last_mode_preserving_strata_summary = {}
             self.last_mode_preserving_selected_strata = []
@@ -2933,8 +4045,37 @@ class IsotopeParticleFilter:
             selected_clusters.append(cluster_int)
             selected_set.add(cluster_int)
 
+        dynamic_spatial_enabled = bool(
+            getattr(
+                self.config,
+                "mode_preserving_dynamic_spatial_allocation",
+                False,
+            )
+        )
+        dynamic_spatial_extra = max(
+            0,
+            int(
+                getattr(
+                    self.config,
+                    "mode_preserving_dynamic_spatial_extra_particles",
+                    0,
+                )
+            ),
+        )
+        dynamic_spatial_min_fraction = max(
+            0.0,
+            float(
+                getattr(
+                    self.config,
+                    "mode_preserving_dynamic_spatial_min_score_fraction",
+                    0.005,
+                )
+            ),
+        )
         protected: list[int] = []
+        protected_lookup: set[int] = set()
         selected_details: list[dict[str, object]] = []
+        dynamic_spatial_details: list[dict[str, object]] = []
         for cluster_idx in selected_clusters:
             cluster_int = int(cluster_idx)
             label = cluster_labels[cluster_int]
@@ -2976,13 +4117,69 @@ class IsotopeParticleFilter:
             added = 0
             for member_idx in ranked_members:
                 particle_idx = int(particle_arr[member_idx])
-                if particle_idx in protected:
+                if particle_idx in protected_lookup:
                     continue
                 protected.append(particle_idx)
+                protected_lookup.add(particle_idx)
                 protected_for_cluster.append(particle_idx)
                 added += 1
                 if added >= target_per_mode:
                     break
+            dynamic_spatial_added: dict[int, int] = {}
+            dynamic_spatial_active = bool(
+                dynamic_spatial_enabled
+                and dynamic_spatial_extra > 0
+                and (cluster_score / total_score) >= dynamic_spatial_min_fraction
+            )
+            if dynamic_spatial_active:
+                source_counts = sorted(
+                    {
+                        int(
+                            self.continuous_particles[int(particle_arr[member_idx])]
+                            .state
+                            .num_sources
+                        )
+                        for member_idx in ranked_members
+                    }
+                )
+                for source_count in source_counts:
+                    added_for_count = 0
+                    for member_idx in ranked_members:
+                        particle_idx = int(particle_arr[member_idx])
+                        particle_count = int(
+                            self.continuous_particles[particle_idx].state.num_sources
+                        )
+                        if particle_count != int(source_count):
+                            continue
+                        if particle_idx in protected_lookup:
+                            continue
+                        protected.append(particle_idx)
+                        protected_lookup.add(particle_idx)
+                        protected_for_cluster.append(particle_idx)
+                        added_for_count += 1
+                        if added_for_count >= dynamic_spatial_extra:
+                            break
+                    if added_for_count > 0:
+                        dynamic_spatial_added[int(source_count)] = int(added_for_count)
+                if dynamic_spatial_added:
+                    dynamic_spatial_details.append(
+                        {
+                            "surface": str(label[0]),
+                            "height_bin": int(label[1]),
+                            "center": [
+                                float(value)
+                                for value in centers[cluster_int].astype(float)
+                            ],
+                            "score_fraction": cluster_score / total_score,
+                            "extra_per_cardinality": int(dynamic_spatial_extra),
+                            "protected_by_cardinality": {
+                                str(key): int(value)
+                                for key, value in sorted(
+                                    dynamic_spatial_added.items()
+                                )
+                            },
+                        }
+                    )
             selected_details.append(
                 {
                     "surface": str(label[0]),
@@ -2995,8 +4192,14 @@ class IsotopeParticleFilter:
                     "protected_particles": protected_for_cluster,
                     "protected_count": int(len(protected_for_cluster)),
                     "accepted": True,
+                    "dynamic_spatial_protected": bool(dynamic_spatial_active),
+                    "dynamic_spatial_counts": {
+                        str(key): int(value)
+                        for key, value in sorted(dynamic_spatial_added.items())
+                    },
                 }
             )
+        self.last_mode_preserving_dynamic_spatial_summary = dynamic_spatial_details
         cardinality_details: list[dict[str, object]] = []
         self.last_mode_preserving_cardinality_summary = {}
         self.last_mode_preserving_selected_cardinalities = []
@@ -3011,6 +4214,70 @@ class IsotopeParticleFilter:
                     )
                 ),
             )
+            external_cardinalities = set()
+            if bool(
+                getattr(
+                    self.config,
+                    "mode_preserving_report_cardinality_strata",
+                    True,
+                )
+            ):
+                external_cardinalities = set(
+                    int(value)
+                    for value in getattr(
+                        self,
+                        "_external_protected_cardinalities",
+                        set(),
+                    )
+                    if int(value) >= 0
+                )
+            extra_per_external = max(
+                0,
+                int(
+                    getattr(
+                        self.config,
+                        "mode_preserving_report_cardinality_extra_particles",
+                        0,
+                    )
+                ),
+            )
+            dynamic_cardinality = bool(
+                getattr(
+                    self.config,
+                    "mode_preserving_dynamic_cardinality_allocation",
+                    False,
+                )
+            )
+            dynamic_extra = max(
+                0,
+                int(
+                    getattr(
+                        self.config,
+                        "mode_preserving_dynamic_cardinality_extra_particles",
+                        0,
+                    )
+                ),
+            )
+            dynamic_min_mass = max(
+                0.0,
+                float(
+                    getattr(
+                        self.config,
+                        "mode_preserving_dynamic_cardinality_min_mass",
+                        0.02,
+                    )
+                ),
+            )
+            dynamic_entropy_min = max(
+                0.0,
+                float(
+                    getattr(
+                        self.config,
+                        "mode_preserving_dynamic_cardinality_entropy_min",
+                        0.5,
+                    )
+                ),
+            )
             if min_per_cardinality > 0:
                 particle_counts = np.asarray(
                     [
@@ -3022,18 +4289,46 @@ class IsotopeParticleFilter:
                 particle_weights = np.asarray(weights, dtype=float).reshape(-1)
                 total_mass = max(float(np.sum(particle_weights)), 1.0e-300)
                 protected_lookup = set(int(value) for value in protected)
-                for source_count in sorted(set(int(value) for value in particle_counts)):
+                source_counts = sorted(set(int(value) for value in particle_counts))
+                mass_by_count: dict[int, float] = {}
+                for source_count in source_counts:
+                    member_indices = np.flatnonzero(particle_counts == source_count)
+                    mass_by_count[int(source_count)] = (
+                        float(np.sum(particle_weights[member_indices])) / total_mass
+                    )
+                mass_arr = np.asarray(list(mass_by_count.values()), dtype=float)
+                positive_mass = mass_arr[mass_arr > 0.0]
+                cardinality_entropy = 0.0
+                if positive_mass.size > 1:
+                    cardinality_entropy = float(
+                        -np.sum(positive_mass * np.log(positive_mass))
+                    )
+                dynamic_active = bool(
+                    dynamic_cardinality
+                    and dynamic_extra > 0
+                    and cardinality_entropy >= dynamic_entropy_min
+                )
+                for source_count in source_counts:
                     member_indices = np.flatnonzero(particle_counts == source_count)
                     if member_indices.size == 0:
                         continue
-                    mass = float(np.sum(particle_weights[member_indices]))
+                    mass_fraction = mass_by_count[int(source_count)]
                     self.last_mode_preserving_cardinality_summary[
                         str(int(source_count))
-                    ] = mass / total_mass
+                    ] = mass_fraction
                     ranked = member_indices[
                         np.argsort(particle_weights[member_indices])[::-1]
                     ]
                     protected_for_count: list[int] = []
+                    externally_protected = int(source_count) in external_cardinalities
+                    target_for_count = min_per_cardinality + (
+                        extra_per_external if externally_protected else 0
+                    )
+                    dynamically_protected = bool(
+                        dynamic_active and mass_fraction >= dynamic_min_mass
+                    )
+                    if dynamically_protected:
+                        target_for_count += dynamic_extra
                     for particle_idx in ranked:
                         idx_int = int(particle_idx)
                         if idx_int in protected_lookup:
@@ -3041,13 +4336,17 @@ class IsotopeParticleFilter:
                         protected.append(idx_int)
                         protected_lookup.add(idx_int)
                         protected_for_count.append(idx_int)
-                        if len(protected_for_count) >= min_per_cardinality:
+                        if len(protected_for_count) >= target_for_count:
                             break
                     cardinality_details.append(
                         {
                             "num_sources": int(source_count),
-                            "mass_fraction": mass / total_mass,
+                            "mass_fraction": mass_fraction,
                             "member_count": int(member_indices.size),
+                            "externally_protected": bool(externally_protected),
+                            "dynamically_protected": bool(dynamically_protected),
+                            "cardinality_entropy": cardinality_entropy,
+                            "target_protected_count": int(target_for_count),
                             "protected_particles": protected_for_count,
                             "protected_count": int(len(protected_for_count)),
                         }
@@ -3097,31 +4396,6 @@ class IsotopeParticleFilter:
             idx[slot] = int(value)
         self.last_mode_preserved_count += int(len(replace_slots))
         return idx
-
-    @staticmethod
-    def _systematic_resample_count(
-        weights: NDArray[np.float64],
-        *,
-        count: int,
-    ) -> NDArray[np.int64]:
-        """Draw ``count`` systematic samples from normalized positive weights."""
-        n_draws = max(0, int(count))
-        if n_draws <= 0:
-            return np.zeros(0, dtype=np.int64)
-        w = np.asarray(weights, dtype=np.float64)
-        if w.size == 0:
-            return np.zeros(0, dtype=np.int64)
-        total = float(np.sum(w))
-        if not np.isfinite(total) or total <= 0.0:
-            w = np.full(w.size, 1.0 / float(w.size), dtype=np.float64)
-        else:
-            w = w / total
-        positions = (np.arange(n_draws, dtype=np.float64) + np.random.uniform()) / float(
-            n_draws
-        )
-        cumulative = np.cumsum(w)
-        cumulative[-1] = 1.0
-        return np.searchsorted(cumulative, positions, side="left").astype(np.int64)
 
     def _cardinality_preserving_resample_draw(
         self,
@@ -3199,7 +4473,7 @@ class IsotopeParticleFilter:
             if group_idx.size == 0 or count <= 0:
                 continue
             local_w = w[group_idx]
-            local_draw = self._systematic_resample_count(local_w, count=int(count))
+            local_draw = systematic_resample_count(local_w, count=int(count))
             selected = group_idx[local_draw]
             if protected_arr.size:
                 valid_protected = protected_arr[
@@ -3293,7 +4567,14 @@ class IsotopeParticleFilter:
             post_w = np.asarray(self.continuous_weights, dtype=np.float64)
             self.last_ess_post = float(1.0 / max(np.sum(post_w**2), 1.0e-12))
             roughening_scale = max(0.0, float(roughening_scale))
-            if not disable_regularize and roughening_scale > 0.0:
+            surface_rejuvenation = bool(
+                getattr(self.config, "surface_rejuvenation_enable", True)
+            )
+            if (
+                surface_rejuvenation
+                and not disable_regularize
+                and roughening_scale > 0.0
+            ):
                 mult = self._roughening_multiplier()
                 sigma_pos = (
                     self._roughening_sigma_pos(len(self.continuous_particles))
@@ -3895,7 +5176,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         background_counts = float(st.background) * data.live_times
         lambda_total = background_counts + np.sum(lambda_m, axis=1)
@@ -3971,6 +5255,33 @@ class IsotopeParticleFilter:
                 for idx in particle_indices
             ]
         )
+        source_rows = sources.reshape(particle_count, count, 3)
+        strength_rows = strengths.reshape(particle_count, count)
+        if (
+            particle_count > 1
+            and np.array_equal(source_rows, source_rows[:1])
+            and np.array_equal(strength_rows, strength_rows[:1])
+        ):
+            lambda_one = expected_counts_per_source(
+                kernel=self.continuous_kernel,
+                isotope=self.isotope,
+                detector_positions=data.detector_positions,
+                sources=source_rows[0],
+                strengths=strength_rows[0],
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+                source_scale=self._measurement_source_scale_vector(
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
+            )
+            lambda_m = np.broadcast_to(
+                np.asarray(lambda_one, dtype=float)[:, None, :],
+                (num_meas, particle_count, count),
+            ).copy()
+            lambda_total = background_counts + np.sum(lambda_m, axis=2)
+            return lambda_m, lambda_total
         lambda_flat = expected_counts_per_source(
             kernel=self.continuous_kernel,
             isotope=self.isotope,
@@ -3980,7 +5291,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         lambda_m = np.asarray(lambda_flat, dtype=float).reshape(
             num_meas,
@@ -4051,7 +5365,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         k_tensor = np.asarray(k_flat, dtype=float).reshape(
             num_meas,
@@ -4232,7 +5549,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         base_support_mask = self._birth_candidate_support_mask(
             candidate_counts=base_candidate_counts,
@@ -4284,7 +5604,10 @@ class IsotopeParticleFilter:
                     live_times=data.live_times,
                     fe_indices=data.fe_indices,
                     pb_indices=data.pb_indices,
-                    source_scale=self._measurement_source_scale(),
+                    source_scale=self._measurement_source_scale_vector(
+                        data.fe_indices,
+                        data.pb_indices,
+                    ),
                 )
                 candidate_counts = np.hstack([candidate_counts, jitter_counts])
                 candidates = np.vstack([candidates, jittered])
@@ -4442,7 +5765,10 @@ class IsotopeParticleFilter:
                 live_times=data.live_times,
                 fe_indices=data.fe_indices,
                 pb_indices=data.pb_indices,
-                source_scale=self._measurement_source_scale(),
+                source_scale=self._measurement_source_scale_vector(
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
             )
             lambda_group = np.asarray(lambda_flat, dtype=float).reshape(
                 int(data.z_k.size),
@@ -4569,7 +5895,10 @@ class IsotopeParticleFilter:
                     live_times=data.live_times,
                     fe_indices=data.fe_indices,
                     pb_indices=data.pb_indices,
-                    source_scale=self._measurement_source_scale(),
+                    source_scale=self._measurement_source_scale_vector(
+                        data.fe_indices,
+                        data.pb_indices,
+                    ),
                 )
                 lambda_total = background_counts + np.sum(lambda_m, axis=1)
             else:
@@ -4880,7 +6209,10 @@ class IsotopeParticleFilter:
                 live_times=data.live_times,
                 fe_indices=data.fe_indices,
                 pb_indices=data.pb_indices,
-                source_scale=self._measurement_source_scale(),
+                source_scale=self._measurement_source_scale_vector(
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
             )
             for col_idx in range(counts.shape[1]):
                 columns.append(np.asarray(counts[:, col_idx], dtype=float))
@@ -4933,7 +6265,10 @@ class IsotopeParticleFilter:
                 live_times=data.live_times,
                 fe_indices=data.fe_indices,
                 pb_indices=data.pb_indices,
-                source_scale=self._measurement_source_scale(),
+                source_scale=self._measurement_source_scale_vector(
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
             )
             group_counts = np.asarray(flat_counts, dtype=float).reshape(
                 int(data.z_k.size),
@@ -5250,7 +6585,10 @@ class IsotopeParticleFilter:
                     live_times=data.live_times,
                     fe_indices=data.fe_indices,
                     pb_indices=data.pb_indices,
-                    source_scale=self._measurement_source_scale(),
+                    source_scale=self._measurement_source_scale_vector(
+                        data.fe_indices,
+                        data.pb_indices,
+                    ),
                 )
                 k_tensor = np.asarray(k_flat, dtype=float).reshape(
                     int(data.z_k.size),
@@ -6339,7 +7677,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         k_mat = np.asarray(k_mat, dtype=float)
         if k_mat.shape != (int(data.z_k.size), num_sources):
@@ -6588,7 +7929,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         num_meas = int(data.z_k.size)
         particle_count = int(len(particle_indices))
@@ -7038,6 +8382,67 @@ class IsotopeParticleFilter:
         ).copy()
         target.num_sources = int(target.positions.shape[0])
 
+    def sync_particles_to_evidence_sources(
+        self,
+        positions: NDArray[np.float64],
+        strengths: NDArray[np.float64],
+        data: MeasurementData | None = None,
+    ) -> int:
+        """
+        Project all particles onto authoritative sparse-evidence source slots.
+
+        The sparse evidence layer is the model-order authority.  Once it has a
+        decisive cardinality, PF particles keep their role as continuous
+        trackers by adopting the evidence-selected source slots instead of
+        running birth/death/split/merge proposals that can reintroduce rejected
+        cardinalities.
+        """
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
+        q_arr = np.maximum(
+            np.asarray(strengths, dtype=float).reshape(-1),
+            0.0,
+        )
+        if pos_arr.shape[0] != q_arr.size:
+            raise ValueError("evidence positions and strengths must have matching rows.")
+        target_count = int(pos_arr.shape[0])
+        changed = 0
+        for particle in self.continuous_particles:
+            st = particle.state
+            current_count = int(st.num_sources)
+            current_pos = np.asarray(st.positions[:current_count], dtype=float).reshape(
+                -1,
+                3,
+            )
+            current_q = np.asarray(st.strengths[:current_count], dtype=float).reshape(-1)
+            same_state = (
+                current_count == target_count
+                and current_pos.shape == pos_arr.shape
+                and current_q.shape == q_arr.shape
+                and np.allclose(current_pos, pos_arr, rtol=0.0, atol=1.0e-12)
+                and np.allclose(current_q, q_arr, rtol=1.0e-12, atol=1.0e-12)
+            )
+            if not same_state:
+                changed += 1
+            st.positions = pos_arr.copy()
+            st.strengths = q_arr.copy()
+            st.num_sources = target_count
+            st.covariances = None
+            st.ages = np.zeros(target_count, dtype=int)
+            st.low_q_streaks = np.zeros(target_count, dtype=int)
+            st.support_scores = np.zeros(target_count, dtype=float)
+            st.tentative_sources = np.zeros(target_count, dtype=bool)
+            st.verification_fail_streaks = np.zeros(target_count, dtype=int)
+        if data is not None and data.z_k.size > 0:
+            self.refresh_weights_from_measurements(data)
+        self.align_continuous_labels()
+        self.last_structural_timing_s = {
+            "total": 0.0,
+            "sparse_evidence_particle_sync": 1.0,
+            "sparse_evidence_synced_particles": float(changed),
+            "sparse_evidence_selected_count": float(target_count),
+        }
+        return int(changed)
+
     def _trial_log_likelihood(
         self,
         st: IsotopeState,
@@ -7084,7 +8489,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         return np.asarray(counts, dtype=float)
 
@@ -7138,6 +8546,80 @@ class IsotopeParticleFilter:
         trial_lambda = np.asarray(lambda_total[:, 0], dtype=float)
         ll_after = self._trial_log_likelihood_from_lambda(data, trial_lambda)
         return trial_strengths, trial_lambda, float(ll_after)
+
+    def _orthogonalized_residual_candidate_indices(
+        self,
+        ranked_candidate_indices: NDArray[np.int64],
+        *,
+        candidate_counts: NDArray[np.float64],
+        existing_response_counts: NDArray[np.float64],
+        observation_variances: NDArray[np.float64] | None,
+        max_corr: float,
+    ) -> NDArray[np.int64]:
+        """
+        Return residual-birth candidates after response-column orthogonalization.
+
+        Matching-pursuit birth evaluates only a tiny pre-ranked candidate set,
+        so the greedy Gram-Schmidt-style loop here is bounded by the configured
+        top-k candidate count. The heavy response evaluation and likelihood
+        refit remain batched; this helper only prevents multiple nearly
+        collinear response columns from entering the same birth proposal set.
+        """
+        ranked = np.asarray(ranked_candidate_indices, dtype=int).ravel()
+        if ranked.size <= 1:
+            return ranked.astype(np.int64, copy=False)
+        counts = np.asarray(candidate_counts, dtype=float)
+        if counts.ndim != 2:
+            return ranked.astype(np.int64, copy=False)
+        valid_ranked = ranked[(ranked >= 0) & (ranked < counts.shape[1])]
+        if valid_ranked.size <= 1:
+            return valid_ranked.astype(np.int64, copy=False)
+        corr_limit = float(np.clip(float(max_corr), 0.0, 1.0))
+        if corr_limit >= 1.0:
+            return valid_ranked.astype(np.int64, copy=False)
+        if observation_variances is None:
+            scale = np.ones(counts.shape[0], dtype=float)
+        else:
+            variances = np.asarray(observation_variances, dtype=float).reshape(-1)
+            if variances.size != counts.shape[0]:
+                scale = np.ones(counts.shape[0], dtype=float)
+            else:
+                scale = 1.0 / np.sqrt(np.maximum(variances, 1.0e-12))
+
+        def _normalized_columns(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Return variance-whitened unit-norm response columns."""
+            arr = np.asarray(matrix, dtype=float)
+            if arr.ndim != 2 or arr.shape[0] != counts.shape[0] or arr.shape[1] == 0:
+                return np.zeros((counts.shape[0], 0), dtype=float)
+            whitened = arr * scale[:, None]
+            norms = np.linalg.norm(whitened, axis=0)
+            keep = norms > 1.0e-12
+            if not np.any(keep):
+                return np.zeros((counts.shape[0], 0), dtype=float)
+            return whitened[:, keep] / norms[keep][None, :]
+
+        basis = _normalized_columns(existing_response_counts)
+        candidate_basis = _normalized_columns(counts[:, valid_ranked])
+        if candidate_basis.shape[1] != valid_ranked.size:
+            return valid_ranked.astype(np.int64, copy=False)
+        selected: list[int] = []
+        selected_columns: list[NDArray[np.float64]] = []
+        for local_idx, candidate_idx in enumerate(valid_ranked.tolist()):
+            column = candidate_basis[:, int(local_idx)]
+            if basis.size:
+                corr_existing = float(np.max(np.abs(basis.T @ column)))
+                if corr_existing > corr_limit:
+                    continue
+            if selected_columns:
+                selected_matrix = np.column_stack(selected_columns)
+                corr_selected = float(np.max(np.abs(selected_matrix.T @ column)))
+                if corr_selected > corr_limit:
+                    continue
+            selected.append(int(candidate_idx))
+            selected_columns.append(column)
+        if not selected:
+            return valid_ranked[:1].astype(np.int64, copy=False)
+        return np.asarray(selected, dtype=np.int64)
 
     def _best_cached_matching_pursuit_birth_trial_batched(
         self,
@@ -7723,7 +9205,10 @@ class IsotopeParticleFilter:
                 live_times=data.live_times,
                 fe_indices=data.fe_indices,
                 pb_indices=data.pb_indices,
-                source_scale=self._measurement_source_scale(),
+                source_scale=self._measurement_source_scale_vector(
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
             )
         else:
             unit_counts_all = np.asarray(candidate_unit_counts, dtype=float)
@@ -7869,6 +9354,14 @@ class IsotopeParticleFilter:
                 break
             ranked = np.flatnonzero(valid)
             ranked = ranked[np.argsort(scores[ranked])[::-1][:topk]]
+            if bool(self.config.birth_orthogonalize_residual_candidates):
+                ranked = self._orthogonalized_residual_candidate_indices(
+                    ranked.astype(np.int64, copy=False),
+                    candidate_counts=unit_counts_all,
+                    existing_response_counts=existing_counts,
+                    observation_variances=data.observation_variances,
+                    max_corr=float(self.config.birth_orthogonal_candidate_corr_max),
+                )
             base_ll = self._trial_log_likelihood_from_lambda(data, lambda_total)
             best_trial: IsotopeState | None = None
             best_delta = -np.inf
@@ -7957,6 +9450,7 @@ class IsotopeParticleFilter:
                 )
             global_forced_proposal = (
                 global_rescue
+                and bool(self.config.birth_global_rescue_force_proposal_on_gate)
                 and np.isfinite(best_delta)
                 and best_delta
                 >= float(self.config.birth_global_rescue_forced_min_delta_ll)
@@ -8092,7 +9586,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         return np.asarray(counts, dtype=float)
 
@@ -8615,7 +10112,10 @@ class IsotopeParticleFilter:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale(),
+            source_scale=self._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
         )
         trial_count = int(len(trials))
         merged_unit_counts = np.asarray(merged_unit_counts, dtype=float)
@@ -9251,6 +10751,7 @@ class IsotopeParticleFilter:
         candidate_positions: NDArray[np.float64] | None = None,
         global_birth_candidates: NDArray[np.float64] | None = None,
         global_birth_candidate_counts: NDArray[np.float64] | None = None,
+        allow_structural_birth_proposals: bool = True,
     ) -> None:
         """
         Apply hysteretic death, residual-driven birth, and split/merge proposals.
@@ -9279,10 +10780,11 @@ class IsotopeParticleFilter:
         if structural_data is None or structural_data.z_k.size == 0:
             self._reset_structural_residual_gate()
             return
+        proposal_enabled = bool(allow_structural_birth_proposals)
         min_distinct = max(1, int(self.config.birth_min_distinct_poses))
         min_stations = max(1, int(self.config.birth_min_distinct_stations))
         global_candidates = np.zeros((0, 3), dtype=float)
-        if global_birth_candidates is not None:
+        if proposal_enabled and global_birth_candidates is not None:
             global_candidates = np.asarray(global_birth_candidates, dtype=float).reshape(
                 -1,
                 3,
@@ -9349,7 +10851,7 @@ class IsotopeParticleFilter:
                 for particle in self.continuous_particles
             )
         birth_proposal = None
-        if birth_capacity_available:
+        if proposal_enabled and birth_capacity_available:
             if bool(regular_structural_support_ready):
                 birth_start = time.perf_counter()
                 birth_proposal = self._compute_birth_proposal(
@@ -9415,6 +10917,8 @@ class IsotopeParticleFilter:
                 proposal_data,
             )
         global_birth_rescue_active = (
+            proposal_enabled
+            and
             bool(self.config.birth_global_rescue_enable)
             and proposal_data is not None
             and proposal_data.z_k.size > 0
@@ -9441,7 +10945,10 @@ class IsotopeParticleFilter:
                     live_times=proposal_data.live_times,
                     fe_indices=proposal_data.fe_indices,
                     pb_indices=proposal_data.pb_indices,
-                    source_scale=self._measurement_source_scale(),
+                    source_scale=self._measurement_source_scale_vector(
+                        proposal_data.fe_indices,
+                        proposal_data.pb_indices,
+                    ),
                 )
         split_candidates_for_trial = birth_candidates
         split_candidate_counts_for_trial = birth_candidate_counts
@@ -9819,6 +11326,8 @@ class IsotopeParticleFilter:
                 timing["prune"] += time.perf_counter() - prune_start
 
             can_try_split = (
+                proposal_enabled
+                and
                 allow_structural_proposal
                 and st.num_sources > 0
                 and proposal_data is not None
@@ -9911,7 +11420,10 @@ class IsotopeParticleFilter:
                                         live_times=proposal_data.live_times,
                                         fe_indices=proposal_data.fe_indices,
                                         pb_indices=proposal_data.pb_indices,
-                                        source_scale=self._measurement_source_scale(),
+                                        source_scale=self._measurement_source_scale_vector(
+                                            proposal_data.fe_indices,
+                                            proposal_data.pb_indices,
+                                        ),
                                     )
                                     lambda_new = (
                                         split_lambda_total
@@ -10009,6 +11521,8 @@ class IsotopeParticleFilter:
                 timing["split"] += time.perf_counter() - split_start
 
             if (
+                proposal_enabled
+                and
                 allow_structural_proposal
                 and not suppress_death
                 and st.num_sources >= 2
@@ -10038,6 +11552,8 @@ class IsotopeParticleFilter:
                     moved = True
 
             if (
+                proposal_enabled
+                and
                 allow_structural_proposal
                 and global_birth_rescue_active
                 and proposal_data is not None
@@ -10072,6 +11588,8 @@ class IsotopeParticleFilter:
                     moved = True
 
             if (
+                proposal_enabled
+                and
                 allow_structural_proposal
                 and not global_birth_moved
                 and birth_probs is not None
@@ -10272,6 +11790,8 @@ class IsotopeParticleFilter:
             for key, value in timing.items()
             if float(value) > 0.0 or key == "total"
         }
+        if not proposal_enabled:
+            self.last_structural_timing_s["birth_proposals_gated"] = 1.0
 
     def _background_level(self) -> float:
         """Resolve per-isotope background level."""

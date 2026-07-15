@@ -1,4 +1,5 @@
 #include <G4Box.hh>
+#include <G4EmCalculator.hh>
 #include <G4EmStandardPhysics_option4.hh>
 #include <G4Event.hh>
 #include <G4Gamma.hh>
@@ -221,10 +222,24 @@ struct EnergyDeposit {
     double weight = 1.0;
 };
 
+enum class DetectorEntryClass {
+    kUncollidedPrimary = 0,
+    kInteractedPrimary = 1,
+    kSecondary = 2,
+};
+
 struct WeightedEventDeposit {
     double edep_mev = 0.0;
     double weight = 1.0;
+    DetectorEntryClass entry_class = DetectorEntryClass::kUncollidedPrimary;
 };
+
+DetectorEntryClass MergeDetectorEntryClass(
+    const DetectorEntryClass current,
+    const DetectorEntryClass incoming
+) {
+    return static_cast<int>(incoming) > static_cast<int>(current) ? incoming : current;
+}
 
 std::string NormalizeToken(const std::string& token) {
     std::string result = token;
@@ -439,6 +454,54 @@ double InverseSquareScale(
     return 1.0 / distance_sq;
 }
 
+double SphereSolidAngleFraction(const double distance_m, const double radius_m) {
+    const double radius = std::max(0.0, radius_m);
+    if (radius <= 0.0) {
+        return 0.0;
+    }
+    if (distance_m <= radius) {
+        return 0.5;
+    }
+    const double ratio = std::clamp(radius / std::max(distance_m, 1.0e-12), 0.0, 1.0);
+    return 0.5 * (1.0 - std::sqrt(std::max(0.0, 1.0 - ratio * ratio)));
+}
+
+double DetectorCpsGeometryScale(
+    const double source_x,
+    const double source_y,
+    const double source_z,
+    const double detector_x,
+    const double detector_y,
+    const double detector_z,
+    const DetectorSpec& detector
+) {
+    const double dx = detector_x - source_x;
+    const double dy = detector_y - source_y;
+    const double dz = detector_z - source_z;
+    const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance <= 1.0e-12) {
+        return 0.0;
+    }
+    const double radius = std::max(0.0, detector.crystal_radius_m);
+    if (radius <= 0.0) {
+        return InverseSquareScale(
+            source_x,
+            source_y,
+            source_z,
+            detector_x,
+            detector_y,
+            detector_z
+        );
+    }
+    const double reference_distance = std::max(1.0, radius);
+    const double reference_fraction = std::max(
+        SphereSolidAngleFraction(reference_distance, radius),
+        1.0e-12
+    );
+    return SphereSolidAngleFraction(std::max(distance, radius), radius)
+        / reference_fraction;
+}
+
 double DetectorReferenceAcceptance(const DetectorSpec& detector) {
     constexpr double kReferenceDistanceM = 1.0;
     constexpr double kPi = 3.14159265358979323846;
@@ -629,6 +692,54 @@ std::array<double, 3> ShieldNormalFromPose(const PoseSpec& pose) {
     return {normal[0] / mag, normal[1] / mag, normal[2] / mag};
 }
 
+std::array<std::array<double, 3>, 3> ShieldAxesFromPose(const PoseSpec& pose) {
+    const double norm = std::sqrt(
+        pose.qw * pose.qw + pose.qx * pose.qx + pose.qy * pose.qy + pose.qz * pose.qz
+    );
+    if (norm <= 1.0e-12) {
+        return {{
+            {1.0, 0.0, 0.0},
+            {0.0, 1.0, 0.0},
+            {0.0, 0.0, 1.0}
+        }};
+    }
+    const double w = pose.qw / norm;
+    const double x = pose.qx / norm;
+    const double y = pose.qy / norm;
+    const double z = pose.qz / norm;
+    const double r00 = 1.0 - 2.0 * (y * y + z * z);
+    const double r01 = 2.0 * (x * y - z * w);
+    const double r02 = 2.0 * (x * z + y * w);
+    const double r10 = 2.0 * (x * y + z * w);
+    const double r11 = 1.0 - 2.0 * (x * x + z * z);
+    const double r12 = 2.0 * (y * z - x * w);
+    const double r20 = 2.0 * (x * z - y * w);
+    const double r21 = 2.0 * (y * z + x * w);
+    const double r22 = 1.0 - 2.0 * (x * x + y * y);
+    return {{
+        {r00, r10, r20},
+        {r01, r11, r21},
+        {r02, r12, r22}
+    }};
+}
+
+void AddShieldAxisMetadata(
+    SimulationResult& result,
+    const std::string& prefix,
+    const PoseSpec& pose
+) {
+    const auto axes = ShieldAxesFromPose(pose);
+    const std::array<std::string, 3> names = {"x", "y", "z"};
+    const std::array<std::string, 3> components = {"x", "y", "z"};
+    for (std::size_t axis = 0; axis < axes.size(); ++axis) {
+        for (std::size_t component = 0; component < axes[axis].size(); ++component) {
+            result.metadata[
+                prefix + "_shield_axis_" + names[axis] + "_" + components[component]
+            ] = std::to_string(axes[axis][component]);
+        }
+    }
+}
+
 int SignWithTolerance(const double value, const double tolerance = 1.0e-6) {
     if (std::abs(value) < tolerance) {
         return 0;
@@ -733,6 +844,180 @@ std::string NormalizeMaterialName(std::string value) {
     return value;
 }
 
+std::string EnergyMetadataToken(const double energy_keV) {
+    std::ostringstream stream;
+    stream << "e" << std::fixed << std::setprecision(1) << energy_keV;
+    std::string token = stream.str();
+    for (char& ch : token) {
+        if (ch == '.') {
+            ch = 'p';
+        }
+    }
+    return token;
+}
+
+std::string MaterialSpecName(const MaterialSpec& material) {
+    const std::string raw = material.name.empty() ? material.preset_name : material.name;
+    return NormalizeMaterialName(raw.empty() ? "air" : raw);
+}
+
+std::string CompositionCacheKey(const std::map<std::string, double>& composition_by_mass) {
+    std::ostringstream stream;
+    bool first = true;
+    for (const auto& item : composition_by_mass) {
+        if (!first) {
+            stream << ";";
+        }
+        first = false;
+        stream << item.first << ":" << std::setprecision(12) << item.second;
+    }
+    return stream.str();
+}
+
+G4Material* ResolveAttenuationMaterial(
+    const MaterialSpec& material,
+    const std::string& fallback_name
+) {
+    const std::string normalized_name = NormalizeMaterialName(
+        MaterialSpecName(material).empty() ? fallback_name : MaterialSpecName(material)
+    );
+    auto* nist = G4NistManager::Instance();
+    if (normalized_name == "air") {
+        return nist->FindOrBuildMaterial("G4_AIR");
+    }
+    if (normalized_name == "concrete") {
+        return nist->FindOrBuildMaterial("G4_CONCRETE");
+    }
+    if (normalized_name == "aluminum") {
+        return nist->FindOrBuildMaterial("G4_Al");
+    }
+    if (normalized_name == "iron") {
+        return nist->FindOrBuildMaterial("G4_Fe");
+    }
+    if (normalized_name == "lead") {
+        return nist->FindOrBuildMaterial("G4_Pb");
+    }
+    if (normalized_name == "water") {
+        return nist->FindOrBuildMaterial("G4_WATER");
+    }
+
+    std::map<std::string, double> composition = material.composition_by_mass;
+    if (composition.empty()) {
+        const auto presets = PresetCompositionByMass();
+        const auto preset_it = presets.find(normalized_name);
+        if (preset_it != presets.end()) {
+            composition = preset_it->second;
+        }
+    }
+    if (composition.empty()) {
+        return nist->FindOrBuildMaterial("G4_AIR");
+    }
+
+    const double density_g_cm3 = material.density_g_cm3 > 0.0
+        ? material.density_g_cm3
+        : PresetDensity(normalized_name);
+    const std::string key = normalized_name
+        + "|rho=" + std::to_string(density_g_cm3)
+        + "|comp=" + CompositionCacheKey(composition);
+    static std::mutex cache_mutex;
+    static std::map<std::string, G4Material*> cache;
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto cached = cache.find(key);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+    auto* resolved = new G4Material(
+        "Attenuation_" + SanitizeMetadataToken(normalized_name)
+            + "_" + std::to_string(cache.size()),
+        density_g_cm3 * g / cm3,
+        static_cast<G4int>(composition.size())
+    );
+    for (const auto& item : composition) {
+        resolved->AddElement(nist->FindOrBuildElement(item.first), item.second);
+    }
+    cache[key] = resolved;
+    return resolved;
+}
+
+double Geant4GammaMuCmInv(G4Material* material, const double energy_keV) {
+    if (material == nullptr || energy_keV <= 0.0) {
+        return 0.0;
+    }
+    G4EmCalculator calculator;
+    const double length = calculator.ComputeGammaAttenuationLength(
+        energy_keV * keV,
+        material
+    );
+    if (!std::isfinite(length) || length <= 0.0) {
+        return 0.0;
+    }
+    const double length_cm = length / cm;
+    if (!std::isfinite(length_cm) || length_cm <= 0.0) {
+        return 0.0;
+    }
+    return 1.0 / length_cm;
+}
+
+void AddMaterialMuMetadata(
+    SimulationResult& result,
+    const std::string& material_token,
+    G4Material* material,
+    const std::set<std::string>& isotopes
+) {
+    const std::string clean_material = SanitizeMetadataToken(material_token);
+    for (const auto& isotope : isotopes) {
+        for (const auto& line : GammaLinesForIsotope(isotope)) {
+            const std::string energy_token = EnergyMetadataToken(line.energy_keV);
+            const double mu_cm_inv = Geant4GammaMuCmInv(material, line.energy_keV);
+            const std::string base = "geant4_mu_cm_inv_"
+                + clean_material + "_" + SanitizeMetadataToken(isotope)
+                + "_" + energy_token;
+            result.metadata[base] = std::to_string(mu_cm_inv);
+        }
+    }
+}
+
+void AddGeant4MaterialMuMetadata(SimulationResult& result, const SceneSpec& scene) {
+    std::set<std::string> isotopes;
+    for (const auto& source : scene.sources) {
+        if (!source.isotope.empty()) {
+            isotopes.insert(source.isotope);
+        }
+    }
+    if (isotopes.empty()) {
+        return;
+    }
+    AddMaterialMuMetadata(
+        result,
+        "shield_fe",
+        ResolveAttenuationMaterial(scene.fe_shield.material, "iron"),
+        isotopes
+    );
+    AddMaterialMuMetadata(
+        result,
+        "shield_pb",
+        ResolveAttenuationMaterial(scene.pb_shield.material, "lead"),
+        isotopes
+    );
+    std::set<std::string> emitted_materials;
+    for (const auto& volume : scene.volumes) {
+        if (volume.transport_mode != "geant4") {
+            continue;
+        }
+        const std::string material_name = MaterialSpecName(volume.material);
+        if (material_name.empty() || emitted_materials.count(material_name) > 0) {
+            continue;
+        }
+        emitted_materials.insert(material_name);
+        AddMaterialMuMetadata(
+            result,
+            "obstacle_" + material_name,
+            ResolveAttenuationMaterial(volume.material, material_name),
+            isotopes
+        );
+    }
+}
+
 class TransportDiagnostics {
 public:
     void Clear() {
@@ -743,6 +1028,12 @@ public:
         killed_non_gamma_secondary_count_ = 0;
         process_counts_.clear();
         volume_step_counts_.clear();
+        interacted_gamma_track_ids_by_thread_.clear();
+    }
+
+    void BeginEvent() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        interacted_gamma_track_ids_by_thread_[std::this_thread::get_id()].clear();
     }
 
     void AddStep(const G4Step* step) {
@@ -759,6 +1050,16 @@ public:
         const auto* process = post_point == nullptr ? nullptr : post_point->GetProcessDefinedStep();
         const std::string process_name = process == nullptr ? "unknown" : process->GetProcessName();
         process_counts_[process_name] += 1;
+        const auto* track = step->GetTrack();
+        const std::string process_key = ToLower(process_name);
+        if (
+            track != nullptr
+            && track->GetDefinition() == G4Gamma::Definition()
+            && process_key != "transportation"
+            && process_key != "unknown"
+        ) {
+            interacted_gamma_track_ids_by_thread_[std::this_thread::get_id()].insert(track->GetTrackID());
+        }
         const auto* secondaries = step->GetSecondaryInCurrentStep();
         if (secondaries != nullptr) {
             secondary_count_ += static_cast<long long>(secondaries->size());
@@ -816,6 +1117,18 @@ public:
         return total;
     }
 
+    bool TrackHadGammaInteraction(const G4Track* track) const {
+        if (track == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto thread_it = interacted_gamma_track_ids_by_thread_.find(std::this_thread::get_id());
+        if (thread_it == interacted_gamma_track_ids_by_thread_.end()) {
+            return false;
+        }
+        return thread_it->second.count(track->GetTrackID()) > 0;
+    }
+
 private:
     mutable std::mutex mutex_;
     long long total_track_steps_ = 0;
@@ -824,6 +1137,7 @@ private:
     long long killed_non_gamma_secondary_count_ = 0;
     std::map<std::string, long long> process_counts_;
     std::map<std::string, long long> volume_step_counts_;
+    std::map<std::thread::id, std::set<int>> interacted_gamma_track_ids_by_thread_;
 };
 
 class EventStore {
@@ -833,15 +1147,24 @@ public:
         const auto thread_id = std::this_thread::get_id();
         current_edep_mev_by_thread_[thread_id] = 0.0;
         current_weight_by_thread_[thread_id] = 1.0;
+        current_entry_class_by_thread_[thread_id] = DetectorEntryClass::kUncollidedPrimary;
     }
 
-    void AddEnergyDeposit(const double edep_mev, const double track_weight) {
+    void AddEnergyDeposit(
+        const double edep_mev,
+        const double track_weight,
+        const DetectorEntryClass entry_class
+    ) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto thread_id = std::this_thread::get_id();
         current_edep_mev_by_thread_[thread_id] += edep_mev;
         if (std::isfinite(track_weight) && track_weight > 0.0) {
             current_weight_by_thread_[thread_id] = track_weight;
         }
+        current_entry_class_by_thread_[thread_id] = MergeDetectorEntryClass(
+            current_entry_class_by_thread_[thread_id],
+            entry_class
+        );
     }
 
     void EndEvent() {
@@ -856,10 +1179,15 @@ public:
             const double weight = weight_it == current_weight_by_thread_.end()
                 ? 1.0
                 : std::max(0.0, weight_it->second);
-            event_edep_mev_.push_back({it->second, weight});
+            const auto entry_it = current_entry_class_by_thread_.find(thread_id);
+            const auto entry_class = entry_it == current_entry_class_by_thread_.end()
+                ? DetectorEntryClass::kUncollidedPrimary
+                : entry_it->second;
+            event_edep_mev_.push_back({it->second, weight, entry_class});
         }
         current_edep_mev_by_thread_.erase(it);
         current_weight_by_thread_.erase(thread_id);
+        current_entry_class_by_thread_.erase(thread_id);
     }
 
     const std::vector<WeightedEventDeposit>& EventDepositsMeV() const {
@@ -871,14 +1199,32 @@ public:
         event_edep_mev_.clear();
         current_edep_mev_by_thread_.clear();
         current_weight_by_thread_.clear();
+        current_entry_class_by_thread_.clear();
     }
 
 private:
     mutable std::mutex mutex_;
     std::map<std::thread::id, double> current_edep_mev_by_thread_;
     std::map<std::thread::id, double> current_weight_by_thread_;
+    std::map<std::thread::id, DetectorEntryClass> current_entry_class_by_thread_;
     std::vector<WeightedEventDeposit> event_edep_mev_;
 };
+
+DetectorEntryClass ClassifyDetectorEntryTrack(
+    const G4Track* track,
+    const TransportDiagnostics* diagnostics
+) {
+    if (track == nullptr || track->GetDefinition() != G4Gamma::Definition()) {
+        return DetectorEntryClass::kInteractedPrimary;
+    }
+    if (track->GetParentID() > 0) {
+        return DetectorEntryClass::kSecondary;
+    }
+    if (diagnostics != nullptr && diagnostics->TrackHadGammaInteraction(track)) {
+        return DetectorEntryClass::kInteractedPrimary;
+    }
+    return DetectorEntryClass::kUncollidedPrimary;
+}
 
 class CrystalSensitiveDetector : public G4VSensitiveDetector {
 public:
@@ -893,6 +1239,9 @@ public:
 
     void Initialize(G4HCofThisEvent*) override {
         store_->BeginEvent();
+        if (diagnostics_ != nullptr) {
+            diagnostics_->BeginEvent();
+        }
     }
 
     G4bool ProcessHits(G4Step* step, G4TouchableHistory*) override {
@@ -908,7 +1257,7 @@ public:
         if (edep_mev > 0.0 && diagnostics_ != nullptr) {
             diagnostics_->AddDetectorHitStep();
         }
-        store_->AddEnergyDeposit(edep_mev, weight);
+        store_->AddEnergyDeposit(edep_mev, weight, ClassifyDetectorEntryTrack(track, diagnostics_));
         return true;
     }
 
@@ -1549,7 +1898,11 @@ private:
                 energy_mev = track->GetKineticEnergy() / MeV;
             }
             if (std::isfinite(energy_mev) && energy_mev > 0.0 && event_store_ != nullptr) {
-                event_store_->AddEnergyDeposit(energy_mev, std::max(0.0, track->GetWeight()));
+                event_store_->AddEnergyDeposit(
+                    energy_mev,
+                    std::max(0.0, track->GetWeight()),
+                    ClassifyDetectorEntryTrack(track, diagnostics_)
+                );
                 if (diagnostics_ != nullptr) {
                     diagnostics_->AddDetectorHitStep();
                 }
@@ -1599,6 +1952,31 @@ private:
     std::string secondary_transport_mode_ = "full_transport";
 };
 
+class EventAction : public G4UserEventAction {
+public:
+    EventAction(EventStore* store, TransportDiagnostics* diagnostics)
+        : store_(store), diagnostics_(diagnostics) {}
+
+    void BeginOfEventAction(const G4Event*) override {
+        if (store_ != nullptr) {
+            store_->BeginEvent();
+        }
+        if (diagnostics_ != nullptr) {
+            diagnostics_->BeginEvent();
+        }
+    }
+
+    void EndOfEventAction(const G4Event*) override {
+        if (store_ != nullptr) {
+            store_->EndEvent();
+        }
+    }
+
+private:
+    EventStore* store_ = nullptr;
+    TransportDiagnostics* diagnostics_ = nullptr;
+};
+
 class SidecarActionInitialization : public G4VUserActionInitialization {
 public:
     SidecarActionInitialization(
@@ -1621,6 +1999,7 @@ public:
 
     void Build() const override {
         SetUserAction(new PrimaryGeneratorAction(source_state_));
+        SetUserAction(new EventAction(event_store_, diagnostics_));
         SetUserAction(new SecondaryTransportStackingAction(
             secondary_transport_mode_,
             detector_scoring_mode_,
@@ -1677,22 +2056,6 @@ void BeamOnHistories(G4RunManager* run_manager, const long histories) {
         remaining -= chunk;
     }
 }
-
-class EventAction : public G4UserEventAction {
-public:
-    explicit EventAction(EventStore* store) : store_(store) {}
-
-    void BeginOfEventAction(const G4Event*) override {
-        store_->BeginEvent();
-    }
-
-    void EndOfEventAction(const G4Event*) override {
-        store_->EndEvent();
-    }
-
-private:
-    EventStore* store_ = nullptr;
-};
 
 SceneSpec ReadSceneFile(const std::string& scene_path) {
     std::ifstream input(scene_path);
@@ -1970,6 +2333,9 @@ public:
         double expected_sampled_primaries = 0.0;
         std::map<std::string, double> source_equivalent_counts;
         std::map<std::string, double> transport_detected_counts;
+        std::map<std::string, double> transport_uncollided_primary_counts;
+        std::map<std::string, double> transport_interacted_primary_counts;
+        std::map<std::string, double> transport_secondary_counts;
         const double reference_acceptance = DetectorReferenceAcceptance(scene_.detector);
         const std::string source_rate_model = NormalizeSourceRateModel(options.source_rate_model);
         const bool detector_cps_rate_model = source_rate_model == "detector_cps_1m";
@@ -1994,8 +2360,21 @@ public:
             request.detector_pose.y * m,
             request.detector_pose.z * m
         );
-        for (const auto& source : scene_.sources) {
-            const double geom_scale = InverseSquareScale(
+        std::map<std::string, double> source_equivalent_counts_by_source;
+        std::map<std::string, double> source_equivalent_counts_by_line;
+        std::map<std::string, double> transport_detected_counts_by_source;
+        std::map<std::string, double> transport_uncollided_primary_counts_by_source;
+        std::map<std::string, double> transport_interacted_primary_counts_by_source;
+        std::map<std::string, double> transport_secondary_counts_by_source;
+        std::map<std::string, double> transport_detected_counts_by_line;
+        std::map<std::string, double> transport_uncollided_primary_counts_by_line;
+        std::map<std::string, double> transport_interacted_primary_counts_by_line;
+        std::map<std::string, double> transport_secondary_counts_by_line;
+        for (std::size_t source_index = 0; source_index < scene_.sources.size(); ++source_index) {
+            const auto& source = scene_.sources[source_index];
+            const std::string source_token = "src" + std::to_string(source_index)
+                + "_" + SanitizeMetadataToken(source.isotope);
+            const double point_geom_scale = InverseSquareScale(
                 source.x,
                 source.y,
                 source.z,
@@ -2003,11 +2382,27 @@ public:
                 request.detector_pose.y,
                 request.detector_pose.z
             );
+            const double detector_cps_geom_scale = DetectorCpsGeometryScale(
+                source.x,
+                source.y,
+                source.z,
+                request.detector_pose.x,
+                request.detector_pose.y,
+                request.detector_pose.z,
+                scene_.detector
+            );
+            const double geom_scale = detector_cps_rate_model
+                ? detector_cps_geom_scale
+                : point_geom_scale;
             const auto lines = GammaLinesForIsotope(source.isotope);
             const double shield_transmission = use_theory_tvl_
                 ? TheoryTvlTransmission(source, scene_, request)
                 : 1.0;
             source_equivalent_counts[source.isotope] += source.intensity_cps_1m
+                * request.dwell_time_s
+                * geom_scale
+                * shield_transmission;
+            source_equivalent_counts_by_source[source_token] += source.intensity_cps_1m
                 * request.dwell_time_s
                 * geom_scale
                 * shield_transmission;
@@ -2029,6 +2424,9 @@ public:
                     * shield_transmission
                     * line_weight
                     * source_rate_scale;
+                const std::string line_token = source_token
+                    + "_" + EnergyMetadataToken(line.energy_keV);
+                source_equivalent_counts_by_line[line_token] += mean_events;
                 if (mean_events <= 0.0) {
                     continue;
                 }
@@ -2070,10 +2468,26 @@ public:
                     if (deposits[index].edep_mev <= 0.0) {
                         continue;
                     }
-                    transport_detected_counts[source.isotope] += std::max(0.0, deposits[index].weight);
+                    const double detected_weight = std::max(0.0, deposits[index].weight);
+                    transport_detected_counts[source.isotope] += detected_weight;
+                    transport_detected_counts_by_source[source_token] += detected_weight;
+                    transport_detected_counts_by_line[line_token] += detected_weight;
+                    if (deposits[index].entry_class == DetectorEntryClass::kUncollidedPrimary) {
+                        transport_uncollided_primary_counts[source.isotope] += detected_weight;
+                        transport_uncollided_primary_counts_by_source[source_token] += detected_weight;
+                        transport_uncollided_primary_counts_by_line[line_token] += detected_weight;
+                    } else if (deposits[index].entry_class == DetectorEntryClass::kInteractedPrimary) {
+                        transport_interacted_primary_counts[source.isotope] += detected_weight;
+                        transport_interacted_primary_counts_by_source[source_token] += detected_weight;
+                        transport_interacted_primary_counts_by_line[line_token] += detected_weight;
+                    } else {
+                        transport_secondary_counts[source.isotope] += detected_weight;
+                        transport_secondary_counts_by_source[source_token] += detected_weight;
+                        transport_secondary_counts_by_line[line_token] += detected_weight;
+                    }
                     energy_deposits.push_back({
                         deposits[index].edep_mev * 1000.0,
-                        std::max(0.0, deposits[index].weight)
+                        detected_weight
                     });
                 }
             }
@@ -2109,6 +2523,39 @@ public:
             spectrum_variance[index] *= observed_scale * observed_scale;
         }
         for (auto& item : transport_detected_counts) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_uncollided_primary_counts) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_interacted_primary_counts) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_secondary_counts) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_detected_counts_by_source) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_uncollided_primary_counts_by_source) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_interacted_primary_counts_by_source) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_secondary_counts_by_source) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_detected_counts_by_line) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_uncollided_primary_counts_by_line) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_interacted_primary_counts_by_line) {
+            item.second *= observed_scale;
+        }
+        for (auto& item : transport_secondary_counts_by_line) {
             item.second *= observed_scale;
         }
         const double total_variance = std::accumulate(
@@ -2148,6 +2595,7 @@ public:
             ? "detector_assembly_entry"
             : "";
         result.metadata["detector_response_applied_in_native"] = detector_scoring_mode_ == "incident_gamma_energy" ? "false" : "true";
+        AddGeant4MaterialMuMetadata(result, scene_);
         result.metadata["secondary_transport_mode"] = secondary_transport_mode_;
         result.metadata["gamma_only_secondary_transport"] = secondary_transport_mode_ == "gamma_only" ? "true" : "false";
         result.metadata["theory_tvl_attenuation"] = use_theory_tvl_ ? "true" : "false";
@@ -2161,6 +2609,19 @@ public:
         result.metadata["primary_sampling_fraction"] = std::to_string(primary_sampling_fraction);
         result.metadata["primary_history_weight"] = std::to_string(primary_history_weight);
         result.metadata["reference_detector_acceptance"] = std::to_string(reference_acceptance);
+        result.metadata["detector_crystal_radius_m"] = std::to_string(scene_.detector.crystal_radius_m);
+        result.metadata["detector_housing_thickness_m"] = std::to_string(scene_.detector.housing_thickness_m);
+        result.metadata["detector_target_radius_m"] = std::to_string(DetectorTargetRadiusM(scene_.detector));
+        const auto fe_shield_normal = ShieldNormalFromPose(request.fe_pose);
+        const auto pb_shield_normal = ShieldNormalFromPose(request.pb_pose);
+        result.metadata["fe_shield_normal_x"] = std::to_string(fe_shield_normal[0]);
+        result.metadata["fe_shield_normal_y"] = std::to_string(fe_shield_normal[1]);
+        result.metadata["fe_shield_normal_z"] = std::to_string(fe_shield_normal[2]);
+        result.metadata["pb_shield_normal_x"] = std::to_string(pb_shield_normal[0]);
+        result.metadata["pb_shield_normal_y"] = std::to_string(pb_shield_normal[1]);
+        result.metadata["pb_shield_normal_z"] = std::to_string(pb_shield_normal[2]);
+        AddShieldAxisMetadata(result, "fe", request.fe_pose);
+        AddShieldAxisMetadata(result, "pb", request.pb_pose);
         result.metadata["total_spectrum_counts"] = std::to_string(observed_total_counts);
         result.metadata["primaries_per_sec"] = std::to_string(static_cast<double>(total_primaries) / safe_runtime_s);
         result.metadata["effective_entries_per_sec"] = std::to_string(effective_spectrum_entries / safe_runtime_s);
@@ -2211,8 +2672,56 @@ public:
         for (const auto& item : source_equivalent_counts) {
             result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
         }
+        for (const auto& item : source_equivalent_counts_by_source) {
+            result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
+        }
+        for (const auto& item : source_equivalent_counts_by_line) {
+            result.metadata["source_equivalent_counts_" + item.first] = std::to_string(item.second);
+        }
         for (const auto& item : transport_detected_counts) {
             result.metadata["transport_detected_counts_" + item.first] = std::to_string(item.second);
+            const double total_detected = std::max(0.0, item.second);
+            const double uncollided = std::max(
+                0.0,
+                transport_uncollided_primary_counts[item.first]
+            );
+            const double interacted = std::max(
+                0.0,
+                transport_interacted_primary_counts[item.first]
+            );
+            const double secondary = std::max(0.0, transport_secondary_counts[item.first]);
+            result.metadata["transport_uncollided_primary_counts_" + item.first] = std::to_string(uncollided);
+            result.metadata["transport_interacted_primary_counts_" + item.first] = std::to_string(interacted);
+            result.metadata["transport_secondary_counts_" + item.first] = std::to_string(secondary);
+            result.metadata["transport_non_uncollided_fraction_" + item.first] = std::to_string(
+                total_detected > 0.0 ? std::clamp((interacted + secondary) / total_detected, 0.0, 1.0) : 0.0
+            );
+        }
+        for (const auto& item : transport_detected_counts_by_source) {
+            result.metadata["transport_detected_counts_" + item.first] = std::to_string(item.second);
+            const double total_detected = std::max(0.0, item.second);
+            const double uncollided = std::max(0.0, transport_uncollided_primary_counts_by_source[item.first]);
+            const double interacted = std::max(0.0, transport_interacted_primary_counts_by_source[item.first]);
+            const double secondary = std::max(0.0, transport_secondary_counts_by_source[item.first]);
+            result.metadata["transport_uncollided_primary_counts_" + item.first] = std::to_string(uncollided);
+            result.metadata["transport_interacted_primary_counts_" + item.first] = std::to_string(interacted);
+            result.metadata["transport_secondary_counts_" + item.first] = std::to_string(secondary);
+            result.metadata["transport_non_uncollided_fraction_" + item.first] = std::to_string(
+                total_detected > 0.0 ? std::clamp((interacted + secondary) / total_detected, 0.0, 1.0) : 0.0
+            );
+        }
+        for (const auto& item : transport_detected_counts_by_line) {
+            result.metadata["transport_detected_counts_" + item.first] = std::to_string(item.second);
+            const double total_detected = std::max(0.0, item.second);
+            const double uncollided = std::max(0.0, transport_uncollided_primary_counts_by_line[item.first]);
+            const double interacted = std::max(0.0, transport_interacted_primary_counts_by_line[item.first]);
+            const double secondary = std::max(0.0, transport_secondary_counts_by_line[item.first]);
+            result.metadata["transport_uncollided_primary_counts_" + item.first] = std::to_string(uncollided);
+            result.metadata["transport_interacted_primary_counts_" + item.first] = std::to_string(interacted);
+            result.metadata["transport_secondary_counts_" + item.first] = std::to_string(secondary);
+            result.metadata["transport_non_uncollided_fraction_" + item.first] = std::to_string(
+                total_detected > 0.0 ? std::clamp((interacted + secondary) / total_detected, 0.0, 1.0) : 0.0
+            );
         }
         if (!scene_.usd_path.empty()) {
             result.metadata["usd_path"] = scene_.usd_path;

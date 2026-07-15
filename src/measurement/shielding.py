@@ -153,6 +153,85 @@ def mu_by_isotope_from_hvl_mm(
     return mu_by_isotope
 
 
+def line_resolved_shield_mu_by_isotope(
+    isotopes: Sequence[str] | None = None,
+    *,
+    normalize_line_intensities: bool = True,
+) -> dict[str, tuple[dict[str, float], ...]]:
+    """
+    Build gamma-line-resolved Fe/Pb attenuation coefficients for PF kernels.
+
+    The Geant4 sidecar emits each isotope's gamma lines separately under the
+    ``detector_cps_1m`` source-rate convention.  The PF likelihood should
+    therefore average shield transmission over the same line set instead of
+    collapsing each isotope to one effective TVL coefficient.  Each returned
+    entry has ``weight``, ``fe``, and ``pb`` keys; ``fe`` and ``pb`` are linear
+    attenuation coefficients in 1/cm.
+    """
+    from sim.isaacsim_app.materials import (  # local import avoids a hard startup dependency
+        composition_mass_attenuation_at_energy,
+        resolve_material_preset,
+    )
+    from spectrum.library import default_library
+
+    library = default_library()
+    requested = list(isotopes) if isotopes is not None else list(library.keys())
+    fe_preset = resolve_material_preset("iron")
+    pb_preset = resolve_material_preset("lead")
+    if fe_preset is None or pb_preset is None:
+        return {}
+    result: dict[str, tuple[dict[str, float], ...]] = {}
+    fallback = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=requested)
+    for isotope in requested:
+        nuclide = library.get(str(isotope))
+        if nuclide is None or not nuclide.lines:
+            continue
+        total_intensity = sum(max(float(line.intensity), 0.0) for line in nuclide.lines)
+        entries: list[dict[str, float]] = []
+        for line in nuclide.lines:
+            raw_weight = max(float(line.intensity), 0.0)
+            if raw_weight <= 0.0:
+                continue
+            weight = raw_weight
+            if normalize_line_intensities and total_intensity > 0.0:
+                weight = raw_weight / total_intensity
+            fe_mass_att = composition_mass_attenuation_at_energy(
+                fe_preset.composition_by_mass,
+                float(line.energy_keV),
+            )
+            pb_mass_att = composition_mass_attenuation_at_energy(
+                pb_preset.composition_by_mass,
+                float(line.energy_keV),
+            )
+            if (
+                fe_mass_att is None
+                or pb_mass_att is None
+                or fe_preset.density_g_cm3 is None
+                or pb_preset.density_g_cm3 is None
+            ):
+                iso_fallback = fallback.get(str(isotope), {})
+                mu_fe = float(
+                    iso_fallback.get("fe", mu_from_tvl_mm(CS137_TVL_FE_MM))
+                )
+                mu_pb = float(
+                    iso_fallback.get("pb", mu_from_tvl_mm(CS137_TVL_PB_MM))
+                )
+            else:
+                mu_fe = float(fe_preset.density_g_cm3) * float(fe_mass_att)
+                mu_pb = float(pb_preset.density_g_cm3) * float(pb_mass_att)
+            entries.append(
+                {
+                    "energy_keV": float(line.energy_keV),
+                    "weight": float(weight),
+                    "fe": float(mu_fe),
+                    "pb": float(mu_pb),
+                }
+            )
+        if entries:
+            result[str(isotope)] = tuple(entries)
+    return result
+
+
 def cartesian_to_spherical(vec: NDArray[np.float64]) -> Tuple[float, float, float]:
     """
     Convert a Cartesian vector to spherical coordinates (r, theta, phi).

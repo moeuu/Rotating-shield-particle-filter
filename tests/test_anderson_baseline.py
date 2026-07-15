@@ -80,6 +80,74 @@ def test_anderson_kernel_models_obstacle_attenuation() -> None:
     assert blocked < free
 
 
+def test_anderson_kernel_preserves_detector_observation_geometry() -> None:
+    """Anderson baseline should pass shared detector aperture geometry to the kernel."""
+    env = EnvironmentConfig(
+        size_x=4.0,
+        size_y=4.0,
+        size_z=2.0,
+        detector_position=(1.0, 1.0, 0.5),
+    )
+    kernel = AndersonAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        obstacle_grid=None,
+        config=AndersonKernelConfig(
+            detector_radius_m=0.05,
+            detector_aperture_radius_m=0.052,
+            detector_aperture_samples=33,
+        ),
+    )
+
+    assert kernel._kernel.detector_radius_m == pytest.approx(0.05)
+    assert kernel._kernel.detector_aperture_radius_m == pytest.approx(0.052)
+    assert kernel._kernel.detector_aperture_samples == 33
+
+
+def test_anderson_kernel_preserves_transport_response_model() -> None:
+    """Anderson baseline should pass an explicit transport sidecar to the kernel."""
+    env = EnvironmentConfig(
+        size_x=4.0,
+        size_y=4.0,
+        size_z=2.0,
+        detector_position=(1.0, 1.0, 0.5),
+    )
+    source = np.asarray([[2.0, 1.0, 0.5]], dtype=float)
+    detector = (1.0, 1.0, 0.5)
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {"Cs-137": {"scale": 1.5}},
+    }
+    base = AndersonAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        obstacle_grid=None,
+        config=AndersonKernelConfig(),
+    )
+    adjusted = AndersonAttenuationKernel.from_environment(
+        env=env,
+        isotopes=["Cs-137"],
+        obstacle_grid=None,
+        config=AndersonKernelConfig(
+            transport_response_model=transport_model,
+        ),
+    )
+
+    base_response = base.response_vector(
+        isotope="Cs-137",
+        detector_pos=detector,
+        sources=source,
+    )
+    adjusted_response = adjusted.response_vector(
+        isotope="Cs-137",
+        detector_pos=detector,
+        sources=source,
+    )
+
+    assert adjusted._kernel.transport_response_model == transport_model
+    assert np.allclose(adjusted_response, 1.5 * base_response)
+
+
 def test_anderson_cpu_parallel_batch_matches_serial() -> None:
     """CPU-worker batch evaluation should preserve the serial expected counts."""
     serial = _build_kernel(None, cpu_workers=1)

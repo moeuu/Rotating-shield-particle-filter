@@ -17,10 +17,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from measurement.continuous_kernels import ContinuousKernel, geometric_term
-from measurement.kernels import ShieldParams
+from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import PointSource
-from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+from measurement.observation_model import build_runtime_observation_model
+from measurement.observation_model import continuous_kernel_from_observation_model
 from realtime_demo import load_sources_from_json
 from sim.geant4_app.app import Geant4Application
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription
@@ -155,22 +155,22 @@ def _ideal_counts(
     live_time_s: float,
     kernel: ContinuousKernel,
 ) -> dict[str, float]:
-    """Compute ideal inverse-square plus shield counts for one shot."""
+    """Compute ideal counts with the shared runtime ContinuousKernel."""
     counts = {str(isotope): 0.0 for isotope in isotopes}
     for source in sources:
         source_pos = source.position_array()
-        attenuation = kernel.attenuation_factor_pair(
-            source.isotope,
-            source_pos,
-            detector_pos,
-            fe_index,
-            pb_index,
-        )
         counts[source.isotope] += (
             float(live_time_s)
             * float(source.intensity_cps_1m)
-            * geometric_term(detector_pos, source_pos)
-            * float(attenuation)
+            * float(
+                kernel.kernel_value_pair(
+                    source.isotope,
+                    detector_pos,
+                    source_pos,
+                    fe_index,
+                    pb_index,
+                )
+            )
         )
     return counts
 
@@ -584,9 +584,13 @@ def main() -> None:
     sources = load_sources_from_json(source_path)
     isotopes = sorted({source.isotope for source in sources})
     decomposer = SpectralDecomposer()
-    kernel = ContinuousKernel(
-        mu_by_isotope=mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes),
-        shield_params=ShieldParams(),
+    observation_model = build_runtime_observation_model(
+        runtime_config,
+        isotopes=isotopes,
+    )
+    kernel = continuous_kernel_from_observation_model(
+        observation_model,
+        obstacle_grid=None,
         use_gpu=False,
     )
     scene = _build_scene(

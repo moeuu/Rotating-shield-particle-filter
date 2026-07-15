@@ -40,6 +40,13 @@ definition, statistics, and observation path.
 - PF shielding likelihoods must use the same spherical-octant shell geometry
   and Pb/Fe dimensions exported to Geant4, not a lower-fidelity fixed-slab
   shortcut.
+- Do not implement calibration, response correction, PF observation logic, or
+  quality-gate changes that are selected to pass a specific validation run,
+  random seed, environment, source layout, shield-pair set, or tail case.
+- Do not use case-specific, run-specific, seed-specific, source-index-specific,
+  or shield-pair-specific empirical corrections unless the parameter is
+  physically defined before evaluation and fitted only from a designated
+  training set.
 
 ## Allowed Performance Work
 
@@ -66,7 +73,23 @@ definition, statistics, and observation path.
   `tests/test_simulation_fidelity_shortcuts.py` passing.
 - Add a regression test before introducing any new simulation option that could
   lower runtime fidelity.
+- For any accuracy-motivated calibration or observation-model change, use failed
+  holdouts only for diagnosis. Final acceptance must be measured on a new random
+  Geant4 environment that was not used to design, fit, or select the change.
+- For shield-sensitive changes, independent validation must cover all 64 Fe/Pb
+  shield-pose pairs for each new scenario unless the user explicitly requests a
+  smaller diagnostic run.
 - For PF, planning, spectrum, obstacle, or Geant4 orchestration code that spans
   particles, candidates, source slots, orientations, spectrum bins, or obstacle
   components, follow `docs/compute_parallelism_policy.md` and add a
   serial-vs-parallel equivalence test or a runtime-path selection test.
+
+## Mid-Run Interpretation
+
+- Do not use the first few poses or early station windows of a full simulation
+  to decide new accuracy-improvement implementation changes. Let the run finish
+  before proposing tuning, rescue, planning, or estimator-behavior changes.
+- Mid-run intervention is allowed only for clear implementation mistakes,
+  crashes, logically inconsistent behavior, invalid configuration wiring, or
+  physics/model mismatches that can be demonstrated independently of early
+  accuracy metrics.

@@ -21,6 +21,27 @@
 - After changing code, always run `pytest` and ensure tests pass.
 
 
+## Generalization and anti-overfitting policy
+
+- Do not implement calibration, response correction, PF observation logic, or
+  quality-gate changes that are fitted to pass a specific validation run,
+  random seed, environment, shield-pair set, source layout, or tail case.
+- Do not adopt case-specific, run-specific, seed-specific, source-index-specific,
+  or shield-pair-specific empirical fixes unless the parameter is physically
+  defined before evaluation and is fitted only from a designated training set.
+- A failed holdout or replay may be used for diagnosis, but not as the final
+  evidence for adopting a tuned correction. After any accuracy-motivated
+  calibration or model change, final acceptance must be measured on a new
+  random Geant4 environment that was not used to design, fit, or select the
+  change.
+- For shield-sensitive changes, the independent validation must evaluate all
+  64 Fe/Pb shield-pose pairs for each new scenario unless the user explicitly
+  requests a smaller diagnostic run.
+- Prefer physically motivated features with regularization and documented count
+  semantics over extra degrees of freedom. If a proposed change mainly improves
+  known replays while weakening independent-environment metrics, reject it.
+
+
 ## RA-L paper ablation plan
 
 - Before running RA-L paper ablations, read
@@ -108,6 +129,13 @@
   PID/session name, and monitor that log from a separate command. If a CUI URL is
   exposed, relay it immediately and keep the server process tied to the
   persistent session.
+- During full simulations, do not decide or implement accuracy-improvement
+  changes from only the first few poses or early station windows. Let the run
+  finish before proposing tuning, rescue, planning, or estimator-behavior
+  changes. Mid-run fixes are allowed only for clear implementation mistakes,
+  crashes, logically inconsistent behavior, invalid configuration wiring, or
+  physics/model mismatches that can be demonstrated independently of early
+  accuracy metrics.
 - "Full simulation" means the standard no-GUI Geant4/PF runtime. Use
   `uv run python main.py --full-simulation` or `uv run python main.py` unless
   the user explicitly asks for another mode. This resolves to

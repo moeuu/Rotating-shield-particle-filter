@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import time
 from typing import Any, Sequence
 
 import numpy as np
@@ -39,6 +40,12 @@ class RemainingMeasurementConfig:
     separation_weight: float = 1.5
     verification_weight: float = 1.0
     residual_weight: float = 1.0
+    report_response_correlation_weight: float = 1.0
+    report_residual_weight: float = 1.0
+    strength_absorption_weight: float = 0.5
+    report_response_correlation_threshold: float = 0.9
+    report_positive_residual_fraction_threshold: float = 0.02
+    report_strength_concentration_threshold: float = 0.75
     high_surface_ambiguity_weight: float = 1.0
     high_surface_z_fraction: float = 0.75
     high_surface_pairwise_separation_threshold: float = 9.0
@@ -73,6 +80,7 @@ class RemainingMeasurementEstimate:
     components: dict[str, float] = field(default_factory=dict)
     gains: dict[str, float] = field(default_factory=dict)
     isotope_details: dict[str, dict[str, float | int]] = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable estimate payload."""
@@ -108,6 +116,73 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, float):
         return value if np.isfinite(value) else None
     return value
+
+
+def _timer_add(timings: dict[str, float] | None, key: str, elapsed_s: float) -> None:
+    """Accumulate a nonnegative timing value when timing collection is enabled."""
+    if timings is None:
+        return
+    timings[key] = float(timings.get(key, 0.0)) + max(float(elapsed_s), 0.0)
+
+
+def _remaining_state_cache_key(
+    estimator: RotatingShieldPFEstimator,
+    config: RemainingMeasurementConfig,
+) -> tuple[Any, ...]:
+    """Return a conservative key for one-shot remaining-state reuse."""
+    config_items = tuple(
+        sorted((str(key), repr(value)) for key, value in asdict(config).items())
+    )
+    return (
+        int(len(getattr(estimator, "measurements", []))),
+        int(getattr(estimator, "_report_cache_revision", 0)),
+        config_items,
+    )
+
+
+def _cached_remaining_state_payload(
+    estimator: RotatingShieldPFEstimator,
+    cache_key: tuple[Any, ...],
+) -> dict[str, Any] | None:
+    """Return cached remaining-state payload for the immediately following call."""
+    payload = getattr(estimator, "_remaining_measurement_state_cache", None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("key") != cache_key:
+        return None
+    return payload
+
+
+def _store_remaining_state_payload(
+    estimator: RotatingShieldPFEstimator,
+    cache_key: tuple[Any, ...],
+    *,
+    components: dict[str, float],
+    isotope_details: dict[str, dict[str, float | int]],
+    mode_arrays: dict[
+        str,
+        list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
+    ],
+    residual_surface_gain: float,
+) -> None:
+    """Store state diagnostics for the next post-DSS remaining-budget call."""
+    setattr(
+        estimator,
+        "_remaining_measurement_state_cache",
+        {
+            "key": cache_key,
+            "components": components,
+            "isotope_details": isotope_details,
+            "mode_arrays": mode_arrays,
+            "residual_surface_gain": float(residual_surface_gain),
+        },
+    )
+
+
+def _clear_remaining_state_payload(estimator: RotatingShieldPFEstimator) -> None:
+    """Drop one-shot remaining-measurement state cache."""
+    if hasattr(estimator, "_remaining_measurement_state_cache"):
+        setattr(estimator, "_remaining_measurement_state_cache", None)
 
 
 def _normalise_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -231,7 +306,11 @@ def _mode_response_matrix(
             live_times=np.asarray(live_times, dtype=float),
             fe_indices=np.asarray(fe_indices, dtype=int),
             pb_indices=np.asarray(pb_indices, dtype=int),
-            source_scale=estimator.response_scale_for_isotope(isotope),
+            source_scale=estimator.response_scales_for_measurements(
+                isotope,
+                fe_indices,
+                pb_indices,
+            ),
         ),
         0.0,
     )
@@ -260,6 +339,7 @@ def _high_surface_mode_mask(
 def _state_budget_components(
     estimator: RotatingShieldPFEstimator,
     config: RemainingMeasurementConfig,
+    timings: dict[str, float] | None = None,
 ) -> tuple[
     dict[str, float],
     dict[str, dict[str, float | int]],
@@ -269,6 +349,8 @@ def _state_budget_components(
     ],
 ]:
     """Return current ambiguity components and cached mode arrays."""
+    start = time.perf_counter()
+    modes_start = time.perf_counter()
     modes_by_iso = extract_signature_modes(
         estimator,
         max_particles=config.max_particles,
@@ -277,6 +359,7 @@ def _state_budget_components(
         max_modes_per_isotope=int(config.max_modes_per_isotope),
         tentative_weight_multiplier=1.5,
     )
+    _timer_add(timings, "state_signature_modes_s", time.perf_counter() - modes_start)
     target_spread = max(float(config.target_position_spread_m), 1.0e-12)
     target_cv = max(float(config.target_strength_cv), 1.0e-12)
     target_cardinality = float(np.clip(config.target_cardinality_confidence, 0.0, 1.0))
@@ -289,26 +372,38 @@ def _state_budget_components(
         "same_isotope_separation": 0.0,
         "pseudo_source_verification": 0.0,
         "residual": 0.0,
+        "report_response_correlation": 0.0,
+        "report_residual": 0.0,
+        "strength_absorption": 0.0,
         "isotope_absence": 0.0,
         "high_surface_ambiguity": 0.0,
     }
     unresolved_absent = {}
     evidence_getter = getattr(estimator, "unresolved_isotope_evidence", None)
     if callable(evidence_getter):
+        evidence_start = time.perf_counter()
         unresolved_absent = evidence_getter(
             min_total_counts=float(config.unresolved_absent_min_total_counts),
             min_max_count=float(config.unresolved_absent_min_max_counts),
             min_snr=float(config.unresolved_absent_min_snr),
         )
+        _timer_add(
+            timings, "state_absent_evidence_s", time.perf_counter() - evidence_start
+        )
+    report_start = time.perf_counter()
     try:
         report_diagnostics = estimator.report_model_order_diagnostics()
     except (RuntimeError, ValueError, TypeError):
         report_diagnostics = {}
+    _timer_add(
+        timings, "state_report_diagnostics_s", time.perf_counter() - report_start
+    )
     isotope_details: dict[str, dict[str, float | int]] = {}
     mode_arrays: dict[
         str,
         list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
     ] = {}
+    isotope_loop_start = time.perf_counter()
     for isotope, filt in estimator.filters.items():
         particles = filt.continuous_particles
         if not particles:
@@ -337,9 +432,56 @@ def _state_budget_components(
             if isinstance(report_stats, dict)
             else 0
         )
+        report_candidate_count = (
+            int(report_stats.get("candidate_count", 0))
+            if isinstance(report_stats, dict)
+            else 0
+        )
+        report_count_supported_zero = (
+            bool(report_stats.get("count_supported_zero_source", False))
+            if isinstance(report_stats, dict)
+            else False
+        )
+        report_model_order_unready = (
+            not bool(report_stats.get("model_order_ready", False))
+            and (
+                report_candidate_count > 0
+                or report_selected_count > 0
+                or report_count_supported_zero
+            )
+            if isinstance(report_stats, dict)
+            else False
+        )
+        report_max_response_corr = (
+            float(report_stats.get("selected_max_response_correlation", 0.0))
+            if isinstance(report_stats, dict)
+            else 0.0
+        )
+        report_positive_residual_fraction = (
+            float(report_stats.get("selected_positive_residual_fraction", 0.0))
+            if isinstance(report_stats, dict)
+            else 0.0
+        )
+        report_positive_residual_chi2 = (
+            float(report_stats.get("selected_positive_residual_chi2", 0.0))
+            if isinstance(report_stats, dict)
+            else 0.0
+        )
+        report_strengths = (
+            np.maximum(
+                np.asarray(
+                    report_stats.get("selected_strengths", []), dtype=float
+                ).reshape(-1),
+                0.0,
+            )
+            if isinstance(report_stats, dict)
+            else np.zeros(0, dtype=float)
+        )
         active_evidence = bool(
             count_supported
             or report_selected_count > 0
+            or report_count_supported_zero
+            or report_model_order_unready
             or str(isotope) in unresolved_absent
         )
         strength_totals = [
@@ -382,14 +524,22 @@ def _state_budget_components(
         tentative_expected = _weighted_tentative_source_count(particles, weights)
         verification_views = int(getattr(filt, "last_birth_residual_distinct_poses", 0))
         required_views = max(1, int(filt.config.pseudo_source_min_distinct_views))
-        verification_budget = tentative_expected * max(
-            required_views - min(verification_views, required_views),
-            0,
-        ) / float(required_views)
+        verification_budget = (
+            tentative_expected
+            * max(
+                required_views - min(verification_views, required_views),
+                0,
+            )
+            / float(required_views)
+        )
         verification_budget += float(
             max(int(getattr(filt, "last_pseudo_source_quarantine_active", 0)), 0)
         )
         separation_budget = 0.0
+        report_corr_budget = 0.0
+        report_residual_budget = 0.0
+        strength_absorption_budget = 0.0
+        report_strength_concentration = 0.0
         min_separation = float("inf")
         unresolved_pairs = 0
         high_surface_budget = 0.0
@@ -422,6 +572,15 @@ def _state_budget_components(
                 "high_surface_unresolved_pair_count": 0,
                 "high_surface_ambiguity_budget": 0.0,
                 "residual_chi2": 0.0,
+                "report_max_response_correlation": float(report_max_response_corr),
+                "report_response_correlation_budget": 0.0,
+                "report_positive_residual_fraction": float(
+                    report_positive_residual_fraction
+                ),
+                "report_positive_residual_chi2": float(report_positive_residual_chi2),
+                "report_residual_budget": 0.0,
+                "report_strength_concentration": 0.0,
+                "strength_absorption_budget": 0.0,
                 "unresolved_absent_budget": 0.0,
                 "unresolved_absent_total_counts": float(
                     absent_payload.get("total_counts", 0.0)
@@ -491,8 +650,7 @@ def _state_budget_components(
                 high_surface_budget += float(
                     np.sum(
                         np.maximum(
-                            high_strengths / max(absorption_threshold, 1.0e-12)
-                            - 1.0,
+                            high_strengths / max(absorption_threshold, 1.0e-12) - 1.0,
                             0.0,
                         )
                     )
@@ -508,14 +666,54 @@ def _state_budget_components(
             residual_budget = max(residual_chi2 / residual_threshold - 1.0, 0.0)
         else:
             residual_chi2 = 0.0
+        if report_selected_count > 1:
+            corr_threshold = float(
+                np.clip(config.report_response_correlation_threshold, 0.0, 1.0)
+            )
+            if corr_threshold < 1.0:
+                report_corr_budget = max(
+                    (report_max_response_corr - corr_threshold)
+                    / max(1.0 - corr_threshold, 1.0e-12),
+                    0.0,
+                )
+        residual_fraction_threshold = max(
+            float(config.report_positive_residual_fraction_threshold),
+            0.0,
+        )
+        if residual_fraction_threshold > 0.0:
+            report_residual_budget = max(
+                report_positive_residual_fraction / residual_fraction_threshold - 1.0,
+                0.0,
+            )
+        if report_strengths.size:
+            total_report_strength = float(np.sum(report_strengths))
+            if total_report_strength > 1.0e-12:
+                report_strength_concentration = float(
+                    np.max(report_strengths) / total_report_strength
+                )
+        concentration_threshold = float(
+            np.clip(config.report_strength_concentration_threshold, 1.0e-12, 1.0)
+        )
+        if (
+            report_selected_count > 1
+            and report_strength_concentration > concentration_threshold
+            and (report_residual_budget > 0.0 or report_corr_budget > 0.0)
+        ):
+            strength_absorption_budget = max(
+                report_strength_concentration / concentration_threshold - 1.0,
+                0.0,
+            )
         components["uncertainty"] += spread_budget + strength_budget
         components["cardinality"] += cardinality_budget
         components["same_isotope_separation"] += separation_budget
         components["pseudo_source_verification"] += verification_budget
         components["residual"] += residual_budget
-        components["isotope_absence"] += (
-            float(config.unresolved_absent_budget_weight) * max(absence_budget, 0.0)
-        )
+        components["report_response_correlation"] += report_corr_budget
+        components["report_residual"] += report_residual_budget
+        components["strength_absorption"] += strength_absorption_budget
+        components["isotope_absence"] += float(
+            config.unresolved_absent_budget_weight
+        ) * max(absence_budget, 0.0)
         components["high_surface_ambiguity"] += high_surface_budget
         isotope_details[isotope] = {
             "mode_count": int(len(modes)),
@@ -541,19 +739,28 @@ def _state_budget_components(
                 if not np.isfinite(high_surface_min_separation)
                 else float(high_surface_min_separation)
             ),
-            "high_surface_unresolved_pair_count": int(
-                high_surface_unresolved_pairs
-            ),
+            "high_surface_unresolved_pair_count": int(high_surface_unresolved_pairs),
             "high_surface_ambiguity_budget": float(high_surface_budget),
             "residual_chi2": float(residual_chi2),
+            "report_max_response_correlation": float(report_max_response_corr),
+            "report_response_correlation_budget": float(report_corr_budget),
+            "report_positive_residual_fraction": float(
+                report_positive_residual_fraction
+            ),
+            "report_positive_residual_chi2": float(report_positive_residual_chi2),
+            "report_residual_budget": float(report_residual_budget),
+            "report_strength_concentration": float(report_strength_concentration),
+            "strength_absorption_budget": float(strength_absorption_budget),
             "unresolved_absent_budget": float(max(absence_budget, 0.0)),
             "unresolved_absent_total_counts": float(
                 absent_payload.get("total_counts", 0.0)
             ),
-            "unresolved_absent_count_snr": float(
-                absent_payload.get("count_snr", 0.0)
-            ),
+            "unresolved_absent_count_snr": float(absent_payload.get("count_snr", 0.0)),
         }
+    _timer_add(
+        timings, "state_isotope_loop_s", time.perf_counter() - isotope_loop_start
+    )
+    _timer_add(timings, "state_total_s", time.perf_counter() - start)
     return components, isotope_details, mode_arrays
 
 
@@ -571,15 +778,14 @@ def _measurement_data_count_evidence(
     if counts.size == 0:
         return False, 0.0, 0.0, 0.0
     variances = np.maximum(
-        np.asarray(getattr(data, "observation_variances", np.ones_like(counts)), dtype=float)
-        .reshape(-1),
+        np.asarray(
+            getattr(data, "observation_variances", np.ones_like(counts)), dtype=float
+        ).reshape(-1),
         1.0,
     )
     total_counts = float(np.sum(counts))
     max_count = float(np.max(counts))
-    signal_snr = float(
-        total_counts / np.sqrt(max(float(np.sum(variances)), 1.0e-12))
-    )
+    signal_snr = float(total_counts / np.sqrt(max(float(np.sum(variances)), 1.0e-12)))
     total_floor = max(float(config.unresolved_absent_min_total_counts), 0.0)
     max_floor = max(float(config.unresolved_absent_min_max_counts), 0.0)
     snr_floor = max(float(config.unresolved_absent_min_snr), 0.0)
@@ -640,8 +846,12 @@ def _prediction_gain_components(
     config: RemainingMeasurementConfig,
     dss_node: DSSPPNode | None,
     dss_diagnostics: dict[str, float | int | str] | None,
+    *,
+    residual_surface_gain: float | None = None,
+    timings: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], int]:
     """Return predicted one-station ambiguity reduction components."""
+    start = time.perf_counter()
     program = tuple(int(pair_id) for pair_id in (shield_program_pair_ids or ()))
     if not program:
         program = (0,)
@@ -728,14 +938,19 @@ def _prediction_gain_components(
             if key in dss_diagnostics:
                 gains["dss_information"] += max(float(dss_diagnostics[key]), 0.0)
                 break
-    residual_surface_gain = _residual_surface_gain_estimate(
-        estimator,
-        mode_arrays,
-        config,
-    )
+    if residual_surface_gain is None:
+        residual_surface_gain = _residual_surface_gain_estimate(
+            estimator,
+            mode_arrays,
+            config,
+            timings=timings,
+        )
+    else:
+        _timer_add(timings, "residual_surface_cache_hit", 1.0)
     gains["residual_surface"] = residual_surface_gain
     gains["residual"] += residual_surface_gain
     gains["pseudo_source_verification"] += float(program_length)
+    _timer_add(timings, "prediction_total_s", time.perf_counter() - start)
     return gains, program_length
 
 
@@ -746,6 +961,7 @@ def _residual_surface_gain_estimate(
         list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
     ],
     config: RemainingMeasurementConfig,
+    timings: dict[str, float] | None = None,
 ) -> float:
     """
     Return a batched estimate of residual reduction available from one surface source.
@@ -757,7 +973,11 @@ def _residual_surface_gain_estimate(
     uses the same PF response model and a batched weighted least-squares strength
     fit over known source-surface candidates; no transport shortcut is introduced.
     """
-    pool_all = np.asarray(getattr(estimator, "candidate_sources", np.zeros((0, 3))), dtype=float)
+    start = time.perf_counter()
+    pool_all = np.asarray(
+        getattr(estimator, "candidate_sources", np.zeros((0, 3))),
+        dtype=float,
+    )
     if pool_all.size == 0:
         return 0.0
     pool_all = pool_all.reshape(-1, 3)
@@ -771,6 +991,7 @@ def _residual_surface_gain_estimate(
         )
         pool = pool_all[sample_indices]
     else:
+        sample_indices = np.arange(pool_all.shape[0], dtype=np.int64)
         pool = pool_all
     if pool.size == 0:
         return 0.0
@@ -779,6 +1000,7 @@ def _residual_surface_gain_estimate(
     eps = max(float(config.gain_epsilon), 1.0e-12)
     total_gain = 0.0
     for isotope, filt in estimator.filters.items():
+        iso_start = time.perf_counter()
         data = estimator._measurement_data_for_iso(isotope, window=None)
         if data is None or data.z_k.size == 0:
             continue
@@ -815,17 +1037,30 @@ def _residual_surface_gain_estimate(
         current_chi2 = float(np.sum((residual * residual) / variances))
         if current_chi2 <= threshold:
             continue
-        candidate_counts = expected_counts_per_source(
-            kernel=filt.continuous_kernel,
-            isotope=isotope,
-            detector_positions=data.detector_positions,
-            sources=pool,
-            strengths=np.ones(pool.shape[0], dtype=float),
-            live_times=data.live_times,
-            fe_indices=data.fe_indices,
-            pb_indices=data.pb_indices,
-            source_scale=estimator.response_scale_for_isotope(isotope),
-        )
+        cached_grid_getter = getattr(estimator, "_cached_candidate_grid_counts", None)
+        if callable(cached_grid_getter):
+            candidate_counts = cached_grid_getter(
+                filt=filt,
+                isotope=isotope,
+                data=data,
+            )[:, sample_indices]
+            _timer_add(timings, "residual_surface_candidate_cache_path", 1.0)
+        else:
+            candidate_counts = expected_counts_per_source(
+                kernel=filt.continuous_kernel,
+                isotope=isotope,
+                detector_positions=data.detector_positions,
+                sources=pool,
+                strengths=np.ones(pool.shape[0], dtype=float),
+                live_times=data.live_times,
+                fe_indices=data.fe_indices,
+                pb_indices=data.pb_indices,
+                source_scale=estimator.response_scales_for_measurements(
+                    isotope,
+                    data.fe_indices,
+                    data.pb_indices,
+                ),
+            )
         counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
         if counts.ndim != 2 or counts.shape != (data.z_k.size, pool.shape[0]):
             continue
@@ -849,6 +1084,12 @@ def _residual_surface_gain_estimate(
         reduction = np.maximum(current_chi2 - trial_chi2, 0.0)
         if reduction.size:
             total_gain += float(np.max(reduction)) / threshold
+        _timer_add(
+            timings,
+            f"residual_surface_{isotope}_s",
+            time.perf_counter() - iso_start,
+        )
+    _timer_add(timings, "residual_surface_total_s", time.perf_counter() - start)
     return float(max(total_gain, 0.0))
 
 
@@ -903,11 +1144,42 @@ def estimate_remaining_measurement_budget(
     update_history: bool = True,
 ) -> RemainingMeasurementEstimate:
     """Estimate remaining station windows from current PF ambiguity."""
+    total_start = time.perf_counter()
     cfg = config or RemainingMeasurementConfig()
-    components, isotope_details, mode_arrays = _state_budget_components(
-        estimator,
-        cfg,
-    )
+    timings: dict[str, float] = {}
+    cache_key = _remaining_state_cache_key(estimator, cfg)
+    cached_state = _cached_remaining_state_payload(estimator, cache_key)
+    cached_residual_surface_gain: float | None = None
+    if cached_state is not None:
+        timings["state_cache_hit"] = 1.0
+        components = dict(cached_state.get("components", {}))
+        isotope_details = dict(cached_state.get("isotope_details", {}))
+        mode_arrays = dict(cached_state.get("mode_arrays", {}))
+        cached_residual_surface_gain = float(
+            cached_state.get("residual_surface_gain", 0.0)
+        )
+    else:
+        timings["state_cache_hit"] = 0.0
+        components, isotope_details, mode_arrays = _state_budget_components(
+            estimator,
+            cfg,
+            timings=timings,
+        )
+        cached_residual_surface_gain = _residual_surface_gain_estimate(
+            estimator,
+            mode_arrays,
+            cfg,
+            timings=timings,
+        )
+        if not update_history:
+            _store_remaining_state_payload(
+                estimator,
+                cache_key,
+                components=components,
+                isotope_details=isotope_details,
+                mode_arrays=mode_arrays,
+                residual_surface_gain=cached_residual_surface_gain,
+            )
     gains, program_length = _prediction_gain_components(
         estimator,
         next_pose_xyz,
@@ -917,6 +1189,8 @@ def estimate_remaining_measurement_budget(
         cfg,
         dss_node,
         dss_diagnostics,
+        residual_surface_gain=cached_residual_surface_gain,
+        timings=timings,
     )
     weighted_budget = (
         float(cfg.uncertainty_weight) * components["uncertainty"]
@@ -924,6 +1198,10 @@ def estimate_remaining_measurement_budget(
         + float(cfg.separation_weight) * components["same_isotope_separation"]
         + float(cfg.verification_weight) * components["pseudo_source_verification"]
         + float(cfg.residual_weight) * components["residual"]
+        + float(cfg.report_response_correlation_weight)
+        * components["report_response_correlation"]
+        + float(cfg.report_residual_weight) * components["report_residual"]
+        + float(cfg.strength_absorption_weight) * components["strength_absorption"]
         + float(cfg.high_surface_ambiguity_weight)
         * components["high_surface_ambiguity"]
         + components["isotope_absence"]
@@ -933,8 +1211,7 @@ def estimate_remaining_measurement_budget(
         + float(cfg.separation_weight) * gains["same_isotope_separation"]
         + float(cfg.verification_weight) * gains["pseudo_source_verification"]
         + float(cfg.residual_weight) * gains["residual"]
-        + float(cfg.high_surface_ambiguity_weight)
-        * gains["high_surface_ambiguity"]
+        + float(cfg.high_surface_ambiguity_weight) * gains["high_surface_ambiguity"]
         + float(cfg.dss_information_gain_weight) * gains["dss_information"]
         + float(cfg.dss_count_utility_weight) * gains["residual"]
     )
@@ -945,6 +1222,8 @@ def estimate_remaining_measurement_budget(
         cfg,
         update_history=update_history,
     )
+    if update_history:
+        _clear_remaining_state_payload(estimator)
     remaining_budget = max(weighted_budget - float(cfg.stop_budget), 0.0)
     denom = max(eta * weighted_gain, float(cfg.gain_epsilon))
     estimate = int(np.ceil(remaining_budget / denom)) if remaining_budget > 0.0 else 0
@@ -973,6 +1252,7 @@ def estimate_remaining_measurement_budget(
         if current_station_count is not None
         else int(len({record.pose_idx for record in estimator.measurements}))
     )
+    _timer_add(timings, "total_s", time.perf_counter() - total_start)
     return RemainingMeasurementEstimate(
         current_station_count=station_count,
         estimated_remaining_stations=estimate,
@@ -990,6 +1270,7 @@ def estimate_remaining_measurement_budget(
         components={key: float(value) for key, value in components.items()},
         gains={key: float(value) for key, value in gains.items()},
         isotope_details=isotope_details,
+        timings={key: float(value) for key, value in timings.items()},
     )
 
 
@@ -1008,5 +1289,7 @@ def format_remaining_measurement_estimate(
         f"budget={estimate.current_budget:.3g} "
         f"gain={estimate.predicted_gain:.3g} "
         f"eta={estimate.empirical_eta:.2f} "
-        f"unresolved={factors}"
+        f"unresolved={factors} "
+        f"timing_total={estimate.timings.get('total_s', 0.0):.3f}s "
+        f"state_cache_hit={int(estimate.timings.get('state_cache_hit', 0.0) > 0.5)}"
     )

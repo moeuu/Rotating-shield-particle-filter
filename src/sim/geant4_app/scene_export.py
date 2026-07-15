@@ -7,6 +7,9 @@ import hashlib
 import json
 from typing import Any
 
+from measurement.detector_geometry import (
+    detector_outer_radius_cm as detector_outer_radius_cm_from_model,
+)
 from sim.isaacsim_app.observation_model import IsaacAssetGeometry
 from sim.isaacsim_app.scene_builder import SceneDescription, StagePrimPaths
 from sim.isaacsim_app.stage_backend import StageBackend, StageMaterialInfo
@@ -278,8 +281,8 @@ def export_scene_for_geant4(
         )
         for source in scene.sources
     )
-    detector_outer_radius_cm = 100.0 * (
-        float(detector_model.crystal_radius_m) + float(detector_model.housing_thickness_m)
+    detector_outer_radius_cm = detector_outer_radius_cm_from_model(
+        detector_model.to_dict()
     )
     fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
         thickness_fe_cm=float(shield_thickness.thickness_fe_cm),

@@ -90,6 +90,7 @@
   "mode_preserving_surface_strata": true,
   "mode_preserving_height_bin_m": 2.0,
   "structural_update_min_counts": 100.0,
+  "structural_update_count_min_snr": 3.0,
   "structural_update_min_snr": 3.0,
   "converge_cluster_spread_max_m": 1.5,
   "converge_cluster_min_support_fraction": 0.05,

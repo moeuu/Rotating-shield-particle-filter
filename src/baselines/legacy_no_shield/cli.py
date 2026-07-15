@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from baselines.legacy_no_shield.realtime_demo import (
+    DEFAULT_ENVIRONMENT_MODE,
     DEFAULT_OBSTACLE_CONFIG,
     DEFAULT_SOURCE_CONFIG,
     load_sources_from_json,
@@ -56,11 +57,12 @@ def main() -> None:
     parser.add_argument(
         "--environment-mode",
         type=str,
-        default="fixed",
+        default=DEFAULT_ENVIRONMENT_MODE,
         choices=("fixed", "random"),
         help=(
             "Environment generation mode: fixed loads the obstacle JSON, "
-            "random creates a fresh obstacle layout at startup."
+            "random creates a fresh obstacle layout at startup "
+            f"(default: {DEFAULT_ENVIRONMENT_MODE})."
         ),
     )
     parser.add_argument(

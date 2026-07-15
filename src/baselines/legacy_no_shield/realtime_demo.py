@@ -41,7 +41,6 @@ import numpy as np
 import time
 
 from measurement.model import EnvironmentConfig, PointSource
-from measurement.obstacles import build_obstacle_grid
 from spectrum.pipeline import SpectralDecomposer
 from sim.blender_environment import generate_blender_environment_usd
 from visualization.realtime_viz import RealTimePFVisualizer, build_frame_from_pf
@@ -51,11 +50,13 @@ from baselines.legacy_no_shield.measurement import BaselineMeasurement
 from baselines.legacy_no_shield.no_shield_pf import NoShieldPF
 from baselines.legacy_no_shield.planning import generate_measurement_positions
 from pf.particle_filter import PFConfig
+from runtime_defaults import DEFAULT_ENVIRONMENT_MODE, DEFAULT_FIXED_OBSTACLE_CONFIG
+from runtime_environment import build_runtime_obstacle_environment
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 RESULTS_DIR = ROOT / "results" / "baselines" / "legacy_no_shield"
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
-DEFAULT_OBSTACLE_CONFIG = ROOT / "obstacle_layouts" / "no_obstacles.json"
+DEFAULT_OBSTACLE_CONFIG = ROOT / DEFAULT_FIXED_OBSTACLE_CONFIG
 MEASUREMENT_TIME_S = 30.0
 SAVE_EVERY_N_STEPS = 10
 DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 1}
@@ -219,7 +220,7 @@ def run_baseline_pf(
     live: bool = True,
     total_time_s: float = 300.0,
     sources: list[PointSource] | None = None,
-    environment_mode: str = "fixed",
+    environment_mode: str = DEFAULT_ENVIRONMENT_MODE,
     obstacle_layout_path: str | None = DEFAULT_OBSTACLE_CONFIG.as_posix(),
     obstacle_seed: int | None = None,
     detect_threshold_abs: float = 30.0,
@@ -239,36 +240,20 @@ def run_baseline_pf(
     )
     sources = _build_demo_sources() if sources is None else sources
     decomposer = SpectralDecomposer()
-    obstacle_grid = None
-    normalized_environment_mode = environment_mode.strip().lower()
-    if normalized_environment_mode not in {"fixed", "random"}:
-        raise ValueError(f"Unknown environment_mode: {environment_mode}")
-    if obstacle_layout_path is not None:
-        obstacle_path: Path | None = None
-        if obstacle_layout_path:
-            obstacle_path = Path(obstacle_layout_path)
-            if not obstacle_path.is_absolute():
-                obstacle_path = (ROOT / obstacle_path).resolve()
-        keep_free = None
-        if env.detector_position is not None:
-            keep_free = [(env.detector_position[0], env.detector_position[1])]
-        obstacle_grid = build_obstacle_grid(
-            mode=normalized_environment_mode,
-            path=obstacle_path,
-            size_x=env.size_x,
-            size_y=env.size_y,
-            cell_size=1.0,
-            blocked_fraction=0.4,
-            rng_seed=obstacle_seed,
-            keep_free_points=keep_free,
-        )
-        mode_message = f"Obstacle environment mode: {normalized_environment_mode}"
-        if normalized_environment_mode == "fixed" and obstacle_path is not None:
-            mode_message += f" ({obstacle_path})"
-        if obstacle_seed is not None:
-            mode_message += f", seed={int(obstacle_seed)}"
-        mode_message += f", blocked_fraction={obstacle_grid.blocked_fraction:.3f}"
-        print(mode_message)
+    obstacle_environment = build_runtime_obstacle_environment(
+        root=ROOT,
+        environment_mode=environment_mode,
+        obstacle_layout_path=obstacle_layout_path,
+        room_size_xyz=(env.size_x, env.size_y, env.size_z),
+        detector_position_xy=env.detector_position,
+        obstacle_seed=obstacle_seed,
+        blocked_fraction=0.4,
+    )
+    obstacle_grid = obstacle_environment.grid
+    normalized_environment_mode = obstacle_environment.mode
+    if obstacle_environment.message is not None:
+        print(obstacle_environment.message)
+    if obstacle_grid is not None:
         if normalized_environment_mode == "random":
             if blender_output_path:
                 generated_output_path = Path(blender_output_path)

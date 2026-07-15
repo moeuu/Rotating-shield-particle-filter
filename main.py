@@ -21,6 +21,7 @@ from realtime_demo import (
 )
 from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
 from runtime_defaults import (
+    DEFAULT_ENVIRONMENT_MODE,
     DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     DEFAULT_MEASUREMENT_TIME_S,
     DEFAULT_RANDOM_SOURCE_COUNT,
@@ -310,11 +311,12 @@ def main() -> None:
     parser.add_argument(
         "--environment-mode",
         type=str,
-        default="fixed",
+        default=DEFAULT_ENVIRONMENT_MODE,
         choices=("fixed", "random"),
         help=(
             "Environment generation mode: fixed loads the obstacle JSON, "
-            "random creates a fresh obstacle layout at startup."
+            "random creates a fresh obstacle layout at startup "
+            f"(default: {DEFAULT_ENVIRONMENT_MODE})."
         ),
     )
     parser.add_argument(

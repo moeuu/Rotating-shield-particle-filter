@@ -13,6 +13,7 @@ from measurement.shielding import (
     generate_octant_orientations,
     generate_octant_rotation_matrices,
     generate_fe_pb_orientation_pairs,
+    line_resolved_shield_mu_by_isotope,
     octant_index_from_normal,
     cartesian_to_spherical,
     iron_shield,
@@ -232,3 +233,26 @@ def test_eu154_hvl_matches_configured_line_effective_attenuation() -> None:
         0.284,
         rel=0.03,
     )
+
+
+def test_line_resolved_shield_mu_uses_normalized_gamma_lines() -> None:
+    """Line-resolved shield coefficients should mirror the Geant4 line mixture."""
+    table = line_resolved_shield_mu_by_isotope(
+        isotopes=["Cs-137", "Co-60", "Eu-154"],
+        normalize_line_intensities=True,
+    )
+
+    assert set(table) == {"Cs-137", "Co-60", "Eu-154"}
+    for isotope, rows in table.items():
+        assert rows
+        total_weight = sum(float(row["weight"]) for row in rows)
+        assert total_weight == pytest.approx(1.0)
+        for row in rows:
+            assert float(row["energy_keV"]) > 0.0
+            assert float(row["fe"]) > 0.0
+            assert float(row["pb"]) > 0.0
+
+    co_pb_values = {round(float(row["pb"]), 8) for row in table["Co-60"]}
+    eu_pb_values = {round(float(row["pb"]), 8) for row in table["Eu-154"]}
+    assert len(co_pb_values) > 1
+    assert len(eu_pb_values) > 1

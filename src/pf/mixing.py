@@ -7,7 +7,6 @@ from typing import Callable, Dict
 import numpy as np
 from numpy.typing import NDArray
 
-from measurement.continuous_kernels import ContinuousKernel
 from pf.estimator import RotatingShieldPFEstimator
 from pf.likelihood import delta_log_likelihood_remove, expected_counts_per_source
 
@@ -170,19 +169,7 @@ def prune_spurious_sources_continuous(
         from pf import gpu_utils
 
         use_gpu_kernel = bool(gpu_utils.torch_available())
-    kernel = ContinuousKernel(
-        mu_by_isotope=estimator.mu_by_isotope,
-        shield_params=estimator.shield_params,
-        use_gpu=use_gpu_kernel,
-        gpu_device=str(getattr(pf_config, "gpu_device", "cuda")),
-        gpu_dtype=str(getattr(pf_config, "gpu_dtype", "float32")),
-        obstacle_grid=getattr(estimator, "obstacle_grid", None),
-        obstacle_height_m=float(getattr(estimator, "obstacle_height_m", 2.0)),
-        obstacle_mu_by_isotope=getattr(estimator, "obstacle_mu_by_isotope", None),
-        obstacle_buildup_coeff=float(getattr(estimator, "obstacle_buildup_coeff", 0.0)),
-        detector_radius_m=float(getattr(estimator, "detector_radius_m", 0.0)),
-        detector_aperture_samples=int(getattr(estimator, "detector_aperture_samples", 1)),
-    )
+    kernel = estimator.continuous_kernel(use_gpu=use_gpu_kernel)
     keep_masks: Dict[str, NDArray[np.bool_]] = {}
     estimates = estimate_snapshot if estimate_snapshot is not None else estimator.estimates()
     method_params = dict(params or {})
@@ -273,7 +260,11 @@ def prune_spurious_sources_continuous(
                 live_times=live_times_arr,
                 fe_indices=fe_arr,
                 pb_indices=pb_arr,
-                source_scale=estimator.response_scale_for_isotope(iso),
+                source_scale=estimator.response_scales_for_measurements(
+                    iso,
+                    fe_arr,
+                    pb_arr,
+                ),
             )
 
         background_rate = 0.0

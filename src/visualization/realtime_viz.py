@@ -33,8 +33,8 @@ class PFFrame:
     - RFe, RPb: rotation matrices for iron/lead shields (3x3)
     - duration: acquisition time T_k
     - counts_by_isotope: z_{k,h} from spectrum unfolding (Sec. 2.5.7)
-    - particle_positions: isotope -> (N_points, 3)
-    - particle_weights: isotope -> (N_points,)
+    - particle_positions: isotope -> source-slot sample positions (N_points, 3)
+    - particle_weights: isotope -> source-slot sample weights (N_points,)
     - estimated_sources: isotope -> (N_est, 3)
     - estimated_strengths: isotope -> (N_est,)
     - path_waypoints_xyz: optional obstacle-aware robot path segment (M, 3)
@@ -58,6 +58,8 @@ class PFFrame:
     spectrum_energy_keV: Optional[NDArray[np.float64]] = None
     spectrum_counts: Optional[NDArray[np.float64]] = None
     spectrum_components_by_isotope: Optional[Dict[str, NDArray[np.float64]]] = None
+    particle_representative_positions: Optional[Dict[str, NDArray[np.float64]]] = None
+    particle_representative_weights: Optional[Dict[str, NDArray[np.float64]]] = None
 
 
 def frame_to_isaac_pf_payload(
@@ -104,6 +106,19 @@ def frame_to_isaac_pf_payload(
         "estimated_sources": estimated_sources,
         "estimated_strengths": estimated_strengths,
     }
+    if frame.particle_representative_positions is not None:
+        payload["particle_representative_positions"] = {
+            isotope: _array2_to_list(np.asarray(positions, dtype=float).reshape((-1, 3)))
+            for isotope, positions in frame.particle_representative_positions.items()
+        }
+    if frame.particle_representative_weights is not None:
+        payload["particle_representative_weights"] = {
+            isotope: [
+                float(value)
+                for value in np.asarray(weights, dtype=float).reshape(-1)
+            ]
+            for isotope, weights in frame.particle_representative_weights.items()
+        }
     waypoints = _coerce_path_waypoints(frame)
     if waypoints.size:
         payload["path_waypoints_xyz"] = _array2_to_list(waypoints)
@@ -2071,11 +2086,33 @@ class CUISplitPFVisualizer:
         rgba[:, 3] = 0.18 + 0.62 * w_norm
         return sizes, rgba
 
-    def _save_pf_3d(self, frame: PFFrame, output_path: Path) -> None:
-        """Save the current PF particles and estimates as a 3D PNG."""
-        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
-        fig = plt.figure(figsize=(9.4, 7.0))
-        ax = fig.add_subplot(111, projection="3d")
+    def _representative_particle_style(
+        self,
+        weights: NDArray[np.float64],
+        color: object,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Map per-PF-particle representative weights to compact display markers."""
+        w = np.asarray(weights, dtype=float)
+        if w.size == 0:
+            return np.full(0, 3.0), np.zeros((0, 4), dtype=float)
+        w_norm = _normalize_weights(w)
+        if float(np.max(w_norm) - np.min(w_norm)) > 1.0e-12:
+            w_norm = (w_norm - np.min(w_norm)) / (np.max(w_norm) - np.min(w_norm))
+        else:
+            w_norm = np.ones_like(w_norm)
+        sizes = 2.2 + 8.0 * w_norm
+        rgba = np.tile(mcolors.to_rgba(color), (w_norm.size, 1))
+        rgba[:, 3] = 0.07 + 0.25 * w_norm
+        return sizes, rgba
+
+    def _draw_pf_scene_context(
+        self,
+        ax: plt.Axes,
+        frame: PFFrame,
+        *,
+        show_legend_context: bool,
+    ) -> None:
+        """Draw static PF scene context shared by source-sample and particle panels."""
         self._draw_obstacles_3d(ax)
         for idx, segment in enumerate(self.path_segments):
             if segment.shape[0] < 2:
@@ -2086,9 +2123,11 @@ class CUISplitPFVisualizer:
                 segment[:, 2],
                 "-",
                 color="cyan",
-                linewidth=2.0,
-                alpha=0.75,
-                label="traversed path" if idx == 0 else None,
+                linewidth=1.6,
+                alpha=0.68,
+                label="traversed path"
+                if idx == 0 and show_legend_context
+                else None,
             )
         path_waypoints = self._unique_path_waypoints()
         if path_waypoints.size:
@@ -2096,14 +2135,14 @@ class CUISplitPFVisualizer:
                 path_waypoints[:, 0],
                 path_waypoints[:, 1],
                 path_waypoints[:, 2],
-                s=16,
+                s=9,
                 color="cyan",
                 edgecolor="black",
-                linewidth=0.3,
-                alpha=0.45,
+                linewidth=0.25,
+                alpha=0.28,
                 marker=".",
                 depthshade=False,
-                label="path waypoint",
+                label="path waypoint" if show_legend_context else None,
             )
         if self.measurement_points:
             points = np.vstack(self.measurement_points)
@@ -2111,62 +2150,57 @@ class CUISplitPFVisualizer:
                 points[:, 0],
                 points[:, 1],
                 points[:, 2],
-                s=55,
+                s=34,
                 color="white",
                 edgecolor="cyan",
-                linewidth=1.0,
+                linewidth=0.8,
                 depthshade=False,
-                label="measurement station",
+                label="measurement station" if show_legend_context else None,
             )
         robot = np.asarray(frame.robot_position, dtype=float)
         ax.scatter(
             [robot[0]],
             [robot[1]],
             [robot[2]],
-            s=90,
+            s=70,
             color="cyan",
             edgecolor="black",
-            linewidth=0.8,
+            linewidth=0.7,
             depthshade=False,
-            label="robot",
+            label="robot" if show_legend_context else None,
         )
         self._plot_true_sources_3d(ax)
+
+    def _plot_estimates_3d(self, ax: plt.Axes, frame: PFFrame) -> None:
+        """Plot current source estimates on one PF 3D axis."""
         for iso in self.isotopes:
-            color = self.colors.get(iso, "gray")
-            pts, weights = self._particle_subset(
-                frame.particle_positions.get(iso, np.zeros((0, 3), dtype=float)),
-                frame.particle_weights.get(iso, np.zeros(0, dtype=float)),
-            )
-            if pts.size:
-                sizes, rgba = self._particle_style(weights, color)
-                ax.scatter(
-                    pts[:, 0],
-                    pts[:, 1],
-                    pts[:, 2],
-                    s=sizes,
-                    c=rgba,
-                    marker=".",
-                    depthshade=False,
-                    label=f"{iso} particles",
-                )
             est = frame.estimated_sources.get(iso, np.zeros((0, 3), dtype=float))
             strengths = frame.estimated_strengths.get(iso, np.zeros(0, dtype=float))
-            if est.size:
-                est = np.asarray(est, dtype=float).reshape((-1, 3))
-                sizes = 120.0 + 0.02 * np.clip(np.asarray(strengths, dtype=float), 0.0, 5000.0)
-                if sizes.size != est.shape[0]:
-                    sizes = np.full(est.shape[0], 140.0, dtype=float)
-                ax.scatter(
-                    est[:, 0],
-                    est[:, 1],
-                    est[:, 2],
-                    marker="x",
-                    s=sizes,
-                    color=color,
-                    linewidths=2.0,
-                    depthshade=False,
-                    label=f"{iso} estimate",
-                )
+            if not np.asarray(est, dtype=float).size:
+                continue
+            est_arr = np.asarray(est, dtype=float).reshape((-1, 3))
+            sizes = 110.0 + 0.018 * np.clip(
+                np.asarray(strengths, dtype=float),
+                0.0,
+                5000.0,
+            )
+            if sizes.size != est_arr.shape[0]:
+                sizes = np.full(est_arr.shape[0], 130.0, dtype=float)
+            ax.scatter(
+                est_arr[:, 0],
+                est_arr[:, 1],
+                est_arr[:, 2],
+                marker="x",
+                s=sizes,
+                color=self.colors.get(iso, "gray"),
+                linewidths=1.9,
+                depthshade=False,
+                label=f"{iso} estimate",
+            )
+
+    def _format_pf_axis(self, ax: plt.Axes, title: str) -> None:
+        """Apply shared bounds, metric ticks, labels, and camera to a PF axis."""
+        xmin, xmax, ymin, ymax, zmin, zmax = self.world_bounds
         ax.set_xlim(float(xmin), float(xmax))
         ax.set_ylim(float(ymin), float(ymax))
         ax.set_zlim(float(zmin), float(zmax))
@@ -2189,15 +2223,106 @@ class CUISplitPFVisualizer:
         ax.set_xlabel("x [m]")
         ax.set_ylabel("y [m]")
         ax.set_zlabel("z [m]")
-        ax.set_title(f"Particle filter 3D - {self._frame_progress_label(frame)}")
+        ax.set_title(title, fontsize=10)
         ax.view_init(elev=26.0, azim=-58.0)
-        ax.legend(
-            loc="upper left",
-            bbox_to_anchor=(1.02, 1.0),
-            borderaxespad=0.0,
-            fontsize=7,
+
+    @staticmethod
+    def _point_count(points_by_isotope: Dict[str, NDArray[np.float64]]) -> int:
+        """Return the total number of display points across isotope arrays."""
+        total = 0
+        for points in points_by_isotope.values():
+            arr = np.asarray(points, dtype=float)
+            if arr.size:
+                total += int(arr.reshape((-1, 3)).shape[0])
+        return total
+
+    def _save_pf_3d(self, frame: PFFrame, output_path: Path) -> None:
+        """Save the current PF particles and estimates as a 3D PNG."""
+        fig = plt.figure(figsize=(14.2, 6.6))
+        ax_samples = fig.add_subplot(121, projection="3d")
+        ax_representatives = fig.add_subplot(122, projection="3d")
+        representative_positions_by_iso = (
+            frame.particle_representative_positions
+            if frame.particle_representative_positions is not None
+            else frame.particle_positions
         )
-        fig.subplots_adjust(right=0.76)
+        representative_weights_by_iso = (
+            frame.particle_representative_weights
+            if frame.particle_representative_weights is not None
+            else frame.particle_weights
+        )
+        self._draw_pf_scene_context(ax_samples, frame, show_legend_context=True)
+        self._draw_pf_scene_context(
+            ax_representatives,
+            frame,
+            show_legend_context=False,
+        )
+        for iso in self.isotopes:
+            color = self.colors.get(iso, "gray")
+            pts, weights = self._particle_subset(
+                frame.particle_positions.get(iso, np.zeros((0, 3), dtype=float)),
+                frame.particle_weights.get(iso, np.zeros(0, dtype=float)),
+            )
+            if pts.size:
+                sizes, rgba = self._particle_style(weights, color)
+                ax_samples.scatter(
+                    pts[:, 0],
+                    pts[:, 1],
+                    pts[:, 2],
+                    s=sizes,
+                    c=rgba,
+                    marker=".",
+                    depthshade=False,
+                    label=f"{iso} source samples",
+                )
+            rep_positions = representative_positions_by_iso.get(
+                iso,
+                np.zeros((0, 3), dtype=float),
+            )
+            rep_weights = representative_weights_by_iso.get(
+                iso,
+                np.zeros(0, dtype=float),
+            )
+            reps, rep_w = self._particle_subset(rep_positions, rep_weights)
+            if reps.size:
+                sizes, rgba = self._representative_particle_style(rep_w, color)
+                ax_representatives.scatter(
+                    reps[:, 0],
+                    reps[:, 1],
+                    reps[:, 2],
+                    s=sizes,
+                    c=rgba,
+                    marker="o",
+                    edgecolors="none",
+                    alpha=None,
+                    depthshade=False,
+                    label=f"{iso} PF particles",
+                )
+        self._plot_estimates_3d(ax_samples, frame)
+        self._plot_estimates_3d(ax_representatives, frame)
+        sample_count = self._point_count(frame.particle_positions)
+        representative_count = self._point_count(representative_positions_by_iso)
+        self._format_pf_axis(
+            ax_samples,
+            f"Source-slot samples (N={sample_count})",
+        )
+        self._format_pf_axis(
+            ax_representatives,
+            f"PF particle active-source centroids (N={representative_count})",
+        )
+        fig.suptitle(
+            f"Particle filter 3D - {self._frame_progress_label(frame)}",
+            fontsize=11,
+        )
+        handles, _labels = ax_representatives.get_legend_handles_labels()
+        if handles:
+            ax_representatives.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+                fontsize=6.5,
+            )
+        fig.subplots_adjust(left=0.02, right=0.86, top=0.88, bottom=0.04, wspace=0.06)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=160, bbox_inches="tight")
         plt.close(fig)
@@ -2385,6 +2510,8 @@ def build_frame_from_pf(
             est = pf.estimates()  # type: ignore[attr-defined]
     particle_positions: Dict[str, NDArray[np.float64]] = {}
     particle_weights: Dict[str, NDArray[np.float64]] = {}
+    particle_representative_positions: Dict[str, NDArray[np.float64]] = {}
+    particle_representative_weights: Dict[str, NDArray[np.float64]] = {}
     estimated_sources: Dict[str, NDArray[np.float64]] = {}
     estimated_strengths: Dict[str, NDArray[np.float64]] = {}
 
@@ -2395,6 +2522,8 @@ def build_frame_from_pf(
     for iso, filt in pf.filters.items():
         positions: list[NDArray[np.float64]] = []
         weights: list[float] = []
+        representative_positions: list[NDArray[np.float64]] = []
+        representative_weights: list[float] = []
         cont_particles = getattr(filt, "continuous_particles", [])
         cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
         if cont_particles and len(cont_weights) == len(cont_particles):
@@ -2402,11 +2531,24 @@ def build_frame_from_pf(
                 active_positions = _active_display_positions(filt, p.state)
                 if active_positions.size == 0:
                     continue
+                representative_positions.append(
+                    np.mean(active_positions.reshape((-1, 3)), axis=0),
+                )
+                representative_weights.append(float(w))
                 for pos in active_positions:
                     positions.append(pos)
                     weights.append(float(w))
         particle_positions[iso] = np.vstack(positions) if positions else np.zeros((0, 3))
         particle_weights[iso] = np.asarray(weights, dtype=float)
+        particle_representative_positions[iso] = (
+            np.vstack(representative_positions)
+            if representative_positions
+            else np.zeros((0, 3))
+        )
+        particle_representative_weights[iso] = np.asarray(
+            representative_weights,
+            dtype=float,
+        )
         if estimated_override is not None and iso in estimated_override:
             est_pos_raw, est_str_raw = estimated_override[iso]
             est_pos = np.asarray(est_pos_raw, dtype=float)
@@ -2520,4 +2662,6 @@ def build_frame_from_pf(
         particle_weights=particle_weights,
         estimated_sources=estimated_sources,
         estimated_strengths=estimated_strengths,
+        particle_representative_positions=particle_representative_positions,
+        particle_representative_weights=particle_representative_weights,
     )

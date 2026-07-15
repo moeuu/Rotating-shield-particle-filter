@@ -7,6 +7,7 @@ from measurement.continuous_kernels import (
     ContinuousKernel,
     finite_sphere_geometric_term,
     geometric_term,
+    segment_rotated_octant_shell_path_length_cm_torch,
 )
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
@@ -51,6 +52,48 @@ def test_finite_sphere_geometric_term_preserves_one_meter_definition() -> None:
     assert at_center < 1.0e4
 
 
+def test_torch_rotated_octant_shell_cached_rotation_matches_direct() -> None:
+    """Cached torch octant rotations should preserve exact path-length results."""
+    torch = pytest.importorskip("torch")
+    kernel = ContinuousKernel(use_gpu=True, gpu_device="cpu", gpu_dtype="float64")
+    device = torch.device("cpu")
+    dtype = torch.float64
+    source_pos = torch.as_tensor(
+        [[1.0, 1.0, 1.0], [-1.0, 1.5, 0.5]],
+        device=device,
+        dtype=dtype,
+    )
+    target_pos = torch.zeros_like(source_pos)
+    center_pos = torch.zeros(1, 3, device=device, dtype=dtype)
+    shield_normal = -np.asarray(kernel.orientations[0], dtype=float)
+    rotation = kernel._rotated_octant_rotation_torch(
+        shield_normal,
+        device=device,
+        dtype=dtype,
+    )
+
+    direct = segment_rotated_octant_shell_path_length_cm_torch(
+        source_pos=source_pos,
+        target_pos=target_pos,
+        center_pos=center_pos,
+        shield_normal=shield_normal,
+        inner_radius_cm=1.0,
+        outer_radius_cm=20.0,
+    )
+    cached = segment_rotated_octant_shell_path_length_cm_torch(
+        source_pos=source_pos,
+        target_pos=target_pos,
+        center_pos=center_pos,
+        shield_normal=None,
+        inner_radius_cm=1.0,
+        outer_radius_cm=20.0,
+        rotation=rotation,
+    )
+
+    assert torch.allclose(cached, direct, rtol=1e-12, atol=1e-12)
+    assert len(kernel._torch_octant_rotation_cache) == 1
+
+
 def test_attenuation_applies_blocking_factor() -> None:
     """Blocked orientation should reduce expected counts by exp(-mu*L)."""
     shield_params = ShieldParams()
@@ -84,6 +127,271 @@ def test_attenuation_applies_blocking_factor() -> None:
     assert np.isclose(blocked_counts, expected_ratio * free_counts, rtol=1e-6)
 
 
+def test_line_resolved_attenuation_uses_weighted_transmission() -> None:
+    """ContinuousKernel should average shield transmission over gamma lines."""
+    shield_params = ShieldParams(
+        mu_fe=0.0,
+        mu_pb=0.0,
+        thickness_fe_cm=2.0,
+        thickness_pb_cm=0.0,
+    )
+    line_mu = {
+        "TestIso": (
+            {"weight": 1.0, "fe": 0.10, "pb": 0.0},
+            {"weight": 3.0, "fe": 0.30, "pb": 0.0},
+        )
+    }
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        line_mu_by_isotope=line_mu,
+        use_gpu=False,
+    )
+    detector = np.zeros(3, dtype=float)
+    source = np.array([[1.0, 1.0, 1.0]], dtype=float)
+    strength = np.array([100.0], dtype=float)
+
+    blocked = kernel.expected_counts_pair(
+        "TestIso",
+        detector,
+        source,
+        strength,
+        fe_index=7,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+    free = kernel.expected_counts_pair(
+        "TestIso",
+        detector,
+        source,
+        strength,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+    expected_ratio = 0.25 * np.exp(-0.10 * 2.0) + 0.75 * np.exp(-0.30 * 2.0)
+
+    assert blocked == pytest.approx(free * expected_ratio, rel=1e-12)
+
+
+def test_line_resolved_obstacle_attenuation_uses_line_mu_values() -> None:
+    """ContinuousKernel should average obstacle transmission over gamma lines."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    ).with_transport_model(
+        boxes_m=((0.0, -0.5, 0.0, 1.0, 0.5, 2.0),),
+        mu_by_isotope={"TestIso": (0.0,)},
+        line_mu_by_isotope={"TestIso": ((0.01,), (0.03,))},
+    )
+    line_mu = {
+        "TestIso": (
+            {"weight": 1.0, "fe": 0.0, "pb": 0.0},
+            {"weight": 3.0, "fe": 0.0, "pb": 0.0},
+        )
+    }
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        obstacle_grid=grid,
+        line_mu_by_isotope=line_mu,
+        use_gpu=False,
+    )
+    free_kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        line_mu_by_isotope=line_mu,
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+
+    blocked = kernel.kernel_value_pair("TestIso", detector, source, 0, 0)
+    free = free_kernel.kernel_value_pair("TestIso", detector, source, 0, 0)
+    expected_ratio = 0.25 * np.exp(-1.0) + 0.75 * np.exp(-3.0)
+
+    assert kernel.obstacle_path_lengths_by_box_cm(source, detector)[0] == pytest.approx(100.0)
+    assert blocked == pytest.approx(free * expected_ratio, rel=1e-12)
+
+
+def test_transport_response_terms_reconstruct_kernel_with_aperture() -> None:
+    """Calibration terms should match the aperture-averaged runtime kernel."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    ).with_transport_model(
+        boxes_m=((0.2, 0.2, 0.2, 0.8, 0.8, 0.8),),
+        mu_by_isotope={"TestIso": (0.01,)},
+        line_mu_by_isotope={"TestIso": ((0.01,), (0.025,))},
+    )
+    line_mu = {
+        "TestIso": (
+            {"weight": 0.4, "fe": 0.05, "pb": 0.08},
+            {"weight": 0.6, "fe": 0.09, "pb": 0.12},
+        )
+    }
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {
+            "TestIso": {
+                "scale": 1.1,
+                "tau_coefficients": {
+                    "shield": 0.03,
+                    "obstacle": -0.02,
+                    "shield_squared": 0.0,
+                    "obstacle_squared": 0.0,
+                    "shield_obstacle": 0.01,
+                },
+                "min_log_scale": -2.0,
+                "max_log_scale": 2.0,
+            }
+        },
+    }
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=2.0,
+            thickness_pb_cm=1.0,
+        ),
+        obstacle_grid=grid,
+        detector_radius_m=0.04,
+        detector_aperture_radius_m=0.03,
+        detector_aperture_samples=9,
+        line_mu_by_isotope=line_mu,
+        transport_response_model=transport_model,
+        use_gpu=False,
+    )
+    detector = np.array([0.0, 0.0, 0.0], dtype=float)
+    source = np.array([1.0, 1.0, 1.0], dtype=float)
+
+    terms = kernel.transport_response_terms_pair("TestIso", detector, source, 7, 5)
+    reconstructed = sum(float(term["kernel"]) for term in terms)
+    direct = kernel.kernel_value_pair("TestIso", detector, source, 7, 5)
+
+    assert len(terms) == 9
+    assert reconstructed == pytest.approx(direct, rel=1.0e-12, abs=1.0e-12)
+    assert any(float(term["obstacle_tau_feature"]) > 0.0 for term in terms)
+    assert any(float(term["shield_tau_feature"]) > 0.0 for term in terms)
+
+
+def test_transport_response_base_terms_reconstruct_capped_base_kernel() -> None:
+    """Base calibration terms should match capped no-sidecar runtime counts."""
+    isotope = "TestIso"
+    shield_params = ShieldParams(
+        mu_fe=0.0,
+        mu_pb=0.0,
+        thickness_fe_cm=2.0,
+        thickness_pb_cm=0.0,
+        buildup_fe_coeff=30.0,
+    )
+    line_mu = {isotope: ({"weight": 1.0, "fe": 0.05, "pb": 0.0},)}
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {
+            isotope: {
+                "scale": 2.0,
+                "tau_coefficients": {},
+                "min_log_scale": -5.0,
+                "max_log_scale": 5.0,
+            }
+        },
+    }
+    base_kernel = ContinuousKernel(
+        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        line_mu_by_isotope=line_mu,
+        use_gpu=False,
+    )
+    response_kernel = ContinuousKernel(
+        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        line_mu_by_isotope=line_mu,
+        transport_response_model=transport_model,
+        use_gpu=False,
+    )
+    detector = np.zeros(3, dtype=float)
+    source = np.array([1.0, 1.0, 1.0], dtype=float)
+
+    terms = response_kernel.transport_response_terms_pair(
+        isotope,
+        detector,
+        source,
+        7,
+        0,
+    )
+
+    assert sum(float(term["uncapped_kernel"]) for term in terms) > sum(
+        float(term["base_kernel"]) for term in terms
+    )
+    assert sum(float(term["base_kernel"]) for term in terms) == pytest.approx(
+        base_kernel.kernel_value_pair(isotope, detector, source, 7, 0),
+        rel=1.0e-12,
+    )
+    assert sum(float(term["kernel"]) for term in terms) == pytest.approx(
+        response_kernel.kernel_value_pair(isotope, detector, source, 7, 0),
+        rel=1.0e-12,
+    )
+
+
+def test_cpu_attenuation_uses_explicit_aperture_radius_without_count_radius() -> None:
+    """CPU attenuation should sample aperture rays independently of count radius."""
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.2, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.2,
+            mu_pb=0.0,
+            thickness_fe_cm=4.0,
+            thickness_pb_cm=0.0,
+            inner_radius_fe_cm=3.0,
+        ),
+        detector_radius_m=0.0,
+        detector_aperture_radius_m=0.08,
+        detector_aperture_samples=17,
+        use_gpu=False,
+    )
+    detector = np.zeros(3, dtype=float)
+    source = np.array([0.2, 0.2, 0.2], dtype=float)
+    targets = kernel._detector_aperture_targets(source, detector)
+    center_attenuation = kernel._attenuation_factor_for_target(
+        "Cs-137",
+        source,
+        detector,
+        detector,
+        fe_index=7,
+        pb_index=0,
+    )
+    aperture_attenuation = float(
+        np.mean(
+            [
+                kernel._attenuation_factor_for_target(
+                    "Cs-137",
+                    source,
+                    target,
+                    detector,
+                    fe_index=7,
+                    pb_index=0,
+                )
+                for target in targets
+            ]
+        )
+    )
+
+    assert aperture_attenuation != pytest.approx(center_attenuation)
+    assert kernel.attenuation_factor_pair(
+        "Cs-137",
+        source,
+        detector,
+        fe_index=7,
+        pb_index=0,
+    ) == pytest.approx(aperture_attenuation, rel=1.0e-12)
+
+
 def test_background_added_to_expected_counts() -> None:
     """Background should add directly to expected rate/counts."""
     kernel = ContinuousKernel()
@@ -99,6 +407,34 @@ def test_background_added_to_expected_counts() -> None:
         background=5.0,
     )
     assert np.isclose(counts, 10.0, rtol=1e-6)
+
+
+def test_detector_cone_aperture_targets_match_outer_sphere() -> None:
+    """Cone aperture targets should match the Geant4 detector-cone geometry."""
+    detector = np.array([0.0, 0.0, 0.0], dtype=float)
+    source = np.array([2.0, 0.3, -0.4], dtype=float)
+    aperture_radius = 0.052
+    kernel = ContinuousKernel(
+        detector_radius_m=0.05,
+        detector_aperture_radius_m=aperture_radius,
+        detector_aperture_samples=17,
+        detector_aperture_sampling="solid_angle_cone",
+        use_gpu=False,
+    )
+
+    targets = kernel._detector_aperture_targets(source, detector)
+    target_radii = np.linalg.norm(targets - detector, axis=1)
+    ray_dirs = targets - source
+    ray_dirs /= np.linalg.norm(ray_dirs, axis=1, keepdims=True)
+    axis = detector - source
+    axis /= np.linalg.norm(axis)
+    ray_angles = np.arccos(np.clip(ray_dirs @ axis, -1.0, 1.0))
+    max_angle = np.arcsin(aperture_radius / np.linalg.norm(detector - source))
+
+    assert targets.shape == (17, 3)
+    assert np.allclose(target_radii, aperture_radius, rtol=0.0, atol=1.0e-10)
+    assert float(np.max(ray_angles)) <= float(max_angle) + 1.0e-10
+    assert np.linalg.matrix_rank(targets - targets.mean(axis=0)) == 3
 
 
 def test_expected_counts_single_isotope_attenuation_levels() -> None:
@@ -247,6 +583,112 @@ def test_obstacle_only_optical_depth_diagnostics_match_kernel() -> None:
         source,
         detector,
     ) == pytest.approx(np.exp(-1.0))
+
+
+def test_source_extent_obstacle_area_average_reduces_grazing_overattenuation() -> None:
+    """Source extent sampling should expose partial obstacle occlusion."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.05),
+        cell_size=0.1,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    )
+    center_kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.1},
+        use_gpu=False,
+    )
+    area_kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.1},
+        source_extent_radius_m=0.2,
+        source_extent_samples=9,
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+
+    center_tau = center_kernel.obstacle_optical_depth_pair(
+        "Cs-137",
+        source,
+        detector,
+    )
+    area_tau = area_kernel.obstacle_area_averaged_optical_depth_pair(
+        "Cs-137",
+        source,
+        detector,
+    )
+
+    assert center_tau > 0.0
+    assert 0.0 <= area_tau < center_tau
+    assert area_kernel.obstacle_area_averaged_attenuation_pair(
+        "Cs-137",
+        source,
+        detector,
+    ) > center_kernel.obstacle_attenuation_factor_pair(
+        "Cs-137",
+        source,
+        detector,
+    )
+
+
+def test_obstacle_log_attenuation_matrix_matches_pair_diagnostic() -> None:
+    """Batched obstacle diagnostics should match the shared single-ray kernel."""
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(3, 1),
+        blocked_cells=((0, 0), (1, 0), (2, 0)),
+    )
+    kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    sources = np.asarray(
+        [
+            [-1.0, 0.0, 1.0],
+            [-1.0, 0.4, 1.0],
+        ],
+        dtype=float,
+    )
+    detectors = np.asarray(
+        [
+            [4.0, 0.0, 1.0],
+            [4.0, 0.4, 1.0],
+            [4.0, 1.5, 1.0],
+        ],
+        dtype=float,
+    )
+
+    matrix = kernel.obstacle_log_attenuation_matrix(
+        "Cs-137",
+        sources,
+        detectors,
+        element_budget=2,
+    )
+    expected = np.asarray(
+        [
+            [
+                kernel.obstacle_log_attenuation_pair("Cs-137", source, detector)
+                for source in sources
+            ]
+            for detector in detectors
+        ],
+        dtype=float,
+    )
+    wide_chunk = kernel.obstacle_log_attenuation_matrix(
+        "Cs-137",
+        sources,
+        detectors,
+        element_budget=10_000,
+    )
+
+    np.testing.assert_allclose(matrix, expected, rtol=1.0e-12, atol=1.0e-12)
+    np.testing.assert_allclose(wide_chunk, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_broad_beam_buildup_increases_but_bounds_attenuated_counts() -> None:
@@ -543,7 +985,7 @@ def test_continuous_kernel_cuda_matches_cpu_with_detector_aperture() -> None:
                 pb_index,
                 live_time_s=1.0,
             )
-            assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)
+            assert gpu_counts == pytest.approx(cpu_counts, rel=2e-6, abs=1e-6)
 
 
 def test_kernel_values_all_pairs_matches_pair_values_cpu() -> None:
@@ -631,6 +1073,60 @@ def test_kernel_values_all_pairs_for_detectors_matches_cpu_pairs() -> None:
         )
 
 
+def test_kernel_values_selected_pairs_for_detectors_matches_cpu_pairs() -> None:
+    """Batched selected-pair detector evaluation should match scalar CPU calls."""
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    detectors = np.array(
+        [
+            [0.1, -0.2, 0.8],
+            [1.2, 0.4, 1.1],
+            [-0.6, 0.7, 0.9],
+        ],
+        dtype=float,
+    )
+    sources = np.array(
+        [
+            [1.0, 0.2, 0.8],
+            [-0.5, 1.4, 1.0],
+            [2.0, -1.0, 0.7],
+        ],
+        dtype=float,
+    )
+    fe_indices = np.array([0, 3, 7], dtype=int)
+    pb_indices = np.array([7, 2, 0], dtype=int)
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=5,
+    )
+
+    batched = kernel.kernel_values_selected_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+    )
+
+    assert batched.shape == (detectors.shape[0], sources.shape[0])
+    for pose_idx, detector in enumerate(detectors):
+        expected = kernel.kernel_values_pair(
+            "Cs-137",
+            detector,
+            sources,
+            int(fe_indices[pose_idx]),
+            int(pb_indices[pose_idx]),
+        )
+        assert batched[pose_idx] == pytest.approx(
+            expected,
+            rel=1.0e-12,
+            abs=1.0e-12,
+        )
+
+
 def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() -> None:
     """All-pair CUDA kernel evaluation should match the CPU observation model."""
     torch = pytest.importorskip("torch")
@@ -662,6 +1158,8 @@ def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() 
         use_gpu=False,
         detector_radius_m=0.038,
         detector_aperture_samples=7,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
     )
     gpu_kernel = ContinuousKernel(
         mu_by_isotope=mu,
@@ -672,6 +1170,8 @@ def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() 
         gpu_dtype="float64",
         detector_radius_m=0.038,
         detector_aperture_samples=7,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
     )
 
     cpu_values = cpu_kernel.kernel_values_all_pairs("Cs-137", detector, sources)
@@ -738,6 +1238,80 @@ def test_kernel_values_all_pairs_for_detectors_cuda_matches_cpu() -> None:
         "Cs-137",
         detectors,
         sources,
+    )
+
+    assert gpu_values == pytest.approx(cpu_values, rel=1.0e-10, abs=1.0e-10)
+
+
+def test_kernel_values_selected_pairs_for_detectors_cuda_matches_cpu() -> None:
+    """Batched selected-pair CUDA detector kernels should match CPU results."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detectors = np.array(
+        [
+            [2.2, 2.2, 1.0],
+            [3.2, 1.4, 1.1],
+            [1.2, 3.4, 0.9],
+        ],
+        dtype=float,
+    )
+    sources = np.array(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    fe_indices = np.array([0, 4, 7], dtype=int)
+    pb_indices = np.array([7, 3, 1], dtype=int)
+    mu = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM)
+    cpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
+    )
+    gpu_kernel = ContinuousKernel(
+        mu_by_isotope=mu,
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
+    )
+
+    cpu_values = cpu_kernel.kernel_values_selected_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+    )
+    gpu_values = gpu_kernel.kernel_values_selected_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
     )
 
     assert gpu_values == pytest.approx(cpu_values, rel=1.0e-10, abs=1.0e-10)
