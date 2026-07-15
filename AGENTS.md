@@ -21,6 +21,13 @@
 - After changing code, always run `pytest` and ensure tests pass.
 
 
+## Git workflow
+
+- Unless the user explicitly requests another branch or a pull request, do not
+  create a non-`main` branch or open a pull request. Commit and push directly to
+  `main`.
+
+
 ## Generalization and anti-overfitting policy
 
 - Do not implement calibration, response correction, PF observation logic, or
