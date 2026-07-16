@@ -18,6 +18,10 @@ from sim.isaacsim_app.stage_backend import (
 from sim.protocol import SimulationCommand
 
 
+ROBOT_MAST_SIZE_XY_M = (0.08, 0.08)
+MIN_VISUAL_MAST_HEIGHT_M = 1.0e-6
+
+
 def _normalize_vector(
     vector_xyz: tuple[float, float, float],
 ) -> tuple[float, float, float]:
@@ -70,6 +74,75 @@ def _movement_yaw_rad(
     if float(np.linalg.norm(delta[:2])) <= 1e-9:
         return float(fallback_yaw_rad)
     return float(atan2(delta[1], delta[0]))
+
+
+def _detector_waypoint_path(
+    start_detector_pose: np.ndarray,
+    target_detector_pose: np.ndarray,
+    travel_waypoints_xyz: tuple[tuple[float, float, float], ...] | None,
+) -> np.ndarray:
+    """Return a deduplicated detector path that starts and ends at command poses."""
+    path_points = [np.asarray(start_detector_pose, dtype=float).reshape(3)]
+    if travel_waypoints_xyz:
+        path_points.extend(
+            np.asarray(waypoint, dtype=float).reshape(3)
+            for waypoint in travel_waypoints_xyz
+        )
+    path_points.append(np.asarray(target_detector_pose, dtype=float).reshape(3))
+    deduplicated = [path_points[0]]
+    for point in path_points[1:]:
+        if float(np.linalg.norm(point - deduplicated[-1])) > 1.0e-9:
+            deduplicated.append(point)
+    return np.vstack(deduplicated).astype(float)
+
+
+def _allocate_segment_steps(
+    segment_lengths_m: np.ndarray,
+    requested_steps: int,
+) -> np.ndarray:
+    """Allocate interpolation steps by segment length while retaining each waypoint."""
+    lengths = np.asarray(segment_lengths_m, dtype=float).reshape(-1)
+    if lengths.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    step_budget = max(int(requested_steps), int(lengths.size))
+    total_length = float(np.sum(lengths))
+    if total_length <= 1.0e-12:
+        return np.ones(lengths.size, dtype=np.int64)
+    ideal = lengths * float(step_budget) / total_length
+    allocated = np.maximum(np.floor(ideal).astype(np.int64), 1)
+    while int(np.sum(allocated)) < step_budget:
+        residual = ideal - allocated
+        allocated[int(np.argmax(residual))] += 1
+    while int(np.sum(allocated)) > step_budget:
+        reducible = allocated > 1
+        if not np.any(reducible):
+            break
+        excess = allocated - ideal
+        excess[~reducible] = -np.inf
+        allocated[int(np.argmax(excess))] -= 1
+    return allocated
+
+
+def _interpolate_detector_path(
+    detector_path_xyz: np.ndarray,
+    requested_steps: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return detector samples paired with their active path-segment starts."""
+    path = np.asarray(detector_path_xyz, dtype=float).reshape(-1, 3)
+    if path.shape[0] <= 1:
+        return [(path[0], path[0])]
+    segment_vectors = np.diff(path, axis=0)
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    steps_by_segment = _allocate_segment_steps(segment_lengths, requested_steps)
+    samples: list[tuple[np.ndarray, np.ndarray]] = []
+    for segment_index, segment_steps in enumerate(steps_by_segment):
+        segment_start = path[segment_index]
+        segment_end = path[segment_index + 1]
+        for step_index in range(1, int(segment_steps) + 1):
+            fraction = float(step_index) / float(segment_steps)
+            sample = segment_start + fraction * (segment_end - segment_start)
+            samples.append((sample, segment_start))
+    return samples
 
 
 @dataclass
@@ -156,18 +229,16 @@ class RobotController:
 
     def apply_command(self, command: SimulationCommand) -> None:
         """Move the grounded base and detector mast to a commanded detector pose."""
-        start_base_pose = np.asarray(self.state.pose_xyz, dtype=float)
-        target_base_pose = np.asarray(
-            (
-                float(command.target_pose_xyz[0]),
-                float(command.target_pose_xyz[1]),
-                self.ground_z_m,
-            ),
-            dtype=float,
-        )
         start_detector_pose = np.asarray(self.state.detector_pose_xyz, dtype=float)
         target_detector_pose = np.asarray(command.target_pose_xyz, dtype=float)
-        distance_m = float(np.linalg.norm(target_detector_pose - start_detector_pose))
+        detector_path = _detector_waypoint_path(
+            start_detector_pose,
+            target_detector_pose,
+            command.travel_waypoints_xyz,
+        )
+        distance_m = float(
+            np.sum(np.linalg.norm(np.diff(detector_path, axis=0), axis=1))
+        )
         travel_time_s = float(command.travel_time_s)
         if travel_time_s <= 0.0 and distance_m > 0.0:
             travel_time_s = distance_m / self.motion_speed_m_s
@@ -177,32 +248,26 @@ class RobotController:
                 max(int(ceil(travel_time_s / self.animation_dt_s)), 1),
                 self.max_animation_steps,
             )
-        motion_yaw = _movement_yaw_rad(
-            start_base_pose,
-            target_base_pose,
-            fallback_yaw_rad=float(command.target_base_yaw_rad),
-        )
-        for idx in range(1, steps + 1):
-            frac = float(idx) / float(steps)
-            interp_base_pose = start_base_pose + frac * (
-                target_base_pose - start_base_pose
+        detector_samples = _interpolate_detector_path(detector_path, steps)
+        for detector_sample, segment_start in detector_samples:
+            interp_base_pose = (
+                float(detector_sample[0]),
+                float(detector_sample[1]),
+                self.ground_z_m,
             )
-            interp_detector_z_m = float(
-                start_detector_pose[2]
-                + frac * (target_detector_pose[2] - start_detector_pose[2])
+            motion_yaw = _movement_yaw_rad(
+                segment_start,
+                detector_sample,
+                fallback_yaw_rad=float(command.target_base_yaw_rad),
             )
             self._apply_pose_and_shields(
-                base_pose_xyz=(
-                    float(interp_base_pose[0]),
-                    float(interp_base_pose[1]),
-                    float(interp_base_pose[2]),
-                ),
-                detector_world_z_m=interp_detector_z_m,
+                base_pose_xyz=interp_base_pose,
+                detector_world_z_m=float(detector_sample[2]),
                 base_yaw_rad=motion_yaw,
                 fe_orientation_index=int(command.fe_orientation_index),
                 pb_orientation_index=int(command.pb_orientation_index),
             )
-            if self.animation_time_scale > 0.0 and steps > 1:
+            if self.animation_time_scale > 0.0 and len(detector_samples) > 1:
                 time.sleep(self.animation_dt_s * self.animation_time_scale)
         self.stage_backend.set_local_pose(
             self.prim_paths.robot_root,
@@ -236,6 +301,16 @@ class RobotController:
             self.prim_paths.robot_root,
             translation_xyz=base_pose_xyz,
             orientation_wxyz=yaw_to_quaternion_wxyz(base_yaw_rad),
+        )
+        mast_height_m = max(detector_local_z_m, MIN_VISUAL_MAST_HEIGHT_M)
+        self.stage_backend.set_local_pose(
+            self.prim_paths.robot_mast_path,
+            translation_xyz=(0.0, 0.0, 0.5 * mast_height_m),
+            scale_xyz=(
+                float(ROBOT_MAST_SIZE_XY_M[0]),
+                float(ROBOT_MAST_SIZE_XY_M[1]),
+                mast_height_m,
+            ),
         )
         self.stage_backend.set_local_pose(
             self.prim_paths.detector_path,

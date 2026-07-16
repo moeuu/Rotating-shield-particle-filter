@@ -30,7 +30,11 @@ from sim.transport import (
     make_transport_segment,
 )
 from spectrum.dead_time import non_paralyzable_correction
-from spectrum.pipeline import BACKGROUND_COUNTS_PER_SECOND, BACKGROUND_RATE_CPS, SpectralDecomposer
+from spectrum.pipeline import (
+    BACKGROUND_COUNTS_PER_SECOND,
+    BACKGROUND_RATE_CPS,
+    SpectralDecomposer,
+)
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
     COMPTON_CONTINUUM_TO_PEAK,
@@ -77,7 +81,10 @@ def point_sources_from_payload(payload: Mapping[str, Any]) -> list[PointSource]:
         if not isinstance(entry, Mapping):
             raise ValueError(f"Source entry {index} must be an object.")
         position_payload = entry.get("position", (0.0, 0.0, 0.0))
-        if not isinstance(position_payload, (list, tuple)) or len(position_payload) != 3:
+        if (
+            not isinstance(position_payload, (list, tuple))
+            or len(position_payload) != 3
+        ):
             raise ValueError(f"Source entry {index} position must have three values.")
         sources.append(
             PointSource(
@@ -99,7 +106,14 @@ def obstacle_grid_from_payload(payload: Mapping[str, Any]) -> ObstacleGrid | Non
     if not isinstance(shape_payload, (list, tuple)) or len(shape_payload) != 2:
         raise ValueError("obstacle_grid_shape must have two values.")
     grid_shape = (int(shape_payload[0]), int(shape_payload[1]))
-    if grid_shape[0] <= 0 or grid_shape[1] <= 0:
+    collision_boxes_payload = payload.get("collision_boxes_m", [])
+    transport_boxes_payload = payload.get("transport_boxes_m", [])
+    if not isinstance(collision_boxes_payload, list):
+        raise ValueError("collision_boxes_m must be a list.")
+    if not isinstance(transport_boxes_payload, list):
+        raise ValueError("transport_boxes_m must be a list.")
+    has_grid = grid_shape[0] > 0 and grid_shape[1] > 0
+    if not has_grid and not collision_boxes_payload and not transport_boxes_payload:
         return None
     origin_payload = payload.get("obstacle_origin_xy", (0.0, 0.0))
     if not isinstance(origin_payload, (list, tuple)) or len(origin_payload) != 2:
@@ -107,11 +121,23 @@ def obstacle_grid_from_payload(payload: Mapping[str, Any]) -> ObstacleGrid | Non
     cells_payload = payload.get("obstacle_cells", [])
     if not isinstance(cells_payload, list):
         raise ValueError("obstacle_cells must be a list.")
-    return ObstacleGrid(
-        origin=(float(origin_payload[0]), float(origin_payload[1])),
-        cell_size=float(payload.get("obstacle_cell_size_m", 1.0)),
-        grid_shape=grid_shape,
-        blocked_cells=tuple((int(cell[0]), int(cell[1])) for cell in cells_payload),
+    return ObstacleGrid.from_dict(
+        {
+            "origin": [float(origin_payload[0]), float(origin_payload[1])],
+            "cell_size": float(payload.get("obstacle_cell_size_m", 1.0)),
+            "grid_shape": [int(grid_shape[0]), int(grid_shape[1])],
+            "blocked_cells": cells_payload,
+            "collision_boxes_m": collision_boxes_payload,
+            "transport_boxes_m": transport_boxes_payload,
+            "transport_mu_by_isotope": payload.get(
+                "transport_mu_by_isotope",
+                {},
+            ),
+            "transport_line_mu_by_isotope": payload.get(
+                "transport_line_mu_by_isotope",
+                {},
+            ),
+        }
     )
 
 
@@ -159,7 +185,9 @@ class PythonTransportSpectrumModel:
         self.scene = PythonTransportScene(
             sources=point_sources_from_payload(payload),
             obstacle_grid=obstacle_grid_from_payload(payload),
-            obstacle_material=str(payload.get("obstacle_material", self.scene.obstacle_material)),
+            obstacle_material=str(
+                payload.get("obstacle_material", self.scene.obstacle_material)
+            ),
         )
         detector_model = payload.get("detector_model")
         if detector_model is not None:
@@ -201,7 +229,9 @@ class PythonTransportSpectrumModel:
             stage_segments_provider=stage_segments_provider,
             shield_path_provider=shield_path_provider,
         )
-        expected = self.expected_spectrum_from_transport_results(transport_results, command.dwell_time_s)
+        expected = self.expected_spectrum_from_transport_results(
+            transport_results, command.dwell_time_s
+        )
         spectrum = self.sample_spectrum(expected, command.step_id)
         metadata = self.metadata_from_transport_results(
             transport_results,
@@ -264,7 +294,9 @@ class PythonTransportSpectrumModel:
             if stage_segments_provider is None:
                 stage_segments = self.obstacle_stage_segments(source, detector_position)
             else:
-                stage_segments = tuple(stage_segments_provider(source, detector_position))
+                stage_segments = tuple(
+                    stage_segments_provider(source, detector_position)
+                )
             if shield_path_provider is None:
                 fe_path_cm, pb_path_cm = self.shield_path_lengths_cm(
                     source,
@@ -273,9 +305,14 @@ class PythonTransportSpectrumModel:
                     command.pb_orientation_index,
                 )
             else:
-                fe_path_cm, pb_path_cm = shield_path_provider(source, detector_position, command)
+                fe_path_cm, pb_path_cm = shield_path_provider(
+                    source, detector_position, command
+                )
             nuclide = self.decomposer.library[source.isotope]
-            nuclide_lines = tuple((float(line.energy_keV), float(line.intensity)) for line in nuclide.lines)
+            nuclide_lines = tuple(
+                (float(line.energy_keV), float(line.intensity))
+                for line in nuclide.lines
+            )
             results.append(
                 build_source_transport_result(
                     source=source,
@@ -295,15 +332,33 @@ class PythonTransportSpectrumModel:
         source: PointSource,
         detector_pose_xyz: tuple[float, float, float],
     ) -> tuple[TransportSegment, ...]:
-        """Return material segments through reset-payload obstacle boxes."""
+        """Return material segments through exclusive transport or fallback boxes."""
         obstacle_grid = self.scene.obstacle_grid
         if obstacle_grid is None:
             return ()
         source_position = np.asarray(source.position, dtype=float)
         detector_position = np.asarray(detector_pose_xyz, dtype=float)
-        material = TransportMaterial(name=self.scene.obstacle_material)
+        boxes = obstacle_grid.attenuation_boxes(
+            z_min=0.0,
+            z_max=self.obstacle_height_m,
+        )
+        isotope_mu_values = (
+            obstacle_grid.transport_mu_values(source.isotope)
+            if obstacle_grid.has_transport_model
+            else None
+        )
+        line_mu_values = (
+            obstacle_grid.transport_line_mu_values(source.isotope)
+            if obstacle_grid.has_transport_model
+            else None
+        )
+        gamma_lines = tuple(
+            line
+            for line in self.decomposer.library[source.isotope].lines
+            if max(float(line.intensity), 0.0) > 0.0
+        )
         segments: list[TransportSegment] = []
-        for box in obstacle_grid.blocked_boxes(z_min=0.0, z_max=self.obstacle_height_m):
+        for box_index, box in enumerate(boxes):
             path_length_cm = 100.0 * segment_box_intersection_length_m(
                 source_position,
                 detector_position,
@@ -311,6 +366,20 @@ class PythonTransportSpectrumModel:
             )
             if path_length_cm <= 0.0:
                 continue
+            mu_by_isotope = {}
+            if isotope_mu_values is not None:
+                mu_by_isotope[source.isotope] = float(isotope_mu_values[box_index])
+            mu_by_energy_keV = {}
+            if line_mu_values is not None and len(line_mu_values) == len(gamma_lines):
+                mu_by_energy_keV = {
+                    float(line.energy_keV): float(line_mu_values[line_index][box_index])
+                    for line_index, line in enumerate(gamma_lines)
+                }
+            material = TransportMaterial(
+                name=self.scene.obstacle_material,
+                mu_by_isotope=mu_by_isotope,
+                mu_by_energy_keV=mu_by_energy_keV,
+            )
             segments.append(
                 make_transport_segment(
                     material,
@@ -371,7 +440,11 @@ class PythonTransportSpectrumModel:
         if BACKGROUND_COUNTS_PER_SECOND != BACKGROUND_RATE_CPS:
             background_rate = BACKGROUND_COUNTS_PER_SECOND
         if background_rate > 0.0:
-            expected += self.decomposer._background_shape * float(background_rate) * float(dwell_time_s)
+            expected += (
+                self.decomposer._background_shape
+                * float(background_rate)
+                * float(dwell_time_s)
+            )
         return np.clip(expected, a_min=0.0, a_max=None)
 
     def source_expected_spectrum(
@@ -383,12 +456,18 @@ class PythonTransportSpectrumModel:
             return np.zeros_like(self.decomposer.energy_axis, dtype=float)
         expected = np.zeros_like(self.decomposer.energy_axis, dtype=float)
         for line in transport_result.lines:
-            expected += float(line.primary_counts) * self.line_response_template(line.energy_keV)
+            expected += float(line.primary_counts) * self.line_response_template(
+                line.energy_keV
+            )
             if line.scatter_counts > 0.0:
-                expected += float(line.scatter_counts) * self.scatter_response_template(line.energy_keV)
+                expected += float(line.scatter_counts) * self.scatter_response_template(
+                    line.energy_keV
+                )
         return expected
 
-    def sample_spectrum(self, expected_spectrum: np.ndarray, step_id: int) -> np.ndarray:
+    def sample_spectrum(
+        self, expected_spectrum: np.ndarray, step_id: int
+    ) -> np.ndarray:
         """Sample Poisson counting noise and apply optional dead-time correction."""
         rng = np.random.default_rng(self.rng_seed + int(step_id))
         sampled = rng.poisson(np.clip(expected_spectrum, a_min=0.0, a_max=None))
@@ -413,9 +492,15 @@ class PythonTransportSpectrumModel:
             "total_obstacle_path_cm": float(
                 sum(result.total_obstacle_path_cm for result in transport_results)
             ),
-            "total_stage_path_cm": float(sum(result.total_stage_path_cm for result in transport_results)),
-            "total_fe_path_cm": float(sum(result.total_fe_path_cm for result in transport_results)),
-            "total_pb_path_cm": float(sum(result.total_pb_path_cm for result in transport_results)),
+            "total_stage_path_cm": float(
+                sum(result.total_stage_path_cm for result in transport_results)
+            ),
+            "total_fe_path_cm": float(
+                sum(result.total_fe_path_cm for result in transport_results)
+            ),
+            "total_pb_path_cm": float(
+                sum(result.total_pb_path_cm for result in transport_results)
+            ),
             "expected_total_counts": float(np.sum(expected_spectrum)),
             "scatter_gain": float(self.scatter_gain),
             "dead_time_s": float(self.dead_time_s),
@@ -443,7 +528,9 @@ class PythonTransportSpectrumModel:
             else 1.0
         )
         response = peak * efficiency * bin_width_keV
-        cont_shape = compton_continuum_shape(energy_axis, cache_key, shape="exponential")
+        cont_shape = compton_continuum_shape(
+            energy_axis, cache_key, shape="exponential"
+        )
         if cont_shape.sum() > 0.0:
             cont_shape = cont_shape / float(cont_shape.sum())
             response += COMPTON_CONTINUUM_TO_PEAK * peak_area * cont_shape * efficiency
@@ -476,7 +563,9 @@ class PythonTransportSpectrumModel:
         if cache_key > 200.0:
             e_back = backscatter_energy(cache_key)
             sigma_back = float(self.decomposer.resolution_fn(e_back))
-            response += 0.25 * gaussian_peak(energy_axis, center=e_back, sigma=sigma_back)
+            response += 0.25 * gaussian_peak(
+                energy_axis, center=e_back, sigma=sigma_back
+            )
         if float(np.sum(response)) > 0.0:
             response = response / float(np.sum(response))
         self._scatter_response_cache[cache_key] = response

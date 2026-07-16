@@ -19,6 +19,7 @@ class SimulationCommand:
     dwell_time_s: float
     travel_time_s: float = 0.0
     shield_actuation_time_s: float = 0.0
+    travel_waypoints_xyz: tuple[tuple[float, float, float], ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation of the command."""
@@ -31,6 +32,14 @@ class SimulationCommand:
             "dwell_time_s": float(self.dwell_time_s),
             "travel_time_s": float(self.travel_time_s),
             "shield_actuation_time_s": float(self.shield_actuation_time_s),
+            "travel_waypoints_xyz": (
+                None
+                if self.travel_waypoints_xyz is None
+                else [
+                    [float(value) for value in waypoint]
+                    for waypoint in self.travel_waypoints_xyz
+                ]
+            ),
         }
 
     @classmethod
@@ -39,6 +48,17 @@ class SimulationCommand:
         pose = tuple(float(v) for v in data["target_pose_xyz"])
         if len(pose) != 3:
             raise ValueError("target_pose_xyz must have exactly three coordinates.")
+        waypoints_payload = data.get("travel_waypoints_xyz")
+        waypoints = None
+        if waypoints_payload is not None:
+            waypoints = tuple(
+                tuple(float(value) for value in waypoint)
+                for waypoint in waypoints_payload
+            )
+            if any(len(waypoint) != 3 for waypoint in waypoints):
+                raise ValueError(
+                    "travel_waypoints_xyz entries must have exactly three coordinates."
+                )
         return cls(
             step_id=int(data["step_id"]),
             target_pose_xyz=pose,
@@ -48,6 +68,7 @@ class SimulationCommand:
             dwell_time_s=float(data["dwell_time_s"]),
             travel_time_s=float(data.get("travel_time_s", 0.0)),
             shield_actuation_time_s=float(data.get("shield_actuation_time_s", 0.0)),
+            travel_waypoints_xyz=waypoints,
         )
 
 

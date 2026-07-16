@@ -59,6 +59,32 @@ def test_obstacle_grid_batch_free_space_matches_scalar() -> None:
     assert np.array_equal(batch, scalar)
 
 
+def test_collision_geometry_roundtrips_and_survives_transport_attachment(
+    tmp_path: Path,
+) -> None:
+    """Physical collision boxes must remain separate from attenuation boxes."""
+    collision_box = (0.1, 0.2, 0.3, 0.8, 0.9, 1.4)
+    transport_box = (1.1, 1.2, 0.0, 1.8, 1.9, 2.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((0, 0),),
+    ).with_collision_model(boxes_m=(collision_box,))
+    grid = grid.with_transport_model(
+        boxes_m=(transport_box,),
+        mu_by_isotope={"Cs-137": (0.1,)},
+    )
+
+    path = tmp_path / "collision_layout.json"
+    grid.save(path)
+    loaded = ObstacleGrid.load(path)
+
+    assert loaded.collision_boxes_m == (collision_box,)
+    assert loaded.transport_boxes_m == (transport_box,)
+    assert loaded.transport_mu_by_isotope == {"Cs-137": (0.1,)}
+
+
 def test_generate_obstacle_grid_respects_keep_free_points() -> None:
     """Keep-free points should never be blocked."""
     rng = np.random.default_rng(1)

@@ -61,6 +61,30 @@ def _load_geant4_runtime_config(config_path: Path) -> dict[str, object]:
     return load_runtime_config(config_path)
 
 
+def test_standard_runtime_uses_continuous_collision_checked_measurement_space() -> None:
+    """The standard full simulation must plan over feasible continuous 3-D poses."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "variance_reduction_external_no_isaac_32threads.json"
+    )
+    payload = _load_geant4_runtime_config(config_path)
+
+    assert payload["detector_height_sampling_mode"] == "continuous"
+    assert "detector_height_actions_m" not in payload
+    assert "detector_height_min_m" not in payload
+    assert "detector_height_max_m" not in payload
+    assert payload["measurement_pose_clearance_enabled"] is True
+    assert float(payload["measurement_pose_clearance_margin_m"]) >= 0.0
+    assert float(payload["measurement_route_grid_cell_size_m"]) == pytest.approx(
+        0.25
+    )
+    assert int(payload["measurement_route_workers"]) > 1
+    assert float(payload["detector_transport_height_m"]) >= 0.0
+
+
 def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
     """Geant4 configs should use detector cps@1m source-rate semantics."""
     forbidden_args = {

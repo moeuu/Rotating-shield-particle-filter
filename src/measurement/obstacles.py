@@ -30,6 +30,7 @@ class ObstacleGrid:
     transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
         default_factory=dict
     )
+    collision_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
 
     def __post_init__(self) -> None:
         """Normalize inputs and validate bounds."""
@@ -52,21 +53,35 @@ class ObstacleGrid:
                 raise ValueError("blocked_cells indices must be non-negative.")
             if cell[0] >= grid_shape[0] or cell[1] >= grid_shape[1]:
                 raise ValueError("blocked_cells entry out of grid bounds.")
-        transport_boxes = tuple(
-            tuple(float(value) for value in box)
-            for box in self.transport_boxes_m
+        collision_boxes = tuple(
+            tuple(float(value) for value in box) for box in self.collision_boxes_m
         )
-        for box in transport_boxes:
-            if len(box) != 6:
-                raise ValueError("transport_boxes_m entries must have six values.")
-            if box[3] < box[0] or box[4] < box[1] or box[5] < box[2]:
-                raise ValueError("transport_boxes_m entries must be ordered lower-to-upper.")
+        transport_boxes = tuple(
+            tuple(float(value) for value in box) for box in self.transport_boxes_m
+        )
+        for field_name, boxes in (
+            ("collision_boxes_m", collision_boxes),
+            ("transport_boxes_m", transport_boxes),
+        ):
+            for box in boxes:
+                if len(box) != 6:
+                    raise ValueError(f"{field_name} entries must have six values.")
+                if not np.all(np.isfinite(np.asarray(box, dtype=float))):
+                    raise ValueError(f"{field_name} entries must be finite.")
+                if box[3] < box[0] or box[4] < box[1] or box[5] < box[2]:
+                    raise ValueError(
+                        f"{field_name} entries must be ordered lower-to-upper."
+                    )
         transport_mu: dict[str, tuple[float, ...]] = {}
         for isotope, values in self.transport_mu_by_isotope.items():
             mu_values = tuple(float(value) for value in values)
             if len(mu_values) != len(transport_boxes):
                 raise ValueError(
                     "transport_mu_by_isotope entries must match transport_boxes_m length."
+                )
+            if any(not np.isfinite(value) or value < 0.0 for value in mu_values):
+                raise ValueError(
+                    "transport_mu_by_isotope entries must be finite and non-negative."
                 )
             transport_mu[str(isotope)] = mu_values
         transport_line_mu: dict[str, tuple[tuple[float, ...], ...]] = {}
@@ -79,12 +94,18 @@ class ObstacleGrid:
                         "transport_line_mu_by_isotope rows must match "
                         "transport_boxes_m length."
                     )
+                if any(not np.isfinite(value) or value < 0.0 for value in mu_values):
+                    raise ValueError(
+                        "transport_line_mu_by_isotope entries must be finite and "
+                        "non-negative."
+                    )
                 parsed_rows.append(mu_values)
             transport_line_mu[str(isotope)] = tuple(parsed_rows)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "cell_size", cell_size)
         object.__setattr__(self, "grid_shape", grid_shape)
         object.__setattr__(self, "blocked_cells", blocked)
+        object.__setattr__(self, "collision_boxes_m", collision_boxes)
         object.__setattr__(self, "transport_boxes_m", transport_boxes)
         object.__setattr__(self, "transport_mu_by_isotope", transport_mu)
         object.__setattr__(
@@ -141,10 +162,13 @@ class ObstacleGrid:
             raise ValueError("points must have shape (N, D) with D >= 2.")
         if np.any(~np.isfinite(points_array[:, :2])):
             raise ValueError("point coordinates must be finite.")
-        relative_xy = points_array[:, :2] - np.asarray(
-            self.origin,
-            dtype=float,
-        )[None, :]
+        relative_xy = (
+            points_array[:, :2]
+            - np.asarray(
+                self.origin,
+                dtype=float,
+            )[None, :]
+        )
         cell_indices = np.floor(relative_xy / float(self.cell_size)).astype(
             np.int64,
         )
@@ -157,9 +181,7 @@ class ObstacleGrid:
         free = np.ones(points_array.shape[0], dtype=bool)
         if not np.any(inside) or not self.blocked_cells:
             return free
-        cell_codes = (
-            cell_indices[:, 0] * int(self.grid_shape[1]) + cell_indices[:, 1]
-        )
+        cell_codes = cell_indices[:, 0] * int(self.grid_shape[1]) + cell_indices[:, 1]
         blocked = np.asarray(self.blocked_cells, dtype=np.int64).reshape(-1, 2)
         blocked_codes = blocked[:, 0] * int(self.grid_shape[1]) + blocked[:, 1]
         free[inside] = ~np.isin(cell_codes[inside], blocked_codes)
@@ -234,6 +256,19 @@ class ObstacleGrid:
         """Return known obstacle transport boxes in meters."""
         return [tuple(box) for box in self.transport_boxes_m]
 
+    def attenuation_boxes(
+        self,
+        *,
+        z_min: float = 0.0,
+        z_max: float = 2.0,
+    ) -> list[tuple[float, float, float, float, float, float]]:
+        """Return the exclusive explicit, collision, or grid attenuation geometry."""
+        if self.has_transport_model:
+            return self.transport_boxes()
+        if self.collision_boxes_m:
+            return [tuple(box) for box in self.collision_boxes_m]
+        return self.blocked_boxes(z_min=z_min, z_max=z_max)
+
     def transport_mu_values(self, isotope: str) -> tuple[float, ...] | None:
         """Return per-transport-box attenuation coefficients for an isotope."""
         if not self.transport_mu_by_isotope:
@@ -274,7 +309,10 @@ class ObstacleGrid:
             cell_size=self.cell_size,
             grid_shape=self.grid_shape,
             blocked_cells=self.blocked_cells,
-            transport_boxes_m=tuple(tuple(float(value) for value in box) for box in boxes_m),
+            collision_boxes_m=self.collision_boxes_m,
+            transport_boxes_m=tuple(
+                tuple(float(value) for value in box) for box in boxes_m
+            ),
             transport_mu_by_isotope={
                 str(isotope): tuple(float(value) for value in values)
                 for isotope, values in mu_by_isotope.items()
@@ -285,6 +323,25 @@ class ObstacleGrid:
                 )
                 for isotope, rows in (line_mu_by_isotope or {}).items()
             },
+        )
+
+    def with_collision_model(
+        self,
+        *,
+        boxes_m: Iterable[Sequence[float]],
+    ) -> "ObstacleGrid":
+        """Return a copy with explicit physical collision boxes attached."""
+        return ObstacleGrid(
+            origin=self.origin,
+            cell_size=self.cell_size,
+            grid_shape=self.grid_shape,
+            blocked_cells=self.blocked_cells,
+            collision_boxes_m=tuple(
+                tuple(float(value) for value in box) for box in boxes_m
+            ),
+            transport_boxes_m=self.transport_boxes_m,
+            transport_mu_by_isotope=self.transport_mu_by_isotope,
+            transport_line_mu_by_isotope=self.transport_line_mu_by_isotope,
         )
 
     def blocked_polygons(
@@ -305,6 +362,7 @@ class ObstacleGrid:
             "grid_shape": [self.grid_shape[0], self.grid_shape[1]],
             "blocked_cells": [list(cell) for cell in self.blocked_cells],
             "blocked_fraction": self.blocked_fraction,
+            "collision_boxes_m": [list(box) for box in self.collision_boxes_m],
             "transport_boxes_m": [list(box) for box in self.transport_boxes_m],
             "transport_mu_by_isotope": {
                 isotope: [float(value) for value in values]
@@ -331,6 +389,7 @@ class ObstacleGrid:
         cell_size = data.get("cell_size", 1.0)
         grid_shape = data.get("grid_shape")
         blocked_cells = data.get("blocked_cells", [])
+        collision_boxes = data.get("collision_boxes_m", [])
         transport_boxes = data.get("transport_boxes_m", [])
         transport_mu_by_isotope = data.get("transport_mu_by_isotope", {})
         transport_line_mu_by_isotope = data.get("transport_line_mu_by_isotope", {})
@@ -338,6 +397,8 @@ class ObstacleGrid:
             raise ValueError("Obstacle layout missing 'grid_shape'.")
         if not isinstance(blocked_cells, list):
             raise ValueError("blocked_cells must be a list.")
+        if not isinstance(collision_boxes, list):
+            raise ValueError("collision_boxes_m must be a list.")
         if not isinstance(transport_boxes, list):
             raise ValueError("transport_boxes_m must be a list.")
         if not isinstance(transport_mu_by_isotope, dict):
@@ -349,9 +410,11 @@ class ObstacleGrid:
             cell_size=float(cell_size),
             grid_shape=(int(grid_shape[0]), int(grid_shape[1])),
             blocked_cells=tuple((int(cell[0]), int(cell[1])) for cell in blocked_cells),
+            collision_boxes_m=tuple(
+                tuple(float(value) for value in box) for box in collision_boxes
+            ),
             transport_boxes_m=tuple(
-                tuple(float(value) for value in box)
-                for box in transport_boxes
+                tuple(float(value) for value in box) for box in transport_boxes
             ),
             transport_mu_by_isotope={
                 str(isotope): tuple(float(value) for value in values)
@@ -538,8 +601,9 @@ def _exploration_backbone_cells(
         if 0 <= cell[0] < nx and 0 <= cell[1] < ny:
             nearest = min(
                 backbone,
-                key=lambda candidate: abs(candidate[0] - cell[0])
-                + abs(candidate[1] - cell[1]),
+                key=lambda candidate: (
+                    abs(candidate[0] - cell[0]) + abs(candidate[1] - cell[1])
+                ),
             )
             backbone.update(_manhattan_cells_between(cell, nearest))
             backbone.add(cell)
@@ -622,9 +686,7 @@ def generate_obstacle_grid(
     )
     reserved_cells.update(keep_free_cells)
     if passage_points is not None:
-        waypoints = (
-            list(passage_points)
-        )
+        waypoints = list(passage_points)
         reserved_cells.update(
             _passage_cells_from_points(
                 waypoints,

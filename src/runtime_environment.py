@@ -144,6 +144,13 @@ def build_runtime_obstacle_environment(
             include_room_boundaries=include_room_boundaries,
             room_boundary_thickness_m=room_boundary_thickness_m,
         )
+        grid = grid.with_collision_model(
+            boxes_m=(
+                component.box_m
+                for instance in known_obstacle_instances
+                for component in instance.components
+            )
+        )
     return RuntimeObstacleEnvironment(
         grid=grid,
         mode=mode,

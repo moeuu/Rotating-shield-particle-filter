@@ -9,6 +9,7 @@ import pytest
 
 import realtime_demo as realtime_demo_module
 from measurement.obstacles import ObstacleGrid
+from measurement.kernels import ShieldParams
 from measurement.model import EnvironmentConfig
 from pf.estimator import (
     MeasurementRecord,
@@ -3651,6 +3652,10 @@ def test_adaptive_dwell_chunks_stop_at_ready_counts(
             detect_threshold_rel=0.0,
             detect_threshold_rel_by_isotope={},
             min_peaks_by_isotope=None,
+            travel_waypoints_xyz=(
+                (1.0, 2.0, 0.5),
+                (1.5, 2.5, 0.5),
+            ),
         )
     )
 
@@ -3679,6 +3684,11 @@ def test_adaptive_dwell_chunks_stop_at_ready_counts(
     assert commands[1].travel_time_s == pytest.approx(0.0)
     assert commands[0].shield_actuation_time_s == pytest.approx(2.0)
     assert commands[1].shield_actuation_time_s == pytest.approx(0.0)
+    assert commands[0].travel_waypoints_xyz == (
+        (1.0, 2.0, 0.5),
+        (1.5, 2.5, 0.5),
+    )
+    assert commands[1].travel_waypoints_xyz is None
 
 
 def test_adaptive_dwell_can_run_without_cap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4152,6 +4162,12 @@ def test_detector_height_partner_requires_same_xy_and_distinct_z() -> None:
         np.array([1.1, 2.0, 1.5], dtype=float),
         xy_tolerance_m=1.0e-6,
     )
+    assert not realtime_demo_module._is_detector_height_partner(
+        low,
+        np.array([1.0, 2.0, 0.6], dtype=float),
+        xy_tolerance_m=1.0e-6,
+        min_z_separation_m=0.25,
+    )
 
 
 def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances() -> None:
@@ -4255,6 +4271,129 @@ def test_detector_mast_heights_resolve_to_world_z_above_nonzero_ground() -> None
     assert initial_world_z == pytest.approx(0.8)
     assert mast_actions == pytest.approx([0.6, 1.4])
     assert world_actions == pytest.approx([0.8, 1.6])
+
+
+def test_continuous_detector_height_workspace_uses_full_mast_interval() -> None:
+    """Continuous planning should sample the mast interval without action levels."""
+    config = realtime_demo_module._resolve_detector_height_planning_config(
+        {
+            "robot_ground_z_m": 0.2,
+            "detector_height_m": 0.6,
+            "detector_height_min_m": 0.5,
+            "detector_height_max_m": 1.5,
+            "detector_height_sampling_mode": "continuous",
+        },
+        room_height_m=2.0,
+    )
+
+    assert config.mode == "continuous"
+    assert config.initial_world_z_m == pytest.approx(0.8)
+    assert config.candidate_world_z_bounds_m == pytest.approx((0.7, 1.7))
+    assert config.candidate_world_heights_m is None
+    assert config.discrete_mast_actions_m == ()
+
+
+def test_continuous_detector_height_defaults_to_full_room_workspace() -> None:
+    """Omitted mast bounds should expose the full room-height interval."""
+    config = realtime_demo_module._resolve_detector_height_planning_config(
+        {
+            "robot_ground_z_m": 0.2,
+            "detector_height_m": 0.6,
+            "detector_height_sampling_mode": "continuous",
+        },
+        room_height_m=2.0,
+    )
+
+    assert config.minimum_mast_height_m == pytest.approx(0.0)
+    assert config.maximum_mast_height_m == pytest.approx(1.8)
+    assert config.candidate_world_z_bounds_m == pytest.approx((0.2, 2.0))
+
+
+def test_continuous_detector_height_workspace_rejects_discrete_actions() -> None:
+    """Ambiguous continuous and discrete height settings should fail early."""
+    with pytest.raises(ValueError, match="must be omitted"):
+        realtime_demo_module._resolve_detector_height_planning_config(
+            {
+                "detector_height_m": 0.5,
+                "detector_height_min_m": 0.5,
+                "detector_height_max_m": 1.5,
+                "detector_height_sampling_mode": "continuous",
+                "detector_height_actions_m": [0.5, 1.5],
+            },
+            room_height_m=2.0,
+        )
+
+
+def test_continuous_workspace_accepts_arbitrary_collision_free_xyz() -> None:
+    """Room-only planning should accept continuous xy and z measurement poses."""
+    height_config = realtime_demo_module._resolve_detector_height_planning_config(
+        {
+            "detector_height_m": 0.5,
+            "detector_height_min_m": 0.5,
+            "detector_height_max_m": 1.5,
+            "detector_height_sampling_mode": "continuous",
+            "measurement_pose_clearance_enabled": True,
+        },
+        room_height_m=10.0,
+    )
+    radius = realtime_demo_module._resolve_measurement_clearance_radius_m(
+        {"measurement_pose_clearance_enabled": True},
+        requested_robot_radius_m=0.35,
+    )
+    workspace, diagnostics = realtime_demo_module._build_measurement_workspace(
+        {"measurement_pose_clearance_enabled": True},
+        environment_size_xyz=(10.0, 20.0, 10.0),
+        detector_height_config=height_config,
+        obstacle_grid=None,
+        base_map=None,
+        shield_params=ShieldParams(),
+        effective_robot_radius_m=radius,
+    )
+
+    arbitrary_poses = np.array(
+        [
+            [0.73, 0.81, 0.67],
+            [4.321, 11.234, 1.137],
+            [9.19, 19.27, 1.493],
+        ],
+        dtype=float,
+    )
+    assert diagnostics["continuous_measurement_volume"] is True
+    assert diagnostics["route_grid_cell_size_m"] == pytest.approx(0.25)
+    assert np.all(workspace.is_free_batch(arbitrary_poses))
+    assert not workspace.is_free((0.1, 2.0, 1.0))
+    waypoints = workspace.motion_waypoints(arbitrary_poses[0], arbitrary_poses[1])
+    assert waypoints is not None
+    assert waypoints[0] == pytest.approx(arbitrary_poses[0])
+    assert waypoints[-1] == pytest.approx(arbitrary_poses[1])
+
+
+def test_room_wide_continuous_workspace_accepts_high_free_measurement_pose() -> None:
+    """Room-wide mode should retain high poses that clear the ceiling."""
+    height_config = realtime_demo_module._resolve_detector_height_planning_config(
+        {
+            "detector_height_m": 0.5,
+            "detector_height_sampling_mode": "continuous",
+            "measurement_pose_clearance_enabled": True,
+        },
+        room_height_m=10.0,
+    )
+    radius = realtime_demo_module._resolve_measurement_clearance_radius_m(
+        {"measurement_pose_clearance_enabled": True},
+        requested_robot_radius_m=0.35,
+    )
+    workspace, _ = realtime_demo_module._build_measurement_workspace(
+        {"measurement_pose_clearance_enabled": True},
+        environment_size_xyz=(10.0, 20.0, 10.0),
+        detector_height_config=height_config,
+        obstacle_grid=None,
+        base_map=None,
+        shield_params=ShieldParams(),
+        effective_robot_radius_m=radius,
+    )
+
+    assert height_config.candidate_world_z_bounds_m == pytest.approx((0.0, 10.0))
+    assert workspace.is_free((4.321, 11.234, 9.7))
 
 
 def test_surface_map_runtime_configuration_is_explicit_and_validated() -> None:

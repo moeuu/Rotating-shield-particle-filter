@@ -10,8 +10,34 @@ from planning.traversability import (
     build_traversability_map_from_obstacle_grid,
     build_traversability_map_from_stage_solids,
     render_traversability_map,
+    shortest_grid_path_points,
 )
 from sim.isaacsim_app.stage_backend import PrimPose, StageSolidPrim
+
+
+class TransitionAwareMap:
+    """Wrap a traversability map with one forbidden graph transition."""
+
+    def __init__(
+        self,
+        base_map: TraversabilityMap,
+        forbidden_edge: tuple[tuple[int, int], tuple[int, int]],
+    ) -> None:
+        """Store the wrapped map and undirected forbidden transition."""
+        self.base_map = base_map
+        self.forbidden_edge = frozenset(forbidden_edge)
+
+    def __getattr__(self, name: str) -> object:
+        """Forward standard grid APIs to the wrapped map."""
+        return getattr(self.base_map, name)
+
+    def is_transition_free(
+        self,
+        first_cell: tuple[int, int],
+        second_cell: tuple[int, int],
+    ) -> bool:
+        """Reject exactly one undirected graph edge."""
+        return frozenset((first_cell, second_cell)) != self.forbidden_edge
 
 
 def test_traversability_map_projects_obstacle_footprints() -> None:
@@ -81,6 +107,30 @@ def test_traversability_shortest_path_reports_disconnected_cells() -> None:
     )
 
     assert path is None
+
+
+def test_traversability_shortest_path_honors_transition_hook() -> None:
+    """A map transition hook should force A* around an unsafe free-node edge."""
+    base_map = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 2),
+        traversable_cells=tuple(
+            (ix, iy) for ix in range(3) for iy in range(2)
+        ),
+    )
+    wrapped = TransitionAwareMap(base_map, ((0, 0), (1, 0)))
+
+    path = base_map.shortest_path_points((0.5, 0.5), (2.5, 0.5))
+    rerouted = shortest_grid_path_points(
+        wrapped,
+        (0.5, 0.5),
+        (2.5, 0.5),
+    )
+
+    assert path is not None
+    assert rerouted is not None
+    assert np.max(rerouted[:, 1]) > np.max(path[:, 1])
 
 
 def test_traversability_map_keeps_reachable_component_only() -> None:

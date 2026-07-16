@@ -29,6 +29,7 @@ class TransportMaterial:
 
     name: str
     mu_by_isotope: dict[str, float] = field(default_factory=dict)
+    mu_by_energy_keV: dict[float, float] = field(default_factory=dict)
     density_g_cm3: float | None = None
     mass_att_by_isotope_cm2_g: dict[str, float] = field(default_factory=dict)
     preset_name: str | None = None
@@ -80,7 +81,13 @@ class SourceTransportResult:
     @property
     def total_obstacle_path_cm(self) -> float:
         """Return the total obstacle-only path length in centimeters."""
-        return float(sum(segment.path_length_cm for segment in self.stage_segments if segment.is_obstacle))
+        return float(
+            sum(
+                segment.path_length_cm
+                for segment in self.stage_segments
+                if segment.is_obstacle
+            )
+        )
 
     @property
     def total_fe_path_cm(self) -> float:
@@ -95,12 +102,18 @@ class SourceTransportResult:
 
 def coerce_transport_material(material: Any) -> TransportMaterial:
     """Convert a stage/exported material-like object into a shared material payload."""
-    composition = normalize_composition_by_mass(getattr(material, "composition_by_mass", {}))
+    composition = normalize_composition_by_mass(
+        getattr(material, "composition_by_mass", {})
+    )
     return TransportMaterial(
         name=str(getattr(material, "name")),
         mu_by_isotope={
             str(key): float(value)
             for key, value in getattr(material, "mu_by_isotope", {}).items()
+        },
+        mu_by_energy_keV={
+            float(key): float(value)
+            for key, value in getattr(material, "mu_by_energy_keV", {}).items()
         },
         density_g_cm3=getattr(material, "density_g_cm3", None),
         mass_att_by_isotope_cm2_g={
@@ -112,7 +125,9 @@ def coerce_transport_material(material: Any) -> TransportMaterial:
     )
 
 
-def make_transport_segment(material: Any, path_length_cm: float, *, is_obstacle: bool = False) -> TransportSegment:
+def make_transport_segment(
+    material: Any, path_length_cm: float, *, is_obstacle: bool = False
+) -> TransportSegment:
     """Build a shared transport segment from a material-like input."""
     return TransportSegment(
         material=coerce_transport_material(material),
@@ -131,7 +146,9 @@ def material_transmission(
     path_length_cm = max(0.0, float(path_length_cm))
     if path_length_cm <= 0.0:
         return 1.0
-    mu = material.mu_by_isotope.get(isotope)
+    mu = material.mu_by_energy_keV.get(float(line_energy_keV))
+    if mu is None:
+        mu = material.mu_by_isotope.get(isotope)
     density_g_cm3 = material.density_g_cm3
     mass_att = material.mass_att_by_isotope_cm2_g.get(isotope)
     energy_mass_att = None
@@ -141,7 +158,9 @@ def material_transmission(
             line_energy_keV,
         )
         if energy_mass_att is None:
-            mass_att = composition_mass_attenuation(material.composition_by_mass, isotope)
+            mass_att = composition_mass_attenuation(
+                material.composition_by_mass, isotope
+            )
     preset = resolve_material_preset(material.preset_name or material.name)
     if density_g_cm3 is None and preset is not None:
         density_g_cm3 = preset.density_g_cm3
@@ -167,7 +186,9 @@ def material_transmission(
     return float(np.exp(-float(mu) * path_length_cm))
 
 
-def scatter_scale(*, path_length_cm: float, transmission: float, scatter_gain: float) -> float:
+def scatter_scale(
+    *, path_length_cm: float, transmission: float, scatter_gain: float
+) -> float:
     """Return a coarse scatter multiplier driven by blocking and material depth."""
     blocked_fraction = float(np.clip(1.0 - float(transmission), 0.0, 1.0))
     path_factor = float(np.clip(float(path_length_cm) / 80.0, 0.0, 2.0))
@@ -190,7 +211,9 @@ def build_source_transport_result(
     stage_segments = tuple(stage_segments)
     detector_position = np.asarray(detector_position_xyz, dtype=float)
     geometric_scale = float(inverse_square_scale(detector_position, source))
-    base_source_counts = float(dwell_time_s) * float(source.intensity_cps_1m) * geometric_scale
+    base_source_counts = (
+        float(dwell_time_s) * float(source.intensity_cps_1m) * geometric_scale
+    )
     total_path_cm = (
         sum(segment.path_length_cm for segment in stage_segments)
         + float(fe_segment.path_length_cm)

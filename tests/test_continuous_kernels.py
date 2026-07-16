@@ -122,7 +122,10 @@ def test_attenuation_applies_blocking_factor() -> None:
         background=0.0,
     )
     expected_ratio = np.exp(
-        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+        -(
+            shield_params.mu_fe * shield_params.thickness_fe_cm
+            + shield_params.mu_pb * shield_params.thickness_pb_cm
+        )
     )
     assert np.isclose(blocked_counts, expected_ratio * free_counts, rtol=1e-6)
 
@@ -212,7 +215,9 @@ def test_line_resolved_obstacle_attenuation_uses_line_mu_values() -> None:
     free = free_kernel.kernel_value_pair("TestIso", detector, source, 0, 0)
     expected_ratio = 0.25 * np.exp(-1.0) + 0.75 * np.exp(-3.0)
 
-    assert kernel.obstacle_path_lengths_by_box_cm(source, detector)[0] == pytest.approx(100.0)
+    assert kernel.obstacle_path_lengths_by_box_cm(source, detector)[0] == pytest.approx(
+        100.0
+    )
     assert blocked == pytest.approx(free * expected_ratio, rel=1e-12)
 
 
@@ -459,7 +464,10 @@ def test_expected_counts_single_isotope_attenuation_levels() -> None:
     shield_params = ShieldParams()
     expected_fe_ratio = np.exp(-(shield_params.mu_fe * shield_params.thickness_fe_cm))
     expected_both_ratio = np.exp(
-        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
+        -(
+            shield_params.mu_fe * shield_params.thickness_fe_cm
+            + shield_params.mu_pb * shield_params.thickness_pb_cm
+        )
     )
     fe_only = expected_counts_single_isotope(
         detector_position=det,
@@ -551,6 +559,76 @@ def test_concrete_obstacle_path_reduces_kernel_value() -> None:
     blocked = kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
     unblocked = free_kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
     assert blocked == pytest.approx(unblocked * np.exp(-1.0), rel=1e-12)
+
+
+def test_collision_boxes_replace_grid_columns_as_pf_attenuation_fallback() -> None:
+    """PF counts should use the exact physical AABB before coarse blocked cells."""
+    collision_box = (0.0, -0.5, 0.0, 1.0, 0.5, 2.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+        collision_boxes_m=(collision_box,),
+    )
+    kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        obstacle_grid=grid,
+        obstacle_height_m=2.0,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    free_kernel = ContinuousKernel(
+        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        use_gpu=False,
+    )
+    source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+
+    blocked = kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
+    free = free_kernel.kernel_value_pair("Cs-137", detector, source, 0, 0)
+
+    assert kernel.obstacle_boxes_m() == pytest.approx(np.asarray([collision_box]))
+    assert kernel.obstacle_path_length_cm(source, detector) == pytest.approx(100.0)
+    assert blocked == pytest.approx(free * np.exp(-1.0), rel=1e-12)
+
+
+def test_explicit_transport_model_prevents_pf_collision_double_count() -> None:
+    """PF attenuation should exclusively use explicit boxes and per-box isotope mu."""
+    collision_box = (0.0, -0.5, 0.0, 1.0, 0.5, 2.0)
+    transport_box = (0.0, 1.5, 0.0, 1.0, 2.5, 2.0)
+    grid = ObstacleGrid(
+        origin=(0.0, -0.5),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+        collision_boxes_m=(collision_box,),
+    ).with_transport_model(
+        boxes_m=(transport_box,),
+        mu_by_isotope={"Cs-137": (0.027,)},
+    )
+    kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.01},
+        use_gpu=False,
+    )
+    collision_ray_source = np.array([-1.0, 0.0, 1.0], dtype=float)
+    collision_ray_detector = np.array([2.0, 0.0, 1.0], dtype=float)
+    transport_ray_source = np.array([-1.0, 2.0, 1.0], dtype=float)
+    transport_ray_detector = np.array([2.0, 2.0, 1.0], dtype=float)
+
+    assert kernel.obstacle_boxes_m() == pytest.approx(np.asarray([transport_box]))
+    assert kernel.obstacle_mu_values_cm_inv("Cs-137") == pytest.approx([0.027])
+    assert kernel.obstacle_path_length_cm(
+        collision_ray_source,
+        collision_ray_detector,
+    ) == pytest.approx(0.0)
+    assert kernel.obstacle_path_length_cm(
+        transport_ray_source,
+        transport_ray_detector,
+    ) == pytest.approx(100.0)
 
 
 def test_obstacle_only_optical_depth_diagnostics_match_kernel() -> None:
@@ -695,7 +773,9 @@ def test_broad_beam_buildup_increases_but_bounds_attenuated_counts() -> None:
     """Build-up should increase attenuated broad-beam counts without exceeding unattenuated counts."""
     detector = np.zeros(3, dtype=float)
     source = np.array([1.0, 1.0, 1.0], dtype=float)
-    base_params = ShieldParams(mu_fe=0.1, mu_pb=0.0, thickness_fe_cm=5.0, thickness_pb_cm=0.0)
+    base_params = ShieldParams(
+        mu_fe=0.1, mu_pb=0.0, thickness_fe_cm=5.0, thickness_pb_cm=0.0
+    )
     narrow_kernel = ContinuousKernel(
         mu_by_isotope={"Cs-137": {"fe": 0.1, "pb": 0.0}},
         shield_params=base_params,
@@ -776,7 +856,9 @@ def test_concrete_obstacle_misses_off_axis_ray() -> None:
     detector = np.array([2.0, 2.0, 1.0], dtype=float)
 
     assert kernel.obstacle_path_length_cm(source, detector) == pytest.approx(0.0)
-    assert kernel.attenuation_factor_pair("Cs-137", source, detector, 0, 0) == pytest.approx(1.0)
+    assert kernel.attenuation_factor_pair(
+        "Cs-137", source, detector, 0, 0
+    ) == pytest.approx(1.0)
 
 
 def test_gpu_expected_counts_include_obstacle_attenuation_on_cpu_device() -> None:

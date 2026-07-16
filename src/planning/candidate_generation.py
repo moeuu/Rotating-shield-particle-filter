@@ -120,6 +120,7 @@ def _filter_candidates(
     height_partner_reference_xyz: NDArray[np.float64] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> NDArray[np.float64]:
     """Filter candidates while allowing only the current station's height mate."""
     if candidates.size == 0:
@@ -133,6 +134,10 @@ def _filter_candidates(
             z_dist = np.abs(diffs[:, :, 2])
             xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
             z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
+            min_z_separation = max(
+                float(height_partner_min_z_separation_m),
+                0.0,
+            )
             exact_action_visited = np.any(
                 (xy_dist <= xy_tolerance) & (z_dist <= z_tolerance),
                 axis=1,
@@ -150,13 +155,13 @@ def _filter_candidates(
             height_partner = (
                 (reference_xy_dist <= xy_tolerance)
                 & (reference_z_dist > z_tolerance)
+                & (reference_z_dist >= min_z_separation)
                 & ~exact_action_visited
             )
             separated = ~exact_action_visited
             if min_dist_from_visited > 0.0:
                 separated &= (
-                    np.all(xy_dist >= min_dist_from_visited, axis=1)
-                    | height_partner
+                    np.all(xy_dist >= min_dist_from_visited, axis=1) | height_partner
                 )
         else:
             distances = np.linalg.norm(diffs, axis=2)
@@ -280,6 +285,44 @@ def _sample_sobol(
     return out
 
 
+def sample_low_discrepancy_heights(
+    rng: np.random.Generator,
+    bounds_z: tuple[float, float],
+    n_samples: int,
+) -> NDArray[np.float64]:
+    """Sample one-dimensional detector heights with a scrambled Sobol sequence."""
+    lower = float(bounds_z[0])
+    upper = float(bounds_z[1])
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        raise ValueError("bounds_z must contain finite values.")
+    if upper < lower:
+        raise ValueError("bounds_z upper bound must be >= lower bound.")
+    if int(n_samples) <= 0:
+        return np.zeros(0, dtype=float)
+    lo = np.array([0.0, 0.0, lower], dtype=float)
+    hi = np.array([0.0, 0.0, upper], dtype=float)
+    return _sample_sobol(rng, lo, hi, int(n_samples))[:, 2]
+
+
+def _sample_current_xy_height_anchors(
+    rng: np.random.Generator,
+    current_pose_xyz: NDArray[np.float64],
+    bounds_z: tuple[float, float],
+    n_samples: int,
+) -> NDArray[np.float64]:
+    """Return batched low-discrepancy height anchors at the current xy station."""
+    heights = sample_low_discrepancy_heights(rng, bounds_z, n_samples)
+    if heights.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    anchors = np.repeat(
+        np.asarray(current_pose_xyz, dtype=float).reshape(1, 3),
+        heights.size,
+        axis=0,
+    )
+    anchors[:, 2] = heights
+    return anchors
+
+
 def _generate_ring_candidates(
     current_pose_xyz: NDArray[np.float64],
     lo: NDArray[np.float64],
@@ -323,14 +366,18 @@ def generate_candidate_poses(
     rng: np.random.Generator | None = None,
     detector_heights_m: Sequence[float] | None = None,
     include_current_xy_height_actions: bool = False,
+    continuous_height_anchor_count: int = 8,
+    allow_height_partners: bool | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> NDArray[np.float64]:
     """Return (L, 3) candidate poses in free space for the given strategy.
 
     When ``detector_heights_m`` is supplied, xy stations are sampled once and
     expanded over the discrete height actions. Continuous z values are never
-    sampled in that mode.
+    sampled in that mode. Without discrete actions, requesting current-xy
+    height actions adds low-discrepancy continuous anchors over the z bounds.
     """
     rng = np.random.default_rng() if rng is None else rng
     current_pose_xyz = np.asarray(current_pose_xyz, dtype=float)
@@ -398,6 +445,21 @@ def generate_candidate_poses(
                 height_actions,
             )
             raw = np.vstack([current_height_actions, raw])
+    elif include_current_xy_height_actions:
+        current_height_anchors = _sample_current_xy_height_anchors(
+            rng,
+            current_pose_xyz,
+            (float(lo[2]), float(hi[2])),
+            max(int(continuous_height_anchor_count), 0),
+        )
+        if current_height_anchors.size:
+            raw = np.vstack([current_height_anchors, raw])
+
+    height_partners_enabled = (
+        height_actions is not None
+        if allow_height_partners is None
+        else bool(allow_height_partners)
+    )
 
     filtered = _filter_candidates(
         raw,
@@ -405,10 +467,11 @@ def generate_candidate_poses(
         min_dist_from_visited,
         is_free_fn,
         is_free_batch_fn=is_free_batch_fn,
-        allow_height_partners=height_actions is not None,
+        allow_height_partners=height_partners_enabled,
         height_partner_reference_xyz=current_pose_xyz,
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     if filtered.shape[0] < n_candidates:
         map_centers = _map_free_cell_centers(
@@ -434,10 +497,11 @@ def generate_candidate_poses(
                 min_dist_from_visited,
                 is_free_fn,
                 is_free_batch_fn=is_free_batch_fn,
-                allow_height_partners=height_actions is not None,
+                allow_height_partners=height_partners_enabled,
                 height_partner_reference_xyz=current_pose_xyz,
                 height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
                 height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+                height_partner_min_z_separation_m=height_partner_min_z_separation_m,
             )
             if map_centers.size:
                 filtered = np.vstack([filtered, map_centers])
@@ -456,10 +520,11 @@ def generate_candidate_poses(
             min_dist_from_visited,
             is_free_fn,
             is_free_batch_fn=is_free_batch_fn,
-            allow_height_partners=height_actions is not None,
+            allow_height_partners=height_partners_enabled,
             height_partner_reference_xyz=current_pose_xyz,
             height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
             height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+            height_partner_min_z_separation_m=height_partner_min_z_separation_m,
         )
         if extra.size:
             filtered = np.vstack([filtered, extra])

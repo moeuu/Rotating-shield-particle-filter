@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from measurement.model import PointSource
+from measurement.obstacle_assets import KnownObstacleInstance, ObstacleComponent
 from measurement.obstacles import ObstacleGrid
 from pf.estimator import MeasurementRecord, RotatingShieldPFEstimator
 from realtime_demo import _has_environment_obstacles, run_live_pf
@@ -43,6 +44,7 @@ from sim.isaacsim_app.scene_builder import (
     SceneDescription,
     SourceDescription,
     StagePrimPaths,
+    build_scene_description,
 )
 from sim.isaacsim_app.stage_backend import (
     FakeStageBackend,
@@ -187,12 +189,19 @@ def test_protocol_round_trip() -> None:
         dwell_time_s=30.0,
         travel_time_s=2.5,
         shield_actuation_time_s=0.75,
+        travel_waypoints_xyz=(
+            (1.0, 2.0, 0.5),
+            (2.0, 2.0, 0.5),
+        ),
     )
     encoded = encode_message("step", command.to_dict())
     msg_type, payload = decode_message(encoded.strip())
     restored = SimulationCommand.from_dict(payload)
     assert msg_type == "step"
     assert restored == command
+    legacy_payload = command.to_dict()
+    legacy_payload.pop("travel_waypoints_xyz")
+    assert SimulationCommand.from_dict(legacy_payload).travel_waypoints_xyz is None
 
     observation = SimulationObservation(
         step_id=3,
@@ -205,6 +214,49 @@ def test_protocol_round_trip() -> None:
         metadata={"backend": "mock"},
     )
     assert SimulationObservation.from_dict(observation.to_dict()) == observation
+
+
+def test_scene_description_parses_collision_and_transport_metadata() -> None:
+    """Reset payloads should preserve distinct collision and attenuation models."""
+    scene = build_scene_description(
+        {
+            "collision_boxes_m": [
+                [0.25, 1.0, 0.1, 1.25, 2.5, 1.8],
+                [3.0, 4.0, 0.0, 3.5, 5.0, 0.75],
+            ],
+            "transport_boxes_m": [[0.5, 1.25, 0.2, 1.0, 2.0, 1.5]],
+            "transport_mu_by_isotope": {"Cs-137": [0.027]},
+            "transport_line_mu_by_isotope": {
+                "Cs-137": [[0.031], [0.024]],
+            },
+        }
+    )
+
+    assert scene.collision_boxes_m == (
+        (0.25, 1.0, 0.1, 1.25, 2.5, 1.8),
+        (3.0, 4.0, 0.0, 3.5, 5.0, 0.75),
+    )
+    assert scene.transport_boxes_m == ((0.5, 1.25, 0.2, 1.0, 2.0, 1.5),)
+    assert scene.transport_mu_by_isotope == {"Cs-137": (0.027,)}
+    assert scene.transport_line_mu_by_isotope == {
+        "Cs-137": ((0.031,), (0.024,)),
+    }
+
+
+@pytest.mark.parametrize(
+    "collision_boxes",
+    (
+        [[0.0, 0.0, 0.0, 1.0, 1.0]],
+        [[0.0, 0.0, 0.0, 1.0, 1.0, float("nan")]],
+        [[1.0, 0.0, 0.0, 0.0, 1.0, 1.0]],
+    ),
+)
+def test_scene_description_rejects_invalid_collision_boxes(
+    collision_boxes: list[list[float]],
+) -> None:
+    """Malformed, non-finite, and reversed reset boxes must fail explicitly."""
+    with pytest.raises(ValueError, match="collision_boxes_m"):
+        build_scene_description({"collision_boxes_m": collision_boxes})
 
 
 def test_mock_bridge_server_round_trip() -> None:
@@ -294,6 +346,150 @@ def test_analytic_runtime_uses_python_transport_obstacle_attenuation() -> None:
     assert sum(blocked_observation.spectrum_counts) < sum(
         clear_observation.spectrum_counts
     )
+
+
+def test_analytic_runtime_collision_box_fallback_reduces_counts() -> None:
+    """Python debug transport should attenuate through a collision-only AABB."""
+    source = PointSource(
+        isotope="Cs-137",
+        position=(0.5, 3.5, 0.5),
+        intensity_cps_1m=5.0e6,
+    )
+    command = SimulationCommand(
+        step_id=17,
+        target_pose_xyz=(0.5, 0.5, 0.5),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=20.0,
+    )
+    common_payload = {
+        "sources": [
+            {
+                "isotope": source.isotope,
+                "position": list(source.position),
+                "intensity_cps_1m": source.intensity_cps_1m,
+            }
+        ],
+        "obstacle_grid_shape": [0, 0],
+        "obstacle_cells": [],
+        "obstacle_material": "concrete",
+    }
+    clear_runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=109,
+    )
+    clear_runtime.reset({**common_payload, "collision_boxes_m": []})
+    clear_observation = clear_runtime.step(command)
+
+    collision_box = (0.0, 1.0, 0.0, 1.0, 2.5, 1.0)
+    blocked_runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=109,
+    )
+    blocked_runtime.reset(
+        {
+            **common_payload,
+            "collision_boxes_m": [list(collision_box)],
+        }
+    )
+    blocked_observation = blocked_runtime.step(command)
+
+    obstacle_grid = blocked_runtime.transport_model.scene.obstacle_grid
+    assert obstacle_grid is not None
+    assert obstacle_grid.collision_boxes_m == (collision_box,)
+    assert obstacle_grid.blocked_boxes() == []
+    assert float(
+        blocked_observation.metadata["total_obstacle_path_cm"]
+    ) == pytest.approx(150.0)
+    assert sum(blocked_observation.spectrum_counts) < sum(
+        clear_observation.spectrum_counts
+    )
+
+
+def test_analytic_runtime_explicit_transport_prevents_collision_double_count() -> None:
+    """Explicit transport geometry and isotope mu must replace collision fallback."""
+    source = PointSource(
+        isotope="Cs-137",
+        position=(0.5, 3.5, 0.5),
+        intensity_cps_1m=5.0e6,
+    )
+    runtime = AnalyticSimulationRuntime(
+        sources=[source],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        rng_seed=111,
+    )
+    transport_box = (0.0, 2.0, 0.0, 1.0, 3.0, 1.0)
+    collision_box = (0.0, 1.0, 0.0, 1.0, 2.0, 1.0)
+    gamma_lines = tuple(
+        line
+        for line in runtime.transport_model.decomposer.library["Cs-137"].lines
+        if float(line.intensity) > 0.0
+    )
+    line_mu_rows = [[0.031 + 0.001 * index] for index, _ in enumerate(gamma_lines)]
+    runtime.reset(
+        {
+            "sources": [
+                {
+                    "isotope": source.isotope,
+                    "position": list(source.position),
+                    "intensity_cps_1m": source.intensity_cps_1m,
+                }
+            ],
+            "obstacle_grid_shape": [0, 0],
+            "obstacle_cells": [],
+            "obstacle_material": "concrete",
+            "collision_boxes_m": [list(collision_box)],
+            "transport_boxes_m": [list(transport_box)],
+            "transport_mu_by_isotope": {"Cs-137": [0.027]},
+            "transport_line_mu_by_isotope": {"Cs-137": line_mu_rows},
+        }
+    )
+    command = SimulationCommand(
+        step_id=19,
+        target_pose_xyz=(0.5, 0.5, 0.5),
+        target_base_yaw_rad=0.0,
+        fe_orientation_index=0,
+        pb_orientation_index=0,
+        dwell_time_s=20.0,
+    )
+
+    segments = runtime.transport_model.obstacle_stage_segments(
+        source,
+        command.target_pose_xyz,
+    )
+    observation = runtime.step(command)
+
+    assert len(segments) == 1
+    assert segments[0].path_length_cm == pytest.approx(100.0)
+    assert segments[0].material.mu_by_isotope["Cs-137"] == pytest.approx(0.027)
+    assert segments[0].material.mu_by_energy_keV[
+        float(gamma_lines[0].energy_keV)
+    ] == pytest.approx(0.031)
+    assert float(observation.metadata["total_obstacle_path_cm"]) == pytest.approx(100.0)
+
+
+def test_mock_observation_model_preserves_scene_collision_boxes() -> None:
+    """Mock sidecar observations should receive the same explicit collision geometry."""
+    collision_box = (0.0, 0.0, 0.0, 0.5, 0.5, 1.0)
+    app = IsaacSimApplication(use_mock=True)
+
+    app.reset(SceneDescription(collision_boxes_m=(collision_box,)))
+
+    transport_model = getattr(app.observation_model, "transport_model")
+    obstacle_grid = transport_model.scene.obstacle_grid
+    assert obstacle_grid is not None
+    assert obstacle_grid.collision_boxes_m == (collision_box,)
+    assert obstacle_grid.attenuation_boxes() == [collision_box]
+    app.close()
 
 
 def test_analytic_runtime_uses_python_transport_spherical_shield() -> None:
@@ -1141,6 +1337,84 @@ def test_robot_controller_interpolates_travel_between_measurement_points() -> No
     assert backend.robot_poses[0][0] < backend.robot_poses[-1][0]
 
 
+def test_robot_controller_executes_detector_waypoints_in_order() -> None:
+    """Waypoint commands should follow the routed detector path instead of its chord."""
+
+    class _RecordingStageBackend(FakeStageBackend):
+        """Record local robot-root translations for waypoint execution."""
+
+        def __init__(self) -> None:
+            """Initialize the root translation history."""
+            super().__init__()
+            self.robot_poses: list[tuple[float, float, float]] = []
+
+        def set_local_pose(
+            self,
+            path: str,
+            *,
+            translation_xyz: tuple[float, float, float] | None = None,
+            orientation_wxyz: tuple[float, float, float, float] | None = None,
+            scale_xyz: tuple[float, float, float] | None = None,
+        ) -> None:
+            """Record root translations while preserving fake-stage behavior."""
+            super().set_local_pose(
+                path,
+                translation_xyz=translation_xyz,
+                orientation_wxyz=orientation_wxyz,
+                scale_xyz=scale_xyz,
+            )
+            if path == "/World/SimBridge/Robot" and translation_xyz is not None:
+                self.robot_poses.append(tuple(float(v) for v in translation_xyz))
+
+    backend = _RecordingStageBackend()
+    scene = SceneDescription()
+    SceneBuilder(backend, detector_height_m=0.5).load_scene(scene)
+    controller = RobotController(
+        backend,
+        scene.prim_paths,
+        detector_height_m=0.5,
+        ground_z_m=0.2,
+        motion_speed_m_s=1.0,
+        animation_dt_s=1.0,
+    )
+    controller.reset()
+    backend.robot_poses = []
+
+    controller.apply_command(
+        SimulationCommand(
+            step_id=0,
+            target_pose_xyz=(3.0, 3.0, 1.0),
+            target_base_yaw_rad=0.0,
+            fe_orientation_index=0,
+            pb_orientation_index=0,
+            dwell_time_s=1.0,
+            travel_time_s=4.0,
+            travel_waypoints_xyz=(
+                (1.0, 1.0, 0.7),
+                (1.0, 3.0, 0.7),
+                (3.0, 3.0, 0.7),
+            ),
+        )
+    )
+
+    root_samples = np.asarray(backend.robot_poses, dtype=float)
+    first_corner = np.flatnonzero(
+        np.all(np.isclose(root_samples, (1.0, 3.0, 0.2)), axis=1)
+    )
+    second_corner = np.flatnonzero(
+        np.all(np.isclose(root_samples, (3.0, 3.0, 0.2)), axis=1)
+    )
+    assert first_corner.size == 1
+    assert second_corner.size >= 1
+    assert int(first_corner[0]) < int(second_corner[0])
+    assert np.allclose(root_samples[:, 2], 0.2)
+    assert root_samples[-1] == pytest.approx((3.0, 3.0, 0.2))
+    assert controller.state.detector_pose_xyz == pytest.approx((3.0, 3.0, 1.0))
+    assert controller.detector_world_pose().translation_xyz == pytest.approx(
+        (3.0, 3.0, 1.0)
+    )
+
+
 def test_robot_controller_interpolates_detector_height_with_shields() -> None:
     """Detector-height commands should lift detector and shields above a grounded base."""
 
@@ -1151,6 +1425,7 @@ def test_robot_controller_interpolates_detector_height_with_shields() -> None:
             """Initialize translation histories by prim path."""
             super().__init__()
             self.translations: dict[str, list[tuple[float, float, float]]] = {}
+            self.scales: dict[str, list[tuple[float, float, float]]] = {}
 
         def set_local_pose(
             self,
@@ -1170,6 +1445,10 @@ def test_robot_controller_interpolates_detector_height_with_shields() -> None:
             if translation_xyz is not None:
                 self.translations.setdefault(path, []).append(
                     tuple(float(value) for value in translation_xyz)
+                )
+            if scale_xyz is not None:
+                self.scales.setdefault(path, []).append(
+                    tuple(float(value) for value in scale_xyz)
                 )
 
     backend = _RecordingStageBackend()
@@ -1197,6 +1476,7 @@ def test_robot_controller_interpolates_detector_height_with_shields() -> None:
         scene.prim_paths.pb_shield_path
     ).translation_xyz == pytest.approx((0.7, 1.0, 0.65))
     backend.translations = {}
+    backend.scales = {}
 
     controller.apply_command(
         SimulationCommand(
@@ -1212,9 +1492,17 @@ def test_robot_controller_interpolates_detector_height_with_shields() -> None:
 
     root_samples = backend.translations[scene.prim_paths.robot_root]
     detector_samples = backend.translations[scene.prim_paths.detector_path]
+    mast_samples = backend.translations[scene.prim_paths.robot_mast_path]
+    mast_scales = backend.scales[scene.prim_paths.robot_mast_path]
     assert len(detector_samples) == 4
     assert all(sample[2] == pytest.approx(0.2) for sample in root_samples)
     assert np.all(np.diff([sample[2] for sample in detector_samples]) > 0.0)
+    assert [sample[2] for sample in mast_samples] == pytest.approx(
+        [0.5 * sample[2] for sample in detector_samples]
+    )
+    assert [scale[2] for scale in mast_scales] == pytest.approx(
+        [sample[2] for sample in detector_samples]
+    )
     assert controller.state.pose_xyz == pytest.approx((1.0, 1.0, 0.2))
     assert controller.state.detector_pose_xyz == pytest.approx((1.0, 1.0, 1.8))
     assert controller.detector_world_pose().translation_xyz == pytest.approx(
@@ -1322,6 +1610,103 @@ def test_scene_builder_can_skip_python_obstacle_authoring() -> None:
     builder.load_scene(scene)
 
     assert "/World/SimBridge/Obstacles/Obstacle_0000" not in backend.prims
+
+
+def test_scene_builder_authors_explicit_collision_boxes_instead_of_grid_columns() -> (
+    None
+):
+    """Explicit 3D boxes should define sidecar geometry when instances are absent."""
+    backend = FakeStageBackend()
+    builder = SceneBuilder(backend)
+    scene = SceneDescription(
+        obstacle_origin_xy=(0.0, 0.0),
+        obstacle_cell_size_m=1.0,
+        obstacle_grid_shape=(2, 2),
+        obstacle_cells=[(0, 0)],
+        obstacle_material="steel",
+        collision_boxes_m=((0.25, 1.0, 0.1, 1.25, 2.5, 1.8),),
+    )
+
+    builder.load_scene(scene)
+
+    box_path = "/World/SimBridge/Obstacles/CollisionBox_0000"
+    assert box_path in backend.prims
+    box = backend.prims[box_path]
+    assert box.scale_xyz == pytest.approx((1.0, 1.5, 1.7))
+    assert box.pose.translation_xyz == pytest.approx((0.75, 1.75, 0.95))
+    assert box.metadata["material"] == "steel"
+    assert box.metadata["transport_group"] == "obstacle"
+    assert "/World/SimBridge/Obstacles/Obstacle_0000" not in backend.prims
+
+
+def test_scene_builder_authors_transport_only_geometry() -> None:
+    """Transport-only scenes should author physical obstacle-material boxes."""
+    backend = FakeStageBackend()
+    builder = SceneBuilder(backend)
+    scene = SceneDescription(
+        obstacle_material="lead",
+        transport_boxes_m=((1.0, 2.0, 0.25, 3.0, 5.0, 1.75),),
+    )
+
+    builder.load_scene(scene)
+
+    box_path = "/World/SimBridge/Obstacles/TransportBox_0000"
+    assert box_path in backend.prims
+    box = backend.prims[box_path]
+    assert box.scale_xyz == pytest.approx((2.0, 3.0, 1.5))
+    assert box.pose.translation_xyz == pytest.approx((2.0, 3.5, 1.0))
+    assert box.metadata["material"] == "lead"
+    assert box.metadata["transport_group"] == "obstacle"
+
+
+def test_scene_builder_prefers_transport_boxes_over_collision_and_grid() -> None:
+    """Transport boxes should suppress lower-priority fallback geometry."""
+    backend = FakeStageBackend()
+    builder = SceneBuilder(backend)
+    scene = SceneDescription(
+        obstacle_cells=[(0, 0)],
+        obstacle_material="steel",
+        collision_boxes_m=((0.0, 0.0, 0.0, 0.5, 0.5, 0.5),),
+        transport_boxes_m=((1.0, 2.0, 0.25, 3.0, 5.0, 1.75),),
+    )
+
+    builder.load_scene(scene)
+
+    box_path = "/World/SimBridge/Obstacles/TransportBox_0000"
+    assert box_path in backend.prims
+    assert backend.prims[box_path].metadata["material"] == "steel"
+    assert "/World/SimBridge/Obstacles/CollisionBox_0000" not in backend.prims
+    assert "/World/SimBridge/Obstacles/Obstacle_0000" not in backend.prims
+
+
+def test_scene_builder_does_not_duplicate_known_instances_as_collision_boxes() -> None:
+    """Known random assets should take precedence over their collision-box mirrors."""
+    backend = FakeStageBackend()
+    builder = SceneBuilder(backend)
+    component = ObstacleComponent(
+        name="leg",
+        center_xyz=(1.0, 1.0, 0.5),
+        size_xyz=(0.2, 0.2, 1.0),
+        material="steel",
+    )
+    instance = KnownObstacleInstance(
+        name="Rack_0000",
+        template="test_rack",
+        footprint_xy=(0.5, 1.5, 0.5, 1.5),
+        footprint_cells=((0, 0),),
+        components=(component,),
+    )
+    scene = SceneDescription(
+        obstacle_instances=(instance,),
+        collision_boxes_m=(component.box_m,),
+        transport_boxes_m=((2.0, 2.0, 0.0, 3.0, 3.0, 1.0),),
+    )
+
+    builder.load_scene(scene)
+
+    assert "/World/SimBridge/Obstacles/Rack_0000/leg" in backend.prims
+    assert "/World/SimBridge/Obstacles/TransportBox_0000" not in backend.prims
+    assert "/World/SimBridge/Obstacles/CollisionBox_0000" not in backend.prims
 
 
 def test_scene_builder_can_author_room_boundaries_as_wall_group() -> None:
@@ -3077,6 +3462,10 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
     assert runtime.reset_payload["usd_path"] == ""
     assert runtime.reset_payload["use_config_usd_fallback"] is False
     assert runtime.reset_payload["obstacle_cells"] == []
+    assert runtime.reset_payload["collision_boxes_m"] == []
+    assert runtime.reset_payload["transport_boxes_m"] == []
+    assert runtime.reset_payload["transport_mu_by_isotope"] == {}
+    assert runtime.reset_payload["transport_line_mu_by_isotope"] == {}
     assert runtime.close_called
     assert runtime.step_calls == 1
     assert estimator.mission_metrics["total_measurements"] == 1
@@ -3100,10 +3489,18 @@ def test_empty_obstacle_grid_disables_config_usd_fallback() -> None:
         grid_shape=(10, 20),
         blocked_cells=((1, 2),),
     )
+    collision_only_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(10, 20),
+        blocked_cells=(),
+        collision_boxes_m=((1.0, 2.0, 0.0, 2.0, 3.0, 1.5),),
+    )
 
     assert not _has_environment_obstacles(None)
     assert not _has_environment_obstacles(empty_grid)
     assert _has_environment_obstacles(blocked_grid)
+    assert _has_environment_obstacles(collision_only_grid)
 
 
 def test_run_live_pf_random_environment_uses_blender_usd(
@@ -3264,7 +3661,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
                     "origin": [0.0, 0.0],
                     "cell_size": 1.0,
                     "grid_shape": [10, 20],
-                    "robot_radius_m": 0.35,
+                    "robot_radius_m": float(kwargs["robot_radius_m"]),
                     "traversable_cells": [[1, 1], [2, 2]],
                 }
             ),
@@ -3329,6 +3726,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     assert blender_calls
     assert blender_calls[0]["base_usd_path"] == expected_base_usd
     assert blender_calls[0]["obstacle_material"] == "air"
+    assert float(blender_calls[0]["robot_radius_m"]) > 0.35
     assert blender_calls[0]["traversability_output_path"] == generated_usd.with_suffix(
         ".traversability.json"
     )
@@ -3337,6 +3735,10 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     assert runtime.reset_payload["author_obstacle_prims"] is True
     assert runtime.reset_payload["obstacle_material"] == "air"
     assert runtime.reset_payload["obstacle_cells"]
+    assert runtime.reset_payload["collision_boxes_m"]
+    assert runtime.reset_payload["transport_boxes_m"]
+    assert runtime.reset_payload["transport_mu_by_isotope"]
+    assert runtime.reset_payload["transport_line_mu_by_isotope"]
     map_path = Path(str(runtime.reset_payload["traversability_map_path"]))
     map_png_path = Path(str(runtime.reset_payload["traversability_map_png_path"]))
     assert map_path.exists()
@@ -3344,5 +3746,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     assert json.loads(map_path.read_text(encoding="utf-8"))["source"] == (
         "blender_projected_3d_environment"
     )
-    assert runtime.reset_payload["robot_radius_m"] == pytest.approx(0.35)
+    assert runtime.reset_payload["robot_radius_m"] == pytest.approx(
+        float(blender_calls[0]["robot_radius_m"])
+    )
     assert runtime.close_called

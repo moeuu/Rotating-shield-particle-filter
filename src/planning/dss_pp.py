@@ -20,6 +20,7 @@ from measurement.continuous_kernels import ContinuousKernel
 from measurement.detector_geometry import DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
 from pf.estimator import RotatingShieldPFEstimator
 from pf.likelihood import expected_counts_per_source
+from planning.candidate_generation import sample_low_discrepancy_heights
 from planning.pose_selection import (
     _auto_scale_observation_penalty,
     _minimum_observation_feasible_mask,
@@ -35,9 +36,7 @@ from runtime_defaults import (
 
 
 _DSS_PP_POSE_EVAL_CONTEXT: dict[str, object] | None = None
-_DSS_PP_PATH_LENGTH_CACHE: dict[
-    tuple[int, tuple[int, int], tuple[int, int]], float
-] = {}
+_DSS_PP_PATH_LENGTH_CACHE: dict[tuple[object, ...], float] = {}
 _DSS_PP_PATH_LENGTH_CACHE_MAX = 20000
 
 
@@ -940,6 +939,31 @@ def _is_free(map_api: object | None, point: NDArray[np.float64]) -> bool:
     return True
 
 
+def _free_space_mask_batch(
+    map_api: object | None,
+    points_xyz: NDArray[np.float64],
+) -> NDArray[np.bool_]:
+    """Return free-space flags, preferring the map's batched runtime path."""
+    points = np.asarray(points_xyz, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_xyz must be shape (N, 3).")
+    if map_api is None:
+        return np.ones(points.shape[0], dtype=bool)
+    for attr in ("is_free_batch", "is_free_space_batch"):
+        function = getattr(map_api, attr, None)
+        if not callable(function):
+            continue
+        mask = np.asarray(function(points), dtype=bool).reshape(-1)
+        if mask.size != points.shape[0]:
+            raise ValueError("Batched free-space checker returned the wrong length.")
+        return mask
+    return np.fromiter(
+        (_is_free(map_api, point) for point in points),
+        dtype=bool,
+        count=points.shape[0],
+    )
+
+
 def _cell_center(
     map_api: object, cell: tuple[int, int], z_value: float
 ) -> NDArray[np.float64]:
@@ -956,48 +980,46 @@ def _cell_center(
 
 
 def _bounds_filter(
-    points: list[NDArray[np.float64]],
+    points: Sequence[NDArray[np.float64]] | NDArray[np.float64],
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
     map_api: object | None,
-) -> list[NDArray[np.float64]]:
-    """Filter points by bounds and traversability."""
-    filtered: list[NDArray[np.float64]] = []
+) -> NDArray[np.float64]:
+    """Filter a candidate batch by bounds and traversability."""
+    point_array = np.asarray(points, dtype=float)
+    if point_array.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    if point_array.ndim != 2 or point_array.shape[1] != 3:
+        raise ValueError("points must be shape (N, 3).")
+    mask = np.all(np.isfinite(point_array), axis=1)
     if bounds_xyz is None:
         lo = None
         hi = None
     else:
         lo = np.asarray(bounds_xyz[0], dtype=float)
         hi = np.asarray(bounds_xyz[1], dtype=float)
-    for point in points:
-        pt = np.asarray(point, dtype=float)
-        if pt.shape != (3,):
-            continue
-        if lo is not None and hi is not None:
-            if bool(np.any(pt < lo) or np.any(pt > hi)):
-                continue
-        if _is_free(map_api, pt):
-            filtered.append(pt)
-    return filtered
+        if lo.shape != (3,) or hi.shape != (3,):
+            raise ValueError("bounds_xyz must contain two (3,) arrays.")
+        mask &= np.all((point_array >= lo) & (point_array <= hi), axis=1)
+    if not np.any(mask):
+        return np.zeros((0, 3), dtype=float)
+    bounded = point_array[mask]
+    return bounded[_free_space_mask_batch(map_api, bounded)]
 
 
 def _dedupe_points(
-    points: Sequence[NDArray[np.float64]],
+    points: Sequence[NDArray[np.float64]] | NDArray[np.float64],
     *,
     decimals: int = 3,
 ) -> NDArray[np.float64]:
     """Return unique points while preserving first occurrence order."""
-    seen: set[tuple[float, float, float]] = set()
-    unique: list[NDArray[np.float64]] = []
-    for point in points:
-        pt = np.asarray(point, dtype=float)
-        key = tuple(float(v) for v in np.round(pt, int(decimals)))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(pt)
-    if not unique:
+    point_array = np.asarray(points, dtype=float)
+    if point_array.size == 0:
         return np.zeros((0, 3), dtype=float)
-    return np.vstack(unique).astype(float)
+    if point_array.ndim != 2 or point_array.shape[1] != 3:
+        raise ValueError("points must be shape (N, 3).")
+    rounded = np.round(point_array, int(decimals))
+    _, first_indices = np.unique(rounded, axis=0, return_index=True)
+    return point_array[np.sort(first_indices)].astype(float)
 
 
 def _bearing_angle_xy(source: NDArray[np.float64], pose: NDArray[np.float64]) -> float:
@@ -1020,6 +1042,7 @@ def augment_candidate_stations(
     map_api: object | None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
     config: DSSPPConfig,
+    continuous_height_bounds_m: tuple[float, float] | None = None,
 ) -> NDArray[np.float64]:
     """Add posterior-ring, occlusion-boundary, and cross-bearing candidates."""
     base = np.asarray(candidate_poses_xyz, dtype=float)
@@ -1123,7 +1146,36 @@ def augment_candidate_stations(
                                     dtype=float,
                                 )
                             )
-    filtered = _bounds_filter(generated, bounds_xyz, map_api)
+    generated_array = (
+        np.vstack(generated).astype(float)
+        if generated
+        else np.zeros((0, 3), dtype=float)
+    )
+    if continuous_height_bounds_m is not None:
+        lower_z = float(continuous_height_bounds_m[0])
+        upper_z = float(continuous_height_bounds_m[1])
+        if not np.isfinite(lower_z) or not np.isfinite(upper_z):
+            raise ValueError("continuous_height_bounds_m must be finite.")
+        if upper_z < lower_z:
+            raise ValueError(
+                "continuous_height_bounds_m upper bound must be >= lower bound."
+            )
+        if bounds_xyz is not None:
+            bounds_lo = np.asarray(bounds_xyz[0], dtype=float).reshape(3)
+            bounds_hi = np.asarray(bounds_xyz[1], dtype=float).reshape(3)
+            if lower_z < bounds_lo[2] or upper_z > bounds_hi[2]:
+                raise ValueError(
+                    "continuous_height_bounds_m must lie within bounds_xyz."
+                )
+        augmented_count = int(generated_array.shape[0] - base.shape[0])
+        if augmented_count > 0:
+            height_rng = np.random.default_rng(config.rng_seed)
+            generated_array[base.shape[0] :, 2] = sample_low_discrepancy_heights(
+                height_rng,
+                (lower_z, upper_z),
+                augmented_count,
+            )
+    filtered = _bounds_filter(generated_array, bounds_xyz, map_api)
     deduped = _dedupe_points(filtered)
     limit = max(base.shape[0], int(config.max_augmented_candidates))
     return deduped[:limit]
@@ -4391,6 +4443,34 @@ def _node_path_length(
     goal = np.asarray(goal_xyz, dtype=float)
     if map_api is None:
         return float(np.linalg.norm(goal - start))
+    motion_waypoints = getattr(map_api, "motion_waypoints", None)
+    if callable(motion_waypoints):
+        start_key = tuple(float(value) for value in start.reshape(3))
+        goal_key = tuple(float(value) for value in goal.reshape(3))
+        cache_key = ("motion", id(map_api), start_key, goal_key)
+        cached = _DSS_PP_PATH_LENGTH_CACHE.get(cache_key)
+        if cached is not None:
+            return float(cached)
+        path = motion_waypoints(start, goal)
+        if path is None:
+            length = float("inf")
+        else:
+            points = np.asarray(path, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+                length = float("inf")
+            elif points.shape[0] == 1:
+                length = 0.0
+            else:
+                length = float(
+                    np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1))
+                )
+        if len(_DSS_PP_PATH_LENGTH_CACHE) >= _DSS_PP_PATH_LENGTH_CACHE_MAX:
+            _DSS_PP_PATH_LENGTH_CACHE.clear()
+        _DSS_PP_PATH_LENGTH_CACHE[cache_key] = float(length)
+        _DSS_PP_PATH_LENGTH_CACHE[
+            ("motion", id(map_api), goal_key, start_key)
+        ] = float(length)
+        return float(length)
     cell_index = getattr(map_api, "cell_index", None)
     if not callable(cell_index):
         return float(np.linalg.norm(goal - start))
@@ -4398,7 +4478,15 @@ def _node_path_length(
     goal_cell = cell_index(goal)
     if start_cell is None or goal_cell is None:
         return float(np.linalg.norm(goal - start))
-    cache_key = (id(map_api), tuple(start_cell), tuple(goal_cell))
+    start_key = tuple(float(value) for value in start.reshape(3))
+    goal_key = tuple(float(value) for value in goal.reshape(3))
+    cache_key = (
+        id(map_api),
+        tuple(start_cell),
+        tuple(goal_cell),
+        start_key,
+        goal_key,
+    )
     cached = _DSS_PP_PATH_LENGTH_CACHE.get(cache_key)
     if cached is not None:
         return float(cached)
@@ -4406,10 +4494,51 @@ def _node_path_length(
     if len(_DSS_PP_PATH_LENGTH_CACHE) >= _DSS_PP_PATH_LENGTH_CACHE_MAX:
         _DSS_PP_PATH_LENGTH_CACHE.clear()
     _DSS_PP_PATH_LENGTH_CACHE[cache_key] = float(length)
-    _DSS_PP_PATH_LENGTH_CACHE[(id(map_api), tuple(goal_cell), tuple(start_cell))] = (
-        float(length)
+    reverse_key = (
+        id(map_api),
+        tuple(goal_cell),
+        tuple(start_cell),
+        goal_key,
+        start_key,
     )
+    _DSS_PP_PATH_LENGTH_CACHE[reverse_key] = float(length)
     return float(length)
+
+
+def _node_path_lengths_batch(
+    map_api: object | None,
+    start_xyz: NDArray[np.float64],
+    goals_xyz: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return candidate path lengths, preferring a map-native batch API."""
+    start = np.asarray(start_xyz, dtype=float).reshape(-1)
+    goals = np.asarray(goals_xyz, dtype=float)
+    if start.shape != (3,) or np.any(~np.isfinite(start)):
+        raise ValueError("start_xyz must be a finite three-vector.")
+    if goals.size == 0:
+        return np.zeros(0, dtype=float)
+    if goals.ndim != 2 or goals.shape[1] != 3:
+        raise ValueError("goals_xyz must be shape (N, 3).")
+    if np.any(~np.isfinite(goals)):
+        raise ValueError("goals_xyz must contain only finite coordinates.")
+    if map_api is None:
+        return np.linalg.norm(goals - start[None, :], axis=1)
+    batch_function = getattr(map_api, "motion_path_lengths_batch", None)
+    if callable(batch_function):
+        lengths = np.asarray(
+            batch_function(start, goals),
+            dtype=float,
+        ).reshape(-1)
+        if lengths.size != goals.shape[0]:
+            raise ValueError(
+                "motion_path_lengths_batch returned the wrong number of values."
+            )
+        return lengths
+    return np.fromiter(
+        (_node_path_length(map_api, start, goal) for goal in goals),
+        dtype=float,
+        count=goals.shape[0],
+    )
 
 
 def _filter_path_reachable_stations(
@@ -4424,13 +4553,40 @@ def _filter_path_reachable_stations(
         return np.zeros((0, 3), dtype=float), 0
     if candidates.ndim != 2 or candidates.shape[1] != 3:
         raise ValueError("candidate_poses_xyz must be shape (N, 3).")
-    reachable = np.asarray(
-        [
-            np.isfinite(_node_path_length(map_api, current_pose_xyz, candidate))
-            for candidate in candidates
-        ],
-        dtype=bool,
+    motion_path_lengths_batch = getattr(
+        map_api,
+        "motion_path_lengths_batch",
+        None,
     )
+    motion_reachable_batch = getattr(
+        map_api,
+        "is_motion_reachable_batch",
+        None,
+    )
+    if callable(motion_path_lengths_batch):
+        path_lengths = _node_path_lengths_batch(
+            map_api,
+            current_pose_xyz,
+            candidates,
+        )
+        reachable = np.isfinite(path_lengths)
+    elif callable(motion_reachable_batch):
+        reachable = np.asarray(
+            motion_reachable_batch(current_pose_xyz, candidates),
+            dtype=bool,
+        ).reshape(-1)
+        if reachable.size != candidates.shape[0]:
+            raise ValueError(
+                "is_motion_reachable_batch returned the wrong number of flags."
+            )
+    else:
+        reachable = np.isfinite(
+            _node_path_lengths_batch(
+                map_api,
+                current_pose_xyz,
+                candidates,
+            )
+        )
     removed = int(np.count_nonzero(~reachable))
     if not np.any(reachable):
         return np.zeros((0, 3), dtype=float), removed
@@ -4567,6 +4723,7 @@ def _height_partner_mask_batch(
     reference_pose_xyz: NDArray[np.float64] | None = None,
     xy_tolerance_m: float = 1.0e-9,
     z_tolerance_m: float = 1.0e-9,
+    min_z_separation_m: float = 0.0,
 ) -> NDArray[np.bool_]:
     """Return unvisited height mates of the current reference station."""
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
@@ -4577,6 +4734,7 @@ def _height_partner_mask_batch(
         return np.zeros(candidates.shape[0], dtype=bool)
     xy_tolerance = max(float(xy_tolerance_m), 0.0)
     z_tolerance = max(float(z_tolerance_m), 0.0)
+    min_z_separation = max(float(min_z_separation_m), 0.0)
     diffs = candidates[:, None, :] - visited[None, :, :]
     xy_distances = np.linalg.norm(diffs[:, :, :2], axis=2)
     z_distances = np.abs(diffs[:, :, 2])
@@ -4596,6 +4754,7 @@ def _height_partner_mask_batch(
     return (
         (reference_xy_distances <= xy_tolerance)
         & (reference_z_distances > z_tolerance)
+        & (reference_z_distances >= min_z_separation)
         & ~exact_action_visited
     )
 
@@ -4643,6 +4802,7 @@ def _station_revisit_penalty(
     reference_pose_xyz: NDArray[np.float64] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> float:
     """Return a normalized penalty for selecting a near-visited station."""
     min_sep = max(float(min_separation_m), 0.0)
@@ -4661,6 +4821,7 @@ def _station_revisit_penalty(
             reference_pose_xyz=reference_pose_xyz,
             xy_tolerance_m=height_partner_xy_tolerance_m,
             z_tolerance_m=height_partner_z_tolerance_m,
+            min_z_separation_m=height_partner_min_z_separation_m,
         )[0]
     ):
         return 0.0
@@ -4681,6 +4842,7 @@ def _station_revisit_penalties_batch(
     reference_pose_xyz: NDArray[np.float64] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> NDArray[np.float64]:
     """Return revisit penalties for many candidate stations."""
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
@@ -4703,6 +4865,7 @@ def _station_revisit_penalties_batch(
         reference_pose_xyz=reference_pose_xyz,
         xy_tolerance_m=height_partner_xy_tolerance_m,
         z_tolerance_m=height_partner_z_tolerance_m,
+        min_z_separation_m=height_partner_min_z_separation_m,
     )
     active = (min_dist < min_sep) & ~height_partners
     penalties[active] = shortfall[active] * shortfall[active]
@@ -5163,6 +5326,7 @@ def _filter_station_separation(
     reference_pose_xyz: NDArray[np.float64] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> tuple[NDArray[np.float64], int]:
     """Remove near-revisited stations when at least one unvisited option exists."""
     min_sep = max(float(min_separation_m), 0.0)
@@ -5184,6 +5348,7 @@ def _filter_station_separation(
         reference_pose_xyz=reference_pose_xyz,
         xy_tolerance_m=height_partner_xy_tolerance_m,
         z_tolerance_m=height_partner_z_tolerance_m,
+        min_z_separation_m=height_partner_min_z_separation_m,
     )
     keep = (np.min(distances, axis=1) >= min_sep) | height_partners
     if not np.any(keep):
@@ -5309,6 +5474,7 @@ def _build_nodes(
     height_partner_forced_program_pair_ids: tuple[int, ...] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
     defer_observation_policy: bool = False,
 ) -> list[DSSPPNode]:
     """Evaluate all station-program nodes for the first horizon layer."""
@@ -5327,12 +5493,10 @@ def _build_nodes(
             kind="forced_height_partner",
         )
     info_gains = np.zeros(candidate_poses.shape[0], dtype=float)
-    path_lengths = np.asarray(
-        [
-            _node_path_length(map_api, current_pose_xyz, pose)
-            for pose in candidate_poses
-        ],
-        dtype=float,
+    path_lengths = _node_path_lengths_batch(
+        map_api,
+        current_pose_xyz,
+        candidate_poses,
     )
     free_cell_centers = _free_cell_centers(
         map_api,
@@ -5372,6 +5536,7 @@ def _build_nodes(
         reference_pose_xyz=current_pose_xyz,
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     bearing_gains = _bearing_diversity_gains_batch(
         candidate_poses,
@@ -5529,6 +5694,7 @@ def _build_nodes(
         reference_pose_xyz=current_pose_xyz,
         xy_tolerance_m=height_partner_xy_tolerance_m,
         z_tolerance_m=height_partner_z_tolerance_m,
+        min_z_separation_m=height_partner_min_z_separation_m,
     )
     evaluation_pose_indices = np.arange(candidate_poses.shape[0], dtype=np.int64)
     raw_nodes: list[DSSPPNode] = []
@@ -5688,9 +5854,7 @@ def _build_nodes(
             ]
             pending = [pending[idx] for idx in keep_indices]
             static_scores = [static_scores[idx] for idx in keep_indices]
-            observation_penalties = [
-                observation_penalties[idx] for idx in keep_indices
-            ]
+            observation_penalties = [observation_penalties[idx] for idx in keep_indices]
             obs_arr = np.asarray(observation_penalties, dtype=float)
         obs_weight = _auto_scale_observation_penalty(
             np.asarray(static_scores, dtype=float),
@@ -6040,6 +6204,7 @@ def _split_height_partner_first_action_nodes(
     enabled: bool,
     xy_tolerance_m: float = 1.0e-9,
     z_tolerance_m: float = 1.0e-9,
+    min_z_separation_m: float = 0.0,
 ) -> tuple[list[DSSPPNode], list[DSSPPNode]]:
     """Separate constrained first actions from unconstrained continuations."""
     all_nodes = list(nodes)
@@ -6055,6 +6220,7 @@ def _split_height_partner_first_action_nodes(
         reference_pose_xyz=current_pose_xyz,
         xy_tolerance_m=xy_tolerance_m,
         z_tolerance_m=z_tolerance_m,
+        min_z_separation_m=min_z_separation_m,
     )
     pose_indices = np.asarray(
         [int(node.pose_index) for node in all_nodes],
@@ -6084,10 +6250,12 @@ def select_dss_pp_next_station(
     visited_poses_xyz: NDArray[np.float64] | None = None,
     map_api: object | None = None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
+    continuous_height_bounds_m: tuple[float, float] | None = None,
     config: DSSPPConfig | None = None,
     height_partner_forced_program_pair_ids: Sequence[int] | None = None,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
 
@@ -6097,6 +6265,10 @@ def select_dss_pp_next_station(
     retain the regular pose-specific program optimization. The global
     ``DSSPPConfig.forced_program_pair_ids`` setting continues to take
     precedence and forces every candidate as before.
+
+    When ``continuous_height_bounds_m`` is provided, newly augmented xy
+    stations receive deterministic low-discrepancy heights within that range;
+    caller-provided candidate heights remain unchanged.
     """
     cfg = config or DSSPPConfig()
     current_pose = np.asarray(current_pose_xyz, dtype=float)
@@ -6131,9 +6303,14 @@ def select_dss_pp_next_station(
             map_api=map_api,
             bounds_xyz=bounds_xyz,
             config=cfg,
+            continuous_height_bounds_m=continuous_height_bounds_m,
         )
     height_xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
     height_z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
+    height_min_z_separation = max(
+        float(height_partner_min_z_separation_m),
+        0.0,
+    )
     candidates, separation_filtered = _filter_station_separation(
         candidates,
         visited_poses_xyz,
@@ -6141,6 +6318,7 @@ def select_dss_pp_next_station(
         reference_pose_xyz=current_pose,
         height_partner_xy_tolerance_m=height_xy_tolerance,
         height_partner_z_tolerance_m=height_z_tolerance,
+        height_partner_min_z_separation_m=height_min_z_separation,
     )
     candidates, path_filtered = _filter_path_reachable_stations(
         candidates,
@@ -6196,6 +6374,7 @@ def select_dss_pp_next_station(
         height_partner_forced_program_pair_ids=height_partner_forced_pairs,
         height_partner_xy_tolerance_m=height_xy_tolerance,
         height_partner_z_tolerance_m=height_z_tolerance,
+        height_partner_min_z_separation_m=height_min_z_separation,
         defer_observation_policy=height_partner_forced_pairs is not None,
     )
     if not evaluated_nodes:
@@ -6211,6 +6390,7 @@ def select_dss_pp_next_station(
         enabled=height_partner_forced_pairs is not None,
         xy_tolerance_m=height_xy_tolerance,
         z_tolerance_m=height_z_tolerance,
+        min_z_separation_m=height_min_z_separation,
     )
     if height_partner_forced_pairs is not None:
         nodes = _apply_node_observation_policy(
@@ -6323,6 +6503,12 @@ def select_dss_pp_next_station(
         ),
         "height_partner_xy_tolerance_m": float(height_xy_tolerance),
         "height_partner_z_tolerance_m": float(height_z_tolerance),
+        "height_partner_min_z_separation_m": float(height_min_z_separation),
+        "continuous_height_bounds_m": (
+            None
+            if continuous_height_bounds_m is None
+            else [float(value) for value in continuous_height_bounds_m]
+        ),
         "height_partner_forced_candidate_count": int(len(forced_height_pose_indices)),
         "height_partner_forced_node_count": int(len(forced_height_nodes)),
         "evaluated_candidate_count": int(len({int(node.pose_index) for node in nodes})),

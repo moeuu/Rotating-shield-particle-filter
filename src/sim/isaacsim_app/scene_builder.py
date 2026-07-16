@@ -9,7 +9,10 @@ from typing import Any
 import numpy as np
 
 from measurement.model import PointSource
-from measurement.obstacle_assets import KnownObstacleInstance, obstacle_instances_from_dicts
+from measurement.obstacle_assets import (
+    KnownObstacleInstance,
+    obstacle_instances_from_dicts,
+)
 
 from sim.isaacsim_app.pf_visualizer import ISOTOPE_COLORS
 from sim.isaacsim_app.stage_backend import StageBackend
@@ -68,6 +71,12 @@ class SceneDescription:
     obstacle_grid_shape: tuple[int, int] = (0, 0)
     obstacle_material: str = "concrete"
     obstacle_cells: list[tuple[int, int]] = field(default_factory=list)
+    collision_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    transport_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    transport_mu_by_isotope: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
+        default_factory=dict
+    )
     obstacle_instances: tuple[KnownObstacleInstance, ...] = ()
     author_obstacle_prims: bool = True
     author_room_boundary_prims: bool = False
@@ -86,11 +95,98 @@ class SceneDescription:
         return [source.to_point_source() for source in self.sources]
 
 
-def _as_float_tuple(values: Any, expected_len: int, field_name: str) -> tuple[float, ...]:
+def _as_float_tuple(
+    values: Any, expected_len: int, field_name: str
+) -> tuple[float, ...]:
     """Validate and normalize a numeric tuple-like payload."""
     if not isinstance(values, (list, tuple)) or len(values) != expected_len:
         raise ValueError(f"{field_name} must be a {expected_len}-element list.")
     return tuple(float(v) for v in values)
+
+
+def _as_axis_aligned_boxes(
+    values: Any,
+    *,
+    field_name: str,
+) -> tuple[tuple[float, float, float, float, float, float], ...]:
+    """Validate and normalize axis-aligned boxes from a reset payload."""
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list.")
+    boxes: list[tuple[float, float, float, float, float, float]] = []
+    for index, raw_box in enumerate(values):
+        box = _as_float_tuple(raw_box, 6, f"{field_name}[{index}]")
+        box_array = np.asarray(box, dtype=float)
+        if np.any(~np.isfinite(box_array)):
+            raise ValueError(f"{field_name} entries must contain finite values.")
+        if np.any(box_array[3:] < box_array[:3]):
+            raise ValueError(f"{field_name} entries must be ordered lower-to-upper.")
+        boxes.append(
+            (
+                float(box[0]),
+                float(box[1]),
+                float(box[2]),
+                float(box[3]),
+                float(box[4]),
+                float(box[5]),
+            )
+        )
+    return tuple(boxes)
+
+
+def _as_transport_mu_by_isotope(
+    values: Any,
+    *,
+    box_count: int,
+) -> dict[str, tuple[float, ...]]:
+    """Validate isotope-effective attenuation values for transport boxes."""
+    if not isinstance(values, dict):
+        raise ValueError("transport_mu_by_isotope must be an object.")
+    result: dict[str, tuple[float, ...]] = {}
+    for isotope, raw_values in values.items():
+        mu_values = _as_float_tuple(
+            raw_values,
+            box_count,
+            f"transport_mu_by_isotope[{isotope!s}]",
+        )
+        array = np.asarray(mu_values, dtype=float)
+        if np.any(~np.isfinite(array)) or np.any(array < 0.0):
+            raise ValueError(
+                "transport_mu_by_isotope entries must be finite and non-negative."
+            )
+        result[str(isotope)] = tuple(float(value) for value in array)
+    return result
+
+
+def _as_transport_line_mu_by_isotope(
+    values: Any,
+    *,
+    box_count: int,
+) -> dict[str, tuple[tuple[float, ...], ...]]:
+    """Validate line-resolved attenuation values for transport boxes."""
+    if not isinstance(values, dict):
+        raise ValueError("transport_line_mu_by_isotope must be an object.")
+    result: dict[str, tuple[tuple[float, ...], ...]] = {}
+    for isotope, raw_rows in values.items():
+        if not isinstance(raw_rows, (list, tuple)):
+            raise ValueError(
+                "transport_line_mu_by_isotope entries must contain row lists."
+            )
+        rows: list[tuple[float, ...]] = []
+        for row_index, raw_row in enumerate(raw_rows):
+            row = _as_float_tuple(
+                raw_row,
+                box_count,
+                f"transport_line_mu_by_isotope[{isotope!s}][{row_index}]",
+            )
+            array = np.asarray(row, dtype=float)
+            if np.any(~np.isfinite(array)) or np.any(array < 0.0):
+                raise ValueError(
+                    "transport_line_mu_by_isotope entries must be finite and "
+                    "non-negative."
+                )
+            rows.append(tuple(float(value) for value in array))
+        result[str(isotope)] = tuple(rows)
+    return result
 
 
 def _sanitize_prim_token(value: str) -> str:
@@ -106,7 +202,9 @@ def _sanitize_prim_token(value: str) -> str:
 
 def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
     """Build a rich scene description from a reset payload."""
-    room_size = _as_float_tuple(payload.get("room_size_xyz", (10.0, 20.0, 10.0)), 3, "room_size_xyz")
+    room_size = _as_float_tuple(
+        payload.get("room_size_xyz", (10.0, 20.0, 10.0)), 3, "room_size_xyz"
+    )
     obstacle_origin = _as_float_tuple(
         payload.get("obstacle_origin_xy", (0.0, 0.0)),
         2,
@@ -127,7 +225,9 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
     for idx, entry in enumerate(sources_payload):
         if not isinstance(entry, dict):
             raise ValueError(f"Source entry {idx} must be an object.")
-        position = _as_float_tuple(entry.get("position", (0.0, 0.0, 0.0)), 3, "source position")
+        position = _as_float_tuple(
+            entry.get("position", (0.0, 0.0, 0.0)), 3, "source position"
+        )
         sources.append(
             SourceDescription(
                 isotope=str(entry.get("isotope", f"source_{idx}")),
@@ -138,8 +238,28 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
     prim_paths_payload = payload.get("prim_paths", {})
     if prim_paths_payload and not isinstance(prim_paths_payload, dict):
         raise ValueError("prim_paths must be a JSON object.")
-    prim_paths = StagePrimPaths(**{key: str(value) for key, value in prim_paths_payload.items()})
-    obstacle_cells = [tuple(int(v) for v in cell) for cell in payload.get("obstacle_cells", [])]
+    prim_paths = StagePrimPaths(
+        **{key: str(value) for key, value in prim_paths_payload.items()}
+    )
+    obstacle_cells = [
+        tuple(int(v) for v in cell) for cell in payload.get("obstacle_cells", [])
+    ]
+    collision_boxes = _as_axis_aligned_boxes(
+        payload.get("collision_boxes_m", []),
+        field_name="collision_boxes_m",
+    )
+    transport_boxes = _as_axis_aligned_boxes(
+        payload.get("transport_boxes_m", []),
+        field_name="transport_boxes_m",
+    )
+    transport_mu = _as_transport_mu_by_isotope(
+        payload.get("transport_mu_by_isotope", {}),
+        box_count=len(transport_boxes),
+    )
+    transport_line_mu = _as_transport_line_mu_by_isotope(
+        payload.get("transport_line_mu_by_isotope", {}),
+        box_count=len(transport_boxes),
+    )
     obstacle_instances = obstacle_instances_from_dicts(
         payload.get("obstacle_instances", [])
     )
@@ -150,11 +270,19 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         obstacle_grid_shape=obstacle_grid_shape,
         obstacle_material=str(payload.get("obstacle_material", "concrete")),
         obstacle_cells=obstacle_cells,
+        collision_boxes_m=collision_boxes,
+        transport_boxes_m=transport_boxes,
+        transport_mu_by_isotope=transport_mu,
+        transport_line_mu_by_isotope=transport_line_mu,
         obstacle_instances=obstacle_instances,
         author_obstacle_prims=bool(payload.get("author_obstacle_prims", True)),
-        author_room_boundary_prims=bool(payload.get("author_room_boundary_prims", False)),
+        author_room_boundary_prims=bool(
+            payload.get("author_room_boundary_prims", False)
+        ),
         sources=sources,
-        usd_path=None if payload.get("usd_path") in (None, "") else str(payload["usd_path"]),
+        usd_path=None
+        if payload.get("usd_path") in (None, "")
+        else str(payload["usd_path"]),
         use_config_usd_fallback=bool(payload.get("use_config_usd_fallback", True)),
         prim_paths=prim_paths,
     )
@@ -216,7 +344,7 @@ class SceneBuilder:
         self.stage_backend.ensure_xform(prim_paths.robot_root)
 
     def _author_obstacles(self, scene: SceneDescription) -> None:
-        """Create known obstacle assets or simple box markers for blocked cells."""
+        """Author the highest-fidelity obstacle geometry available in the scene."""
         if not scene.author_obstacle_prims:
             return
         if scene.obstacle_instances:
@@ -233,6 +361,29 @@ class SceneBuilder:
                         material=component.material,
                         transport_group="obstacle",
                     )
+            return
+        authored_boxes: tuple[tuple[float, float, float, float, float, float], ...] = ()
+        prim_name_prefix = ""
+        if scene.transport_boxes_m:
+            authored_boxes = scene.transport_boxes_m
+            prim_name_prefix = "TransportBox"
+        elif scene.collision_boxes_m:
+            authored_boxes = scene.collision_boxes_m
+            prim_name_prefix = "CollisionBox"
+        if authored_boxes:
+            for index, box in enumerate(authored_boxes):
+                lower = np.asarray(box[:3], dtype=float)
+                upper = np.asarray(box[3:], dtype=float)
+                size = upper - lower
+                center = 0.5 * (lower + upper)
+                self.stage_backend.ensure_box(
+                    f"{scene.prim_paths.obstacles_root}/{prim_name_prefix}_{index:04d}",
+                    size_xyz=tuple(float(value) for value in size),
+                    translation_xyz=tuple(float(value) for value in center),
+                    color_rgb=(0.2, 0.2, 0.2),
+                    material=scene.obstacle_material,
+                    transport_group="obstacle",
+                )
             return
         z_center = 0.5 * self.obstacle_height_m
         cell_size = scene.obstacle_cell_size_m
@@ -357,7 +508,8 @@ class SceneBuilder:
         )
         fe_points, fe_counts, fe_indices = _octant_shell_mesh(
             inner_radius_m=fe_inner_cm / 100.0,
-            outer_radius_m=(fe_inner_cm + float(self.shield_thickness.thickness_fe_cm)) / 100.0,
+            outer_radius_m=(fe_inner_cm + float(self.shield_thickness.thickness_fe_cm))
+            / 100.0,
             theta_steps=8,
             phi_steps=8,
         )
@@ -372,7 +524,8 @@ class SceneBuilder:
         )
         pb_points, pb_counts, pb_indices = _octant_shell_mesh(
             inner_radius_m=pb_inner_cm / 100.0,
-            outer_radius_m=(pb_inner_cm + float(self.shield_thickness.thickness_pb_cm)) / 100.0,
+            outer_radius_m=(pb_inner_cm + float(self.shield_thickness.thickness_pb_cm))
+            / 100.0,
             theta_steps=8,
             phi_steps=8,
         )

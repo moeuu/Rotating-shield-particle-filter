@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import inspect
 import json
 import os
@@ -232,6 +232,11 @@ from planning.pose_selection import (
     select_next_pose_from_candidates,
 )
 from planning.dss_pp import DSSPPConfig, select_dss_pp_next_station
+from planning.measurement_workspace import (
+    AxisAlignedRoomBounds,
+    DetectorAssemblyGeometry,
+    MeasurementWorkspace,
+)
 from planning.remaining_measurements import (
     RemainingMeasurementConfig,
     estimate_remaining_measurement_budget,
@@ -386,8 +391,10 @@ class DeferredPFVisualizer:
 
 
 def _has_environment_obstacles(obstacle_grid: ObstacleGrid | None) -> bool:
-    """Return whether an obstacle grid contains transport-relevant obstacles."""
-    return obstacle_grid is not None and len(obstacle_grid.blocked_cells) > 0
+    """Return whether an obstacle grid contains authored physical obstacles."""
+    return obstacle_grid is not None and bool(
+        obstacle_grid.blocked_cells or obstacle_grid.collision_boxes_m
+    )
 
 
 def _pf_obstacle_attenuation_enabled(runtime_config: dict[str, object]) -> bool:
@@ -1434,9 +1441,7 @@ def _final_count_bias_diagnostics(
         fe_blocks.append(np.asarray(data.fe_indices, dtype=np.int64).reshape(-1))
         pb_blocks.append(np.asarray(data.pb_indices, dtype=np.int64).reshape(-1))
     observed_all = (
-        np.concatenate(observed_blocks)
-        if observed_blocks
-        else np.zeros(0, dtype=float)
+        np.concatenate(observed_blocks) if observed_blocks else np.zeros(0, dtype=float)
     )
     predicted_all = (
         np.concatenate(predicted_blocks)
@@ -1444,16 +1449,10 @@ def _final_count_bias_diagnostics(
         else np.zeros(0, dtype=float)
     )
     isotope_all = (
-        np.concatenate(isotope_blocks)
-        if isotope_blocks
-        else np.zeros(0, dtype=str)
+        np.concatenate(isotope_blocks) if isotope_blocks else np.zeros(0, dtype=str)
     )
-    fe_all = (
-        np.concatenate(fe_blocks) if fe_blocks else np.zeros(0, dtype=np.int64)
-    )
-    pb_all = (
-        np.concatenate(pb_blocks) if pb_blocks else np.zeros(0, dtype=np.int64)
-    )
+    fe_all = np.concatenate(fe_blocks) if fe_blocks else np.zeros(0, dtype=np.int64)
+    pb_all = np.concatenate(pb_blocks) if pb_blocks else np.zeros(0, dtype=np.int64)
     summary = summarize_count_bias(
         observed_all,
         predicted_all,
@@ -3314,8 +3313,7 @@ def _sanitize_json_payload(payload: object) -> object:
         return _sanitize_json_payload(payload.item())
     if isinstance(payload, Mapping):
         return {
-            str(key): _sanitize_json_payload(value)
-            for key, value in payload.items()
+            str(key): _sanitize_json_payload(value) for key, value in payload.items()
         }
     if isinstance(payload, (list, tuple)):
         return [_sanitize_json_payload(value) for value in payload]
@@ -4797,12 +4795,61 @@ def _spectrum_config_from_runtime_config(
     return build_spectrum_config_from_runtime_config(runtime_config)
 
 
-def _resolve_detector_height_world_actions(
+@dataclass(frozen=True)
+class DetectorHeightPlanningConfig:
+    """Describe the detector mast workspace used by pose planning."""
+
+    mode: str
+    ground_z_m: float
+    initial_mast_height_m: float
+    minimum_mast_height_m: float
+    maximum_mast_height_m: float
+    discrete_mast_actions_m: tuple[float, ...] = ()
+
+    @property
+    def initial_world_z_m(self) -> float:
+        """Return the initial detector height in world coordinates."""
+        return float(self.ground_z_m + self.initial_mast_height_m)
+
+    @property
+    def minimum_world_z_m(self) -> float:
+        """Return the minimum detector world height."""
+        return float(self.ground_z_m + self.minimum_mast_height_m)
+
+    @property
+    def maximum_world_z_m(self) -> float:
+        """Return the maximum detector world height."""
+        return float(self.ground_z_m + self.maximum_mast_height_m)
+
+    @property
+    def discrete_world_actions_m(self) -> tuple[float, ...]:
+        """Return configured discrete world heights, or an empty tuple."""
+        return tuple(
+            float(self.ground_z_m + value) for value in self.discrete_mast_actions_m
+        )
+
+    @property
+    def candidate_world_heights_m(self) -> tuple[float, ...] | None:
+        """Return discrete candidate heights or None for continuous sampling."""
+        if self.mode == "continuous":
+            return None
+        return self.discrete_world_actions_m
+
+    @property
+    def candidate_world_z_bounds_m(self) -> tuple[float, float]:
+        """Return the z interval sampled by the pose candidate generator."""
+        if self.mode == "continuous":
+            return self.minimum_world_z_m, self.maximum_world_z_m
+        actions = self.discrete_world_actions_m
+        return float(min(actions)), float(max(actions))
+
+
+def _resolve_detector_height_planning_config(
     runtime_config: Mapping[str, object],
     *,
     room_height_m: float,
-) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64]]:
-    """Resolve mast-height settings into detector world-z planning actions."""
+) -> DetectorHeightPlanningConfig:
+    """Resolve continuous or legacy discrete detector-height planning settings."""
     room_height = float(room_height_m)
     ground_z = float(runtime_config.get("robot_ground_z_m", 0.0))
     if not np.isfinite(ground_z):
@@ -4821,10 +4868,50 @@ def _resolve_detector_height_world_actions(
             )
         ),
     )
+    if not np.isfinite(initial_mast_height):
+        raise ValueError("detector_height_m must be finite.")
+    if not np.isfinite(minimum_mast_height) or not np.isfinite(maximum_mast_height):
+        raise ValueError("detector height bounds must be finite.")
+    if maximum_mast_height < minimum_mast_height:
+        raise ValueError("detector_height_max_m must be >= detector_height_min_m.")
+    if not minimum_mast_height <= initial_mast_height <= maximum_mast_height:
+        raise ValueError(
+            "detector_height_m must lie within the detector height bounds."
+        )
     height_payload = runtime_config.get(
         "detector_height_actions_m",
         runtime_config.get("detector_heights_m"),
     )
+    raw_mode = runtime_config.get("detector_height_sampling_mode")
+    if raw_mode is None:
+        mode = "discrete"
+    else:
+        mode = str(raw_mode).strip().lower().replace("-", "_")
+    aliases = {
+        "continuous": "continuous",
+        "continuous_sobol": "continuous",
+        "sobol": "continuous",
+        "discrete": "discrete",
+        "fixed": "discrete",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            "detector_height_sampling_mode must be 'continuous' or 'discrete'."
+        )
+    mode = aliases[mode]
+    if mode == "continuous":
+        if height_payload is not None:
+            raise ValueError(
+                "detector_height_actions_m must be omitted when continuous detector "
+                "height sampling is enabled."
+            )
+        return DetectorHeightPlanningConfig(
+            mode=mode,
+            ground_z_m=ground_z,
+            initial_mast_height_m=initial_mast_height,
+            minimum_mast_height_m=minimum_mast_height,
+            maximum_mast_height_m=maximum_mast_height,
+        )
     mast_actions = resolve_detector_height_actions(
         height_payload,
         default_height_m=initial_mast_height,
@@ -4836,13 +4923,207 @@ def _resolve_detector_height_world_actions(
             default_height_m=initial_mast_height,
             bounds_z=(minimum_mast_height, maximum_mast_height),
         )
-    world_actions = mast_actions + ground_z
+    world_actions = np.asarray(mast_actions, dtype=float) + ground_z
     if np.any(world_actions < 0.0) or np.any(world_actions > room_height):
         raise ValueError(
             "Detector mast-height actions plus robot_ground_z_m must lie inside the room."
         )
-    initial_world_z = float(ground_z + initial_mast_height)
-    return ground_z, initial_world_z, mast_actions, world_actions
+    return DetectorHeightPlanningConfig(
+        mode=mode,
+        ground_z_m=ground_z,
+        initial_mast_height_m=initial_mast_height,
+        minimum_mast_height_m=minimum_mast_height,
+        maximum_mast_height_m=maximum_mast_height,
+        discrete_mast_actions_m=tuple(float(value) for value in mast_actions),
+    )
+
+
+def _resolve_detector_height_world_actions(
+    runtime_config: Mapping[str, object],
+    *,
+    room_height_m: float,
+) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64]]:
+    """Resolve legacy discrete mast settings into world-z planning actions."""
+    config = _resolve_detector_height_planning_config(
+        runtime_config,
+        room_height_m=room_height_m,
+    )
+    if config.mode != "discrete":
+        raise ValueError(
+            "_resolve_detector_height_world_actions only supports discrete mode."
+        )
+    return (
+        float(config.ground_z_m),
+        float(config.initial_world_z_m),
+        np.asarray(config.discrete_mast_actions_m, dtype=float),
+        np.asarray(config.discrete_world_actions_m, dtype=float),
+    )
+
+
+_DEFAULT_ROBOT_BASE_RADIUS_M = float(np.hypot(0.31, 0.32))
+_DEFAULT_ROBOT_BASE_HEIGHT_M = 0.23
+_DEFAULT_ROBOT_MAST_RADIUS_M = float(np.hypot(0.04, 0.04))
+
+
+def _resolve_measurement_clearance_radius_m(
+    runtime_config: Mapping[str, object],
+    *,
+    requested_robot_radius_m: float,
+) -> float:
+    """Return the conservative floor-planning radius for the physical robot."""
+    requested_radius = float(requested_robot_radius_m)
+    if not np.isfinite(requested_radius) or requested_radius < 0.0:
+        raise ValueError("robot_radius_m must be finite and non-negative.")
+    if not bool(runtime_config.get("measurement_pose_clearance_enabled", True)):
+        return requested_radius
+    physical_radius = float(
+        runtime_config.get(
+            "robot_base_physical_radius_m",
+            _DEFAULT_ROBOT_BASE_RADIUS_M,
+        )
+    )
+    clearance_margin = float(
+        runtime_config.get("measurement_pose_clearance_margin_m", 0.02)
+    )
+    if not np.isfinite(physical_radius) or physical_radius <= 0.0:
+        raise ValueError("robot_base_physical_radius_m must be finite and positive.")
+    if not np.isfinite(clearance_margin) or clearance_margin < 0.0:
+        raise ValueError(
+            "measurement_pose_clearance_margin_m must be finite and non-negative."
+        )
+    return float(max(requested_radius, physical_radius + clearance_margin))
+
+
+def _measurement_collision_boxes(
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    ground_z_m: float,
+    obstacle_height_m: float,
+) -> tuple[tuple[float, float, float, float, float, float], ...]:
+    """Return explicit 3D collision boxes, with grid columns as a fallback."""
+    if obstacle_grid is None:
+        return ()
+    explicit_boxes = tuple(obstacle_grid.collision_boxes_m)
+    if explicit_boxes:
+        return explicit_boxes
+    return tuple(
+        obstacle_grid.blocked_boxes(
+            z_min=float(ground_z_m),
+            z_max=float(ground_z_m) + max(float(obstacle_height_m), 0.0),
+        )
+    )
+
+
+def _build_measurement_workspace(
+    runtime_config: Mapping[str, object],
+    *,
+    environment_size_xyz: Sequence[float],
+    detector_height_config: DetectorHeightPlanningConfig,
+    obstacle_grid: ObstacleGrid | None,
+    base_map: object | None,
+    shield_params: object,
+    effective_robot_radius_m: float,
+) -> tuple[object | None, dict[str, object]]:
+    """Build the 3D measurement workspace and its serialized diagnostics."""
+    enabled = bool(runtime_config.get("measurement_pose_clearance_enabled", True))
+    if not enabled:
+        return base_map, {
+            "enabled": False,
+            "effective_robot_radius_m": float(effective_robot_radius_m),
+        }
+    environment_size = np.asarray(environment_size_xyz, dtype=float).reshape(-1)
+    if environment_size.shape != (3,) or np.any(~np.isfinite(environment_size)):
+        raise ValueError("environment_size_xyz must be a finite three-vector.")
+    margin = float(runtime_config.get("measurement_pose_clearance_margin_m", 0.02))
+    base_height = float(
+        runtime_config.get(
+            "robot_base_physical_height_m",
+            _DEFAULT_ROBOT_BASE_HEIGHT_M,
+        )
+    )
+    mast_radius = float(
+        runtime_config.get(
+            "detector_mast_physical_radius_m",
+            _DEFAULT_ROBOT_MAST_RADIUS_M,
+        )
+    )
+    geometry_values = np.asarray([margin, base_height, mast_radius], dtype=float)
+    if np.any(~np.isfinite(geometry_values)) or margin < 0.0:
+        raise ValueError("Measurement-clearance dimensions must be finite.")
+    if base_height <= 0.0 or mast_radius < 0.0:
+        raise ValueError(
+            "Robot base height must be positive and mast radius non-negative."
+        )
+    shield_outer_radius_m = 0.01 * max(
+        float(getattr(shield_params, "inner_radius_fe_cm"))
+        + float(getattr(shield_params, "thickness_fe_cm")),
+        float(getattr(shield_params, "inner_radius_pb_cm"))
+        + float(getattr(shield_params, "thickness_pb_cm")),
+    )
+    if not np.isfinite(shield_outer_radius_m) or shield_outer_radius_m <= 0.0:
+        raise ValueError("Shield outer radius must be finite and positive.")
+    transport_mast_height = float(
+        runtime_config.get(
+            "detector_transport_height_m",
+            detector_height_config.initial_mast_height_m,
+        )
+    )
+    if not (
+        detector_height_config.minimum_mast_height_m
+        <= transport_mast_height
+        <= detector_height_config.maximum_mast_height_m
+    ):
+        raise ValueError(
+            "detector_transport_height_m must lie inside the detector mast range."
+        )
+    obstacle_height = float(runtime_config.get("obstacle_height_m", 2.0))
+    collision_boxes = _measurement_collision_boxes(
+        obstacle_grid,
+        ground_z_m=detector_height_config.ground_z_m,
+        obstacle_height_m=obstacle_height,
+    )
+    assembly = DetectorAssemblyGeometry(
+        base_radius_m=float(effective_robot_radius_m),
+        base_height_m=base_height + margin,
+        mast_radius_m=mast_radius + margin,
+        head_radius_m=shield_outer_radius_m + margin,
+    )
+    workspace = MeasurementWorkspace(
+        room_bounds=AxisAlignedRoomBounds(
+            lower_xyz=(0.0, 0.0, detector_height_config.ground_z_m),
+            upper_xyz=tuple(float(value) for value in environment_size),
+        ),
+        assembly=assembly,
+        ground_z_m=detector_height_config.ground_z_m,
+        detector_transport_world_z_m=(
+            detector_height_config.ground_z_m + transport_mast_height
+        ),
+        collision_boxes_m=collision_boxes,
+        base_map=base_map,
+        motion_worker_count=max(
+            0,
+            int(runtime_config.get("measurement_route_workers", 0)),
+        ),
+        motion_grid_cell_size_m=float(
+            runtime_config.get("measurement_route_grid_cell_size_m", 0.25)
+        ),
+    )
+    diagnostics: dict[str, object] = {
+        "enabled": True,
+        "continuous_measurement_volume": (detector_height_config.mode == "continuous"),
+        "height_sampling_mode": detector_height_config.mode,
+        "collision_box_count": int(len(collision_boxes)),
+        "effective_robot_radius_m": float(assembly.base_radius_m),
+        "base_height_m": float(assembly.base_height_m),
+        "mast_radius_m": float(assembly.mast_radius_m),
+        "head_radius_m": float(assembly.head_radius_m),
+        "clearance_margin_m": float(margin),
+        "transport_world_z_m": float(workspace.detector_transport_world_z_m),
+        "motion_policy": "retract_translate_extend",
+        "route_workers": int(workspace.motion_worker_count),
+        "route_grid_cell_size_m": float(workspace.motion_grid_cell_size_m),
+    }
+    return workspace, diagnostics
 
 
 def _surface_map_spacing_from_runtime_config(
@@ -5057,10 +5338,7 @@ def _fit_final_surface_map(
                 )
             ),
         )
-        if (
-            max_response_elements
-            and peak_response_elements > max_response_elements
-        ):
+        if max_response_elements and peak_response_elements > max_response_elements:
             return {
                 "enabled": True,
                 "available": False,
@@ -5075,9 +5353,7 @@ def _fit_final_surface_map(
                 "response_peak_array_multiplier": int(peak_array_multiplier),
                 "max_response_elements": int(max_response_elements),
                 "raw_maximum_spectrum_bin_count": int(raw_maximum_bin_count),
-                "maximum_spectrum_bin_count_for_memory_guard": int(
-                    maximum_bin_count
-                ),
+                "maximum_spectrum_bin_count_for_memory_guard": int(maximum_bin_count),
                 "spacing_m": [float(value) for value in spacing],
                 "isotope_count_for_memory_guard": int(memory_guard_isotope_count),
                 **_timing_payload(),
@@ -5115,9 +5391,7 @@ def _fit_final_surface_map(
                 "max_response_elements": int(max_response_elements),
                 "max_patch_count": int(max_patch_count),
                 "raw_maximum_spectrum_bin_count": int(raw_maximum_bin_count),
-                "maximum_spectrum_bin_count_for_memory_guard": int(
-                    maximum_bin_count
-                ),
+                "maximum_spectrum_bin_count_for_memory_guard": int(maximum_bin_count),
                 "isotope_count_for_memory_guard": int(memory_guard_isotope_count),
                 "spacing_m": [float(value) for value in spacing],
                 **_timing_payload(solver_completed=True),
@@ -5470,6 +5744,14 @@ def _obstacle_aware_waypoints(
     start = np.asarray(start_xyz, dtype=float).reshape(3)
     goal = np.asarray(goal_xyz, dtype=float).reshape(3)
     if map_api is not None:
+        motion_waypoints = getattr(map_api, "motion_waypoints", None)
+        if callable(motion_waypoints):
+            path = motion_waypoints(start, goal)
+            if path is None:
+                return np.zeros((0, 3), dtype=float), True
+            path_array = np.asarray(path, dtype=float)
+            if path_array.ndim == 2 and path_array.shape[0] >= 2:
+                return path_array, True
         path = shortest_grid_path_points(map_api, start, goal, allow_diagonal=True)
         if path is not None and path.shape[0] >= 2:
             return np.asarray(path, dtype=float), True
@@ -5499,7 +5781,27 @@ def _filter_reachable_candidates(
 ) -> NDArray[np.float64]:
     """Keep only candidates connected to the current pose on the traversability grid."""
     candidate_arr = np.asarray(candidates, dtype=float)
-    if candidate_arr.size == 0 or not _supports_grid_path(map_api):
+    if candidate_arr.size == 0:
+        return candidate_arr
+    motion_reachable_batch = getattr(map_api, "is_motion_reachable_batch", None)
+    if callable(motion_reachable_batch):
+        reachable_mask = np.asarray(
+            motion_reachable_batch(current_pose_xyz, candidate_arr),
+            dtype=bool,
+        ).reshape(-1)
+        if reachable_mask.size != candidate_arr.shape[0]:
+            raise ValueError(
+                "is_motion_reachable_batch returned the wrong number of flags."
+            )
+        return candidate_arr[reachable_mask]
+    motion_waypoints = getattr(map_api, "motion_waypoints", None)
+    if callable(motion_waypoints):
+        reachable_mask = [
+            motion_waypoints(current_pose_xyz, candidate) is not None
+            for candidate in candidate_arr
+        ]
+        return candidate_arr[np.asarray(reachable_mask, dtype=bool)]
+    if not _supports_grid_path(map_api):
         return candidate_arr
     reachable_mask = [
         shortest_grid_path_points(map_api, current_pose_xyz, candidate) is not None
@@ -5619,11 +5921,16 @@ def _generate_planning_candidates(
     visited_poses_xyz: NDArray[np.float64] | None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
     detector_heights_m: Sequence[float] | None = None,
+    continuous_height_anchor_count: int = 0,
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
+    height_partner_min_z_separation_m: float = 0.0,
 ) -> tuple[NDArray[np.float64], bool, float]:
     """Generate next-pose actions with one relaxed-spacing retry."""
     min_dist = max(float(min_dist_from_visited), 0.0)
+    height_partners_enabled = bool(
+        detector_heights_m is not None or int(continuous_height_anchor_count) > 0
+    )
     candidates = generate_candidate_poses(
         current_pose_xyz=current_pose_xyz,
         map_api=map_api,
@@ -5633,9 +5940,12 @@ def _generate_planning_candidates(
         visited_poses_xyz=visited_poses_xyz,
         bounds_xyz=bounds_xyz,
         detector_heights_m=detector_heights_m,
-        include_current_xy_height_actions=detector_heights_m is not None,
+        include_current_xy_height_actions=height_partners_enabled,
+        continuous_height_anchor_count=max(int(continuous_height_anchor_count), 0),
+        allow_height_partners=height_partners_enabled,
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
@@ -5654,9 +5964,12 @@ def _generate_planning_candidates(
         visited_poses_xyz=visited_poses_xyz,
         bounds_xyz=bounds_xyz,
         detector_heights_m=detector_heights_m,
-        include_current_xy_height_actions=detector_heights_m is not None,
+        include_current_xy_height_actions=height_partners_enabled,
+        continuous_height_anchor_count=max(int(continuous_height_anchor_count), 0),
+        allow_height_partners=height_partners_enabled,
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
+        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
@@ -5672,13 +5985,16 @@ def _is_detector_height_partner(
     *,
     xy_tolerance_m: float,
     z_tolerance_m: float = 1.0e-9,
+    min_z_separation_m: float = 0.0,
 ) -> bool:
     """Return whether two actions share xy but use distinct detector heights."""
     first = np.asarray(first_pose_xyz, dtype=float).reshape(3)
     second = np.asarray(second_pose_xyz, dtype=float).reshape(3)
+    z_distance = abs(float(first[2]) - float(second[2]))
     return bool(
         np.linalg.norm(first[:2] - second[:2]) <= max(float(xy_tolerance_m), 0.0)
-        and abs(float(first[2]) - float(second[2])) > max(float(z_tolerance_m), 0.0)
+        and z_distance > max(float(z_tolerance_m), 0.0)
+        and z_distance >= max(float(min_z_separation_m), 0.0)
     )
 
 
@@ -5697,7 +6013,9 @@ def _measurement_detector_positions(
             stored_position = registered_poses[pose_index]
         position = np.asarray(stored_position, dtype=float).reshape(-1)
         if position.shape != (3,) or np.any(~np.isfinite(position)):
-            raise ValueError("measurement detector positions must be finite XYZ vectors.")
+            raise ValueError(
+                "measurement detector positions must be finite XYZ vectors."
+            )
         positions.append(position.copy())
     if not positions:
         return np.zeros((0, 3), dtype=float)
@@ -5716,9 +6034,7 @@ def _pose_tolerance_component_labels(
     if count == 0:
         return np.zeros(0, dtype=np.int64)
     xy_tolerance = max(float(xy_tolerance_m), 0.0)
-    z_tolerance = (
-        None if z_tolerance_m is None else max(float(z_tolerance_m), 0.0)
-    )
+    z_tolerance = None if z_tolerance_m is None else max(float(z_tolerance_m), 0.0)
     parents = np.arange(count, dtype=np.int64)
 
     def _find(index: int) -> int:
@@ -5744,8 +6060,7 @@ def _pose_tolerance_component_labels(
         within = np.linalg.norm(differences, axis=1) <= xy_tolerance
         if z_tolerance is not None:
             within &= (
-                np.abs(positions[first + 1 :, 2] - positions[first, 2])
-                <= z_tolerance
+                np.abs(positions[first + 1 :, 2] - positions[first, 2]) <= z_tolerance
             )
         for offset in np.flatnonzero(within):
             _union(first, first + 1 + int(offset))
@@ -6670,9 +6985,7 @@ def _spectrum_evidence_payload(
         return None
     background_getter = getattr(decomposer, "configured_background_spectrum", None)
     background = (
-        background_getter(float(live_time_s))
-        if callable(background_getter)
-        else None
+        background_getter(float(live_time_s)) if callable(background_getter) else None
     )
     background_arr = None
     if background is not None:
@@ -7283,6 +7596,7 @@ def _acquire_spectrum_observation(
     source_cardinality_ready: bool = True,
     source_cardinality_min_live_s: float = 0.0,
     candidate_isotopes: Sequence[str] | None = None,
+    travel_waypoints_xyz: Sequence[Sequence[float]] | None = None,
 ) -> tuple[
     SimulationObservation,
     float,
@@ -7294,6 +7608,14 @@ def _acquire_spectrum_observation(
 ]:
     """Acquire one logical spectrum, optionally stopping adaptive dwell early."""
     target_pose = tuple(float(v) for v in pose_xyz)
+    command_waypoints = (
+        None
+        if travel_waypoints_xyz is None
+        else tuple(
+            tuple(float(value) for value in waypoint)
+            for waypoint in travel_waypoints_xyz
+        )
+    )
     if not adaptive_dwell:
         observation = simulation_runtime.step(
             SimulationCommand(
@@ -7305,6 +7627,7 @@ def _acquire_spectrum_observation(
                 dwell_time_s=float(live_time_s),
                 travel_time_s=float(travel_time_s),
                 shield_actuation_time_s=float(shield_actuation_time_s),
+                travel_waypoints_xyz=command_waypoints,
             )
         )
         spectrum = _analysis_spectrum_array(observation, decomposer)
@@ -7372,6 +7695,7 @@ def _acquire_spectrum_observation(
                 shield_actuation_time_s=(
                     float(shield_actuation_time_s) if chunk_index == 0 else 0.0
                 ),
+                travel_waypoints_xyz=command_waypoints if chunk_index == 0 else None,
             )
         )
         spectrum = _analysis_spectrum_array(observation, decomposer)
@@ -7681,15 +8005,20 @@ def run_live_pf(
         0.0,
         float(runtime_config.get("adaptive_cardinality_min_bic_margin", 0.0)),
     )
+    effective_robot_radius_m = _resolve_measurement_clearance_radius_m(
+        runtime_config,
+        requested_robot_radius_m=float(robot_radius_m),
+    )
     environment_size_z_m = 10.0
-    (
-        robot_ground_z_m,
-        initial_detector_world_z_m,
-        detector_mast_height_actions,
-        detector_height_actions,
-    ) = _resolve_detector_height_world_actions(
+    detector_height_config = _resolve_detector_height_planning_config(
         runtime_config,
         room_height_m=environment_size_z_m,
+    )
+    robot_ground_z_m = float(detector_height_config.ground_z_m)
+    initial_detector_world_z_m = float(detector_height_config.initial_world_z_m)
+    detector_height_candidates = detector_height_config.candidate_world_heights_m
+    detector_height_min_world_z_m, detector_height_max_world_z_m = (
+        detector_height_config.candidate_world_z_bounds_m
     )
     detector_pose_consistency_tolerance_m = max(
         0.0,
@@ -7706,18 +8035,55 @@ def run_live_pf(
         0.0,
         float(runtime_config.get("detector_height_pair_z_tolerance_m", 1.0e-9)),
     )
+    detector_height_pair_min_separation_m = max(
+        0.0,
+        float(runtime_config.get("detector_height_pair_min_separation_m", 0.0)),
+    )
+    detector_continuous_height_partner_candidates = (
+        max(
+            0,
+            int(
+                runtime_config.get(
+                    "detector_continuous_height_partner_candidates",
+                    8,
+                )
+            ),
+        )
+        if detector_height_config.mode == "continuous"
+        else 0
+    )
+    continuous_height_bounds_for_dss = (
+        (
+            detector_height_min_world_z_m,
+            detector_height_max_world_z_m,
+        )
+        if detector_height_config.mode == "continuous"
+        else None
+    )
     env = EnvironmentConfig(
         size_x=10.0,
         size_y=20.0,
         size_z=environment_size_z_m,
         detector_position=(1.0, 1.0, initial_detector_world_z_m),
     )
-    print(
-        "Detector height actions: "
-        f"ground_z={robot_ground_z_m:.3f}m "
-        f"mast={detector_mast_height_actions.tolist()} "
-        f"world_z={detector_height_actions.tolist()}"
-    )
+    if detector_height_config.mode == "continuous":
+        print(
+            "Detector height workspace: "
+            f"mode=continuous ground_z={robot_ground_z_m:.3f}m "
+            "mast_range="
+            f"[{detector_height_config.minimum_mast_height_m:.3f}, "
+            f"{detector_height_config.maximum_mast_height_m:.3f}]m "
+            "world_z_range="
+            f"[{detector_height_min_world_z_m:.3f}, "
+            f"{detector_height_max_world_z_m:.3f}]m"
+        )
+    else:
+        print(
+            "Detector height workspace: "
+            f"mode=discrete ground_z={robot_ground_z_m:.3f}m "
+            f"mast={list(detector_height_config.discrete_mast_actions_m)} "
+            f"world_z={list(detector_height_config.discrete_world_actions_m)}"
+        )
     normalized_source_generation_mode = source_generation_mode.strip().lower()
     if normalized_source_generation_mode not in {"demo", "surface_random"}:
         raise ValueError("source_generation_mode must be 'demo' or 'surface_random'.")
@@ -8106,7 +8472,7 @@ def run_live_pf(
             obstacle_asset_seed=obstacle_seed,
             base_usd_path=base_usd_path,
             traversability_output_path=traversability_map_path,
-            robot_radius_m=float(robot_radius_m),
+            robot_radius_m=float(effective_robot_radius_m),
             traversability_reachable_from_xy=(
                 float(env.detector_position[0]),
                 float(env.detector_position[1]),
@@ -8117,10 +8483,12 @@ def run_live_pf(
         print(f"Generated Blender random environment: {generated_blender_usd_path}")
         if traversability_map_path.exists():
             traversability_map = TraversabilityMap.load(traversability_map_path)
-        else:
+        if traversability_map is None or float(
+            traversability_map.robot_radius_m
+        ) + 1.0e-9 < float(effective_robot_radius_m):
             traversability_map = build_traversability_map_from_obstacle_grid(
                 obstacle_grid,
-                robot_radius_m=float(robot_radius_m),
+                robot_radius_m=float(effective_robot_radius_m),
                 reachable_from=env.detector_position,
             )
             traversability_map.save(traversability_map_path)
@@ -8129,7 +8497,13 @@ def run_live_pf(
             "Generated 2D robot traversability map: "
             f"{traversability_map_path} "
             f"(free_fraction={traversability_map.traversable_fraction:.3f}, "
-            f"robot_radius_m={float(robot_radius_m):.2f})"
+            f"robot_radius_m={float(effective_robot_radius_m):.2f})"
+        )
+    elif obstacle_grid is not None and obstacle_grid.blocked_cells:
+        traversability_map = build_traversability_map_from_obstacle_grid(
+            obstacle_grid,
+            robot_radius_m=float(effective_robot_radius_m),
+            reachable_from=env.detector_position,
         )
     planning_map = (
         traversability_map if traversability_map is not None else obstacle_grid
@@ -8156,11 +8530,11 @@ def run_live_pf(
     )
 
     bounds_lo = np.array(
-        [0.0, 0.0, float(np.min(detector_height_actions))],
+        [0.0, 0.0, detector_height_min_world_z_m],
         dtype=float,
     )
     bounds_hi = np.array(
-        [env.size_x, env.size_y, float(np.max(detector_height_actions))],
+        [env.size_x, env.size_y, detector_height_max_world_z_m],
         dtype=float,
     )
 
@@ -8216,6 +8590,35 @@ def run_live_pf(
     detector_geometry = observation_model.detector_geometry
     shield_thickness = resolve_shield_thickness_config(runtime_config)
     shield_params = observation_model.shield_params
+    planning_map, measurement_workspace_diagnostics = _build_measurement_workspace(
+        runtime_config,
+        environment_size_xyz=(env.size_x, env.size_y, env.size_z),
+        detector_height_config=detector_height_config,
+        obstacle_grid=obstacle_grid,
+        base_map=planning_map,
+        shield_params=shield_params,
+        effective_robot_radius_m=effective_robot_radius_m,
+    )
+    if isinstance(planning_map, MeasurementWorkspace):
+        initial_pose = np.asarray(env.detector_position, dtype=float).reshape(1, 3)
+        initial_validity = planning_map.endpoint_validity_masks(initial_pose)
+        if not bool(initial_validity["valid"][0]):
+            failed_checks = sorted(
+                name
+                for name, values in initial_validity.items()
+                if name != "valid" and not bool(values[0])
+            )
+            raise ValueError(
+                "Initial detector pose is not collision-free: "
+                f"failed_checks={failed_checks}."
+            )
+        print(
+            "3D measurement workspace: collision-aware free-volume planning enabled "
+            f"(collision_boxes={measurement_workspace_diagnostics['collision_box_count']}, "
+            f"base_radius={measurement_workspace_diagnostics['effective_robot_radius_m']:.3f}m, "
+            f"head_radius={measurement_workspace_diagnostics['head_radius_m']:.3f}m, "
+            f"transport_z={measurement_workspace_diagnostics['transport_world_z_m']:.3f}m)"
+        )
     obstacle_buildup_coeff = observation_model.obstacle_buildup_coeff
     pf_obstacle_buildup_coeff = (
         obstacle_buildup_coeff if pf_obstacle_grid is not None else 0.0
@@ -12366,6 +12769,26 @@ def run_live_pf(
             "obstacle_cells": []
             if obstacle_grid is None
             else list(obstacle_grid.blocked_cells),
+            "collision_boxes_m": []
+            if obstacle_grid is None
+            else [list(box) for box in obstacle_grid.collision_boxes_m],
+            "transport_boxes_m": []
+            if obstacle_grid is None
+            else [list(box) for box in obstacle_grid.transport_boxes_m],
+            "transport_mu_by_isotope": {}
+            if obstacle_grid is None
+            else {
+                str(isotope): [float(value) for value in values]
+                for isotope, values in obstacle_grid.transport_mu_by_isotope.items()
+            },
+            "transport_line_mu_by_isotope": {}
+            if obstacle_grid is None
+            else {
+                str(isotope): [[float(value) for value in row] for row in rows]
+                for isotope, rows in (
+                    obstacle_grid.transport_line_mu_by_isotope.items()
+                )
+            },
             "obstacle_instances": []
             if known_obstacle_instances is None
             else obstacle_instances_to_dicts(known_obstacle_instances),
@@ -12375,7 +12798,8 @@ def run_live_pf(
             "traversability_map_png_path": None
             if traversability_map_png_path is None
             else traversability_map_png_path.as_posix(),
-            "robot_radius_m": float(robot_radius_m),
+            "robot_radius_m": float(effective_robot_radius_m),
+            "measurement_workspace": measurement_workspace_diagnostics,
             "author_obstacle_prims": (
                 known_obstacle_instances is not None
                 or generated_blender_usd_path is None
@@ -12431,13 +12855,21 @@ def run_live_pf(
             "converge": converge,
             "pose_candidates": int(pose_candidates),
             "pose_min_dist_m": float(pose_min_dist),
-            "detector_height_actions_m": [
-                float(value) for value in detector_mast_height_actions
-            ],
-            "detector_height_action_world_z_m": [
-                float(value) for value in detector_height_actions
-            ],
+            "detector_height_sampling_mode": detector_height_config.mode,
+            "detector_height_min_m": float(
+                detector_height_config.minimum_mast_height_m
+            ),
+            "detector_height_max_m": float(
+                detector_height_config.maximum_mast_height_m
+            ),
+            "detector_height_actions_m": list(
+                detector_height_config.discrete_mast_actions_m
+            ),
+            "detector_height_action_world_z_m": list(
+                detector_height_config.discrete_world_actions_m
+            ),
             "robot_ground_z_m": float(robot_ground_z_m),
+            "measurement_workspace": measurement_workspace_diagnostics,
             "height_partner_reuse_shield_program": bool(
                 height_partner_reuse_shield_program
             ),
@@ -12573,9 +13005,7 @@ def run_live_pf(
             pose_elapsed = 0.0
             zero_ig_override = False
             active_shield_program = pending_shield_program
-            force_strict_active_shield_program = (
-                pending_force_strict_shield_program
-            )
+            force_strict_active_shield_program = pending_force_strict_shield_program
             pending_shield_program = None
             pending_force_strict_shield_program = False
             if active_shield_program:
@@ -12836,12 +13266,18 @@ def run_live_pf(
                         min_dist_from_visited=pose_min_dist,
                         visited_poses_xyz=visited_stop_arr,
                         bounds_xyz=(bounds_lo, bounds_hi),
-                        detector_heights_m=detector_height_actions,
+                        detector_heights_m=detector_height_candidates,
+                        continuous_height_anchor_count=(
+                            detector_continuous_height_partner_candidates
+                        ),
                         height_partner_xy_tolerance_m=(
                             detector_height_pair_xy_tolerance_m
                         ),
                         height_partner_z_tolerance_m=(
                             detector_height_pair_z_tolerance_m
+                        ),
+                        height_partner_min_z_separation_m=(
+                            detector_height_pair_min_separation_m
                         ),
                     )
                     (
@@ -12899,6 +13335,13 @@ def run_live_pf(
                 step_motion_distance_m = float(pending_motion_distance_m)
                 step_motion_time_s = float(pending_motion_time_s)
                 step_rotation_time_s = float(rotation_overhead_s)
+                step_travel_waypoints: list[list[float]] | None = None
+                if pending_path_segment is not None:
+                    waypoint_payload = pending_path_segment.get("waypoints_xyz")
+                    if waypoint_payload is not None:
+                        waypoint_array = np.asarray(waypoint_payload, dtype=float)
+                        if waypoint_array.ndim == 2 and waypoint_array.shape[1] == 3:
+                            step_travel_waypoints = waypoint_array.tolist()
                 cardinality_ready = True
                 cardinality_reason = "disabled"
                 if bool(adaptive_cardinality_dwell_enable):
@@ -12960,6 +13403,7 @@ def run_live_pf(
                     source_cardinality_ready=cardinality_ready,
                     source_cardinality_min_live_s=(adaptive_cardinality_min_live_s),
                     candidate_isotopes=list(isotopes),
+                    travel_waypoints_xyz=step_travel_waypoints,
                 )
                 executed_pair_ids_this_pose.append(int(fe_idx * num_orients + pb_idx))
                 pending_motion_distance_m = 0.0
@@ -13105,9 +13549,7 @@ def run_live_pf(
                     )
                     for iso in pf_isotopes
                 }
-                history_z_k = {
-                    iso: float(z_detected.get(iso, 0.0)) for iso in isotopes
-                }
+                history_z_k = {iso: float(z_detected.get(iso, 0.0)) for iso in isotopes}
                 history_z_variance = {
                     iso: float(
                         max(
@@ -14004,12 +14446,14 @@ def run_live_pf(
                     min_dist_from_visited=pose_min_dist,
                     visited_poses_xyz=visited_arr,
                     bounds_xyz=(bounds_lo, bounds_hi),
-                    detector_heights_m=detector_height_actions,
-                    height_partner_xy_tolerance_m=(
-                        detector_height_pair_xy_tolerance_m
+                    detector_heights_m=detector_height_candidates,
+                    continuous_height_anchor_count=(
+                        detector_continuous_height_partner_candidates
                     ),
-                    height_partner_z_tolerance_m=(
-                        detector_height_pair_z_tolerance_m
+                    height_partner_xy_tolerance_m=(detector_height_pair_xy_tolerance_m),
+                    height_partner_z_tolerance_m=(detector_height_pair_z_tolerance_m),
+                    height_partner_min_z_separation_m=(
+                        detector_height_pair_min_separation_m
                     ),
                 )
             )
@@ -14083,6 +14527,7 @@ def run_live_pf(
                         visited_poses_xyz=visited_arr,
                         map_api=planning_map,
                         bounds_xyz=(bounds_lo, bounds_hi),
+                        continuous_height_bounds_m=(continuous_height_bounds_for_dss),
                         config=dss_selection_config,
                         height_partner_forced_program_pair_ids=(
                             height_partner_program_for_scoring
@@ -14092,6 +14537,9 @@ def run_live_pf(
                         ),
                         height_partner_z_tolerance_m=(
                             detector_height_pair_z_tolerance_m
+                        ),
+                        height_partner_min_z_separation_m=(
+                            detector_height_pair_min_separation_m
                         ),
                     )
                     dss_elapsed = time.perf_counter() - dss_start
@@ -14210,15 +14658,15 @@ def run_live_pf(
                     visited_poses_xyz=visited_arr,
                     map_api=planning_map,
                     bounds_xyz=(bounds_lo, bounds_hi),
+                    continuous_height_bounds_m=continuous_height_bounds_for_dss,
                     config=dss_selection_config,
                     height_partner_forced_program_pair_ids=(
                         height_partner_program_for_scoring
                     ),
-                    height_partner_xy_tolerance_m=(
-                        detector_height_pair_xy_tolerance_m
-                    ),
-                    height_partner_z_tolerance_m=(
-                        detector_height_pair_z_tolerance_m
+                    height_partner_xy_tolerance_m=(detector_height_pair_xy_tolerance_m),
+                    height_partner_z_tolerance_m=(detector_height_pair_z_tolerance_m),
+                    height_partner_min_z_separation_m=(
+                        detector_height_pair_min_separation_m
                     ),
                 )
                 dss_elapsed = time.perf_counter() - dss_start
@@ -14307,6 +14755,9 @@ def run_live_pf(
                             visited_poses_xyz=visited_arr,
                             map_api=planning_map,
                             bounds_xyz=(bounds_lo, bounds_hi),
+                            continuous_height_bounds_m=(
+                                continuous_height_bounds_for_dss
+                            ),
                             config=dss_selection_config,
                             height_partner_forced_program_pair_ids=(
                                 height_partner_program_for_scoring
@@ -14316,6 +14767,9 @@ def run_live_pf(
                             ),
                             height_partner_z_tolerance_m=(
                                 detector_height_pair_z_tolerance_m
+                            ),
+                            height_partner_min_z_separation_m=(
+                                detector_height_pair_min_separation_m
                             ),
                         )
                         guard_dss_elapsed = time.perf_counter() - guard_dss_start
@@ -14468,6 +14922,7 @@ def run_live_pf(
                         visited_poses_xyz=visited_arr,
                         map_api=planning_map,
                         bounds_xyz=(bounds_lo, bounds_hi),
+                        continuous_height_bounds_m=(continuous_height_bounds_for_dss),
                         config=dss_selection_config,
                         height_partner_forced_program_pair_ids=(
                             height_partner_program_for_scoring
@@ -14477,6 +14932,9 @@ def run_live_pf(
                         ),
                         height_partner_z_tolerance_m=(
                             detector_height_pair_z_tolerance_m
+                        ),
+                        height_partner_min_z_separation_m=(
+                            detector_height_pair_min_separation_m
                         ),
                     )
                     dss_elapsed = time.perf_counter() - dss_start
@@ -14517,6 +14975,7 @@ def run_live_pf(
                 np.asarray(next_pose, dtype=float),
                 xy_tolerance_m=detector_height_pair_xy_tolerance_m,
                 z_tolerance_m=detector_height_pair_z_tolerance_m,
+                min_z_separation_m=detector_height_pair_min_separation_m,
             )
             if (
                 is_height_partner_action
@@ -14819,13 +15278,9 @@ def run_live_pf(
     max_ig_wall_s = float(np.max(ig_wall_samples_s)) if ig_wall_samples_s else 0.0
     mean_pf_wall_s = float(np.mean(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
     max_pf_wall_s = float(np.max(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
-    median_pf_wall_s = (
-        float(np.median(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
-    )
+    median_pf_wall_s = float(np.median(pf_wall_samples_s)) if pf_wall_samples_s else 0.0
     p95_pf_wall_s = (
-        float(np.percentile(pf_wall_samples_s, 95.0))
-        if pf_wall_samples_s
-        else 0.0
+        float(np.percentile(pf_wall_samples_s, 95.0)) if pf_wall_samples_s else 0.0
     )
     mean_path_planning_wall_s = (
         float(np.mean(path_planning_wall_samples_s))
@@ -14866,13 +15321,17 @@ def run_live_pf(
         "adaptive_ready_min_counts": float(adaptive_ready_min_counts),
         "adaptive_ready_min_isotopes": int(adaptive_ready_min_isotopes),
         "adaptive_ready_min_snr": float(adaptive_ready_min_snr),
-        "detector_height_actions_m": [
-            float(value) for value in detector_mast_height_actions
-        ],
-        "detector_height_action_world_z_m": [
-            float(value) for value in detector_height_actions
-        ],
+        "detector_height_sampling_mode": detector_height_config.mode,
+        "detector_height_min_m": float(detector_height_config.minimum_mast_height_m),
+        "detector_height_max_m": float(detector_height_config.maximum_mast_height_m),
+        "detector_height_actions_m": list(
+            detector_height_config.discrete_mast_actions_m
+        ),
+        "detector_height_action_world_z_m": list(
+            detector_height_config.discrete_world_actions_m
+        ),
         "robot_ground_z_m": float(robot_ground_z_m),
+        "measurement_workspace": measurement_workspace_diagnostics,
         **station_height_metrics,
         "detector_pose_consistency_tolerance_m": float(
             detector_pose_consistency_tolerance_m
@@ -14949,9 +15408,7 @@ def run_live_pf(
                 "and strict payload sanitization; final JSON I/O and notification "
                 "are excluded."
             ),
-            "wall_clock_runtime_s": (
-                "Compatibility alias of online_wall_clock_s."
-            ),
+            "wall_clock_runtime_s": ("Compatibility alias of online_wall_clock_s."),
             "final_point_reporting_pipeline_time_s": (
                 "Final point-estimate selection, pruning, refit, and absent-isotope "
                 "reporting time; visualization and file output are excluded."
@@ -15190,9 +15647,7 @@ def run_live_pf(
                 if best_so_far_selected
                 else "current_final_report"
             )
-            diagnostic["reference_consistent"] = bool(
-                uncertainty_reference_consistent
-            )
+            diagnostic["reference_consistent"] = bool(uncertainty_reference_consistent)
     final_source_status = _final_estimate_source_status(estimator, estimates)
     confirmed_est_by_iso = _filter_serialized_sources_by_status(
         est_by_iso,
@@ -15296,9 +15751,7 @@ def run_live_pf(
             "final_reporting_and_surface_attempt_time_s": (
                 final_estimation_attempt_total_time_s
             ),
-            "final_point_estimate_time_s": float(
-                final_point_reporting_pipeline_time_s
-            ),
+            "final_point_estimate_time_s": float(final_point_reporting_pipeline_time_s),
             "final_surface_map_mle_time_s": surface_map_completed_fit_time_s,
             "final_mle_time_s": final_estimation_total_time_s,
             "gpu_memory": gpu_memory_metrics,
@@ -15420,16 +15873,12 @@ def run_live_pf(
             "model_identifiability": model_evaluation_diagnostics,
             "cluster_stability": cluster_stability,
             "operational": {
-                "mean_pf_update_time_s": mission_metrics.get(
-                    "mean_pf_update_time_s"
-                ),
+                "mean_pf_update_time_s": mission_metrics.get("mean_pf_update_time_s"),
                 "pf_update_count": mission_metrics.get("pf_update_count"),
                 "median_pf_update_time_s": mission_metrics.get(
                     "median_pf_update_time_s"
                 ),
-                "p95_pf_update_time_s": mission_metrics.get(
-                    "p95_pf_update_time_s"
-                ),
+                "p95_pf_update_time_s": mission_metrics.get("p95_pf_update_time_s"),
                 "max_pf_update_time_s": mission_metrics.get("max_pf_update_time_s"),
                 "final_point_reporting_pipeline_time_s": mission_metrics.get(
                     "final_point_reporting_pipeline_time_s"
@@ -15536,9 +15985,9 @@ def run_live_pf(
     final_payload["mission_metrics"]["end_to_end_wall_clock_s"] = (
         end_to_end_wall_clock_s
     )
-    final_payload["evaluation_metrics"]["operational"][
-        "end_to_end_wall_clock_s"
-    ] = end_to_end_wall_clock_s
+    final_payload["evaluation_metrics"]["operational"]["end_to_end_wall_clock_s"] = (
+        end_to_end_wall_clock_s
+    )
     setattr(estimator, "final_run_summary", final_payload)
     if save_outputs and summary_out_path is not None:
         summary_out_path.write_text(

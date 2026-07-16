@@ -50,6 +50,7 @@ def test_random_runtime_environment_can_attach_transport_model(tmp_path: Path) -
     assert environment.grid is not None
     assert environment.known_obstacle_instances is not None
     assert environment.grid.transport_boxes_m
+    assert environment.grid.collision_boxes_m
     assert environment.asset_summary() is not None
 
 
@@ -86,6 +87,7 @@ def test_random_runtime_environment_can_attach_room_boundary_transport(
     assert len(with_boundaries.grid.transport_boxes_m) == (
         len(base.grid.transport_boxes_m) + 6
     )
+    assert with_boundaries.grid.collision_boxes_m == base.grid.collision_boxes_m
     assert any(box[2] < 0.0 for box in with_boundaries.grid.transport_boxes_m)
     assert any(box[5] > 10.0 for box in with_boundaries.grid.transport_boxes_m)
 

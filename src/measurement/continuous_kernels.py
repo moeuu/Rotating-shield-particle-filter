@@ -59,7 +59,9 @@ def _finite_sphere_geometric_term_torch(
     fraction = 0.5 * (1.0 - torch.sqrt(torch.clamp(1.0 - ratio * ratio, min=0.0)))
     reference = max(1.0, radius)
     ref_ratio = min(radius / reference, 1.0)
-    ref_fraction = max(0.5 * (1.0 - float(np.sqrt(max(1.0 - ref_ratio * ref_ratio, 0.0)))), 1.0e-12)
+    ref_fraction = max(
+        0.5 * (1.0 - float(np.sqrt(max(1.0 - ref_ratio * ref_ratio, 0.0)))), 1.0e-12
+    )
     return fraction / ref_fraction
 
 
@@ -107,7 +109,11 @@ def finite_sphere_geometric_term(
     radius = max(float(detector_radius_m), 0.0)
     if radius <= 0.0:
         return geometric_term(detector, source)
-    d = float(np.linalg.norm(np.asarray(detector, dtype=float) - np.asarray(source, dtype=float)))
+    d = float(
+        np.linalg.norm(
+            np.asarray(detector, dtype=float) - np.asarray(source, dtype=float)
+        )
+    )
     d_eff = max(d, radius)
     reference = max(1.0, radius)
 
@@ -194,8 +200,7 @@ def transport_response_payload_for_isotope(
     payload = by_isotope.get(str(isotope))
     if payload is None:
         normalized = {
-            _normalize_isotope_key(key): value
-            for key, value in by_isotope.items()
+            _normalize_isotope_key(key): value for key, value in by_isotope.items()
         }
         payload = normalized.get(_normalize_isotope_key(isotope))
     return dict(payload) if isinstance(payload, dict) else {}
@@ -330,9 +335,7 @@ def transport_response_factor_from_payload(
         distance_fe_cap,
         distance_pb_cap,
         distance_obstacle_cap,
-    ) = (
-        transport_response_feature_caps_from_payload(payload)
-    )
+    ) = transport_response_feature_caps_from_payload(payload)
     shield_tau_raw = max(float(shield_tau_feature), 0.0)
     obstacle_tau_raw = max(float(obstacle_tau_feature), 0.0)
     fe_tau_raw = max(float(fe_tau_feature or 0.0), 0.0)
@@ -371,9 +374,7 @@ def transport_response_factor_from_payload(
     log_scale += float(coeffs.get("obstacle", 0.0)) * obstacle_tau
     log_scale += float(coeffs.get("shield_squared", 0.0)) * shield_tau * shield_tau
     log_scale += (
-        float(coeffs.get("obstacle_squared", 0.0))
-        * obstacle_tau
-        * obstacle_tau
+        float(coeffs.get("obstacle_squared", 0.0)) * obstacle_tau * obstacle_tau
     )
     log_scale += float(coeffs.get("shield_obstacle", 0.0)) * shield_tau * obstacle_tau
     log_scale += float(coeffs.get("fe", 0.0)) * fe_tau
@@ -387,9 +388,7 @@ def transport_response_factor_from_payload(
     log_scale += float(coeffs.get("distance_shield", 0.0)) * distance_shield
     log_scale += float(coeffs.get("distance_fe", 0.0)) * distance_fe
     log_scale += float(coeffs.get("distance_pb", 0.0)) * distance_pb
-    log_scale += (
-        float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
-    )
+    log_scale += float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
     log_scale = min(max(log_scale, min_log), max_log)
     return float(np.exp(log_scale))
 
@@ -402,7 +401,9 @@ def resolve_obstacle_mu_cm_inv(
     table = mu_by_isotope if mu_by_isotope is not None else CONCRETE_MU_CM_INV
     if isotope in table:
         return float(table[isotope])
-    normalized = {_normalize_isotope_key(key): float(value) for key, value in table.items()}
+    normalized = {
+        _normalize_isotope_key(key): float(value) for key, value in table.items()
+    }
     norm_key = _normalize_isotope_key(isotope)
     if norm_key in normalized:
         return normalized[norm_key]
@@ -423,7 +424,9 @@ def segment_box_intersection_length_m(
     detector = np.asarray(detector_pos, dtype=float)
     box = np.asarray(box_m, dtype=float)
     if source.shape != (3,) or detector.shape != (3,) or box.shape != (6,):
-        raise ValueError("source_pos, detector_pos, and box_m must have shapes (3,), (3,), and (6,).")
+        raise ValueError(
+            "source_pos, detector_pos, and box_m must have shapes (3,), (3,), and (6,)."
+        )
     direction = detector - source
     segment_length = float(np.linalg.norm(direction))
     if segment_length <= tol:
@@ -712,7 +715,9 @@ def segment_rotated_octant_shell_path_length_cm(
         mid = 0.5 * (left + right)
         point = source_local + mid * delta
         radius_sq = float(np.dot(point, point))
-        inside_shell = (inner_m * inner_m - tol) <= radius_sq <= (outer_m * outer_m + tol)
+        inside_shell = (
+            (inner_m * inner_m - tol) <= radius_sq <= (outer_m * outer_m + tol)
+        )
         inside_octant = bool(np.all(point >= -tol))
         if inside_shell and inside_octant:
             length += (right - left) * segment_length
@@ -791,11 +796,16 @@ def segment_rotated_octant_shell_path_length_cm_torch(
         radius_sq <= outer_m * outer_m + float(tol)
     )
     inside_octant = torch.all(point >= -float(tol), dim=-1)
-    length_m = torch.sum(
-        torch.where(inside_shell & inside_octant, width, torch.zeros_like(width)),
-        dim=-1,
-    ) * segment_length
-    return torch.where(segment_length > float(tol), 100.0 * length_m, torch.zeros_like(length_m))
+    length_m = (
+        torch.sum(
+            torch.where(inside_shell & inside_octant, width, torch.zeros_like(width)),
+            dim=-1,
+        )
+        * segment_length
+    )
+    return torch.where(
+        segment_length > float(tol), 100.0 * length_m, torch.zeros_like(length_m)
+    )
 
 
 def obstacle_path_lengths_cm_torch(
@@ -862,9 +872,19 @@ def obstacle_path_lengths_by_box_cm_torch(
         axis_max = torch.where(parallel & ~inside, neg_inf, axis_max)
         t_min_axes.append(axis_min)
         t_max_axes.append(axis_max)
-    t_enter = torch.maximum(torch.stack(t_min_axes, dim=-1).amax(dim=-1), torch.zeros_like(distance).unsqueeze(-1))
-    t_exit = torch.minimum(torch.stack(t_max_axes, dim=-1).amin(dim=-1), torch.ones_like(distance).unsqueeze(-1))
-    length_m = torch.where(t_exit > t_enter, (t_exit - t_enter) * distance.unsqueeze(-1), torch.zeros_like(t_exit))
+    t_enter = torch.maximum(
+        torch.stack(t_min_axes, dim=-1).amax(dim=-1),
+        torch.zeros_like(distance).unsqueeze(-1),
+    )
+    t_exit = torch.minimum(
+        torch.stack(t_max_axes, dim=-1).amin(dim=-1),
+        torch.ones_like(distance).unsqueeze(-1),
+    )
+    length_m = torch.where(
+        t_exit > t_enter,
+        (t_exit - t_enter) * distance.unsqueeze(-1),
+        torch.zeros_like(t_exit),
+    )
     return 100.0 * length_m
 
 
@@ -999,7 +1019,9 @@ class ContinuousKernel:
     mu_by_isotope: Dict[str, object] | None = None
     shield_params: ShieldParams = field(default_factory=ShieldParams)
     octant_shield: OctantShield = OctantShield()
-    orientations: NDArray[np.float64] = field(default_factory=generate_octant_orientations)
+    orientations: NDArray[np.float64] = field(
+        default_factory=generate_octant_orientations
+    )
     use_gpu: bool = True
     gpu_device: str = "cuda"
     gpu_dtype: str = "float32"
@@ -1015,8 +1037,12 @@ class ContinuousKernel:
     source_extent_samples: int = 1
     line_mu_by_isotope: Dict[str, object] | None = None
     transport_response_model: Dict[str, object] | None = None
-    _obstacle_boxes_cache: NDArray[np.float64] | None = field(default=None, init=False, repr=False)
-    _torch_octant_rotation_cache: dict[tuple[str, str, tuple[float, float, float]], object] = field(
+    _obstacle_boxes_cache: NDArray[np.float64] | None = field(
+        default=None, init=False, repr=False
+    )
+    _torch_octant_rotation_cache: dict[
+        tuple[str, str, tuple[float, float, float]], object
+    ] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -1117,9 +1143,7 @@ class ContinuousKernel:
         if all_orientation_pairs:
             denom = max(denom, sample_count * num_pairs * line_count)
         element_budget = (
-            4_000_000
-            if str(self.gpu_dtype).lower() == "float64"
-            else 8_000_000
+            4_000_000 if str(self.gpu_dtype).lower() == "float64" else 8_000_000
         )
         safe_chunk = max(1, int(element_budget // denom))
         return max(1, min(chunk, safe_chunk))
@@ -1145,7 +1169,9 @@ class ContinuousKernel:
             return ()
         entry = table.get(isotope)
         if entry is None:
-            normalized = {_normalize_isotope_key(key): value for key, value in table.items()}
+            normalized = {
+                _normalize_isotope_key(key): value for key, value in table.items()
+            }
             entry = normalized.get(_normalize_isotope_key(isotope))
         if entry is None:
             return ()
@@ -1153,20 +1179,31 @@ class ContinuousKernel:
         for item in entry if isinstance(entry, (list, tuple)) else ():
             if isinstance(item, dict):
                 weight = float(item.get("weight", 0.0))
-                mu_fe = float(item.get("fe", item.get("mu_fe", self.shield_params.mu_fe)))
-                mu_pb = float(item.get("pb", item.get("mu_pb", self.shield_params.mu_pb)))
+                mu_fe = float(
+                    item.get("fe", item.get("mu_fe", self.shield_params.mu_fe))
+                )
+                mu_pb = float(
+                    item.get("pb", item.get("mu_pb", self.shield_params.mu_pb))
+                )
             elif isinstance(item, (list, tuple, np.ndarray)) and len(item) >= 3:
                 weight = float(item[0])
                 mu_fe = float(item[1])
                 mu_pb = float(item[2])
             else:
                 continue
-            if weight > 0.0 and np.isfinite(weight) and np.isfinite(mu_fe) and np.isfinite(mu_pb):
+            if (
+                weight > 0.0
+                and np.isfinite(weight)
+                and np.isfinite(mu_fe)
+                and np.isfinite(mu_pb)
+            ):
                 rows.append((weight, mu_fe, mu_pb))
         total_weight = sum(weight for weight, _, _ in rows)
         if total_weight <= 0.0:
             return ()
-        return tuple((weight / total_weight, mu_fe, mu_pb) for weight, mu_fe, mu_pb in rows)
+        return tuple(
+            (weight / total_weight, mu_fe, mu_pb) for weight, mu_fe, mu_pb in rows
+        )
 
     def _max_line_count(self) -> int:
         """Return the maximum configured line count used by attenuation batching."""
@@ -1327,9 +1364,7 @@ class ContinuousKernel:
             distance_fe_cap,
             distance_pb_cap,
             distance_obstacle_cap,
-        ) = (
-            self._transport_response_feature_caps(isotope)
-        )
+        ) = self._transport_response_feature_caps(isotope)
         shield_tau_raw = torch.clamp(shield_tau_feature, min=0.0)
         shield_tau = shield_tau_raw
         if shield_cap is not None:
@@ -1388,26 +1423,37 @@ class ContinuousKernel:
         log_scale = pair_log_t
         log_scale = log_scale + float(coeffs.get("shield", 0.0)) * shield_tau
         log_scale = log_scale + float(coeffs.get("obstacle", 0.0)) * obstacle_tau
-        log_scale = log_scale + float(coeffs.get("shield_squared", 0.0)) * shield_tau * shield_tau
-        log_scale = log_scale + float(coeffs.get("obstacle_squared", 0.0)) * obstacle_tau * obstacle_tau
-        log_scale = log_scale + float(coeffs.get("shield_obstacle", 0.0)) * shield_tau * obstacle_tau
+        log_scale = (
+            log_scale
+            + float(coeffs.get("shield_squared", 0.0)) * shield_tau * shield_tau
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("obstacle_squared", 0.0)) * obstacle_tau * obstacle_tau
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("shield_obstacle", 0.0)) * shield_tau * obstacle_tau
+        )
         log_scale = log_scale + float(coeffs.get("fe", 0.0)) * fe_tau
         log_scale = log_scale + float(coeffs.get("pb", 0.0)) * pb_tau
         log_scale = log_scale + float(coeffs.get("fe_squared", 0.0)) * fe_tau * fe_tau
         log_scale = log_scale + float(coeffs.get("pb_squared", 0.0)) * pb_tau * pb_tau
         log_scale = log_scale + float(coeffs.get("fe_pb", 0.0)) * fe_tau * pb_tau
-        log_scale = log_scale + float(coeffs.get("fe_obstacle", 0.0)) * fe_tau * obstacle_tau
-        log_scale = log_scale + float(coeffs.get("pb_obstacle", 0.0)) * pb_tau * obstacle_tau
+        log_scale = (
+            log_scale + float(coeffs.get("fe_obstacle", 0.0)) * fe_tau * obstacle_tau
+        )
+        log_scale = (
+            log_scale + float(coeffs.get("pb_obstacle", 0.0)) * pb_tau * obstacle_tau
+        )
         log_scale = log_scale + float(coeffs.get("distance", 0.0)) * distance
         log_scale = (
-            log_scale
-            + float(coeffs.get("distance_shield", 0.0)) * distance_shield
+            log_scale + float(coeffs.get("distance_shield", 0.0)) * distance_shield
         )
         log_scale = log_scale + float(coeffs.get("distance_fe", 0.0)) * distance_fe
         log_scale = log_scale + float(coeffs.get("distance_pb", 0.0)) * distance_pb
         log_scale = (
-            log_scale
-            + float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
+            log_scale + float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
         )
         log_scale = torch.clamp(log_scale, min=float(min_log), max=float(max_log))
         return torch.exp(log_scale)
@@ -1417,13 +1463,10 @@ class ContinuousKernel:
         if self.obstacle_grid is None:
             return np.zeros((0, 6), dtype=float)
         if self._obstacle_boxes_cache is None:
-            if getattr(self.obstacle_grid, "has_transport_model", False):
-                boxes = self.obstacle_grid.transport_boxes()
-            else:
-                boxes = self.obstacle_grid.blocked_boxes(
-                    z_min=0.0,
-                    z_max=float(self.obstacle_height_m),
-                )
+            boxes = self.obstacle_grid.attenuation_boxes(
+                z_min=0.0,
+                z_max=float(self.obstacle_height_m),
+            )
             if boxes:
                 self._obstacle_boxes_cache = np.asarray(boxes, dtype=float)
             else:
@@ -1659,9 +1702,15 @@ class ContinuousKernel:
     ) -> float:
         """Return a bounded broad-beam build-up factor from optical depths."""
         factor = 1.0
-        factor += self.shield_params.buildup_fe_coeff * (1.0 - float(np.exp(-max(tau_fe, 0.0))))
-        factor += self.shield_params.buildup_pb_coeff * (1.0 - float(np.exp(-max(tau_pb, 0.0))))
-        factor += self.obstacle_buildup_coeff * (1.0 - float(np.exp(-max(tau_obstacle, 0.0))))
+        factor += self.shield_params.buildup_fe_coeff * (
+            1.0 - float(np.exp(-max(tau_fe, 0.0)))
+        )
+        factor += self.shield_params.buildup_pb_coeff * (
+            1.0 - float(np.exp(-max(tau_pb, 0.0)))
+        )
+        factor += self.obstacle_buildup_coeff * (
+            1.0 - float(np.exp(-max(tau_obstacle, 0.0)))
+        )
         return max(1.0, float(factor))
 
     def _buildup_factor_torch(
@@ -1674,8 +1723,12 @@ class ContinuousKernel:
         if torch is None:
             raise RuntimeError("torch is not available")
         factor = torch.ones_like(tau_fe)
-        factor = factor + self.shield_params.buildup_fe_coeff * (1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0)))
-        factor = factor + self.shield_params.buildup_pb_coeff * (1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0)))
+        factor = factor + self.shield_params.buildup_fe_coeff * (
+            1.0 - torch.exp(-torch.clamp(tau_fe, min=0.0))
+        )
+        factor = factor + self.shield_params.buildup_pb_coeff * (
+            1.0 - torch.exp(-torch.clamp(tau_pb, min=0.0))
+        )
         factor = factor + self.obstacle_buildup_coeff * (
             1.0 - torch.exp(-torch.clamp(tau_obstacle, min=0.0))
         )
@@ -1740,7 +1793,9 @@ class ContinuousKernel:
         tol: float,
     ) -> "torch.Tensor":
         """Return a boolean mask for rays blocked by the selected octant (torch)."""
-        (theta_low, theta_high), (phi_low, phi_high) = self.octant_shield.theta_phi_ranges[octant_index]
+        (theta_low, theta_high), (phi_low, phi_high) = (
+            self.octant_shield.theta_phi_ranges[octant_index]
+        )
         theta = torch.acos(torch.clamp(dir_unit[:, 2], -1.0, 1.0))
         phi = torch.remainder(torch.atan2(dir_unit[:, 1], dir_unit[:, 0]), 2.0 * np.pi)
         tol_t = torch.as_tensor(tol, device=dir_unit.device, dtype=dir_unit.dtype)
@@ -1825,7 +1880,8 @@ class ContinuousKernel:
                 outer_radius_cm=inner_radius_cm + thickness_cm,
             )
         return self._shield_path_length_cm(
-            direction_m=np.asarray(target_pos, dtype=float) - np.asarray(source_pos, dtype=float),
+            direction_m=np.asarray(target_pos, dtype=float)
+            - np.asarray(source_pos, dtype=float),
             normal=incoming_normal,
             thickness_cm=thickness_cm,
             inner_radius_cm=inner_radius_cm,
@@ -2000,10 +2056,8 @@ class ContinuousKernel:
             cos_theta = 1.0 - fraction * (1.0 - cos_theta_max)
             sin_theta = float(np.sqrt(max(1.0 - cos_theta * cos_theta, 0.0)))
             angle = golden_angle * float(index)
-            direction = (
-                cos_theta * axis
-                + sin_theta
-                * (float(np.cos(angle)) * basis_u + float(np.sin(angle)) * basis_v)
+            direction = cos_theta * axis + sin_theta * (
+                float(np.cos(angle)) * basis_u + float(np.sin(angle)) * basis_v
             )
             radial_sq = (distance * sin_theta) ** 2
             chord = float(np.sqrt(max(radius_sq - radial_sq, 0.0)))
@@ -2024,10 +2078,13 @@ class ContinuousKernel:
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         normal_fe = self.orientations[fe_index]
         normal_pb = self.orientations[pb_index]
-        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(target_pos, dtype=float)
+        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(
+            target_pos, dtype=float
+        )
         distance_feature = float(
             np.linalg.norm(
-                np.asarray(source_pos, dtype=float) - np.asarray(detector_pos, dtype=float)
+                np.asarray(source_pos, dtype=float)
+                - np.asarray(detector_pos, dtype=float)
             )
         )
         blocked_fe = rotated_positive_octant_blocks_direction(
@@ -2154,36 +2211,48 @@ class ContinuousKernel:
             l_fe = spherical_shell_path_length_cm_torch(
                 direction,
                 self.shield_params.inner_radius_fe_cm,
-                self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
+                self.shield_params.inner_radius_fe_cm
+                + self.shield_params.thickness_fe_cm,
                 blocked_fe,
             )
             l_pb = spherical_shell_path_length_cm_torch(
                 direction,
                 self.shield_params.inner_radius_pb_cm,
-                self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
+                self.shield_params.inner_radius_pb_cm
+                + self.shield_params.thickness_pb_cm,
                 blocked_pb,
             )
             return l_fe, l_pb
         if self.shield_params.use_angle_attenuation:
             l_fe = torch.where(
                 blocked_fe & (cos_fe > tol_t),
-                torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype) / cos_fe,
+                torch.as_tensor(
+                    self.shield_params.thickness_fe_cm, device=device, dtype=dtype
+                )
+                / cos_fe,
                 torch.zeros_like(cos_fe),
             )
             l_pb = torch.where(
                 blocked_pb & (cos_pb > tol_t),
-                torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype) / cos_pb,
+                torch.as_tensor(
+                    self.shield_params.thickness_pb_cm, device=device, dtype=dtype
+                )
+                / cos_pb,
                 torch.zeros_like(cos_pb),
             )
             return l_fe, l_pb
         l_fe = torch.where(
             blocked_fe,
-            torch.as_tensor(self.shield_params.thickness_fe_cm, device=device, dtype=dtype),
+            torch.as_tensor(
+                self.shield_params.thickness_fe_cm, device=device, dtype=dtype
+            ),
             torch.zeros_like(cos_fe),
         )
         l_pb = torch.where(
             blocked_pb,
-            torch.as_tensor(self.shield_params.thickness_pb_cm, device=device, dtype=dtype),
+            torch.as_tensor(
+                self.shield_params.thickness_pb_cm, device=device, dtype=dtype
+            ),
             torch.zeros_like(cos_pb),
         )
         return l_fe, l_pb
@@ -2210,7 +2279,9 @@ class ContinuousKernel:
         helper_y[..., 1] = 1.0
         helper = torch.where(torch.abs(axis[..., 2:3]) > 0.9, helper_y, helper_z)
         basis_u = torch.linalg.cross(axis, helper, dim=-1)
-        basis_u = basis_u / torch.clamp(torch.linalg.norm(basis_u, dim=-1, keepdim=True), min=tol)
+        basis_u = basis_u / torch.clamp(
+            torch.linalg.norm(basis_u, dim=-1, keepdim=True), min=tol
+        )
         basis_v = torch.linalg.cross(axis, basis_u, dim=-1)
         if self.detector_aperture_sampling == "solid_angle_cone":
             return (
@@ -2276,14 +2347,9 @@ class ContinuousKernel:
             fractions[1:] = (indices[1:] - 0.5) / float(sample_count - 1)
         radii = float(radius) * torch.sqrt(torch.clamp(fractions, min=0.0, max=1.0))
         angles = indices * float(np.pi * (3.0 - np.sqrt(5.0)))
-        offsets = (
-            radii.view(1, sample_count, 1)
-            * (
-                torch.cos(angles).view(1, sample_count, 1)
-                * basis_u.unsqueeze(-2)
-                + torch.sin(angles).view(1, sample_count, 1)
-                * basis_v.unsqueeze(-2)
-            )
+        offsets = radii.view(1, sample_count, 1) * (
+            torch.cos(angles).view(1, sample_count, 1) * basis_u.unsqueeze(-2)
+            + torch.sin(angles).view(1, sample_count, 1) * basis_v.unsqueeze(-2)
         )
         return sources.unsqueeze(-2) + offsets, sample_count
 
@@ -2355,7 +2421,9 @@ class ContinuousKernel:
         radii = torch.sqrt(fractions)
         radii[0] = 0.0
         max_radius = torch.minimum(
-            torch.as_tensor(aperture_radius, device=detector.device, dtype=detector.dtype),
+            torch.as_tensor(
+                aperture_radius, device=detector.device, dtype=detector.dtype
+            ),
             0.95 * dist,
         )
         angles = indices * torch.as_tensor(
@@ -2408,13 +2476,11 @@ class ContinuousKernel:
             device=sources.device,
             dtype=sources.dtype,
         )
-        direction = (
-            cos_theta.unsqueeze(-1) * axis.unsqueeze(-2)
-            + sin_theta.unsqueeze(-1)
-            * (
-                torch.cos(angles).view(1, sample_count, 1) * basis_u.unsqueeze(-2)
-                + torch.sin(angles).view(1, sample_count, 1) * basis_v.unsqueeze(-2)
-            )
+        direction = cos_theta.unsqueeze(-1) * axis.unsqueeze(-2) + sin_theta.unsqueeze(
+            -1
+        ) * (
+            torch.cos(angles).view(1, sample_count, 1) * basis_u.unsqueeze(-2)
+            + torch.sin(angles).view(1, sample_count, 1) * basis_v.unsqueeze(-2)
         )
         radial_sq = (dist.unsqueeze(-1) * sin_theta) ** 2
         chord = torch.sqrt(torch.clamp(radius_t * radius_t - radial_sq, min=0.0))
@@ -2446,7 +2512,9 @@ class ContinuousKernel:
         if sources_t.numel() == 0:
             return float(background)
         strengths_t = torch.as_tensor(strengths, device=device, dtype=dtype)
-        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 3)
+        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(
+            1, 3
+        )
         direction = detector_t - sources_t
         dist = torch.linalg.norm(direction, dim=1)
         tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
@@ -2468,10 +2536,18 @@ class ContinuousKernel:
         dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
 
         detector_to_source_unit = -dir_unit
-        blocked_fe = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, fe_index, tol)
-        blocked_pb = self._rotated_octant_blocked_mask_torch(detector_to_source_unit, pb_index, tol)
-        normal_fe = torch.as_tensor(self.orientations[fe_index], device=device, dtype=dtype)
-        normal_pb = torch.as_tensor(self.orientations[pb_index], device=device, dtype=dtype)
+        blocked_fe = self._rotated_octant_blocked_mask_torch(
+            detector_to_source_unit, fe_index, tol
+        )
+        blocked_pb = self._rotated_octant_blocked_mask_torch(
+            detector_to_source_unit, pb_index, tol
+        )
+        normal_fe = torch.as_tensor(
+            self.orientations[fe_index], device=device, dtype=dtype
+        )
+        normal_pb = torch.as_tensor(
+            self.orientations[pb_index], device=device, dtype=dtype
+        )
         cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=-1), 0.0, 1.0)
         cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
         if (
@@ -2497,7 +2573,8 @@ class ContinuousKernel:
                 center_pos=center,
                 shield_normal=fe_normal,
                 inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-                outer_radius_cm=self.shield_params.inner_radius_fe_cm + self.shield_params.thickness_fe_cm,
+                outer_radius_cm=self.shield_params.inner_radius_fe_cm
+                + self.shield_params.thickness_fe_cm,
                 tol=tol,
                 rotation=fe_rotation,
             )
@@ -2507,7 +2584,8 @@ class ContinuousKernel:
                 center_pos=center,
                 shield_normal=pb_normal,
                 inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-                outer_radius_cm=self.shield_params.inner_radius_pb_cm + self.shield_params.thickness_pb_cm,
+                outer_radius_cm=self.shield_params.inner_radius_pb_cm
+                + self.shield_params.thickness_pb_cm,
                 tol=tol,
                 rotation=pb_rotation,
             )
@@ -2620,8 +2698,7 @@ class ContinuousKernel:
                 fe_tau_feature,
                 pb_tau_feature,
                 distance_feature=dist.unsqueeze(-1),
-                distance_shield_feature=dist.unsqueeze(-1)
-                * shield_tau_feature,
+                distance_shield_feature=dist.unsqueeze(-1) * shield_tau_feature,
                 device=device,
                 dtype=dtype,
             )
@@ -2646,8 +2723,7 @@ class ContinuousKernel:
                 tau_fe,
                 tau_pb,
                 distance_feature=dist.unsqueeze(-1),
-                distance_shield_feature=dist.unsqueeze(-1)
-                * (tau_fe + tau_pb),
+                distance_shield_feature=dist.unsqueeze(-1) * (tau_fe + tau_pb),
                 device=device,
                 dtype=dtype,
             )
@@ -2687,7 +2763,9 @@ class ContinuousKernel:
         if sources_t.numel() == 0:
             return torch.zeros((pair_count, 0), device=device, dtype=dtype)
 
-        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(1, 3)
+        detector_t = torch.as_tensor(detector_pos, device=device, dtype=dtype).view(
+            1, 3
+        )
         direction = detector_t - sources_t
         dist = torch.linalg.norm(direction, dim=1)
         tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
@@ -2873,8 +2951,7 @@ class ContinuousKernel:
                 fe_tau_feature,
                 pb_tau_feature,
                 distance_feature=dist.view(1, -1, 1),
-                distance_shield_feature=dist.view(1, -1, 1)
-                * shield_tau_feature,
+                distance_shield_feature=dist.view(1, -1, 1) * shield_tau_feature,
                 device=device,
                 dtype=dtype,
             )
@@ -2901,8 +2978,7 @@ class ContinuousKernel:
                 tau_fe,
                 tau_pb,
                 distance_feature=dist.view(1, -1, 1),
-                distance_shield_feature=dist.view(1, -1, 1)
-                * (tau_fe + tau_pb),
+                distance_shield_feature=dist.view(1, -1, 1) * (tau_fe + tau_pb),
                 device=device,
                 dtype=dtype,
             )
@@ -3065,7 +3141,9 @@ class ContinuousKernel:
         if sources_t.ndim != 2 or sources_t.shape[1] != 3:
             raise ValueError("sources must be shaped (N, 3).")
         if detectors_t.shape[0] != sources_t.shape[0]:
-            raise ValueError("detector_positions and sources must have the same row count.")
+            raise ValueError(
+                "detector_positions and sources must have the same row count."
+            )
         num_orients = int(len(self.orientations))
         num_pairs = num_orients * num_orients
         if sources_t.numel() == 0:
@@ -3257,8 +3335,7 @@ class ContinuousKernel:
                     fe_tau_feature,
                     pb_tau_feature,
                     distance_feature=dist.view(1, -1, 1),
-                    distance_shield_feature=dist.view(1, -1, 1)
-                    * shield_tau_feature,
+                    distance_shield_feature=dist.view(1, -1, 1) * shield_tau_feature,
                     device=device,
                     dtype=dtype,
                 )
@@ -3285,8 +3362,7 @@ class ContinuousKernel:
                     tau_fe,
                     tau_pb,
                     distance_feature=dist.view(1, -1, 1),
-                    distance_shield_feature=dist.view(1, -1, 1)
-                    * (tau_fe + tau_pb),
+                    distance_shield_feature=dist.view(1, -1, 1) * (tau_fe + tau_pb),
                     device=device,
                     dtype=dtype,
                 )
@@ -3320,7 +3396,9 @@ class ContinuousKernel:
         if sources_t.ndim != 2 or sources_t.shape[1] != 3:
             raise ValueError("sources must be shaped (N, 3).")
         if detectors_t.shape[0] != sources_t.shape[0]:
-            raise ValueError("detector_positions and sources must have the same row count.")
+            raise ValueError(
+                "detector_positions and sources must have the same row count."
+            )
         row_count = int(sources_t.shape[0])
         if row_count == 0:
             return np.zeros(0, dtype=float)
@@ -3328,7 +3406,9 @@ class ContinuousKernel:
         fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1) % num_orients
         pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1) % num_orients
         if fe_arr.size != row_count or pb_arr.size != row_count:
-            raise ValueError("Fe/Pb index arrays must match the detector-source row count.")
+            raise ValueError(
+                "Fe/Pb index arrays must match the detector-source row count."
+            )
         unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
         orient_to_row = {int(orient): idx for idx, orient in enumerate(unique_orients)}
         fe_select = torch.as_tensor(
@@ -3875,8 +3955,8 @@ class ContinuousKernel:
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         normal_fe = self.orientations[fe_index]
         normal_pb = self.orientations[pb_index]
-        detector_to_source = (
-            np.asarray(source_pos, dtype=float) - np.asarray(target_pos, dtype=float)
+        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(
+            target_pos, dtype=float
         )
         distance_feature = float(
             np.linalg.norm(
@@ -3972,13 +4052,13 @@ class ContinuousKernel:
             distance_pb_cap,
             distance_obstacle_cap,
         ) = self._transport_response_feature_caps(isotope)
-        distance_shield_feature = (
-            max(distance_feature, 0.0) * max(shield_tau_feature, 0.0)
+        distance_shield_feature = max(distance_feature, 0.0) * max(
+            shield_tau_feature, 0.0
         )
         distance_fe_feature = max(distance_feature, 0.0) * max(fe_tau_feature, 0.0)
         distance_pb_feature = max(distance_feature, 0.0) * max(pb_tau_feature, 0.0)
-        distance_obstacle_feature = (
-            max(distance_feature, 0.0) * max(obstacle_tau_feature, 0.0)
+        distance_obstacle_feature = max(distance_feature, 0.0) * max(
+            obstacle_tau_feature, 0.0
         )
         shield_tau_capped = self._capped_transport_feature(
             shield_tau_feature,
@@ -4087,7 +4167,9 @@ class ContinuousKernel:
             source_pos,
             self.detector_radius_m,
         )
-        att = self.attenuation_factor_pair(isotope, source_pos, detector_pos, fe_index, pb_index)
+        att = self.attenuation_factor_pair(
+            isotope, source_pos, detector_pos, fe_index, pb_index
+        )
         return geom * att
 
     def expected_rate(
@@ -4164,7 +4246,9 @@ class ContinuousKernel:
         """
         Compute Λ_{k,h} = T_k λ_{k,h} (Eq. 3.13).
         """
-        rate = self.expected_rate(isotope, detector_pos, sources, strengths, orient_idx, background=background)
+        rate = self.expected_rate(
+            isotope, detector_pos, sources, strengths, orient_idx, background=background
+        )
         return float(live_time_s * rate)
 
     def expected_counts_pair(

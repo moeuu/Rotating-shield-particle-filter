@@ -69,14 +69,19 @@ class ObservationModel(ABC):
 
 
 def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
-    """Build an obstacle grid from the scene description when cells exist."""
-    if scene.obstacle_grid_shape[0] <= 0 or scene.obstacle_grid_shape[1] <= 0:
+    """Build an obstacle grid from scene cells or explicit collision geometry."""
+    has_grid = scene.obstacle_grid_shape[0] > 0 and scene.obstacle_grid_shape[1] > 0
+    if not has_grid and not scene.collision_boxes_m and not scene.transport_boxes_m:
         return None
     return ObstacleGrid(
         origin=scene.obstacle_origin_xy,
         cell_size=scene.obstacle_cell_size_m,
         grid_shape=scene.obstacle_grid_shape,
         blocked_cells=tuple(scene.obstacle_cells),
+        collision_boxes_m=scene.collision_boxes_m,
+        transport_boxes_m=scene.transport_boxes_m,
+        transport_mu_by_isotope=scene.transport_mu_by_isotope,
+        transport_line_mu_by_isotope=scene.transport_line_mu_by_isotope,
     )
 
 
@@ -253,8 +258,12 @@ class IsaacSimObservationModel(ObservationModel):
                 }
             )
         )
-        for solid_prim in self.robot_controller.stage_backend.list_solid_prims(path_prefixes=prefixes):
-            material_info = self._material_for_prim(solid_prim.path, solid_prim.material_info)
+        for solid_prim in self.robot_controller.stage_backend.list_solid_prims(
+            path_prefixes=prefixes
+        ):
+            material_info = self._material_for_prim(
+                solid_prim.path, solid_prim.material_info
+            )
             if material_info is None:
                 continue
             if solid_prim.path in {
@@ -263,16 +272,21 @@ class IsaacSimObservationModel(ObservationModel):
                 self.robot_controller.prim_paths.detector_path,
             }:
                 continue
-            if solid_prim.path.startswith(self.robot_controller.prim_paths.sources_root):
+            if solid_prim.path.startswith(
+                self.robot_controller.prim_paths.sources_root
+            ):
                 continue
-            path_length_cm = 100.0 * self._solid_path_length_m(source_xyz, detector_xyz, solid_prim)
+            path_length_cm = 100.0 * self._solid_path_length_m(
+                source_xyz, detector_xyz, solid_prim
+            )
             if path_length_cm <= 0.0:
                 continue
             segments.append(
                 make_transport_segment(
                     material_info,
                     float(path_length_cm),
-                    is_obstacle=material_info.name.lower() == self.scene.obstacle_material.lower(),
+                    is_obstacle=material_info.name.lower()
+                    == self.scene.obstacle_material.lower(),
                 )
             )
         return tuple(segments)
@@ -316,10 +330,15 @@ class IsaacSimObservationModel(ObservationModel):
         matched_material: str | None = None
         matched_len = -1
         for rule in self.stage_material_rules:
-            if path.startswith(rule.path_prefix) and len(rule.path_prefix) > matched_len:
+            if (
+                path.startswith(rule.path_prefix)
+                and len(rule.path_prefix) > matched_len
+            ):
                 matched_material = rule.material
                 matched_len = len(rule.path_prefix)
-        if matched_material is None and path.startswith(self.robot_controller.prim_paths.obstacles_root):
+        if matched_material is None and path.startswith(
+            self.robot_controller.prim_paths.obstacles_root
+        ):
             return StageMaterialInfo(name=self.scene.obstacle_material)
         if matched_material is None and path.startswith("/World/Environment"):
             return StageMaterialInfo(name="concrete")
@@ -351,11 +370,15 @@ class IsaacSimObservationModel(ObservationModel):
             if radius_m is None:
                 return 0.0
             sphere = Sphere(center_xyz=pose.translation_xyz, radius_m=float(radius_m))
-            return float(segment_path_length_through_sphere(source_xyz, detector_xyz, sphere))
+            return float(
+                segment_path_length_through_sphere(source_xyz, detector_xyz, sphere)
+            )
         if shape == "mesh":
             triangles_xyz = getattr(solid_prim, "triangles_xyz")
             if not triangles_xyz:
                 return 0.0
             mesh = TriangleMesh(triangles_xyz=triangles_xyz)
-            return float(segment_path_length_through_mesh(source_xyz, detector_xyz, mesh))
+            return float(
+                segment_path_length_through_mesh(source_xyz, detector_xyz, mesh)
+            )
         return 0.0

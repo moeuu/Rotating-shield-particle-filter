@@ -306,6 +306,7 @@ def _path_neighbors(
     is_free_cell = _free_cell_fn(map_api)
     if is_free_cell is None:
         return
+    transition_is_free = getattr(map_api, "is_transition_free", None)
     nx, ny = int(grid_shape[0]), int(grid_shape[1])
     cell_size = float(getattr(map_api, "cell_size", 1.0))
     ix, iy = int(cell[0]), int(cell[1])
@@ -332,6 +333,10 @@ def _path_neighbors(
             side_b = (ix, iy + dy)
             if not bool(is_free_cell(side_a)) or not bool(is_free_cell(side_b)):
                 continue
+        if callable(transition_is_free) and not bool(
+            transition_is_free(cell, neighbor)
+        ):
+            continue
         yield neighbor, float(multiplier) * cell_size
 
 

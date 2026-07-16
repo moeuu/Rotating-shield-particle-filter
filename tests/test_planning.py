@@ -504,6 +504,58 @@ def test_candidate_generation_keeps_same_xy_alternate_height_action() -> None:
     assert not any(np.allclose(candidate, current) for candidate in candidates)
 
 
+def test_candidate_generation_adds_continuous_same_xy_height_anchors() -> None:
+    """Continuous planning should add useful same-xy anchors without a height list."""
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    candidates = generate_candidate_poses(
+        current_pose_xyz=current,
+        n_candidates=24,
+        strategy="free_space_sobol",
+        min_dist_from_visited=3.0,
+        visited_poses_xyz=current.reshape(1, 3),
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 1.5], dtype=float),
+        ),
+        rng=np.random.default_rng(23),
+        include_current_xy_height_actions=True,
+        continuous_height_anchor_count=16,
+        allow_height_partners=True,
+        height_partner_min_z_separation_m=0.4,
+    )
+
+    same_xy = np.linalg.norm(candidates[:, :2] - current[None, :2], axis=1) <= 1e-12
+    anchors = candidates[same_xy]
+    assert anchors.shape[0] > 1
+    assert np.all(np.abs(anchors[:, 2] - current[2]) >= 0.4)
+    assert np.all((anchors[:, 2] >= 0.5) & (anchors[:, 2] <= 1.5))
+    assert np.any(~np.isclose(anchors[:, 2], 1.5))
+
+
+def test_continuous_height_partner_requires_minimum_z_separation() -> None:
+    """Tiny continuous height jitter must not bypass station-spacing rejection."""
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [
+            [1.0, 1.0, 0.5001],
+            [1.0, 1.0, 1.1],
+            [5.0, 1.0, 0.5001],
+        ],
+        dtype=float,
+    )
+
+    filtered = candidate_generation._filter_candidates(
+        candidates,
+        visited,
+        3.0,
+        lambda _candidate: True,
+        allow_height_partners=True,
+        height_partner_min_z_separation_m=0.5,
+    )
+
+    assert np.allclose(filtered, candidates[1:])
+
+
 def test_dss_station_spacing_preserves_height_partner_only() -> None:
     """DSS station filtering should preserve a distinct-height revisit."""
     visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
@@ -624,6 +676,23 @@ def test_dss_height_partner_mask_uses_current_station_and_shared_tolerance() -> 
     assert strict_tolerance_mask.tolist() == [False, False]
 
 
+def test_dss_height_partner_mask_requires_minimum_z_separation() -> None:
+    """DSS should not classify sub-threshold height jitter as a paired action."""
+    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
+    candidates = np.array(
+        [[1.0, 1.0, 0.5001], [1.0, 1.0, 1.1]],
+        dtype=float,
+    )
+
+    mask = dss_pp._height_partner_mask_batch(
+        candidates,
+        visited,
+        min_z_separation_m=0.5,
+    )
+
+    assert mask.tolist() == [False, True]
+
+
 def test_dss_height_partner_requires_an_unvisited_height_action() -> None:
     """DSS should waive revisit costs only for a genuinely new height action."""
     visited = np.array(
@@ -655,6 +724,271 @@ def test_dss_height_partner_requires_an_unvisited_height_action() -> None:
     assert np.allclose(filtered, [[1.0, 1.0, 2.5], [5.0, 1.0, 0.5]])
     assert np.all(penalties[:2] > 0.0)
     assert penalties[2] == pytest.approx(0.0)
+
+
+def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> None:
+    """Continuous augmentation should vary z and use batched free-space checks."""
+
+    class BatchOnlyPlanningMap:
+        """Expose only a usable batched free-space runtime path."""
+
+        def __init__(self) -> None:
+            """Initialize batch-call accounting."""
+            self.batch_calls = 0
+
+        def is_free(self, _point: np.ndarray) -> bool:
+            """Reject accidental use of the scalar compatibility path."""
+            raise AssertionError("scalar free-space path must not be selected")
+
+        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
+            """Accept every in-bounds candidate in one batch."""
+            self.batch_calls += 1
+            return np.ones(np.asarray(points).shape[0], dtype=bool)
+
+    planning_map = BatchOnlyPlanningMap()
+    base = np.array(
+        [[0.25, 0.25, 0.4], [0.75, 0.75, 1.4]],
+        dtype=float,
+    )
+    current = np.array([0.5, 0.5, 0.5], dtype=float)
+    bounds = (
+        np.array([0.0, 0.0, 0.25], dtype=float),
+        np.array([2.0, 2.0, 1.75], dtype=float),
+    )
+    config = DSSPPConfig(max_augmented_candidates=16, rng_seed=17)
+
+    continuous = dss_pp.augment_candidate_stations(
+        base,
+        modes_by_isotope={},
+        current_pose_xyz=current,
+        visited_poses_xyz=None,
+        map_api=planning_map,
+        bounds_xyz=bounds,
+        config=config,
+        continuous_height_bounds_m=(0.25, 1.75),
+    )
+    legacy = dss_pp.augment_candidate_stations(
+        base,
+        modes_by_isotope={},
+        current_pose_xyz=current,
+        visited_poses_xyz=None,
+        map_api=planning_map,
+        bounds_xyz=bounds,
+        config=config,
+    )
+
+    assert planning_map.batch_calls == 2
+    assert np.allclose(continuous[: base.shape[0]], base)
+    assert np.unique(np.round(continuous[base.shape[0] :, 2], 6)).size > 1
+    assert np.all(
+        (continuous[base.shape[0] :, 2] >= 0.25)
+        & (continuous[base.shape[0] :, 2] <= 1.75)
+    )
+    assert np.allclose(legacy[: base.shape[0]], base)
+    assert np.allclose(legacy[base.shape[0] :, 2], current[2])
+
+
+def test_dss_path_cache_distinguishes_exact_xyz_inside_one_cell() -> None:
+    """Cached grid paths must retain endpoint and height-dependent distance."""
+    traversable = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        traversable_cells=((0, 0),),
+    )
+    start = np.array([0.1, 0.1, 0.5], dtype=float)
+    same_height = np.array([0.2, 0.2, 0.5], dtype=float)
+    raised = np.array([0.2, 0.2, 1.5], dtype=float)
+
+    dss_pp._DSS_PP_PATH_LENGTH_CACHE.clear()
+    try:
+        same_height_length = dss_pp._node_path_length(
+            traversable,
+            start,
+            same_height,
+        )
+        raised_length = dss_pp._node_path_length(
+            traversable,
+            start,
+            raised,
+        )
+    finally:
+        dss_pp._DSS_PP_PATH_LENGTH_CACHE.clear()
+
+    assert same_height_length == pytest.approx(np.linalg.norm(same_height - start))
+    assert raised_length == pytest.approx(np.linalg.norm(raised - start))
+    assert raised_length > same_height_length
+
+
+def test_dss_path_filter_prefers_batch_lengths_over_reachability_flags() -> None:
+    """Candidate filtering uses finite batch lengths before legacy flags."""
+
+    class BatchLengthMap:
+        """Expose both APIs while making legacy use an immediate failure."""
+
+        def __init__(self) -> None:
+            """Initialize the batch-call counter."""
+            self.batch_calls = 0
+
+        def motion_path_lengths_batch(
+            self,
+            start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Return one unreachable candidate between two reachable ones."""
+            del start_xyz
+            self.batch_calls += 1
+            assert goals_xyz.shape == (3, 3)
+            return np.array([1.0, float("inf"), 2.0], dtype=float)
+
+        def is_motion_reachable_batch(
+            self,
+            start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Fail if the compatibility path is selected before lengths."""
+            del start_xyz, goals_xyz
+            raise AssertionError("legacy reachability API should not be used")
+
+    planning_map = BatchLengthMap()
+    candidates = np.array(
+        [
+            [1.0, 0.0, 0.5],
+            [2.0, 0.0, 0.5],
+            [3.0, 0.0, 0.5],
+        ],
+        dtype=float,
+    )
+
+    filtered, removed = dss_pp._filter_path_reachable_stations(
+        candidates,
+        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
+        map_api=planning_map,
+    )
+
+    assert planning_map.batch_calls == 1
+    assert removed == 1
+    np.testing.assert_allclose(filtered, candidates[[0, 2]])
+
+
+def test_dss_batch_path_length_helper_matches_vector_and_scalar_fallbacks() -> None:
+    """DSS batch path lengths preserve native and compatibility semantics."""
+
+    class NativeBatchMap:
+        """Return deterministic native batch lengths for dispatch testing."""
+
+        def __init__(self) -> None:
+            """Initialize the native batch-call counter."""
+            self.batch_calls = 0
+
+        def motion_path_lengths_batch(
+            self,
+            start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Return direct distances with a deterministic offset."""
+            self.batch_calls += 1
+            return np.linalg.norm(goals_xyz - start_xyz[None, :], axis=1) + 0.25
+
+    start = np.array([0.0, 0.0, 0.5], dtype=float)
+    goals = np.array(
+        [[1.0, 0.0, 0.5], [0.0, 2.0, 1.5]],
+        dtype=float,
+    )
+    native_map = NativeBatchMap()
+
+    native = dss_pp._node_path_lengths_batch(native_map, start, goals)
+    no_map = dss_pp._node_path_lengths_batch(None, start, goals)
+
+    assert native_map.batch_calls == 1
+    np.testing.assert_allclose(
+        native,
+        np.linalg.norm(goals - start[None, :], axis=1) + 0.25,
+    )
+    np.testing.assert_allclose(
+        no_map,
+        np.linalg.norm(goals - start[None, :], axis=1),
+    )
+
+
+def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
+    """End-to-end station selection dispatches both path phases in batches."""
+
+    class TrackingBatchMap:
+        """Wrap a traversability map and count native batch path requests."""
+
+        def __init__(self, wrapped: TraversabilityMap) -> None:
+            """Store the wrapped grid and initialize its call counter."""
+            self.wrapped = wrapped
+            self.batch_calls = 0
+
+        def __getattr__(self, name: str) -> object:
+            """Forward non-batch map APIs to the traversability grid."""
+            return getattr(self.wrapped, name)
+
+        def motion_path_lengths_batch(
+            self,
+            start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Return finite direct lengths for every candidate in one call."""
+            self.batch_calls += 1
+            return np.linalg.norm(goals_xyz - start_xyz[None, :], axis=1)
+
+        def is_motion_reachable_batch(
+            self,
+            start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Fail if selection bypasses the preferred path-length API."""
+            del start_xyz, goals_xyz
+            raise AssertionError("legacy reachability API should not be used")
+
+    estimator = _build_simple_estimator()
+    wrapped = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        traversable_cells=tuple(
+            (ix, iy) for ix in range(4) for iy in range(4)
+        ),
+    )
+    planning_map = TrackingBatchMap(wrapped)
+    candidates = np.array(
+        [[1.5, 1.5, 0.5], [2.5, 1.5, 0.5]],
+        dtype=float,
+    )
+
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+        visited_poses_xyz=None,
+        map_api=planning_map,
+        config=DSSPPConfig(
+            horizon=1,
+            beam_width=2,
+            max_programs=1,
+            program_length=1,
+            live_time_s=1.0,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=1.0,
+            lambda_rotation=0.0,
+            lambda_coverage=0.0,
+            eta_revisit=0.0,
+            eta_observation=0.0,
+            eta_differential=0.0,
+            eta_count_balance=0.0,
+            min_station_separation_m=0.0,
+            signature_std_min_counts=0.0,
+            enforce_min_observation=False,
+            augment_candidates=False,
+        ),
+    )
+
+    assert planning_map.batch_calls == 2
+    assert any(np.allclose(result.next_pose, pose) for pose in candidates)
 
 
 def test_estimate_lambda_cost_range_scales_motion() -> None:
