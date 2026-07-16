@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import inspect
 from typing import Callable, Sequence
 import sys
 import threading
@@ -267,8 +268,11 @@ def select_next_pose(
         t_short_s = (
             pf_config.short_time_s if pf_config is not None else 1.0
         ) if t_short_s is None else t_short_s
-        if rng_seed is not None:
-            np.random.seed(rng_seed)
+        planning_rng = (
+            np.random.default_rng()
+            if rng_seed is None
+            else np.random.default_rng(int(rng_seed))
+        )
         rollouts = int(num_rollouts)
         if rollouts <= 0 and not use_mean_measurement:
             rollouts = 1
@@ -279,19 +283,33 @@ def select_next_pose(
             if criterion == "after_rotation" and hasattr(
                 estimator, "expected_uncertainty_after_rotation"
             ):
-                uncertainty = estimator.expected_uncertainty_after_rotation(
+                rotation_kwargs: dict[str, object] = {}
+                rotation_method = estimator.expected_uncertainty_after_rotation
+                if "rng_seed" in inspect.signature(rotation_method).parameters:
+                    rotation_kwargs["rng_seed"] = int(
+                        planning_rng.integers(0, 2**32 - 1)
+                    )
+                uncertainty = rotation_method(
                     pose_xyz=estimator.poses[idx_int],
                     live_time_per_rot_s=t_short_s,
                     tau_ig=tau_ig,
                     tmax_s=t_max_s,
                     n_rollouts=rollouts,
                     orient_selection="IG",
+                    **rotation_kwargs,
                 )
             elif criterion == "uncertainty" and hasattr(
                 estimator, "expected_uncertainty_after_pose"
             ):
-                uncertainty = estimator.expected_uncertainty_after_pose(
-                    pose_idx=idx_int, orient_idx=0, live_time_s=t_short_s
+                pose_method = estimator.expected_uncertainty_after_pose
+                pose_kwargs: dict[str, object] = {}
+                if "rng" in inspect.signature(pose_method).parameters:
+                    pose_kwargs["rng"] = planning_rng
+                uncertainty = pose_method(
+                    pose_idx=idx_int,
+                    orient_idx=0,
+                    live_time_s=t_short_s,
+                    **pose_kwargs,
                 )
             else:
                 uncertainty = estimator.expected_uncertainty(

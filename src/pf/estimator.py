@@ -8,7 +8,7 @@ import hashlib
 import itertools
 import re
 import time
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple
 import copy
 import os
 
@@ -30,24 +30,11 @@ from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.reporting import dedupe_report_candidates, measurement_vector
 from pf.resampling import systematic_resample
-from pf.sparse_evidence import (
-    SparsePoissonEvidenceConfig,
-    fit_joint_sparse_poisson_evidence,
-    fit_sparse_poisson_evidence,
-    fit_sparse_poisson_spectral_evidence,
-    joint_sparse_poisson_evidence_to_diagnostics,
-    refine_sparse_poisson_evidence_offgrid,
-    sparse_poisson_ambiguity_diagnostics,
-    sparse_poisson_evidence_to_diagnostics,
-)
 from pf.state import IsotopeState
-from pf.surface_map import (
-    ContiguousPoissonBinAggregation,
-    SurfaceMapConfig,
-    aggregate_contiguous_poisson_bins,
-    contiguous_poisson_bin_aggregation,
-    fit_surface_map_poisson,
-)
+
+if TYPE_CHECKING:
+    from pf.sparse_evidence import SparsePoissonEvidenceConfig
+    from pf.surface_map import ContiguousPoissonBinAggregation, SurfaceMapConfig
 
 
 def _weighted_quantile(
@@ -366,6 +353,7 @@ class RotatingShieldPFConfig:
         - converge_require_all: if True, all criteria must hold; else any two
     """
 
+    estimator_profile: str = "pf_strict"
     num_particles: int = 200
     min_particles: int | None = None
     max_particles: int | None = None
@@ -5021,11 +5009,13 @@ class RotatingShieldPFEstimator:
                 z_covariance_k,
             )
         )
-        sanitized_spectrum_payload = (
-            self._complete_spectrum_payload_with_configured_responses(
-                self._sanitize_spectrum_payload(spectrum_payload)
+        sanitized_spectrum_payload = None
+        if spectrum_payload is not None:
+            sanitized_spectrum_payload = (
+                self._complete_spectrum_payload_with_configured_responses(
+                    self._sanitize_spectrum_payload(spectrum_payload)
+                )
             )
-        )
         if self._defer_resample_birth:
             self.last_strength_prior_diagnostics = {}
         else:
@@ -5040,10 +5030,14 @@ class RotatingShieldPFEstimator:
         for iso, val in z_k.items():
             if iso not in self.filters:
                 continue
-            pf_spectrum_payload = self._pf_spectrum_update_payload_for_isotope(
-                iso,
-                z_k,
-                sanitized_spectrum_payload,
+            pf_spectrum_payload = (
+                None
+                if sanitized_spectrum_payload is None
+                else self._pf_spectrum_update_payload_for_isotope(
+                    iso,
+                    z_k,
+                    sanitized_spectrum_payload,
+                )
             )
             # Use continuous PF update that relies on spectrum-unfolded counts.
             self.filters[iso].update_continuous_pair(
@@ -5125,7 +5119,8 @@ class RotatingShieldPFEstimator:
         if self._defer_resample_birth:
             self._deferred_measurement_count += 1
         else:
-            self.refresh_sparse_poisson_evidence()
+            if bool(self.pf_config.sparse_poisson_evidence_enable):
+                self.refresh_sparse_poisson_evidence()
             self._apply_birth_death()
         self._invalidate_report_cache()
         if not self._defer_resample_birth:
@@ -5162,7 +5157,8 @@ class RotatingShieldPFEstimator:
             0,
             int(self._previous_deferred_measurement_count),
         )
-        self.refresh_sparse_poisson_evidence()
+        if bool(self.pf_config.sparse_poisson_evidence_enable):
+            self.refresh_sparse_poisson_evidence()
         self._apply_birth_death(birth_window_override=birth_context_count)
         self._invalidate_report_cache()
         post_finalize_estimates = self.estimates(use_pre_finalize_guard=False)
@@ -5217,9 +5213,12 @@ class RotatingShieldPFEstimator:
                 z_covariance_k,
                 spectrum_payload,
             ) = self._normalize_pair_sequence_record(record)
-            spectrum_payload = self._complete_spectrum_payload_with_configured_responses(
-                spectrum_payload
-            )
+            if spectrum_payload is not None:
+                spectrum_payload = (
+                    self._complete_spectrum_payload_with_configured_responses(
+                        spectrum_payload
+                    )
+                )
             effective_variance_k, sanitized_covariance_k = (
                 self._project_observation_covariance_to_variance(
                     z_k,
@@ -5320,24 +5319,26 @@ class RotatingShieldPFEstimator:
                 sequence_length=z_arr.size,
                 z_view_covariance_by_isotope=z_view_covariance_by_isotope,
             )
-            sequence_spectrum_payload = self._stack_pf_spectrum_sequence_payloads(
-                [
-                    self._pf_spectrum_update_payload_for_isotope(
-                        iso,
-                        z_k,
-                        spectrum_payload,
-                    )
-                    for (
-                        z_k,
-                        _fe_index,
-                        _pb_index,
-                        _live_time_s,
-                        _z_variance_k,
-                        _z_covariance_k,
-                        spectrum_payload,
-                    ) in normalized_records
-                ]
-            )
+            sequence_spectrum_payload = None
+            if any(record[6] is not None for record in normalized_records):
+                sequence_spectrum_payload = self._stack_pf_spectrum_sequence_payloads(
+                    [
+                        self._pf_spectrum_update_payload_for_isotope(
+                            iso,
+                            z_k,
+                            spectrum_payload,
+                        )
+                        for (
+                            z_k,
+                            _fe_index,
+                            _pb_index,
+                            _live_time_s,
+                            _z_variance_k,
+                            _z_covariance_k,
+                            spectrum_payload,
+                        ) in normalized_records
+                    ]
+                )
             tasks.append(
                 (
                     iso,
@@ -5447,7 +5448,8 @@ class RotatingShieldPFEstimator:
         stage_wall["append_measurements"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
         self._candidate_verification_station_start = int(base_measurement_count)
-        self.refresh_sparse_poisson_evidence()
+        if bool(self.pf_config.sparse_poisson_evidence_enable):
+            self.refresh_sparse_poisson_evidence()
         stage_wall["sparse_poisson_refresh"] = time.perf_counter() - stage_start
         stage_start = time.perf_counter()
         self._apply_birth_death()
@@ -5606,7 +5608,8 @@ class RotatingShieldPFEstimator:
                 detector_position_xyz_m=tuple(float(value) for value in detector_pos),
             )
         )
-        self.refresh_sparse_poisson_evidence()
+        if bool(self.pf_config.sparse_poisson_evidence_enable):
+            self.refresh_sparse_poisson_evidence()
         self._apply_birth_death()
         self._invalidate_report_cache()
         self._record_history_estimate(len(self.measurements))
@@ -7885,6 +7888,8 @@ class RotatingShieldPFEstimator:
         response_at_positions: Callable[[NDArray[np.float64]], NDArray[np.float64]],
     ) -> dict[str, Any] | None:
         """Return off-grid sparse evidence refinement diagnostics."""
+        from pf.sparse_evidence import refine_sparse_poisson_evidence_offgrid
+
         if not bool(self.pf_config.sparse_poisson_offgrid_refine_enable):
             return None
         selected_positions = np.asarray(
@@ -8076,6 +8081,8 @@ class RotatingShieldPFEstimator:
         data_by_isotope: Mapping[str, MeasurementData],
     ) -> dict[str, Any] | None:
         """Return joint multi-isotope off-grid refinement diagnostics."""
+        from pf.sparse_evidence import refine_sparse_poisson_evidence_offgrid
+
         if not bool(self.pf_config.sparse_poisson_offgrid_refine_enable):
             return None
         if (
@@ -8255,6 +8262,12 @@ class RotatingShieldPFEstimator:
         isotope: str,
     ) -> dict[str, Any] | None:
         """Return direct spectrum-bin sparse evidence diagnostics for one isotope."""
+        from pf.sparse_evidence import (
+            fit_sparse_poisson_spectral_evidence,
+            sparse_poisson_ambiguity_diagnostics,
+            sparse_poisson_evidence_to_diagnostics,
+        )
+
         spectral_start = time.perf_counter()
         stage_wall: Dict[str, float] = {}
         if not bool(self.pf_config.sparse_poisson_spectral_evidence_enable):
@@ -8351,6 +8364,11 @@ class RotatingShieldPFEstimator:
         isotope_names: Sequence[str],
     ) -> dict[str, Any] | None:
         """Refresh joint multi-isotope spectrum-bin sparse evidence diagnostics."""
+        from pf.sparse_evidence import (
+            fit_joint_sparse_poisson_evidence,
+            joint_sparse_poisson_evidence_to_diagnostics,
+        )
+
         joint_start = time.perf_counter()
         stage_wall: Dict[str, float] = {}
         self._last_joint_sparse_poisson_evidence_diagnostics = {}
@@ -8628,6 +8646,8 @@ class RotatingShieldPFEstimator:
         nuisance_parameter_count: int = 0,
     ) -> SparsePoissonEvidenceConfig:
         """Return the all-history sparse Poisson evidence configuration."""
+        from pf.sparse_evidence import SparsePoissonEvidenceConfig
+
         return SparsePoissonEvidenceConfig(
             max_sources=self._report_max_sources_per_isotope(),
             candidate_limit=int(self.pf_config.sparse_poisson_evidence_candidate_limit),
@@ -8856,6 +8876,12 @@ class RotatingShieldPFEstimator:
         background: NDArray[np.float64],
     ) -> dict[str, Any] | None:
         """Update all-history sparse Poisson evidence diagnostics for one isotope."""
+        from pf.sparse_evidence import (
+            fit_sparse_poisson_evidence,
+            sparse_poisson_ambiguity_diagnostics,
+            sparse_poisson_evidence_to_diagnostics,
+        )
+
         evidence_start = time.perf_counter()
         stage_wall: Dict[str, float] = {}
         if not bool(self.pf_config.sparse_poisson_evidence_enable):
@@ -12750,6 +12776,11 @@ class RotatingShieldPFEstimator:
         over the small configured isotope template mapping; no spectrum bins,
         measurements, patches, or response columns are iterated in Python.
         """
+        from pf.surface_map import (
+            aggregate_contiguous_poisson_bins,
+            contiguous_poisson_bin_aggregation,
+        )
+
         counts = np.asarray(history.get("spectrum_counts"), dtype=float)
         if counts.ndim != 2 or counts.shape[1] < 1:
             raise ValueError("surface-map spectrum history must be measurements x bins.")
@@ -12838,6 +12869,8 @@ class RotatingShieldPFEstimator:
         online prune state are not read for candidate selection, isotope columns,
         initialization, response evaluation, or optimization.
         """
+        from pf.surface_map import SurfaceMapConfig, fit_surface_map_poisson
+
         isotope_order = self.configured_isotope_order()
         active_isotopes = tuple(str(isotope) for isotope in self.isotopes)
         payload: Dict[str, Any] = {
@@ -14455,10 +14488,14 @@ class RotatingShieldPFEstimator:
         n_rollouts = int(n_rollouts)
         use_mean_measurement = n_rollouts <= 0
         rollouts = max(1, n_rollouts)
-        if rng_seed is None:
-            rng = np.random.default_rng(np.random.randint(0, 2**32 - 1))
-        else:
-            rng = np.random.default_rng(int(rng_seed))
+        # Planning rollouts must never advance or reseed the global NumPy stream
+        # used by the sequential PF.  Otherwise a live planner call between two
+        # observations makes same-seed MeasurementLog replay diverge.
+        rng = (
+            np.random.default_rng()
+            if rng_seed is None
+            else np.random.default_rng(int(rng_seed))
+        )
         from measurement.shielding import generate_octant_rotation_matrices
 
         RFe_candidates = generate_octant_rotation_matrices()
@@ -14906,8 +14943,6 @@ class RotatingShieldPFEstimator:
         n_rollouts = int(num_rollouts)
         if n_rollouts <= 0 and not use_mean_measurement:
             n_rollouts = 1
-        if rng_seed is not None:
-            np.random.seed(rng_seed)
         return self.expected_uncertainty_after_rotation(
             pose_xyz=detector_pos,
             live_time_per_rot_s=t_short_s,

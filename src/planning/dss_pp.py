@@ -155,9 +155,9 @@ class DSSPPConfig:
     cardinality_bic_parameter_count_per_source: int = 4
     same_isotope_direct_separation_guard: bool = True
     same_isotope_direct_separation_epsilon: float = 1.0e-9
-    include_runtime_rescue_modes: bool = True
+    include_runtime_rescue_modes: bool = False
     runtime_rescue_mode_weight: float = 0.5
-    include_global_surface_rescue_modes: bool = True
+    include_global_surface_rescue_modes: bool = False
     global_surface_rescue_mode_weight: float = 0.75
     recovery_isotopes: tuple[str, ...] = ()
     recovery_isotope_mode_weight_multiplier: float = 2.0
@@ -767,9 +767,9 @@ def extract_signature_modes(
     mode_cluster_radius_m: float = 1.5,
     max_modes_per_isotope: int = 4,
     tentative_weight_multiplier: float = 1.0,
-    include_runtime_rescue_modes: bool = True,
+    include_runtime_rescue_modes: bool = False,
     runtime_rescue_mode_weight: float = 0.5,
-    include_global_surface_rescue_modes: bool = True,
+    include_global_surface_rescue_modes: bool = False,
     global_surface_rescue_mode_weight: float = 0.75,
     weak_mode_weight_floor: float = 0.0,
     dominant_mode_weight_cap: float = 1.0,
@@ -789,14 +789,27 @@ def extract_signature_modes(
         str,
         tuple[NDArray[np.float64], NDArray[np.float64], float],
     ] = {}
-    if bool(include_runtime_rescue_modes):
+    capabilities = getattr(estimator, "profile_capabilities", None)
+    # Capability-bearing estimators are governed by the pure-profile boundary.
+    # Legacy estimator objects have no capability map and retain their historical
+    # opt-in rescue behavior for regression compatibility.
+    allow_batch_candidates = capabilities is None or bool(
+        getattr(capabilities, "batch_candidates_in_planner", False)
+    )
+    include_runtime_rescue_modes = bool(
+        include_runtime_rescue_modes and allow_batch_candidates
+    )
+    include_global_surface_rescue_modes = bool(
+        include_global_surface_rescue_modes and allow_batch_candidates
+    )
+    if include_runtime_rescue_modes:
         rescue_getter = getattr(estimator, "runtime_report_rescue_modes", None)
         if callable(rescue_getter):
             try:
                 rescue_payload = dict(rescue_getter())
             except (RuntimeError, ValueError, TypeError):
                 rescue_payload = {}
-    if bool(include_global_surface_rescue_modes):
+    if include_global_surface_rescue_modes:
         global_rescue_getter = getattr(
             estimator,
             "planning_surface_rescue_modes",
@@ -4020,7 +4033,38 @@ def _cardinality_evidence_gap_pressure(
     estimator: RotatingShieldPFEstimator,
     config: DSSPPConfig,
 ) -> float:
-    """Return planning pressure from unresolved sparse cardinality evidence gaps."""
+    """Return profile-authorized cardinality uncertainty for planning."""
+    capabilities = getattr(estimator, "profile_capabilities", None)
+    pure_profile = capabilities is not None and not bool(
+        getattr(capabilities, "all_history_sparse_evidence", False)
+    )
+    if pure_profile:
+        getter = getattr(estimator, "posterior_cardinality_distribution", None)
+        if not callable(getter):
+            return 0.0
+        distributions = getter()
+        entropies: list[float] = []
+        for payload in distributions.values():
+            if not isinstance(payload, dict):
+                continue
+            probabilities = np.asarray(
+                [max(float(value), 0.0) for value in payload.values()],
+                dtype=float,
+            )
+            total = float(np.sum(probabilities))
+            if total <= 0.0:
+                continue
+            probabilities = probabilities / total
+            positive = probabilities[probabilities > 0.0]
+            if positive.size <= 1:
+                entropies.append(0.0)
+                continue
+            entropy = -float(np.sum(positive * np.log(positive)))
+            entropies.append(entropy / float(np.log(probabilities.size)))
+        return float(np.mean(entropies)) if entropies else 0.0
+
+    # Preserve the historical augmented-estimator diagnostic for objects that
+    # do not opt into the capability-controlled pure runtime.
     target = max(float(config.cardinality_evidence_gap_target), 1.0e-12)
     diagnostics: dict[str, object] = {}
     getter = getattr(estimator, "sparse_poisson_evidence_diagnostics", None)
@@ -6451,8 +6495,12 @@ def select_dss_pp_next_station(
         config=cfg,
     )
     mode_count = sum(len(mode_list) for mode_list in modes.values())
+    profile_capabilities = getattr(estimator, "profile_capabilities", None)
+    allow_batch_candidates = profile_capabilities is None or bool(
+        getattr(profile_capabilities, "batch_candidates_in_planner", False)
+    )
     runtime_rescue_mode_counts: dict[str, int] = {}
-    if bool(cfg.include_runtime_rescue_modes):
+    if bool(cfg.include_runtime_rescue_modes) and allow_batch_candidates:
         rescue_getter = getattr(estimator, "runtime_report_rescue_modes", None)
         if callable(rescue_getter):
             try:
@@ -6464,10 +6512,10 @@ def select_dss_pp_next_station(
                     )
             except (RuntimeError, ValueError, TypeError):
                 runtime_rescue_mode_counts = {}
-    raw_global_counts = getattr(
-        estimator,
-        "_last_planning_surface_rescue_mode_counts",
-        {},
+    raw_global_counts = (
+        getattr(estimator, "_last_planning_surface_rescue_mode_counts", {})
+        if allow_batch_candidates
+        else {}
     )
     global_surface_rescue_mode_counts = (
         {str(key): int(value) for key, value in raw_global_counts.items()}
@@ -6545,6 +6593,16 @@ def select_dss_pp_next_station(
         ),
         "cardinality_evidence_pressure": float(
             _cardinality_evidence_gap_pressure(estimator, cfg)
+        ),
+        "pf_cardinality_pressure": float(
+            _cardinality_evidence_gap_pressure(estimator, cfg)
+        ),
+        "planner_belief_sources": list(
+            getattr(
+                estimator,
+                "planner_belief_sources",
+                ("pf_posterior", "pf_tentative"),
+            )
         ),
         "unresolved_planning_evidence": bool(unresolved_planning_evidence),
         "program_eval_workers": int(program_eval_workers),

@@ -1,0 +1,9 @@
+{
+  "extends": "pf_strict_3d.json",
+  "estimator_profile": "pf_profiled",
+  "measurement_log_output_dir": "logs/pure_pf/geant4_pf_profiled_3d_measurement_log",
+  "conditional_strength_refit": true,
+  "conditional_strength_profile_before_likelihood": true,
+  "refit_after_moves": true,
+  "source_prune_refit_after_remove": false
+}

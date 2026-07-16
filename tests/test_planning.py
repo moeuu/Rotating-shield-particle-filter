@@ -1364,6 +1364,34 @@ def test_expected_uncertainty_after_rotation_stops_with_zero_time() -> None:
     assert u_after == pytest.approx(u0)
 
 
+def test_planning_rollouts_do_not_advance_or_reseed_pf_numpy_stream() -> None:
+    """Planning-only Monte Carlo must be isolated from sequential PF randomness."""
+    est = _build_simple_estimator()
+    np.random.seed(20260717)
+    before = np.random.get_state()
+
+    est.expected_uncertainty_after_rotation(
+        pose_xyz=np.array([0.0, 0.0, 0.0]),
+        live_time_per_rot_s=1.0,
+        tau_ig=1e9,
+        tmax_s=1.0,
+        n_rollouts=0,
+    )
+    est.expected_uncertainty_after_rotation_at_pose(
+        np.array([0.0, 0.0, 0.0]),
+        tau_ig=1e9,
+        t_max_s=1.0,
+        t_short_s=1.0,
+        num_rollouts=0,
+        rng_seed=91,
+    )
+    after = np.random.get_state()
+
+    assert before[0] == after[0]
+    np.testing.assert_array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+
+
 def test_expected_uncertainty_after_rotation_stops_with_large_tau() -> None:
     """Large tau_ig should stop immediately and return current uncertainty."""
     est = _build_simple_estimator()

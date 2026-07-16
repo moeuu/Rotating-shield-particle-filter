@@ -7,17 +7,21 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import matplotlib
 
 from measurement.observation_model import build_runtime_observation_model
+
+if TYPE_CHECKING:
+    from pf.surface_map import SurfaceMapConfig
 
 
 def _has_display() -> bool:
@@ -82,6 +86,127 @@ def _resolve_station_update_modes(
     if joint_observation_update:
         delayed_resample_update = False
     return joint_observation_update, delayed_resample_update
+
+
+def _resolve_required_measurement_log_target(
+    explicit_output: str | None,
+    runtime_config: Mapping[str, Any],
+    *,
+    repository_root: Path,
+) -> Path:
+    """Resolve a mandatory pure-run log target before estimator construction."""
+    raw = (
+        explicit_output
+        if explicit_output not in (None, "")
+        else runtime_config.get("measurement_log_output_dir")
+    )
+    if raw in (None, ""):
+        raise ValueError(
+            "Pure PF live runs require measurement_log_output or "
+            "runtime_config.measurement_log_output_dir before estimation."
+        )
+    target = Path(str(raw)).expanduser()
+    if not target.is_absolute():
+        target = Path(repository_root) / target
+    if target.exists():
+        raise FileExistsError(
+            f"Refusing to replace required pure MeasurementLog {target}."
+        )
+    return target
+
+
+def _truth_free_live_runtime_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove source-realization inputs before publishing PF provenance."""
+
+    def _is_realization_key(key: object) -> bool:
+        normalized = "".join(character for character in str(key).lower() if character.isalnum())
+        if normalized.startswith(("sourcerate", "sourceextent")):
+            return any(
+                marker in normalized
+                for marker in (
+                    "groundtruth",
+                    "layout",
+                    "generation",
+                    "rng",
+                    "seed",
+                )
+            )
+        return (
+            normalized.startswith("randomsource")
+            or normalized.startswith("sourcegeneration")
+            or normalized.startswith("sourcerng")
+            or normalized.startswith("sourcelayout")
+            or normalized
+            in {
+                "sourcecount",
+                "sourceintensity",
+                "sourceseed",
+                "sources",
+                "pointsources",
+                "truesources",
+            }
+        )
+
+    def _sanitize(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {
+                str(key): _sanitize(nested)
+                for key, nested in item.items()
+                if not _is_realization_key(key)
+            }
+        if isinstance(item, list):
+            return [_sanitize(nested) for nested in item]
+        if isinstance(item, tuple):
+            return tuple(_sanitize(nested) for nested in item)
+        return item
+
+    return dict(_sanitize(value))
+
+
+def _build_effective_live_runtime_config(
+    runtime_config: Mapping[str, Any],
+    *,
+    pf_config: object,
+    candidate_sources_xyz: NDArray[np.float64],
+    source_position_bounds: tuple[NDArray[np.float64], NDArray[np.float64]],
+    api_settings: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return one canonical config binding every resolved live-PF input."""
+    candidates = np.asarray(candidate_sources_xyz, dtype=np.float64)
+    if candidates.ndim != 2 or candidates.shape[1] != 3:
+        raise ValueError("candidate_sources_xyz must have shape (N, 3).")
+    lower = np.asarray(source_position_bounds[0], dtype=np.float64).reshape(-1)
+    upper = np.asarray(source_position_bounds[1], dtype=np.float64).reshape(-1)
+    if lower.shape != (3,) or upper.shape != (3,):
+        raise ValueError("source_position_bounds must contain two XYZ vectors.")
+    spacing = np.asarray(
+        api_settings.get("candidate_grid_spacing_m"), dtype=np.float64
+    ).reshape(-1)
+    if spacing.shape != (3,) or np.any(~np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError(
+            "api_settings.candidate_grid_spacing_m must be a positive XYZ vector."
+        )
+    payload = _truth_free_live_runtime_config(runtime_config)
+    payload["effective_pf_replay"] = {
+        "api_settings": json_safe(dict(api_settings)),
+        "pf_config": json_safe(pf_config),
+        "candidate_grid": {
+            "generator": "realtime_source_candidate_grid.v1",
+            "point_count": int(candidates.shape[0]),
+            "xyz_sha256": sha256_json(candidates),
+            "spacing_xyz_m": json_safe(
+                spacing
+            ),
+            "margin_m": float(api_settings.get("candidate_grid_margin_m", 0.0)),
+            "source_surface_prior": bool(
+                api_settings.get("source_surface_prior", False)
+            ),
+            "obstacle_height_m": float(api_settings.get("obstacle_height_m", 2.0)),
+            "position_min_xyz_m": json_safe(lower),
+            "position_max_xyz_m": json_safe(upper),
+        },
+    }
+    return dict(json_safe(payload))
 
 
 def _resolve_random_source_isotopes(
@@ -220,8 +345,9 @@ from pf.likelihood import (
     expected_counts_per_source,
 )
 from pf.parallel import Measurement
-from pf.estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
-from pf.surface_map import SurfaceMapConfig
+from pf.pure_estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
+from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
+from pf.provenance import json_safe, repository_commit, sha256_json
 from planning.candidate_generation import (
     generate_candidate_poses,
     resolve_detector_height_actions,
@@ -279,6 +405,7 @@ from mission_control import (
     report_model_order_ready_for_stop as _report_model_order_ready_for_stop,
     report_model_order_simple_ready_for_stop as _report_model_order_simple_ready_for_stop,
     resolve_mission_max_poses as _resolve_mission_max_poses,
+    resolve_mission_max_steps as _resolve_mission_max_steps,
     sparse_cardinality_evidence_gap_unresolved as _sparse_gap_unresolved,
 )
 from runtime_defaults import (
@@ -293,6 +420,101 @@ from runtime_defaults import (
     DEFAULT_ROTATION_OVERHEAD_S,
 )
 from runtime_environment import build_runtime_obstacle_environment
+from runtime.measurement_log import (
+    MeasurementLogRecord,
+    MeasurementLogStreamWriter,
+    build_forward_model_manifest,
+)
+
+
+def _pure_pf_profile_active(estimator: object) -> bool:
+    """Return whether batch/report capabilities are forbidden for this estimator."""
+    capabilities = getattr(estimator, "profile_capabilities", None)
+    return capabilities is not None and not any(
+        bool(getattr(capabilities, field, False))
+        for field in (
+            "all_history_sparse_evidence",
+            "report_mle_rescue",
+            "surface_map_reconstruction",
+            "batch_model_order_selection",
+            "batch_strength_refit",
+            "batch_candidates_in_planner",
+            "batch_evidence_in_mission_stop",
+            "batch_evidence_in_adaptive_dwell",
+        )
+    )
+
+
+def _pure_pf_primary_estimates(
+    estimator: object,
+    isotopes: Sequence[str],
+) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] | None:
+    """Return an unfiltered PF-posterior projection for a pure profile."""
+    if not _pure_pf_profile_active(estimator):
+        return None
+    getter = getattr(estimator, "estimates", None)
+    if not callable(getter):
+        raise RuntimeError("A pure PF must expose its posterior estimates projection.")
+    raw = getter()
+    return {
+        str(isotope): (
+            np.asarray(
+                raw.get(str(isotope), (np.zeros((0, 3)), np.zeros(0)))[0],
+                dtype=float,
+            ).reshape(-1, 3),
+            np.asarray(
+                raw.get(str(isotope), (np.zeros((0, 3)), np.zeros(0)))[1],
+                dtype=float,
+            ).reshape(-1),
+        )
+        for isotope in isotopes
+    }
+
+
+_PURE_PF_SUMMARY_PROVENANCE_KEYS = (
+    "schema_version",
+    "estimator_family",
+    "estimator_variant",
+    "estimator_profile",
+    "final_estimate_source",
+    "uses_all_history_batch_fit",
+    "uses_surface_map",
+    "uses_batch_model_order",
+    "batch_feedback_to_particles",
+    "batch_methods_invoked",
+    "planner_belief_sources",
+    "repository_commit",
+    "measurement_log_schema_version",
+    "measurement_log_sha256",
+    "config_sha256",
+    "resolved_config_sha256",
+    "random_seed",
+    "profile_capability_map",
+)
+
+
+def _pure_pf_summary_provenance(estimator: object) -> dict[str, Any]:
+    """Embed mandatory pure-PF provenance in every legacy summary result."""
+    if not _pure_pf_profile_active(estimator):
+        return {}
+    snapshot_getter = getattr(estimator, "posterior_snapshot", None)
+    if not callable(snapshot_getter):
+        raise RuntimeError("A pure PF result requires posterior_snapshot provenance.")
+    snapshot = snapshot_getter()
+    serializer = getattr(snapshot, "to_dict", None)
+    if not callable(serializer):
+        raise RuntimeError("A pure PF posterior snapshot must be serializable.")
+    payload = dict(serializer())
+    missing = [key for key in _PURE_PF_SUMMARY_PROVENANCE_KEYS if key not in payload]
+    if missing:
+        raise RuntimeError(
+            "Pure PF posterior provenance is incomplete: " + ", ".join(missing)
+        )
+    return {
+        **{key: payload[key] for key in _PURE_PF_SUMMARY_PROVENANCE_KEYS},
+        "estimator_provenance": dict(payload.get("provenance", {})),
+        "pf_posterior": payload,
+    }
 from sim import (
     SimulationCommand,
     SimulationObservation,
@@ -628,7 +850,9 @@ def _final_estimate_source_status(
 ) -> dict[str, list[dict[str, object]]]:
     """Return confirmed/tentative status metadata for final reported sources."""
     diagnostics: dict[str, Any] = {}
-    if hasattr(estimator, "report_model_order_diagnostics"):
+    if not _pure_pf_profile_active(estimator) and hasattr(
+        estimator, "report_model_order_diagnostics"
+    ):
         try:
             diagnostics = dict(estimator.report_model_order_diagnostics())
         except (RuntimeError, ValueError, TypeError):
@@ -2996,6 +3220,8 @@ def _log_report_model_order_diagnostics(
     label: str,
 ) -> None:
     """Log report-level model-order selection diagnostics."""
+    if _pure_pf_profile_active(estimator):
+        return
     if not hasattr(estimator, "report_model_order_diagnostics"):
         return
     diagnostics = estimator.report_model_order_diagnostics()
@@ -5145,6 +5371,8 @@ def _surface_map_config_from_runtime_config(
     runtime_config: Mapping[str, object],
 ) -> SurfaceMapConfig:
     """Build the PF-independent L1+TV surface solver configuration."""
+    from pf.surface_map import SurfaceMapConfig
+
     return SurfaceMapConfig(
         l1_weight=max(0.0, float(runtime_config.get("surface_map_l1_weight", 0.0))),
         tv_weight=max(0.0, float(runtime_config.get("surface_map_tv_weight", 0.0))),
@@ -6261,7 +6489,8 @@ def _adaptive_mission_stop_reason(
     """Return an adaptive mission-stop reason when exploration is sufficiently complete."""
     if len(visited_poses_xyz) < max(1, int(min_poses)):
         return None
-    report_simple_ready = bool(allow_report_simple_stop) and (
+    pure_pf = _pure_pf_profile_active(estimator)
+    report_simple_ready = not pure_pf and bool(allow_report_simple_stop) and (
         _report_model_order_simple_ready_for_stop(
             estimator,
             remaining_measurement_estimate=remaining_measurement_estimate,
@@ -6279,9 +6508,8 @@ def _adaptive_mission_stop_reason(
             refresh_estimates=False,
         )
     )
-    report_ready = _report_model_order_ready_for_stop(
-        estimator,
-        refresh_estimates=False,
+    report_ready = pure_pf or _report_model_order_ready_for_stop(
+        estimator, refresh_estimates=False
     )
     if bool(require_model_order_ready) and not (report_ready or report_simple_ready):
         return None
@@ -6323,9 +6551,8 @@ def _adaptive_mission_stop_reason(
             min_support=int(birth_residual_min_support),
         ):
             return None
-        if not _report_model_order_ready_for_stop(
-            estimator,
-            refresh_estimates=False,
+        if not pure_pf and not _report_model_order_ready_for_stop(
+            estimator, refresh_estimates=False
         ):
             return None
         if bool(
@@ -6375,6 +6602,8 @@ def _posterior_cardinality_summary(filt: object) -> tuple[float, float]:
 
 def _report_model_order_matches_posterior(estimator: object) -> bool:
     """Return True when report-level source count agrees with PF cardinality."""
+    if _pure_pf_profile_active(estimator):
+        return True
     pf_config = getattr(estimator, "pf_config", None)
     if not bool(getattr(pf_config, "report_model_order_require_posterior_match", True)):
         return True
@@ -6423,9 +6652,8 @@ def _all_pf_filters_converged(
             return False
         if not bool(getattr(filt, "is_converged", False)):
             return False
-    if not _report_model_order_ready_for_stop(
-        estimator,
-        refresh_estimates=bool(refresh_estimates),
+    if not _pure_pf_profile_active(estimator) and not _report_model_order_ready_for_stop(
+        estimator, refresh_estimates=bool(refresh_estimates)
     ):
         return False
     if not _report_model_order_matches_posterior(estimator):
@@ -6448,6 +6676,28 @@ def _source_cardinality_dwell_status(
     report model should have a stable model order and a reasonably conditioned
     response matrix before adaptive dwell is allowed to stop at its minimum.
     """
+    if _pure_pf_profile_active(estimator):
+        filters = getattr(estimator, "filters", {})
+        if not isinstance(filters, dict) or not filters:
+            return False, "no_pf_posterior"
+        variance_limit = max(
+            float(
+                getattr(
+                    getattr(estimator, "pf_config", None),
+                    "converge_cardinality_var_max",
+                    0.05,
+                )
+            ),
+            0.0,
+        )
+        pending = [
+            str(isotope)
+            for isotope, filt in sorted(filters.items())
+            if _posterior_cardinality_summary(filt)[1] > variance_limit + 1.0e-9
+        ]
+        if pending:
+            return False, f"pf_cardinality_variance:{','.join(pending)}"
+        return True, "pf_cardinality_ready"
     if bool(refresh_estimates):
         try:
             estimator.estimates()
@@ -6592,6 +6842,44 @@ def _has_unresolved_discriminative_pseudo_failures(
 
 def _final_model_order_status(estimator: object) -> dict[str, Any]:
     """Return compact model-order and pseudo-source diagnostics for JSON output."""
+    if _pure_pf_profile_active(estimator):
+        getter = getattr(estimator, "posterior_cardinality_distribution", None)
+        distributions = dict(getter()) if callable(getter) else {}
+        cardinality: dict[str, dict[str, Any]] = {}
+        for isotope, distribution_raw in sorted(distributions.items()):
+            distribution = {
+                int(key): max(float(value), 0.0)
+                for key, value in dict(distribution_raw).items()
+            }
+            total = float(sum(distribution.values()))
+            if total > 0.0:
+                distribution = {
+                    key: value / total for key, value in distribution.items()
+                }
+            counts = np.asarray(list(distribution), dtype=float)
+            probabilities = np.asarray(list(distribution.values()), dtype=float)
+            mean = float(np.sum(counts * probabilities)) if counts.size else 0.0
+            variance = (
+                float(np.sum(probabilities * (counts - mean) ** 2))
+                if counts.size
+                else 0.0
+            )
+            positive = probabilities[probabilities > 0.0]
+            entropy = float(-np.sum(positive * np.log(positive)))
+            cardinality[str(isotope)] = {
+                "distribution": {
+                    str(key): float(value)
+                    for key, value in sorted(distribution.items())
+                },
+                "mean": mean,
+                "variance": variance,
+                "entropy_nats": entropy,
+            }
+        return {
+            "source": "pf_posterior",
+            "uses_batch_model_order": False,
+            "pf_cardinality": cardinality,
+        }
     if hasattr(estimator, "estimates"):
         try:
             estimator.estimates()
@@ -7835,6 +8123,7 @@ def run_live_pf(
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
     output_tag: str | None = None,
+    measurement_log_output: str | None = None,
     pose_candidates: int = 64,
     pose_min_dist: float = 3.0,
     return_state: bool = False,
@@ -7893,6 +8182,8 @@ def run_live_pf(
         pf_config_overrides: Optional overrides applied to the PF configuration.
         save_outputs: When False, skip writing plots and snapshot images.
         output_tag: Optional tag appended to result output filenames.
+        measurement_log_output: Truth-free log directory. Pure runs require this
+            argument or runtime_config.measurement_log_output_dir.
         pose_candidates: Number of pose candidates to generate per step.
         pose_min_dist: Minimum distance from visited poses for candidates (meters).
         return_state: When True, return the estimator for inspection/testing.
@@ -7961,7 +8252,16 @@ def run_live_pf(
     )
     notifier = PiplupNotifier(notification_config)
     live = _coerce_live_visualization(live)
-    runtime_config = load_runtime_config(sim_config_path)
+    if sim_config_path is None:
+        input_config_hash = sha256_json({})
+    else:
+        input_config_hash = hashlib.sha256(
+            Path(sim_config_path).expanduser().read_bytes()
+        ).hexdigest()
+    runtime_config = enforce_pure_runtime_settings(load_runtime_config(sim_config_path))
+    joint_observation_update, delayed_resample_update = _resolve_station_update_modes(
+        runtime_config
+    )
     adaptive_ready_allow_informative_low = bool(
         runtime_config.get("adaptive_ready_allow_informative_low", False)
     )
@@ -8100,6 +8400,15 @@ def run_live_pf(
         .lower()
     )
     RuntimeCountExtractor.validate_count_method(spectrum_count_method)
+    if spectrum_count_method != "response_poisson":
+        raise ValueError(
+            "Pure PF live runs require spectrum_count_method='response_poisson'."
+        )
+    measurement_log_target = _resolve_required_measurement_log_target(
+        measurement_log_output,
+        runtime_config,
+        repository_root=ROOT,
+    )
     if min_peaks_by_isotope is None:
         min_peaks_by_isotope = dict(DETECT_MIN_PEAKS_BY_ISOTOPE)
     detect_threshold_rel_by_isotope = dict(DETECT_REL_THRESH_BY_ISOTOPE)
@@ -8541,6 +8850,25 @@ def run_live_pf(
     isotopes = list(
         _resolve_candidate_isotopes(runtime_config, decomposer.isotope_names)
     )
+    measurement_log_runtime_config = _truth_free_live_runtime_config(runtime_config)
+    measurement_log_runtime_config.update(
+        {
+            "sim_backend": str(sim_backend),
+            "spectrum_count_method": str(spectrum_count_method),
+            "candidate_isotopes": [str(value) for value in isotopes],
+            "source_rate_model": "detector_cps_1m",
+            "environment_mode": str(normalized_environment_mode),
+            "joint_observation_update": bool(joint_observation_update),
+            "delayed_resample_update": bool(delayed_resample_update),
+        }
+    )
+    pf_random_seed = int(
+        runtime_config.get(
+            "pf_random_seed",
+            runtime_config.get("random_seed", runtime_config.get("rng_seed", 0)),
+        )
+    )
+    np.random.seed(pf_random_seed)
     print(
         "PF candidate isotopes: "
         f"{isotopes} (spectrum_library={list(decomposer.isotope_names)})"
@@ -9524,6 +9852,7 @@ def run_live_pf(
         int(_shield_view_ratio_config_value("min_views", 2)),
     )
     adaptive_mission_stop = bool(runtime_config.get("adaptive_mission_stop", False))
+    max_steps = _resolve_mission_max_steps(max_steps, runtime_config)
     max_poses = _resolve_mission_max_poses(max_poses, runtime_config)
     mission_stop_min_convergence_poses = max(
         1,
@@ -9778,6 +10107,7 @@ def run_live_pf(
         structural_trial_parallel_min_trials,
     ) = _resolve_structural_trial_parallelism(runtime_config)
     pf_conf = RotatingShieldPFConfig(
+        estimator_profile=str(runtime_config.get("estimator_profile", "pf_strict")),
         num_particles=num_particles,
         min_particles=num_particles,
         max_particles=num_particles,
@@ -11250,9 +11580,6 @@ def run_live_pf(
             pf_conf.init_num_sources = (1, 1)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
-    joint_observation_update, delayed_resample_update = _resolve_station_update_modes(
-        runtime_config
-    )
     strict_planned_shield_program = bool(
         runtime_config.get(
             "strict_planned_shield_program",
@@ -11468,6 +11795,52 @@ def run_live_pf(
     pf_source_extent_radius_m = observation_model.source_extent_radius_m
     pf_source_extent_samples = observation_model.source_extent_samples
 
+    # This is the sole effective configuration hashed into live PF provenance,
+    # the MeasurementLog, and the forward-model manifest.  Apply the pure
+    # capability boundary before serializing it so hostile API overrides cannot
+    # survive in provenance while being disabled later by the estimator.
+    apply_profile_to_config(pf_conf)
+    measurement_log_runtime_config = _build_effective_live_runtime_config(
+        measurement_log_runtime_config,
+        pf_config=pf_conf,
+        candidate_sources_xyz=np.asarray(grid, dtype=np.float64),
+        source_position_bounds=(
+            np.asarray(source_position_min, dtype=np.float64),
+            np.asarray(source_position_max, dtype=np.float64),
+        ),
+        api_settings={
+            "max_steps": max_steps,
+            "max_poses": max_poses,
+            "birth_enabled": bool(birth_enabled),
+            "num_particles": int(num_particles),
+            "candidate_grid_spacing_m": list(spacing),
+            "candidate_grid_margin_m": float(candidate_grid_margin),
+            "source_surface_prior": bool(source_surface_prior),
+            "obstacle_height_m": float(
+                runtime_config.get("obstacle_height_m", 2.0)
+            ),
+            "pose_candidates": int(pose_candidates),
+            "pose_min_dist_m": float(pose_min_dist),
+            "path_planner": str(path_planner_resolved),
+            "dss_pp": json_safe(dss_config),
+            "measurement_time_s": float(live_time),
+            "adaptive_dwell": bool(adaptive_dwell),
+            "adaptive_dwell_chunk_s": float(adaptive_dwell_chunk_s),
+            "adaptive_min_dwell_s": float(adaptive_min_dwell_s),
+            "adaptive_ready_min_counts": float(adaptive_ready_min_counts),
+            "adaptive_ready_min_isotopes": int(adaptive_ready_min_isotopes),
+            "adaptive_ready_min_snr": float(adaptive_ready_min_snr),
+            "nominal_motion_speed_m_s": float(nominal_motion_speed_m_s),
+            "rotation_overhead_s": float(rotation_overhead_s),
+            "joint_observation_update": bool(joint_observation_update),
+            "delayed_resample_update": bool(delayed_resample_update),
+            "pf_random_seed": int(pf_random_seed),
+            "sim_backend": str(sim_backend),
+            "environment_mode": str(normalized_environment_mode),
+        },
+    )
+    measurement_log_config_hash = sha256_json(measurement_log_runtime_config)
+
     def _build_estimator() -> tuple[
         RotatingShieldPFEstimator, NDArray[np.float64], int
     ]:
@@ -11490,6 +11863,9 @@ def run_live_pf(
             source_extent_samples=pf_source_extent_samples,
             line_mu_by_isotope=line_mu_by_isotope,
             transport_response_model=transport_response_model,
+            config_hash=input_config_hash,
+            resolved_config_hash=measurement_log_config_hash,
+            random_seed=pf_random_seed,
         )
         pose_local = np.array(env.detector_position, dtype=float)
         estimator_local.add_measurement_pose(pose_local)
@@ -11637,6 +12013,9 @@ def run_live_pf(
         report candidates, so final close-merge is reserved for legacy fallbacks
         and must not collapse BIC-selected multi-source reports.
         """
+        pure_estimates = _pure_pf_primary_estimates(estimator_final, isotope_list)
+        if pure_estimates is not None:
+            return pure_estimates
         if not use_pruning:
             raw_estimates = estimator_final.estimates()
             final_estimates: dict[
@@ -11716,6 +12095,8 @@ def run_live_pf(
         dict[str, dict[str, float | int | bool | str]],
     ]:
         """Apply the configured final absent-isotope filter to estimates."""
+        if _pure_pf_profile_active(estimator):
+            return estimates_in, {}
         return _filter_absent_final_estimates(
             estimates_in,
             estimator.measurements,
@@ -11782,6 +12163,51 @@ def run_live_pf(
         plt.close(preview_viz.fig)
 
     estimator, current_pose, current_pose_idx = _build_estimator()
+    measurement_log_writer: MeasurementLogStreamWriter | None = None
+    if measurement_log_target is not None:
+        environment_payload: dict[str, Any] = {
+            "environment_model_id": str(
+                runtime_config.get(
+                    "environment_model_id",
+                    f"{normalized_environment_mode}_environment.v1",
+                )
+            ),
+            "size_x": float(env.size_x),
+            "size_y": float(env.size_y),
+            "size_z": float(env.size_z),
+            "detector_position": [float(value) for value in env.detector_position],
+            "environment_mode": str(normalized_environment_mode),
+            "obstacle_grid": (
+                None if obstacle_grid is None else obstacle_grid.to_dict()
+            ),
+        }
+        commit = repository_commit()
+        forward_manifest = build_forward_model_manifest(
+            runtime_config=measurement_log_runtime_config,
+            environment=environment_payload,
+            obstacle_layout_path=obstacle_layout_path,
+            isotopes=isotopes,
+            repository_commit=commit,
+            resolved_config_sha256=measurement_log_config_hash,
+            run_root=measurement_log_target,
+            repository_root=ROOT,
+        )
+        measurement_log_writer = MeasurementLogStreamWriter(
+            measurement_log_target,
+            run_id=str(
+                runtime_config.get(
+                    "measurement_log_run_id",
+                    measurement_log_target.name,
+                )
+            ),
+            repository_commit=commit,
+            runtime_config=measurement_log_runtime_config,
+            environment=environment_payload,
+            forward_model_manifest=forward_manifest,
+            isotopes=isotopes,
+            metadata={"acquisition": "live_append_before_pf_update"},
+            obstacle_layout_path=obstacle_layout_path,
+        )
     viz = _build_visualizer()
     cui_split_viz = _build_cui_split_visualizer()
     if live:
@@ -12068,6 +12494,8 @@ def run_live_pf(
         label: str,
     ) -> DSSPPConfig:
         """Return the DSS-PP config with adaptive shield-program length applied."""
+        if _pure_pf_profile_active(estimator):
+            return config
         sparse_diagnostics: Mapping[str, Any] = {}
         sparse_getter = getattr(estimator, "sparse_poisson_evidence_diagnostics", None)
         if callable(sparse_getter):
@@ -12253,7 +12681,9 @@ def run_live_pf(
         max_steps = None
     if max_poses is not None and max_poses <= 0:
         max_poses = None
-    gpu_status = "enabled" if estimator._gpu_enabled() else "disabled"
+    gpu_status = "disabled"
+    if bool(estimator.pf_config.use_gpu):
+        gpu_status = "enabled" if estimator._gpu_enabled() else "disabled"
     cfg = decomposer.config
     dwell_cap_label = f"{live_time:.3f}" if has_live_time_cap else "unbounded"
     dwell_step_label = f"{live_time:.1f}" if has_live_time_cap else "unbounded"
@@ -13530,15 +13960,10 @@ def run_live_pf(
                         )
                 _reactivate_online_absent_isotopes(raw_detected_isotopes)
                 pf_isotopes = list(estimator.isotopes)
-                # Preserve every configured response template for the independent
-                # final surface MLE; the online PF count update remains gated below.
-                spectrum_payload = _spectrum_evidence_payload(
-                    decomposer,
-                    spectrum,
-                    live_time_s=float(actual_live_time_s),
-                    spectrum_variance=spectrum_variance,
-                    isotopes=isotopes,
-                )
+                # The scientific baseline is a response_poisson count-domain PF.
+                # Raw bins remain in MeasurementLog for standalone MLE/ablations
+                # and must never enter the online PF likelihood a second time.
+                spectrum_payload = None
                 z_k_full = {iso: float(z_detected.get(iso, 0.0)) for iso in pf_isotopes}
                 z_variance_full = {
                     iso: float(
@@ -13614,13 +14039,32 @@ def run_live_pf(
                 planned_pose_error_m = float(
                     np.linalg.norm(pose_for_pf - np.asarray(pose, dtype=float))
                 )
-                if planned_pose_error_m > detector_pose_consistency_tolerance_m:
+                if rotation_count == 0:
+                    if planned_pose_error_m > detector_pose_consistency_tolerance_m:
+                        raise RuntimeError(
+                            "Simulator detector pose does not match the planned PF "
+                            f"pose: planned={np.asarray(pose, dtype=float).tolist()} "
+                            f"observed={pose_for_pf.tolist()} "
+                            f"error_m={planned_pose_error_m:.6g} "
+                            "(check detector-height actuation and simulator pose "
+                            "wiring)."
+                        )
+                    # The observation pose is the scientific likelihood input.
+                    # Synchronize the still-unused station pose before the first
+                    # update so the log and replay use bit-identical geometry.
+                    estimator.poses[current_pose_idx] = pose_for_pf.copy()
+                    estimator.kernel_cache = None
+                    estimator._invalidate_report_cache()
+                    pose = pose_for_pf.copy()
+                    current_pose = pose_for_pf.copy()
+                elif not np.array_equal(
+                    np.asarray(estimator.poses[current_pose_idx], dtype=float),
+                    pose_for_pf,
+                ):
                     raise RuntimeError(
-                        "Simulator detector pose does not match the planned PF pose: "
-                        f"planned={np.asarray(pose, dtype=float).tolist()} "
-                        f"observed={pose_for_pf.tolist()} "
-                        f"error_m={planned_pose_error_m:.6g} "
-                        "(check detector-height actuation and simulator pose wiring)."
+                        "Simulator detector pose changed within one PF station; "
+                        "pure replay requires an exact station pose after the "
+                        "first observation."
                     )
                 meas = Measurement(
                     counts_by_isotope=z_k,
@@ -13635,6 +14079,66 @@ def run_live_pf(
                     detector_position=pose_for_pf,
                 )
                 last_measurement_for_diagnostics = meas
+                if measurement_log_writer is not None:
+                    log_covariance_payload = _metadata_count_covariance(
+                        observation.metadata,
+                        {str(isotope) for isotope in isotopes},
+                    )
+                    log_covariance = np.diag(
+                        [float(history_z_variance[isotope]) for isotope in isotopes]
+                    ).astype(np.float64)
+                    if isinstance(log_covariance_payload, Mapping):
+                        for row_index, row_isotope in enumerate(isotopes):
+                            row_payload = log_covariance_payload.get(row_isotope, {})
+                            if not isinstance(row_payload, Mapping):
+                                continue
+                            for column_index, column_isotope in enumerate(isotopes):
+                                if column_isotope in row_payload:
+                                    log_covariance[row_index, column_index] = float(
+                                        row_payload[column_isotope]
+                                    )
+                    measurement_log_writer.append_before_update(
+                        MeasurementLogRecord(
+                            step_id=int(step_counter),
+                            action_id=int(step_counter),
+                            station_id=int(pose_counter),
+                            detector_pose_xyz=tuple(
+                                float(value) for value in pose_for_pf
+                            ),
+                            detector_quat_wxyz=tuple(
+                                float(value)
+                                for value in observation.detector_quat_wxyz
+                            ),
+                            fe_orientation_index=int(fe_idx),
+                            pb_orientation_index=int(pb_idx),
+                            live_time_s=float(actual_live_time_s),
+                            travel_time_s=float(step_motion_time_s),
+                            shield_actuation_time_s=float(step_rotation_time_s),
+                            energy_bin_edges_keV=np.asarray(
+                                observation.energy_bin_edges_keV,
+                                dtype=np.float64,
+                            ),
+                            spectrum_counts=np.asarray(spectrum, dtype=np.float64),
+                            spectrum_variance=(
+                                None
+                                if spectrum_variance is None
+                                else np.asarray(
+                                    spectrum_variance,
+                                    dtype=np.float64,
+                                )
+                            ),
+                            isotope_counts=dict(history_z_k),
+                            isotope_count_covariance=log_covariance,
+                            metadata={
+                                "backend": str(
+                                    observation.metadata.get("backend", sim_backend)
+                                ),
+                                "spectrum_count_method": str(spectrum_count_method),
+                                "dwell_ready_reason": str(dwell_ready_reason),
+                                "dwell_chunks": int(dwell_chunks),
+                            },
+                        )
+                    )
                 pf_start = time.perf_counter()
                 if joint_observation_update:
                     joint_record: tuple[object, ...] = (
@@ -13900,6 +14404,10 @@ def run_live_pf(
                 pose_elapsed += actual_live_time_s + step_rotation_time_s
                 if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
                     break
+            if measurement_log_writer is not None and rotation_count > 0:
+                measurement_log_writer.mark_station_complete_before_update(
+                    int(pose_counter)
+                )
             if delayed_resample_update:
                 pf_start = time.perf_counter()
                 finalized_measurements = estimator.finalize_deferred_pose_update()
@@ -13986,43 +14494,10 @@ def run_live_pf(
                     pruned_display_force_refresh = True
             elif joint_observation_update and joint_update_records:
                 pf_start = time.perf_counter()
-                if len(joint_update_records) == 1:
-                    normalized_joint = (
-                        RotatingShieldPFEstimator._normalize_pair_sequence_record(
-                            joint_update_records[0]
-                        )
-                    )
-                    (
-                        z_joint,
-                        fe_joint,
-                        pb_joint,
-                        live_joint,
-                        var_joint,
-                        cov_joint,
-                        spectrum_payload_joint,
-                    ) = normalized_joint
-                    update_kwargs = {}
-                    if cov_joint is not None:
-                        update_kwargs["z_covariance_k"] = cov_joint
-                    if spectrum_payload_joint is not None and _callable_accepts_keyword(
-                        estimator.update_pair,
-                        "spectrum_payload",
-                    ):
-                        update_kwargs["spectrum_payload"] = spectrum_payload_joint
-                    estimator.update_pair(
-                        z_k=z_joint,
-                        pose_idx=current_pose_idx,
-                        fe_index=fe_joint,
-                        pb_index=pb_joint,
-                        live_time_s=live_joint,
-                        z_variance_k=var_joint,
-                        **update_kwargs,
-                    )
-                else:
-                    estimator.update_pair_sequence(
-                        joint_update_records,
-                        pose_idx=current_pose_idx,
-                    )
+                estimator.update_pair_sequence(
+                    joint_update_records,
+                    pose_idx=current_pose_idx,
+                )
                 if estimator.last_strength_prior_diagnostics:
                     for iso, stats in sorted(
                         estimator.last_strength_prior_diagnostics.items()
@@ -14172,39 +14647,42 @@ def run_live_pf(
                     )
                     else None
                 )
-                report_simple_ready_for_low_ig = bool(
-                    mission_stop_report_simple_enable
-                ) and _report_model_order_simple_ready_for_stop(
-                    estimator,
-                    remaining_measurement_estimate=remaining_stop_estimate,
-                    max_sources_per_isotope=(
-                        mission_stop_report_simple_max_sources_per_isotope
-                    ),
-                    min_bic_margin=mission_stop_report_simple_min_bic_margin,
-                    max_condition_number=(
-                        mission_stop_report_simple_max_condition_number
-                    ),
-                    max_response_correlation=(
-                        mission_stop_report_simple_max_response_correlation
-                    ),
-                    residual_budget_threshold=(
-                        mission_stop_report_simple_residual_budget_threshold
-                    ),
-                    ambiguity_budget_threshold=(
-                        mission_stop_report_simple_ambiguity_budget_threshold
-                    ),
-                    allow_high_surface_ambiguity=(
-                        mission_stop_report_simple_allow_high_surface_ambiguity
-                    ),
-                    require_no_birth_residual=False,
-                    birth_residual_min_support=(
-                        mission_stop_birth_residual_min_support
-                    ),
-                    refresh_estimates=False,
+                report_simple_ready_for_low_ig = (
+                    not _pure_pf_profile_active(estimator)
+                    and bool(mission_stop_report_simple_enable)
+                    and _report_model_order_simple_ready_for_stop(
+                        estimator,
+                        remaining_measurement_estimate=remaining_stop_estimate,
+                        max_sources_per_isotope=(
+                            mission_stop_report_simple_max_sources_per_isotope
+                        ),
+                        min_bic_margin=mission_stop_report_simple_min_bic_margin,
+                        max_condition_number=(
+                            mission_stop_report_simple_max_condition_number
+                        ),
+                        max_response_correlation=(
+                            mission_stop_report_simple_max_response_correlation
+                        ),
+                        residual_budget_threshold=(
+                            mission_stop_report_simple_residual_budget_threshold
+                        ),
+                        ambiguity_budget_threshold=(
+                            mission_stop_report_simple_ambiguity_budget_threshold
+                        ),
+                        allow_high_surface_ambiguity=(
+                            mission_stop_report_simple_allow_high_surface_ambiguity
+                        ),
+                        require_no_birth_residual=False,
+                        birth_residual_min_support=(
+                            mission_stop_birth_residual_min_support
+                        ),
+                        refresh_estimates=False,
+                    )
                 )
                 if (
                     (
                         not bool(mission_stop_require_model_order_ready)
+                        or _pure_pf_profile_active(estimator)
                         or _report_model_order_ready_for_stop(
                             estimator,
                             refresh_estimates=False,
@@ -14304,45 +14782,52 @@ def run_live_pf(
                 remaining_unresolved = not _remaining_measurement_ready_for_stop(
                     remaining_stop_estimate
                 )
-                report_simple_ready_at_cap = bool(
-                    mission_stop_report_simple_enable
-                ) and _report_model_order_simple_ready_for_stop(
-                    estimator,
-                    remaining_measurement_estimate=remaining_stop_estimate,
-                    max_sources_per_isotope=(
-                        mission_stop_report_simple_max_sources_per_isotope
-                    ),
-                    min_bic_margin=mission_stop_report_simple_min_bic_margin,
-                    max_condition_number=(
-                        mission_stop_report_simple_max_condition_number
-                    ),
-                    max_response_correlation=(
-                        mission_stop_report_simple_max_response_correlation
-                    ),
-                    residual_budget_threshold=(
-                        mission_stop_report_simple_residual_budget_threshold
-                    ),
-                    ambiguity_budget_threshold=(
-                        mission_stop_report_simple_ambiguity_budget_threshold
-                    ),
-                    allow_high_surface_ambiguity=(
-                        mission_stop_report_simple_allow_high_surface_ambiguity
-                    ),
-                    require_no_birth_residual=False,
-                    birth_residual_min_support=(
-                        mission_stop_birth_residual_min_support
-                    ),
-                    refresh_estimates=False,
-                )
-                model_order_unresolved = not (
-                    _report_model_order_ready_for_stop(
+                report_simple_ready_at_cap = (
+                    not _pure_pf_profile_active(estimator)
+                    and bool(mission_stop_report_simple_enable)
+                    and _report_model_order_simple_ready_for_stop(
                         estimator,
+                        remaining_measurement_estimate=remaining_stop_estimate,
+                        max_sources_per_isotope=(
+                            mission_stop_report_simple_max_sources_per_isotope
+                        ),
+                        min_bic_margin=mission_stop_report_simple_min_bic_margin,
+                        max_condition_number=(
+                            mission_stop_report_simple_max_condition_number
+                        ),
+                        max_response_correlation=(
+                            mission_stop_report_simple_max_response_correlation
+                        ),
+                        residual_budget_threshold=(
+                            mission_stop_report_simple_residual_budget_threshold
+                        ),
+                        ambiguity_budget_threshold=(
+                            mission_stop_report_simple_ambiguity_budget_threshold
+                        ),
+                        allow_high_surface_ambiguity=(
+                            mission_stop_report_simple_allow_high_surface_ambiguity
+                        ),
+                        require_no_birth_residual=False,
+                        birth_residual_min_support=(
+                            mission_stop_birth_residual_min_support
+                        ),
                         refresh_estimates=False,
                     )
-                    or (report_simple_ready_at_cap and not remaining_unresolved)
+                )
+                model_order_unresolved = (
+                    False
+                    if _pure_pf_profile_active(estimator)
+                    else not (
+                        _report_model_order_ready_for_stop(
+                            estimator,
+                            refresh_estimates=False,
+                        )
+                        or (report_simple_ready_at_cap and not remaining_unresolved)
+                    )
                 )
                 can_extend = (
-                    bool(mission_stop_soft_extend_on_unresolved)
+                    not _pure_pf_profile_active(estimator)
+                    and bool(mission_stop_soft_extend_on_unresolved)
                     and soft_pose_extension_used
                     < int(mission_stop_soft_extension_poses)
                     and (remaining_unresolved or model_order_unresolved)
@@ -15077,6 +15562,21 @@ def run_live_pf(
     finally:
         simulation_runtime.close()
 
+    published_measurement_log = None
+    if measurement_log_writer is not None:
+        if not measurement_log_writer.records:
+            raise RuntimeError(
+                "Pure PF run produced no MeasurementLog records; refusing to "
+                "return an estimator with unavailable input provenance."
+            )
+        published_measurement_log = measurement_log_writer.finalize()
+        estimator.measurement_log_sha256 = published_measurement_log.log_sha256
+        print(
+            "MeasurementLog published: "
+            f"{published_measurement_log.path} "
+            f"sha256={published_measurement_log.log_sha256}"
+        )
+
     online_wall_clock_s = float(time.perf_counter() - run_wall_start)
     wall_clock_runtime_s = online_wall_clock_s
 
@@ -15099,13 +15599,17 @@ def run_live_pf(
         )
         estimates_out_path = RESULTS_DIR / f"result_estimates{output_suffix}.png"
         summary_out_path = RESULTS_DIR / f"result_summary{output_suffix}.json"
+        pf_posterior_out_path = RESULTS_DIR / f"pf_posterior{output_suffix}.json"
         result_paths = {
             "pf_plot": pf_out_path.as_posix(),
             "estimates_plot": estimates_out_path.as_posix(),
             "spectrum_plot": spectrum_out_path.as_posix(),
             "last_spectrum_plot": last_spectrum_out_path.as_posix(),
             "summary_json": summary_out_path.as_posix(),
+            "pf_posterior_json": pf_posterior_out_path.as_posix(),
         }
+        if published_measurement_log is not None:
+            result_paths["measurement_log"] = str(published_measurement_log.path)
         if estimate_trace_out_path is not None:
             result_paths["intermediate_estimate_trace_jsonl"] = (
                 estimate_trace_out_path.as_posix()
@@ -15124,7 +15628,7 @@ def run_live_pf(
         best_so_far_stage = None
         best_so_far_selected = False
         final_report_getter = getattr(estimator, "final_report_estimate", None)
-        if callable(final_report_getter):
+        if not _pure_pf_profile_active(estimator) and callable(final_report_getter):
             try:
                 best_so_far_stage = final_report_getter(use_best_so_far=True)
                 selection = getattr(estimator, "_last_final_report_selection", {})
@@ -15509,7 +16013,7 @@ def run_live_pf(
         best_so_far_stage = None
         best_so_far_selected = False
         final_report_getter = getattr(estimator, "final_report_estimate", None)
-        if callable(final_report_getter):
+        if not _pure_pf_profile_active(estimator) and callable(final_report_getter):
             try:
                 best_so_far_stage = final_report_getter(use_best_so_far=True)
                 selection = getattr(estimator, "_last_final_report_selection", {})
@@ -15822,9 +16326,10 @@ def run_live_pf(
     remaining_trace_summary = _remaining_measurement_trace_summary(
         remaining_measurement_estimates
     )
+    pure_pf_profile = _pure_pf_profile_active(estimator)
     final_model_order_status = _final_model_order_status(estimator)
     best_report_summary = {}
-    if hasattr(estimator, "best_report_summary"):
+    if not pure_pf_profile and hasattr(estimator, "best_report_summary"):
         try:
             best_report_summary = dict(estimator.best_report_summary())
         except (RuntimeError, ValueError, TypeError):
@@ -15835,14 +16340,18 @@ def run_live_pf(
         "sparse_poisson_evidence_diagnostics",
         None,
     )
-    if callable(sparse_evidence_getter):
+    if not pure_pf_profile and callable(sparse_evidence_getter):
         try:
             final_sparse_poisson_evidence = dict(sparse_evidence_getter())
         except (RuntimeError, ValueError, TypeError):
             final_sparse_poisson_evidence = {}
+    report_model_order_diagnostics = (
+        {}
+        if pure_pf_profile
+        else dict(estimator.report_model_order_diagnostics())
+    )
     model_evaluation_diagnostics = summarize_model_diagnostics(
-        estimator.report_model_order_diagnostics(),
-        final_sparse_poisson_evidence,
+        report_model_order_diagnostics, final_sparse_poisson_evidence
     )
     final_candidate_verification = {}
     verification_getter = getattr(
@@ -15850,12 +16359,13 @@ def run_live_pf(
         "candidate_verification_diagnostics",
         None,
     )
-    if callable(verification_getter):
+    if not pure_pf_profile and callable(verification_getter):
         try:
             final_candidate_verification = dict(verification_getter())
         except (RuntimeError, ValueError, TypeError):
             final_candidate_verification = {}
     final_payload = {
+        **_pure_pf_summary_provenance(estimator),
         "measurements_completed": int(step_counter),
         "mission_metrics": {
             **{
@@ -15962,7 +16472,7 @@ def run_live_pf(
                 stage: _serialize_estimate_stage(stage_estimates)
                 for stage, stage_estimates in final_estimate_stages.items()
             },
-            "report_model_order": estimator.report_model_order_diagnostics(),
+            "report_model_order": report_model_order_diagnostics,
             "sparse_poisson_evidence": final_sparse_poisson_evidence,
             "candidate_verification": final_candidate_verification,
             "model_order_status": final_model_order_status,
@@ -15990,6 +16500,18 @@ def run_live_pf(
     )
     setattr(estimator, "final_run_summary", final_payload)
     if save_outputs and summary_out_path is not None:
+        posterior_getter = getattr(estimator, "posterior_snapshot", None)
+        if callable(posterior_getter):
+            pf_posterior_out_path.write_text(
+                json.dumps(
+                    posterior_getter().to_dict(),
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         summary_out_path.write_text(
             json.dumps(
                 final_payload,

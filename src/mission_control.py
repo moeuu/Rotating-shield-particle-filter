@@ -378,6 +378,22 @@ def adapt_dss_program_length_for_budget(
     return config, "full"
 
 
+def resolve_mission_max_steps(
+    cli_max_steps: int | None,
+    runtime_config: Mapping[str, Any],
+) -> int | None:
+    """Resolve the fixed measurement budget, preserving explicit CLI input."""
+    if cli_max_steps is not None:
+        return max(1, int(cli_max_steps)) if int(cli_max_steps) > 0 else None
+    measurement_budget_value = runtime_config.get(
+        "measurement_budget_max_steps",
+        None,
+    )
+    if measurement_budget_value is None:
+        return None
+    return max(1, int(measurement_budget_value))
+
+
 def resolve_mission_max_poses(
     cli_max_poses: int | None,
     runtime_config: Mapping[str, Any],

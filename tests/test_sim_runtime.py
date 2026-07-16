@@ -3261,7 +3261,10 @@ def test_real_application_mesh_geometry_reduces_counts() -> None:
     )
 
 
-def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_live_pf_uses_simulation_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """The real-time loop should route measurements through the runtime interface."""
     import realtime_demo
 
@@ -3452,6 +3455,7 @@ def test_run_live_pf_uses_simulation_runtime(monkeypatch: pytest.MonkeyPatch) ->
         obstacle_layout_path=None,
         pf_config_overrides={"orientation_k": 1},
         save_outputs=False,
+        measurement_log_output=(tmp_path / "runtime-measurement-log").as_posix(),
         return_state=True,
         sim_backend="isaacsim",
     )
@@ -3640,6 +3644,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
 
     blender_calls: list[dict[str, object]] = []
     generated_usd = tmp_path / "generated.usda"
+    measurement_log_output = tmp_path / "random-runtime-measurement-log"
     config_path = tmp_path / "configs" / "isaacsim" / "manchester_random.json"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
@@ -3712,10 +3717,11 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         ig_threshold_mode="absolute",
         ig_threshold_min=0.0,
         environment_mode="random",
-        obstacle_layout_path="obstacle_layouts/random_test_unused.json",
+        obstacle_layout_path="obstacle_layouts/no_obstacles.json",
         obstacle_seed=11,
         pf_config_overrides={"orientation_k": 1},
         save_outputs=False,
+        measurement_log_output=measurement_log_output.as_posix(),
         return_state=True,
         sim_backend="isaacsim",
         sim_config_path=config_path.as_posix(),

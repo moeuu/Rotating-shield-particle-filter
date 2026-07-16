@@ -3024,15 +3024,121 @@ class IsotopeParticleFilter:
         pb_index: int,
         live_time_s: float,
     ) -> NDArray[np.float64]:
-        """Compute Fe/Pb pair expected counts on CPU."""
+        """Compute one Fe/Pb-pair row through the batched CPU kernel."""
         if self.kernel is None:
             raise RuntimeError("Continuous PF update requires an attached kernel.")
         detector_pos = np.asarray(self.kernel.poses[int(pose_idx)], dtype=float)
-        return self._continuous_expected_counts_pair_at_pose_cpu(
+        counts = self._continuous_expected_counts_pair_sequence_at_pose_cpu(
             detector_pos=detector_pos,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            live_time_s=live_time_s,
+            fe_indices=np.asarray([int(fe_index)], dtype=np.int64),
+            pb_indices=np.asarray([int(pb_index)], dtype=np.int64),
+            live_times_s=np.asarray([float(live_time_s)], dtype=np.float64),
+        )
+        return counts[0]
+
+    def _continuous_expected_counts_pair_sequence_cpu(
+        self,
+        pose_idx: int,
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        live_times_s: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute all views x particles x source slots in one CPU batch."""
+        if self.kernel is None:
+            raise RuntimeError("Continuous PF update requires an attached kernel.")
+        detector_pos = np.asarray(self.kernel.poses[int(pose_idx)], dtype=float)
+        return self._continuous_expected_counts_pair_sequence_at_pose_cpu(
+            detector_pos=detector_pos,
+            fe_indices=fe_indices,
+            pb_indices=pb_indices,
+            live_times_s=live_times_s,
+        )
+
+    def _continuous_expected_counts_pair_sequence_at_pose_cpu(
+        self,
+        detector_pos: NDArray[np.float64],
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        live_times_s: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return selected-pair counts from the production kernel on CPU.
+
+        The production packed-state kernel vectorizes shield views, particles,
+        and source slots.  Running that same kernel on a CPU device avoids a
+        scalar view/particle loop while retaining line, aperture, obstacle, and
+        transport-response semantics.
+        """
+        from pf import gpu_utils
+        import torch
+
+        fe_arr = np.asarray(fe_indices, dtype=np.int64).reshape(-1)
+        pb_arr = np.asarray(pb_indices, dtype=np.int64).reshape(-1)
+        live_arr = np.asarray(live_times_s, dtype=np.float64).reshape(-1)
+        if not (fe_arr.size == pb_arr.size == live_arr.size):
+            raise ValueError("Fe, Pb, and live-time arrays must have matching lengths.")
+        particle_count = len(self.continuous_particles)
+        if fe_arr.size == 0 or particle_count == 0:
+            return np.zeros((fe_arr.size, particle_count), dtype=np.float64)
+        device = torch.device("cpu")
+        dtype = torch.float64
+        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
+            [particle.state for particle in self.continuous_particles],
+            device=device,
+            dtype=dtype,
+        )
+        (
+            packed_positions,
+            packed_strengths,
+            packed_mask,
+            inverse,
+        ) = self._compress_identical_packed_sources_torch(
+            positions,
+            strengths,
+            mask,
+        )
+        if inverse is None:
+            unit_live_counts = self.continuous_kernel.expected_counts_selected_pairs_for_packed_states_torch(
+                isotope=self.isotope,
+                detector_pos=np.asarray(detector_pos, dtype=float),
+                positions=positions,
+                strengths=strengths,
+                backgrounds=backgrounds,
+                mask=mask,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+                live_time_s=1.0,
+                source_scale=self._measurement_source_scale_vector(fe_arr, pb_arr),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            source_unit_counts = self.continuous_kernel.expected_counts_selected_pairs_for_packed_states_torch(
+                isotope=self.isotope,
+                detector_pos=np.asarray(detector_pos, dtype=float),
+                positions=packed_positions,
+                strengths=packed_strengths,
+                backgrounds=torch.zeros(
+                    int(packed_positions.shape[0]),
+                    device=device,
+                    dtype=dtype,
+                ),
+                mask=packed_mask,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+                live_time_s=1.0,
+                source_scale=self._measurement_source_scale_vector(fe_arr, pb_arr),
+                device=device,
+                dtype=dtype,
+            )
+            unit_live_counts = source_unit_counts.index_select(1, inverse)
+            unit_live_counts = unit_live_counts + backgrounds.unsqueeze(0)
+        live_t = torch.as_tensor(live_arr, device=device, dtype=dtype).view(-1, 1)
+        return (
+            unit_live_counts.mul(live_t)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
         )
 
     def _continuous_expected_counts_pair_at_pose_cpu(
@@ -3042,30 +3148,14 @@ class IsotopeParticleFilter:
         pb_index: int,
         live_time_s: float,
     ) -> NDArray[np.float64]:
-        """Compute Fe/Pb pair expected counts at an explicit pose on CPU."""
-        detector_arr = np.asarray(detector_pos, dtype=float)
-        lam = np.zeros(len(self.continuous_particles), dtype=float)
-        source_scale = self._measurement_source_scale(
-            fe_index=fe_index,
-            pb_index=pb_index,
+        """Compute one explicit-pose pair through the batched CPU kernel."""
+        counts = self._continuous_expected_counts_pair_sequence_at_pose_cpu(
+            detector_pos=np.asarray(detector_pos, dtype=float),
+            fe_indices=np.asarray([int(fe_index)], dtype=np.int64),
+            pb_indices=np.asarray([int(pb_index)], dtype=np.int64),
+            live_times_s=np.asarray([float(live_time_s)], dtype=np.float64),
         )
-        for particle_idx, particle in enumerate(self.continuous_particles):
-            state = particle.state
-            rate = float(state.background)
-            for pos, strength in zip(
-                state.positions[: state.num_sources],
-                state.strengths[: state.num_sources],
-            ):
-                kernel_val = self.continuous_kernel.kernel_value_pair(
-                    isotope=self.isotope,
-                    detector_pos=detector_arr,
-                    source_pos=pos,
-                    fe_index=int(fe_index),
-                    pb_index=int(pb_index),
-                )
-                rate += source_scale * float(kernel_val) * float(strength)
-            lam[particle_idx] = float(live_time_s) * rate
-        return lam
+        return counts[0]
 
     def _continuous_expected_counts(
         self, pose_idx: int, orient_idx: int, live_time_s: float
@@ -3188,7 +3278,6 @@ class IsotopeParticleFilter:
             self.updates_skipped += 1
             return
         self.reset_step_stats()
-        self._gpu_enabled()
         detector_pos = (
             np.asarray(self.kernel.poses[pose_idx], dtype=float)
             if self.kernel
@@ -3198,11 +3287,25 @@ class IsotopeParticleFilter:
 
         def _lam_fn() -> "torch.Tensor":
             """Return expected counts for the current particle set."""
-            return self._continuous_expected_counts_pair_torch(
-                pose_idx=pose_idx,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
+            if self.config.use_gpu:
+                self._gpu_enabled()
+                return self._continuous_expected_counts_pair_torch(
+                    pose_idx=pose_idx,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    live_time_s=live_time_s,
+                )
+            import torch
+
+            return torch.as_tensor(
+                self._continuous_expected_counts_pair_cpu(
+                    pose_idx=pose_idx,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    live_time_s=live_time_s,
+                ),
+                dtype=torch.float64,
+                device="cpu",
             )
 
         spectrum_arrays = self._spectrum_update_arrays(
@@ -3401,7 +3504,6 @@ class IsotopeParticleFilter:
             self.updates_skipped += 1
             return
         self.reset_step_stats()
-        self._gpu_enabled()
         detector_pos = (
             np.asarray(self.kernel.poses[pose_idx], dtype=float)
             if self.kernel
@@ -3467,12 +3569,27 @@ class IsotopeParticleFilter:
 
         def _ll_fn() -> "torch.Tensor":
             """Return summed per-particle log-likelihood for the shield sequence."""
-            lam_kn = self._continuous_expected_counts_pair_sequence_torch(
-                pose_idx=pose_idx,
-                fe_indices=fe_arr,
-                pb_indices=pb_arr,
-                live_times_s=live_arr,
-            )
+            if self.config.use_gpu:
+                self._gpu_enabled()
+                lam_kn = self._continuous_expected_counts_pair_sequence_torch(
+                    pose_idx=pose_idx,
+                    fe_indices=fe_arr,
+                    pb_indices=pb_arr,
+                    live_times_s=live_arr,
+                )
+            else:
+                import torch
+
+                lam_kn = torch.as_tensor(
+                    self._continuous_expected_counts_pair_sequence_cpu(
+                        pose_idx=pose_idx,
+                        fe_indices=fe_arr,
+                        pb_indices=pb_arr,
+                        live_times_s=live_arr,
+                    ),
+                    dtype=torch.float64,
+                    device="cpu",
+                )
             if spectrum_arrays is not None:
                 observed, template, background_spectrum, variance = spectrum_arrays
                 spectrum_ll = (
@@ -3550,15 +3667,28 @@ class IsotopeParticleFilter:
             self.updates_skipped += 1
             return
         self.reset_step_stats()
-        self._gpu_enabled()
 
         def _lam_fn() -> "torch.Tensor":
             """Return expected counts for the current particle set."""
-            return self._continuous_expected_counts_pair_at_pose_torch(
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
+            if self.config.use_gpu:
+                self._gpu_enabled()
+                return self._continuous_expected_counts_pair_at_pose_torch(
+                    detector_pos=detector_pos,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    live_time_s=live_time_s,
+                )
+            import torch
+
+            return torch.as_tensor(
+                self._continuous_expected_counts_pair_at_pose_cpu(
+                    detector_pos=detector_pos,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                    live_time_s=live_time_s,
+                ),
+                dtype=torch.float64,
+                device="cpu",
             )
 
         if self.config.use_tempering:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +21,7 @@ from pf.estimator import (
 from pf.likelihood import expected_counts_per_source
 from pf.mixing import prune_spurious_sources_continuous
 from pf.particle_filter import IsotopeParticle, MeasurementData
+from pf.profiles import resolve_estimator_profile
 from pf.state import IsotopeState
 from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
@@ -30,6 +33,7 @@ from realtime_demo import (
     _apply_baseline_shield_program_to_dss_config,
     _argv_requests_cui,
     _build_candidate_sources,
+    _build_effective_live_runtime_config,
     _build_intermediate_estimate_trace_payload,
     _build_robot_path_segment,
     _compute_shield_selection_grid,
@@ -54,11 +58,14 @@ from realtime_demo import (
     _log_surface_candidate_observability_diagnostics,
     _pf_obstacle_attenuation_enabled,
     _pf_obstacle_grid_for_runtime,
+    _pure_pf_primary_estimates,
+    _pure_pf_summary_provenance,
     _online_absent_pruning_supported_isotopes,
     _prune_online_absent_isotopes,
     _resolve_ig_workers,
     _resolve_runtime_use_gpu,
     _resolve_mission_max_poses,
+    _resolve_mission_max_steps,
     _resolve_plot_save_interval,
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
@@ -66,6 +73,7 @@ from realtime_demo import (
     _resolve_display_prune_refresh_interval,
     _resolve_structural_trial_parallelism,
     _resolve_station_update_modes,
+    _resolve_required_measurement_log_target,
     _particle_surface_diagnostics,
     _report_model_order_simple_ready_for_stop,
     _select_best_pair_from_scores,
@@ -75,6 +83,7 @@ from realtime_demo import (
     _spectrum_evidence_payload,
     _spectrum_config_from_runtime_config,
     _source_cardinality_dwell_status,
+    _truth_free_live_runtime_config,
     _remaining_measurement_progress,
     run_live_pf,
 )
@@ -123,6 +132,135 @@ def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
 
     assert _resolve_mission_max_poses(8, runtime_config) == 8
     assert _resolve_mission_max_poses(None, runtime_config) == 10
+
+
+def test_cli_max_steps_overrides_runtime_measurement_budget() -> None:
+    """The fixed config budget applies only when the CLI omits max steps."""
+    runtime_config = {"measurement_budget_max_steps": 160}
+
+    assert _resolve_mission_max_steps(80, runtime_config) == 80
+    assert _resolve_mission_max_steps(None, runtime_config) == 160
+    assert _resolve_mission_max_steps(0, runtime_config) is None
+
+
+def test_effective_live_config_is_truth_free_and_binds_exact_pf_inputs(
+    tmp_path: Path,
+) -> None:
+    """Live provenance strips source generation while hashing actual PF support."""
+    raw = {
+        "source_rate_model": "detector_cps_1m",
+        "source_extent_radius_m": 0.05,
+        "random_source_seed": 7,
+        "random_source_count": 3,
+        "random_source_intensity_cps_1m": 1000.0,
+        "source_generation_mode": "surface_random",
+        "source_layout_path": "secret-layout.json",
+        "nested": {"random_source_isotopes": ["Cs-137"]},
+    }
+    sanitized = _truth_free_live_runtime_config(raw)
+    serialized = json.dumps(sanitized, sort_keys=True)
+    assert sanitized["source_rate_model"] == "detector_cps_1m"
+    assert sanitized["source_extent_radius_m"] == pytest.approx(0.05)
+    for fragment in ("random_source", "source_generation", "source_layout"):
+        assert fragment not in serialized
+
+    config = RotatingShieldPFConfig(num_particles=8, use_gpu=False)
+    first_grid = np.asarray([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+    first = _build_effective_live_runtime_config(
+        raw,
+        pf_config=config,
+        candidate_sources_xyz=first_grid,
+        source_position_bounds=(np.zeros(3), np.ones(3)),
+        api_settings={
+            "pf_random_seed": 5,
+            "joint_observation_update": False,
+            "delayed_resample_update": True,
+            "candidate_grid_spacing_m": [1.0, 1.0, 1.0],
+        },
+    )
+    second = _build_effective_live_runtime_config(
+        raw,
+        pf_config=config,
+        candidate_sources_xyz=np.asarray([[0.0, 0.0, 0.0]]),
+        source_position_bounds=(np.zeros(3), np.ones(3)),
+        api_settings={
+            "pf_random_seed": 5,
+            "joint_observation_update": False,
+            "delayed_resample_update": True,
+            "candidate_grid_spacing_m": [1.0, 1.0, 1.0],
+        },
+    )
+    assert first["effective_pf_replay"]["candidate_grid"]["point_count"] == 2
+    assert first != second
+
+    with pytest.raises(ValueError, match="require measurement_log_output"):
+        _resolve_required_measurement_log_target(None, {}, repository_root=tmp_path)
+    target = _resolve_required_measurement_log_target(
+        None,
+        {"measurement_log_output_dir": "logs/run"},
+        repository_root=tmp_path,
+    )
+    assert target == tmp_path / "logs/run"
+
+
+def test_pure_primary_estimates_preserve_low_strength_posterior_modes() -> None:
+    """Primary pure-PF output must bypass legacy report and display filters."""
+    _profile, capabilities = resolve_estimator_profile("pf_strict")
+    expected_positions = np.asarray([[1.0, 2.0, 0.5]], dtype=float)
+    expected_strengths = np.asarray([25.0], dtype=float)
+    estimator = SimpleNamespace(
+        profile_capabilities=capabilities,
+        estimates=lambda: {
+            "Cs-137": (expected_positions.copy(), expected_strengths.copy())
+        },
+    )
+
+    actual = _pure_pf_primary_estimates(estimator, ("Cs-137", "Co-60"))
+
+    assert actual is not None
+    np.testing.assert_array_equal(actual["Cs-137"][0], expected_positions)
+    np.testing.assert_array_equal(actual["Cs-137"][1], expected_strengths)
+    assert actual["Co-60"][0].shape == (0, 3)
+    assert actual["Co-60"][1].shape == (0,)
+
+
+def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
+    """Every pure-PF result file must identify its log, config, and PF origin."""
+    _profile, capabilities = resolve_estimator_profile("pf_strict")
+    payload = {
+        "schema_version": 1,
+        "estimator_family": "particle_filter",
+        "estimator_variant": "pf_strict",
+        "estimator_profile": "pf_strict",
+        "final_estimate_source": "pf_posterior",
+        "uses_all_history_batch_fit": False,
+        "uses_surface_map": False,
+        "uses_batch_model_order": False,
+        "batch_feedback_to_particles": False,
+        "batch_methods_invoked": [],
+        "planner_belief_sources": ["pf_posterior", "pf_tentative"],
+        "repository_commit": "a" * 40,
+        "measurement_log_schema_version": 1,
+        "measurement_log_sha256": "b" * 64,
+        "config_sha256": "c" * 64,
+        "resolved_config_sha256": "d" * 64,
+        "random_seed": 7,
+        "profile_capability_map": capabilities.to_dict(),
+        "provenance": {"estimator_commit": "a" * 40},
+        "isotopes": {},
+    }
+    estimator = SimpleNamespace(
+        profile_capabilities=capabilities,
+        posterior_snapshot=lambda: SimpleNamespace(to_dict=lambda: dict(payload)),
+    )
+
+    summary = _pure_pf_summary_provenance(estimator)
+
+    assert summary["final_estimate_source"] == "pf_posterior"
+    assert summary["measurement_log_sha256"] == "b" * 64
+    assert summary["resolved_config_sha256"] == "d" * 64
+    assert summary["batch_methods_invoked"] == []
+    assert summary["pf_posterior"] == payload
 
 
 def test_dss_one_step_guard_uses_ranked_node_diagnostics() -> None:
@@ -2827,8 +2965,9 @@ def test_source_position_support_limits_candidate_grid_z() -> None:
 
 def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Keep PF gating active while retaining configured count history for evaluation."""
+    """Retain every configured response-Poisson count in the pure PF history."""
     import realtime_demo
 
     class _DummyViz:
@@ -2860,9 +2999,11 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         pb_index: int,
         live_time_s: float,
         z_variance_k: dict[str, float] | None = None,
+        z_covariance_k: dict[str, dict[str, float]] | None = None,
         spectrum_payload: dict[str, object] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
+        del z_covariance_k
         if spectrum_payload is not None:
             templates = spectrum_payload.get(
                 "spectrum_response_templates_by_isotope",
@@ -2925,6 +3066,22 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         """Return an empty frame placeholder."""
         return {}
 
+    def _fake_shield_grid(
+        *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Bypass response-heavy shield diagnostics in this loop-wiring test."""
+        del args
+        scores = np.asarray(kwargs["ig_scores"], dtype=float)
+        zeros = np.zeros_like(scores)
+        return scores.copy(), {
+            "eig": scores.copy(),
+            "signature": zeros.copy(),
+            "signature_utility": zeros.copy(),
+            "low_count_penalty": zeros.copy(),
+            "count_balance_penalty": zeros.copy(),
+            "rotation_cost": zeros.copy(),
+        }
+
     def _fake_candidate_poses(*args: object, **kwargs: object) -> np.ndarray:
         """Return two deterministic candidate poses."""
         return np.array([[1.0, 1.0, 0.5], [2.0, 2.0, 0.5]], dtype=float)
@@ -2952,6 +3109,11 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     monkeypatch.setattr(realtime_demo, "_compute_ig_grid", _fake_ig_grid)
     monkeypatch.setattr(
         realtime_demo,
+        "_compute_shield_selection_grid",
+        _fake_shield_grid,
+    )
+    monkeypatch.setattr(
+        realtime_demo,
         "DETECT_CONSECUTIVE_BY_ISOTOPE",
         {"Cs-137": 1, "Co-60": 1, "Eu-154": 1},
     )
@@ -2967,10 +3129,11 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     monkeypatch.setattr(
         SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
     )
-    monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
-    monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
-    monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
-    monkeypatch.setattr(RotatingShieldPFEstimator, "add_isotopes", _fake_add_isotopes)
+    pure_estimator_type = realtime_demo.RotatingShieldPFEstimator
+    monkeypatch.setattr(pure_estimator_type, "update_pair", _fake_update_pair)
+    monkeypatch.setattr(pure_estimator_type, "estimates", _fake_estimates)
+    monkeypatch.setattr(pure_estimator_type, "_gpu_enabled", _fake_gpu_enabled)
+    monkeypatch.setattr(pure_estimator_type, "add_isotopes", _fake_add_isotopes)
 
     estimator = run_live_pf(
         live=False,
@@ -2984,11 +3147,17 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         ig_threshold_mode="absolute",
         ig_threshold_min=0.0,
         obstacle_layout_path=None,
-        pf_config_overrides={"orientation_k": 1},
+        num_particles=8,
+        pf_config_overrides={
+            "orientation_k": 1,
+            "min_particles": 8,
+            "max_particles": 8,
+        },
         save_outputs=False,
         return_state=True,
         nominal_motion_speed_m_s=1.0,
         rotation_overhead_s=2.0,
+        measurement_log_output=str(tmp_path / "measurement-log"),
     )
     assert estimator is not None
     assert len(estimator.measurements) >= 2
@@ -3035,7 +3204,6 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     assert metrics["gpu_memory"]["available"] is False
     evaluation = estimator.final_run_summary["evaluation_metrics"]
     assert "p95" in evaluation["accuracy"]["position_error"]
-    assert evaluation["accuracy"]["position_error"]["p95"] is None
     assert "by_shield_pair" in evaluation["count_bias"]
     assert "spectrum_bin_heldout_deviance" in evaluation["model_identifiability"]
     assert "consecutive_matched_cluster_shift_m" in evaluation["cluster_stability"]
@@ -3045,7 +3213,7 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         "operational"
     ]["end_to_end_wall_clock_s"]
     json.dumps(estimator.final_run_summary, allow_nan=False)
-    assert estimator.isotopes == ["Cs-137"]
+    assert estimator.isotopes == list(ANALYSIS_ISOTOPES)
     for rec in estimator.measurements:
         assert set(rec.z_k) == set(ANALYSIS_ISOTOPES)
         assert rec.z_variance_k is not None
@@ -3053,11 +3221,7 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         assert rec.z_variance_k["Cs-137"] == pytest.approx(2.0)
     assert planning_isotope_args
     assert all(value is None for value in planning_isotope_args)
-    assert spectrum_template_isotope_sets
-    assert all(
-        template_isotopes == set(ANALYSIS_ISOTOPES)
-        for template_isotopes in spectrum_template_isotope_sets
-    )
+    assert spectrum_template_isotope_sets == []
     estimates = estimator.estimates()
     positions, strengths = estimates.get("Cs-137", (np.zeros((0, 3)), np.zeros(0)))
     assert positions.size > 0
@@ -3541,6 +3705,7 @@ def test_prune_missing_isotope_does_not_zero_fill(
     ]
 
     def _fake_estimates() -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Return a deterministic estimate for the pruning regression."""
         positions = np.array([[0.5, 0.5, 0.5]], dtype=float)
         strengths = np.array([100.0], dtype=float)
         return {iso: (positions.copy(), strengths.copy()) for iso in isotopes}
