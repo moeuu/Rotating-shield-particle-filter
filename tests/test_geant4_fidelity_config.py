@@ -28,6 +28,7 @@ from pf.likelihood import (
     DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA,
     DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA,
 )
+from pf.profiles import enforce_pure_runtime_settings
 from sim.geant4_app.app import Geant4AppConfig
 from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
@@ -57,8 +58,8 @@ def _geant4_runtime_config_paths() -> list[Path]:
 
 
 def _load_geant4_runtime_config(config_path: Path) -> dict[str, object]:
-    """Load a Geant4 runtime config after resolving optional inheritance."""
-    return load_runtime_config(config_path)
+    """Load the effective pure-PF config after resolving inheritance."""
+    return enforce_pure_runtime_settings(load_runtime_config(config_path))
 
 
 def test_standard_runtime_uses_continuous_collision_checked_measurement_space() -> None:
@@ -163,10 +164,7 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
             _assert_validated_geant4_count_likelihood(payload)
         if "response_poisson_count_variance_ceiling_enable" in payload:
             _assert_response_poisson_variance_ceiling(payload)
-        assert payload["online_absent_isotope_pruning"] is True
-        assert int(payload["online_absent_min_poses"]) >= 8
-        assert float(payload["online_absent_coverage_fraction"]) >= 0.75
-        assert int(payload["online_absent_min_measurements"]) >= 8
+        assert payload["online_absent_isotope_pruning"] is False
         dss_pp = payload.get("dss_pp", {})
         if isinstance(dss_pp, dict):
             assert dss_pp.get("one_step_guard_enable", True) is True
@@ -248,17 +246,42 @@ def _assert_validated_shield_view_ratio_likelihood(payload: dict[str, object]) -
     assert int(ratio["min_views"]) >= 2
 
 
-def _assert_validated_spectrum_bin_evidence(payload: dict[str, object]) -> None:
-    """Assert that Geant4 runtime uses spectrum-bin sparse evidence."""
-    assert payload["sparse_poisson_evidence_enable"] is True
-    assert payload["sparse_poisson_evidence_authoritative"] is True
-    assert payload["sparse_poisson_spectral_evidence_enable"] is True
-    assert payload["sparse_poisson_spectral_evidence_primary"] is True
-    assert payload["sparse_poisson_spectral_nuisance_enable"] is True
-    assert payload["sparse_poisson_joint_evidence_enable"] is True
-    assert payload["sparse_poisson_offgrid_refine_enable"] is True
-    assert float(payload["sparse_poisson_offgrid_refine_radius_m"]) > 0.0
-    assert int(payload["sparse_poisson_offgrid_refine_max_iter"]) >= 1
+def _assert_pure_pf_estimator_boundary(payload: dict[str, object]) -> None:
+    """Assert that a runtime config cannot activate a second batch estimator."""
+    assert payload["estimator_profile"] == "pf_strict"
+    forbidden = (
+        "birth_global_rescue_enable",
+        "birth_global_rescue_candidate_memory_enable",
+        "conditional_strength_refit",
+        "conditional_strength_profile_before_likelihood",
+        "all_history_dictionary_proposal_enable",
+        "candidate_verification_independent_evidence_enable",
+        "candidate_verification_queue_enable",
+        "final_absent_isotope_filter",
+        "mode_preserving_report_cardinality_strata",
+        "online_absent_isotope_pruning",
+        "parallel_isotope_updates",
+        "report_best_so_far_enable",
+        "report_cluster_model_selection",
+        "report_mle_rescue_enable",
+        "report_model_order_prune_particles",
+        "report_strength_refit",
+        "report_surface_local_refine",
+        "runtime_report_rescue_enable",
+        "runtime_report_rescue_memory_enable",
+        "sparse_poisson_evidence_authoritative",
+        "sparse_poisson_evidence_enable",
+        "sparse_poisson_joint_evidence_enable",
+        "sparse_poisson_offgrid_refine_enable",
+        "sparse_poisson_spectral_evidence_enable",
+        "surface_map_reconstruction_enable",
+    )
+    for field in forbidden:
+        assert payload[field] is False
+    dss = payload["dss_pp"]
+    assert dss["adaptive_program_length_enable"] is False
+    assert dss["include_runtime_rescue_modes"] is False
+    assert dss["include_global_surface_rescue_modes"] is False
 
 
 def test_standard_full_simulation_count_likelihood_uncertainty_is_validated() -> None:
@@ -275,7 +298,7 @@ def test_standard_full_simulation_count_likelihood_uncertainty_is_validated() ->
     _assert_validated_geant4_count_likelihood(payload)
     _assert_validated_shield_contrast_likelihood(payload)
     _assert_validated_shield_view_ratio_likelihood(payload)
-    _assert_validated_spectrum_bin_evidence(payload)
+    _assert_pure_pf_estimator_boundary(payload)
     _assert_response_poisson_variance_ceiling(payload)
 
 
@@ -359,34 +382,7 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert int(payload["birth_min_distinct_poses"]) >= 5
     assert float(payload["birth_existing_response_corr_max"]) <= 0.99
     assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
-    assert payload["report_exclude_unverified_sources"] is True
-    assert payload["report_strength_refit"] is True
-    assert payload["report_strength_refit_use_all_measurements"] is True
-    assert payload["report_strength_refit_preserve_cardinality"] is False
-    assert float(payload["report_strength_refit_prior_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_penalty_weight"]) == 0.0
-    assert float(payload["report_strength_observation_overshoot_penalty_weight"]) > 0.0
-    assert float(payload["report_strength_observation_overshoot_sigma"]) > 0.0
-    assert payload["report_surface_local_refine"] is True
-    assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
-    assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
-    assert payload["report_mle_rescue_enable"] is True
-    assert int(payload["report_mle_rescue_max_candidates"]) >= 12
-    assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
-    assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
-    assert payload["report_mle_rescue_surface_quota_enable"] is True
-    assert float(payload["report_mle_rescue_surface_quota_min_score_fraction"]) > 0.0
-    assert int(payload["report_mle_rescue_surface_quota_per_stratum"]) >= 2
-    assert payload["report_mle_rescue_spatial_quota_enable"] is True
-    assert float(payload["report_mle_rescue_spatial_quota_tile_m"]) > 0.0
-    assert payload["birth_global_rescue_enable"] is True
-    assert int(payload["birth_global_rescue_max_candidates"]) >= 16
-    assert int(payload["birth_global_rescue_min_support"]) >= 2
-    assert int(payload["birth_global_rescue_min_distinct_poses"]) >= 2
-    assert int(payload["birth_global_rescue_min_distinct_stations"]) == 1
-    assert payload["birth_global_rescue_force_proposal_on_gate"] is False
-    assert payload["birth_global_rescue_candidate_memory_enable"] is True
-    assert int(payload["birth_global_rescue_candidate_memory_min_retained"]) >= 0
+    _assert_pure_pf_estimator_boundary(payload)
     assert float(payload["random_source_intensity_min_cps_1m"]) >= 3.0e5
     assert float(payload["random_source_intensity_max_cps_1m"]) >= 2.0e6
     assert float(payload["birth_q_max"]) >= float(
@@ -394,25 +390,6 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     )
     assert payload["high_strength_split_enable"] is True
     assert float(payload["high_strength_split_q_multiple"]) >= 1.0
-    assert payload["runtime_report_rescue_enable"] is True
-    assert float(payload["runtime_report_rescue_weight"]) > 0.0
-    assert payload["runtime_report_rescue_quarantine_enable"] is True
-    assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
-    assert float(payload["runtime_report_rescue_candidate_weight"]) > float(
-        payload["runtime_report_rescue_quarantine_weight"]
-    )
-    assert float(payload["runtime_report_rescue_candidate_weight"]) >= 0.08
-    assert payload["runtime_report_rescue_memory_enable"] is True
-    assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
-    assert payload["report_best_so_far_enable"] is True
-    assert (
-        float(payload["report_best_so_far_final_min_measurement_fraction"]) >= 0.8
-    )
-    assert payload["report_best_so_far_final_require_resolved"] is True
-    assert payload["report_model_order_underfit_gate"] is True
-    assert float(payload["report_model_order_underfit_min_residual_fraction"]) > 0.0
-    assert float(payload["report_model_order_underfit_min_positive_chi2"]) > 0.0
-    assert payload["mission_stop_soft_extension_require_report_progress"] is True
     assert payload["weak_source_prune_require_observable"] is True
     assert int(payload["weak_source_prune_min_observable_measurements"]) >= 1
     assert payload["cardinality_preserving_resample"] is True
@@ -421,11 +398,7 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert float(payload["source_strength_prior_mean"]) == 0.0
     assert float(payload["source_strength_prior_weight"]) == 0.0
     assert float(payload["source_strength_observation_overshoot_penalty_weight"]) > 0.0
-    assert float(payload["report_mle_rescue_visibility_reference_strength"]) == 0.0
     assert float(payload["weak_source_prune_visibility_reference_strength"]) == 0.0
-    assert payload["report_model_order_require_posterior_match"] is False
-    assert float(payload["report_model_order_zero_source_min_bic_margin"]) >= 10.0
-    assert payload["report_model_order_prune_particles"] is True
     assert payload["mode_preserving_resample"] is True
     assert int(payload["mode_preserving_max_modes"]) >= 12
     assert int(payload["mode_preserving_particles_per_mode"]) >= 8
@@ -433,8 +406,6 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
     assert payload["mode_preserving_cardinality_strata"] is True
     assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
-    assert payload["mode_preserving_report_cardinality_strata"] is True
-    assert int(payload["mode_preserving_report_cardinality_extra_particles"]) >= 4
     assert payload["split_residual_guided"] is True
     assert payload["split_residual_always_try"] is True
     assert int(payload["split_residual_candidate_count"]) >= 8
@@ -467,10 +438,6 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
         )
         >= 512
     )
-    assert payload["dss_pp"]["include_runtime_rescue_modes"] is True
-    assert float(payload["dss_pp"]["runtime_rescue_mode_weight"]) > 0.0
-    assert payload["dss_pp"]["include_global_surface_rescue_modes"] is True
-    assert float(payload["dss_pp"]["global_surface_rescue_mode_weight"]) > 0.0
     assert float(payload["dss_pp"]["high_surface_pair_boost"]) > 1.0
     assert float(payload["dss_pp"]["high_surface_cross_stratum_boost"]) > 1.0
     assert float(payload["dss_pp"]["correlation_reduction_weight"]) > 0.0
@@ -534,57 +501,13 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert int(payload["birth_min_distinct_poses"]) >= 5
     assert float(payload["birth_existing_response_corr_max"]) <= 0.99
     assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
-    assert payload["report_exclude_unverified_sources"] is True
-    assert payload["report_strength_refit"] is True
-    assert payload["report_strength_refit_use_all_measurements"] is True
-    assert payload["report_strength_refit_preserve_cardinality"] is False
-    assert float(payload["report_strength_refit_prior_weight"]) > 0.0
-    assert float(payload["report_strength_absorption_penalty_weight"]) == 0.0
-    assert float(payload["report_strength_observation_overshoot_penalty_weight"]) > 0.0
-    assert float(payload["report_strength_observation_overshoot_sigma"]) > 0.0
-    assert payload["report_surface_local_refine"] is True
-    assert float(payload["report_surface_local_refine_radius_m"]) > 0.0
-    assert int(payload["report_surface_local_refine_max_candidates_per_source"]) <= 27
-    assert payload["report_mle_rescue_enable"] is True
-    assert int(payload["report_mle_rescue_max_candidates"]) >= 12
-    assert float(payload["report_mle_rescue_visibility_weight"]) > 0.0
-    assert int(payload["report_mle_rescue_min_visible_measurements"]) >= 1
-    assert payload["report_mle_rescue_surface_quota_enable"] is True
-    assert float(payload["report_mle_rescue_surface_quota_min_score_fraction"]) > 0.0
-    assert payload["report_mle_rescue_spatial_quota_enable"] is True
-    assert payload["birth_global_rescue_enable"] is True
-    assert int(payload["birth_global_rescue_max_candidates"]) >= 16
-    assert int(payload["birth_global_rescue_min_support"]) >= 2
-    assert int(payload["birth_global_rescue_min_distinct_poses"]) >= 2
-    assert int(payload["birth_global_rescue_min_distinct_stations"]) == 1
-    assert payload["birth_global_rescue_force_proposal_on_gate"] is False
-    assert payload["birth_global_rescue_candidate_memory_enable"] is True
-    assert int(payload["birth_global_rescue_candidate_memory_min_retained"]) >= 0
+    _assert_pure_pf_estimator_boundary(payload)
     assert float(payload["random_source_intensity_min_cps_1m"]) >= 3.0e5
     assert float(payload["random_source_intensity_max_cps_1m"]) >= 2.0e6
     assert float(payload["birth_q_max"]) >= float(
         payload["random_source_intensity_max_cps_1m"]
     )
     assert payload["high_strength_split_enable"] is True
-    assert payload["runtime_report_rescue_enable"] is True
-    assert float(payload["runtime_report_rescue_weight"]) > 0.0
-    assert payload["runtime_report_rescue_quarantine_enable"] is True
-    assert float(payload["runtime_report_rescue_quarantine_weight"]) > 0.0
-    assert float(payload["runtime_report_rescue_candidate_weight"]) > float(
-        payload["runtime_report_rescue_quarantine_weight"]
-    )
-    assert float(payload["runtime_report_rescue_candidate_weight"]) >= 0.08
-    assert payload["runtime_report_rescue_memory_enable"] is True
-    assert float(payload["runtime_report_rescue_memory_decay"]) > 0.0
-    assert payload["report_best_so_far_enable"] is True
-    assert (
-        float(payload["report_best_so_far_final_min_measurement_fraction"]) >= 0.8
-    )
-    assert payload["report_best_so_far_final_require_resolved"] is True
-    assert payload["report_model_order_underfit_gate"] is True
-    assert float(payload["report_model_order_underfit_min_residual_fraction"]) > 0.0
-    assert float(payload["report_model_order_underfit_min_positive_chi2"]) > 0.0
-    assert payload["mission_stop_soft_extension_require_report_progress"] is True
     assert payload["weak_source_prune_require_observable"] is True
     assert int(payload["weak_source_prune_min_observable_measurements"]) >= 1
     assert payload["cardinality_preserving_resample"] is True
@@ -593,11 +516,7 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert float(payload["source_strength_prior_mean"]) == 0.0
     assert float(payload["source_strength_prior_weight"]) == 0.0
     assert float(payload["source_strength_observation_overshoot_penalty_weight"]) > 0.0
-    assert float(payload["report_mle_rescue_visibility_reference_strength"]) == 0.0
     assert float(payload["weak_source_prune_visibility_reference_strength"]) == 0.0
-    assert payload["report_model_order_require_posterior_match"] is False
-    assert float(payload["report_model_order_zero_source_min_bic_margin"]) >= 10.0
-    assert payload["report_model_order_prune_particles"] is True
     assert payload["split_residual_guided"] is True
     assert payload["split_residual_always_try"] is True
     assert int(payload["split_residual_candidate_count"]) >= 8
@@ -631,21 +550,15 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
         >= 512
     )
     assert int(payload["mission_stop_max_poses"]) == 20
-    assert payload["mission_stop_require_model_order_ready"] is True
+    assert payload["mission_stop_require_model_order_ready"] is False
     assert payload["mission_stop_require_remaining_measurement_ready"] is True
-    assert payload["mission_stop_soft_extend_on_unresolved"] is True
+    assert payload["mission_stop_soft_extend_on_unresolved"] is False
     assert int(payload["mission_stop_soft_extension_poses"]) == 2
     assert payload["mission_stop_require_pf_convergence_for_coverage"] is False
-    assert payload["mission_stop_report_simple_enable"] is True
-    assert float(payload["mission_stop_report_simple_min_bic_margin"]) >= 10.0
-    assert payload["mission_stop_report_simple_allow_high_surface_ambiguity"] is True
-    assert payload["dss_pp"]["adaptive_program_length_enable"] is True
+    assert payload["mission_stop_report_simple_enable"] is False
+    assert payload["dss_pp"]["adaptive_program_length_enable"] is False
     assert int(payload["dss_pp"]["adaptive_simple_program_length"]) <= 2
     assert payload["dss_pp"]["same_isotope_direct_separation_guard"] is True
-    assert payload["dss_pp"]["include_runtime_rescue_modes"] is True
-    assert float(payload["dss_pp"]["runtime_rescue_mode_weight"]) > 0.0
-    assert payload["dss_pp"]["include_global_surface_rescue_modes"] is True
-    assert float(payload["dss_pp"]["global_surface_rescue_mode_weight"]) > 0.0
     assert float(payload["dss_pp"]["high_surface_pair_boost"]) > 1.0
     assert float(payload["dss_pp"]["high_surface_cross_stratum_boost"]) > 1.0
     assert float(payload["dss_pp"]["temporal_separation_weight"]) >= 8.0
@@ -659,8 +572,6 @@ def test_variance_reduction_config_is_explicit_weighted_mode() -> None:
     assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
     assert payload["mode_preserving_cardinality_strata"] is True
     assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
-    assert payload["mode_preserving_report_cardinality_strata"] is True
-    assert int(payload["mode_preserving_report_cardinality_extra_particles"]) >= 4
 
 
 def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
@@ -778,8 +689,8 @@ def test_standard_transport_response_model_does_not_stack_legacy_scales() -> Non
         assert "measurement_scale_by_isotope_and_pair" not in payload
 
 
-def test_standard_pre_likelihood_profile_does_not_reweight_old_history() -> None:
-    """Standard profiling must keep post-refit historical reweighting disabled."""
+def test_standard_strict_profile_disables_strength_profiling() -> None:
+    """Standard runtime must keep conditional strength optimization disabled."""
     root = Path(__file__).resolve().parents[1]
     config_path = (
         root
@@ -789,12 +700,13 @@ def test_standard_pre_likelihood_profile_does_not_reweight_old_history() -> None
     )
     payload = _load_geant4_runtime_config(config_path)
 
-    assert payload.get("conditional_strength_profile_before_likelihood") is True
+    assert payload.get("conditional_strength_refit") is False
+    assert payload.get("conditional_strength_profile_before_likelihood") is False
     assert payload.get("conditional_strength_refit_reweight") is False
 
 
-def test_standard_full_simulation_enables_guarded_surface_reconstruction() -> None:
-    """Standard final L1+TV fitting must run only inside explicit memory guards."""
+def test_standard_full_simulation_disables_surface_reconstruction() -> None:
+    """Standard final output must come from PF posterior particles only."""
     root = Path(__file__).resolve().parents[1]
     config_path = (
         root
@@ -804,14 +716,7 @@ def test_standard_full_simulation_enables_guarded_surface_reconstruction() -> No
     )
     payload = _load_geant4_runtime_config(config_path)
 
-    assert payload.get("surface_map_reconstruction_enable") is True
-    assert int(payload.get("surface_map_max_patch_count", 0)) > 0
-    assert int(payload.get("surface_map_max_response_elements", 0)) > 0
-    assert int(payload.get("surface_map_max_spectrum_bins", 0)) == 32
-    spacing = np.asarray(payload.get("surface_map_spacing_m"), dtype=float)
-    assert spacing.shape == (3,)
-    assert np.all(np.isfinite(spacing) & (spacing > 0.0))
-    assert int(payload.get("surface_map_max_iterations", 0)) > 0
+    assert payload.get("surface_map_reconstruction_enable") is False
 
 
 def test_standard_runtime_declares_reproducible_evaluation_bins() -> None:

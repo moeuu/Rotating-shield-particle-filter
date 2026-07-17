@@ -98,6 +98,26 @@ def test_only_profiled_variant_can_enable_conditional_strength_profile() -> None
     assert differences == {"conditional_strength_profile"}
 
 
+def test_runtime_profile_resolves_conditional_strength_fields() -> None:
+    """Resolved runtime mappings must agree with the selected PF capability."""
+    requested = {
+        "conditional_strength_refit": True,
+        "conditional_strength_profile_before_likelihood": True,
+        "conditional_strength_refit_reweight": True,
+        "refit_after_moves": True,
+    }
+    strict = enforce_pure_runtime_settings(
+        {**requested, "estimator_profile": "pf_strict"}
+    )
+    profiled = enforce_pure_runtime_settings(
+        {**requested, "estimator_profile": "pf_profiled"}
+    )
+
+    for field in requested:
+        assert strict[field] is False
+        assert profiled[field] is True
+
+
 def test_pure_estimator_applies_boundary_before_legacy_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,6 +150,25 @@ def test_pure_estimator_applies_boundary_before_legacy_initialization(
         measurement_log_sha256="b" * 64,
     )
     assert estimator.pf_config.sparse_poisson_evidence_enable is False
+
+
+def test_pure_estimator_rejects_inherited_batch_estimation_entry_points() -> None:
+    """Pure PF must fail closed when legacy position or strength MLE is requested."""
+    estimator = PurePFEstimator(
+        isotopes=("Cs-137",),
+        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        measurement_log_sha256="b" * 64,
+    )
+
+    for method_name in estimator.forbidden_batch_entry_points:
+        with pytest.raises(RuntimeError, match="PurePFEstimator boundary"):
+            getattr(estimator, method_name)()
+
+    assert estimator.batch_methods_invoked == list(
+        estimator.forbidden_batch_entry_points
+    )
 
 
 def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
@@ -227,6 +266,69 @@ def test_pure_profiles_keep_fixed_budget_and_continuous_3d_planning(
     assert int(dss["horizon"]) >= 1
     assert int(dss["program_length"]) >= 1
     assert int(dss["max_programs"]) >= 1
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
+        "configs/geant4/high_fidelity_external_no_isaac.json",
+        "configs/python/high_fidelity_no_isaac.json",
+    ],
+)
+def test_standard_runtime_configs_declare_strict_pf_boundary(
+    relative_path: str,
+) -> None:
+    """Standard config files must not rely on runtime overrides for PF purity."""
+    root = Path(__file__).resolve().parents[1]
+    payload = load_runtime_config(root / relative_path)
+
+    assert payload["estimator_profile"] == "pf_strict"
+    forbidden = (
+        "all_history_dictionary_proposal_enable",
+        "birth_global_rescue_enable",
+        "conditional_strength_profile_before_likelihood",
+        "conditional_strength_refit",
+        "report_cluster_model_selection",
+        "report_mle_rescue_enable",
+        "report_strength_refit",
+        "report_surface_local_refine",
+        "runtime_report_rescue_enable",
+        "sparse_poisson_evidence_enable",
+        "surface_map_reconstruction_enable",
+    )
+    for field in forbidden:
+        assert payload.get(field, False) is False
+    dss = payload.get("dss_pp", {})
+    assert dss.get("adaptive_program_length_enable", False) is False
+    assert dss.get("include_runtime_rescue_modes", False) is False
+    assert dss.get("include_global_surface_rescue_modes", False) is False
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "configs/geant4/variance_reduction_external_no_isaac_32threads.json",
+        "configs/geant4/high_fidelity_external_no_isaac.json",
+        "configs/python/high_fidelity_no_isaac.json",
+    ],
+)
+def test_standard_runtime_configs_select_parallel_compute_paths(
+    relative_path: str,
+) -> None:
+    """Standard runtimes must select batched worker paths explicitly."""
+    root = Path(__file__).resolve().parents[1]
+    payload = load_runtime_config(root / relative_path)
+
+    assert int(payload["python_worker_count"]) > 1
+    assert int(payload["ig_workers"]) > 1
+    assert int(payload["pose_selection_workers"]) > 1
+    assert int(payload["structural_trial_workers"]) > 1
+    assert int(payload["structural_trial_parallel_min_trials"]) >= 1
+    assert int(payload["dss_pp"]["program_eval_workers"]) > 1
+    # Per-isotope filters currently share NumPy's deterministic RNG stream.
+    # Parallel work therefore stays inside particles, candidates, and trials.
+    assert payload["parallel_isotope_updates"] is False
 
 
 def test_pure_final_report_ignores_legacy_best_so_far_selection(

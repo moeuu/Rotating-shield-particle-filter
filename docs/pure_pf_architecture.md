@@ -23,9 +23,10 @@ evidence, surface maps, report MLE, batch model order, or off-grid refinement.
 `pf.profiles.resolve_estimator_profile` is the single authority. Legacy
 configuration booleans cannot grant a capability that the profile denies.
 
-- `pf_strict` (default): source strengths and background remain particle state;
-  conditional strength profiling and every all-history/batch capability are
-  disabled.
+- `pf_strict` (default): source cardinalities, positions, and strengths remain
+  particle state; the configured background rate is carried in the state
+  schema. Conditional strength profiling and every all-history/batch capability
+  are disabled.
 - `pf_profiled`: identical except that causal conditional strength profiling
   may be applied during the sequential PF update. It is not described as a
   strict PF.
@@ -33,6 +34,38 @@ configuration booleans cannot grant a capability that the profile denies.
 Both variants report `final_estimate_source=pf_posterior`, an empty
 `batch_methods_invoked`, and false values for all-history fit, surface-map,
 batch-model-order, and batch-feedback provenance.
+
+The standard Geant4 and Python runtime configurations declare `pf_strict`
+directly and keep forbidden batch flags false in the files themselves.
+`enforce_pure_runtime_settings` and `apply_profile_to_config` remain fail-closed
+guards for inherited configs and hostile API overrides. Inherited legacy
+report-MLE methods are not part of the `PurePFEstimator` boundary: direct calls
+to report position refinement, report-strength fitting, dictionary rescue, or
+surface reconstruction raise `PurePFBoundaryError` and are recorded in purity
+diagnostics.
+
+PF-internal trans-dimensional proposals are a separate boundary. Residual
+birth/split/merge proposals may evaluate a bounded causal measurement block and
+optimize trial source strengths at fixed candidate positions before accepting
+or rejecting a proposed particle state. Those trial values are never emitted as
+a second estimate and never replace the weighted PF posterior. Consequently,
+`pf_strict` means PF-only localization without all-history batch refinement; it
+does not mean that every data-informed proposal must be sampled from the prior.
+
+## Execution model
+
+The standard runtime automatically enables the torch/CUDA path when CUDA is
+available. Expected-count kernels, observation likelihoods, spectrum processing,
+and full shield-pair information-gain grids use batched GPU operations. Without
+CUDA, the same equations use batched NumPy kernels.
+
+CPU parallelism is explicit for PF structural trials, candidate-pose evaluation,
+DSS-PP program evaluation, motion planning, and Geant4 transport. The standard
+configs request 32 workers/threads for these paths. Per-isotope PF updates remain
+serial because the filters currently share NumPy's global random stream; running
+them concurrently would make random draws scheduling-dependent. Parallel work is
+therefore applied inside deterministic particle, candidate, and structural-trial
+kernels rather than around the stochastic isotope-update order.
 
 ## PF posterior reporting
 

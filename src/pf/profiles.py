@@ -95,6 +95,54 @@ _PROFILE_ALIASES = {
     "pf_online_profiled": EstimatorProfile.PF_PROFILED,
 }
 
+_CONDITIONAL_STRENGTH_FIELDS = (
+    "conditional_strength_refit",
+    "conditional_strength_profile_before_likelihood",
+    "conditional_strength_refit_reweight",
+    "refit_after_moves",
+)
+
+_FORBIDDEN_BATCH_BOOLEAN_FIELDS = (
+    "birth_global_rescue_enable",
+    "birth_global_rescue_candidate_memory_enable",
+    "runtime_report_rescue_enable",
+    "runtime_report_rescue_memory_enable",
+    "all_history_dictionary_proposal_enable",
+    "candidate_verification_queue_enable",
+    "candidate_verification_independent_evidence_enable",
+    "report_mle_rescue_enable",
+    "report_cluster_model_selection",
+    "report_model_order_prune_particles",
+    "report_strength_refit",
+    "report_surface_local_refine",
+    "sparse_poisson_evidence_enable",
+    "sparse_poisson_evidence_authoritative",
+    "sparse_poisson_spectral_evidence_enable",
+    "sparse_poisson_spectral_evidence_primary",
+    "sparse_poisson_joint_evidence_enable",
+    "sparse_poisson_offgrid_refine_enable",
+    "sparse_poisson_ambiguity_report_enable",
+    "mode_preserving_report_cardinality_strata",
+    "report_best_so_far_enable",
+    "report_pre_finalize_guard",
+    "runtime_report_rescue_verification_queue_only",
+    "adaptive_strength_prior",
+    "source_prune_refit_after_remove",
+)
+
+_FORBIDDEN_RUNTIME_BOOLEAN_FIELDS = (
+    "adaptive_cardinality_dwell_enable",
+    "adaptive_mission_stop",
+    "mission_stop_require_model_order_ready",
+    "mission_stop_report_simple_enable",
+    "mission_stop_soft_extend_on_unresolved",
+    "surface_map_reconstruction_enable",
+    "pf_detected_isotopes_only",
+    "pf_detected_isotope_activation_only",
+    "online_absent_isotope_pruning",
+    "final_absent_isotope_filter",
+)
+
 
 def resolve_estimator_profile(
     value: EstimatorProfile | str | None,
@@ -142,13 +190,7 @@ def apply_profile_to_config(config: Any) -> EstimatorCapabilities:
     )
     config.estimator_profile = profile.value
 
-    conditional_fields = (
-        "conditional_strength_refit",
-        "conditional_strength_profile_before_likelihood",
-        "conditional_strength_refit_reweight",
-        "refit_after_moves",
-    )
-    for field in conditional_fields:
+    for field in _CONDITIONAL_STRENGTH_FIELDS:
         if hasattr(config, field):
             setattr(
                 config,
@@ -157,34 +199,7 @@ def apply_profile_to_config(config: Any) -> EstimatorCapabilities:
                 and bool(capabilities.conditional_strength_profile),
             )
 
-    forbidden_boolean_fields = (
-        "birth_global_rescue_enable",
-        "birth_global_rescue_candidate_memory_enable",
-        "runtime_report_rescue_enable",
-        "runtime_report_rescue_memory_enable",
-        "all_history_dictionary_proposal_enable",
-        "candidate_verification_queue_enable",
-        "candidate_verification_independent_evidence_enable",
-        "report_mle_rescue_enable",
-        "report_cluster_model_selection",
-        "report_model_order_prune_particles",
-        "report_strength_refit",
-        "report_surface_local_refine",
-        "sparse_poisson_evidence_enable",
-        "sparse_poisson_evidence_authoritative",
-        "sparse_poisson_spectral_evidence_enable",
-        "sparse_poisson_spectral_evidence_primary",
-        "sparse_poisson_joint_evidence_enable",
-        "sparse_poisson_offgrid_refine_enable",
-        "sparse_poisson_ambiguity_report_enable",
-        "mode_preserving_report_cardinality_strata",
-        "report_best_so_far_enable",
-        "report_pre_finalize_guard",
-        "runtime_report_rescue_verification_queue_only",
-        "adaptive_strength_prior",
-        "source_prune_refit_after_remove",
-    )
-    for field in forbidden_boolean_fields:
+    for field in _FORBIDDEN_BATCH_BOOLEAN_FIELDS:
         if hasattr(config, field):
             setattr(config, field, False)
     if hasattr(config, "mode_preserving_report_cardinality_extra_particles"):
@@ -198,42 +213,25 @@ def enforce_pure_runtime_settings(
     profile: EstimatorProfile | str | None = None,
 ) -> dict[str, Any]:
     """Return runtime settings with batch planner/dwell/stop paths disabled."""
-    resolved_profile, _ = resolve_estimator_profile(
+    resolved_profile, capabilities = resolve_estimator_profile(
         profile
         if profile is not None
         else runtime_config.get("estimator_profile", EstimatorProfile.PF_STRICT.value)
     )
     result = dict(runtime_config)
     result["estimator_profile"] = resolved_profile.value
-    result.update(
-        {
-            "adaptive_cardinality_dwell_enable": False,
-            "adaptive_mission_stop": False,
-            "mission_stop_require_model_order_ready": False,
-            "mission_stop_report_simple_enable": False,
-            "mission_stop_soft_extend_on_unresolved": False,
-            "surface_map_reconstruction_enable": False,
-            "pf_detected_isotopes_only": False,
-            "pf_detected_isotope_activation_only": False,
-            "online_absent_isotope_pruning": False,
-            "sparse_poisson_evidence_enable": False,
-            "sparse_poisson_evidence_authoritative": False,
-            "sparse_poisson_spectral_evidence_enable": False,
-            "sparse_poisson_joint_evidence_enable": False,
-            "sparse_poisson_offgrid_refine_enable": False,
-            "report_mle_rescue_enable": False,
-            "runtime_report_rescue_enable": False,
-            "all_history_dictionary_proposal_enable": False,
-            "report_cluster_model_selection": False,
-            "report_model_order_prune_particles": False,
-            "report_strength_refit": False,
-            "report_surface_local_refine": False,
-            "final_absent_isotope_filter": False,
-            # PF update kernels share NumPy's deterministic RNG stream.  Keep
-            # isotope updates serial so scheduling cannot reorder draws.
-            "parallel_isotope_updates": False,
-        }
-    )
+    for field in (
+        *_FORBIDDEN_BATCH_BOOLEAN_FIELDS,
+        *_FORBIDDEN_RUNTIME_BOOLEAN_FIELDS,
+    ):
+        result[field] = False
+    if not capabilities.conditional_strength_profile:
+        for field in _CONDITIONAL_STRENGTH_FIELDS:
+            result[field] = False
+    result["mode_preserving_report_cardinality_extra_particles"] = 0
+    # PF update kernels share NumPy's deterministic RNG stream. Keep isotope
+    # updates serial so scheduling cannot reorder draws.
+    result["parallel_isotope_updates"] = False
     dss_payload = result.get("dss_pp", {})
     dss = dict(dss_payload) if isinstance(dss_payload, Mapping) else {}
     dss.update(

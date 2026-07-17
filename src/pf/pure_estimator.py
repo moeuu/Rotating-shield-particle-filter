@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, NoReturn, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +40,17 @@ class PurePFEstimator(_LegacyEstimatorShell):
         ProposalOrigin.PF_BIRTH,
         ProposalOrigin.PF_RESIDUAL,
         ProposalOrigin.PF_SPLIT,
+    )
+    forbidden_batch_entry_points: tuple[str, ...] = (
+        "_solve_report_strengths",
+        "_solve_report_strengths_batch",
+        "_augment_report_candidates_with_mle_rescue",
+        "_select_report_clusters_by_model_order",
+        "_refine_report_surface_positions",
+        "_refit_reported_strengths",
+        "_all_history_dictionary_candidates",
+        "_runtime_report_rescue_estimate",
+        "fit_surface_map",
     )
 
     def __init__(
@@ -108,6 +119,63 @@ class PurePFEstimator(_LegacyEstimatorShell):
         except ValueError:
             return False
         return resolved in self.allowed_proposal_origins
+
+    def _reject_batch_estimation(self, method_name: str) -> NoReturn:
+        """Record and reject an inherited all-history batch-estimation call."""
+        self.batch_methods_invoked.append(str(method_name))
+        raise PurePFBoundaryError(
+            f"{method_name} is outside the PurePFEstimator boundary."
+        )
+
+    def _solve_report_strengths(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Reject the inherited all-history report-strength optimizer."""
+        del args, kwargs
+        self._reject_batch_estimation("_solve_report_strengths")
+
+    def _solve_report_strengths_batch(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Reject the inherited batched all-history strength optimizer."""
+        del args, kwargs
+        self._reject_batch_estimation("_solve_report_strengths_batch")
+
+    def _augment_report_candidates_with_mle_rescue(
+        self, *args: Any, **kwargs: Any
+    ) -> NoReturn:
+        """Reject inherited report-MLE position candidate augmentation."""
+        del args, kwargs
+        self._reject_batch_estimation("_augment_report_candidates_with_mle_rescue")
+
+    def _select_report_clusters_by_model_order(
+        self, *args: Any, **kwargs: Any
+    ) -> NoReturn:
+        """Reject inherited batch model-order selection for final reports."""
+        del args, kwargs
+        self._reject_batch_estimation("_select_report_clusters_by_model_order")
+
+    def _refine_report_surface_positions(
+        self, *args: Any, **kwargs: Any
+    ) -> NoReturn:
+        """Reject inherited all-history surface-position refinement."""
+        del args, kwargs
+        self._reject_batch_estimation("_refine_report_surface_positions")
+
+    def _refit_reported_strengths(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """Reject inherited final-report position and strength refitting."""
+        del args, kwargs
+        self._reject_batch_estimation("_refit_reported_strengths")
+
+    def _all_history_dictionary_candidates(
+        self, *args: Any, **kwargs: Any
+    ) -> NoReturn:
+        """Reject inherited all-history dictionary proposals."""
+        del args, kwargs
+        self._reject_batch_estimation("_all_history_dictionary_candidates")
+
+    def _runtime_report_rescue_estimate(
+        self, *args: Any, **kwargs: Any
+    ) -> NoReturn:
+        """Reject inherited runtime report-MLE rescue estimation."""
+        del args, kwargs
+        self._reject_batch_estimation("_runtime_report_rescue_estimate")
 
     def refresh_sparse_poisson_evidence(self) -> Dict[str, Dict[str, Any]]:
         """Return no evidence because all-history sparse fits are outside pure PF."""
@@ -331,9 +399,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
     def fit_surface_map(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Reject surface-map reconstruction at the pure PF boundary."""
         del args, kwargs
-        raise PurePFBoundaryError(
-            "Surface-map reconstruction is not available in the pure PF repository path."
-        )
+        self._reject_batch_estimation("fit_surface_map")
 
     def serialized_state(self) -> bytes:
         """Return a canonical byte representation for causality/determinism tests."""

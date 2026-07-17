@@ -225,7 +225,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert passive_no_shield["thread_count"] >= 1
     assert passive_no_shield["python_worker_count"] >= 1
     assert passive_no_shield["pose_selection_workers"] >= 1
-    assert passive_no_shield["parallel_isotope_updates"] is True
+    assert passive_no_shield["parallel_isotope_updates"] is False
     assert passive_no_shield["parallel_isotope_workers"] >= 1
     assert passive_no_shield["dss_pp"]["program_eval_workers"] >= 1
     passive_equal_time = json.loads(
