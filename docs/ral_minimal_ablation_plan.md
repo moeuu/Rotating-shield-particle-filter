@@ -76,6 +76,10 @@ The paper subset files are:
 - `results/ral_ablation/ral_paper_subset_manifest.csv`
 - `results/ral_ablation/run_paper_subset.sh`
 
+Each generated full-simulation config writes a unique truth-free MeasurementLog
+below `results/ral_ablation/measurement_logs/<output-tag>`. The target directory
+must not already exist when the run starts; archive a previous log before rerun.
+
 Run the selected full simulations with:
 
 ```bash

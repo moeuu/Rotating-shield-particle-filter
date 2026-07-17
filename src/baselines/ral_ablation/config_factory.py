@@ -26,6 +26,7 @@ DEFAULT_BASE_CONFIG = (
     ROOT / "configs" / "geant4" / "variance_reduction_external_no_isaac_32threads.json"
 )
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
+DEFAULT_MEASUREMENT_LOG_ROOT = Path("results") / "ral_ablation" / "measurement_logs"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
 
 
@@ -663,6 +664,10 @@ def _variant_config(
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
     config["random_seed_base"] = int(seed)
+    config["measurement_log_output_dir"] = (
+        DEFAULT_MEASUREMENT_LOG_ROOT / output_tag
+    ).as_posix()
+    config["measurement_log_run_id"] = str(output_tag)
     # Keep the browser progress page stable across ablation runs. The final
     # result files still use output_tag, so only the live progress view is shared.
     config["cui_split_view_dir"] = DEFAULT_CUI_SPLIT_VIEW_DIR

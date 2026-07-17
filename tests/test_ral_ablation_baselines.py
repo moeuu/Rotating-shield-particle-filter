@@ -314,6 +314,18 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert source_payload["metadata"]["visibility_filter"] is True
     assert proposed_config.get("pf_max_sources") is None
     assert proposed_config.get("init_num_sources_max") is None
+    assert proposed_config["measurement_log_output_dir"] == (
+        "results/ral_ablation/measurement_logs/"
+        "mix9_multi_isotope_cardinality_proposed_seed_1234"
+    )
+    assert proposed_config["measurement_log_run_id"] == (
+        "mix9_multi_isotope_cardinality_proposed_seed_1234"
+    )
+    measurement_log_targets = {
+        json.loads(entry.config_path.read_text())["measurement_log_output_dir"]
+        for entry in entries
+    }
+    assert len(measurement_log_targets) == len(entries)
     assert "--full-simulation" in by_variant["proposed"].command
     assert "--max-sources" not in by_variant["proposed"].command
     assert "--adaptive-dwell" not in by_variant["proposed"].command
