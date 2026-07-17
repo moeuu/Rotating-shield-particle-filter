@@ -38,6 +38,9 @@ from runtime_defaults import (
 _DSS_PP_POSE_EVAL_CONTEXT: dict[str, object] | None = None
 _DSS_PP_PATH_LENGTH_CACHE: dict[tuple[object, ...], float] = {}
 _DSS_PP_PATH_LENGTH_CACHE_MAX = 20000
+# Private capability used only by the opt-in, non-actuating recommendation
+# boundary.  A normal pure-PF planner call never receives this object.
+_HYBRID_RECOMMENDATION_EXTERNAL_MODE_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -712,12 +715,12 @@ def _preserve_external_rescue_modes(
     max_modes: int,
 ) -> list[SignatureMode]:
     """
-    Keep distinct runtime rescue hypotheses visible to DSS-PP planning.
+    Keep distinct explicitly authorized external hypotheses visible to DSS-PP.
 
-    The rescue list is already produced by all-history report/residual scoring.
-    When PF modes fill the planner mode budget, this replaces the lowest-weight
-    duplicate-free planner mode with a distinct rescue hypothesis instead of
-    silently dropping every posterior-external hypothesis.
+    The list can contain a legacy runtime rescue mode or an opt-in planner-only
+    mode. When PF modes fill the planner budget, this replaces the lowest-weight
+    duplicate-free mode with a distinct external hypothesis instead of silently
+    dropping every posterior-external hypothesis.
     """
     limit = max(1, int(max_modes))
     result = list(modes[:limit])
@@ -773,8 +776,9 @@ def extract_signature_modes(
     global_surface_rescue_mode_weight: float = 0.75,
     weak_mode_weight_floor: float = 0.0,
     dominant_mode_weight_cap: float = 1.0,
+    _planner_only_external_mode_token: object | None = None,
 ) -> dict[str, list[SignatureMode]]:
-    """Extract isotope-wise posterior and runtime-rescue modes for planning."""
+    """Extract isotope-wise posterior and explicitly planner-only modes."""
     particles = estimator.planning_particles(
         max_particles=max_particles,
         method=method,
@@ -789,6 +793,7 @@ def extract_signature_modes(
         str,
         tuple[NDArray[np.float64], NDArray[np.float64], float],
     ] = {}
+    planner_only_external_payload: dict[str, tuple[SignatureMode, ...]] = {}
     capabilities = getattr(estimator, "profile_capabilities", None)
     # Capability-bearing estimators are governed by the pure-profile boundary.
     # Legacy estimator objects have no capability map and retain their historical
@@ -820,6 +825,70 @@ def extract_signature_modes(
                 global_rescue_payload = dict(global_rescue_getter())
             except (RuntimeError, ValueError, TypeError):
                 global_rescue_payload = {}
+    external_getter = getattr(
+        estimator,
+        "planner_only_external_signature_modes",
+        None,
+    )
+    if callable(external_getter):
+        if (
+            _planner_only_external_mode_token
+            is not _HYBRID_RECOMMENDATION_EXTERNAL_MODE_TOKEN
+        ):
+            raise ValueError(
+                "Planner-only external modes are available only through the "
+                "explicit hybrid recommendation boundary."
+            )
+        raw_external_payload = external_getter()
+        if not isinstance(raw_external_payload, dict):
+            raise ValueError(
+                "planner_only_external_signature_modes must return a mapping."
+            )
+        known_isotopes = {str(value) for value in estimator.isotopes}
+        unknown_isotopes = sorted(
+            str(value) for value in set(raw_external_payload) - known_isotopes
+        )
+        if unknown_isotopes:
+            raise ValueError(
+                "Planner-only external modes contain unknown isotopes: "
+                + ", ".join(unknown_isotopes)
+                + "."
+            )
+        for isotope, raw_modes in raw_external_payload.items():
+            validated_modes: list[SignatureMode] = []
+            for raw_mode in raw_modes:
+                if not isinstance(raw_mode, SignatureMode):
+                    raise TypeError(
+                        "Planner-only external modes must be SignatureMode values."
+                    )
+                position = np.asarray(raw_mode.position_xyz, dtype=float).reshape(3)
+                strength = float(raw_mode.strength_cps_1m)
+                weight = float(raw_mode.weight)
+                spread = float(raw_mode.spread_m)
+                if (
+                    str(raw_mode.isotope) != str(isotope)
+                    or not np.all(np.isfinite(position))
+                    or not np.isfinite(strength)
+                    or strength <= 0.0
+                    or not np.isfinite(weight)
+                    or weight <= 0.0
+                    or not np.isfinite(spread)
+                    or spread < 0.0
+                ):
+                    raise ValueError(
+                        "Planner-only external modes require matching isotopes, "
+                        "finite XYZ, positive strength/weight, and non-negative spread."
+                    )
+                validated_modes.append(
+                    SignatureMode(
+                        isotope=str(isotope),
+                        position_xyz=position.copy(),
+                        strength_cps_1m=strength,
+                        weight=weight,
+                        spread_m=spread,
+                    )
+                )
+            planner_only_external_payload[str(isotope)] = tuple(validated_modes)
     exclude_quarantined = bool(
         getattr(
             getattr(estimator, "pf_config", None),
@@ -831,7 +900,7 @@ def extract_signature_modes(
         positions: list[NDArray[np.float64]] = []
         strengths: list[float] = []
         sample_weights: list[float] = []
-        external_rescue_modes: list[SignatureMode] = []
+        posterior_external_modes: list[SignatureMode] = []
         if isotope in particles:
             states, weights = particles[isotope]
             norm_weights = _normalise_weights(np.asarray(weights, dtype=float))
@@ -902,17 +971,20 @@ def extract_signature_modes(
             mass=float(global_surface_rescue_mode_weight),
             eps=eps,
         )
-        external_rescue_modes.extend(rescue_modes)
-        external_rescue_modes.extend(global_rescue_modes)
-        for rescue_mode in external_rescue_modes:
+        posterior_external_modes.extend(rescue_modes)
+        posterior_external_modes.extend(global_rescue_modes)
+        posterior_external_modes.extend(
+            planner_only_external_payload.get(str(isotope), ())
+        )
+        for rescue_mode in posterior_external_modes:
             positions.append(np.asarray(rescue_mode.position_xyz, dtype=float))
             strengths.append(float(rescue_mode.strength_cps_1m))
             sample_weights.append(float(rescue_mode.weight))
         total_sample_weight = float(np.sum(np.maximum(sample_weights, 0.0)))
         if total_sample_weight > eps:
-            external_rescue_modes = [
+            posterior_external_modes = [
                 replace(mode, weight=float(mode.weight) / total_sample_weight)
-                for mode in external_rescue_modes
+                for mode in posterior_external_modes
             ]
         modes = _cluster_source_samples(
             isotope,
@@ -924,7 +996,7 @@ def extract_signature_modes(
         )
         modes = _preserve_external_rescue_modes(
             modes,
-            external_rescue_modes,
+            posterior_external_modes,
             radius_m=mode_cluster_radius_m,
             max_modes=max_modes_per_isotope,
         )
@@ -4505,15 +4577,13 @@ def _node_path_length(
             elif points.shape[0] == 1:
                 length = 0.0
             else:
-                length = float(
-                    np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1))
-                )
+                length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
         if len(_DSS_PP_PATH_LENGTH_CACHE) >= _DSS_PP_PATH_LENGTH_CACHE_MAX:
             _DSS_PP_PATH_LENGTH_CACHE.clear()
         _DSS_PP_PATH_LENGTH_CACHE[cache_key] = float(length)
-        _DSS_PP_PATH_LENGTH_CACHE[
-            ("motion", id(map_api), goal_key, start_key)
-        ] = float(length)
+        _DSS_PP_PATH_LENGTH_CACHE[("motion", id(map_api), goal_key, start_key)] = float(
+            length
+        )
         return float(length)
     cell_index = getattr(map_api, "cell_index", None)
     if not callable(cell_index):
@@ -6300,6 +6370,7 @@ def select_dss_pp_next_station(
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
+    _planner_only_external_mode_token: object | None = None,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
 
@@ -6334,6 +6405,7 @@ def select_dss_pp_next_station(
         global_surface_rescue_mode_weight=float(cfg.global_surface_rescue_mode_weight),
         weak_mode_weight_floor=float(cfg.weak_mode_weight_floor),
         dominant_mode_weight_cap=float(cfg.dominant_mode_weight_cap),
+        _planner_only_external_mode_token=_planner_only_external_mode_token,
     )
     modes = _apply_recovery_isotope_mode_weights(modes, cfg)
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
@@ -6512,6 +6584,30 @@ def select_dss_pp_next_station(
                     )
             except (RuntimeError, ValueError, TypeError):
                 runtime_rescue_mode_counts = {}
+    planner_only_external_mode_counts: dict[str, int] = {}
+    external_getter = getattr(
+        estimator,
+        "planner_only_external_signature_modes",
+        None,
+    )
+    if callable(external_getter):
+        if (
+            _planner_only_external_mode_token
+            is not _HYBRID_RECOMMENDATION_EXTERNAL_MODE_TOKEN
+        ):
+            raise ValueError(
+                "Planner-only external modes are available only through the "
+                "explicit hybrid recommendation boundary."
+            )
+        external_payload = external_getter()
+        if not isinstance(external_payload, dict):
+            raise ValueError(
+                "planner_only_external_signature_modes must return a mapping."
+            )
+        planner_only_external_mode_counts = {
+            str(isotope): int(len(mode_list))
+            for isotope, mode_list in external_payload.items()
+        }
     raw_global_counts = (
         getattr(estimator, "_last_planning_surface_rescue_mode_counts", {})
         if allow_batch_candidates
@@ -6565,6 +6661,7 @@ def select_dss_pp_next_station(
         "mode_count": int(mode_count),
         "runtime_rescue_mode_counts": runtime_rescue_mode_counts,
         "runtime_rescue_mode_weight": float(cfg.runtime_rescue_mode_weight),
+        "planner_only_external_mode_counts": planner_only_external_mode_counts,
         "global_surface_rescue_mode_counts": global_surface_rescue_mode_counts,
         "global_surface_rescue_mode_weight": float(
             cfg.global_surface_rescue_mode_weight

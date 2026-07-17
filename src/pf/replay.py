@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -580,8 +580,21 @@ def replay_records(
     estimator: PurePFEstimator,
     *,
     stop_after: int | None = None,
+    pre_record_callback: Callable[
+        [PurePFEstimator, MeasurementLogRecord, int, int], None
+    ]
+    | None = None,
+    station_complete_callback: Callable[
+        [PurePFEstimator, MeasurementLogRecord, int], None
+    ]
+    | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Replay a causal prefix using its explicitly logged station boundaries."""
+    """Replay a causal prefix using its explicitly logged station boundaries.
+
+    Optional callbacks are reserved for estimator-neutral wrappers.  The
+    standard replay command supplies neither callback, so its state, random
+    stream, trace, and output bytes retain their existing semantics.
+    """
     isotopes = tuple(str(value) for value in log.run_manifest.get("isotopes", ()))
     limit = len(log.records) if stop_after is None else max(0, int(stop_after))
     station_pose: dict[int, NDArray[np.float64]] = {}
@@ -615,6 +628,8 @@ def replay_records(
         pair = _pair_record(record, isotopes)
         station_complete = _station_complete(record)
         pose_idx = station_pose_index[station_id]
+        if pre_record_callback is not None:
+            pre_record_callback(estimator, record, record_index, pose_idx)
 
         if not joint_update and not delayed_update:
             normalized = PurePFEstimator._normalize_pair_sequence_record(pair)
@@ -631,6 +646,8 @@ def replay_records(
                 z_variance_k=variances,
                 **kwargs,
             )
+            if station_complete and station_complete_callback is not None:
+                station_complete_callback(estimator, record, record_index)
             trace.append(_trace_row(estimator, record, record_index=record_index))
             continue
 
@@ -657,6 +674,8 @@ def replay_records(
                     tuple(pending_pairs),
                     pose_idx=pending_pose_idx,
                 )
+                if station_complete_callback is not None:
+                    station_complete_callback(estimator, record, record_index)
             trace.append(_trace_row(estimator, record, record_index=record_index))
         else:
             normalized = PurePFEstimator._normalize_pair_sequence_record(pair)
@@ -675,6 +694,8 @@ def replay_records(
             )
             if station_complete:
                 estimator.finalize_deferred_pose_update()
+                if station_complete_callback is not None:
+                    station_complete_callback(estimator, record, record_index)
             trace.append(_trace_row(estimator, record, record_index=record_index))
 
         if station_complete:

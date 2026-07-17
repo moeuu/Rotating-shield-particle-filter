@@ -22,6 +22,48 @@ To run tests:
 uv run pytest
 ```
 
+## Pure-PF replay and opt-in hybrid boundary
+
+The scientific baseline is `pf_strict`: count-domain sequential PF localization
+without all-history batch refinement. Its public MeasurementLog replay and posterior
+reporting semantics are unchanged:
+
+```bash
+uv run python -m pf.replay \
+  --measurement-log /path/to/measurement_log \
+  --config /path/to/pf_config.json \
+  --profile pf_strict \
+  --output-dir results/pf-replay
+```
+
+Hybrid support is deliberately isolated in separate opt-in entry points for the
+orchestrator repository. `pf.hybrid_replay` applies MLE-shaped position proposals only
+as fixed-cardinality Metropolis-within-Gibbs moves. The PF evaluates its complete
+target through the declared cutoff plus the forward/reverse proposal correction;
+particle weights, strengths, backgrounds, and source count are not overwritten by an
+MLE objective. Receipts retain particle-level decisions and honest aggregate
+attempt/accept/reject/not-sampled counts.
+
+`pf.hybrid_planning` causally replays the same prefix and emits one algorithmic DSS-PP
+XYZ/height/shield-program recommendation from PF modes plus pending/verified external
+modes. Quarantined modes are excluded. It requires a collision/reachability-attested
+candidate set, proves PF bytes are unchanged, and always reports
+`robot_actuation_authorized=false`.
+
+```bash
+uv run python -m pf.hybrid_planning \
+  --measurement-log /path/to/station_marked_log \
+  --config /path/to/pf_config.json \
+  --planning-request /path/to/planning_request.json \
+  --directive-schedule /path/to/directives.json \
+  --profile pf_strict \
+  --output results/hybrid_planning_recommendation.json
+```
+
+These hybrid entry points do not alter or get called by normal `pf.replay`. See
+[`docs/external_relocation_boundary.md`](docs/external_relocation_boundary.md) and
+[`docs/hybrid_planning_boundary.md`](docs/hybrid_planning_boundary.md).
+
 ## GPU acceleration (optional)
 
 To enable CUDA acceleration for EIG, rotation rollouts, and PF updates, install torch:
