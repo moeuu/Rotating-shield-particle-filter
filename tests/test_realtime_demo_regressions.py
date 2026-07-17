@@ -62,6 +62,7 @@ from realtime_demo import (
     _pure_pf_summary_provenance,
     _online_absent_pruning_supported_isotopes,
     _prune_online_absent_isotopes,
+    _measurement_log_obstacle_layout_path,
     _resolve_ig_workers,
     _resolve_runtime_use_gpu,
     _resolve_mission_max_poses,
@@ -201,6 +202,38 @@ def test_effective_live_config_is_truth_free_and_binds_exact_pf_inputs(
         repository_root=tmp_path,
     )
     assert target == tmp_path / "logs/run"
+
+
+def test_measurement_log_obstacle_layout_path_is_portable_and_physical(
+    tmp_path: Path,
+) -> None:
+    """Only a repository-local fixed asset should become a log pointer."""
+    repository_root = tmp_path / "repository"
+    fixed_layout = repository_root / "obstacle_layouts" / "fixed.json"
+    fixed_environment = SimpleNamespace(mode="fixed", layout_path=fixed_layout)
+    random_environment = SimpleNamespace(mode="random", layout_path=fixed_layout)
+
+    assert _measurement_log_obstacle_layout_path(
+        fixed_environment,
+        repository_root=repository_root,
+    ) == "obstacle_layouts/fixed.json"
+    assert (
+        _measurement_log_obstacle_layout_path(
+            random_environment,
+            repository_root=repository_root,
+        )
+        is None
+    )
+
+    external_environment = SimpleNamespace(
+        mode="fixed",
+        layout_path=tmp_path / "external" / "fixed.json",
+    )
+    with pytest.raises(ValueError, match="must be inside the repository"):
+        _measurement_log_obstacle_layout_path(
+            external_environment,
+            repository_root=repository_root,
+        )
 
 
 def test_pure_primary_estimates_preserve_low_strength_posterior_modes() -> None:

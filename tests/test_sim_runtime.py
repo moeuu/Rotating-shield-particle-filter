@@ -3755,4 +3755,8 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     assert runtime.reset_payload["robot_radius_m"] == pytest.approx(
         float(blender_calls[0]["robot_radius_m"])
     )
+    run_manifest = json.loads(
+        (measurement_log_output / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert run_manifest["obstacle_layout_path"] is None
     assert runtime.close_called

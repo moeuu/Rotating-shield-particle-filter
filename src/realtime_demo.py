@@ -115,6 +115,28 @@ def _resolve_required_measurement_log_target(
     return target
 
 
+def _measurement_log_obstacle_layout_path(
+    obstacle_environment: RuntimeObstacleEnvironment,
+    *,
+    repository_root: Path,
+) -> str | None:
+    """Return the portable fixed-layout asset referenced by a live log."""
+    if obstacle_environment.mode != "fixed":
+        return None
+    if obstacle_environment.layout_path is None:
+        return None
+    resolved_root = Path(repository_root).resolve()
+    resolved_layout = Path(obstacle_environment.layout_path).resolve()
+    try:
+        relative = resolved_layout.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            "Fixed obstacle layouts recorded in MeasurementLog must be inside "
+            "the repository."
+        ) from exc
+    return relative.as_posix()
+
+
 def _truth_free_live_runtime_config(value: Mapping[str, Any]) -> dict[str, Any]:
     """Remove source-realization inputs before publishing PF provenance."""
 
@@ -419,7 +441,10 @@ from runtime_defaults import (
     DEFAULT_ROBOT_SPEED_M_S,
     DEFAULT_ROTATION_OVERHEAD_S,
 )
-from runtime_environment import build_runtime_obstacle_environment
+from runtime_environment import (
+    RuntimeObstacleEnvironment,
+    build_runtime_obstacle_environment,
+)
 from runtime.measurement_log import (
     MeasurementLogRecord,
     MeasurementLogStreamWriter,
@@ -8433,6 +8458,10 @@ def run_live_pf(
     obstacle_grid = obstacle_environment.grid
     normalized_environment_mode = obstacle_environment.mode
     known_obstacle_instances = obstacle_environment.known_obstacle_instances
+    measurement_log_obstacle_layout_path = _measurement_log_obstacle_layout_path(
+        obstacle_environment,
+        repository_root=ROOT,
+    )
     runtime_obstacle_material = str(runtime_config.get("obstacle_material", "concrete"))
     if obstacle_environment.message is not None:
         print(obstacle_environment.message)
@@ -12185,7 +12214,7 @@ def run_live_pf(
         forward_manifest = build_forward_model_manifest(
             runtime_config=measurement_log_runtime_config,
             environment=environment_payload,
-            obstacle_layout_path=obstacle_layout_path,
+            obstacle_layout_path=measurement_log_obstacle_layout_path,
             isotopes=isotopes,
             repository_commit=commit,
             resolved_config_sha256=measurement_log_config_hash,
@@ -12206,7 +12235,7 @@ def run_live_pf(
             forward_model_manifest=forward_manifest,
             isotopes=isotopes,
             metadata={"acquisition": "live_append_before_pf_update"},
-            obstacle_layout_path=obstacle_layout_path,
+            obstacle_layout_path=measurement_log_obstacle_layout_path,
         )
     viz = _build_visualizer()
     cui_split_viz = _build_cui_split_visualizer()
