@@ -84,6 +84,7 @@ def test_standard_runtime_uses_continuous_collision_checked_measurement_space() 
     )
     assert int(payload["measurement_route_workers"]) > 1
     assert float(payload["detector_transport_height_m"]) >= 0.0
+    assert payload["height_partner_reuse_shield_program"] is False
 
 
 def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:

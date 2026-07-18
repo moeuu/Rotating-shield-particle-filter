@@ -244,7 +244,7 @@
   "final_absent_min_support_measurements": 2,
   "headless": true,
   "headless_visualizer_defer": true,
-  "height_partner_reuse_shield_program": true,
+  "height_partner_reuse_shield_program": false,
   "high_strength_split_candidate_count": 12,
   "high_strength_split_enable": true,
   "high_strength_split_offset_m": 1.5,

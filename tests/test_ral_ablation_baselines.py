@@ -154,6 +154,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert proposed_config["surface_observability_diagnostic_candidates"] == 0
     assert proposed_config["sparse_poisson_evidence_min_distinct_stations"] == 2
+    assert proposed_config["height_partner_reuse_shield_program"] is False
     assert round_robin["orientation_k"] == proposed_config["orientation_k"]
     assert (
         round_robin["min_rotations_per_pose"]

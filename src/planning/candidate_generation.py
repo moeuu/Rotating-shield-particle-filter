@@ -185,6 +185,31 @@ def _filter_candidates(
     return candidates[mask]
 
 
+def _filter_motion_reachable_candidates(
+    candidates_xyz: NDArray[np.float64],
+    *,
+    current_pose_xyz: NDArray[np.float64],
+    map_api: object | None,
+    enabled: bool,
+) -> NDArray[np.float64]:
+    """Filter one candidate batch with the map's native reachability API."""
+    candidates = np.asarray(candidates_xyz, dtype=float).reshape(-1, 3)
+    if not enabled or candidates.shape[0] == 0:
+        return candidates
+    checker = getattr(map_api, "is_motion_reachable_batch", None)
+    if not callable(checker):
+        return candidates
+    reachable = np.asarray(
+        checker(current_pose_xyz, candidates),
+        dtype=bool,
+    ).reshape(-1)
+    if reachable.size != candidates.shape[0]:
+        raise ValueError(
+            "is_motion_reachable_batch returned the wrong number of flags."
+        )
+    return candidates[reachable]
+
+
 def resolve_detector_height_actions(
     detector_heights_m: Sequence[float] | None,
     *,
@@ -371,6 +396,7 @@ def generate_candidate_poses(
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
+    require_motion_reachable: bool = False,
 ) -> NDArray[np.float64]:
     """Return (L, 3) candidate poses in free space for the given strategy.
 
@@ -378,6 +404,8 @@ def generate_candidate_poses(
     expanded over the discrete height actions. Continuous z values are never
     sampled in that mode. Without discrete actions, requesting current-xy
     height actions adds low-discrepancy continuous anchors over the z bounds.
+    When requested, every generated batch is reachability-filtered before
+    deterministic map-center replenishment decides whether more poses are needed.
     """
     rng = np.random.default_rng() if rng is None else rng
     current_pose_xyz = np.asarray(current_pose_xyz, dtype=float)
@@ -473,6 +501,12 @@ def generate_candidate_poses(
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
         height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
+    filtered = _filter_motion_reachable_candidates(
+        filtered,
+        current_pose_xyz=current_pose_xyz,
+        map_api=map_api,
+        enabled=bool(require_motion_reachable),
+    )
     if filtered.shape[0] < n_candidates:
         map_centers = _map_free_cell_centers(
             map_api,
@@ -503,6 +537,12 @@ def generate_candidate_poses(
                 height_partner_z_tolerance_m=height_partner_z_tolerance_m,
                 height_partner_min_z_separation_m=height_partner_min_z_separation_m,
             )
+            map_centers = _filter_motion_reachable_candidates(
+                map_centers,
+                current_pose_xyz=current_pose_xyz,
+                map_api=map_api,
+                enabled=bool(require_motion_reachable),
+            )
             if map_centers.size:
                 filtered = np.vstack([filtered, map_centers])
     if filtered.shape[0] < n_candidates:
@@ -525,6 +565,12 @@ def generate_candidate_poses(
             height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
             height_partner_z_tolerance_m=height_partner_z_tolerance_m,
             height_partner_min_z_separation_m=height_partner_min_z_separation_m,
+        )
+        extra = _filter_motion_reachable_candidates(
+            extra,
+            current_pose_xyz=current_pose_xyz,
+            map_api=map_api,
+            enabled=bool(require_motion_reachable),
         )
         if extra.size:
             filtered = np.vstack([filtered, extra])

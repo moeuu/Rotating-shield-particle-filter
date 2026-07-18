@@ -86,7 +86,7 @@
     "detector_pose_consistency_tolerance_m": 0.0001,
     "detector_height_pair_xy_tolerance_m": 0.000001,
     "detector_height_pair_z_tolerance_m": 1e-9,
-    "height_partner_reuse_shield_program": true,
+    "height_partner_reuse_shield_program": false,
     "measurement_pose_clearance_enabled": true,
     "measurement_pose_clearance_margin_m": 0.02,
     "measurement_route_grid_cell_size_m": 0.25,

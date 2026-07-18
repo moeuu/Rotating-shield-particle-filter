@@ -14,6 +14,7 @@ from planning.measurement_workspace import (
     DetectorAssemblyGeometry,
     MeasurementWorkspace,
 )
+from planning.traversability import TraversabilityMap
 
 
 class DummyBaseMap:
@@ -677,6 +678,56 @@ def test_fine_graph_preserves_room_edge_detour_with_grid_like_base_map() -> None
     assert workspace._transport_graph.cell_size == pytest.approx(0.25)
     assert np.min(route[:, 1]) == pytest.approx(0.375)
     assert np.min(route[:, 1]) >= 0.3
+    horizontal = np.isclose(route[:-1, 2], 0.6) & np.isclose(
+        route[1:, 2],
+        0.6,
+    )
+    assert np.all(
+        workspace.is_horizontal_motion_free_batch(
+            route[:-1][horizontal],
+            route[1:][horizontal],
+        )
+    )
+
+
+def test_native_grid_fallback_preserves_one_cell_centerline_corridor() -> None:
+    """A fine-lattice phase mismatch must not disconnect a safe native corridor."""
+    traversable = tuple((0, iy) for iy in range(5))
+    base_map = TraversabilityMap(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 5),
+        traversable_cells=traversable,
+        robot_radius_m=0.465,
+    )
+    wall = ((1.0, 0.0, 0.0, 2.0, 5.0, 0.8),)
+    workspace = MeasurementWorkspace(
+        room_bounds=_room(),
+        assembly=DetectorAssemblyGeometry(
+            base_radius_m=0.465,
+            base_height_m=0.3,
+            mast_radius_m=0.05,
+            head_radius_m=0.2,
+        ),
+        ground_z_m=0.0,
+        detector_transport_world_z_m=0.6,
+        collision_boxes_m=wall,
+        base_map=base_map,
+        motion_grid_cell_size_m=0.25,
+    )
+    start = np.array([0.5, 0.5, 1.2], dtype=float)
+    goal = np.array([0.5, 4.5, 1.2], dtype=float)
+    graph = workspace._transport_graph
+
+    assert graph is not None
+    assert workspace._transport_graph_path(
+        np.array([0.5, 0.5, 0.6], dtype=float),
+        np.array([0.5, 4.5, 0.6], dtype=float),
+        graph,
+    ) is None
+    route = workspace.motion_waypoints(start, goal)
+    assert route is not None
+    np.testing.assert_allclose(route[:, 0], np.full(route.shape[0], 0.5))
     horizontal = np.isclose(route[:-1, 2], 0.6) & np.isclose(
         route[1:, 2],
         0.6,

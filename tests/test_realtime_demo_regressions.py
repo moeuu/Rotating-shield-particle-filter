@@ -1223,6 +1223,51 @@ def test_reachable_candidate_filter_removes_disconnected_free_cells() -> None:
     assert filtered[0, 0] == pytest.approx(1.5)
 
 
+def test_candidate_spacing_retry_triggers_for_height_only_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Height-only actions must not suppress the lateral-spacing retry."""
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    requested_distances: list[float] = []
+
+    def _fake_generate_candidate_poses(**kwargs: object) -> np.ndarray:
+        """Return a lateral action only after the spacing is relaxed."""
+        requested = float(kwargs["min_dist_from_visited"])
+        requested_distances.append(requested)
+        if requested >= 3.0:
+            return np.array([[1.0, 1.0, 1.5]], dtype=float)
+        return np.array(
+            [[1.0, 1.0, 1.5], [3.0, 1.0, 0.5]],
+            dtype=float,
+        )
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "generate_candidate_poses",
+        _fake_generate_candidate_poses,
+    )
+
+    candidates, relaxed, resolved_distance = (
+        realtime_demo_module._generate_planning_candidates(
+            current_pose_xyz=current,
+            map_api=None,
+            n_candidates=16,
+            min_dist_from_visited=3.0,
+            visited_poses_xyz=current.reshape(1, 3),
+            bounds_xyz=(
+                np.array([0.0, 0.0, 0.5], dtype=float),
+                np.array([10.0, 10.0, 2.0], dtype=float),
+            ),
+            continuous_height_anchor_count=8,
+        )
+    )
+
+    assert relaxed is True
+    assert requested_distances == pytest.approx([3.0, 1.5])
+    assert resolved_distance == pytest.approx(1.5)
+    assert np.any(np.linalg.norm(candidates[:, :2] - current[:2], axis=1) > 0.0)
+
+
 def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
     """Coverage should not stop a mission while residual birth evidence remains."""
 
@@ -4366,6 +4411,22 @@ def test_detector_height_partner_requires_same_xy_and_distinct_z() -> None:
         xy_tolerance_m=1.0e-6,
         min_z_separation_m=0.25,
     )
+
+
+def test_height_partner_reoptimizes_shield_program_by_default() -> None:
+    """Height changes should not force the prior station's shield program."""
+    pair_ids = (3, 4, 6, 13, 17, 36, 43, 52)
+
+    assert realtime_demo_module._height_partner_program_for_scoring(
+        reuse_enabled=False,
+        executed_pair_ids=pair_ids,
+        baseline_shield_policy=None,
+    ) is None
+    assert realtime_demo_module._height_partner_program_for_scoring(
+        reuse_enabled=True,
+        executed_pair_ids=pair_ids,
+        baseline_shield_policy=None,
+    ) == pair_ids
 
 
 def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances() -> None:

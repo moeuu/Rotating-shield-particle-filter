@@ -418,6 +418,66 @@ def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() ->
     assert any(np.allclose(candidate, [8.5, 8.5, 0.5]) for candidate in candidates)
 
 
+def test_candidate_generation_replenishes_after_batch_reachability_filter() -> None:
+    """Reachability loss must trigger native map-center replenishment."""
+
+    class ReachabilityMap:
+        """Expose one reachable native cell and reject sampled off-center poses."""
+
+        origin = (0.0, 0.0)
+        cell_size = 1.0
+        grid_shape = (10, 10)
+        traversable_cells = ((8, 8),)
+
+        def __init__(self) -> None:
+            """Initialize batched reachability accounting."""
+            self.reachability_calls = 0
+
+        def cell_center(self, cell: tuple[int, int]) -> tuple[float, float]:
+            """Return the center of one native map cell."""
+            return float(cell[0]) + 0.5, float(cell[1]) + 0.5
+
+        def is_free(self, _point: np.ndarray) -> bool:
+            """Reject accidental use of the scalar free-space callback."""
+            raise AssertionError("scalar free-space path must not be selected")
+
+        def is_free_batch(self, points: np.ndarray) -> np.ndarray:
+            """Mark all sampled endpoints free before reachability filtering."""
+            return np.ones(np.asarray(points).shape[0], dtype=bool)
+
+        def is_motion_reachable_batch(
+            self,
+            _start_xyz: np.ndarray,
+            goals_xyz: np.ndarray,
+        ) -> np.ndarray:
+            """Keep only the native center to make replenishment deterministic."""
+            self.reachability_calls += 1
+            goals = np.asarray(goals_xyz, dtype=float)
+            return np.all(
+                np.isclose(goals, np.array([8.5, 8.5, 0.5])[None, :]),
+                axis=1,
+            )
+
+    planning_map = ReachabilityMap()
+    candidates = generate_candidate_poses(
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
+        map_api=planning_map,
+        n_candidates=4,
+        strategy="free_space_sobol",
+        min_dist_from_visited=1.0,
+        visited_poses_xyz=np.array([[0.5, 0.5, 0.5]], dtype=float),
+        bounds_xyz=(
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 0.5], dtype=float),
+        ),
+        rng=np.random.default_rng(7),
+        require_motion_reachable=True,
+    )
+
+    assert planning_map.reachability_calls >= 2
+    np.testing.assert_allclose(candidates, np.array([[8.5, 8.5, 0.5]]))
+
+
 def test_candidate_filter_prefers_batched_free_space_path() -> None:
     """Standard maps should filter candidate arrays without scalar callbacks."""
 

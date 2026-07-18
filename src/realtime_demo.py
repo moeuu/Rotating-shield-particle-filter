@@ -6179,7 +6179,7 @@ def _generate_planning_candidates(
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
 ) -> tuple[NDArray[np.float64], bool, float]:
-    """Generate next-pose actions with one relaxed-spacing retry."""
+    """Generate next-pose actions with one lateral-spacing retry."""
     min_dist = max(float(min_dist_from_visited), 0.0)
     height_partners_enabled = bool(
         detector_heights_m is not None or int(continuous_height_anchor_count) > 0
@@ -6199,13 +6199,24 @@ def _generate_planning_candidates(
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
         height_partner_min_z_separation_m=height_partner_min_z_separation_m,
+        require_motion_reachable=True,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
         map_api=map_api,
         candidates=candidates,
     )
-    if candidates.size != 0 or min_dist <= 0.0:
+    lateral_distance = np.linalg.norm(
+        candidates[:, :2] - np.asarray(current_pose_xyz, dtype=float)[None, :2],
+        axis=1,
+    )
+    lateral_available = bool(
+        np.any(
+            lateral_distance
+            > max(float(height_partner_xy_tolerance_m), 1.0e-9)
+        )
+    )
+    if lateral_available or min_dist <= 0.0:
         return candidates, False, min_dist
     relaxed_dist = max(min_dist * 0.5, 0.5)
     candidates = generate_candidate_poses(
@@ -6223,6 +6234,7 @@ def _generate_planning_candidates(
         height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
         height_partner_min_z_separation_m=height_partner_min_z_separation_m,
+        require_motion_reachable=True,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
@@ -6249,6 +6261,19 @@ def _is_detector_height_partner(
         and z_distance > max(float(z_tolerance_m), 0.0)
         and z_distance >= max(float(min_z_separation_m), 0.0)
     )
+
+
+def _height_partner_program_for_scoring(
+    *,
+    reuse_enabled: bool,
+    executed_pair_ids: Sequence[int],
+    baseline_shield_policy: Mapping[str, object] | None,
+) -> tuple[int, ...] | None:
+    """Return an explicitly requested legacy height-partner shield program."""
+    if not reuse_enabled or baseline_shield_policy is not None:
+        return None
+    pair_ids = tuple(int(value) for value in executed_pair_ids)
+    return pair_ids or None
 
 
 def _measurement_detector_positions(
@@ -8350,7 +8375,7 @@ def run_live_pf(
         float(runtime_config.get("detector_pose_consistency_tolerance_m", 1.0e-4)),
     )
     height_partner_reuse_shield_program = bool(
-        runtime_config.get("height_partner_reuse_shield_program", True)
+        runtime_config.get("height_partner_reuse_shield_program", False)
     )
     detector_height_pair_xy_tolerance_m = max(
         0.0,
@@ -14973,8 +14998,8 @@ def run_live_pf(
             )
             if relaxed_retry:
                 print(
-                    "No candidates with current spacing; retrying with min_dist="
-                    f"{candidate_min_dist:.2f}."
+                    "No reachable lateral candidates with current spacing; "
+                    f"retrying with min_dist={candidate_min_dist:.2f}."
                 )
             if candidates.size == 0:
                 print("No candidate poses available; stopping exploration.")
@@ -14986,13 +15011,11 @@ def run_live_pf(
             dss_diagnostics: dict[str, Any] | None = None
             dss_first_node = None
             height_partner_program_for_scoring = (
-                tuple(int(value) for value in executed_pair_ids_this_pose)
-                if (
-                    height_partner_reuse_shield_program
-                    and executed_pair_ids_this_pose
-                    and baseline_shield_policy is None
+                _height_partner_program_for_scoring(
+                    reuse_enabled=height_partner_reuse_shield_program,
+                    executed_pair_ids=executed_pair_ids_this_pose,
+                    baseline_shield_policy=baseline_shield_policy,
                 )
-                else None
             )
             baseline_path_selection = select_baseline_next_pose(
                 baseline_path_policy,

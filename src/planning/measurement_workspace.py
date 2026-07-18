@@ -1365,27 +1365,40 @@ class MeasurementWorkspace:
                     goal_transport_xyz,
                     transport_graph,
                 )
+                if path is None and self.base_map is not None:
+                    # The fine lattice and native map centers have different
+                    # phases. A narrow but physically valid native-cell corridor
+                    # can therefore be absent from the fine lattice. Use the
+                    # native route only after validating every segment against
+                    # the same exact 3-D swept envelope and overlay geometry.
+                    path = self._native_base_transport_path(
+                        start_transport_xyz,
+                        goal_transport_xyz,
+                    )
+                    if path is not None and path.shape[0] >= 2:
+                        segment_free = self.is_horizontal_motion_free_batch(
+                            path[:-1],
+                            path[1:],
+                        )
+                        segment_free &= self._base_overlay_segment_free_batch(
+                            path[:-1],
+                            path[1:],
+                            np.asarray(
+                                transport_graph.overlay_blocked_boxes_m,
+                                dtype=float,
+                            ),
+                        )
+                        if not np.all(segment_free):
+                            path = None
                 if path is None:
                     return None
         elif self.base_map is None:
             path = np.vstack([start_transport_xyz, goal_transport_xyz])
         else:
-            path_function = getattr(self.base_map, "shortest_path_points", None)
-            if callable(path_function):
-                path = path_function(
-                    start_transport_xyz,
-                    goal_transport_xyz,
-                    allow_diagonal=True,
-                )
-            else:
-                from planning.traversability import shortest_grid_path_points
-
-                path = shortest_grid_path_points(
-                    self.base_map,
-                    start_transport_xyz,
-                    goal_transport_xyz,
-                    allow_diagonal=True,
-                )
+            path = self._native_base_transport_path(
+                start_transport_xyz,
+                goal_transport_xyz,
+            )
             if path is None:
                 return None
         path_array = np.asarray(path, dtype=float)
@@ -1399,6 +1412,43 @@ class MeasurementWorkspace:
             [start_transport_xyz, path_array, goal_transport_xyz]
         )
         return _dedupe_consecutive_points(path_array)
+
+    def _native_base_transport_path(
+        self,
+        start_transport_xyz: NDArray[np.float64],
+        goal_transport_xyz: NDArray[np.float64],
+    ) -> NDArray[np.float64] | None:
+        """Return the wrapped map's native-cell path at transport height."""
+        if self.base_map is None:
+            return None
+        path_function = getattr(self.base_map, "shortest_path_points", None)
+        if callable(path_function):
+            path = path_function(
+                start_transport_xyz,
+                goal_transport_xyz,
+                allow_diagonal=True,
+            )
+        else:
+            from planning.traversability import shortest_grid_path_points
+
+            path = shortest_grid_path_points(
+                self.base_map,
+                start_transport_xyz,
+                goal_transport_xyz,
+                allow_diagonal=True,
+            )
+        if path is None:
+            return None
+        path_array = np.asarray(path, dtype=float)
+        if path_array.ndim != 2 or path_array.shape[1] != 3:
+            raise ValueError("base_map path must be shaped (N, 3).")
+        if path_array.shape[0] == 0 or np.any(~np.isfinite(path_array)):
+            return None
+        path_array = path_array.copy()
+        path_array[:, 2] = float(self.detector_transport_world_z_m)
+        return _dedupe_consecutive_points(
+            np.vstack([start_transport_xyz, path_array, goal_transport_xyz])
+        )
 
     @staticmethod
     def _motion_cache_key(
