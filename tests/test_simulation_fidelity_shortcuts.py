@@ -145,6 +145,51 @@ def test_runtime_count_extraction_preserves_isotope_count_covariance(
     assert corr == pytest.approx(-0.5)
 
 
+def test_runtime_count_extraction_symmetrizes_reciprocal_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime covariance must remain exactly symmetric after numerical drift."""
+    decomposer = SpectralDecomposer()
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return a covariance with realistic reciprocal roundoff drift."""
+        self.last_count_variances = {"Cs-137": 25.0, "Co-60": 100.0}
+        self.last_count_covariance = {
+            "Cs-137": {"Cs-137": 25.0, "Co-60": -25.0},
+            "Co-60": {"Cs-137": -25.0001, "Co-60": 100.0},
+        }
+        self.last_response_poisson_diagnostics = {"status": "ok"}
+        return {"Cs-137": 50.0, "Co-60": 20.0}, {"Cs-137", "Co-60"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=10.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+    )
+
+    assert result.covariance is not None
+    forward = result.covariance["Cs-137"]["Co-60"]
+    reverse = result.covariance["Co-60"]["Cs-137"]
+    assert forward == reverse
+    assert forward == pytest.approx(-25.00005)
+
+
 def test_response_diagnostics_inflate_runtime_count_variance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

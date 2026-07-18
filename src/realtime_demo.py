@@ -14241,6 +14241,9 @@ def run_live_pf(
                                     log_covariance[row_index, column_index] = float(
                                         row_payload[column_isotope]
                                     )
+                    log_covariance = 0.5 * (
+                        log_covariance + log_covariance.T
+                    )
                     measurement_log_writer.append_before_update(
                         MeasurementLogRecord(
                             step_id=int(step_counter),

@@ -136,42 +136,64 @@ class RuntimeCountExtractor:
         source_covariance = getattr(self.decomposer, "last_count_covariance", {})
         if not isinstance(source_covariance, Mapping):
             source_covariance = {}
-        covariance: dict[str, dict[str, float]] = {}
-        for row_iso in isotopes:
-            row_var = max(float(variances.get(row_iso, counts.get(row_iso, 1.0))), 1.0)
-            row: dict[str, float] = {}
+        runtime_variances = {
+            isotope: max(
+                float(variances.get(isotope, counts.get(isotope, 1.0))),
+                1.0,
+            )
+            for isotope in isotopes
+        }
+        covariance = {
+            row_iso: {
+                col_iso: (
+                    float(runtime_variances[row_iso])
+                    if row_iso == col_iso
+                    else 0.0
+                )
+                for col_iso in isotopes
+            }
+            for row_iso in isotopes
+        }
+        for row_index, row_iso in enumerate(isotopes):
             source_row = source_covariance.get(row_iso, {})
             if not isinstance(source_row, Mapping):
                 source_row = {}
             source_row_var = self._mapping_float(source_row, row_iso)
-            for col_iso in isotopes:
-                col_var = max(
-                    float(variances.get(col_iso, counts.get(col_iso, 1.0))),
-                    1.0,
-                )
-                if row_iso == col_iso:
-                    row[col_iso] = float(row_var)
-                    continue
-                raw_cov = self._mapping_float(source_row, col_iso)
+            for col_iso in isotopes[row_index + 1 :]:
                 source_col_row = source_covariance.get(col_iso, {})
-                source_col_var = (
-                    self._mapping_float(source_col_row, col_iso)
-                    if isinstance(source_col_row, Mapping)
-                    else None
-                )
+                if not isinstance(source_col_row, Mapping):
+                    source_col_row = {}
+                source_col_var = self._mapping_float(source_col_row, col_iso)
                 if (
-                    raw_cov is None
-                    or source_row_var is None
+                    source_row_var is None
                     or source_col_var is None
                     or source_row_var <= 0.0
                     or source_col_var <= 0.0
                 ):
-                    row[col_iso] = 0.0
                     continue
-                corr = float(raw_cov) / float(np.sqrt(source_row_var * source_col_var))
+                reciprocal_values = [
+                    value
+                    for value in (
+                        self._mapping_float(source_row, col_iso),
+                        self._mapping_float(source_col_row, row_iso),
+                    )
+                    if value is not None
+                ]
+                if not reciprocal_values:
+                    continue
+                source_offdiag = float(np.mean(reciprocal_values))
+                corr = source_offdiag / float(
+                    np.sqrt(source_row_var * source_col_var)
+                )
                 corr = float(np.clip(corr, -1.0, 1.0))
-                row[col_iso] = float(corr * np.sqrt(row_var * col_var))
-            covariance[row_iso] = row
+                scaled = float(
+                    corr
+                    * np.sqrt(
+                        runtime_variances[row_iso] * runtime_variances[col_iso]
+                    )
+                )
+                covariance[row_iso][col_iso] = scaled
+                covariance[col_iso][row_iso] = scaled
         return covariance
 
     def _apply_spectrum_variance_floor(

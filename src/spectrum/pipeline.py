@@ -1350,7 +1350,9 @@ class SpectralDecomposer:
         if background_anchor_term is not None:
             bg_idx, _, bg_variance = background_anchor_term
             fisher[bg_idx, bg_idx] += 1.0 / bg_variance
+        fisher = 0.5 * (fisher + fisher.T)
         covariance = np.linalg.pinv(fisher, rcond=1e-12)
+        covariance = 0.5 * (covariance + covariance.T)
         variances: Dict[str, float] = {isotope: 1.0 for isotope in requested}
         coefficient_correlation_by_isotope = {name: 0.0 for name in fit_names}
         coefficient_correlation_max_abs = 0.0
@@ -1381,6 +1383,7 @@ class SpectralDecomposer:
                 isotope_covariance[row_iso_idx, col_iso_idx] = float(
                     row_weights @ block @ col_weights
                 )
+        isotope_covariance = 0.5 * (isotope_covariance + isotope_covariance.T)
         if len(fit_names) > 1:
             diag = np.maximum(np.diag(isotope_covariance), 0.0)
             denom = np.sqrt(np.maximum(np.outer(diag, diag), 1.0e-24))
