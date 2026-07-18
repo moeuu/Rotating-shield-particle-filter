@@ -10878,7 +10878,8 @@ class IsotopeParticleFilter:
         Source-existence ordering uses posterior mass, while the reported
         position and strength use weighted medians.  This avoids high-intensity
         posterior tails dominating the displayed estimate without changing the
-        PF update itself.
+        PF update itself. Surface-prior summaries are projected back into the
+        constrained state space before they are returned.
         """
         if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
@@ -10966,6 +10967,7 @@ class IsotopeParticleFilter:
             if order.size
             else np.zeros((0, 3))
         )
+        pos_out = self._project_positions_to_source_prior(pos_out)
         q_out = (
             np.array([cluster_q[i] for i in order], dtype=float)
             if order.size
@@ -12231,7 +12233,11 @@ class IsotopeParticleFilter:
 
     def estimate(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
         """
-        Continuous MMSE estimate over positions/strengths using continuous_particles.
+        Return a continuous posterior point estimate over positions and strengths.
+
+        The unconstrained position estimate is the MMSE posterior mean. When the
+        source prior is surface-constrained, its nearest feasible projection is
+        returned as the constrained squared-error Bayes action.
         """
         if (
             self.config.converge_enable
@@ -12239,7 +12245,11 @@ class IsotopeParticleFilter:
             and self.frozen_estimate is not None
             and self._convergence_can_freeze()
         ):
-            return self.frozen_estimate
+            frozen_positions, frozen_strengths = self.frozen_estimate
+            return (
+                self._project_positions_to_source_prior(frozen_positions),
+                np.asarray(frozen_strengths, dtype=float).copy(),
+            )
         if not self.continuous_particles:
             return np.zeros((0, 3)), np.zeros(0)
         if not self._can_use_gpu():
@@ -12274,7 +12284,10 @@ class IsotopeParticleFilter:
                 positions[source_idx] = np.sum(w_arr[:, None] * pos_arr, axis=0)
                 strengths[source_idx] = float(np.sum(w_arr * q_arr))
             active = strengths > 0.0
-            return positions[active], strengths[active]
+            return (
+                self._project_positions_to_source_prior(positions[active]),
+                strengths[active],
+            )
         from pf import gpu_utils
         import torch
 
@@ -12304,6 +12317,6 @@ class IsotopeParticleFilter:
         strengths = str_mean.detach().cpu().numpy()
         # Trim zero-strength slots.
         mask = strengths > 0
-        positions = positions[mask]
+        positions = self._project_positions_to_source_prior(positions[mask])
         strengths = strengths[mask]
         return positions, strengths

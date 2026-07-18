@@ -1350,6 +1350,53 @@ def test_surface_position_prior_initializes_and_roughens_on_surfaces() -> None:
             )
 
 
+def test_surface_position_prior_projects_reported_point_estimates() -> None:
+    """PF point summaries should remain inside the surface-constrained state space."""
+    env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    cfg = PFConfig(
+        num_particles=3,
+        use_gpu=False,
+        init_num_sources=(1, 1),
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(env.size_x, env.size_y, env.size_z),
+        source_position_prior="surface",
+        cluster_eps_m=3.0,
+        cluster_min_samples=1,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([1.0, 1.0, 1.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    pf = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=dummy_kernel,
+        config=cfg,
+    )
+    particle_positions = (
+        np.array([0.0, 1.0, 1.0]),
+        np.array([1.0, 0.0, 1.0]),
+        np.array([1.0, 1.0, 0.0]),
+    )
+    pf.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                1,
+                position.reshape(1, 3),
+                np.array([1000.0]),
+                0.0,
+            ),
+            log_weight=np.log(1.0 / 3.0),
+        )
+        for position in particle_positions
+    ]
+
+    mean_positions, _ = pf.estimate()
+    clustered_positions, _ = pf.estimate_clustered()
+
+    for position in np.vstack([mean_positions, clustered_positions]):
+        assert is_allowed_source_surface_position(position, env)
+
+
 def test_student_t_count_likelihood_softens_model_mismatch() -> None:
     """Robust count likelihood should not over-trust a simplified transport kernel."""
     z_obs = np.array([100.0], dtype=float)
