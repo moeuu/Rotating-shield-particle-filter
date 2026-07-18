@@ -13170,25 +13170,35 @@ class RotatingShieldPFEstimator:
         *,
         use_pre_finalize_guard: bool,
     ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Return protected pre-finalize estimates when post-finalize collapsed."""
+        """Return a state-constrained estimate, using a pre-finalize guard if needed."""
+
+        def constrain_positions(values: NDArray[np.float64]) -> NDArray[np.float64]:
+            """Project every report origin through the isotope position prior."""
+            values_arr = np.asarray(values, dtype=float).reshape(-1, 3)
+            filt = self.filters.get(isotope)
+            projector = getattr(filt, "_project_positions_to_source_prior", None)
+            if not callable(projector):
+                return values_arr
+            return np.asarray(projector(values_arr), dtype=float).reshape(-1, 3)
+
         pos_arr = np.asarray(positions, dtype=float)
         q_arr = np.asarray(strengths, dtype=float)
         if not use_pre_finalize_guard:
-            return pos_arr, q_arr
+            return constrain_positions(pos_arr), q_arr
         guarded = self._pre_finalize_guard_estimates.get(isotope)
         if guarded is None:
-            return pos_arr, q_arr
+            return constrain_positions(pos_arr), q_arr
         guard_pos, guard_q = guarded
         if guard_pos.shape[0] <= pos_arr.shape[0]:
-            return pos_arr, q_arr
+            return constrain_positions(pos_arr), q_arr
         refit_pos, refit_q = self._refit_reported_strengths(
             isotope,
             guard_pos,
             guard_q,
         )
         if refit_pos.shape[0] >= guard_pos.shape[0]:
-            return refit_pos, refit_q
-        return guard_pos.copy(), guard_q.copy()
+            return constrain_positions(refit_pos), refit_q
+        return constrain_positions(guard_pos), guard_q.copy()
 
     def estimate_all(
         self,

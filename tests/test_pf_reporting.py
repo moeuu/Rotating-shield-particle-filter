@@ -126,6 +126,46 @@ def test_measurement_vector_rejects_wrong_length() -> None:
         measurement_vector(np.asarray([1.0, 2.0]), 3, "z", allow_scalar=False)
 
 
+def test_report_guard_projects_every_origin_to_surface_prior() -> None:
+    """Raw and guarded report positions should obey the configured state space."""
+    environment = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    estimator = RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        candidate_sources=np.array([[0.0, 1.0, 1.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": {"fe": 0.01, "pb": 0.02}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=3,
+            use_gpu=False,
+            position_min=(0.0, 0.0, 0.0),
+            position_max=(2.0, 2.0, 2.0),
+            source_position_prior="surface",
+        ),
+    )
+    estimator.add_measurement_pose(np.array([1.0, 1.0, 1.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    off_surface = np.array([[0.5, 0.5, 0.5]], dtype=float)
+    raw_positions, _ = estimator._guarded_report_estimate(
+        "Cs-137",
+        off_surface,
+        np.array([1.0]),
+        use_pre_finalize_guard=False,
+    )
+    estimator._pre_finalize_guard_estimates["Cs-137"] = (
+        np.array([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]], dtype=float),
+        np.array([1.0, 2.0]),
+    )
+    guarded_positions, _ = estimator._guarded_report_estimate(
+        "Cs-137",
+        raw_positions,
+        np.array([1.0]),
+        use_pre_finalize_guard=True,
+    )
+
+    for position in np.vstack([raw_positions, guarded_positions]):
+        assert source_surface_kind(position, environment) is not None
+
+
 def test_dedupe_report_candidates_keeps_strong_order() -> None:
     """Report candidate de-duplication should preserve deterministic input order."""
     positions = np.asarray(
