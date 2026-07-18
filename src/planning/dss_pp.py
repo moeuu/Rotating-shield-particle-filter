@@ -6370,6 +6370,7 @@ def select_dss_pp_next_station(
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
+    allow_height_partner_first_action: bool = True,
     _planner_only_external_mode_token: object | None = None,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
@@ -6383,7 +6384,10 @@ def select_dss_pp_next_station(
 
     When ``continuous_height_bounds_m`` is provided, newly augmented xy
     stations receive deterministic low-discrepancy heights within that range;
-    caller-provided candidate heights remain unchanged.
+    caller-provided candidate heights remain unchanged. Setting
+    ``allow_height_partner_first_action`` to false also removes same-xy height
+    actions introduced by DSS candidate augmentation. This keeps a caller's
+    one-step height-action lock valid across the full planning boundary.
     """
     cfg = config or DSSPPConfig()
     current_pose = np.asarray(current_pose_xyz, dtype=float)
@@ -6410,6 +6414,12 @@ def select_dss_pp_next_station(
     modes = _apply_recovery_isotope_mode_weights(modes, cfg)
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     base_candidates = candidates.copy()
+    height_xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
+    height_z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
+    height_min_z_separation = max(
+        float(height_partner_min_z_separation_m),
+        0.0,
+    )
     if cfg.augment_candidates:
         candidates = augment_candidate_stations(
             candidates,
@@ -6421,11 +6431,26 @@ def select_dss_pp_next_station(
             config=cfg,
             continuous_height_bounds_m=continuous_height_bounds_m,
         )
-    height_xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
-    height_z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
-    height_min_z_separation = max(
-        float(height_partner_min_z_separation_m),
-        0.0,
+
+    def _without_disallowed_height_actions(
+        candidate_rows: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], int]:
+        """Remove first-step height partners when the caller locks them out."""
+        rows = np.asarray(candidate_rows, dtype=float).reshape(-1, 3)
+        if bool(allow_height_partner_first_action) or rows.shape[0] == 0:
+            return rows, 0
+        height_mask = _height_partner_mask_batch(
+            rows,
+            visited_poses_xyz,
+            reference_pose_xyz=current_pose,
+            xy_tolerance_m=height_xy_tolerance,
+            z_tolerance_m=height_z_tolerance,
+            min_z_separation_m=height_min_z_separation,
+        )
+        return rows[~height_mask], int(np.count_nonzero(height_mask))
+
+    candidates, disallowed_height_filtered = _without_disallowed_height_actions(
+        candidates
     )
     candidates, separation_filtered = _filter_station_separation(
         candidates,
@@ -6443,8 +6468,12 @@ def select_dss_pp_next_station(
     )
     fallback_used = False
     if candidates.size == 0 and base_candidates.size != 0:
+        fallback_candidates, fallback_height_filtered = (
+            _without_disallowed_height_actions(base_candidates)
+        )
+        disallowed_height_filtered += int(fallback_height_filtered)
         candidates, base_path_filtered = _filter_path_reachable_stations(
-            base_candidates,
+            fallback_candidates,
             current_pose_xyz=current_pose,
             map_api=map_api,
         )
@@ -6648,6 +6677,12 @@ def select_dss_pp_next_station(
         "height_partner_xy_tolerance_m": float(height_xy_tolerance),
         "height_partner_z_tolerance_m": float(height_z_tolerance),
         "height_partner_min_z_separation_m": float(height_min_z_separation),
+        "allow_height_partner_first_action": bool(
+            allow_height_partner_first_action
+        ),
+        "disallowed_height_partner_candidates": int(
+            disallowed_height_filtered
+        ),
         "continuous_height_bounds_m": (
             None
             if continuous_height_bounds_m is None

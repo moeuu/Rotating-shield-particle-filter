@@ -6195,15 +6195,11 @@ def _generate_planning_candidates(
         if visited_poses_xyz is None
         else np.asarray(visited_poses_xyz, dtype=float).reshape(-1, 3)
     )
-    previous_move_was_height_partner = bool(
-        visited.shape[0] >= 2
-        and _is_detector_height_partner(
-            visited[-2],
-            visited[-1],
-            xy_tolerance_m=height_partner_xy_tolerance_m,
-            z_tolerance_m=height_partner_z_tolerance_m,
-            min_z_separation_m=height_partner_min_z_separation_m,
-        )
+    previous_move_was_height_partner = _previous_move_was_height_partner(
+        visited,
+        xy_tolerance_m=height_partner_xy_tolerance_m,
+        z_tolerance_m=height_partner_z_tolerance_m,
+        min_z_separation_m=height_partner_min_z_separation_m,
     )
     height_partners_enabled = bool(
         height_partners_requested and not previous_move_was_height_partner
@@ -6288,6 +6284,54 @@ def _generate_planning_candidates(
         candidates=candidates,
     )
     return candidates, True, relaxed_dist
+
+
+def _previous_move_was_height_partner(
+    visited_poses_xyz: NDArray[np.float64] | None,
+    *,
+    xy_tolerance_m: float,
+    z_tolerance_m: float = 1.0e-9,
+    min_z_separation_m: float = 0.0,
+) -> bool:
+    """Return whether the latest completed station move changed only height."""
+    if visited_poses_xyz is None:
+        return False
+    visited = np.asarray(visited_poses_xyz, dtype=float).reshape(-1, 3)
+    return bool(
+        visited.shape[0] >= 2
+        and _is_detector_height_partner(
+            visited[-2],
+            visited[-1],
+            xy_tolerance_m=xy_tolerance_m,
+            z_tolerance_m=z_tolerance_m,
+            min_z_separation_m=min_z_separation_m,
+        )
+    )
+
+
+def _validate_selected_station_action(
+    *,
+    current_pose_xyz: NDArray[np.float64],
+    next_pose_xyz: NDArray[np.float64],
+    previous_move_was_height_partner: bool,
+    xy_tolerance_m: float,
+    z_tolerance_m: float = 1.0e-9,
+    min_z_separation_m: float = 0.0,
+) -> bool:
+    """Validate the selected action and return whether it changes only height."""
+    is_height_partner_action = _is_detector_height_partner(
+        current_pose_xyz,
+        next_pose_xyz,
+        xy_tolerance_m=xy_tolerance_m,
+        z_tolerance_m=z_tolerance_m,
+        min_z_separation_m=min_z_separation_m,
+    )
+    if bool(previous_move_was_height_partner) and is_height_partner_action:
+        raise RuntimeError(
+            "Planner selected consecutive same-xy height actions after the "
+            "height-action lock was enabled."
+        )
+    return bool(is_height_partner_action)
 
 
 def _is_detector_height_partner(
@@ -15022,6 +15066,15 @@ def run_live_pf(
                     print(f"Reached max poses ({max_poses}); stopping exploration.")
                     break
             visited_arr = np.vstack(visited_poses) if visited_poses else None
+            previous_move_was_height_partner = _previous_move_was_height_partner(
+                visited_arr,
+                xy_tolerance_m=detector_height_pair_xy_tolerance_m,
+                z_tolerance_m=detector_height_pair_z_tolerance_m,
+                min_z_separation_m=detector_height_pair_min_separation_m,
+            )
+            allow_height_partner_first_action = bool(
+                not previous_move_was_height_partner
+            )
             print("Generating candidate poses for next measurement point...")
             candidates, relaxed_retry, candidate_min_dist = (
                 _generate_planning_candidates(
@@ -15136,6 +15189,9 @@ def run_live_pf(
                         ),
                         height_partner_min_z_separation_m=(
                             detector_height_pair_min_separation_m
+                        ),
+                        allow_height_partner_first_action=(
+                            allow_height_partner_first_action
                         ),
                     )
                     dss_elapsed = time.perf_counter() - dss_start
@@ -15264,6 +15320,9 @@ def run_live_pf(
                     height_partner_min_z_separation_m=(
                         detector_height_pair_min_separation_m
                     ),
+                    allow_height_partner_first_action=(
+                        allow_height_partner_first_action
+                    ),
                 )
                 dss_elapsed = time.perf_counter() - dss_start
                 total_path_planning_wall_s += float(dss_elapsed)
@@ -15366,6 +15425,9 @@ def run_live_pf(
                             ),
                             height_partner_min_z_separation_m=(
                                 detector_height_pair_min_separation_m
+                            ),
+                            allow_height_partner_first_action=(
+                                allow_height_partner_first_action
                             ),
                         )
                         guard_dss_elapsed = time.perf_counter() - guard_dss_start
@@ -15532,6 +15594,9 @@ def run_live_pf(
                         height_partner_min_z_separation_m=(
                             detector_height_pair_min_separation_m
                         ),
+                        allow_height_partner_first_action=(
+                            allow_height_partner_first_action
+                        ),
                     )
                     dss_elapsed = time.perf_counter() - dss_start
                     total_path_planning_wall_s += float(dss_elapsed)
@@ -15566,9 +15631,12 @@ def run_live_pf(
                         dss_diagnostics,
                         label=f"pose_{current_pose_idx}_one_step_fixed_station",
                     )
-            is_height_partner_action = _is_detector_height_partner(
-                np.asarray(pose, dtype=float),
-                np.asarray(next_pose, dtype=float),
+            is_height_partner_action = _validate_selected_station_action(
+                current_pose_xyz=np.asarray(pose, dtype=float),
+                next_pose_xyz=np.asarray(next_pose, dtype=float),
+                previous_move_was_height_partner=(
+                    previous_move_was_height_partner
+                ),
                 xy_tolerance_m=detector_height_pair_xy_tolerance_m,
                 z_tolerance_m=detector_height_pair_z_tolerance_m,
                 min_z_separation_m=detector_height_pair_min_separation_m,

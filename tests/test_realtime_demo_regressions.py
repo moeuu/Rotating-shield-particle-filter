@@ -1376,6 +1376,18 @@ def test_candidate_generation_disables_consecutive_height_partners(
     assert generation_options == [(False, False)]
 
 
+def test_selected_station_action_fails_fast_on_consecutive_height_move() -> None:
+    """The runtime boundary must reject a reintroduced consecutive height move."""
+    with pytest.raises(RuntimeError, match="consecutive same-xy height actions"):
+        realtime_demo_module._validate_selected_station_action(
+            current_pose_xyz=np.array([1.0, 1.0, 1.5], dtype=float),
+            next_pose_xyz=np.array([1.0, 1.0, 2.5], dtype=float),
+            previous_move_was_height_partner=True,
+            xy_tolerance_m=1.0e-9,
+            min_z_separation_m=0.25,
+        )
+
+
 def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
     """Coverage should not stop a mission while residual birth evidence remains."""
 

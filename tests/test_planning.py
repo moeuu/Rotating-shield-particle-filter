@@ -4770,6 +4770,61 @@ def test_dss_pp_augments_with_global_unvisited_coverage_candidates() -> None:
     assert result.diagnostics["candidate_count"] > 1
 
 
+def test_dss_pp_filters_augmented_height_action_when_first_action_is_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSS augmentation must not restore a caller-disallowed height action."""
+    estimator = _build_simple_estimator()
+    current = np.array([1.0, 1.0, 1.5], dtype=float)
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
+        dtype=float,
+    )
+    lateral = np.array([5.0, 1.0, 1.5], dtype=float)
+    augmented_height = np.array([1.0, 1.0, 2.5], dtype=float)
+
+    def _fake_augment_candidate_stations(
+        _candidate_poses_xyz: np.ndarray,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        """Return one legal lateral action and one augmented height action."""
+        return np.vstack([lateral, augmented_height])
+
+    monkeypatch.setattr(
+        dss_pp,
+        "augment_candidate_stations",
+        _fake_augment_candidate_stations,
+    )
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        candidate_poses_xyz=lateral.reshape(1, 3),
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        continuous_height_bounds_m=(0.5, 2.5),
+        config=DSSPPConfig(
+            augment_candidates=True,
+            horizon=1,
+            max_programs=1,
+            lambda_eig=0.0,
+            lambda_signature=0.0,
+            lambda_distance=0.0,
+            lambda_coverage=0.0,
+            lambda_rotation=0.0,
+            eta_count_balance=0.0,
+            eta_differential=0.0,
+            eta_observation=0.0,
+            enforce_min_observation=False,
+            min_station_separation_m=0.0,
+            signature_std_min_counts=0.0,
+        ),
+        allow_height_partner_first_action=False,
+    )
+
+    assert np.allclose(result.next_pose, lateral)
+    assert result.diagnostics["allow_height_partner_first_action"] is False
+    assert result.diagnostics["disallowed_height_partner_candidates"] == 1
+
+
 def test_dss_pp_count_balance_penalty_is_isotope_agnostic() -> None:
     """DSS-PP balance penalty should reject any single-isotope dominated program."""
     balanced = {"Cs-137": 12.0, "Co-60": 12.0, "Eu-154": 12.0}
