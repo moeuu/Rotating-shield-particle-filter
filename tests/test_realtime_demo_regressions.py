@@ -85,6 +85,7 @@ from realtime_demo import (
     _spectrum_config_from_runtime_config,
     _source_cardinality_dwell_status,
     _truth_free_live_runtime_config,
+    _validate_surface_constrained_estimates,
     _remaining_measurement_progress,
     run_live_pf,
 )
@@ -97,6 +98,26 @@ from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from visualization.realtime_viz import PFFrame
+
+
+def test_surface_report_quality_gate_rejects_off_surface_estimate() -> None:
+    """The runtime must fail closed before publishing an invalid surface report."""
+    estimates = {
+        "Cs-137": (
+            np.asarray([[0.5, 0.5, 0.5]], dtype=float),
+            np.asarray([10.0], dtype=float),
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="off-surface positions"):
+        _validate_surface_constrained_estimates(
+            estimates,
+            EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
+            None,
+            obstacle_height_m=2.0,
+            tolerance_m=1.0e-5,
+            surface_prior_active=True,
+        )
 
 
 def test_spectrum_evidence_payload_uses_independent_configured_background() -> None:

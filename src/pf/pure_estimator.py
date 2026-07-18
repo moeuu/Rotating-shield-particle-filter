@@ -311,6 +311,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
                 states,
                 np.asarray(filt.continuous_weights, dtype=float),
                 max_cardinality=self.pf_config.max_sources,
+                position_projector=filt._project_positions_to_source_prior,
             )
         return result
 

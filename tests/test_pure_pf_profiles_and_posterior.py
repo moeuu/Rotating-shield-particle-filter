@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 
 from mission_control import resolve_mission_max_poses, resolve_mission_max_steps
+from measurement.model import EnvironmentConfig
+from measurement.source_surfaces import source_surface_kind
 from pf.estimator import RotatingShieldPFConfig
+from pf.particle_filter import IsotopeParticle
 from pf.posterior import posterior_point_estimate_from_states
 from pf.profiles import (
     ProposalOrigin,
@@ -18,6 +21,7 @@ from pf.profiles import (
     resolve_estimator_profile,
 )
 from pf.pure_estimator import PurePFEstimator
+from pf.state import IsotopeState
 from planning.dss_pp import extract_signature_modes
 from sim.runtime import load_runtime_config
 
@@ -348,6 +352,49 @@ def test_pure_final_report_ignores_legacy_best_so_far_selection(
 
     np.testing.assert_array_equal(actual["Cs-137"][0], expected["Cs-137"][0])
     np.testing.assert_array_equal(actual["Cs-137"][1], expected["Cs-137"][1])
+
+
+def test_pure_posterior_projects_surface_particle_mean_to_surface() -> None:
+    """A mean of separated surface particles must remain in the source state space."""
+    environment = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    estimator = PurePFEstimator(
+        isotopes=("Cs-137",),
+        candidate_sources=np.asarray([[0.0, 1.0, 1.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            use_gpu=False,
+            position_min=(0.0, 0.0, 0.0),
+            position_max=(2.0, 2.0, 2.0),
+            source_position_prior="surface",
+        ),
+        measurement_log_sha256="b" * 64,
+    )
+    estimator.add_measurement_pose(np.asarray([1.0, 1.0, 1.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.filters["Cs-137"].continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.asarray([position], dtype=float),
+                strengths=np.asarray([10.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        )
+        for position in ((0.0, 1.0, 1.0), (2.0, 1.0, 1.0))
+    ]
+
+    point_estimate = estimator.posterior_point_estimate()["Cs-137"]
+    reported_positions = estimator.estimates()["Cs-137"][0]
+
+    assert len(point_estimate.modes) == 1
+    assert source_surface_kind(
+        point_estimate.modes[0].position_mean_xyz,
+        environment,
+    ) is not None
+    assert source_surface_kind(reported_positions[0], environment) is not None
 
 
 def test_posterior_aligns_swapped_labels_and_reports_uncertainty() -> None:

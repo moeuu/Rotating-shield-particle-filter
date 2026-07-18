@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import itertools
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -315,6 +315,10 @@ def posterior_point_estimate_from_states(
     weights: NDArray[np.float64],
     *,
     max_cardinality: int | None = None,
+    position_projector: Callable[
+        [NDArray[np.float64]], NDArray[np.float64]
+    ]
+    | None = None,
 ) -> PFPointEstimate:
     """Aggregate a PF-only estimate from a deterministic MAP-cardinality stratum.
 
@@ -405,6 +409,18 @@ def posterior_point_estimate_from_states(
         aligned_positions,
         optimize=True,
     )
+    if position_projector is not None:
+        projected_mean = np.asarray(
+            position_projector(position_mean),
+            dtype=float,
+        )
+        if projected_mean.shape != position_mean.shape:
+            raise ValueError(
+                "position_projector must preserve the (sources, 3) shape."
+            )
+        if np.any(~np.isfinite(projected_mean)):
+            raise ValueError("position_projector must return finite positions.")
+        position_mean = projected_mean
     position_delta = aligned_positions - position_mean[None, :, :]
     position_covariance = np.einsum(
         "n,nki,nkj->kij",

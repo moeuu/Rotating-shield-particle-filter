@@ -496,6 +496,44 @@ def _pure_pf_primary_estimates(
     }
 
 
+def _validate_surface_constrained_estimates(
+    estimates: Mapping[
+        str,
+        tuple[NDArray[np.float64], NDArray[np.float64]],
+    ],
+    environment: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    tolerance_m: float,
+    surface_prior_active: bool,
+) -> None:
+    """Fail closed when a surface-prior report contains an off-surface point."""
+    if not surface_prior_active:
+        return
+    position_groups = [
+        np.asarray(estimate[0], dtype=float).reshape(-1, 3)
+        for estimate in estimates.values()
+        if np.asarray(estimate[0]).size
+    ]
+    if not position_groups:
+        return
+    positions = np.concatenate(position_groups, axis=0)
+    surface_kinds = source_surface_kinds(
+        positions,
+        environment,
+        obstacle_grid,
+        obstacle_height_m=obstacle_height_m,
+        tolerance_m=tolerance_m,
+    )
+    off_surface_count = int(np.count_nonzero(np.equal(surface_kinds, None)))
+    if off_surface_count:
+        raise RuntimeError(
+            "Surface-constrained PF report contains "
+            f"{off_surface_count}/{positions.shape[0]} off-surface positions."
+        )
+
+
 _PURE_PF_SUMMARY_PROVENANCE_KEYS = (
     "schema_version",
     "estimator_family",
@@ -15884,6 +15922,22 @@ def run_live_pf(
             final_estimates, final_absent_diagnostics = _apply_final_absent_filter(
                 final_estimates,
             )
+            _validate_surface_constrained_estimates(
+                final_estimates,
+                env,
+                obstacle_grid,
+                obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+                tolerance_m=max(
+                    0.0,
+                    float(
+                        runtime_config.get(
+                            "posterior_surface_tolerance_m",
+                            1.0e-5,
+                        )
+                    ),
+                ),
+                surface_prior_active=bool(source_surface_prior),
+            )
             final_estimate_stages_for_run["final_estimates"] = final_estimates
             final_estimates_for_run = final_estimates
             raw_estimates = raw_stage
@@ -16263,6 +16317,22 @@ def run_live_pf(
                     estimates
                 )
         estimates, final_absent_diagnostics = _apply_final_absent_filter(estimates)
+        _validate_surface_constrained_estimates(
+            estimates,
+            env,
+            obstacle_grid,
+            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+            tolerance_m=max(
+                0.0,
+                float(
+                    runtime_config.get(
+                        "posterior_surface_tolerance_m",
+                        1.0e-5,
+                    )
+                ),
+            ),
+            surface_prior_active=bool(source_surface_prior),
+        )
         final_estimate_stages["final_estimates"] = estimates
     else:
         estimates = final_estimates_for_run
