@@ -1268,6 +1268,114 @@ def test_candidate_spacing_retry_triggers_for_height_only_actions(
     assert np.any(np.linalg.norm(candidates[:, :2] - current[:2], axis=1) > 0.0)
 
 
+def test_candidate_spacing_retry_triggers_when_lateral_actions_are_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One lateral action must not suppress the lateral-spacing retry."""
+    current = np.array([1.0, 1.0, 0.5], dtype=float)
+    requested_distances: list[float] = []
+
+    def _fake_generate_candidate_poses(**kwargs: object) -> np.ndarray:
+        """Return the requested lateral inventory for each spacing."""
+        requested = float(kwargs["min_dist_from_visited"])
+        requested_distances.append(requested)
+        if requested >= 3.0:
+            return np.array(
+                [[1.0, 1.0, 1.5], [4.0, 1.0, 0.5]],
+                dtype=float,
+            )
+        lateral_x = np.arange(2.0, 11.0, dtype=float)
+        return np.column_stack(
+            [
+                lateral_x,
+                np.ones_like(lateral_x),
+                np.full_like(lateral_x, 0.5),
+            ]
+        )
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "generate_candidate_poses",
+        _fake_generate_candidate_poses,
+    )
+
+    candidates, relaxed, resolved_distance = (
+        realtime_demo_module._generate_planning_candidates(
+            current_pose_xyz=current,
+            map_api=None,
+            n_candidates=16,
+            min_dist_from_visited=3.0,
+            visited_poses_xyz=current.reshape(1, 3),
+            bounds_xyz=(
+                np.array([0.0, 0.0, 0.5], dtype=float),
+                np.array([12.0, 12.0, 2.0], dtype=float),
+            ),
+            continuous_height_anchor_count=8,
+        )
+    )
+
+    assert relaxed is True
+    assert requested_distances == pytest.approx([3.0, 1.5])
+    assert resolved_distance == pytest.approx(1.5)
+    assert candidates.shape == (9, 3)
+
+
+def test_candidate_generation_disables_consecutive_height_partners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A height-partner move must be followed by a lateral station move."""
+    current = np.array([1.0, 1.0, 1.5], dtype=float)
+    visited = np.array(
+        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
+        dtype=float,
+    )
+    generation_options: list[tuple[bool, bool]] = []
+
+    def _fake_generate_candidate_poses(**kwargs: object) -> np.ndarray:
+        """Record whether local height actions are enabled."""
+        generation_options.append(
+            (
+                bool(kwargs["include_current_xy_height_actions"]),
+                bool(kwargs["allow_height_partners"]),
+            )
+        )
+        lateral_x = np.arange(2.0, 18.0, dtype=float)
+        return np.column_stack(
+            [
+                lateral_x,
+                np.ones_like(lateral_x),
+                np.full_like(lateral_x, 1.5),
+            ]
+        )
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "generate_candidate_poses",
+        _fake_generate_candidate_poses,
+    )
+
+    candidates, relaxed, resolved_distance = (
+        realtime_demo_module._generate_planning_candidates(
+            current_pose_xyz=current,
+            map_api=None,
+            n_candidates=16,
+            min_dist_from_visited=3.0,
+            visited_poses_xyz=visited,
+            bounds_xyz=(
+                np.array([0.0, 0.0, 0.5], dtype=float),
+                np.array([20.0, 20.0, 2.0], dtype=float),
+            ),
+            continuous_height_anchor_count=8,
+            height_partner_min_z_separation_m=0.25,
+        )
+    )
+
+    assert relaxed is False
+    assert resolved_distance == pytest.approx(3.0)
+    assert candidates.shape == (16, 3)
+    assert generation_options == [(False, False)]
+
+
 def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
     """Coverage should not stop a mission while residual birth evidence remains."""
 

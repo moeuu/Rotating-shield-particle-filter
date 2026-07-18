@@ -6179,11 +6179,66 @@ def _generate_planning_candidates(
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
 ) -> tuple[NDArray[np.float64], bool, float]:
-    """Generate next-pose actions with one lateral-spacing retry."""
+    """Generate next-pose actions with one lateral-spacing retry.
+
+    The local height-action budget must not crowd lateral stations out of the
+    candidate batch. A height action is also a one-step partner measurement:
+    after taking one, the next station must move laterally instead of chaining
+    another height action at the same xy location.
+    """
     min_dist = max(float(min_dist_from_visited), 0.0)
-    height_partners_enabled = bool(
+    height_partners_requested = bool(
         detector_heights_m is not None or int(continuous_height_anchor_count) > 0
     )
+    visited = (
+        np.zeros((0, 3), dtype=float)
+        if visited_poses_xyz is None
+        else np.asarray(visited_poses_xyz, dtype=float).reshape(-1, 3)
+    )
+    previous_move_was_height_partner = bool(
+        visited.shape[0] >= 2
+        and _is_detector_height_partner(
+            visited[-2],
+            visited[-1],
+            xy_tolerance_m=height_partner_xy_tolerance_m,
+            z_tolerance_m=height_partner_z_tolerance_m,
+            min_z_separation_m=height_partner_min_z_separation_m,
+        )
+    )
+    height_partners_enabled = bool(
+        height_partners_requested and not previous_move_was_height_partner
+    )
+    if height_partners_enabled:
+        if detector_heights_m is not None:
+            height_action_budget = len(tuple(detector_heights_m))
+        else:
+            height_action_budget = max(
+                int(continuous_height_anchor_count),
+                0,
+            )
+    else:
+        height_action_budget = 0
+    required_lateral_count = max(
+        int(n_candidates) - min(height_action_budget, int(n_candidates) - 1),
+        1,
+    )
+
+    def _lateral_count(candidate_rows: NDArray[np.float64]) -> int:
+        """Return the number of candidates that change detector xy."""
+        rows = np.asarray(candidate_rows, dtype=float).reshape(-1, 3)
+        if rows.shape[0] == 0:
+            return 0
+        lateral_distance = np.linalg.norm(
+            rows[:, :2] - np.asarray(current_pose_xyz, dtype=float)[None, :2],
+            axis=1,
+        )
+        return int(
+            np.count_nonzero(
+                lateral_distance
+                > max(float(height_partner_xy_tolerance_m), 1.0e-9)
+            )
+        )
+
     candidates = generate_candidate_poses(
         current_pose_xyz=current_pose_xyz,
         map_api=map_api,
@@ -6206,17 +6261,8 @@ def _generate_planning_candidates(
         map_api=map_api,
         candidates=candidates,
     )
-    lateral_distance = np.linalg.norm(
-        candidates[:, :2] - np.asarray(current_pose_xyz, dtype=float)[None, :2],
-        axis=1,
-    )
-    lateral_available = bool(
-        np.any(
-            lateral_distance
-            > max(float(height_partner_xy_tolerance_m), 1.0e-9)
-        )
-    )
-    if lateral_available or min_dist <= 0.0:
+    lateral_count = _lateral_count(candidates)
+    if lateral_count >= required_lateral_count or min_dist <= 0.0:
         return candidates, False, min_dist
     relaxed_dist = max(min_dist * 0.5, 0.5)
     candidates = generate_candidate_poses(
@@ -14998,14 +15044,27 @@ def run_live_pf(
             )
             if relaxed_retry:
                 print(
-                    "No reachable lateral candidates with current spacing; "
+                    "Insufficient reachable lateral candidates with current spacing; "
                     f"retrying with min_dist={candidate_min_dist:.2f}."
                 )
             if candidates.size == 0:
                 print("No candidate poses available; stopping exploration.")
                 break
+            candidate_xy_distance = np.linalg.norm(
+                candidates[:, :2] - pose[None, :2],
+                axis=1,
+            )
+            lateral_candidate_count = int(
+                np.count_nonzero(
+                    candidate_xy_distance
+                    > max(float(detector_height_pair_xy_tolerance_m), 1.0e-9)
+                )
+            )
             print(
-                f"Generated {len(candidates)} candidate poses. Computing best next pose..."
+                f"Generated {len(candidates)} candidate poses "
+                f"(lateral={lateral_candidate_count}, "
+                f"height={len(candidates) - lateral_candidate_count}). "
+                "Computing best next pose..."
             )
             planned_program_for_next: tuple[int, ...] | None = None
             dss_diagnostics: dict[str, Any] | None = None
