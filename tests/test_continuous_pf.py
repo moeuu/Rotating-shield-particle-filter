@@ -15,13 +15,18 @@ from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import is_allowed_source_surface_position
 from pf.likelihood import (
+    CountLikelihoodSpec,
     DEFAULT_GEANT4_COUNT_LIKELIHOOD_DF,
     DEFAULT_GEANT4_SPECTRUM_COUNT_REL_SIGMA,
     DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA,
     count_likelihood_variance,
     count_likelihood_variance_torch,
     count_log_likelihood,
+    count_log_likelihood_terms_np,
+    count_log_likelihood_terms_torch,
     normalize_count_likelihood_model,
+    predictive_count_likelihood_variance,
+    predictive_count_likelihood_variance_torch,
 )
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.particle_filter import (
@@ -1054,6 +1059,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
         station_view_covariance_enable=True,
         station_view_correlated_spectrum_fraction=1.0,
         shield_contrast_likelihood_enable=False,
+        observation_count_variance_includes_counting_noise=True,
     )
     filt = IsotopeParticleFilter(isotope="Cs-137", kernel=None, config=cfg)
     lam = np.asarray(
@@ -1089,6 +1095,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
             spectrum_count_rel_sigma=0.1,
             spectrum_count_abs_sigma=2.0,
             observation_count_variance=obs_var,
+            observation_count_variance_includes_counting_noise=True,
         )
         common = (0.1**2) * np.outer(lam_vec, lam_vec) + 2.0**2
         np.fill_diagonal(common, 0.0)
@@ -1629,6 +1636,56 @@ def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
     np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
 
+def test_pf_counting_noise_flag_matches_shared_numpy_and_torch() -> None:
+    """PF matrix and Torch increments must share corrected variance semantics."""
+    torch = pytest.importorskip("torch")
+    cfg = PFConfig(
+        num_particles=1,
+        count_likelihood_model="gaussian",
+        observation_count_variance_includes_counting_noise=True,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
+    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
+    z_obs = 39.0
+    observation_variance = 100.0
+    lambdas = np.array([37.0, 41.0], dtype=float)
+
+    matrix = filt._count_log_likelihood_matrix_np(
+        np.array([z_obs], dtype=float),
+        lambdas.reshape(1, -1),
+        observation_count_variance=observation_variance,
+    )
+    gpu = (
+        filt._log_likelihood_increment_gpu(
+            torch.as_tensor(lambdas, dtype=torch.float64),
+            z_obs=z_obs,
+            observation_count_variance=observation_variance,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    shared = np.array(
+        [
+            count_log_likelihood(
+                np.array([z_obs], dtype=float),
+                np.array([value], dtype=float),
+                model="gaussian",
+                observation_count_variance=observation_variance,
+                observation_count_variance_includes_counting_noise=True,
+            )
+            for value in lambdas
+        ],
+        dtype=float,
+    )
+
+    np.testing.assert_allclose(matrix, shared, rtol=1.0e-12, atol=1.0e-12)
+    np.testing.assert_allclose(gpu, shared, rtol=1.0e-12, atol=1.0e-12)
+
+
 @pytest.mark.parametrize("model", ["poisson", "gaussian", "student_t"])
 def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
     """Batched sequence likelihoods should equal summed scalar increments."""
@@ -1642,6 +1699,7 @@ def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
         spectrum_count_abs_sigma=0.25,
         low_count_abs_sigma=1.0,
         low_count_transition_counts=20.0,
+        observation_count_variance_includes_counting_noise=True,
         count_likelihood_df=4.0,
     )
     dummy_kernel = type("K", (), {})()
@@ -2565,6 +2623,368 @@ def test_count_likelihood_variance_torch_matches_numpy() -> None:
         rtol=1.0e-12,
         atol=1.0e-12,
     )
+
+
+def test_counting_noise_in_observation_variance_is_included_once() -> None:
+    """Extracted Poisson variance should replace, not duplicate, its count term."""
+    z_obs = np.array([[100.0], [0.0]], dtype=float)
+    lambda_obs = np.array([[80.0, 120.0], [4.0, 8.0]], dtype=float)
+    observation_variance = np.array([[400.0], [9.0]], dtype=float)
+
+    default_variance = count_likelihood_variance(
+        z_obs,
+        lambda_obs,
+        observation_count_variance=observation_variance,
+    )
+    explicit_legacy = count_likelihood_variance(
+        z_obs,
+        lambda_obs,
+        observation_count_variance=observation_variance,
+        observation_count_variance_includes_counting_noise=False,
+    )
+    corrected = count_likelihood_variance(
+        z_obs,
+        lambda_obs,
+        observation_count_variance=observation_variance,
+        observation_count_variance_includes_counting_noise=True,
+    )
+
+    np.testing.assert_array_equal(default_variance, explicit_legacy)
+    np.testing.assert_allclose(
+        corrected,
+        lambda_obs + np.array([[300.0], [8.0]], dtype=float),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_counting_noise_variance_numpy_torch_equivalence() -> None:
+    """The batched Torch path must implement the corrected NumPy equation."""
+    torch = pytest.importorskip("torch")
+    z_obs = np.array([[100.0], [0.0]], dtype=float)
+    lambda_obs = np.array([[80.0, 120.0], [4.0, 8.0]], dtype=float)
+    observation_variance = np.array([[400.0], [9.0]], dtype=float)
+    kwargs = {
+        "transport_model_rel_sigma": 0.1,
+        "spectrum_count_abs_sigma": 3.0,
+        "observation_count_variance_includes_counting_noise": True,
+    }
+
+    expected = count_likelihood_variance(
+        z_obs,
+        lambda_obs,
+        observation_count_variance=observation_variance,
+        **kwargs,
+    )
+    actual = count_likelihood_variance_torch(
+        torch.as_tensor(z_obs, dtype=torch.float64),
+        torch.as_tensor(lambda_obs, dtype=torch.float64),
+        observation_count_variance=torch.as_tensor(
+            observation_variance,
+            dtype=torch.float64,
+        ),
+        **kwargs,
+    )
+
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+@pytest.mark.parametrize("model", ["poisson", "normal", "student_t"])
+def test_count_log_likelihood_terms_sum_matches_scalar(model: str) -> None:
+    """Broadcast likelihood terms should sum to the scalar public helper."""
+    z_obs = np.array([[5.0], [120.0]], dtype=float)
+    lambda_obs = np.array(
+        [
+            [4.0, 6.0, 8.0],
+            [100.0, 125.0, 150.0],
+        ],
+        dtype=float,
+    )
+    observation_variance = np.array([[2.0], [7.0]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model=model,
+        transport_model_rel_sigma=0.2,
+        transport_model_abs_sigma=3.0,
+        spectrum_count_rel_sigma=0.15,
+        spectrum_count_abs_sigma=5.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        observation_count_variance_includes_counting_noise=True,
+        student_t_df=3.0,
+    )
+
+    terms = count_log_likelihood_terms_np(
+        z_obs,
+        lambda_obs,
+        spec=spec,
+        observation_count_variance=observation_variance,
+    )
+    scalar = count_log_likelihood(
+        z_obs,
+        lambda_obs,
+        model=model,
+        transport_model_rel_sigma=0.2,
+        transport_model_abs_sigma=3.0,
+        spectrum_count_rel_sigma=0.15,
+        spectrum_count_abs_sigma=5.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        observation_count_variance=observation_variance,
+        observation_count_variance_includes_counting_noise=True,
+        student_t_df=3.0,
+    )
+
+    assert spec.model == normalize_count_likelihood_model(model)
+    assert terms.shape == lambda_obs.shape
+    assert float(np.sum(terms)) == pytest.approx(scalar, rel=0.0, abs=0.0)
+
+
+@pytest.mark.parametrize("model", ["poisson", "gaussian", "robust"])
+def test_count_log_likelihood_terms_torch_matches_numpy(model: str) -> None:
+    """Torch broadcast likelihood terms should match NumPy in float64."""
+    torch = pytest.importorskip("torch")
+    z_obs = np.array([[5.0], [120.0]], dtype=float)
+    lambda_obs = np.array(
+        [
+            [4.0, 6.0, 8.0],
+            [100.0, 125.0, 150.0],
+        ],
+        dtype=float,
+    )
+    observation_variance = np.array([[2.0], [7.0]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model=model,
+        transport_model_rel_sigma=0.2,
+        transport_model_abs_sigma=3.0,
+        spectrum_count_rel_sigma=0.15,
+        spectrum_count_abs_sigma=5.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        observation_count_variance_includes_counting_noise=True,
+        student_t_df=3.0,
+    )
+
+    expected = count_log_likelihood_terms_np(
+        z_obs,
+        lambda_obs,
+        spec=spec,
+        observation_count_variance=observation_variance,
+    )
+    actual = count_log_likelihood_terms_torch(
+        torch.as_tensor(z_obs, dtype=torch.float64),
+        torch.as_tensor(lambda_obs, dtype=torch.float64),
+        spec=spec,
+        observation_count_variance=torch.as_tensor(
+            observation_variance,
+            dtype=torch.float64,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_predictive_count_likelihood_variance_uses_posterior_mean() -> None:
+    """Predictive robust variance should use the mean as both scale references."""
+    posterior_mean = np.array(
+        [
+            [0.0, 10.0, 100.0],
+            [250.0, 500.0, 1000.0],
+        ],
+        dtype=float,
+    )
+    observation_variance = np.array([[2.0], [7.0]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        transport_model_rel_sigma=0.2,
+        transport_model_abs_sigma=3.0,
+        spectrum_count_rel_sigma=0.15,
+        spectrum_count_abs_sigma=5.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        student_t_df=5.0,
+    )
+    mean_safe = np.maximum(posterior_mean, 1.0e-12)
+    low_count_weight = 100.0 / (mean_safe + 100.0)
+    expected = (
+        mean_safe
+        + (0.2 * mean_safe) ** 2
+        + 3.0**2
+        + (0.15 * mean_safe) ** 2
+        + 5.0**2
+        + (20.0 * low_count_weight) ** 2
+        + observation_variance
+    )
+
+    actual = predictive_count_likelihood_variance(
+        posterior_mean,
+        spec=spec,
+        observation_count_variance=observation_variance,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_predictive_count_likelihood_variance_torch_matches_numpy() -> None:
+    """Torch predictive variance should preserve the NumPy plug-in model."""
+    torch = pytest.importorskip("torch")
+    posterior_mean = np.array([[0.0, 20.0], [200.0, 2000.0]], dtype=float)
+    observation_variance = np.array([[3.0], [11.0]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="t",
+        transport_model_rel_sigma=0.1,
+        transport_model_abs_sigma=2.0,
+        spectrum_count_rel_sigma=0.05,
+        spectrum_count_abs_sigma=4.0,
+        low_count_abs_sigma=15.0,
+        low_count_transition_counts=80.0,
+        student_t_df=5.0,
+    )
+
+    expected = predictive_count_likelihood_variance(
+        posterior_mean,
+        spec=spec,
+        observation_count_variance=observation_variance,
+    )
+    actual = predictive_count_likelihood_variance_torch(
+        torch.as_tensor(posterior_mean, dtype=torch.float64),
+        spec=spec,
+        observation_count_variance=torch.as_tensor(
+            observation_variance,
+            dtype=torch.float64,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_planning_eig_samples_conditional_particle_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Robust future draws must use the selected latent particle's variance."""
+    captured: dict[str, np.ndarray] = {}
+
+    def _capture_samples(
+        selected_lambdas: np.ndarray,
+        predictive_variance: np.ndarray,
+        *,
+        spec: CountLikelihoodSpec,
+        rng: np.random.Generator,
+        epsilon: float = 1.0e-12,
+    ) -> np.ndarray:
+        """Capture conditional scales and return deterministic observations."""
+        del spec, rng, epsilon
+        captured["selected"] = np.asarray(selected_lambdas, dtype=float).copy()
+        captured["variance"] = np.asarray(predictive_variance, dtype=float).copy()
+        return np.asarray(selected_lambdas, dtype=float)
+
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "_sample_planning_count_observations_np",
+        staticmethod(_capture_samples),
+    )
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        transport_model_rel_sigma=0.2,
+        spectrum_count_abs_sigma=3.0,
+    )
+    RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
+        np.array([[10.0, 1000.0]], dtype=float),
+        np.array([0.5, 0.5], dtype=float),
+        spec=spec,
+        num_samples=16,
+        rng=np.random.default_rng(42),
+    )
+
+    expected = predictive_count_likelihood_variance(
+        captured["selected"],
+        spec=spec,
+    )
+    np.testing.assert_allclose(captured["variance"], expected)
+    assert np.unique(captured["variance"]).size > 1
+
+
+def test_strength_uncertainty_samples_conditional_particle_variance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strength rollouts must use the selected latent particle's variance."""
+    captured: dict[str, np.ndarray] = {}
+
+    def _capture_samples(
+        selected_lambdas: np.ndarray,
+        predictive_variance: np.ndarray,
+        *,
+        spec: CountLikelihoodSpec,
+        rng: np.random.Generator,
+        epsilon: float = 1.0e-12,
+    ) -> np.ndarray:
+        """Capture conditional scales and return deterministic observations."""
+        del spec, rng, epsilon
+        captured["selected"] = np.asarray(selected_lambdas, dtype=float).copy()
+        captured["variance"] = np.asarray(predictive_variance, dtype=float).copy()
+        return np.asarray(selected_lambdas, dtype=float)
+
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "_sample_planning_count_observations_np",
+        staticmethod(_capture_samples),
+    )
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        transport_model_rel_sigma=0.2,
+        spectrum_count_abs_sigma=3.0,
+    )
+    RotatingShieldPFEstimator._expected_strength_uncertainty_from_lambdas_np(
+        np.array([10.0, 1000.0], dtype=float),
+        np.array([0.5, 0.5], dtype=float),
+        np.array([[1.0], [2.0]], dtype=float),
+        spec=spec,
+        num_samples=16,
+        rng=np.random.default_rng(42),
+    )
+
+    expected = predictive_count_likelihood_variance(
+        captured["selected"],
+        spec=spec,
+    )
+    np.testing.assert_allclose(captured["variance"], expected)
+    assert np.unique(captured["variance"]).size > 1
+
+
+def test_predictive_poisson_variance_ignores_robust_floors() -> None:
+    """Poisson predictive variance should remain the clamped posterior mean."""
+    posterior_mean = np.array([0.0, 5.0, 100.0], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="poisson",
+        transport_model_rel_sigma=10.0,
+        transport_model_abs_sigma=100.0,
+        spectrum_count_rel_sigma=10.0,
+        spectrum_count_abs_sigma=100.0,
+        low_count_abs_sigma=100.0,
+        low_count_transition_counts=100.0,
+    )
+
+    actual = predictive_count_likelihood_variance(
+        posterior_mean,
+        spec=spec,
+        observation_count_variance=1.0e6,
+    )
+
+    np.testing.assert_array_equal(actual, np.maximum(posterior_mean, 1.0e-12))
 
 
 def test_transport_absolute_floor_softens_low_count_model_mismatch() -> None:

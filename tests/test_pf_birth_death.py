@@ -4307,6 +4307,187 @@ def test_grid_initialization_respects_source_count_prior() -> None:
     assert set(counts) == {0, 1, 2, 3}
 
 
+def test_grid_source_counts_use_vectorized_runtime_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batched grid cardinalities should match the scalar oracle used by tests."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=3,
+        num_particles=1,
+        init_num_sources=(0, 5),
+        init_grid_spacing_m=1.0,
+        init_grid_repeats=4,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(2.0, 1.0, 1.0),
+    )
+    particle_count = 19
+    actual = filt._initial_source_counts_for_particles(
+        particle_count,
+        cyclic=True,
+    )
+    expected = np.asarray(
+        [filt._initial_source_count_for_particle(idx) for idx in range(particle_count)],
+        dtype=np.int64,
+    )
+
+    np.testing.assert_array_equal(actual, expected)
+
+    def fail_scalar_path(_particle_index: int) -> int:
+        """Fail if standard grid initialization regresses to a particle loop."""
+        pytest.fail("Grid initialization called the scalar source-count oracle.")
+
+    monkeypatch.setattr(filt, "_initial_source_count_for_particle", fail_scalar_path)
+    filt._init_continuous_particles()
+
+    assert len(filt.continuous_particles) == 8
+    assert {particle.state.num_sources for particle in filt.continuous_particles} == {
+        0,
+        1,
+        2,
+        3,
+    }
+
+
+def test_batched_joint_tuple_retry_selection_matches_scalar_oracle() -> None:
+    """Batched retry selection should match pairwise scalar distance checks."""
+    tuples = np.asarray(
+        [
+            [
+                [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 3.0, 0.0]],
+                [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [2.0, 2.0, 0.0]],
+                [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [3.0, 3.0, 0.0]],
+            ],
+            [
+                [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [3.0, 1.0, 0.0], [9.0, 9.0, 0.0]],
+                [[1.0, 1.0, 0.0], [3.0, 1.0, 0.0], [1.0, 3.0, 0.0], [9.0, 9.0, 0.0]],
+                [[1.0, 1.0, 0.0], [4.0, 1.0, 0.0], [1.0, 4.0, 0.0], [9.0, 9.0, 0.0]],
+            ],
+            [
+                [[2.0, 2.0, 0.0], [2.0, 2.0, 0.0], [2.0, 2.0, 0.0], [2.0, 2.0, 0.0]],
+                [[2.0, 2.0, 0.0], [0.0, 0.0, 0.0], [4.0, 4.0, 0.0], [8.0, 8.0, 0.0]],
+                [[2.0, 2.0, 0.0], [1.0, 1.0, 0.0], [3.0, 3.0, 0.0], [7.0, 7.0, 0.0]],
+            ],
+        ],
+        dtype=float,
+    )
+    source_counts = np.asarray([4, 3, 1], dtype=np.int64)
+    threshold = 1.5
+    expected: list[int] = []
+    for particle_idx, source_count in enumerate(source_counts):
+        selected = None
+        for retry_idx in range(tuples.shape[1]):
+            active = tuples[particle_idx, retry_idx, : int(source_count)]
+            if active.shape[0] <= 1:
+                min_distance = np.inf
+            else:
+                pair_left, pair_right = np.triu_indices(active.shape[0], k=1)
+                min_distance = float(
+                    np.min(
+                        np.linalg.norm(active[pair_left] - active[pair_right], axis=1)
+                    )
+                )
+            if min_distance >= threshold:
+                selected = retry_idx
+                break
+        assert selected is not None
+        expected.append(int(selected))
+
+    actual = IsotopeParticleFilter._select_initial_tuple_retry_indices(
+        tuples,
+        source_counts,
+        min_separation_m=threshold,
+    )
+
+    np.testing.assert_array_equal(actual, np.asarray(expected, dtype=np.int64))
+    with pytest.raises(ValueError, match="Unable to construct separated"):
+        IsotopeParticleFilter._select_initial_tuple_retry_indices(
+            tuples[:1, :1],
+            np.asarray([4], dtype=np.int64),
+            min_separation_m=1.0,
+        )
+
+
+def test_latin_hypercube_joint_grid_initialization_is_reproducible() -> None:
+    """K=3/4 tuples should retain anchors and the declared pair separation."""
+    filters: list[IsotopeParticleFilter] = []
+    for _ in range(2):
+        np.random.seed(7)
+        filters.append(
+            _build_filter(
+                p_birth=0.0,
+                min_strength=0.01,
+                max_sources=4,
+                num_particles=1,
+                init_num_sources=(3, 4),
+                init_grid_spacing_m=1.0,
+                init_grid_repeats=2,
+                init_joint_position_design="latin_hypercube",
+                init_joint_position_retries=32,
+                init_source_min_separation_m=1.0,
+                position_min=(0.0, 0.0, 0.0),
+                position_max=(4.0, 4.0, 1.0),
+            )
+        )
+
+    first, repeated = filters
+    grid_positions = first._initial_grid_positions()
+    expected_anchors = np.repeat(grid_positions, 2, axis=0)
+    actual_anchors = np.vstack(
+        [particle.state.positions[0] for particle in first.continuous_particles]
+    )
+
+    np.testing.assert_allclose(actual_anchors, expected_anchors, rtol=0.0, atol=0.0)
+    assert np.unique(actual_anchors, axis=0).shape[0] == grid_positions.shape[0]
+    assert {particle.state.num_sources for particle in first.continuous_particles} == {
+        3,
+        4,
+    }
+    for particle, repeated_particle in zip(
+        first.continuous_particles,
+        repeated.continuous_particles,
+    ):
+        np.testing.assert_allclose(
+            particle.state.positions,
+            repeated_particle.state.positions,
+            rtol=0.0,
+            atol=0.0,
+        )
+        pair_left, pair_right = np.triu_indices(particle.state.num_sources, k=1)
+        pair_distances = np.linalg.norm(
+            particle.state.positions[pair_left] - particle.state.positions[pair_right],
+            axis=1,
+        )
+        assert float(np.min(pair_distances)) >= 1.0 - 1.0e-12
+
+
+def test_grid_initialization_uses_batched_uniform_strength_prior() -> None:
+    """A declared source-population range should bound all initial PF strengths."""
+    np.random.seed(13)
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        max_sources=3,
+        num_particles=1,
+        init_num_sources=(1, 3),
+        init_grid_spacing_m=1.0,
+        init_grid_repeats=4,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(2.0, 1.0, 1.0),
+        init_strength_prior="uniform",
+        init_strength_min=300000.0,
+        init_strength_max=2000000.0,
+    )
+    strengths = np.concatenate(
+        [particle.state.strengths for particle in filt.continuous_particles]
+    )
+
+    assert strengths.size > 0
+    assert np.all(strengths >= 300000.0)
+    assert np.all(strengths <= 2000000.0)
+
+
 def test_birth_excludes_candidates_near_detector_poses() -> None:
     """Birth proposals should not place sources on measured detector poses."""
     np.random.seed(0)
@@ -4388,6 +4569,221 @@ def test_death_removes_weak_sources() -> None:
         support_data=support_data, birth_data=None, candidate_positions=None
     )
     assert all(p.state.num_sources == 0 for p in filt.continuous_particles)
+
+
+def test_death_uses_declared_source_strength_support_threshold() -> None:
+    """Evidence-poor sources below the physical prior support should be removable."""
+    np.random.seed(1)
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=5.0,
+        death_strength_threshold=300000.0,
+        max_sources=2,
+        num_particles=1,
+        death_low_q_streak=1,
+        death_delta_ll_threshold=0.0,
+        support_ema_alpha=1.0,
+        p_kill=1.0,
+        source_prune_min_distinct_stations=1,
+        source_prune_min_distinct_views=1,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=2,
+                positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+                strengths=np.array([100000.0, 200000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    support_data = MeasurementData(
+        z_k=np.array([0.0], dtype=float),
+        observation_variances=np.array([1.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([7], dtype=int),
+        pb_indices=np.array([7], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    filt.apply_birth_death(
+        support_data=support_data,
+        birth_data=None,
+        candidate_positions=None,
+    )
+
+    assert filt.last_kill_count == 2
+    assert filt.continuous_particles[0].state.num_sources == 0
+
+
+def test_evidence_driven_death_waits_for_multistation_support() -> None:
+    """Unsupported sources should die by evidence, not an unrelated cps floor."""
+    np.random.seed(2)
+    filt = _build_filter(
+        p_birth=0.0,
+        p_kill=1.0,
+        min_strength=5.0,
+        death_strength_threshold=300000.0,
+        death_require_low_strength=False,
+        death_low_q_streak=2,
+        death_delta_ll_threshold=0.0,
+        support_ema_alpha=1.0,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=2,
+        num_particles=1,
+        max_sources=1,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+                strengths=np.array([1000000.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+    one_station = MeasurementData(
+        z_k=np.zeros(1, dtype=float),
+        observation_variances=np.ones(1, dtype=float),
+        detector_positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.ones(1, dtype=float),
+    )
+    two_stations = MeasurementData(
+        z_k=np.zeros(2, dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=np.array(
+            [[1.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1], dtype=int),
+        pb_indices=np.array([0, 1], dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+
+    filt.apply_birth_death(
+        support_data=one_station,
+        birth_data=None,
+        candidate_positions=None,
+    )
+    assert filt.last_kill_count == 0
+    assert filt.continuous_particles[0].state.low_q_streaks[0] == 0
+
+    filt.apply_birth_death(
+        support_data=two_stations,
+        birth_data=None,
+        candidate_positions=None,
+    )
+    assert filt.last_kill_count == 0
+    assert filt.continuous_particles[0].state.low_q_streaks[0] == 1
+
+    filt.apply_birth_death(
+        support_data=two_stations,
+        birth_data=None,
+        candidate_positions=None,
+    )
+    assert filt.last_kill_count == 1
+    assert filt.continuous_particles[0].state.num_sources == 0
+
+
+def test_evidence_death_prunes_neutral_source_without_strength_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Half-BIC evidence should prune a neutral source after station history."""
+    np.random.seed(23)
+    filt = _build_filter(
+        p_birth=0.0,
+        p_kill=1.0,
+        min_strength=5.0,
+        death_require_low_strength=False,
+        death_low_q_streak=2,
+        source_prune_refit_after_remove=False,
+        source_prune_bic_penalty_params=4,
+        source_prune_delta_ll_threshold=0.0,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=2,
+        pseudo_source_verification_enable=False,
+        conditional_strength_refit=False,
+        refit_after_moves=False,
+        split_prob=0.0,
+        split_residual_always_try=False,
+        high_strength_split_enable=False,
+        merge_prob=0.0,
+        num_particles=1,
+        max_sources=2,
+    )
+    state = IsotopeState(
+        num_sources=2,
+        positions=np.array(
+            [[0.0, 0.0, 0.0], [4.0, 4.0, 0.0]],
+            dtype=float,
+        ),
+        strengths=np.array([1.0e6, 0.0], dtype=float),
+        background=0.0,
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+    detector_positions = np.array(
+        [[1.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    template = MeasurementData(
+        z_k=np.zeros(2, dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=detector_positions,
+        fe_indices=np.array([0, 1], dtype=int),
+        pb_indices=np.array([0, 1], dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+    _, expected = filt._lambda_components(state, template)
+    support_data = MeasurementData(
+        z_k=expected,
+        observation_variances=np.maximum(expected, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=np.array([0, 1], dtype=int),
+        pb_indices=np.array([0, 1], dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+
+    def _fail_refit(*args: object, **kwargs: object) -> None:
+        """Fail if strict non-refit evidence death invokes a refit path."""
+        raise AssertionError("evidence-only death must not invoke strength refit")
+
+    monkeypatch.setattr(
+        filt,
+        "_source_prune_refit_after_remove_mask",
+        _fail_refit,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_source_prune_refit_after_remove_mask_batched",
+        _fail_refit,
+    )
+    monkeypatch.setattr(filt, "_refit_strengths_for_particle", _fail_refit)
+    monkeypatch.setattr(filt, "_refit_particle_indices_batched", _fail_refit)
+
+    filt.apply_birth_death(
+        support_data=support_data,
+        birth_data=None,
+        candidate_positions=None,
+    )
+    first_state = filt.continuous_particles[0].state
+    assert filt.last_kill_count == 0
+    assert first_state.low_q_streaks.tolist() == [0, 1]
+
+    filt.apply_birth_death(
+        support_data=support_data,
+        birth_data=None,
+        candidate_positions=None,
+    )
+    final_state = filt.continuous_particles[0].state
+    assert filt.last_kill_count == 1
+    assert final_state.num_sources == 1
+    assert final_state.strengths.tolist() == [pytest.approx(1.0e6)]
+    assert final_state.low_q_streaks.tolist() == [0]
 
 
 def test_source_detector_exclusion_removes_detector_collapsed_source() -> None:

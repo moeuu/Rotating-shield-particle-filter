@@ -460,7 +460,9 @@ def _replay_case(
     return estimates, diagnostics
 
 
-def _runtime_likelihood_settings(runtime_config: dict[str, object]) -> dict[str, float]:
+def _runtime_likelihood_settings(
+    runtime_config: dict[str, object],
+) -> dict[str, bool | float]:
     """Return PF likelihood variance settings from nested or legacy config keys."""
     payload = runtime_config.get("pf_count_likelihood", {})
     likelihood = payload if isinstance(payload, dict) else {}
@@ -473,6 +475,15 @@ def _runtime_likelihood_settings(runtime_config: dict[str, object]) -> dict[str,
         if legacy_name in runtime_config:
             return float(runtime_config[legacy_name])
         return float(default)
+
+    def boolean_value(name: str, default: bool) -> bool:
+        """Return one boolean likelihood parameter value."""
+        if name in likelihood:
+            return bool(likelihood[name])
+        legacy_name = f"pf_{name}"
+        if legacy_name in runtime_config:
+            return bool(runtime_config[legacy_name])
+        return bool(default)
 
     return {
         "transport_model_rel_sigma": max(
@@ -513,6 +524,10 @@ def _runtime_likelihood_settings(runtime_config: dict[str, object]) -> dict[str,
                 DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS,
             ),
             0.0,
+        ),
+        "observation_count_variance_includes_counting_noise": boolean_value(
+            "observation_count_variance_includes_counting_noise",
+            False,
         ),
     }
 

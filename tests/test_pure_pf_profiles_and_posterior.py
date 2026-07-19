@@ -19,6 +19,7 @@ from pf.profiles import (
     apply_profile_to_config,
     enforce_pure_runtime_settings,
     resolve_estimator_profile,
+    resolve_structural_transition_provenance,
 )
 from pf.pure_estimator import PurePFEstimator
 from pf.state import IsotopeState
@@ -120,6 +121,77 @@ def test_runtime_profile_resolves_conditional_strength_fields() -> None:
     for field in requested:
         assert strict[field] is False
         assert profiled[field] is True
+
+
+def test_structural_provenance_distinguishes_fixed_k_from_heuristic_birth() -> None:
+    """Result metadata must not present matching pursuit as exact RJMCMC."""
+    fixed_config = RotatingShieldPFConfig(
+        estimator_profile="pf_strict",
+        init_num_sources=(3, 3),
+        birth_enable=False,
+    )
+    fixed_capabilities = apply_profile_to_config(fixed_config)
+    fixed = resolve_structural_transition_provenance(
+        fixed_config,
+        capabilities=fixed_capabilities,
+    ).to_dict()
+
+    assert fixed["posterior_semantics"] == (
+        "fixed_cardinality_sequential_particle_filter"
+    )
+    assert fixed["structural_kernel_family"] == (
+        "fixed_cardinality_no_structural_moves"
+    )
+    assert fixed["structural_moves_enabled"] is False
+    assert fixed["structural_kernel_target_preserving"] is True
+    assert fixed["structural_kernel_exact_rj"] is False
+    assert fixed["reversible_jump_mcmc_used"] is False
+    assert fixed["data_conditioned_structural_proposal"] is False
+
+    birth_config = RotatingShieldPFConfig(
+        estimator_profile="pf_strict",
+        init_num_sources=(0, 5),
+        birth_enable=True,
+    )
+    birth_capabilities = apply_profile_to_config(birth_config)
+    birth = resolve_structural_transition_provenance(
+        birth_config,
+        capabilities=birth_capabilities,
+    ).to_dict()
+
+    assert birth["posterior_semantics"] == (
+        "approximate_sequential_particle_ensemble_with_heuristic_structural_moves"
+    )
+    assert birth["structural_kernel_family"] == ("residual_matching_pursuit_heuristic")
+    assert birth["structural_moves_enabled"] is True
+    assert birth["structural_kernel_target_preserving"] is False
+    assert birth["structural_kernel_exact_rj"] is False
+    assert birth["reversible_jump_mcmc_used"] is False
+    assert birth["data_conditioned_structural_proposal"] is True
+    assert birth["data_conditioned_strength_proposal"] is True
+    assert birth["data_conditioned_strength_proposal_importance_corrected"] is False
+
+
+def test_static_cardinality_mixture_without_moves_is_target_preserving() -> None:
+    """A variable initial K support is distinct from heuristic K transitions."""
+    config = RotatingShieldPFConfig(
+        estimator_profile="pf_strict",
+        init_num_sources=(0, 5),
+        birth_enable=False,
+    )
+    capabilities = apply_profile_to_config(config)
+    provenance = resolve_structural_transition_provenance(
+        config,
+        capabilities=capabilities,
+    ).to_dict()
+
+    assert provenance["posterior_semantics"] == (
+        "static_cardinality_mixture_sequential_particle_filter"
+    )
+    assert provenance["structural_kernel_family"] == (
+        "static_cardinality_mixture_no_structural_moves"
+    )
+    assert provenance["structural_kernel_target_preserving"] is True
 
 
 def test_pure_estimator_applies_boundary_before_legacy_initialization(
@@ -390,10 +462,13 @@ def test_pure_posterior_projects_surface_particle_mean_to_surface() -> None:
     reported_positions = estimator.estimates()["Cs-137"][0]
 
     assert len(point_estimate.modes) == 1
-    assert source_surface_kind(
-        point_estimate.modes[0].position_mean_xyz,
-        environment,
-    ) is not None
+    assert (
+        source_surface_kind(
+            point_estimate.modes[0].position_mean_xyz,
+            environment,
+        )
+        is not None
+    )
     assert source_surface_kind(reported_positions[0], environment) is not None
 
 

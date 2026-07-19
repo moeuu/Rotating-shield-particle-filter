@@ -744,6 +744,7 @@ def _write_replay_outputs(
         )
         (temporary / "pf_trace.jsonl").write_bytes(trace_bytes)
         final_state = estimator.serialized_state()
+        structural = estimator.structural_transition_diagnostics()
         diagnostics = {
             "schema_version": 1,
             "estimator_family": "particle_filter",
@@ -758,6 +759,16 @@ def _write_replay_outputs(
             "final_state_sha256": _sha256_bytes(final_state),
             "forward_model_compatibility": "local_manifest_exact_match",
             "forbidden_batch_methods_invoked": list(estimator.batch_methods_invoked),
+            "posterior_semantics": str(structural["posterior_semantics"]),
+            "structural_kernel_family": str(structural["structural_kernel_family"]),
+            "structural_kernel_target_preserving": bool(
+                structural["structural_kernel_target_preserving"]
+            ),
+            "structural_kernel_exact_rj": bool(
+                structural["structural_kernel_exact_rj"]
+            ),
+            "reversible_jump_mcmc_used": bool(structural["reversible_jump_mcmc_used"]),
+            "structural_transition_provenance": dict(structural),
         }
         (temporary / "pf_diagnostics.json").write_bytes(
             canonical_json_bytes(diagnostics)

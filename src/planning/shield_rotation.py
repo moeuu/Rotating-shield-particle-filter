@@ -7,6 +7,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from pf.estimator import RotatingShieldPFEstimator
+from pf.likelihood import CountLikelihoodSpec
 
 
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
@@ -15,6 +16,44 @@ def _normalize_weights(weights: np.ndarray) -> np.ndarray:
     if total <= 0.0:
         return np.ones_like(weights) / max(len(weights), 1)
     return weights / total
+
+
+def _count_likelihood_spec_for_estimator(
+    estimator: RotatingShieldPFEstimator,
+    isotope: str,
+) -> CountLikelihoodSpec:
+    """Return an isotope spec while preserving lightweight estimator test doubles."""
+    getter = getattr(estimator, "count_likelihood_spec_for_isotope", None)
+    if callable(getter):
+        return getter(isotope)
+    config = estimator.pf_config
+
+    def _isotope_float(name: str) -> float:
+        """Resolve one scalar or isotope-mapped fallback configuration value."""
+        value = getattr(config, name, 0.0)
+        if isinstance(value, dict):
+            value = value.get(str(isotope), 0.0)
+        return float(value)
+
+    return CountLikelihoodSpec(
+        model=str(getattr(config, "count_likelihood_model", "poisson")),
+        transport_model_rel_sigma=_isotope_float("transport_model_rel_sigma"),
+        transport_model_abs_sigma=_isotope_float("transport_model_abs_sigma"),
+        spectrum_count_rel_sigma=_isotope_float("spectrum_count_rel_sigma"),
+        spectrum_count_abs_sigma=_isotope_float("spectrum_count_abs_sigma"),
+        low_count_abs_sigma=_isotope_float("low_count_abs_sigma"),
+        low_count_transition_counts=_isotope_float(
+            "low_count_transition_counts"
+        ),
+        observation_count_variance_includes_counting_noise=bool(
+            getattr(
+                config,
+                "observation_count_variance_includes_counting_noise",
+                False,
+            )
+        ),
+        student_t_df=float(getattr(config, "count_likelihood_df", 5.0)),
+    )
 
 
 def _resolve_gpu_context(
@@ -392,19 +431,6 @@ def _eig_scores_gpu(
     if num_samples is None:
         num_samples = estimator.pf_config.eig_num_samples
     num_samples = int(num_samples)
-    cache: Dict[str, Tuple[object, object, object, object, object, object, object]] = {}
-    for iso, (positions, strengths, backgrounds, mask, weights_t) in packed.items():
-        log_weights_t = torch_mod.log(weights_t + eps)
-        H_prior = -torch_mod.sum(weights_t * log_weights_t)
-        cache[iso] = (
-            positions,
-            strengths,
-            backgrounds,
-            mask,
-            weights_t,
-            log_weights_t,
-            H_prior,
-        )
 
     scores: Dict[int, float] = {}
     for oid in candidate_ids:
@@ -417,9 +443,7 @@ def _eig_scores_gpu(
             backgrounds,
             mask,
             weights_t,
-            log_weights_t,
-            H_prior,
-        ) in cache.items():
+        ) in packed.items():
             lam_t = kernel.expected_counts_pair_for_packed_states_torch(
                 isotope=iso,
                 detector_pos=detector_pos,
@@ -438,17 +462,18 @@ def _eig_scores_gpu(
                 device=device,
                 dtype=dtype,
             )
-            if num_samples <= 0:
-                H_post_mean = torch_mod.zeros((), device=device, dtype=dtype)
-            else:
-                idx = torch_mod.multinomial(weights_t, num_samples, replacement=True)
-                z = torch_mod.poisson(lam_t[idx])
-                logw = log_weights_t + z.unsqueeze(1) * torch_mod.log(lam_t + eps) - lam_t
-                logw = logw - torch_mod.logsumexp(logw, dim=1, keepdim=True)
-                w_post = torch_mod.exp(logw)
-                H_post = -torch_mod.sum(w_post * torch_mod.log(w_post + eps), dim=1)
-                H_post_mean = torch_mod.mean(H_post)
-            ig_h = float((H_prior - H_post_mean).item())
+            ig_h = float(
+                RotatingShieldPFEstimator._planning_eig_from_lambdas_torch(
+                    lam_t,
+                    weights_t,
+                    spec=_count_likelihood_spec_for_estimator(estimator, iso),
+                    num_samples=num_samples,
+                    epsilon=eps,
+                )[0]
+                .detach()
+                .cpu()
+                .item()
+            )
             total_ig += alphas.get(iso, 0.0) * ig_h
         scores[oid] = float(total_ig)
     return scores

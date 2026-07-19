@@ -118,6 +118,7 @@ class SpectrumConfig:
     response_poisson_underallocation_count_guard_ratio: float = 1.05
     response_poisson_underallocation_count_guard_photo_snr: float = 8.0
     response_poisson_diagnostic_variance_enable: bool = True
+    response_poisson_global_diagnostic_variance_enable: bool = False
     response_poisson_diagnostic_reduced_chi2_threshold: float = 2.0
     response_poisson_diagnostic_reduced_chi2_scale: float = 0.5
     response_poisson_diagnostic_condition_threshold: float = 1.0e4

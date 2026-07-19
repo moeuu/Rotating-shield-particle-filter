@@ -1191,8 +1191,7 @@ def test_deferred_pose_update_delays_structural_update(monkeypatch):
 
     def _fake_apply_birth_death(self, birth_window_override=None):
         """Record birth/death applications."""
-        _ = birth_window_override
-        birth_calls.append(len(self.measurements))
+        birth_calls.append((len(self.measurements), birth_window_override))
 
     monkeypatch.setattr(
         IsotopeParticleFilter,
@@ -1248,7 +1247,79 @@ def test_deferred_pose_update_delays_structural_update(monkeypatch):
 
     assert finalized == 2
     assert finalize_calls == ["Cs-137"]
-    assert birth_calls == [2]
+    assert birth_calls == [(2, 2)]
+
+
+def test_deferred_pose_update_preserves_configured_full_birth_history(monkeypatch):
+    """A non-positive birth window must survive station-level finalization."""
+    birth_data_sizes = []
+
+    def _fake_update_continuous_pair(self, *args, **kwargs):
+        """Avoid particle work while recording deferred estimator behavior."""
+        _ = (self, args, kwargs)
+
+    def _fake_finalize_deferred_update(self):
+        """Avoid particle finalization in the birth-window regression test."""
+        _ = self
+
+    def _record_structural_update(self, task):
+        """Record the measurement count delivered to residual birth."""
+        _ = self
+        birth_data = task[4]
+        birth_data_sizes.append(0 if birth_data is None else int(birth_data.z_k.size))
+
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "update_continuous_pair",
+        _fake_update_continuous_pair,
+    )
+    monkeypatch.setattr(
+        IsotopeParticleFilter,
+        "finalize_deferred_update",
+        _fake_finalize_deferred_update,
+    )
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "_run_isotope_structural_update",
+        _record_structural_update,
+    )
+
+    est = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            max_sources=1,
+            adaptive_strength_prior=False,
+            birth_window=0,
+        ),
+        shield_params=ShieldParams(),
+    )
+    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
+    est.measurements.extend(
+        MeasurementRecord(
+            z_k={"Cs-137": float(count)},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            fe_index=0,
+            pb_index=0,
+        )
+        for count in (1, 2, 3)
+    )
+    est.begin_deferred_pose_update()
+    est.update_pair(
+        z_k={"Cs-137": 4.0},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+
+    assert est.finalize_deferred_pose_update() == 1
+    assert birth_data_sizes == [4]
 
 
 def test_deferred_pose_update_defers_history_estimate_recompute(monkeypatch):
@@ -1647,6 +1718,10 @@ def test_rotating_config_passes_strength_and_label_parameters():
         max_particles=1,
         init_strength_log_mean=2.5,
         init_strength_log_sigma=0.25,
+        init_strength_prior="uniform",
+        init_strength_min=300000.0,
+        init_strength_max=2000000.0,
+        death_strength_threshold=300000.0,
         label_pos_weight=1.7,
         label_strength_weight=0.4,
         label_missing_cost=123.0,
@@ -1666,6 +1741,10 @@ def test_rotating_config_passes_strength_and_label_parameters():
 
     assert pf_config.init_strength_log_mean == pytest.approx(2.5)
     assert pf_config.init_strength_log_sigma == pytest.approx(0.25)
+    assert pf_config.init_strength_prior == "uniform"
+    assert pf_config.init_strength_min == pytest.approx(300000.0)
+    assert pf_config.init_strength_max == pytest.approx(2000000.0)
+    assert pf_config.death_strength_threshold == pytest.approx(300000.0)
     assert pf_config.label_pos_weight == pytest.approx(1.7)
     assert pf_config.label_strength_weight == pytest.approx(0.4)
     assert pf_config.label_missing_cost == pytest.approx(123.0)

@@ -65,7 +65,12 @@ not be authoritative in `pf_strict` or `pf_profiled`:
 
 PF-internal residual birth/death/split/merge, particle-state strength updates,
 robust likelihoods, covariance, tempering, resampling, and roughening are not
-batch estimators. Their configuration remains part of the PF family.
+batch estimators. Their configuration remains part of the PF family. This
+classification is only about the batch-estimator boundary: the current
+residual matching-pursuit structural path is heuristic and lacks the proposal,
+reverse-move, prior, and Jacobian terms required for exact reversible-jump or
+importance-corrected target preservation. Result provenance states that
+limitation explicitly whenever structural moves are enabled.
 
 ## Required active-path disposition
 

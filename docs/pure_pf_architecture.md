@@ -33,7 +33,9 @@ configuration booleans cannot grant a capability that the profile denies.
 
 Both variants report `final_estimate_source=pf_posterior`, an empty
 `batch_methods_invoked`, and false values for all-history fit, surface-map,
-batch-model-order, and batch-feedback provenance.
+batch-model-order, and batch-feedback provenance. These purity fields describe
+the PF-versus-batch estimator boundary; by themselves they do not claim that a
+data-conditioned structural kernel is exact or target preserving.
 
 The standard Geant4 and Python runtime configurations declare `pf_strict`
 directly and keep forbidden batch flags false in the files themselves.
@@ -47,10 +49,22 @@ diagnostics.
 PF-internal trans-dimensional proposals are a separate boundary. Residual
 birth/split/merge proposals may evaluate a bounded causal measurement block and
 optimize trial source strengths at fixed candidate positions before accepting
-or rejecting a proposed particle state. Those trial values are never emitted as
-a second estimate and never replace the weighted PF posterior. Consequently,
-`pf_strict` means PF-only localization without all-history batch refinement; it
-does not mean that every data-informed proposal must be sampled from the prior.
+or rejecting a proposed particle state. The current matching-pursuit path is a
+heuristic structural move: it does not evaluate forward/reverse proposal
+densities, a source/cardinality prior ratio, or a dimension-matching Jacobian.
+Its window likelihood refresh is therefore not an importance or
+reversible-jump correction. Those trial values are not emitted as a second
+batch estimate, but a run with structural moves enabled must not be described
+as exact RJMCMC or as a target-preserving Bayesian posterior.
+
+Every result records `posterior_semantics`, `structural_kernel_family`,
+`structural_kernel_target_preserving`, `structural_kernel_exact_rj`, and the
+complete `structural_transition_provenance` mapping. With `birth_enable=false`,
+the structural dimension is unchanged and this narrow structural-kernel flag
+is true. With residual birth/death/split/merge enabled, the family is recorded
+as `residual_matching_pursuit_heuristic` and target preservation is false.
+Consequently, `pf_strict` means PF-only localization without all-history batch
+refinement; it is not an exactness label for the structural kernel.
 
 ## Execution model
 

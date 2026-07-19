@@ -19,7 +19,12 @@ from numpy.typing import NDArray
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.detector_geometry import DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
 from pf.estimator import RotatingShieldPFEstimator
-from pf.likelihood import expected_counts_per_source
+from pf.likelihood import (
+    CountLikelihoodSpec,
+    count_log_likelihood_terms_np,
+    expected_counts_per_source,
+    predictive_count_likelihood_variance,
+)
 from planning.candidate_generation import sample_low_discrepancy_heights
 from planning.pose_selection import (
     _auto_scale_observation_penalty,
@@ -1508,6 +1513,10 @@ def _score_program_from_pair_cache(
             signature_total += isotope_weight * _signature_separation_score(
                 signatures,
                 variance_floor=config.count_variance_floor,
+                likelihood_spec=_count_likelihood_spec_for_isotope(
+                    estimator,
+                    isotope,
+                ),
             )
             temporal_total += (
                 isotope_weight
@@ -1602,44 +1611,247 @@ def _program_pair_id_matrix(
     return matrix
 
 
-def _program_conditioned_information_gain(
+def _program_view_mask(
+    programs: Sequence[ShieldProgram],
     *,
+    max_length: int,
+) -> NDArray[np.bool_]:
+    """Return a mask selecting the physical views in padded programs."""
+    if max_length <= 0:
+        return np.zeros((len(programs), 0), dtype=bool)
+    lengths = np.asarray([len(program.pair_ids) for program in programs], dtype=int)
+    return np.arange(max_length, dtype=int)[None, :] < lengths[:, None]
+
+
+def _draw_program_future_counts(
+    truth_lambdas_pvs: NDArray[np.float64],
+    predictive_variance_pvs: NDArray[np.float64],
+    *,
+    spec: CountLikelihoodSpec,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Draw batched future counts from the configured PF observation family."""
+    truth = np.maximum(np.asarray(truth_lambdas_pvs, dtype=float), 0.0)
+    variance = np.maximum(
+        np.asarray(predictive_variance_pvs, dtype=float),
+        1.0e-12,
+    )
+    if spec.model == "poisson":
+        return rng.poisson(truth).astype(float, copy=False)
+    scale = np.sqrt(variance)
+    if spec.model == "gaussian":
+        noise = rng.normal(size=truth.shape)
+    else:
+        noise = rng.standard_t(
+            df=max(float(spec.student_t_df), 1.0 + 1.0e-12),
+            size=truth.shape,
+        )
+    return np.maximum(truth + scale * noise, 0.0)
+
+
+def _program_information_gain_from_lambdas(
+    lambdas_pvn: NDArray[np.float64],
+    weights_n: NDArray[np.float64],
+    view_mask_pv: NDArray[np.bool_],
+    *,
+    spec: CountLikelihoodSpec,
+    num_samples: int,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Return joint-view mutual information for every program in one batch."""
+    lambdas = np.maximum(np.asarray(lambdas_pvn, dtype=float), 1.0e-12)
+    weights = _normalise_weights(np.asarray(weights_n, dtype=float))
+    mask = np.asarray(view_mask_pv, dtype=bool)
+    if lambdas.ndim != 3:
+        raise ValueError("lambdas_pvn must be shaped (program, view, particle).")
+    if mask.shape != lambdas.shape[:2]:
+        raise ValueError("view_mask_pv must match the program and view dimensions.")
+    if weights.size != lambdas.shape[2]:
+        raise ValueError("weights_n must match the particle dimension.")
+    program_count, _, particle_count = lambdas.shape
+    if program_count == 0 or particle_count < 2 or not np.any(mask):
+        return np.zeros(program_count, dtype=float)
+
+    sample_count = max(int(num_samples), 1)
+    latent_indices = rng.choice(
+        particle_count,
+        size=sample_count,
+        replace=True,
+        p=weights,
+    )
+    truth = lambdas[:, :, latent_indices]
+    predictive_variance = predictive_count_likelihood_variance(
+        truth,
+        spec=spec,
+    )
+    observations = _draw_program_future_counts(
+        truth,
+        predictive_variance,
+        spec=spec,
+        rng=rng,
+    )
+    log_terms = count_log_likelihood_terms_np(
+        observations[:, :, :, None],
+        lambdas[:, :, None, :],
+        spec=spec,
+    )
+    log_likelihood = np.sum(
+        log_terms * mask[:, :, None, None],
+        axis=1,
+    )
+    log_prior = np.log(np.maximum(weights, 1.0e-300))[None, None, :]
+    log_joint = log_likelihood + log_prior
+    max_log_joint = np.max(log_joint, axis=2, keepdims=True)
+    log_evidence = max_log_joint + np.log(
+        np.sum(np.exp(log_joint - max_log_joint), axis=2, keepdims=True)
+    )
+    posterior = np.exp(log_joint - log_evidence)
+    kl_samples = np.sum(
+        posterior * (log_joint - log_evidence - log_prior),
+        axis=2,
+    )
+    information_gain = np.mean(kl_samples, axis=1)
+    return np.maximum(
+        np.where(np.isfinite(information_gain), information_gain, 0.0),
+        0.0,
+    )
+
+
+def _program_information_gains_for_poses(
     estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    program: ShieldProgram,
-) -> float:
-    """Return Poisson mode-discrimination information for an exact program."""
-    if not program.pair_ids:
-        return 0.0
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
+    detector_positions: NDArray[np.float64],
+    programs_by_pose: Sequence[Sequence[ShieldProgram]],
+    *,
+    config: DSSPPConfig,
+    rng_seed: int | None,
+) -> list[NDArray[np.float64]] | None:
+    """Return joint-program EIGs using one shared posterior particle subset."""
+    required_methods = (
+        "planning_particles",
+        "expected_counts_all_pairs_for_states_at_detectors",
+    )
+    if any(not hasattr(estimator, name) for name in required_methods):
+        return None
+    filters = getattr(estimator, "filters", None)
+    pf_config = getattr(estimator, "pf_config", None)
+    isotopes = tuple(getattr(estimator, "isotopes", ()))
+    if not isinstance(filters, dict) or pf_config is None or not isotopes:
+        return None
+    if any(
+        isotope not in filters
+        or not (
+            hasattr(filters[isotope], "count_likelihood_spec")
+            or hasattr(filters[isotope], "_count_likelihood_kwargs")
+        )
+        for isotope in isotopes
+    ):
+        return None
+
+    detectors = np.asarray(detector_positions, dtype=float)
+    if detectors.size == 0:
+        detectors = np.zeros((0, 3), dtype=float)
+    if detectors.ndim != 2 or detectors.shape[1] != 3:
+        raise ValueError("detector_positions must be shaped (pose, 3).")
+    if len(programs_by_pose) != detectors.shape[0]:
+        raise ValueError("programs_by_pose must match detector_positions.")
+    outputs = [np.zeros(len(programs), dtype=float) for programs in programs_by_pose]
+    if detectors.shape[0] == 0:
+        return outputs
+
+    rng = np.random.default_rng(rng_seed)
+    particles_by_isotope = estimator.planning_particles(
+        max_particles=config.planning_particles,
+        method=config.planning_method,
+        rng=rng,
+    )
+    alpha_weights = getattr(pf_config, "alpha_weights", None) or {
+        isotope: 1.0 for isotope in isotopes
     }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    pair_ids = np.asarray(program.pair_ids, dtype=np.int64)
-    total_information = 0.0
-    epsilon = 1.0e-12
-    for isotope in estimator.isotopes:
-        matrix, weights_raw = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        if matrix.ndim != 2 or matrix.shape[1] < 2 or matrix.shape[0] == 0:
+    alpha_sum = sum(float(alpha_weights.get(isotope, 1.0)) for isotope in isotopes)
+    alpha_sum = max(float(alpha_sum), 1.0e-12)
+    configured_samples = getattr(pf_config, "planning_eig_samples", None)
+    if configured_samples is None:
+        configured_samples = getattr(pf_config, "eig_num_samples", 50)
+    # Bound the largest detector/source/pair tensor while still amortizing the
+    # shared spherical-octant and obstacle-response evaluation across poses.
+    pose_chunk_size = min(8, max(1, int(detectors.shape[0])))
+    for isotope in isotopes:
+        subset = particles_by_isotope.get(isotope)
+        if subset is None:
             continue
-        if np.any(pair_ids < 0) or np.any(pair_ids >= matrix.shape[0]):
-            raise ValueError("Shield program contains an out-of-range pair id.")
-        rates = np.maximum(matrix[pair_ids, :], 0.0)
-        weights = _normalise_weights(np.asarray(weights_raw, dtype=float))
-        if weights.size != rates.shape[1]:
-            weights = np.full(rates.shape[1], 1.0 / rates.shape[1], dtype=float)
-        mixture_mean = np.sum(rates * weights[None, :], axis=1, keepdims=True)
-        log_ratio = np.log(
-            np.maximum(rates, epsilon) / np.maximum(mixture_mean, epsilon)
+        states, weights = subset
+        if len(states) < 2:
+            continue
+        filt = filters[isotope]
+        spec = (
+            filt.count_likelihood_spec()
+            if hasattr(filt, "count_likelihood_spec")
+            else CountLikelihoodSpec(**filt._count_likelihood_kwargs())
         )
-        poisson_kl = rates * log_ratio - rates + mixture_mean
-        expected_kl = float(np.sum(poisson_kl * weights[None, :]))
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        total_information += isotope_weight * max(expected_kl, 0.0)
-    return float(np.log1p(max(total_information, 0.0)))
+        isotope_weight = float(alpha_weights.get(isotope, 1.0)) / alpha_sum
+        for chunk_start in range(0, detectors.shape[0], pose_chunk_size):
+            chunk_stop = min(chunk_start + pose_chunk_size, detectors.shape[0])
+            all_pair_lambdas = (
+                estimator.expected_counts_all_pairs_for_states_at_detectors(
+                    isotope=isotope,
+                    detector_positions=detectors[chunk_start:chunk_stop],
+                    live_time_s=float(config.live_time_s),
+                    states=states,
+                )
+            )
+            expected_shape = (
+                chunk_stop - chunk_start,
+                int(estimator.num_orientations) ** 2,
+            )
+            if all_pair_lambdas.ndim != 3 or all_pair_lambdas.shape[:2] != expected_shape:
+                raise RuntimeError(
+                    "Batched planning response has an unexpected shape: "
+                    f"{all_pair_lambdas.shape}."
+                )
+            for local_index, pose_index in enumerate(
+                range(chunk_start, chunk_stop)
+            ):
+                programs = programs_by_pose[pose_index]
+                pair_ids = _program_pair_id_matrix(programs)
+                if pair_ids.size == 0:
+                    continue
+                if np.any(pair_ids < 0) or np.any(
+                    pair_ids >= all_pair_lambdas.shape[1]
+                ):
+                    raise ValueError("Shield program contains an out-of-range pair id.")
+                view_mask = _program_view_mask(
+                    programs,
+                    max_length=pair_ids.shape[1],
+                )
+                isotope_gain = _program_information_gain_from_lambdas(
+                    all_pair_lambdas[local_index, pair_ids, :],
+                    np.asarray(weights, dtype=float),
+                    view_mask,
+                    spec=spec,
+                    num_samples=int(configured_samples),
+                    rng=rng,
+                )
+                outputs[pose_index] += isotope_weight * isotope_gain
+    return [np.maximum(values, 0.0) for values in outputs]
+
+
+def _program_information_gains_at_pose(
+    estimator: RotatingShieldPFEstimator,
+    detector_pos: NDArray[np.float64],
+    programs: Sequence[ShieldProgram],
+    *,
+    config: DSSPPConfig,
+    rng_seed: int | None,
+) -> NDArray[np.float64] | None:
+    """Return likelihood-matched joint EIG, or None for a legacy test facade."""
+    batched = _program_information_gains_for_poses(
+        estimator,
+        np.asarray(detector_pos, dtype=float).reshape(1, 3),
+        [programs],
+        config=config,
+        rng_seed=rng_seed,
+    )
+    return None if batched is None else batched[0]
 
 
 def _expected_bic_gap_against_source_removal_batch(
@@ -1648,13 +1860,16 @@ def _expected_bic_gap_against_source_removal_batch(
     parameter_count_per_source: int = 4,
 ) -> NDArray[np.float64]:
     """
-    Return expected BIC gap between a multi-source model and K-1 alternatives.
+    Return an opt-in heuristic BIC gap between source-mode columns.
 
     ``signatures_plm`` is shaped ``(program, shield_view, source_mode)`` and
-    contains expected counts from each source mode. The full model explains the
-    expected mean exactly. Each K-1 alternative removes one source column and
-    refits nonnegative strengths for the remaining columns in a batched weighted
-    least-squares approximation to the local Poisson likelihood.
+    contains expected counts from each marginal source mode. The full model
+    explains the expected mean exactly. Each K-1 alternative removes one source
+    column and refits nonnegative strengths for the remaining columns in a
+    batched weighted least-squares approximation to the local Poisson
+    likelihood. Because signature-mode extraction does not preserve particle
+    source-set co-occurrence, this score is not posterior cardinality evidence
+    and must remain disabled in the standard RAL configuration.
     """
     raw = np.maximum(np.asarray(signatures_plm, dtype=float), 0.0)
     if raw.ndim != 3:
@@ -1716,6 +1931,7 @@ def _batched_signature_separation_scores(
     raw_counts: NDArray[np.float64],
     *,
     variance_floor: float,
+    likelihood_spec: CountLikelihoodSpec | None = None,
 ) -> NDArray[np.float64]:
     """Return scalar-equivalent signature scores for many programs."""
     raw = np.maximum(np.asarray(raw_counts, dtype=float), 0.0)
@@ -1726,7 +1942,12 @@ def _batched_signature_separation_scores(
         return np.zeros(raw.shape[0], dtype=float)
     left = raw[:, :, pair_i]
     right = raw[:, :, pair_j]
-    variance = np.maximum(left + right, max(float(variance_floor), 1.0e-12))
+    spec = likelihood_spec or CountLikelihoodSpec(model="poisson")
+    variance = np.maximum(
+        predictive_count_likelihood_variance(left, spec=spec)
+        + predictive_count_likelihood_variance(right, spec=spec),
+        max(float(variance_floor), 1.0e-12),
+    )
     distances = np.sum((left - right) * (left - right) / variance, axis=1)
     scores = np.min(distances, axis=1)
     return np.maximum(scores, 0.0)
@@ -1939,6 +2160,10 @@ def _score_programs_from_pair_cache(
             signature_total += isotope_weight * _batched_signature_separation_scores(
                 raw,
                 variance_floor=float(config.count_variance_floor),
+                likelihood_spec=_count_likelihood_spec_for_isotope(
+                    estimator,
+                    isotope,
+                ),
             )
             temporal_total += isotope_weight * _batched_temporal_separation_scores(
                 raw,
@@ -2129,22 +2354,44 @@ def _weighted_mean_signature(
     return np.sum(weight_arr[:, None] * sig_arr, axis=0)
 
 
+def _count_likelihood_spec_for_isotope(
+    estimator: RotatingShieldPFEstimator,
+    isotope: str,
+) -> CountLikelihoodSpec:
+    """Resolve the isotope-specific PF likelihood used by DSS diagnostics."""
+    filters = getattr(estimator, "filters", {})
+    filt = filters.get(isotope) if isinstance(filters, dict) else None
+    if filt is None:
+        return CountLikelihoodSpec(model="poisson")
+    if hasattr(filt, "count_likelihood_spec"):
+        return filt.count_likelihood_spec()
+    if not hasattr(filt, "_count_likelihood_kwargs"):
+        return CountLikelihoodSpec(model="poisson")
+    return CountLikelihoodSpec(**filt._count_likelihood_kwargs())
+
+
 def _signature_separation_score(
     signatures: list[NDArray[np.float64]],
     *,
     variance_floor: float,
+    likelihood_spec: CountLikelihoodSpec | None = None,
 ) -> float:
     """Return the worst-pair Mahalanobis shield-signature separation."""
     if len(signatures) < 2:
         return 0.0
     floor = max(float(variance_floor), 1e-12)
+    spec = likelihood_spec or CountLikelihoodSpec(model="poisson")
     best_worst = np.inf
     for idx in range(len(signatures)):
         for jdx in range(idx + 1, len(signatures)):
             left = signatures[idx]
             right = signatures[jdx]
             diff = left - right
-            variance = np.maximum(left + right, floor)
+            variance = np.maximum(
+                predictive_count_likelihood_variance(left, spec=spec)
+                + predictive_count_likelihood_variance(right, spec=spec),
+                floor,
+            )
             distance = float(np.sum(diff * diff / variance))
             best_worst = min(best_worst, distance)
     if not np.isfinite(best_worst):
@@ -2506,7 +2753,7 @@ def _program_pairwise_ambiguity_diagnostics(
         active_modes = [mode for mode in modes if float(mode.weight) > 0.0]
         if len(active_modes) < 2:
             continue
-        matrix, _weights = pair_cache.get(
+        matrix, mode_weights_raw = pair_cache.get(
             isotope,
             (np.zeros((0, 0), dtype=float), []),
         )
@@ -2518,8 +2765,21 @@ def _program_pairwise_ambiguity_diagnostics(
             max(matrix.shape[0] - 1, 0),
         )
         program_response = np.maximum(matrix[pair_ids, :], 0.0)
+        mode_weights = _normalise_weights(
+            np.asarray(mode_weights_raw, dtype=float)
+        )
+        if mode_weights.size != program_response.shape[1]:
+            mode_weights = np.full(
+                program_response.shape[1],
+                1.0 / float(program_response.shape[1]),
+                dtype=float,
+            )
+        program_mean = np.einsum("vm,m->v", program_response, mode_weights)
         program_variance = np.maximum(
-            np.sum(program_response, axis=1),
+            predictive_count_likelihood_variance(
+                program_mean,
+                spec=_count_likelihood_spec_for_isotope(estimator, isotope),
+            ),
             threshold,
         )
         before_response = np.zeros((0, len(active_modes)), dtype=float)
@@ -3795,6 +4055,10 @@ def _score_program(
             signature_total += isotope_weight * _signature_separation_score(
                 signatures,
                 variance_floor=config.count_variance_floor,
+                likelihood_spec=_count_likelihood_spec_for_isotope(
+                    estimator,
+                    isotope,
+                ),
             )
             temporal_total += (
                 isotope_weight
@@ -4406,22 +4670,9 @@ def _evaluate_pose_index_from_context(
         programs=pose_programs,
         config=config,
     )
-    program_information_gains = np.asarray(
-        [
-            _program_conditioned_information_gain(
-                estimator=estimator,
-                pair_cache=pair_cache,
-                program=program,
-            )
-            if (
-                float(config.lambda_eig) > 0.0
-                and program.kind == "forced_height_partner"
-            )
-            else 0.0
-            for program in pose_programs
-        ],
-        dtype=float,
-    )
+    # Exact joint-view EIG is filled only for the shortlisted poses after all
+    # cheap station-program terms have been evaluated.
+    program_information_gains = np.zeros(len(pose_programs), dtype=float)
     for program_index, (program, score_row) in enumerate(
         zip(pose_programs, program_score_rows)
     ):
@@ -5894,18 +6145,37 @@ def _build_nodes(
             order = np.argsort(cheap_pose_scores[valid_pose_indices])[::-1]
             selected_pose_indices = valid_pose_indices[order[:limit]]
 
-        def _candidate_ig_for_index(pose_index_value: int) -> tuple[int, float]:
-            """Return the candidate EIG for one station index."""
+        pending_indices_by_pose: dict[int, list[int]] = {}
+        for pending_index, item in enumerate(pending):
+            pending_indices_by_pose.setdefault(int(item[0]), []).append(pending_index)
+
+        def _candidate_ig_for_index(
+            pose_index_value: int,
+        ) -> tuple[int, list[int], NDArray[np.float64]]:
+            """Return joint-view EIG for all programs at one station."""
             pose_index = int(pose_index_value)
-            value = _candidate_information_gain(
+            pending_indices = pending_indices_by_pose.get(pose_index, [])
+            pose_programs = [pending[index][2] for index in pending_indices]
+            gains = _program_information_gains_at_pose(
                 estimator,
-                candidate_poses[int(pose_index)],
+                candidate_poses[pose_index],
+                pose_programs,
                 config=config,
                 rng_seed=None
                 if config.rng_seed is None
                 else int(config.rng_seed) + int(pose_index),
             )
-            return pose_index, float(value)
+            if gains is None:
+                legacy_gain = _candidate_information_gain(
+                    estimator,
+                    candidate_poses[pose_index],
+                    config=config,
+                    rng_seed=None
+                    if config.rng_seed is None
+                    else int(config.rng_seed) + int(pose_index),
+                )
+                gains = np.full(len(pose_programs), legacy_gain, dtype=float)
+            return pose_index, pending_indices, np.asarray(gains, dtype=float)
 
         eig_indices = [int(index) for index in selected_pose_indices]
         eig_workers = min(
@@ -5932,8 +6202,33 @@ def _build_nodes(
             # memory in obstacle-rich scenes without changing the math.
             eig_workers = 1
         try:
-            if eig_workers <= 1 or len(eig_indices) <= 1:
-                eig_results = [_candidate_ig_for_index(index) for index in eig_indices]
+            batched_programs = [
+                [
+                    pending[index][2]
+                    for index in pending_indices_by_pose.get(pose_index, [])
+                ]
+                for pose_index in eig_indices
+            ]
+            batched_gains = _program_information_gains_for_poses(
+                estimator,
+                candidate_poses[eig_indices],
+                batched_programs,
+                config=config,
+                rng_seed=config.rng_seed,
+            )
+            if batched_gains is not None:
+                eig_results = [
+                    (
+                        pose_index,
+                        pending_indices_by_pose.get(pose_index, []),
+                        np.asarray(values, dtype=float),
+                    )
+                    for pose_index, values in zip(eig_indices, batched_gains)
+                ]
+            elif eig_workers <= 1 or len(eig_indices) <= 1:
+                eig_results = [
+                    _candidate_ig_for_index(index) for index in eig_indices
+                ]
             else:
                 with ThreadPoolExecutor(max_workers=eig_workers) as executor:
                     eig_results = list(
@@ -5942,16 +6237,24 @@ def _build_nodes(
         finally:
             if hasattr(estimator, "_dss_pp_current_uncertainty_cache"):
                 delattr(estimator, "_dss_pp_current_uncertainty_cache")
-        for pose_index, value in eig_results:
-            info_gains[int(pose_index)] = float(value)
+        for pose_index, pending_indices, values in eig_results:
+            if values.size != len(pending_indices):
+                raise RuntimeError(
+                    "Program EIG result does not match the shortlisted programs."
+                )
+            info_gains[int(pose_index)] = (
+                float(np.max(values)) if values.size else 0.0
+            )
+            for pending_index, value in zip(pending_indices, values):
+                item = pending[pending_index]
+                pending[pending_index] = (
+                    *item[:3],
+                    float(value),
+                    *item[4:],
+                )
         static_scores = [
             float(score)
-            + float(config.lambda_eig)
-            * (
-                float(item[3])
-                if item[2].kind == "forced_height_partner"
-                else float(info_gains[item[0]])
-            )
+            + float(config.lambda_eig) * float(item[3])
             for score, item in zip(static_scores, pending)
         ]
     obs_arr = np.asarray(observation_penalties, dtype=float)
@@ -6011,11 +6314,7 @@ def _build_nodes(
             remaining_route_penalty,
             remaining_route_gain,
         ) = item
-        info_gain = (
-            float(program_information_gain)
-            if program.kind == "forced_height_partner"
-            else float(info_gains[pose_index])
-        )
+        info_gain = float(program_information_gain)
         placeholder_node = DSSPPNode(
             pose_index=int(pose_index),
             pose_xyz=pose,
@@ -6741,6 +7040,30 @@ def select_dss_pp_next_station(
         "horizon": int(max(1, cfg.horizon)),
         "beam_width": int(max(1, cfg.beam_width)),
         "first_program_kind": first.program.kind,
+        "planning_eig_joint_program_views": True,
+        "planning_eig_shared_posterior_subset": True,
+        "planning_eig_batched_detector_pair_response": True,
+        "planning_eig_pose_chunk_size": 8,
+        "planning_eig_likelihood_models": {
+            str(isotope): _count_likelihood_spec_for_isotope(
+                estimator,
+                str(isotope),
+            ).model
+            for isotope in estimator.isotopes
+        },
+        "planning_eig_observation_variance_includes_counting_noise": {
+            str(isotope): bool(
+                _count_likelihood_spec_for_isotope(
+                    estimator,
+                    str(isotope),
+                ).observation_count_variance_includes_counting_noise
+            )
+            for isotope in estimator.isotopes
+        },
+        "planning_eig_covariance_semantics": (
+            "pf_model_diagonal_predictive_variance_without_unobserved_"
+            "future_extraction_covariance"
+        ),
         "first_information_gain": float(first.information_gain),
         "first_signature_score": float(first.signature_score),
         "first_temporal_separation_score": float(first.temporal_separation_score),

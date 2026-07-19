@@ -11,6 +11,7 @@ import planning.shield_rotation as shield_rotation
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
+from pf.likelihood import CountLikelihoodSpec
 from pf.state import IsotopeState
 from planning.pose_selection import (
     estimate_lambda_cost,
@@ -276,6 +277,69 @@ def test_shield_selection_batch_grids_match_pairwise_scores() -> None:
                 )
 
 
+def test_multi_detector_all_pair_counts_match_serial_detector_calls() -> None:
+    """Batched detector responses must preserve the serial PF count model."""
+    normals = generate_octant_rotation_matrices()
+    shield_normals = np.asarray([matrix[:, 2] for matrix in normals], dtype=float)
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[1.0, 1.0, 0.5]], dtype=float),
+        shield_normals=shield_normals,
+        mu_by_isotope={"Cs-137": {"fe": 0.2, "pb": 0.3}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=3,
+            max_sources=2,
+            use_gpu=False,
+            init_num_sources=(0, 0),
+        ),
+        shield_params=ShieldParams(),
+    )
+    states = [
+        IsotopeState(
+            num_sources=2,
+            positions=np.array([[1.0, 2.0, 0.5], [4.0, 1.0, 1.5]]),
+            strengths=np.array([1200.0, 400.0]),
+            background=2.0,
+        ),
+        IsotopeState(
+            num_sources=1,
+            positions=np.array([[2.5, 3.0, 0.2]]),
+            strengths=np.array([750.0]),
+            background=4.0,
+        ),
+        IsotopeState(
+            num_sources=0,
+            positions=np.zeros((0, 3), dtype=float),
+            strengths=np.zeros(0, dtype=float),
+            background=3.0,
+        ),
+    ]
+    detectors = np.array([[5.0, 5.0, 0.5], [7.0, 2.0, 1.0]], dtype=float)
+
+    batched = estimator.expected_counts_all_pairs_for_states_at_detectors(
+        isotope="Cs-137",
+        detector_positions=detectors,
+        live_time_s=2.5,
+        states=states,
+    )
+    serial = np.stack(
+        [
+            estimator.expected_counts_all_pairs_for_states_at_detector(
+                isotope="Cs-137",
+                detector_pos=detector,
+                live_time_s=2.5,
+                states=states,
+            )
+            for detector in detectors
+        ],
+        axis=0,
+    )
+
+    assert batched.shape == (detectors.shape[0], 64, len(states))
+    assert np.all(np.isfinite(batched))
+    np.testing.assert_allclose(batched, serial, rtol=1.0e-12, atol=1.0e-12)
+
+
 def test_orientation_expected_information_gain_grid_cpu_fallback_matches_pairwise() -> (
     None
 ):
@@ -300,6 +364,113 @@ def test_orientation_expected_information_gain_grid_cpu_fallback_matches_pairwis
                 particles_by_isotope=planning_particles,
             )
             assert grid[fe_index, pb_index] == pytest.approx(pairwise)
+
+
+def test_planning_eig_numpy_torch_scoring_equivalence() -> None:
+    """NumPy and Torch EIG scoring should agree for fixed robust observations."""
+    torch = pytest.importorskip("torch")
+    lambdas = np.array(
+        [
+            [2.0, 12.0, 30.0],
+            [5.0, 20.0, 50.0],
+        ],
+        dtype=float,
+    )
+    weights = np.array([0.2, 0.3, 0.5], dtype=float)
+    observations = np.array(
+        [
+            [1.0, 8.0, 18.0, 32.0],
+            [3.0, 16.0, 35.0, 55.0],
+        ],
+        dtype=float,
+    )
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        transport_model_rel_sigma=0.2,
+        transport_model_abs_sigma=3.0,
+        spectrum_count_rel_sigma=0.1,
+        spectrum_count_abs_sigma=4.0,
+        low_count_abs_sigma=10.0,
+        low_count_transition_counts=80.0,
+        student_t_df=5.0,
+    )
+
+    expected = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
+        lambdas,
+        weights,
+        spec=spec,
+        num_samples=observations.shape[1],
+        rng=np.random.default_rng(17),
+        observations_as=observations,
+    )
+    actual = RotatingShieldPFEstimator._planning_eig_from_lambdas_torch(
+        torch.as_tensor(lambdas, dtype=torch.float64),
+        torch.as_tensor(weights, dtype=torch.float64),
+        spec=spec,
+        num_samples=observations.shape[1],
+        observations_as=torch.as_tensor(observations, dtype=torch.float64),
+    )
+
+    np.testing.assert_allclose(
+        actual.detach().cpu().numpy(),
+        expected,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_planning_eig_decreases_with_declared_model_noise() -> None:
+    """Larger runtime model uncertainty should reduce Monte-Carlo action EIG."""
+    lambdas = np.array([[2.0, 25.0], [5.0, 60.0]], dtype=float)
+    weights = np.array([0.5, 0.5], dtype=float)
+    certain_spec = CountLikelihoodSpec(
+        model="student_t",
+        student_t_df=5.0,
+    )
+    uncertain_spec = CountLikelihoodSpec(
+        model="student_t",
+        spectrum_count_abs_sigma=100.0,
+        student_t_df=5.0,
+    )
+
+    certain = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
+        lambdas,
+        weights,
+        spec=certain_spec,
+        num_samples=8192,
+        rng=np.random.default_rng(29),
+    )
+    uncertain = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
+        lambdas,
+        weights,
+        spec=uncertain_spec,
+        num_samples=8192,
+        rng=np.random.default_rng(29),
+    )
+
+    assert np.all(certain > uncertain)
+
+
+def test_orientation_information_gain_uses_predictive_model_variance() -> None:
+    """The analytic rotation surrogate should inherit the PF noise model."""
+    estimator = _build_simple_estimator()
+    filt = estimator.filters["Cs-137"]
+    filt.config.count_likelihood_model = "student_t"
+    filt.config.spectrum_count_abs_sigma = 0.0
+    certain = estimator.orientation_information_gain(
+        pose_idx=0,
+        orient_idx=0,
+        live_time_s=1.0,
+    )
+
+    filt.config.spectrum_count_abs_sigma = 100.0
+    uncertain = estimator.orientation_information_gain(
+        pose_idx=0,
+        orient_idx=0,
+        live_time_s=1.0,
+    )
+
+    assert certain > uncertain >= 0.0
 
 
 def test_rotation_policy_stops_when_information_low() -> None:
@@ -2943,45 +3114,95 @@ def _build_height_partner_program_test_estimator() -> RotatingShieldPFEstimator:
     return estimator
 
 
-def test_forced_height_program_information_uses_exact_pairs_and_length() -> None:
-    """Forced-program information must reflect its executed views and duration."""
-    estimator = SimpleNamespace(
-        isotopes=["Cs-137"],
-        pf_config=SimpleNamespace(alpha_weights={"Cs-137": 1.0}),
+def test_joint_program_eig_uses_program_views_and_pf_likelihood() -> None:
+    """Joint program EIG should distinguish views and inherit robust PF noise."""
+    lambdas = np.array(
+        [
+            [[2.0, 18.0], [2.0, 18.0]],
+            [[10.0, 10.0], [10.0, 10.0]],
+        ],
+        dtype=float,
     )
-    pair_cache = {
-        "Cs-137": (
-            np.array([[2.0, 8.0], [5.0, 5.0]], dtype=float),
-            [0.5, 0.5],
-        )
-    }
-    informative = dss_pp._program_conditioned_information_gain(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        program=dss_pp.ShieldProgram("informative", (0,), "forced_height_partner"),
+    weights = np.array([0.5, 0.5], dtype=float)
+    mask = np.ones((2, 2), dtype=bool)
+    poisson = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        weights,
+        mask,
+        spec=CountLikelihoodSpec(model="poisson"),
+        num_samples=512,
+        rng=np.random.default_rng(31),
     )
-    repeated = dss_pp._program_conditioned_information_gain(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        program=dss_pp.ShieldProgram(
-            "repeated",
-            (0, 0),
-            "forced_height_partner",
+    robust = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        weights,
+        mask,
+        spec=CountLikelihoodSpec(
+            model="student_t",
+            spectrum_count_abs_sigma=100.0,
+            student_t_df=5.0,
         ),
+        num_samples=512,
+        rng=np.random.default_rng(31),
     )
-    uninformative = dss_pp._program_conditioned_information_gain(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        program=dss_pp.ShieldProgram(
-            "uninformative",
-            (1,),
-            "forced_height_partner",
-        ),
+    repeated = dss_pp._program_information_gain_from_lambdas(
+        lambdas[:1],
+        weights,
+        np.array([[True, True]], dtype=bool),
+        spec=CountLikelihoodSpec(model="poisson"),
+        num_samples=512,
+        rng=np.random.default_rng(31),
+    )
+    single = dss_pp._program_information_gain_from_lambdas(
+        lambdas[:1],
+        weights,
+        np.array([[True, False]], dtype=bool),
+        spec=CountLikelihoodSpec(model="poisson"),
+        num_samples=512,
+        rng=np.random.default_rng(31),
+    )
+    deterministic = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        weights,
+        mask,
+        spec=CountLikelihoodSpec(model="poisson"),
+        num_samples=512,
+        rng=np.random.default_rng(31),
     )
 
-    assert informative > 0.0
-    assert repeated > informative
-    assert uninformative == pytest.approx(0.0)
+    assert poisson[0] > poisson[1]
+    assert robust[0] < poisson[0]
+    assert repeated[0] > single[0]
+    assert deterministic == pytest.approx(poisson)
+
+
+def test_signature_separation_uses_predictive_pf_variance() -> None:
+    """DSS signature separation should shrink under declared PF model noise."""
+    raw = np.array([[[2.0, 18.0], [3.0, 17.0]]], dtype=float)
+    poisson_spec = CountLikelihoodSpec(model="poisson")
+    robust_spec = CountLikelihoodSpec(
+        model="student_t",
+        spectrum_count_abs_sigma=100.0,
+        student_t_df=5.0,
+    )
+    poisson = dss_pp._batched_signature_separation_scores(
+        raw,
+        variance_floor=1.0,
+        likelihood_spec=poisson_spec,
+    )
+    robust = dss_pp._batched_signature_separation_scores(
+        raw,
+        variance_floor=1.0,
+        likelihood_spec=robust_spec,
+    )
+    scalar = dss_pp._signature_separation_score(
+        [raw[0, :, 0], raw[0, :, 1]],
+        variance_floor=1.0,
+        likelihood_spec=robust_spec,
+    )
+
+    assert robust[0] < poisson[0]
+    assert robust[0] == pytest.approx(scalar)
 
 
 def test_height_optimized_twin_does_not_scale_first_action_penalty() -> None:
@@ -4454,6 +4675,7 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
         max_sources=1,
         use_gpu=False,
         init_num_sources=(1, 1),
+        observation_count_variance_includes_counting_noise=True,
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
@@ -4476,23 +4698,25 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
             log_weight=0.0,
         )
     ]
-    calls: list[tuple[float, float, float]] = []
+    calls: list[np.ndarray] = []
 
-    def _fake_information_gain(
+    def _fake_information_gains(
         estimator: RotatingShieldPFEstimator,
         pose_xyz: np.ndarray,
+        programs: list[list[dss_pp.ShieldProgram]],
         *,
         config: DSSPPConfig,
         rng_seed: int | None,
-    ) -> float:
-        """Record expensive EIG calls and return a deterministic value."""
-        calls.append(tuple(float(value) for value in pose_xyz))
-        return 1.0
+    ) -> list[np.ndarray]:
+        """Record one batched EIG call and return deterministic values."""
+        del estimator, config, rng_seed
+        calls.append(np.asarray(pose_xyz, dtype=float).copy())
+        return [np.ones(len(pose_programs), dtype=float) for pose_programs in programs]
 
     monkeypatch.setattr(
         dss_pp,
-        "_candidate_information_gain",
-        _fake_information_gain,
+        "_program_information_gains_for_poses",
+        _fake_information_gains,
     )
     candidates = np.array(
         [
@@ -4528,7 +4752,15 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
     )
 
     assert result.next_pose.shape == (3,)
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert calls[0].shape == (2, 3)
+    assert result.diagnostics["planning_eig_joint_program_views"] is True
+    assert result.diagnostics["planning_eig_likelihood_models"] == {
+        "Cs-137": "poisson"
+    }
+    assert result.diagnostics[
+        "planning_eig_observation_variance_includes_counting_noise"
+    ] == {"Cs-137": True}
 
 
 def test_candidate_information_gain_uses_cached_current_uncertainty() -> None:

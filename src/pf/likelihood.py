@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -44,6 +45,44 @@ def _normalize_count_likelihood_model(model: str) -> str:
     return normalize_count_likelihood_model(model)
 
 
+@dataclass(frozen=True)
+class CountLikelihoodSpec:
+    """Store one normalized count-likelihood configuration."""
+
+    model: str = "poisson"
+    transport_model_rel_sigma: float = 0.0
+    transport_model_abs_sigma: float = 0.0
+    spectrum_count_rel_sigma: float = 0.0
+    spectrum_count_abs_sigma: float = 0.0
+    low_count_abs_sigma: float = 0.0
+    low_count_transition_counts: float = 0.0
+    observation_count_variance_includes_counting_noise: bool = False
+    student_t_df: float = 5.0
+
+    def __post_init__(self) -> None:
+        """Normalize aliases and numeric inputs without changing their semantics."""
+        object.__setattr__(
+            self,
+            "model",
+            normalize_count_likelihood_model(self.model),
+        )
+        object.__setattr__(
+            self,
+            "observation_count_variance_includes_counting_noise",
+            bool(self.observation_count_variance_includes_counting_noise),
+        )
+        for field_name in (
+            "transport_model_rel_sigma",
+            "transport_model_abs_sigma",
+            "spectrum_count_rel_sigma",
+            "spectrum_count_abs_sigma",
+            "low_count_abs_sigma",
+            "low_count_transition_counts",
+            "student_t_df",
+        ):
+            object.__setattr__(self, field_name, float(getattr(self, field_name)))
+
+
 def poisson_log_likelihood(z_k: NDArray[np.float64], lambda_k: NDArray[np.float64], epsilon: float = 1e-12) -> float:
     """
     Return the Poisson log-likelihood sum_k [z_k * log(lambda_k) - lambda_k] (constants omitted).
@@ -63,6 +102,7 @@ def count_likelihood_variance(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
+    observation_count_variance_includes_counting_noise: bool = False,
     epsilon: float = 1e-12,
 ) -> NDArray[np.float64]:
     """
@@ -72,7 +112,9 @@ def count_likelihood_variance(
     from transport-model mismatch and spectrum-count extraction error. This is
     the likelihood-side place to absorb Geant4 effects that are intentionally
     not represented in the fast PF kernel, such as scatter, build-up, and
-    photopeak-decomposition residuals.
+    photopeak-decomposition residuals. When the propagated extraction variance
+    already contains counting noise, its plug-in ``max(z, 1)`` component is
+    removed before the particle-dependent ``lambda`` term is added.
     """
     z_arr = np.maximum(np.asarray(z_k, dtype=float), 0.0)
     lam_arr = np.maximum(np.asarray(lambda_k, dtype=float), float(epsilon))
@@ -83,6 +125,12 @@ def count_likelihood_variance(
     low_count_abs = max(float(low_count_abs_sigma), 0.0)
     low_count_transition = max(float(low_count_transition_counts), 0.0)
     obs_var = np.maximum(np.asarray(observation_count_variance, dtype=float), 0.0)
+    if bool(observation_count_variance_includes_counting_noise):
+        # Response-regression covariance already propagates the Poisson
+        # statistics of the observed spectrum.  Retain only its variance in
+        # excess of the plug-in source-equivalent Poisson term; ``lam_arr``
+        # below supplies that term once for every candidate particle.
+        obs_var = np.maximum(obs_var - np.maximum(z_arr, 1.0), 0.0)
     scale_ref = np.maximum(z_arr, lam_arr)
     low_count_weight = 0.0
     if low_count_abs > 0.0 and low_count_transition > 0.0:
@@ -110,6 +158,7 @@ def count_likelihood_variance_torch(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | "torch.Tensor" = 0.0,
+    observation_count_variance_includes_counting_noise: bool = False,
     epsilon: float = 1e-12,
 ) -> "torch.Tensor":
     """Return torch observation variance equivalent to count_likelihood_variance."""
@@ -132,6 +181,11 @@ def count_likelihood_variance_torch(
         ),
         min=0.0,
     )
+    if bool(observation_count_variance_includes_counting_noise):
+        obs_var = torch.clamp(
+            obs_var - torch.clamp(z_arr, min=1.0),
+            min=0.0,
+        )
     transport_rel = max(float(transport_model_rel_sigma), 0.0)
     transport_abs = max(float(transport_model_abs_sigma), 0.0)
     spectrum_rel = max(float(spectrum_count_rel_sigma), 0.0)
@@ -154,6 +208,162 @@ def count_likelihood_variance_torch(
     return torch.clamp(variance, min=float(epsilon))
 
 
+def predictive_count_likelihood_variance(
+    posterior_mean_lambda: NDArray[np.float64],
+    *,
+    spec: CountLikelihoodSpec,
+    observation_count_variance: float | NDArray[np.float64] = 0.0,
+    epsilon: float = 1e-12,
+) -> NDArray[np.float64]:
+    """Return the plug-in likelihood variance at a posterior-mean count rate.
+
+    The future observation is unknown during planning, so the observation-side
+    scale reference is set to the posterior mean itself. For a Poisson model,
+    model-discrepancy and extraction variances are intentionally ignored just
+    as they are in the Poisson likelihood.
+    """
+    mean_lambda = np.maximum(
+        np.asarray(posterior_mean_lambda, dtype=float),
+        float(epsilon),
+    )
+    if spec.model == "poisson":
+        return mean_lambda
+    return count_likelihood_variance(
+        mean_lambda,
+        mean_lambda,
+        transport_model_rel_sigma=spec.transport_model_rel_sigma,
+        transport_model_abs_sigma=spec.transport_model_abs_sigma,
+        spectrum_count_rel_sigma=spec.spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spec.spectrum_count_abs_sigma,
+        low_count_abs_sigma=spec.low_count_abs_sigma,
+        low_count_transition_counts=spec.low_count_transition_counts,
+        observation_count_variance=observation_count_variance,
+        observation_count_variance_includes_counting_noise=(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+        epsilon=epsilon,
+    )
+
+
+def predictive_count_likelihood_variance_torch(
+    posterior_mean_lambda: "torch.Tensor",
+    *,
+    spec: CountLikelihoodSpec,
+    observation_count_variance: float | "torch.Tensor" = 0.0,
+    epsilon: float = 1e-12,
+) -> "torch.Tensor":
+    """Return the Torch equivalent of predictive_count_likelihood_variance."""
+    import torch
+
+    if torch.is_tensor(posterior_mean_lambda):
+        mean_lambda = posterior_mean_lambda.to(dtype=torch.float64)
+    else:
+        mean_lambda = torch.as_tensor(posterior_mean_lambda, dtype=torch.float64)
+    mean_lambda = torch.clamp(mean_lambda, min=float(epsilon))
+    if spec.model == "poisson":
+        return mean_lambda
+    return count_likelihood_variance_torch(
+        mean_lambda,
+        mean_lambda,
+        transport_model_rel_sigma=spec.transport_model_rel_sigma,
+        transport_model_abs_sigma=spec.transport_model_abs_sigma,
+        spectrum_count_rel_sigma=spec.spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spec.spectrum_count_abs_sigma,
+        low_count_abs_sigma=spec.low_count_abs_sigma,
+        low_count_transition_counts=spec.low_count_transition_counts,
+        observation_count_variance=observation_count_variance,
+        observation_count_variance_includes_counting_noise=(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+        epsilon=epsilon,
+    )
+
+
+def count_log_likelihood_terms_np(
+    z_k: NDArray[np.float64],
+    lambda_k: NDArray[np.float64],
+    *,
+    spec: CountLikelihoodSpec,
+    observation_count_variance: float | NDArray[np.float64] = 0.0,
+    epsilon: float = 1e-12,
+) -> NDArray[np.float64]:
+    """Return broadcast count-log-likelihood terms without summing dimensions."""
+    z_arr = np.asarray(z_k, dtype=float)
+    lam_arr = np.maximum(np.asarray(lambda_k, dtype=float), float(epsilon))
+    if spec.model == "poisson":
+        return np.asarray(z_arr * np.log(lam_arr) - lam_arr, dtype=float)
+
+    variance = count_likelihood_variance(
+        z_arr,
+        lam_arr,
+        transport_model_rel_sigma=spec.transport_model_rel_sigma,
+        transport_model_abs_sigma=spec.transport_model_abs_sigma,
+        spectrum_count_rel_sigma=spec.spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spec.spectrum_count_abs_sigma,
+        low_count_abs_sigma=spec.low_count_abs_sigma,
+        low_count_transition_counts=spec.low_count_transition_counts,
+        observation_count_variance=observation_count_variance,
+        observation_count_variance_includes_counting_noise=(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+        epsilon=epsilon,
+    )
+    residual = z_arr - lam_arr
+    if spec.model == "gaussian":
+        terms = -0.5 * ((residual**2) / variance + np.log(variance))
+        return np.asarray(terms, dtype=float)
+
+    df = max(float(spec.student_t_df), 1.0 + float(epsilon))
+    terms = -0.5 * (df + 1.0) * np.log1p((residual**2) / (df * variance))
+    terms -= 0.5 * np.log(variance)
+    return np.asarray(terms, dtype=float)
+
+
+def count_log_likelihood_terms_torch(
+    z_k: "torch.Tensor",
+    lambda_k: "torch.Tensor",
+    *,
+    spec: CountLikelihoodSpec,
+    observation_count_variance: float | "torch.Tensor" = 0.0,
+    epsilon: float = 1e-12,
+) -> "torch.Tensor":
+    """Return Torch terms equivalent to count_log_likelihood_terms_np."""
+    import torch
+
+    if torch.is_tensor(lambda_k):
+        lam_arr = lambda_k.to(dtype=torch.float64)
+    else:
+        lam_arr = torch.as_tensor(lambda_k, dtype=torch.float64)
+    lam_arr = torch.clamp(lam_arr, min=float(epsilon))
+    z_arr = torch.as_tensor(z_k, device=lam_arr.device, dtype=torch.float64)
+    if spec.model == "poisson":
+        return z_arr * torch.log(lam_arr) - lam_arr
+
+    variance = count_likelihood_variance_torch(
+        z_arr,
+        lam_arr,
+        transport_model_rel_sigma=spec.transport_model_rel_sigma,
+        transport_model_abs_sigma=spec.transport_model_abs_sigma,
+        spectrum_count_rel_sigma=spec.spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spec.spectrum_count_abs_sigma,
+        low_count_abs_sigma=spec.low_count_abs_sigma,
+        low_count_transition_counts=spec.low_count_transition_counts,
+        observation_count_variance=observation_count_variance,
+        observation_count_variance_includes_counting_noise=(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+        epsilon=epsilon,
+    )
+    residual = z_arr - lam_arr
+    if spec.model == "gaussian":
+        return -0.5 * ((residual**2) / variance + torch.log(variance))
+
+    df = max(float(spec.student_t_df), 1.0 + float(epsilon))
+    return -0.5 * (df + 1.0) * torch.log1p(
+        (residual**2) / (df * variance)
+    ) - 0.5 * torch.log(variance)
+
+
 def count_log_likelihood(
     z_k: NDArray[np.float64],
     lambda_k: NDArray[np.float64],
@@ -166,6 +376,7 @@ def count_log_likelihood(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
+    observation_count_variance_includes_counting_noise: bool = False,
     student_t_df: float = 5.0,
     epsilon: float = 1e-12,
 ) -> float:
@@ -176,32 +387,26 @@ def count_log_likelihood(
     ``student_t`` allow non-integer spectrum-decomposition counts and inflate
     the variance for unmodelled Geant4 transport effects.
     """
-    normalized_model = _normalize_count_likelihood_model(model)
-    z_arr = np.asarray(z_k, dtype=float)
-    lam_arr = np.maximum(np.asarray(lambda_k, dtype=float), float(epsilon))
-    if normalized_model == "poisson":
-        return poisson_log_likelihood(z_arr, lam_arr, epsilon=epsilon)
-
-    variance = count_likelihood_variance(
-        z_arr,
-        lam_arr,
+    spec = CountLikelihoodSpec(
+        model=model,
         transport_model_rel_sigma=transport_model_rel_sigma,
         transport_model_abs_sigma=transport_model_abs_sigma,
         spectrum_count_rel_sigma=spectrum_count_rel_sigma,
         spectrum_count_abs_sigma=spectrum_count_abs_sigma,
         low_count_abs_sigma=low_count_abs_sigma,
         low_count_transition_counts=low_count_transition_counts,
+        observation_count_variance_includes_counting_noise=(
+            observation_count_variance_includes_counting_noise
+        ),
+        student_t_df=student_t_df,
+    )
+    terms = count_log_likelihood_terms_np(
+        z_k,
+        lambda_k,
+        spec=spec,
         observation_count_variance=observation_count_variance,
         epsilon=epsilon,
     )
-    residual = z_arr - lam_arr
-    if normalized_model == "gaussian":
-        terms = -0.5 * ((residual**2) / variance + np.log(variance))
-        return float(np.sum(terms))
-
-    df = max(float(student_t_df), 1.0 + float(epsilon))
-    terms = -0.5 * (df + 1.0) * np.log1p((residual**2) / (df * variance))
-    terms -= 0.5 * np.log(variance)
     return float(np.sum(terms))
 
 
@@ -218,6 +423,7 @@ def delta_log_likelihood_remove(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
+    observation_count_variance_includes_counting_noise: bool = False,
     student_t_df: float = 5.0,
 ) -> NDArray[np.float64]:
     """
@@ -240,6 +446,9 @@ def delta_log_likelihood_remove(
             low_count_abs_sigma=low_count_abs_sigma,
             low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
+            observation_count_variance_includes_counting_noise=(
+                observation_count_variance_includes_counting_noise
+            ),
             student_t_df=student_t_df,
             epsilon=epsilon,
         )
@@ -260,6 +469,9 @@ def delta_log_likelihood_remove(
                 low_count_abs_sigma=low_count_abs_sigma,
                 low_count_transition_counts=low_count_transition_counts,
                 observation_count_variance=observation_count_variance,
+                observation_count_variance_includes_counting_noise=(
+                    observation_count_variance_includes_counting_noise
+                ),
                 student_t_df=student_t_df,
                 epsilon=epsilon,
             )
@@ -286,6 +498,7 @@ def delta_log_likelihood_update(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
+    observation_count_variance_includes_counting_noise: bool = False,
     student_t_df: float = 5.0,
 ) -> float:
     """
@@ -304,6 +517,9 @@ def delta_log_likelihood_update(
             low_count_abs_sigma=low_count_abs_sigma,
             low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
+            observation_count_variance_includes_counting_noise=(
+                observation_count_variance_includes_counting_noise
+            ),
             student_t_df=student_t_df,
             epsilon=epsilon,
         )
@@ -318,6 +534,9 @@ def delta_log_likelihood_update(
             low_count_abs_sigma=low_count_abs_sigma,
             low_count_transition_counts=low_count_transition_counts,
             observation_count_variance=observation_count_variance,
+            observation_count_variance_includes_counting_noise=(
+                observation_count_variance_includes_counting_noise
+            ),
             student_t_df=student_t_df,
             epsilon=epsilon,
         )

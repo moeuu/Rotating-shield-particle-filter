@@ -190,6 +190,150 @@ def test_runtime_count_extraction_symmetrizes_reciprocal_covariance(
     assert forward == pytest.approx(-25.00005)
 
 
+def test_runtime_covariance_does_not_rescale_formal_correlation_to_added_floors(
+) -> None:
+    """Independent runtime floors must not inflate formal cross-covariance."""
+    decomposer = SpectralDecomposer()
+    decomposer.last_count_covariance = {
+        "Cs-137": {"Cs-137": 25.0, "Co-60": -25.0},
+        "Co-60": {"Cs-137": -25.0, "Co-60": 100.0},
+    }
+    covariance = RuntimeCountExtractor(
+        decomposer
+    )._count_covariance_with_runtime_variances(
+        {"Cs-137": 100.0, "Co-60": 100.0},
+        {"Cs-137": 10000.0, "Co-60": 40000.0},
+    )
+
+    assert covariance["Cs-137"]["Cs-137"] == pytest.approx(10000.0)
+    assert covariance["Co-60"]["Co-60"] == pytest.approx(40000.0)
+    assert covariance["Cs-137"]["Co-60"] == pytest.approx(-25.0)
+    assert covariance["Co-60"]["Cs-137"] == pytest.approx(-25.0)
+
+
+def test_runtime_covariance_ceiling_scales_complete_formal_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capping formal diagonals must preserve their fitted correlation."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            response_poisson_count_variance_ceiling_enable=True,
+            response_poisson_count_variance_max_rel_sigma=0.15,
+            response_poisson_count_variance_max_abs_sigma=0.0,
+        )
+    )
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return a high-variance correlated formal regression result."""
+        del spectrum, live_time_s, kwargs
+        self.last_count_variances = {"Cs-137": 1.0e9, "Co-60": 4.0e9}
+        self.last_count_covariance = {
+            "Cs-137": {"Cs-137": 1.0e9, "Co-60": -1.0e9},
+            "Co-60": {"Cs-137": -1.0e9, "Co-60": 4.0e9},
+        }
+        self.last_response_poisson_diagnostics = {"status": "ok"}
+        return {"Cs-137": 1000.0, "Co-60": 2000.0}, {"Cs-137", "Co-60"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=10.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+    )
+
+    assert result.covariance is not None
+    row_var = result.covariance["Cs-137"]["Cs-137"]
+    col_var = result.covariance["Co-60"]["Co-60"]
+    correlation = result.covariance["Cs-137"]["Co-60"] / np.sqrt(
+        row_var * col_var
+    )
+    assert row_var == pytest.approx((0.15 * 1000.0) ** 2)
+    assert col_var == pytest.approx((0.15 * 2000.0) ** 2)
+    assert correlation == pytest.approx(-0.5)
+
+
+def test_global_response_chi2_does_not_inflate_every_isotope_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full-spectrum fit residuals are not isotope-count error calibration."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            response_poisson_diagnostic_variance_enable=True,
+            response_poisson_global_diagnostic_variance_enable=False,
+        )
+    )
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+
+    def _fake_counts(
+        self: SpectralDecomposer,
+        spectrum: np.ndarray,
+        *,
+        live_time_s: float = 1.0,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return stable isotope counts with only a poor global fit statistic."""
+        self.last_count_variances = {"Cs-137": 25.0, "Co-60": 36.0}
+        self.last_count_covariance = {}
+        self.last_response_poisson_diagnostics = {
+            "reduced_chi2": 500.0,
+            "design_condition_number": 1.0,
+            "fisher_condition_number": 1.0,
+        }
+        return {"Cs-137": 1000.0, "Co-60": 800.0}, {"Cs-137", "Co-60"}
+
+    monkeypatch.setattr(
+        SpectralDecomposer,
+        "isotope_counts_with_detection",
+        _fake_counts,
+    )
+
+    result = RuntimeCountExtractor(decomposer).extract(
+        spectrum,
+        live_time_s=30.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+    )
+
+    assert result.variances == pytest.approx({"Cs-137": 25.0, "Co-60": 36.0})
+    components = decomposer.last_response_poisson_diagnostics[
+        "runtime_variance_components"
+    ]
+    assert components["Cs-137"]["final_variance"] == pytest.approx(25.0)
+    assert components["Co-60"]["final_variance"] == pytest.approx(36.0)
+
+
+def test_global_response_chi2_variance_remains_explicitly_opt_in() -> None:
+    """Legacy global diagnostic inflation should require an explicit setting."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            response_poisson_global_diagnostic_variance_enable=True,
+            response_poisson_diagnostic_reduced_chi2_threshold=2.0,
+            response_poisson_diagnostic_reduced_chi2_scale=0.5,
+        )
+    )
+    extractor = RuntimeCountExtractor(decomposer)
+
+    sigma = extractor._diagnostic_relative_sigma({"reduced_chi2": 10.0})
+
+    assert sigma == pytest.approx(1.0)
+
+
 def test_response_diagnostics_inflate_runtime_count_variance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -308,15 +452,17 @@ def test_crosstalk_guard_disagreement_inflates_runtime_count_variance(
     assert diagnostics["runtime_diagnostic_variance_floor"]["Cs-137"] > 1000.0
 
 
-def test_diagnostic_variance_floor_survives_runtime_ceiling(
+def test_diagnostic_variance_floor_is_recorded_after_formal_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PF ingestion should not over-trust max-tail count disagreements."""
+    """Guard disagreement should be a stage after the formal covariance cap."""
     config = SpectrumConfig(
         response_poisson_diagnostic_variance_enable=True,
         response_poisson_count_variance_ceiling_enable=True,
         response_poisson_count_variance_max_rel_sigma=0.15,
         response_poisson_count_variance_max_abs_sigma=40.0,
+        response_poisson_count_variance_preserve_diagnostic_floors=False,
+        response_poisson_count_variance_preserve_guard_floors=False,
     )
     decomposer = SpectralDecomposer(config)
     spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
@@ -329,7 +475,7 @@ def test_diagnostic_variance_floor_survives_runtime_ceiling(
         **kwargs: object,
     ) -> tuple[dict[str, float], set[str]]:
         """Return a tail disagreement with a large guard variance."""
-        self.last_count_variances = {"Cs-137": 1.0e8}
+        self.last_count_variances = {"Cs-137": 1.0e9}
         self.last_response_poisson_diagnostics = {
             "reduced_chi2": 1.0,
             "design_condition_number": 1.0,
@@ -368,10 +514,17 @@ def test_diagnostic_variance_floor_survives_runtime_ceiling(
     assert result.variances["Cs-137"] > naive_ceiling
     assert result.variances["Cs-137"] == pytest.approx(diagnostic_floor)
     diagnostics = decomposer.last_response_poisson_diagnostics
-    assert "runtime_variance_ceiling_preserved" in diagnostics
-    assert diagnostics["runtime_variance_ceiling"]["Cs-137"][
-        "uncertainty_ceiling"
-    ] == pytest.approx(naive_ceiling)
+    components = diagnostics["runtime_variance_components"]["Cs-137"]
+    assert components["formal_after_ceiling_variance"] <= naive_ceiling
+    assert components["formal_after_ceiling_variance"] == pytest.approx(
+        naive_ceiling
+    )
+    assert components["isotope_diagnostic_variance"] == pytest.approx(
+        diagnostic_floor
+    )
+    assert components["isotope_diagnostic_increment"] == pytest.approx(
+        diagnostic_floor - components["transport_statistical_variance"]
+    )
 
 
 def test_low_snr_photo_count_disagreement_survives_runtime_ceiling(

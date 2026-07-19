@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import itertools
 from typing import Any, Callable, Mapping, Sequence
 
@@ -94,10 +94,27 @@ class PFPosteriorSnapshot:
     random_seed: int
     profile_capability_map: Mapping[str, bool]
     record_count: int
+    structural_transition_provenance: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """Return the required JSON-safe PF result contract."""
+        structural = {
+            str(key): value
+            for key, value in sorted(self.structural_transition_provenance.items())
+        }
+        if not structural:
+            structural = {
+                "posterior_semantics": "unspecified",
+                "structural_kernel_exact_rj": False,
+                "structural_kernel_family": "unspecified",
+                "structural_kernel_target_preserving": False,
+                "structural_moves_enabled": False,
+                "reversible_jump_mcmc_used": False,
+                "data_conditioned_structural_proposal": False,
+                "data_conditioned_strength_proposal": False,
+                "data_conditioned_strength_proposal_importance_corrected": False,
+            }
         provenance = {
             "estimator_repository": "moeuu/Rotating-shield-particle-filter",
             "estimator_commit": str(self.repository_commit),
@@ -108,6 +125,8 @@ class PFPosteriorSnapshot:
             "random_seed": int(self.random_seed),
             "planner_belief_sources": list(self.planner_belief_sources),
             "batch_feedback_applied": False,
+            "posterior_semantics": str(structural["posterior_semantics"]),
+            "structural_transition_provenance": dict(structural),
         }
         return {
             "schema_version": int(self.schema_version),
@@ -121,6 +140,16 @@ class PFPosteriorSnapshot:
             "batch_feedback_to_particles": False,
             "batch_feedback_applied": False,
             "batch_methods_invoked": [],
+            "posterior_semantics": str(structural["posterior_semantics"]),
+            "structural_kernel_family": str(structural["structural_kernel_family"]),
+            "structural_kernel_target_preserving": bool(
+                structural["structural_kernel_target_preserving"]
+            ),
+            "structural_kernel_exact_rj": bool(
+                structural["structural_kernel_exact_rj"]
+            ),
+            "reversible_jump_mcmc_used": bool(structural["reversible_jump_mcmc_used"]),
+            "structural_transition_provenance": dict(structural),
             "planner_belief_sources": list(self.planner_belief_sources),
             "repository_commit": str(self.repository_commit),
             "measurement_log_schema_version": int(self.measurement_log_schema_version),
@@ -315,9 +344,7 @@ def posterior_point_estimate_from_states(
     weights: NDArray[np.float64],
     *,
     max_cardinality: int | None = None,
-    position_projector: Callable[
-        [NDArray[np.float64]], NDArray[np.float64]
-    ]
+    position_projector: Callable[[NDArray[np.float64]], NDArray[np.float64]]
     | None = None,
 ) -> PFPointEstimate:
     """Aggregate a PF-only estimate from a deterministic MAP-cardinality stratum.
@@ -415,9 +442,7 @@ def posterior_point_estimate_from_states(
             dtype=float,
         )
         if projected_mean.shape != position_mean.shape:
-            raise ValueError(
-                "position_projector must preserve the (sources, 3) shape."
-            )
+            raise ValueError("position_projector must preserve the (sources, 3) shape.")
         if np.any(~np.isfinite(projected_mean)):
             raise ValueError("position_projector must return finite positions.")
         position_mean = projected_mean

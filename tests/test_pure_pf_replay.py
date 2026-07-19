@@ -222,6 +222,19 @@ def test_replay_outputs_are_deterministic_and_provenance_hashes_are_distinct(
     assert diagnostics["forbidden_batch_methods_invoked"] == []
     assert posterior["final_estimate_source"] == "pf_posterior"
     assert posterior["uses_all_history_batch_fit"] is False
+    assert posterior["posterior_semantics"] == (
+        "fixed_cardinality_sequential_particle_filter"
+    )
+    assert posterior["structural_kernel_family"] == (
+        "fixed_cardinality_no_structural_moves"
+    )
+    assert posterior["structural_kernel_target_preserving"] is True
+    assert posterior["structural_kernel_exact_rj"] is False
+    assert posterior["reversible_jump_mcmc_used"] is False
+    assert (
+        diagnostics["structural_transition_provenance"]
+        == (posterior["structural_transition_provenance"])
+    )
 
 
 def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(

@@ -7,7 +7,6 @@ import math
 import re
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from measurement.kernels import ShieldParams
@@ -221,6 +220,12 @@ def _assert_validated_geant4_count_likelihood(payload: dict[str, object]) -> Non
     assert float(pf_count_likelihood["low_count_transition_counts"]) == (
         pytest.approx(DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS)
     )
+    assert (
+        pf_count_likelihood[
+            "observation_count_variance_includes_counting_noise"
+        ]
+        is True
+    )
 
 
 def _assert_validated_shield_contrast_likelihood(payload: dict[str, object]) -> None:
@@ -337,9 +342,9 @@ def _assert_response_poisson_variance_ceiling(payload: dict[str, object]) -> Non
     )
     assert (
         payload["response_poisson_count_variance_preserve_diagnostic_floors"]
-        is True
+        is False
     )
-    assert payload["response_poisson_count_variance_preserve_guard_floors"] is True
+    assert payload["response_poisson_count_variance_preserve_guard_floors"] is False
 
 
 def test_high_fidelity_external_config_uses_native_geometry() -> None:

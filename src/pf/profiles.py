@@ -61,6 +61,28 @@ class EstimatorCapabilities:
         return {str(key): bool(value) for key, value in asdict(self).items()}
 
 
+@dataclass(frozen=True)
+class StructuralTransitionProvenance:
+    """Describe whether PF structural moves preserve a declared target."""
+
+    posterior_semantics: str
+    structural_kernel_family: str
+    structural_moves_enabled: bool
+    structural_kernel_target_preserving: bool
+    structural_kernel_exact_rj: bool
+    reversible_jump_mcmc_used: bool
+    data_conditioned_structural_proposal: bool
+    data_conditioned_strength_proposal: bool
+    data_conditioned_strength_proposal_importance_corrected: bool
+
+    def to_dict(self) -> dict[str, bool | str]:
+        """Return a JSON-safe structural-transition provenance mapping."""
+        return {
+            str(key): value if isinstance(value, str) else bool(value)
+            for key, value in asdict(self).items()
+        }
+
+
 _STRICT_CAPABILITIES = EstimatorCapabilities(
     conditional_strength_profile=False,
     all_history_sparse_evidence=False,
@@ -181,6 +203,80 @@ def resolved_profile_diagnostics(
         "estimator_variant": profile.value,
         "profile_capabilities": capabilities.to_dict(),
     }
+
+
+def resolve_structural_transition_provenance(
+    config: Any,
+    *,
+    capabilities: EstimatorCapabilities | None = None,
+) -> StructuralTransitionProvenance:
+    """Resolve truthful semantics for the configured PF structural kernel.
+
+    The current residual birth/death/split/merge path selects and refits trial
+    states using the observation window. It does not evaluate forward/reverse
+    proposal densities, a reversible-jump Jacobian, or an importance correction.
+    Consequently, enabling that path is recorded as heuristic even though the
+    resulting states are scored by the configured count likelihood.
+    """
+    if capabilities is None:
+        _profile, capabilities = resolve_estimator_profile(
+            getattr(config, "estimator_profile", EstimatorProfile.PF_STRICT.value)
+        )
+    structural_moves_enabled = bool(getattr(config, "birth_enable", False))
+    conditional_strength_profile = bool(capabilities.conditional_strength_profile) and (
+        bool(getattr(config, "conditional_strength_refit", False))
+        or bool(
+            getattr(config, "conditional_strength_profile_before_likelihood", False)
+        )
+    )
+
+    raw_initial_support = getattr(config, "init_num_sources", (0, 0))
+    try:
+        initial_lower, initial_upper = raw_initial_support
+        fixed_initial_cardinality = int(initial_lower) == int(initial_upper)
+    except (TypeError, ValueError):
+        fixed_initial_cardinality = True
+
+    if structural_moves_enabled:
+        kernel_family = "residual_matching_pursuit_heuristic"
+        posterior_semantics = (
+            "approximate_sequential_particle_ensemble_with_heuristic_structural_moves"
+        )
+        target_preserving = False
+        data_conditioned_structural = True
+        data_conditioned_strength = True
+    else:
+        kernel_family = (
+            "fixed_cardinality_no_structural_moves"
+            if fixed_initial_cardinality
+            else "static_cardinality_mixture_no_structural_moves"
+        )
+        posterior_semantics = (
+            "fixed_cardinality_sequential_particle_filter"
+            if fixed_initial_cardinality
+            else "static_cardinality_mixture_sequential_particle_filter"
+        )
+        target_preserving = True
+        data_conditioned_structural = False
+        data_conditioned_strength = conditional_strength_profile
+
+    if conditional_strength_profile:
+        posterior_semantics += "_with_deterministic_strength_profiling"
+
+    return StructuralTransitionProvenance(
+        posterior_semantics=posterior_semantics,
+        structural_kernel_family=kernel_family,
+        structural_moves_enabled=structural_moves_enabled,
+        structural_kernel_target_preserving=target_preserving,
+        # No current runtime path implements reversible-jump MCMC. For a
+        # fixed-dimensional run this is false because RJ is not used, not
+        # because a correction is missing.
+        structural_kernel_exact_rj=False,
+        reversible_jump_mcmc_used=False,
+        data_conditioned_structural_proposal=data_conditioned_structural,
+        data_conditioned_strength_proposal=data_conditioned_strength,
+        data_conditioned_strength_proposal_importance_corrected=False,
+    )
 
 
 def apply_profile_to_config(config: Any) -> EstimatorCapabilities:

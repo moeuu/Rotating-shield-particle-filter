@@ -18,7 +18,11 @@ from pf.posterior import (
     cardinality_distribution_from_states,
     posterior_point_estimate_from_states,
 )
-from pf.profiles import ProposalOrigin, apply_profile_to_config
+from pf.profiles import (
+    ProposalOrigin,
+    apply_profile_to_config,
+    resolve_structural_transition_provenance,
+)
 from pf.provenance import canonical_json_bytes, repository_commit, sha256_json
 
 
@@ -110,6 +114,13 @@ class PurePFEstimator(_LegacyEstimatorShell):
         """Return the resolved scientific PF variant."""
         return str(self.pf_config.estimator_profile)
 
+    def structural_transition_diagnostics(self) -> dict[str, bool | str]:
+        """Return truthful target-preservation provenance for structural moves."""
+        return resolve_structural_transition_provenance(
+            self.pf_config,
+            capabilities=self.profile_capabilities,
+        ).to_dict()
+
     def accepts_proposal_origin(self, origin: ProposalOrigin | str) -> bool:
         """Return whether a proposal origin is allowed to alter this PF."""
         try:
@@ -151,9 +162,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
         del args, kwargs
         self._reject_batch_estimation("_select_report_clusters_by_model_order")
 
-    def _refine_report_surface_positions(
-        self, *args: Any, **kwargs: Any
-    ) -> NoReturn:
+    def _refine_report_surface_positions(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Reject inherited all-history surface-position refinement."""
         del args, kwargs
         self._reject_batch_estimation("_refine_report_surface_positions")
@@ -163,16 +172,12 @@ class PurePFEstimator(_LegacyEstimatorShell):
         del args, kwargs
         self._reject_batch_estimation("_refit_reported_strengths")
 
-    def _all_history_dictionary_candidates(
-        self, *args: Any, **kwargs: Any
-    ) -> NoReturn:
+    def _all_history_dictionary_candidates(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Reject inherited all-history dictionary proposals."""
         del args, kwargs
         self._reject_batch_estimation("_all_history_dictionary_candidates")
 
-    def _runtime_report_rescue_estimate(
-        self, *args: Any, **kwargs: Any
-    ) -> NoReturn:
+    def _runtime_report_rescue_estimate(self, *args: Any, **kwargs: Any) -> NoReturn:
         """Reject inherited runtime report-MLE rescue estimation."""
         del args, kwargs
         self._reject_batch_estimation("_runtime_report_rescue_estimate")
@@ -344,6 +349,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
             random_seed=self.random_seed,
             profile_capability_map=self.profile_capabilities.to_dict(),
             record_count=len(self.measurements),
+            structural_transition_provenance=(self.structural_transition_diagnostics()),
         )
 
     def estimates(

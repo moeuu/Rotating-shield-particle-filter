@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,6 +24,14 @@ try:
 except ImportError:  # pragma: no cover - scipy is an optional runtime dependency.
     least_squares = None
     _SCIPY_AVAILABLE = False
+
+try:
+    import torch
+
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - torch is an optional runtime dependency.
+    torch = None
+    _TORCH_AVAILABLE = False
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -51,6 +59,20 @@ from measurement.shielding import (
     mu_by_isotope_from_tvl_mm,
     rotation_matrix_between_vectors,
 )
+from pf.estimator import RotatingShieldPFConfig
+from pf.likelihood import (
+    DEFAULT_GEANT4_COUNT_LIKELIHOOD_DF,
+    DEFAULT_GEANT4_COUNT_LIKELIHOOD_MODEL,
+    DEFAULT_GEANT4_LOW_COUNT_ABS_SIGMA,
+    DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS,
+    DEFAULT_GEANT4_SPECTRUM_COUNT_ABS_SIGMA,
+    DEFAULT_GEANT4_SPECTRUM_COUNT_REL_SIGMA,
+    DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA,
+    DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA,
+    CountLikelihoodSpec,
+    count_likelihood_variance,
+)
+from pf.pure_estimator import PurePFEstimator
 from sim.geant4_app.app import Geant4Application
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription
 from sim.isaacsim_app.stage_backend import FakeStageBackend
@@ -95,6 +117,191 @@ DEFAULT_TRANSPORT_RESPONSE_TAU_FEATURE_CAPS = {
 }
 
 
+def build_runtime_covariance_projector(
+    runtime_config: dict[str, Any],
+) -> PurePFEstimator:
+    """Build a projection-only shell configured like the runtime pure PF."""
+    pf_config = RotatingShieldPFConfig(
+        observation_covariance_projection_enable=bool(
+            runtime_config.get("observation_covariance_projection_enable", True)
+        ),
+        observation_covariance_projection_weight=float(
+            runtime_config.get("observation_covariance_projection_weight", 1.0)
+        ),
+        observation_covariance_projection_max_corr=float(
+            runtime_config.get("observation_covariance_projection_max_corr", 0.999)
+        ),
+    )
+    projector = object.__new__(PurePFEstimator)
+    projector.pf_config = pf_config
+    return projector
+
+
+def project_runtime_observation_covariance(
+    projector: PurePFEstimator,
+    counts: dict[str, float],
+    variances: dict[str, float],
+    covariance: dict[str, dict[str, float]] | None,
+) -> tuple[dict[str, float], dict[str, dict[str, float]] | None]:
+    """Call the runtime estimator's shared observation-covariance projection."""
+    projected, sanitized = projector._project_observation_covariance_to_variance(
+        counts,
+        variances,
+        covariance,
+    )
+    return (
+        dict(variances) if projected is None else dict(projected),
+        sanitized,
+    )
+
+
+def _runtime_count_likelihood_value(
+    runtime_config: Mapping[str, Any],
+    key: str,
+    default: object,
+) -> object:
+    """Read one nested or legacy PF count-likelihood configuration value."""
+    nested = runtime_config.get("pf_count_likelihood", {})
+    if isinstance(nested, Mapping) and key in nested:
+        return nested[key]
+    return runtime_config.get(f"pf_{key}", default)
+
+
+def _isotope_float_value(
+    value: object,
+    isotope: str,
+    *,
+    default: float = 0.0,
+) -> float:
+    """Resolve a scalar or isotope-indexed nonnegative likelihood setting."""
+    selected = value.get(isotope, default) if isinstance(value, Mapping) else value
+    try:
+        numeric = float(selected)
+    except (TypeError, ValueError):
+        numeric = float(default)
+    return max(numeric, 0.0)
+
+
+def build_runtime_count_likelihood_specs(
+    runtime_config: Mapping[str, Any],
+) -> dict[str, CountLikelihoodSpec]:
+    """Resolve the same isotope-wise count likelihood used by runtime PFs."""
+    geant4_defaults = str(runtime_config.get("backend", "")).lower() == "geant4"
+    spectrum_defaults = (
+        str(runtime_config.get("spectrum_count_method", ""))
+        == RuntimeCountExtractor.STANDARD_METHOD
+    )
+    robust_defaults = bool(geant4_defaults or spectrum_defaults)
+    model = str(
+        _runtime_count_likelihood_value(
+            runtime_config,
+            "count_likelihood_model",
+            DEFAULT_GEANT4_COUNT_LIKELIHOOD_MODEL if robust_defaults else "poisson",
+        )
+    )
+    transport_rel = _runtime_count_likelihood_value(
+        runtime_config,
+        "transport_model_rel_sigma",
+        DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA if geant4_defaults else 0.0,
+    )
+    transport_abs = _runtime_count_likelihood_value(
+        runtime_config,
+        "transport_model_abs_sigma",
+        DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA if geant4_defaults else 0.0,
+    )
+    spectrum_rel = _runtime_count_likelihood_value(
+        runtime_config,
+        "spectrum_count_rel_sigma",
+        DEFAULT_GEANT4_SPECTRUM_COUNT_REL_SIGMA if geant4_defaults else 0.0,
+    )
+    spectrum_abs = _runtime_count_likelihood_value(
+        runtime_config,
+        "spectrum_count_abs_sigma",
+        DEFAULT_GEANT4_SPECTRUM_COUNT_ABS_SIGMA if geant4_defaults else 0.0,
+    )
+    low_count_abs = _runtime_count_likelihood_value(
+        runtime_config,
+        "low_count_abs_sigma",
+        DEFAULT_GEANT4_LOW_COUNT_ABS_SIGMA if geant4_defaults else 0.0,
+    )
+    low_count_transition = _runtime_count_likelihood_value(
+        runtime_config,
+        "low_count_transition_counts",
+        DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS if geant4_defaults else 0.0,
+    )
+    observation_variance_includes_counting_noise = bool(
+        _runtime_count_likelihood_value(
+            runtime_config,
+            "observation_count_variance_includes_counting_noise",
+            False,
+        )
+    )
+    student_t_df = float(
+        _runtime_count_likelihood_value(
+            runtime_config,
+            "count_likelihood_df",
+            DEFAULT_GEANT4_COUNT_LIKELIHOOD_DF,
+        )
+    )
+    return {
+        isotope: CountLikelihoodSpec(
+            model=model,
+            transport_model_rel_sigma=_isotope_float_value(
+                transport_rel,
+                isotope,
+            ),
+            transport_model_abs_sigma=_isotope_float_value(
+                transport_abs,
+                isotope,
+            ),
+            spectrum_count_rel_sigma=_isotope_float_value(
+                spectrum_rel,
+                isotope,
+            ),
+            spectrum_count_abs_sigma=_isotope_float_value(
+                spectrum_abs,
+                isotope,
+            ),
+            low_count_abs_sigma=_isotope_float_value(
+                low_count_abs,
+                isotope,
+            ),
+            low_count_transition_counts=_isotope_float_value(
+                low_count_transition,
+                isotope,
+            ),
+            observation_count_variance_includes_counting_noise=(
+                observation_variance_includes_counting_noise
+            ),
+            student_t_df=max(student_t_df, 1.0),
+        )
+        for isotope in ISOTOPES
+    }
+
+
+def _count_likelihood_spec_payload(spec: CountLikelihoodSpec) -> dict[str, Any]:
+    """Return a JSON-safe count-likelihood specification."""
+    marginal_factor = (
+        float(spec.student_t_df / (spec.student_t_df - 2.0))
+        if spec.model == "student_t" and spec.student_t_df > 2.0
+        else None
+    )
+    return {
+        "model": spec.model,
+        "transport_model_rel_sigma": spec.transport_model_rel_sigma,
+        "transport_model_abs_sigma": spec.transport_model_abs_sigma,
+        "spectrum_count_rel_sigma": spec.spectrum_count_rel_sigma,
+        "spectrum_count_abs_sigma": spec.spectrum_count_abs_sigma,
+        "low_count_abs_sigma": spec.low_count_abs_sigma,
+        "low_count_transition_counts": spec.low_count_transition_counts,
+        "observation_count_variance_includes_counting_noise": bool(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+        "student_t_df": spec.student_t_df,
+        "student_t_marginal_variance_over_scale_squared": marginal_factor,
+    }
+
+
 @dataclass(frozen=True)
 class ValidationSource:
     """Describe a source used by a validation case."""
@@ -135,6 +342,15 @@ class ValidationCase:
     obstacle_instances: tuple[KnownObstacleInstance, ...] = field(default_factory=tuple)
     include_in_accuracy_summary: bool = True
     generation_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DetectorPoseCandidate:
+    """Store one detector pose and its inexpensive preselection score."""
+
+    pose_xyz: tuple[float, float, float]
+    proxy_score: float
+    proxy_features: dict[str, Any]
 
 
 def _clamp_room_position(
@@ -476,13 +692,13 @@ def _case_with_detector_and_pair(
     )
 
 
-def _expected_count_matrix_over_shield_pairs(
+def _expected_count_matrix_over_shield_pairs_serial(
     case: ValidationCase,
     runtime_config: dict[str, Any],
     kernel: ContinuousKernel,
     pair_ids: tuple[int, ...] | None = None,
 ) -> np.ndarray:
-    """Return PF expected counts for selected Fe/Pb pairs and all isotopes."""
+    """Return a scalar test oracle for selected Fe/Pb-pair expected counts."""
     selected_pair_ids = (
         tuple(range(64))
         if pair_ids is None
@@ -502,6 +718,127 @@ def _expected_count_matrix_over_shield_pairs(
         counts = expected_pf_counts_with_kernel(pair_case, runtime_config, kernel)
         matrix[row_index, :] = [float(counts[isotope]) for isotope in ISOTOPES]
     return matrix
+
+
+def _measurement_source_scales_for_pairs(
+    isotope: str,
+    pair_ids: NDArray[np.int64],
+    runtime_config: Mapping[str, Any],
+) -> NDArray[np.float64]:
+    """Return configured source-count scales for a fixed shield-pair batch."""
+    global_scales = runtime_config.get("measurement_scale_by_isotope", {})
+    global_scale = (
+        max(float(global_scales.get(str(isotope), 1.0)), 0.0)
+        if isinstance(global_scales, Mapping)
+        else 1.0
+    )
+    pair_scale_root = runtime_config.get(
+        "measurement_scale_by_isotope_and_pair",
+        {},
+    )
+    pair_scales = (
+        pair_scale_root.get(str(isotope), {})
+        if isinstance(pair_scale_root, Mapping)
+        else {}
+    )
+    if not isinstance(pair_scales, Mapping):
+        return np.full(pair_ids.size, global_scale, dtype=float)
+    # This is a fixed-size metadata gather, not shield-response computation;
+    # the 64-pair physics kernel below remains one batched operation.
+    return np.asarray(
+        [
+            max(
+                float(
+                    pair_scales.get(
+                        str(int(pair_id)),
+                        pair_scales.get(int(pair_id), global_scale),
+                    )
+                ),
+                0.0,
+            )
+            for pair_id in pair_ids
+        ],
+        dtype=float,
+    )
+
+
+def _expected_count_matrix_over_shield_pairs(
+    case: ValidationCase,
+    runtime_config: dict[str, Any],
+    kernel: ContinuousKernel,
+    pair_ids: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Return all selected pair counts using the batched kernel runtime path."""
+    num_orientations = int(len(kernel.orientations))
+    num_pairs = num_orientations * num_orientations
+    selected_pair_ids = np.asarray(
+        np.arange(num_pairs, dtype=np.int64)
+        if pair_ids is None
+        else tuple(int(pair_id) for pair_id in pair_ids),
+        dtype=np.int64,
+    ).reshape(-1)
+    if np.any(selected_pair_ids < 0) or np.any(selected_pair_ids >= num_pairs):
+        raise ValueError(f"Shield pair ids must be in [0, {num_pairs - 1}].")
+    matrix = np.zeros((selected_pair_ids.size, len(ISOTOPES)), dtype=float)
+    detector = np.asarray(case.detector_pose_xyz, dtype=float)
+    for isotope_index, isotope in enumerate(ISOTOPES):
+        isotope_sources = [
+            source for source in case.sources if source.isotope == isotope
+        ]
+        if not isotope_sources:
+            continue
+        positions = np.asarray(
+            [source.position_xyz for source in isotope_sources],
+            dtype=float,
+        )
+        intensities = np.asarray(
+            [source.intensity_cps_1m for source in isotope_sources],
+            dtype=float,
+        )
+        all_pair_kernels = kernel.kernel_values_all_pairs(
+            isotope=isotope,
+            detector_pos=detector,
+            sources=positions,
+        )
+        selected_kernels = np.asarray(all_pair_kernels, dtype=float)[
+            selected_pair_ids,
+            :,
+        ]
+        source_scales = _measurement_source_scales_for_pairs(
+            isotope,
+            selected_pair_ids,
+            runtime_config,
+        )
+        matrix[:, isotope_index] = (
+            float(case.dwell_time_s)
+            * source_scales
+            * np.asarray(selected_kernels @ intensities, dtype=float)
+        )
+    return matrix
+
+
+def _enable_batched_pair_screening(
+    kernel: ContinuousKernel,
+    runtime_config: Mapping[str, Any],
+) -> ContinuousKernel:
+    """Select Torch batching for exact all-pair detector-pose validation."""
+    if not _TORCH_AVAILABLE or torch is None:
+        raise RuntimeError(
+            "Exact all-shield-pair screening requires torch batching."
+        )
+    requested_device = str(
+        runtime_config.get("validation_pair_screening_device", "")
+    ).strip()
+    if not requested_device:
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        requested_device = "cpu"
+    kernel.use_gpu = True
+    kernel.gpu_device = requested_device
+    kernel.gpu_dtype = str(
+        runtime_config.get("validation_pair_screening_dtype", "float64")
+    )
+    return kernel
 
 
 def _count_imbalance(counts: np.ndarray) -> float:
@@ -711,6 +1048,47 @@ def _selection_screen_pair_ids(
     if mode == "balanced":
         return None if bool(screen_all_shield_pairs) else None
     return STRESS_SCREEN_SHIELD_PAIR_IDS
+
+
+def _select_exact_target_qualified_detector(
+    candidates: list[DetectorPoseCandidate],
+    *,
+    base_case: ValidationCase,
+    transport_grid: ObstacleGrid,
+    runtime_config: dict[str, Any],
+    target_kernel: ContinuousKernel,
+    min_target_counts: float,
+    all_shield_pairs: bool,
+) -> tuple[
+    DetectorPoseCandidate,
+    dict[str, Any],
+    int,
+]:
+    """Select the highest-ranked pose passing the exact PF response gate."""
+    threshold = max(float(min_target_counts), 0.0)
+    ranked = sorted(candidates, key=lambda item: item.proxy_score, reverse=True)
+    best_exact_min = -float("inf")
+    for attempt_index, candidate in enumerate(ranked, start=1):
+        exact_features = _detector_selection_features(
+            base_case,
+            candidate.pose_xyz,
+            transport_grid=transport_grid,
+            runtime_config=runtime_config,
+            target_kernel=target_kernel,
+            evaluate_all_shield_pairs=bool(all_shield_pairs),
+            selection_pair_ids=None,
+            use_fast_proxy=False,
+        )
+        exact_min = float(exact_features.get("min_isotope_target", 0.0))
+        best_exact_min = max(best_exact_min, exact_min)
+        if exact_min >= threshold:
+            return candidate, exact_features, attempt_index
+    raise ValueError(
+        "No sampled detector pose satisfies the exact PF response gate across "
+        f"{'all 64 shield pairs' if all_shield_pairs else 'the selected pair'}: "
+        f"required={threshold:.6g}, best={best_exact_min:.6g}, "
+        f"candidates={len(ranked)}."
+    )
 
 
 def _source_isotope_program(case_index: int, source_count: int) -> list[str]:
@@ -1046,10 +1424,12 @@ def _generated_multi_isotope_source_case(
         if can_score_target
         else None
     )
-    best_detector: tuple[float, float, float] | None = None
-    best_min_target = -float("inf")
-    best_score = -float("inf")
-    best_features: dict[str, Any] = {}
+    if target_kernel is not None and bool(screen_all_shield_pairs):
+        target_kernel = _enable_batched_pair_screening(
+            target_kernel,
+            runtime_config,
+        )
+    candidates: list[DetectorPoseCandidate] = []
     selection_pair_ids = _selection_screen_pair_ids(
         mode=effective_selection_mode,
         screen_all_shield_pairs=bool(screen_all_shield_pairs),
@@ -1089,32 +1469,47 @@ def _generated_multi_isotope_source_case(
             mode=effective_selection_mode,
             min_target_counts=float(min_isotope_target_counts) if require_target else 0.0,
         )
-        if score > best_score:
-            best_detector = detector_candidate
-            best_min_target = min_count
-            best_score = score
-            best_features = dict(features)
+        candidates.append(
+            DetectorPoseCandidate(
+                pose_xyz=detector_candidate,
+                proxy_score=float(score),
+                proxy_features=dict(features),
+            )
+        )
         if (
             effective_selection_mode == "balanced"
             and require_target
             and min_count >= float(min_isotope_target_counts)
         ):
             break
-    if best_detector is None:
-        best_detector = _jittered_free_pose(
-            transport_grid,
-            rng,
-            room_size_xyz=room_size,
+    if not candidates:
+        raise RuntimeError("Detector-pose sampling produced no candidates.")
+    exact_validation_attempts = 0
+    target_gate_passed: bool | None = None
+    if require_target:
+        if target_kernel is None or runtime_config is None:
+            raise RuntimeError("Exact target screening requires a runtime kernel.")
+        selected, best_features, exact_validation_attempts = (
+            _select_exact_target_qualified_detector(
+                candidates,
+                base_case=base_screen_case,
+                transport_grid=transport_grid,
+                runtime_config=runtime_config,
+                target_kernel=target_kernel,
+                min_target_counts=float(min_isotope_target_counts),
+                all_shield_pairs=bool(screen_all_shield_pairs),
+            )
         )
-        best_features = _detector_selection_features(
-            base_screen_case,
-            best_detector,
-            transport_grid=transport_grid,
-            runtime_config=runtime_config if can_score_target else None,
-            target_kernel=target_kernel if can_score_target else None,
-            evaluate_all_shield_pairs=bool(screen_all_shield_pairs),
-            selection_pair_ids=selection_pair_ids,
-            use_fast_proxy=(effective_selection_mode != "balanced"),
+        target_gate_passed = True
+    else:
+        selected = max(candidates, key=lambda item: item.proxy_score)
+        best_features = dict(selected.proxy_features)
+    best_detector = selected.pose_xyz
+    best_score = float(selected.proxy_score)
+    best_min_target = float(best_features.get("min_isotope_target", 0.0))
+    if require_target and best_min_target < float(min_isotope_target_counts):
+        raise AssertionError(
+            "Exact detector-pose gate returned a below-threshold candidate."
         )
     template_counts: dict[str, int] = {}
     for instance in instances:
@@ -1133,6 +1528,25 @@ def _generated_multi_isotope_source_case(
         "detector_selection_effective_mode": effective_selection_mode,
         "detector_selection_score": float(best_score),
         "detector_selection_attempts": int(max_detector_attempts),
+        "detector_selection_preselection_features": dict(
+            selected.proxy_features
+        ),
+        "detector_selection_exact_validation_attempts": int(
+            exact_validation_attempts
+        ),
+        "detector_selection_target_gate_passed": target_gate_passed,
+        "detector_selection_exact_pair_count": (
+            64 if require_target and screen_all_shield_pairs else (1 if require_target else 0)
+        ),
+        "detector_selection_batch_backend": (
+            None
+            if target_kernel is None or not screen_all_shield_pairs
+            else {
+                "use_gpu_kernel": bool(target_kernel.use_gpu),
+                "device": str(target_kernel.gpu_device),
+                "dtype": str(target_kernel.gpu_dtype),
+            }
+        ),
     }
     detector_metadata.update(best_features)
     return ValidationCase(
@@ -1163,23 +1577,14 @@ def _min_expected_count_over_shield_pairs(
     kernel: ContinuousKernel,
 ) -> float:
     """Return the minimum isotope target count over all 64 Fe/Pb pairs."""
-    min_count = float("inf")
-    for fe_index in range(8):
-        for pb_index in range(8):
-            pair_case = ValidationCase(
-                name=case.name,
-                description=case.description,
-                detector_pose_xyz=case.detector_pose_xyz,
-                sources=case.sources,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                dwell_time_s=case.dwell_time_s,
-                obstacle_cells=case.obstacle_cells,
-                obstacle_instances=case.obstacle_instances,
-                include_in_accuracy_summary=case.include_in_accuracy_summary,
-            )
-            counts = expected_pf_counts_with_kernel(pair_case, runtime_config, kernel)
-            min_count = min(min_count, *(float(counts[isotope]) for isotope in ISOTOPES))
+    count_matrix = _expected_count_matrix_over_shield_pairs(
+        case,
+        runtime_config,
+        kernel,
+    )
+    if not count_matrix.size:
+        return 0.0
+    min_count = float(np.min(count_matrix))
     return min_count if np.isfinite(min_count) else 0.0
 
 
@@ -1987,9 +2392,346 @@ def case_to_dict(case: ValidationCase) -> dict[str, Any]:
     }
 
 
+def _finite_variance(value: object, *, fallback: float = 1.0) -> float:
+    """Return a finite positive variance with a deterministic fallback."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(fallback)
+    if not np.isfinite(result) or result <= 0.0:
+        result = float(fallback)
+    return float(max(result, 1.0))
+
+
+def _covariance_payload(
+    covariance: Mapping[str, Mapping[str, float]] | None,
+    isotopes: tuple[str, ...],
+    *,
+    diagonal_variances: Mapping[str, float] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Return a complete JSON-safe covariance mapping in isotope order."""
+    source = covariance if isinstance(covariance, Mapping) else {}
+    payload: dict[str, dict[str, float]] = {}
+    for row_isotope in isotopes:
+        raw_row = source.get(row_isotope, {})
+        row = raw_row if isinstance(raw_row, Mapping) else {}
+        payload[row_isotope] = {}
+        for column_isotope in isotopes:
+            fallback = (
+                _finite_variance(diagonal_variances.get(row_isotope, 1.0))
+                if row_isotope == column_isotope
+                and diagonal_variances is not None
+                else 0.0
+            )
+            try:
+                value = float(row.get(column_isotope, fallback))
+            except (TypeError, ValueError):
+                value = float(fallback)
+            if not np.isfinite(value):
+                value = float(fallback)
+            payload[row_isotope][column_isotope] = float(value)
+    return payload
+
+
+def _response_poisson_variance_stages(
+    diagnostics: Mapping[str, object],
+    runtime_variances: Mapping[str, float],
+    projected_variances: Mapping[str, float],
+) -> dict[str, dict[str, float | bool]]:
+    """Return formal, runtime, and PF-projected variance stages by isotope."""
+    formal_diagnostics = diagnostics.get("variances", {})
+    formal_by_isotope = (
+        formal_diagnostics if isinstance(formal_diagnostics, Mapping) else {}
+    )
+    component_diagnostics = diagnostics.get("runtime_variance_components", {})
+    components_by_isotope = (
+        component_diagnostics
+        if isinstance(component_diagnostics, Mapping)
+        else {}
+    )
+    stages: dict[str, dict[str, float | bool]] = {}
+    for isotope in ISOTOPES:
+        runtime_variance = _finite_variance(runtime_variances.get(isotope, 1.0))
+        projected_variance = _finite_variance(
+            projected_variances.get(isotope, runtime_variance),
+            fallback=runtime_variance,
+        )
+        raw_components = components_by_isotope.get(isotope, {})
+        components = raw_components if isinstance(raw_components, Mapping) else {}
+        formal_variance = _finite_variance(
+            components.get(
+                "formal_input_variance",
+                formal_by_isotope.get(isotope, runtime_variance),
+            ),
+            fallback=runtime_variance,
+        )
+        ceilinged_formal_variance = _finite_variance(
+            components.get("formal_after_ceiling_variance", formal_variance),
+            fallback=formal_variance,
+        )
+        tolerance = max(abs(formal_variance), 1.0) * 1.0e-12
+        stages[isotope] = {
+            "formal_variance": formal_variance,
+            "ceilinged_formal_variance": ceilinged_formal_variance,
+            "runtime_variance": runtime_variance,
+            "projected_variance": projected_variance,
+            "runtime_over_formal": runtime_variance / formal_variance,
+            "runtime_over_ceilinged_formal": (
+                runtime_variance / ceilinged_formal_variance
+            ),
+            "projected_over_runtime": projected_variance / runtime_variance,
+            "projected_over_formal": projected_variance / formal_variance,
+            "projected_over_ceilinged_formal": (
+                projected_variance / ceilinged_formal_variance
+            ),
+            "formal_ceiling_applied": bool(
+                ceilinged_formal_variance < formal_variance - tolerance
+            ),
+        }
+    return stages
+
+
+def _mahalanobis_squared(
+    residual_by_isotope: Mapping[str, float],
+    covariance: Mapping[str, Mapping[str, float]],
+    isotopes: list[str],
+) -> float | None:
+    """Return a robust covariance-normalized residual quadratic form."""
+    if not isotopes:
+        return None
+    residual = np.asarray(
+        [float(residual_by_isotope[isotope]) for isotope in isotopes],
+        dtype=float,
+    )
+    matrix = np.asarray(
+        [
+            [float(covariance[row][column]) for column in isotopes]
+            for row in isotopes
+        ],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(residual)) or not np.all(np.isfinite(matrix)):
+        return None
+    matrix = 0.5 * (matrix + matrix.T)
+    try:
+        inverse = np.linalg.pinv(matrix, hermitian=True)
+    except np.linalg.LinAlgError:
+        return None
+    value = float(residual @ inverse @ residual)
+    if not np.isfinite(value):
+        return None
+    return float(max(value, 0.0))
+
+
+def _response_poisson_residual_diagnostics(
+    counts: Mapping[str, float],
+    truth_counts: Mapping[str, float],
+    variance_stages: Mapping[str, Mapping[str, float | bool]],
+    formal_covariance: Mapping[str, Mapping[str, float]],
+    runtime_covariance: Mapping[str, Mapping[str, float]],
+    estimator_covariance: Mapping[str, Mapping[str, float]],
+    *,
+    min_target: float,
+) -> dict[str, Any]:
+    """Build per-case residual diagnostics for covariance coverage analysis."""
+    included = [
+        isotope
+        for isotope in ISOTOPES
+        if float(truth_counts.get(isotope, 0.0)) >= float(min_target)
+    ]
+    residuals = {
+        isotope: float(counts.get(isotope, 0.0))
+        - float(truth_counts.get(isotope, 0.0))
+        for isotope in ISOTOPES
+    }
+    normalized: dict[str, dict[str, float]] = {
+        "formal": {},
+        "runtime": {},
+        "projected": {},
+    }
+    formal_diagonal: dict[str, float] = {}
+    runtime_diagonal: dict[str, float] = {}
+    projected_diagonal: dict[str, float] = {}
+    for isotope in ISOTOPES:
+        stage = variance_stages[isotope]
+        formal = _finite_variance(stage["formal_variance"])
+        runtime = _finite_variance(stage["runtime_variance"])
+        projected = _finite_variance(stage["projected_variance"])
+        formal_diagonal[isotope] = formal
+        runtime_diagonal[isotope] = runtime
+        projected_diagonal[isotope] = projected
+        normalized["formal"][isotope] = residuals[isotope] / np.sqrt(formal)
+        normalized["runtime"][isotope] = residuals[isotope] / np.sqrt(runtime)
+        normalized["projected"][isotope] = residuals[isotope] / np.sqrt(projected)
+    diagonal_formal_covariance = _covariance_payload(
+        None,
+        ISOTOPES,
+        diagonal_variances=formal_diagonal,
+    )
+    diagonal_runtime_covariance = _covariance_payload(
+        None,
+        ISOTOPES,
+        diagonal_variances=runtime_diagonal,
+    )
+    diagonal_projected_covariance = _covariance_payload(
+        None,
+        ISOTOPES,
+        diagonal_variances=projected_diagonal,
+    )
+    covariance_by_stage = {
+        "formal_full": formal_covariance,
+        "formal_diagonal": diagonal_formal_covariance,
+        "runtime_full": runtime_covariance,
+        "runtime_diagonal": diagonal_runtime_covariance,
+        "estimator_sanitized_full": estimator_covariance,
+        "projected_diagonal": diagonal_projected_covariance,
+    }
+    mahalanobis = {
+        name: _mahalanobis_squared(residuals, covariance, included)
+        for name, covariance in covariance_by_stage.items()
+    }
+    return {
+        "truth_reference": "transport_detected_counts_by_isotope",
+        "included_isotopes": included,
+        "degrees_of_freedom": int(len(included)),
+        "residual_counts_by_isotope": residuals,
+        "normalized_residual_by_isotope": normalized,
+        "mahalanobis_squared": mahalanobis,
+    }
+
+
+def _count_likelihood_scale_squared(
+    observed_count: float,
+    target_count: float,
+    projected_observation_variance: float,
+    spec: CountLikelihoodSpec,
+) -> float:
+    """Return the exact scalar scale squared used by the PF count likelihood."""
+    target = max(float(target_count), 1.0e-12)
+    if spec.model == "poisson":
+        return target
+    scale_squared = count_likelihood_variance(
+        np.asarray([max(float(observed_count), 0.0)], dtype=float),
+        np.asarray([target], dtype=float),
+        transport_model_rel_sigma=spec.transport_model_rel_sigma,
+        transport_model_abs_sigma=spec.transport_model_abs_sigma,
+        spectrum_count_rel_sigma=spec.spectrum_count_rel_sigma,
+        spectrum_count_abs_sigma=spec.spectrum_count_abs_sigma,
+        low_count_abs_sigma=spec.low_count_abs_sigma,
+        low_count_transition_counts=spec.low_count_transition_counts,
+        observation_count_variance=max(
+            float(projected_observation_variance),
+            0.0,
+        ),
+        observation_count_variance_includes_counting_noise=(
+            spec.observation_count_variance_includes_counting_noise
+        ),
+    )
+    return float(np.asarray(scale_squared, dtype=float).reshape(-1)[0])
+
+
+def _pf_likelihood_target_diagnostic(
+    counts: Mapping[str, float],
+    targets: Mapping[str, float],
+    projected_variances: Mapping[str, float],
+    likelihood_specs: Mapping[str, CountLikelihoodSpec],
+    *,
+    min_target: float,
+) -> dict[str, Any]:
+    """Build one truth-forward target residual diagnostic at final PF scale."""
+    included = [
+        isotope
+        for isotope in ISOTOPES
+        if float(targets.get(isotope, 0.0)) >= float(min_target)
+    ]
+    residuals: dict[str, float] = {}
+    scale_squared_by_isotope: dict[str, float] = {}
+    normalized_by_isotope: dict[str, float] = {}
+    relative_scale_by_isotope: dict[str, float] = {}
+    for isotope in ISOTOPES:
+        observed = float(counts.get(isotope, 0.0))
+        target = float(targets.get(isotope, 0.0))
+        residual = observed - target
+        spec = likelihood_specs[isotope]
+        scale_squared = _count_likelihood_scale_squared(
+            observed,
+            target,
+            float(projected_variances.get(isotope, 0.0)),
+            spec,
+        )
+        scale = float(np.sqrt(max(scale_squared, 1.0e-12)))
+        residuals[isotope] = residual
+        scale_squared_by_isotope[isotope] = scale_squared
+        normalized_by_isotope[isotope] = residual / scale
+        relative_scale_by_isotope[isotope] = scale / max(abs(target), 1.0)
+    squared_distance = float(
+        sum(normalized_by_isotope[isotope] ** 2 for isotope in included)
+    )
+    return {
+        "included_isotopes": included,
+        "degrees_of_freedom": int(len(included)),
+        "target_counts_by_isotope": {
+            isotope: float(targets.get(isotope, 0.0)) for isotope in ISOTOPES
+        },
+        "residual_counts_by_isotope": residuals,
+        "likelihood_scale_squared_by_isotope": scale_squared_by_isotope,
+        "normalized_residual_by_isotope": normalized_by_isotope,
+        "likelihood_scale_over_target_by_isotope": relative_scale_by_isotope,
+        "diagonal_squared_distance": squared_distance,
+    }
+
+
+def _pf_count_likelihood_diagnostics(
+    counts: Mapping[str, float],
+    runtime_pf_targets: Mapping[str, float],
+    geant4_mu_targets: Mapping[str, float] | None,
+    projected_variances: Mapping[str, float],
+    likelihood_specs: Mapping[str, CountLikelihoodSpec],
+    *,
+    min_target: float,
+) -> dict[str, Any]:
+    """Report truth-forward residuals using the complete PF count scale."""
+    targets = {
+        "runtime_pf_forward": _pf_likelihood_target_diagnostic(
+            counts,
+            runtime_pf_targets,
+            projected_variances,
+            likelihood_specs,
+            min_target=float(min_target),
+        )
+    }
+    if geant4_mu_targets is not None:
+        targets["geant4_mu_pf_forward"] = _pf_likelihood_target_diagnostic(
+            counts,
+            geant4_mu_targets,
+            projected_variances,
+            likelihood_specs,
+            min_target=float(min_target),
+        )
+    return {
+        "scale_semantics": (
+            "count_likelihood_variance output used as likelihood scale squared; "
+            "for Student-t this is not its marginal variance"
+        ),
+        "observation_variance_semantics": (
+            "PF-projected response-Poisson observation variance; when its spec "
+            "declares included counting noise, max(observed_count, 1) is replaced "
+            "by the particle-dependent Poisson mean, then transport, spectrum, "
+            "and low-count components are added"
+        ),
+        "likelihood_spec_by_isotope": {
+            isotope: _count_likelihood_spec_payload(likelihood_specs[isotope])
+            for isotope in ISOTOPES
+        },
+        "targets": targets,
+    }
+
+
 def run_case(
     app: Geant4Application,
     decomposer: SpectralDecomposer,
+    covariance_projector: PurePFEstimator,
+    likelihood_specs: Mapping[str, CountLikelihoodSpec],
     case: ValidationCase,
     step_id: int,
     runtime_config: dict[str, Any],
@@ -2057,6 +2799,46 @@ def run_case(
         isotope: float(runtime_counts.variances.get(isotope, 1.0))
         for isotope in ISOTOPES
     }
+    raw_formal_variances = response_poisson_diagnostics.get("variances", {})
+    formal_variances = (
+        raw_formal_variances if isinstance(raw_formal_variances, Mapping) else {}
+    )
+    formal_covariance = _covariance_payload(
+        getattr(decomposer, "last_count_covariance", None),
+        ISOTOPES,
+        diagonal_variances={
+            isotope: _finite_variance(
+                formal_variances.get(
+                    isotope,
+                    response_poisson_variances[isotope],
+                )
+            )
+            for isotope in ISOTOPES
+        },
+    )
+    runtime_covariance = _covariance_payload(
+        runtime_counts.covariance,
+        ISOTOPES,
+        diagonal_variances=response_poisson_variances,
+    )
+    projected_variances, estimator_covariance_raw = (
+        project_runtime_observation_covariance(
+            covariance_projector,
+            response_poisson_counts,
+            response_poisson_variances,
+            runtime_covariance,
+        )
+    )
+    estimator_covariance = _covariance_payload(
+        estimator_covariance_raw,
+        ISOTOPES,
+        diagonal_variances=response_poisson_variances,
+    )
+    variance_stages = _response_poisson_variance_stages(
+        response_poisson_diagnostics,
+        response_poisson_variances,
+        projected_variances,
+    )
     photopeak_counts = decomposer.compute_photopeak_nnls_counts(
         spectrum,
         live_time_s=float(case.dwell_time_s),
@@ -2079,6 +2861,14 @@ def run_case(
         target_kernel,
         metadata,
     )
+    pf_count_likelihood_diagnostics = _pf_count_likelihood_diagnostics(
+        response_poisson_counts,
+        target_counts,
+        target_counts_geant4_mu,
+        projected_variances,
+        likelihood_specs,
+        min_target=float(min_target),
+    )
     line_mu_diagnostics = weighted_mu_diagnostics(metadata, target_kernel)
     target_diagnostics = expected_pf_count_diagnostics(
         case,
@@ -2088,6 +2878,15 @@ def run_case(
     )
     tally_counts = source_tally_counts(dict(observation.metadata))
     truth_counts = transport_truth_counts(dict(observation.metadata))
+    covariance_residual_diagnostics = _response_poisson_residual_diagnostics(
+        response_poisson_counts,
+        truth_counts,
+        variance_stages,
+        formal_covariance,
+        runtime_covariance,
+        estimator_covariance,
+        min_target=float(min_target),
+    )
     uncollided_primary_counts = {
         isotope: float(metadata.get(f"transport_uncollided_primary_counts_{isotope}", 0.0))
         for isotope in ISOTOPES
@@ -2279,7 +3078,22 @@ def run_case(
                 method: float(values.get(isotope, 0.0))
                 for method, values in methods.items()
             },
-            "response_poisson_variance": float(response_poisson_variances.get(isotope, 1.0)),
+            "response_poisson_formal_variance": float(
+                variance_stages[isotope]["formal_variance"]
+            ),
+            "response_poisson_ceilinged_formal_variance": float(
+                variance_stages[isotope]["ceilinged_formal_variance"]
+            ),
+            "response_poisson_variance": float(
+                response_poisson_variances.get(isotope, 1.0)
+            ),
+            "response_poisson_projected_variance": float(
+                projected_variances.get(
+                    isotope,
+                    response_poisson_variances.get(isotope, 1.0),
+                )
+            ),
+            "response_poisson_variance_stages": dict(variance_stages[isotope]),
             "response_poisson_method_name": str(
                 response_poisson_methods.get(isotope, "response_poisson")
             ),
@@ -2376,6 +3190,29 @@ def run_case(
         "kernel_diagnostics": kernel_diagnostics,
         "target_diagnostics": target_diagnostics,
         "response_poisson_diagnostics": response_poisson_diagnostics,
+        "response_poisson_covariance": {
+            "isotope_order": list(ISOTOPES),
+            "formal": formal_covariance,
+            "runtime": runtime_covariance,
+            "estimator_sanitized": estimator_covariance,
+            "projected_variance_by_isotope": {
+                isotope: float(projected_variances[isotope])
+                for isotope in ISOTOPES
+            },
+            "projection_config": {
+                "enabled": bool(
+                    covariance_projector.pf_config.observation_covariance_projection_enable
+                ),
+                "weight": float(
+                    covariance_projector.pf_config.observation_covariance_projection_weight
+                ),
+                "max_correlation": float(
+                    covariance_projector.pf_config.observation_covariance_projection_max_corr
+                ),
+            },
+            "residual_diagnostics": covariance_residual_diagnostics,
+        },
+        "pf_count_likelihood_diagnostics": pf_count_likelihood_diagnostics,
         "per_isotope": per_isotope,
     }
     return result, spectrum
@@ -2417,6 +3254,31 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "coefficient_correlation_by_isotope",
                 {},
             )
+        )
+        covariance_payload = dict(result.get("response_poisson_covariance", {}))
+        formal_covariance = dict(covariance_payload.get("formal", {}))
+        runtime_covariance = dict(covariance_payload.get("runtime", {}))
+        estimator_covariance = dict(
+            covariance_payload.get("estimator_sanitized", {})
+        )
+        residual_diagnostics = dict(
+            covariance_payload.get("residual_diagnostics", {})
+        )
+        case_mahalanobis = dict(
+            residual_diagnostics.get("mahalanobis_squared", {})
+        )
+        pf_likelihood_payload = dict(
+            result.get("pf_count_likelihood_diagnostics", {})
+        )
+        pf_likelihood_targets = dict(pf_likelihood_payload.get("targets", {}))
+        runtime_pf_likelihood = dict(
+            pf_likelihood_targets.get("runtime_pf_forward", {})
+        )
+        geant4_mu_pf_likelihood = dict(
+            pf_likelihood_targets.get("geant4_mu_pf_forward", {})
+        )
+        pf_likelihood_specs = dict(
+            pf_likelihood_payload.get("likelihood_spec_by_isotope", {})
         )
         for isotope, item in result["per_isotope"].items():
             line_mu_diagnostics = dict(item.get("line_mu_diagnostics", {}))
@@ -2462,6 +3324,119 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "estimated_counts": value,
                         "estimated_variance": (
                             item["response_poisson_variance"]
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_formal_variance": (
+                            item.get("response_poisson_formal_variance", "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_ceilinged_formal_variance": (
+                            item.get(
+                                "response_poisson_ceilinged_formal_variance",
+                                "",
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_runtime_variance": (
+                            item.get("response_poisson_variance", "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_projected_variance": (
+                            item.get("response_poisson_projected_variance", "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_variance_stages": (
+                            json.dumps(
+                                item.get("response_poisson_variance_stages", {}),
+                                sort_keys=True,
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_formal_covariance_row": (
+                            json.dumps(
+                                formal_covariance.get(isotope, {}),
+                                sort_keys=True,
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_runtime_covariance_row": (
+                            json.dumps(
+                                runtime_covariance.get(isotope, {}),
+                                sort_keys=True,
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_estimator_covariance_row": (
+                            json.dumps(
+                                estimator_covariance.get(isotope, {}),
+                                sort_keys=True,
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_covariance_degrees_of_freedom": (
+                            residual_diagnostics.get("degrees_of_freedom", "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "response_poisson_mahalanobis_squared": (
+                            json.dumps(case_mahalanobis, sort_keys=True)
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "pf_count_likelihood_spec": (
+                            json.dumps(
+                                pf_likelihood_specs.get(isotope, {}),
+                                sort_keys=True,
+                            )
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "pf_runtime_target_likelihood_scale_squared": (
+                            dict(
+                                runtime_pf_likelihood.get(
+                                    "likelihood_scale_squared_by_isotope",
+                                    {},
+                                )
+                            ).get(isotope, "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "pf_runtime_target_normalized_residual": (
+                            dict(
+                                runtime_pf_likelihood.get(
+                                    "normalized_residual_by_isotope",
+                                    {},
+                                )
+                            ).get(isotope, "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "pf_geant4_mu_target_likelihood_scale_squared": (
+                            dict(
+                                geant4_mu_pf_likelihood.get(
+                                    "likelihood_scale_squared_by_isotope",
+                                    {},
+                                )
+                            ).get(isotope, "")
+                            if method == "response_poisson"
+                            else ""
+                        ),
+                        "pf_geant4_mu_target_normalized_residual": (
+                            dict(
+                                geant4_mu_pf_likelihood.get(
+                                    "normalized_residual_by_isotope",
+                                    {},
+                                )
+                            ).get(isotope, "")
                             if method == "response_poisson"
                             else ""
                         ),
@@ -2879,6 +3854,462 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     }
                 )
     return rows
+
+
+def _finite_distribution(values: list[float]) -> dict[str, float | int]:
+    """Return compact finite distribution statistics."""
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    return {
+        "num_points": int(array.size),
+        "min": float(np.min(array)) if array.size else float("nan"),
+        "mean": float(np.mean(array)) if array.size else float("nan"),
+        "median": float(np.median(array)) if array.size else float("nan"),
+        "p90": float(np.percentile(array, 90.0)) if array.size else float("nan"),
+        "p95": float(np.percentile(array, 95.0)) if array.size else float("nan"),
+        "p99": float(np.percentile(array, 99.0)) if array.size else float("nan"),
+        "max": float(np.max(array)) if array.size else float("nan"),
+    }
+
+
+def _normalized_residual_coverage(values: list[float]) -> dict[str, float | int]:
+    """Return normalized-residual moments and empirical sigma coverage."""
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    absolute = np.abs(array)
+    summary = _finite_distribution(absolute.tolist())
+    summary.update(
+        {
+            "mean_signed": (
+                float(np.mean(array)) if array.size else float("nan")
+            ),
+            "rms": (
+                float(np.sqrt(np.mean(array * array)))
+                if array.size
+                else float("nan")
+            ),
+            "coverage_within_1sigma": (
+                float(np.mean(absolute <= 1.0))
+                if absolute.size
+                else float("nan")
+            ),
+            "coverage_within_2sigma": (
+                float(np.mean(absolute <= 2.0))
+                if absolute.size
+                else float("nan")
+            ),
+            "coverage_within_3sigma": (
+                float(np.mean(absolute <= 3.0))
+                if absolute.size
+                else float("nan")
+            ),
+        }
+    )
+    return summary
+
+
+def _covariance_summary_accumulator() -> dict[str, Any]:
+    """Return an empty variance-ratio and coverage accumulator."""
+    return {
+        "num_isotope_records": 0,
+        "num_coverage_records": 0,
+        "ratios": {
+            "runtime_over_formal": [],
+            "runtime_over_ceilinged_formal": [],
+            "projected_over_runtime": [],
+            "projected_over_formal": [],
+            "projected_over_ceilinged_formal": [],
+        },
+        "normalized_residuals": {
+            "formal": [],
+            "runtime": [],
+            "projected": [],
+        },
+        "ceiling_counts": {
+            "formal_ceiling_applied": 0,
+            "runtime_above_ceilinged_formal": 0,
+            "projected_above_ceilinged_formal": 0,
+            "projected_above_runtime": 0,
+        },
+    }
+
+
+def _accumulate_covariance_record(
+    accumulator: dict[str, Any],
+    *,
+    count: float,
+    truth: float,
+    stage: Mapping[str, object],
+    include_coverage: bool,
+) -> None:
+    """Add one isotope record to covariance ratio and coverage diagnostics."""
+    formal = _finite_variance(stage.get("formal_variance", 1.0))
+    ceilinged = _finite_variance(
+        stage.get("ceilinged_formal_variance", formal),
+        fallback=formal,
+    )
+    runtime = _finite_variance(
+        stage.get("runtime_variance", formal),
+        fallback=formal,
+    )
+    projected = _finite_variance(
+        stage.get("projected_variance", runtime),
+        fallback=runtime,
+    )
+    ratios = {
+        "runtime_over_formal": runtime / formal,
+        "runtime_over_ceilinged_formal": runtime / ceilinged,
+        "projected_over_runtime": projected / runtime,
+        "projected_over_formal": projected / formal,
+        "projected_over_ceilinged_formal": projected / ceilinged,
+    }
+    for name, value in ratios.items():
+        accumulator["ratios"][name].append(float(value))
+    if include_coverage:
+        residual = float(count) - float(truth)
+        accumulator["normalized_residuals"]["formal"].append(
+            residual / np.sqrt(formal)
+        )
+        accumulator["normalized_residuals"]["runtime"].append(
+            residual / np.sqrt(runtime)
+        )
+        accumulator["normalized_residuals"]["projected"].append(
+            residual / np.sqrt(projected)
+        )
+        accumulator["num_coverage_records"] += 1
+    tolerance = max(formal, ceilinged, runtime, projected, 1.0) * 1.0e-12
+    ceiling_counts = accumulator["ceiling_counts"]
+    if bool(stage.get("formal_ceiling_applied", ceilinged < formal - tolerance)):
+        ceiling_counts["formal_ceiling_applied"] += 1
+    if runtime > ceilinged + tolerance:
+        ceiling_counts["runtime_above_ceilinged_formal"] += 1
+    if projected > ceilinged + tolerance:
+        ceiling_counts["projected_above_ceilinged_formal"] += 1
+    if projected > runtime + tolerance:
+        ceiling_counts["projected_above_runtime"] += 1
+    accumulator["num_isotope_records"] += 1
+
+
+def _finalize_covariance_accumulator(
+    accumulator: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Convert covariance accumulator lists into JSON summary statistics."""
+    num_records = int(accumulator.get("num_isotope_records", 0))
+    ceiling_counts = {
+        str(name): int(value)
+        for name, value in dict(accumulator.get("ceiling_counts", {})).items()
+    }
+    ceiling_fractions = {
+        name: (float(value) / num_records if num_records else float("nan"))
+        for name, value in ceiling_counts.items()
+    }
+    return {
+        "num_isotope_records": num_records,
+        "num_coverage_records": int(accumulator.get("num_coverage_records", 0)),
+        "variance_ratios": {
+            str(name): _finite_distribution(list(values))
+            for name, values in dict(accumulator.get("ratios", {})).items()
+        },
+        "ceiling_exceedance_counts": ceiling_counts,
+        "ceiling_exceedance_fractions": ceiling_fractions,
+        "normalized_residual_coverage_vs_transport_truth": {
+            str(name): _normalized_residual_coverage(list(values))
+            for name, values in dict(
+                accumulator.get("normalized_residuals", {})
+            ).items()
+        },
+    }
+
+
+def _mahalanobis_distribution(
+    values: list[tuple[float, int]],
+) -> dict[str, Any]:
+    """Summarize case-wise Mahalanobis squared values and degrees of freedom."""
+    finite = [
+        (float(value), int(degrees))
+        for value, degrees in values
+        if np.isfinite(float(value)) and int(degrees) > 0
+    ]
+    squared = [value for value, _degrees in finite]
+    per_degree = [value / degrees for value, degrees in finite]
+    total_degrees = int(sum(degrees for _value, degrees in finite))
+    total_squared = float(sum(squared))
+    return {
+        "num_cases": int(len(finite)),
+        "total_degrees_of_freedom": total_degrees,
+        "pooled_squared_per_degree_of_freedom": (
+            total_squared / total_degrees
+            if total_degrees
+            else float("nan")
+        ),
+        "mahalanobis_squared": _finite_distribution(squared),
+        "squared_per_degree_of_freedom": _finite_distribution(per_degree),
+    }
+
+
+def summarize_response_poisson_covariance(
+    results: list[dict[str, Any]],
+    min_target: float,
+) -> dict[str, Any]:
+    """Summarize formal, runtime, and PF-projected count uncertainty."""
+    total = _covariance_summary_accumulator()
+    by_isotope = {
+        isotope: _covariance_summary_accumulator() for isotope in ISOTOPES
+    }
+    mahalanobis: dict[str, list[tuple[float, int]]] = {
+        "formal_full": [],
+        "formal_diagonal": [],
+        "runtime_full": [],
+        "runtime_diagonal": [],
+        "estimator_sanitized_full": [],
+        "projected_diagonal": [],
+    }
+    num_cases = 0
+    for result in results:
+        case = result.get("case", {})
+        if not bool(case.get("include_in_accuracy_summary", True)):
+            continue
+        covariance_payload = result.get("response_poisson_covariance", {})
+        covariance_payload = (
+            covariance_payload if isinstance(covariance_payload, Mapping) else {}
+        )
+        residual_diagnostics = covariance_payload.get("residual_diagnostics", {})
+        residual_diagnostics = (
+            residual_diagnostics
+            if isinstance(residual_diagnostics, Mapping)
+            else {}
+        )
+        degrees = int(residual_diagnostics.get("degrees_of_freedom", 0))
+        case_mahalanobis = residual_diagnostics.get("mahalanobis_squared", {})
+        if isinstance(case_mahalanobis, Mapping) and degrees > 0:
+            for name in mahalanobis:
+                value = case_mahalanobis.get(name)
+                if value is not None:
+                    mahalanobis[name].append((float(value), degrees))
+            num_cases += 1
+        for isotope, item in result.get("per_isotope", {}).items():
+            if isotope not in by_isotope:
+                by_isotope[isotope] = _covariance_summary_accumulator()
+            truth = float(item.get("transport_truth_counts", 0.0))
+            include_coverage = truth >= float(min_target)
+            runtime = _finite_variance(item.get("response_poisson_variance", 1.0))
+            raw_stage = item.get("response_poisson_variance_stages", {})
+            stage = dict(raw_stage) if isinstance(raw_stage, Mapping) else {}
+            stage.setdefault(
+                "formal_variance",
+                item.get("response_poisson_formal_variance", runtime),
+            )
+            stage.setdefault(
+                "ceilinged_formal_variance",
+                item.get("response_poisson_ceilinged_formal_variance", runtime),
+            )
+            stage.setdefault("runtime_variance", runtime)
+            stage.setdefault(
+                "projected_variance",
+                item.get("response_poisson_projected_variance", runtime),
+            )
+            count = float(
+                dict(item.get("method_counts", {})).get("response_poisson", 0.0)
+            )
+            _accumulate_covariance_record(
+                total,
+                count=count,
+                truth=truth,
+                stage=stage,
+                include_coverage=include_coverage,
+            )
+            _accumulate_covariance_record(
+                by_isotope[isotope],
+                count=count,
+                truth=truth,
+                stage=stage,
+                include_coverage=include_coverage,
+            )
+    return {
+        "metric_definitions": {
+            "formal_variance": (
+                "response-regression covariance before runtime ceiling/floors"
+            ),
+            "runtime_variance": (
+                "RuntimeCountExtractor diagonal after ceiling and all floors"
+            ),
+            "projected_variance": (
+                "per-isotope variance returned by the runtime PF shared "
+                "observation-covariance projection"
+            ),
+            "mahalanobis_squared": (
+                "quadratic residual against Geant4 isotope-labeled transport "
+                "truth, with the named covariance stage"
+            ),
+        },
+        "min_transport_truth_counts": float(min_target),
+        "num_cases_with_covariance_residuals": int(num_cases),
+        **_finalize_covariance_accumulator(total),
+        "mahalanobis_vs_transport_truth": {
+            name: _mahalanobis_distribution(values)
+            for name, values in mahalanobis.items()
+        },
+        "by_isotope": {
+            isotope: _finalize_covariance_accumulator(accumulator)
+            for isotope, accumulator in sorted(by_isotope.items())
+        },
+    }
+
+
+def _pf_likelihood_summary_accumulator() -> dict[str, Any]:
+    """Return an empty final-PF-likelihood calibration accumulator."""
+    return {
+        "normalized_residuals": [],
+        "relative_scales": [],
+        "case_squared_distances": [],
+        "by_isotope": {
+            isotope: {"normalized_residuals": [], "relative_scales": []}
+            for isotope in ISOTOPES
+        },
+    }
+
+
+def _finalize_pf_likelihood_summary(
+    accumulator: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Finalize normalized residual and scale summaries for one PF target."""
+    normalized = list(accumulator.get("normalized_residuals", []))
+    relative_scales = list(accumulator.get("relative_scales", []))
+    case_distances = list(accumulator.get("case_squared_distances", []))
+    by_isotope_payload = accumulator.get("by_isotope", {})
+    by_isotope = (
+        by_isotope_payload if isinstance(by_isotope_payload, Mapping) else {}
+    )
+    return {
+        "num_records": int(len(normalized)),
+        "num_cases": int(len(case_distances)),
+        "normalized_residual_coverage": _normalized_residual_coverage(
+            normalized
+        ),
+        "likelihood_scale_over_target": _finite_distribution(relative_scales),
+        "diagonal_squared_distance": _mahalanobis_distribution(case_distances),
+        "by_isotope": {
+            isotope: {
+                "num_records": int(
+                    len(
+                        dict(by_isotope.get(isotope, {})).get(
+                            "normalized_residuals",
+                            [],
+                        )
+                    )
+                ),
+                "normalized_residual_coverage": _normalized_residual_coverage(
+                    list(
+                        dict(by_isotope.get(isotope, {})).get(
+                            "normalized_residuals",
+                            [],
+                        )
+                    )
+                ),
+                "likelihood_scale_over_target": _finite_distribution(
+                    list(
+                        dict(by_isotope.get(isotope, {})).get(
+                            "relative_scales",
+                            [],
+                        )
+                    )
+                ),
+            }
+            for isotope in ISOTOPES
+        },
+    }
+
+
+def summarize_pf_count_likelihood_diagnostics(
+    results: list[dict[str, Any]],
+    min_target: float,
+) -> dict[str, Any]:
+    """Summarize residual calibration at the final runtime PF likelihood scale."""
+    accumulators: dict[str, dict[str, Any]] = {}
+    likelihood_specs: dict[str, Any] = {}
+    scale_semantics = ""
+    observation_semantics = ""
+    for result in results:
+        case = result.get("case", {})
+        if not bool(case.get("include_in_accuracy_summary", True)):
+            continue
+        payload = result.get("pf_count_likelihood_diagnostics", {})
+        if not isinstance(payload, Mapping):
+            continue
+        if not likelihood_specs:
+            raw_specs = payload.get("likelihood_spec_by_isotope", {})
+            if isinstance(raw_specs, Mapping):
+                likelihood_specs = dict(raw_specs)
+        scale_semantics = str(payload.get("scale_semantics", scale_semantics))
+        observation_semantics = str(
+            payload.get("observation_variance_semantics", observation_semantics)
+        )
+        targets = payload.get("targets", {})
+        if not isinstance(targets, Mapping):
+            continue
+        for target_name, raw_target in targets.items():
+            if not isinstance(raw_target, Mapping):
+                continue
+            accumulator = accumulators.setdefault(
+                str(target_name),
+                _pf_likelihood_summary_accumulator(),
+            )
+            target_counts = raw_target.get("target_counts_by_isotope", {})
+            normalized = raw_target.get("normalized_residual_by_isotope", {})
+            relative_scales = raw_target.get(
+                "likelihood_scale_over_target_by_isotope",
+                {},
+            )
+            if not all(
+                isinstance(value, Mapping)
+                for value in (target_counts, normalized, relative_scales)
+            ):
+                continue
+            case_values: list[float] = []
+            for isotope in ISOTOPES:
+                target = float(target_counts.get(isotope, 0.0))
+                if target < float(min_target):
+                    continue
+                normalized_value = float(normalized.get(isotope, float("nan")))
+                relative_scale = float(
+                    relative_scales.get(isotope, float("nan"))
+                )
+                if not np.isfinite(normalized_value) or not np.isfinite(
+                    relative_scale
+                ):
+                    continue
+                accumulator["normalized_residuals"].append(normalized_value)
+                accumulator["relative_scales"].append(relative_scale)
+                isotope_accumulator = accumulator["by_isotope"][isotope]
+                isotope_accumulator["normalized_residuals"].append(
+                    normalized_value
+                )
+                isotope_accumulator["relative_scales"].append(relative_scale)
+                case_values.append(normalized_value)
+            if case_values:
+                accumulator["case_squared_distances"].append(
+                    (float(np.sum(np.square(case_values))), len(case_values))
+                )
+    return {
+        "metric_definitions": {
+            "normalized_residual": (
+                "(response_poisson - truth-source PF forward target) divided "
+                "by the configured count-likelihood scale"
+            ),
+            "diagonal_squared_distance": (
+                "sum of squared normalized count residuals; this is a scale "
+                "diagnostic, not a Student-t chi-square statistic"
+            ),
+        },
+        "min_pf_target_counts": float(min_target),
+        "scale_semantics": scale_semantics,
+        "observation_variance_semantics": observation_semantics,
+        "likelihood_spec_by_isotope": likelihood_specs,
+        "targets": {
+            target_name: _finalize_pf_likelihood_summary(accumulator)
+            for target_name, accumulator in sorted(accumulators.items())
+        },
+    }
 
 
 def summarize_accuracy(
@@ -4987,6 +6418,18 @@ def build_summary(
         "elapsed_s": float(time.time() - sweep_start),
         "min_target_counts": float(args.min_target_counts),
         "accuracy_summary": summarize_accuracy(results, float(args.min_target_counts)),
+        "response_poisson_covariance_summary": (
+            summarize_response_poisson_covariance(
+                results,
+                float(args.min_target_counts),
+            )
+        ),
+        "pf_count_likelihood_summary": (
+            summarize_pf_count_likelihood_diagnostics(
+                results,
+                float(args.min_target_counts),
+            )
+        ),
         "shield_pair_diagnostics": summarize_shield_pair_diagnostics(
             results,
             float(args.min_target_counts),
@@ -5296,6 +6739,8 @@ def main() -> None:
     )
 
     decomposer = SpectralDecomposer(spectrum_config_from_runtime_config(runtime_config))
+    covariance_projector = build_runtime_covariance_projector(runtime_config)
+    likelihood_specs = build_runtime_count_likelihood_specs(runtime_config)
     results: list[dict[str, Any]] = []
     spectra: dict[str, np.ndarray] = {}
     cases_seen: list[ValidationCase] = []
@@ -5312,6 +6757,8 @@ def main() -> None:
             result, spectrum = run_case(
                 app,
                 decomposer,
+                covariance_projector,
+                likelihood_specs,
                 case,
                 step_id,
                 runtime_config,

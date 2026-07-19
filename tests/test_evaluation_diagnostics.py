@@ -249,6 +249,7 @@ def test_summarize_cluster_stability_tracks_motion_and_count_stability() -> None
 
     isotope = diagnostics["by_isotope"]["Cs-137"]
     assert isotope["final_window_count_stability_fraction"] == 1.0
+    assert isotope["unmatched_cluster_event_count"] == 0
     assert isotope["birth_death_event_count"] == 0
     shift = isotope["consecutive_matched_cluster_shift_m"]
     assert shift["count"] == 2
@@ -289,10 +290,17 @@ def test_cluster_stability_separates_final_window_and_same_count_replacement() -
     )
 
     isotope = diagnostics["by_isotope"]["Cs-137"]
+    assert isotope["unmatched_cluster_appearance_count"] == 1
+    assert isotope["unmatched_cluster_disappearance_count"] == 1
+    assert isotope["unmatched_cluster_event_count"] == 2
+    assert isotope["same_cardinality_cluster_replacement_transition_count"] == 1
     assert isotope["birth_event_count"] == 1
     assert isotope["death_event_count"] == 1
     assert isotope["birth_death_event_count"] == 2
     assert isotope["same_count_birth_death_transition_count"] == 1
+    assert isotope["legacy_birth_death_key_semantics"] == (
+        "unmatched_reported_clusters_not_accepted_pf_transitions"
+    )
     assert isotope["all_history_consecutive_matched_cluster_shift_m"]["count"] == 2
     assert isotope["final_window_consecutive_matched_cluster_shift_m"]["count"] == 1
     final_strength = isotope[

@@ -25,7 +25,14 @@ from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kinds
 from measurement.surface_patches import SurfacePatchDictionary
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
-from pf.likelihood import expected_counts_per_source
+from pf.likelihood import (
+    CountLikelihoodSpec,
+    count_log_likelihood_terms_np,
+    count_log_likelihood_terms_torch,
+    expected_counts_per_source,
+    predictive_count_likelihood_variance,
+    predictive_count_likelihood_variance_torch,
+)
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.reporting import dedupe_report_candidates, measurement_vector
@@ -33,6 +40,8 @@ from pf.resampling import systematic_resample
 from pf.state import IsotopeState
 
 if TYPE_CHECKING:
+    import torch
+
     from pf.sparse_evidence import SparsePoissonEvidenceConfig
     from pf.surface_map import ContiguousPoissonBinAggregation, SurfaceMapConfig
 
@@ -83,7 +92,8 @@ class RotatingShieldPFConfig:
         - death_delta_ll_threshold: ΔLL threshold required to kill weak sources
         - support_ema_alpha: EMA weight for per-source ΔLL support
         - support_window: measurement window for per-source support scoring
-        - birth_window: measurement window for residual-driven birth proposals
+        - birth_window: measurement window for residual-driven birth proposals;
+          non-positive values use the full measurement history
         - birth_softmax_temp: temperature for residual proposal sampling
         - birth_min_score: score floor for residual proposal sampling
         - birth_enable: enable birth/death/split/merge moves
@@ -275,11 +285,17 @@ class RotatingShieldPFConfig:
         - init_num_sources: inclusive range for initial source count per particle
         - init_grid_spacing_m: grid spacing for deterministic particle initialization
         - init_grid_repeats: repeated strength samples per deterministic grid point
+        - init_joint_position_design: independent or Latin-hypercube source tuples
+        - init_joint_position_retries: complete tuples tested per anchor
+        - init_source_min_separation_m: prior minimum within-isotope spacing
         - roughening_k: roughening coefficient for post-resample position jitter
         - min_sigma_pos: minimum roughening sigma (meters)
         - max_sigma_pos: maximum roughening sigma (meters)
         - roughening_decay: multiplier decay per resample within an observation
         - roughening_min_mult: minimum multiplier for roughening decay
+        - init_strength_prior: lognormal, uniform, or log_uniform strength prior
+        - init_strength_min: optional lower source-strength support in cps@1m
+        - init_strength_max: optional upper source-strength support in cps@1m
         - init_strength_log_mean: log-normal median for fallback strength initialization
         - init_strength_log_sigma: log-normal spread for fallback strength initialization
         - strength_log_sigma: log-space jitter for strengths
@@ -330,6 +346,8 @@ class RotatingShieldPFConfig:
         - transport_model_abs_sigma: absolute transport-model mismatch floor in counts
         - spectrum_count_rel_sigma: relative spectrum-decomposition count uncertainty
         - spectrum_count_abs_sigma: additive spectrum-decomposition count uncertainty
+        - observation_count_variance_includes_counting_noise: whether propagated
+          extraction variance already contains its source-equivalent Poisson term
         - low_count_abs_sigma: extra low-count uncertainty floor in counts
         - low_count_transition_counts: count scale where the low-count floor decays
         - count_likelihood_df: Student-t degrees of freedom for robust count likelihood
@@ -374,6 +392,7 @@ class RotatingShieldPFConfig:
     spectrum_count_abs_sigma: float | Dict[str, float] = 0.0
     low_count_abs_sigma: float | Dict[str, float] = 0.0
     low_count_transition_counts: float | Dict[str, float] = 0.0
+    observation_count_variance_includes_counting_noise: bool = False
     count_likelihood_df: float = 5.0
     shield_contrast_likelihood_enable: bool = False
     shield_contrast_likelihood_weight: float = 1.0
@@ -394,6 +413,8 @@ class RotatingShieldPFConfig:
     p_birth: float = 0.05
     p_kill: float = 0.1
     death_low_q_streak: int = 10
+    death_strength_threshold: float = 0.0
+    death_require_low_strength: bool = True
     death_delta_ll_threshold: float = 0.0
     support_ema_alpha: float = 0.3
     support_window: int = 1
@@ -706,12 +727,18 @@ class RotatingShieldPFConfig:
     init_num_sources: Tuple[int, int] = (0, 3)
     init_grid_spacing_m: float | None = None
     init_grid_repeats: int = 1
+    init_joint_position_design: str = "independent"
+    init_joint_position_retries: int = 1
+    init_source_min_separation_m: float = 0.0
     roughening_k: float = 0.5
     surface_rejuvenation_enable: bool = True
     min_sigma_pos: float = 0.05
     max_sigma_pos: float = 1.5
     roughening_decay: float = 0.5
     roughening_min_mult: float = 0.25
+    init_strength_prior: str = "lognormal"
+    init_strength_min: float = 0.0
+    init_strength_max: float | None = None
     init_strength_log_mean: float = 9.0
     init_strength_log_sigma: float = 1.0
     strength_log_sigma: float = 0.3
@@ -783,6 +810,50 @@ class RotatingShieldPFConfig:
                 "ess_low and ess_high must satisfy 0 < ess_low < ess_high < 1."
             )
         self.init_grid_repeats = max(1, int(self.init_grid_repeats))
+        self.init_joint_position_design = (
+            str(self.init_joint_position_design).strip().lower().replace("-", "_")
+        )
+        if self.init_joint_position_design not in {"independent", "latin_hypercube"}:
+            raise ValueError(
+                "init_joint_position_design must be independent or latin_hypercube."
+            )
+        self.init_joint_position_retries = max(
+            1,
+            int(self.init_joint_position_retries),
+        )
+        self.init_source_min_separation_m = max(
+            float(self.init_source_min_separation_m),
+            0.0,
+        )
+        self.death_strength_threshold = max(
+            float(self.death_strength_threshold),
+            0.0,
+        )
+        self.init_strength_prior = (
+            str(self.init_strength_prior).strip().lower().replace("-", "_")
+        )
+        if self.init_strength_prior not in {"lognormal", "uniform", "log_uniform"}:
+            raise ValueError(
+                "init_strength_prior must be lognormal, uniform, or log_uniform."
+            )
+        self.init_strength_min = max(float(self.init_strength_min), 0.0)
+        self.init_strength_max = (
+            None
+            if self.init_strength_max is None
+            else float(self.init_strength_max)
+        )
+        if (
+            self.init_strength_max is not None
+            and self.init_strength_max < self.init_strength_min
+        ):
+            raise ValueError("init_strength_max must be >= init_strength_min.")
+        if self.init_strength_prior in {"uniform", "log_uniform"}:
+            if self.init_strength_max is None or not np.isfinite(
+                self.init_strength_max
+            ):
+                raise ValueError("bounded strength priors require a finite maximum.")
+        if self.init_strength_prior == "log_uniform" and self.init_strength_min <= 0.0:
+            raise ValueError("log_uniform strength prior requires a positive minimum.")
         self.ig_workers = int(self.ig_workers)
         if self.ig_workers < 0:
             raise ValueError("ig_workers must be >= 0.")
@@ -850,6 +921,9 @@ class RotatingShieldPFConfig:
                 "count_likelihood_model must be poisson, gaussian, or student_t."
             )
         self.count_likelihood_model = normalized_likelihood
+        self.observation_count_variance_includes_counting_noise = bool(
+            self.observation_count_variance_includes_counting_noise
+        )
         self.count_likelihood_df = max(float(self.count_likelihood_df), 1.0)
         self.shield_view_ratio_likelihood_enable = bool(
             self.shield_view_ratio_likelihood_enable
@@ -2983,6 +3057,9 @@ class RotatingShieldPFEstimator:
             spectrum_count_abs_sigma=self.pf_config.spectrum_count_abs_sigma,
             low_count_abs_sigma=self.pf_config.low_count_abs_sigma,
             low_count_transition_counts=self.pf_config.low_count_transition_counts,
+            observation_count_variance_includes_counting_noise=(
+                self.pf_config.observation_count_variance_includes_counting_noise
+            ),
             count_likelihood_df=self.pf_config.count_likelihood_df,
             shield_contrast_likelihood_enable=(
                 self.pf_config.shield_contrast_likelihood_enable
@@ -3029,6 +3106,8 @@ class RotatingShieldPFEstimator:
             p_birth=self.pf_config.p_birth,
             p_kill=self.pf_config.p_kill,
             death_low_q_streak=self.pf_config.death_low_q_streak,
+            death_strength_threshold=self.pf_config.death_strength_threshold,
+            death_require_low_strength=self.pf_config.death_require_low_strength,
             death_delta_ll_threshold=self.pf_config.death_delta_ll_threshold,
             support_ema_alpha=self.pf_config.support_ema_alpha,
             support_window=self.pf_config.support_window,
@@ -3387,12 +3466,20 @@ class RotatingShieldPFEstimator:
             init_num_sources=self.pf_config.init_num_sources,
             init_grid_spacing_m=self.pf_config.init_grid_spacing_m,
             init_grid_repeats=self.pf_config.init_grid_repeats,
+            init_joint_position_design=self.pf_config.init_joint_position_design,
+            init_joint_position_retries=self.pf_config.init_joint_position_retries,
+            init_source_min_separation_m=(
+                self.pf_config.init_source_min_separation_m
+            ),
             roughening_k=self.pf_config.roughening_k,
             surface_rejuvenation_enable=self.pf_config.surface_rejuvenation_enable,
             min_sigma_pos=self.pf_config.min_sigma_pos,
             max_sigma_pos=self.pf_config.max_sigma_pos,
             roughening_decay=self.pf_config.roughening_decay,
             roughening_min_mult=self.pf_config.roughening_min_mult,
+            init_strength_prior=self.pf_config.init_strength_prior,
+            init_strength_min=self.pf_config.init_strength_min,
+            init_strength_max=self.pf_config.init_strength_max,
             init_strength_log_mean=self.pf_config.init_strength_log_mean,
             init_strength_log_sigma=self.pf_config.init_strength_log_sigma,
             strength_log_sigma=self.pf_config.strength_log_sigma,
@@ -4482,6 +4569,95 @@ class RotatingShieldPFEstimator:
         )
         return lam_t.detach().cpu().numpy().astype(float, copy=False)
 
+    def expected_counts_all_pairs_for_states_at_detectors(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        live_time_s: float,
+        states: Sequence[IsotopeState],
+    ) -> NDArray[np.float64]:
+        """Compute all-pair counts for many detector positions in one batch.
+
+        The result is shaped ``(detector, pair, state)``.  Particle source slots
+        are packed once and the shared continuous kernel evaluates every
+        detector/source/pair response together.  Callers should pass bounded
+        detector chunks when many planning poses are under consideration.
+        """
+        detectors = np.asarray(detector_positions, dtype=float)
+        if detectors.size == 0:
+            detectors = np.zeros((0, 3), dtype=float)
+        if detectors.ndim != 2 or detectors.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (D, 3).")
+        num_pairs = int(self.num_orientations) * int(self.num_orientations)
+        state_count = len(states)
+        if state_count == 0:
+            return np.zeros((detectors.shape[0], num_pairs, 0), dtype=float)
+
+        max_sources = max((max(0, int(state.num_sources)) for state in states), default=0)
+        backgrounds = np.asarray(
+            [max(float(state.background), 0.0) for state in states],
+            dtype=float,
+        )
+        source_rates = np.zeros(
+            (detectors.shape[0], num_pairs, state_count),
+            dtype=float,
+        )
+        if max_sources > 0 and detectors.shape[0] > 0:
+            positions = np.zeros((state_count, max_sources, 3), dtype=float)
+            strengths = np.zeros((state_count, max_sources), dtype=float)
+            for state_index, state in enumerate(states):
+                source_count = min(max(0, int(state.num_sources)), max_sources)
+                if source_count <= 0:
+                    continue
+                positions[state_index, :source_count, :] = np.asarray(
+                    state.positions[:source_count],
+                    dtype=float,
+                )
+                strengths[state_index, :source_count] = np.maximum(
+                    np.asarray(state.strengths[:source_count], dtype=float),
+                    0.0,
+                )
+            kernel_values = self._continuous_kernel().kernel_values_all_pairs_for_detectors(
+                isotope=isotope,
+                detector_positions=detectors,
+                sources=positions.reshape(-1, 3),
+            )
+            expected_shape = (
+                detectors.shape[0],
+                num_pairs,
+                state_count * max_sources,
+            )
+            if kernel_values.shape != expected_shape:
+                raise RuntimeError(
+                    "Batched all-pair kernel returned an unexpected shape: "
+                    f"{kernel_values.shape} != {expected_shape}."
+                )
+            source_rates = np.einsum(
+                "daps,ps->dap",
+                kernel_values.reshape(
+                    detectors.shape[0],
+                    num_pairs,
+                    state_count,
+                    max_sources,
+                ),
+                strengths,
+                optimize=True,
+            )
+
+        num_orients = int(self.num_orientations)
+        fe_indices = np.repeat(np.arange(num_orients), num_orients)
+        pb_indices = np.tile(np.arange(num_orients), num_orients)
+        source_scales = self.response_scales_for_measurements(
+            isotope,
+            fe_indices,
+            pb_indices,
+        )
+        rates = (
+            backgrounds[None, None, :]
+            + source_scales[None, :, None] * np.maximum(source_rates, 0.0)
+        )
+        return np.maximum(float(live_time_s) * rates, 0.0)
+
     def shield_selection_batch_grids(
         self,
         pose_idx: int,
@@ -5159,7 +5335,10 @@ class RotatingShieldPFEstimator:
         )
         if bool(self.pf_config.sparse_poisson_evidence_enable):
             self.refresh_sparse_poisson_evidence()
-        self._apply_birth_death(birth_window_override=birth_context_count)
+        birth_window_override = (
+            birth_context_count if int(self.pf_config.birth_window) > 0 else None
+        )
+        self._apply_birth_death(birth_window_override=birth_window_override)
         self._invalidate_report_cache()
         post_finalize_estimates = self.estimates(use_pre_finalize_guard=False)
         self._update_pre_finalize_guard(
@@ -13990,13 +14169,311 @@ class RotatingShieldPFEstimator:
         """Return the number of shield orientation normals."""
         return self.normals.shape[0]
 
+    def count_likelihood_spec_for_isotope(
+        self,
+        isotope: str,
+    ) -> CountLikelihoodSpec:
+        """Return the normalized runtime count-likelihood spec for an isotope."""
+        filt = self.filters[str(isotope)]
+        return CountLikelihoodSpec(**filt._count_likelihood_kwargs())
+
+    @staticmethod
+    def _sample_planning_count_observations_np(
+        selected_lambdas: NDArray[np.float64],
+        predictive_variance: NDArray[np.float64] | float,
+        *,
+        spec: CountLikelihoodSpec,
+        rng: np.random.Generator,
+        epsilon: float = 1.0e-12,
+    ) -> NDArray[np.float64]:
+        """Sample non-negative future counts from the configured planning model."""
+        lambdas = np.maximum(np.asarray(selected_lambdas, dtype=float), epsilon)
+        if spec.model == "poisson":
+            return np.asarray(rng.poisson(lambdas), dtype=float)
+        scale = np.sqrt(
+            np.maximum(np.asarray(predictive_variance, dtype=float), epsilon)
+        )
+        if spec.model == "gaussian":
+            observations = rng.normal(loc=lambdas, scale=scale)
+        else:
+            df = max(float(spec.student_t_df), 1.0 + epsilon)
+            observations = lambdas + scale * rng.standard_t(
+                df,
+                size=lambdas.shape,
+            )
+        return np.maximum(np.asarray(observations, dtype=float), 0.0)
+
+    @staticmethod
+    def _sample_planning_count_observations_torch(
+        selected_lambdas: "torch.Tensor",
+        predictive_variance: "torch.Tensor",
+        *,
+        spec: CountLikelihoodSpec,
+        epsilon: float = 1.0e-12,
+    ) -> "torch.Tensor":
+        """Return the Torch equivalent of planning count observation sampling."""
+        import torch
+
+        lambdas = torch.clamp(selected_lambdas.to(dtype=torch.float64), min=epsilon)
+        if spec.model == "poisson":
+            return torch.poisson(lambdas)
+        scale = torch.sqrt(
+            torch.clamp(
+                predictive_variance.to(device=lambdas.device, dtype=torch.float64),
+                min=epsilon,
+            )
+        )
+        if spec.model == "gaussian":
+            observations = lambdas + scale * torch.randn_like(lambdas)
+        else:
+            df = max(float(spec.student_t_df), 1.0 + epsilon)
+            distribution = torch.distributions.StudentT(
+                torch.as_tensor(df, device=lambdas.device, dtype=torch.float64)
+            )
+            noise = distribution.sample(lambdas.shape)
+            observations = lambdas + scale * noise
+        return torch.clamp(observations, min=0.0)
+
+    @staticmethod
+    def _planning_eig_from_lambdas_np(
+        lambdas_ap: NDArray[np.float64],
+        weights_p: NDArray[np.float64],
+        *,
+        spec: CountLikelihoodSpec,
+        num_samples: int,
+        rng: np.random.Generator,
+        observations_as: NDArray[np.float64] | None = None,
+        epsilon: float = 1.0e-12,
+    ) -> NDArray[np.float64]:
+        """Return batched action EIG using the configured count likelihood."""
+        lambdas = np.maximum(np.asarray(lambdas_ap, dtype=float), epsilon)
+        if lambdas.ndim == 1:
+            lambdas = lambdas.reshape(1, -1)
+        if lambdas.ndim != 2:
+            raise ValueError("lambdas_ap must have shape action x particle.")
+        weights = np.maximum(np.asarray(weights_p, dtype=float).reshape(-1), 0.0)
+        if weights.size != lambdas.shape[1]:
+            raise ValueError("weights_p must have one value per particle.")
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= epsilon:
+            weights = np.full(weights.size, 1.0 / max(weights.size, 1), dtype=float)
+        else:
+            weights = weights / weight_sum
+        log_weights = np.log(weights + epsilon)
+        h_prior = -float(np.sum(weights * log_weights))
+        action_count = int(lambdas.shape[0])
+        if observations_as is None:
+            sample_count = int(num_samples)
+            if sample_count <= 0:
+                return np.full(action_count, h_prior, dtype=float)
+            sample_indices = rng.choice(
+                weights.size,
+                size=(action_count, sample_count),
+                replace=True,
+                p=weights,
+            )
+            selected = np.take_along_axis(lambdas, sample_indices, axis=1)
+            predictive_variance = predictive_count_likelihood_variance(
+                selected,
+                spec=spec,
+                epsilon=epsilon,
+            )
+            observations = (
+                RotatingShieldPFEstimator._sample_planning_count_observations_np(
+                    selected,
+                    predictive_variance,
+                    spec=spec,
+                    rng=rng,
+                    epsilon=epsilon,
+                )
+            )
+        else:
+            observations = np.asarray(observations_as, dtype=float)
+            if observations.ndim == 1 and action_count == 1:
+                observations = observations.reshape(1, -1)
+            if observations.ndim != 2 or observations.shape[0] != action_count:
+                raise ValueError("observations_as must have shape action x sample.")
+            if observations.shape[1] == 0:
+                return np.full(action_count, h_prior, dtype=float)
+        likelihood_terms = count_log_likelihood_terms_np(
+            observations[:, :, None],
+            lambdas[:, None, :],
+            spec=spec,
+            epsilon=epsilon,
+        )
+        log_posterior = log_weights[None, None, :] + likelihood_terms
+        log_posterior -= logsumexp(log_posterior, axis=2, keepdims=True)
+        posterior = np.exp(log_posterior)
+        h_post = -np.sum(
+            posterior * np.log(posterior + epsilon),
+            axis=2,
+        )
+        return np.full(action_count, h_prior, dtype=float) - np.mean(h_post, axis=1)
+
+    @staticmethod
+    def _planning_eig_from_lambdas_torch(
+        lambdas_ap: "torch.Tensor",
+        weights_p: "torch.Tensor",
+        *,
+        spec: CountLikelihoodSpec,
+        num_samples: int,
+        observations_as: "torch.Tensor | None" = None,
+        epsilon: float = 1.0e-12,
+    ) -> "torch.Tensor":
+        """Return Torch action EIG equivalent to the batched NumPy helper."""
+        import torch
+
+        lambdas = torch.clamp(lambdas_ap.to(dtype=torch.float64), min=epsilon)
+        if lambdas.ndim == 1:
+            lambdas = lambdas.reshape(1, -1)
+        if lambdas.ndim != 2:
+            raise ValueError("lambdas_ap must have shape action x particle.")
+        weights = torch.clamp(
+            weights_p.to(device=lambdas.device, dtype=torch.float64).reshape(-1),
+            min=0.0,
+        )
+        if int(weights.numel()) != int(lambdas.shape[1]):
+            raise ValueError("weights_p must have one value per particle.")
+        weight_sum = torch.sum(weights)
+        if float(weight_sum.detach().cpu().item()) <= epsilon:
+            weights = torch.full_like(weights, 1.0 / max(int(weights.numel()), 1))
+        else:
+            weights = weights / weight_sum
+        log_weights = torch.log(weights + epsilon)
+        h_prior = -torch.sum(weights * log_weights)
+        action_count = int(lambdas.shape[0])
+        if observations_as is None:
+            sample_count = int(num_samples)
+            if sample_count <= 0:
+                return torch.full(
+                    (action_count,),
+                    float(h_prior.detach().cpu().item()),
+                    device=lambdas.device,
+                    dtype=torch.float64,
+                )
+            sample_indices = torch.multinomial(
+                weights.expand(action_count, -1),
+                sample_count,
+                replacement=True,
+            )
+            selected = torch.gather(lambdas, 1, sample_indices)
+            predictive_variance = predictive_count_likelihood_variance_torch(
+                selected,
+                spec=spec,
+                epsilon=epsilon,
+            )
+            observations = (
+                RotatingShieldPFEstimator._sample_planning_count_observations_torch(
+                    selected,
+                    predictive_variance,
+                    spec=spec,
+                    epsilon=epsilon,
+                )
+            )
+        else:
+            observations = observations_as.to(
+                device=lambdas.device,
+                dtype=torch.float64,
+            )
+            if observations.ndim == 1 and action_count == 1:
+                observations = observations.reshape(1, -1)
+            if observations.ndim != 2 or int(observations.shape[0]) != action_count:
+                raise ValueError("observations_as must have shape action x sample.")
+            if int(observations.shape[1]) == 0:
+                return h_prior.expand(action_count).clone()
+        likelihood_terms = count_log_likelihood_terms_torch(
+            observations.unsqueeze(2),
+            lambdas.unsqueeze(1),
+            spec=spec,
+            epsilon=epsilon,
+        )
+        log_posterior = log_weights.view(1, 1, -1) + likelihood_terms
+        log_posterior = log_posterior - torch.logsumexp(
+            log_posterior,
+            dim=2,
+            keepdim=True,
+        )
+        posterior = torch.exp(log_posterior)
+        h_post = -torch.sum(
+            posterior * torch.log(posterior + epsilon),
+            dim=2,
+        )
+        return h_prior - torch.mean(h_post, dim=1)
+
+    @staticmethod
+    def _expected_strength_uncertainty_from_lambdas_np(
+        lambdas_p: NDArray[np.float64],
+        weights_p: NDArray[np.float64],
+        strengths_pm: NDArray[np.float64],
+        *,
+        spec: CountLikelihoodSpec,
+        num_samples: int,
+        rng: np.random.Generator,
+        epsilon: float = 1.0e-12,
+    ) -> float:
+        """Return batched expected posterior strength variance for one action."""
+        lambdas = np.maximum(np.asarray(lambdas_p, dtype=float).reshape(-1), epsilon)
+        weights = np.maximum(np.asarray(weights_p, dtype=float).reshape(-1), 0.0)
+        strengths = np.asarray(strengths_pm, dtype=float)
+        if strengths.ndim != 2 or strengths.shape[0] != lambdas.size:
+            raise ValueError("strengths_pm must have one row per particle.")
+        if weights.size != lambdas.size:
+            raise ValueError("weights_p must have one value per particle.")
+        sample_count = int(num_samples)
+        if sample_count <= 0 or strengths.size == 0:
+            return 0.0
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= epsilon:
+            weights = np.full(weights.size, 1.0 / max(weights.size, 1), dtype=float)
+        else:
+            weights = weights / weight_sum
+        sample_indices = rng.choice(
+            weights.size,
+            size=sample_count,
+            replace=True,
+            p=weights,
+        )
+        selected_lambdas = lambdas[sample_indices]
+        predictive_variance = predictive_count_likelihood_variance(
+            selected_lambdas,
+            spec=spec,
+            epsilon=epsilon,
+        )
+        observations = (
+            RotatingShieldPFEstimator._sample_planning_count_observations_np(
+                selected_lambdas,
+                predictive_variance,
+                spec=spec,
+                rng=rng,
+                epsilon=epsilon,
+            )
+        )
+        likelihood_terms = count_log_likelihood_terms_np(
+            observations[:, None],
+            lambdas[None, :],
+            spec=spec,
+            epsilon=epsilon,
+        )
+        log_posterior = np.log(weights + epsilon)[None, :] + likelihood_terms
+        log_posterior -= logsumexp(log_posterior, axis=1, keepdims=True)
+        posterior = np.exp(log_posterior)
+        posterior_mean = posterior @ strengths
+        posterior_second = posterior @ (strengths * strengths)
+        posterior_variance = np.maximum(
+            posterior_second - posterior_mean * posterior_mean,
+            0.0,
+        )
+        return float(np.mean(np.sum(posterior_variance, axis=1)))
+
     def orientation_information_gain(
         self, pose_idx: int, orient_idx: int, live_time_s: float = 1.0
     ) -> float:
         """
         Information gain surrogate using Eq. (3.40)–(3.42) style variance ratio.
 
-        IG_k(phi) ~= 0.5 * log(1 + Var[Lambda_k(phi)] / E[Lambda_k(phi)]) aggregated over isotopes.
+        The denominator is the configured likelihood's predictive variance at
+        the posterior-mean count. It reduces to the original mean-count
+        denominator exactly for a Poisson likelihood.
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
@@ -14018,7 +14495,14 @@ class RotatingShieldPFEstimator:
                 w = np.zeros(0, dtype=float)
             mean = float(np.sum(w * lam))
             var = float(np.sum(w * (lam - mean) ** 2))
-            ig_total += 0.5 * float(np.log1p(var / max(mean, eps)))
+            predictive_variance = float(
+                predictive_count_likelihood_variance(
+                    np.asarray(mean, dtype=float),
+                    spec=self.count_likelihood_spec_for_isotope(iso),
+                    epsilon=eps,
+                )
+            )
+            ig_total += 0.5 * float(np.log1p(var / predictive_variance))
         return ig_total
 
     def max_orientation_information_gain(
@@ -14145,22 +14629,18 @@ class RotatingShieldPFEstimator:
                 weights_t = torch.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
             else:
                 weights_t = weights_t / weight_sum
-            H_prior = -torch.sum(weights_t * torch.log(weights_t + eps))
-            if num_samples <= 0:
-                H_post_mean = torch.zeros((), device=device, dtype=dtype)
-            else:
-                idx = torch.multinomial(weights_t, num_samples, replacement=True)
-                z = torch.poisson(lam_t[idx])
-                logw = (
-                    torch.log(weights_t + eps)
-                    + z.unsqueeze(1) * torch.log(lam_t + eps)
-                    - lam_t
-                )
-                logw = logw - torch.logsumexp(logw, dim=1, keepdim=True)
-                w_post = torch.exp(logw)
-                H_post = -torch.sum(w_post * torch.log(w_post + eps), dim=1)
-                H_post_mean = torch.mean(H_post)
-            ig_h = float((H_prior - H_post_mean).item())
+            ig_h = float(
+                self._planning_eig_from_lambdas_torch(
+                    lam_t,
+                    weights_t,
+                    spec=self.count_likelihood_spec_for_isotope(iso),
+                    num_samples=int(num_samples),
+                    epsilon=eps,
+                )[0]
+                .detach()
+                .cpu()
+                .item()
+            )
             total_ig += alphas.get(iso, 0.0) * ig_h
         return float(total_ig)
 
@@ -14186,22 +14666,56 @@ class RotatingShieldPFEstimator:
         num_orients = int(self.num_orientations)
         num_pairs = num_orients * num_orients
         if not self._can_use_gpu():
-            from measurement.shielding import generate_octant_rotation_matrices
-
-            rot_mats = generate_octant_rotation_matrices()
-            scores = np.zeros((num_orients, num_orients), dtype=float)
-            for fe_idx, RFe in enumerate(rot_mats[:num_orients]):
-                for pb_idx, RPb in enumerate(rot_mats[:num_orients]):
-                    scores[fe_idx, pb_idx] = self.orientation_expected_information_gain(
-                        pose_idx=pose_idx,
-                        RFe=RFe,
-                        RPb=RPb,
-                        live_time_s=live_time_s,
-                        num_samples=num_samples,
-                        alpha_by_isotope=alpha_by_isotope,
-                        particles_by_isotope=particles_by_isotope,
+            detector_pos = np.asarray(
+                self.kernel_cache.poses[int(pose_idx)],
+                dtype=float,
+            )
+            sample_count = (
+                self.pf_config.eig_num_samples
+                if num_samples is None
+                else int(num_samples)
+            )
+            eps = 1.0e-12
+            alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
+            alpha_sum = sum(float(value) for value in alphas.values()) or 1.0
+            alphas = {
+                key: float(value) / alpha_sum for key, value in alphas.items()
+            }
+            rng = np.random.default_rng()
+            scores = np.zeros(num_pairs, dtype=float)
+            for iso, filt in self.filters.items():
+                if getattr(filt, "is_converged", False) and getattr(
+                    filt.config,
+                    "converge_enable",
+                    False,
+                ):
+                    continue
+                if particles_by_isotope is not None and iso in particles_by_isotope:
+                    states, weights = particles_by_isotope[iso]
+                else:
+                    if not filt.continuous_particles:
+                        continue
+                    states = [particle.state for particle in filt.continuous_particles]
+                    weights = filt.continuous_weights
+                if not states:
+                    continue
+                lambdas = self.expected_counts_all_pairs_for_states_at_detector(
+                    isotope=iso,
+                    detector_pos=detector_pos,
+                    live_time_s=float(live_time_s),
+                    states=states,
+                )
+                scores += float(alphas.get(iso, 0.0)) * (
+                    self._planning_eig_from_lambdas_np(
+                        lambdas,
+                        np.asarray(weights, dtype=float),
+                        spec=self.count_likelihood_spec_for_isotope(iso),
+                        num_samples=sample_count,
+                        rng=rng,
+                        epsilon=eps,
                     )
-            return scores
+                )
+            return scores.reshape(num_orients, num_orients)
 
         detector_pos = np.asarray(self.kernel_cache.poses[int(pose_idx)], dtype=float)
         num_samples = (
@@ -14217,7 +14731,10 @@ class RotatingShieldPFEstimator:
 
         device = gpu_utils.resolve_device(self.pf_config.gpu_device)
         dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        iso_data: Dict[str, tuple["torch.Tensor", "torch.Tensor"]] = {}
+        iso_data: Dict[
+            str,
+            tuple["torch.Tensor", "torch.Tensor", CountLikelihoodSpec],
+        ] = {}
         for iso, filt in self.filters.items():
             if getattr(filt, "is_converged", False) and getattr(
                 filt.config, "converge_enable", False
@@ -14251,38 +14768,26 @@ class RotatingShieldPFEstimator:
                 weights_t = torch.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
             else:
                 weights_t = weights_t / weight_sum_t
-            iso_data[iso] = (lam_all, weights_t)
+            iso_data[iso] = (
+                lam_all,
+                weights_t,
+                self.count_likelihood_spec_for_isotope(iso),
+            )
         if not iso_data:
             return np.zeros((num_orients, num_orients), dtype=float)
 
-        scores = np.zeros(num_pairs, dtype=float)
-        for pair_idx in range(num_pairs):
-            total_ig = 0.0
-            for iso, (lam_all, weights_t) in iso_data.items():
-                lam_t = lam_all[pair_idx]
-                log_weights = torch.log(weights_t + eps)
-                h_prior = -torch.sum(weights_t * log_weights)
-                if int(num_samples) <= 0:
-                    h_post_mean = torch.zeros((), device=device, dtype=dtype)
-                else:
-                    idx = torch.multinomial(
-                        weights_t, int(num_samples), replacement=True
-                    )
-                    z = torch.poisson(lam_t[idx])
-                    logw = (
-                        log_weights.view(1, -1)
-                        + z.unsqueeze(1) * torch.log(lam_t + eps).view(1, -1)
-                        - lam_t.view(1, -1)
-                    )
-                    logw = logw - torch.logsumexp(logw, dim=1, keepdim=True)
-                    w_post = torch.exp(logw)
-                    h_post = -torch.sum(w_post * torch.log(w_post + eps), dim=1)
-                    h_post_mean = torch.mean(h_post)
-                total_ig += float(alphas.get(iso, 0.0)) * float(
-                    (h_prior - h_post_mean).item()
+        scores_t = torch.zeros(num_pairs, device=device, dtype=torch.float64)
+        for iso, (lam_all, weights_t, spec) in iso_data.items():
+            scores_t = scores_t + float(alphas.get(iso, 0.0)) * (
+                self._planning_eig_from_lambdas_torch(
+                    lam_all,
+                    weights_t,
+                    spec=spec,
+                    num_samples=int(num_samples),
+                    epsilon=eps,
                 )
-            scores[pair_idx] = total_ig
-        return scores.reshape(num_orients, num_orients)
+            )
+        return scores_t.detach().cpu().numpy().reshape(num_orients, num_orients)
 
     def _orientation_expected_information_gain_cpu(
         self,
@@ -14329,28 +14834,17 @@ class RotatingShieldPFEstimator:
                 states=states,
             )
             lam = np.maximum(np.asarray(lam, dtype=float).reshape(-1), eps)
-            h_prior = -float(np.sum(weights_arr * np.log(weights_arr + eps)))
-            if num_samples <= 0:
-                h_post_mean = 0.0
-            else:
-                sample_indices = rng.choice(
-                    weights_arr.size,
-                    size=int(num_samples),
-                    replace=True,
-                    p=weights_arr,
-                )
-                z_samples = rng.poisson(lam[sample_indices])
-                logw = (
-                    np.log(weights_arr + eps)[None, :]
-                    + z_samples[:, None] * np.log(lam + eps)[None, :]
-                    - lam[None, :]
-                )
-                logw -= logw.max(axis=1, keepdims=True)
-                w_post = np.exp(logw)
-                w_post /= np.maximum(np.sum(w_post, axis=1, keepdims=True), eps)
-                h_post = -np.sum(w_post * np.log(w_post + eps), axis=1)
-                h_post_mean = float(np.mean(h_post))
-            total_ig += alphas.get(iso, 0.0) * (h_prior - h_post_mean)
+            ig_h = float(
+                self._planning_eig_from_lambdas_np(
+                    lam,
+                    weights_arr,
+                    spec=self.count_likelihood_spec_for_isotope(iso),
+                    num_samples=int(num_samples),
+                    rng=rng,
+                    epsilon=eps,
+                )[0]
+            )
+            total_ig += alphas.get(iso, 0.0) * ig_h
         return float(total_ig)
 
     def _strength_matrix(self, filt: IsotopeParticleFilter) -> NDArray[np.float64]:
@@ -14378,8 +14872,9 @@ class RotatingShieldPFEstimator:
         """
         Monte-Carlo estimate of E[U | q_cand] where U = Σ_h Σ_m Var(q_{h,m}) (Eq. 3.38 surrogate).
 
-        Draw hypothetical Poisson observations at pose q_cand and average posterior variance of strengths.
-        Uses either Fe/Pb indices (if provided) or orient_idx into the kernel orientations.
+        Draw hypothetical observations from the configured count model and
+        average posterior strength variance. Uses either Fe/Pb indices or the
+        legacy single-orientation index.
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
@@ -14402,19 +14897,15 @@ class RotatingShieldPFEstimator:
                     pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
                 )
             strengths_mat = self._strength_matrix(filt)
-            U_accum = 0.0
-            for _ in range(num_samples):
-                n = int(rng.choice(len(lam), p=weights))
-                z = rng.poisson(lam[n])
-                logw = np.log(weights + eps) + z * np.log(lam + eps) - lam
-                logw -= logsumexp(logw)
-                w_post = np.exp(logw)
-                if strengths_mat.size == 0:
-                    continue
-                mean = np.sum(w_post[:, None] * strengths_mat, axis=0)
-                var = np.sum(w_post[:, None] * (strengths_mat - mean) ** 2, axis=0)
-                U_accum += float(np.sum(var))
-            total_U += U_accum / max(num_samples, 1)
+            total_U += self._expected_strength_uncertainty_from_lambdas_np(
+                lam,
+                np.asarray(weights, dtype=float),
+                strengths_mat,
+                spec=self.count_likelihood_spec_for_isotope(iso),
+                num_samples=int(num_samples),
+                rng=rng,
+                epsilon=eps,
+            )
         return float(total_U)
 
     def expected_uncertainty_after_pose_xyz(
@@ -14429,7 +14920,8 @@ class RotatingShieldPFEstimator:
         """
         Monte-Carlo estimate of E[U | pose_xyz] for an explicit detector position.
 
-        Uses Fe/Pb indices to compute expected counts without relying on pose indices.
+        Uses Fe/Pb indices and the configured count likelihood without relying
+        on pose indices.
         """
         detector_pos = np.asarray(pose_xyz, dtype=float)
         if detector_pos.shape != (3,):
@@ -14454,19 +14946,15 @@ class RotatingShieldPFEstimator:
             if lam.size == 0:
                 continue
             strengths_mat = self._strength_matrix(filt)
-            U_accum = 0.0
-            for _ in range(num_samples):
-                n = int(rng.choice(len(lam), p=weights))
-                z = rng.poisson(lam[n])
-                logw = np.log(weights + eps) + z * np.log(lam + eps) - lam
-                logw -= logsumexp(logw)
-                w_post = np.exp(logw)
-                if strengths_mat.size == 0:
-                    continue
-                mean = np.sum(w_post[:, None] * strengths_mat, axis=0)
-                var = np.sum(w_post[:, None] * (strengths_mat - mean) ** 2, axis=0)
-                U_accum += float(np.sum(var))
-            total_U += U_accum / max(num_samples, 1)
+            total_U += self._expected_strength_uncertainty_from_lambdas_np(
+                lam,
+                weights,
+                strengths_mat,
+                spec=self.count_likelihood_spec_for_isotope(iso),
+                num_samples=num_samples,
+                rng=rng,
+                epsilon=eps,
+            )
         return float(total_U)
 
     def expected_uncertainty_after_rotation(
@@ -14581,7 +15069,7 @@ class RotatingShieldPFEstimator:
             pb_idx: int,
             rng_local: np.random.Generator,
         ) -> Dict[str, float]:
-            """Simulate isotope-wise Poisson observations at the candidate pose."""
+            """Simulate isotope-wise observations from each runtime count model."""
             z_k: Dict[str, float] = {}
             for iso, filt in estimator.filters.items():
                 if not filt.continuous_particles:
@@ -14601,7 +15089,20 @@ class RotatingShieldPFEstimator:
                     z_k[iso] = float(np.sum(weights * lam))
                 else:
                     idx = int(rng_local.choice(len(lam), p=weights))
-                    z_k[iso] = float(rng_local.poisson(lam[idx]))
+                    spec = estimator.count_likelihood_spec_for_isotope(iso)
+                    selected_lambda = np.asarray(lam[idx], dtype=float)
+                    predictive_variance = predictive_count_likelihood_variance(
+                        selected_lambda,
+                        spec=spec,
+                    )
+                    z_k[iso] = float(
+                        estimator._sample_planning_count_observations_np(
+                            selected_lambda,
+                            predictive_variance,
+                            spec=spec,
+                            rng=rng_local,
+                        )
+                    )
             return z_k
 
         def _run_once(
@@ -14740,6 +15241,7 @@ class RotatingShieldPFEstimator:
                 "weights": weights,
                 "num_particles": weights.size,
                 "resample_threshold": filt.config.resample_threshold,
+                "likelihood_spec": self.count_likelihood_spec_for_isotope(iso),
             }
         if not iso_data:
             return 0.0 if not return_debug else (0.0, {"rollouts": [], "u_vals": []})
@@ -14777,20 +15279,9 @@ class RotatingShieldPFEstimator:
             subset_indices: NDArray[np.int64],
             subset_weights: NDArray[np.float64],
             num_samples: int,
+            spec: CountLikelihoodSpec,
         ) -> "torch.Tensor":
-            """Compute IG scores for all orientations from precomputed lambdas."""
-            if num_samples <= 0:
-                weights_t = torch.as_tensor(
-                    subset_weights, device=lam_all.device, dtype=lam_all.dtype
-                )
-                weights_t = weights_t / torch.sum(weights_t)
-                h_prior = -torch.sum(weights_t * torch.log(weights_t + eps))
-                return torch.full(
-                    (lam_all.shape[0],),
-                    h_prior,
-                    device=lam_all.device,
-                    dtype=lam_all.dtype,
-                )
+            """Compute model-aware IG for all orientations from cached lambdas."""
             idx_t = torch.as_tensor(
                 subset_indices, device=lam_all.device, dtype=torch.long
             )
@@ -14798,32 +15289,28 @@ class RotatingShieldPFEstimator:
             weights_t = torch.as_tensor(
                 subset_weights, device=lam_all.device, dtype=lam_all.dtype
             )
-            weights_t = weights_t / torch.sum(weights_t)
-            log_weights = torch.log(weights_t + eps)
-            h_prior = -torch.sum(weights_t * log_weights)
-            weights_row = weights_t.expand(lam_sel.shape[0], -1)
-            idx_samples = torch.multinomial(weights_row, num_samples, replacement=True)
-            lam_samples = torch.gather(lam_sel, 1, idx_samples)
-            z = torch.poisson(lam_samples)
-            log_lam = torch.log(lam_sel + eps)
-            logw = (
-                log_weights.view(1, 1, -1)
-                + z.unsqueeze(2) * log_lam.unsqueeze(1)
-                - lam_sel.unsqueeze(1)
+            return self._planning_eig_from_lambdas_torch(
+                lam_sel,
+                weights_t,
+                spec=spec,
+                num_samples=int(num_samples),
+                epsilon=eps,
             )
-            logw = logw - torch.logsumexp(logw, dim=2, keepdim=True)
-            w_post = torch.exp(logw)
-            h_post = -torch.sum(w_post * torch.log(w_post + eps), dim=2)
-            h_post_mean = torch.mean(h_post, dim=1)
-            return h_prior - h_post_mean
 
         def _update_weights(
             lam_curr: NDArray[np.float64],
             weights: NDArray[np.float64],
             z_obs: float,
+            spec: CountLikelihoodSpec,
         ) -> NDArray[np.float64]:
-            """Update weights using Poisson log-likelihood and normalize."""
-            logw = np.log(weights + eps) + z_obs * np.log(lam_curr + eps) - lam_curr
+            """Update rollout weights using the configured count likelihood."""
+            likelihood_terms = count_log_likelihood_terms_np(
+                np.asarray(z_obs, dtype=float),
+                lam_curr,
+                spec=spec,
+                epsilon=eps,
+            )
+            logw = np.log(weights + eps) + likelihood_terms
             logw -= np.max(logw)
             w = np.exp(logw)
             total = np.sum(w)
@@ -14863,6 +15350,7 @@ class RotatingShieldPFEstimator:
                         subset_indices=subset_idx,
                         subset_weights=subset_w,
                         num_samples=int(eig_samples),
+                        spec=data["likelihood_spec"],
                     )
                     weight = float(alphas.get(iso, 0.0))
                     ig_scores = ig_scores * weight
@@ -14898,8 +15386,28 @@ class RotatingShieldPFEstimator:
                         z_obs = float(np.sum(weights * lam_curr))
                     else:
                         idx = int(rng.choice(len(lam_curr), p=weights))
-                        z_obs = float(rng.poisson(lam_curr[idx]))
-                    weights = _update_weights(lam_curr, weights, z_obs)
+                        spec = data["likelihood_spec"]
+                        selected_lambda = np.asarray(lam_curr[idx], dtype=float)
+                        predictive_variance = predictive_count_likelihood_variance(
+                            selected_lambda,
+                            spec=spec,
+                            epsilon=eps,
+                        )
+                        z_obs = float(
+                            self._sample_planning_count_observations_np(
+                                selected_lambda,
+                                predictive_variance,
+                                spec=spec,
+                                rng=rng,
+                                epsilon=eps,
+                            )
+                        )
+                    weights = _update_weights(
+                        lam_curr,
+                        weights,
+                        z_obs,
+                        data["likelihood_spec"],
+                    )
                     ess = 1.0 / max(np.sum(weights**2), eps)
                     if ess < float(data["resample_threshold"]) * len(weights):
                         resampled = systematic_resample(np.log(weights + eps))

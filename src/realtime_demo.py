@@ -141,7 +141,9 @@ def _truth_free_live_runtime_config(value: Mapping[str, Any]) -> dict[str, Any]:
     """Remove source-realization inputs before publishing PF provenance."""
 
     def _is_realization_key(key: object) -> bool:
-        normalized = "".join(character for character in str(key).lower() if character.isalnum())
+        normalized = "".join(
+            character for character in str(key).lower() if character.isalnum()
+        )
         if normalized.startswith(("sourcerate", "sourceextent")):
             return any(
                 marker in normalized
@@ -216,9 +218,7 @@ def _build_effective_live_runtime_config(
             "generator": "realtime_source_candidate_grid.v1",
             "point_count": int(candidates.shape[0]),
             "xyz_sha256": sha256_json(candidates),
-            "spacing_xyz_m": json_safe(
-                spacing
-            ),
+            "spacing_xyz_m": json_safe(spacing),
             "margin_m": float(api_settings.get("candidate_grid_margin_m", 0.0)),
             "source_surface_prior": bool(
                 api_settings.get("source_surface_prior", False)
@@ -269,6 +269,67 @@ def _runtime_float(
     if value is None:
         return float(default)
     return float(value)
+
+
+def _seed_pf_random_generators(seed: int) -> None:
+    """Seed NumPy and Torch PF/planning draws from one declared run seed."""
+    resolved_seed = int(seed)
+    np.random.seed(resolved_seed)
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(resolved_seed)
+
+
+def _resolve_pf_initial_strength_prior(
+    runtime_config: Mapping[str, Any],
+) -> tuple[str, float, float | None]:
+    """Resolve the explicit PF strength prior without using realized truth."""
+    source_rate_model = str(runtime_config.get("source_rate_model", "")).strip().lower()
+    generator_min = runtime_config.get("random_source_intensity_min_cps_1m")
+    generator_max = runtime_config.get("random_source_intensity_max_cps_1m")
+    generator_prior_available = bool(
+        source_rate_model == "detector_cps_1m"
+        and generator_min is not None
+        and generator_max is not None
+    )
+    configured_prior = runtime_config.get("pf_init_strength_prior")
+    prior = (
+        "uniform"
+        if configured_prior is None and generator_prior_available
+        else str(configured_prior or "lognormal").strip().lower().replace("-", "_")
+    )
+    default_min = float(generator_min) if generator_prior_available else 0.0
+    default_max = float(generator_max) if generator_prior_available else None
+    minimum = max(
+        _runtime_float(
+            runtime_config,
+            "pf_init_strength_min_cps_1m",
+            default_min if prior in {"uniform", "log_uniform"} else 0.0,
+        ),
+        0.0,
+    )
+    maximum_raw = runtime_config.get("pf_init_strength_max_cps_1m")
+    if maximum_raw is None and prior in {"uniform", "log_uniform"}:
+        maximum_raw = default_max
+    maximum = None if maximum_raw is None else float(maximum_raw)
+    if prior not in {"lognormal", "uniform", "log_uniform"}:
+        raise ValueError(
+            "pf_init_strength_prior must be lognormal, uniform, or log_uniform."
+        )
+    if maximum is not None and maximum < minimum:
+        raise ValueError(
+            "pf_init_strength_max_cps_1m must be >= pf_init_strength_min_cps_1m."
+        )
+    if prior in {"uniform", "log_uniform"}:
+        if maximum is None or not np.isfinite(maximum):
+            raise ValueError("bounded PF strength priors require a finite maximum.")
+    if prior == "log_uniform" and minimum <= 0.0:
+        raise ValueError("log_uniform PF strength prior requires a positive minimum.")
+    return prior, float(minimum), maximum
 
 
 def _resolve_candidate_isotopes(
@@ -545,6 +606,12 @@ _PURE_PF_SUMMARY_PROVENANCE_KEYS = (
     "uses_batch_model_order",
     "batch_feedback_to_particles",
     "batch_methods_invoked",
+    "posterior_semantics",
+    "structural_kernel_family",
+    "structural_kernel_target_preserving",
+    "structural_kernel_exact_rj",
+    "reversible_jump_mcmc_used",
+    "structural_transition_provenance",
     "planner_belief_sources",
     "repository_commit",
     "measurement_log_schema_version",
@@ -578,6 +645,8 @@ def _pure_pf_summary_provenance(estimator: object) -> dict[str, Any]:
         "estimator_provenance": dict(payload.get("provenance", {})),
         "pf_posterior": payload,
     }
+
+
 from sim import (
     SimulationCommand,
     SimulationObservation,
@@ -1724,7 +1793,9 @@ def _final_count_bias_diagnostics(
         observed = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
         observed_blocks.append(observed)
         predicted_blocks.append(np.asarray(predicted, dtype=float).reshape(-1))
-        isotope_blocks.append(np.full(observed.size, isotope, dtype=str))
+        isotope_blocks.append(
+            np.repeat(np.asarray([str(isotope)], dtype=str), observed.size)
+        )
         fe_blocks.append(np.asarray(data.fe_indices, dtype=np.int64).reshape(-1))
         pb_blocks.append(np.asarray(data.pb_indices, dtype=np.int64).reshape(-1))
     observed_all = (
@@ -5488,6 +5559,9 @@ def _count_error_model_diagnostics(
             "count_likelihood_model": str(pf_config.count_likelihood_model),
             "student_t_degrees_of_freedom": float(pf_config.count_likelihood_df),
             "spectrum_covariance_propagated": True,
+            "observation_count_variance_includes_counting_noise": bool(
+                pf_config.observation_count_variance_includes_counting_noise
+            ),
             "station_view_covariance_enabled": bool(
                 pf_config.station_view_covariance_enable
             ),
@@ -6216,6 +6290,7 @@ def _generate_planning_candidates(
     height_partner_xy_tolerance_m: float = 1.0e-9,
     height_partner_z_tolerance_m: float = 1.0e-9,
     height_partner_min_z_separation_m: float = 0.0,
+    rng: np.random.Generator | None = None,
 ) -> tuple[NDArray[np.float64], bool, float]:
     """Generate next-pose actions with one lateral-spacing retry.
 
@@ -6268,8 +6343,7 @@ def _generate_planning_candidates(
         )
         return int(
             np.count_nonzero(
-                lateral_distance
-                > max(float(height_partner_xy_tolerance_m), 1.0e-9)
+                lateral_distance > max(float(height_partner_xy_tolerance_m), 1.0e-9)
             )
         )
 
@@ -6289,6 +6363,7 @@ def _generate_planning_candidates(
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
         height_partner_min_z_separation_m=height_partner_min_z_separation_m,
         require_motion_reachable=True,
+        rng=rng,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
@@ -6315,6 +6390,7 @@ def _generate_planning_candidates(
         height_partner_z_tolerance_m=height_partner_z_tolerance_m,
         height_partner_min_z_separation_m=height_partner_min_z_separation_m,
         require_motion_reachable=True,
+        rng=rng,
     )
     candidates = _filter_reachable_candidates(
         current_pose_xyz=current_pose_xyz,
@@ -6668,22 +6744,30 @@ def _adaptive_mission_stop_reason(
     if len(visited_poses_xyz) < max(1, int(min_poses)):
         return None
     pure_pf = _pure_pf_profile_active(estimator)
-    report_simple_ready = not pure_pf and bool(allow_report_simple_stop) and (
-        _report_model_order_simple_ready_for_stop(
-            estimator,
-            remaining_measurement_estimate=remaining_measurement_estimate,
-            max_sources_per_isotope=int(report_simple_max_sources_per_isotope),
-            min_bic_margin=float(report_simple_min_bic_margin),
-            max_condition_number=float(report_simple_max_condition_number),
-            max_response_correlation=float(report_simple_max_response_correlation),
-            residual_budget_threshold=float(report_simple_residual_budget_threshold),
-            ambiguity_budget_threshold=float(report_simple_ambiguity_budget_threshold),
-            allow_high_surface_ambiguity=bool(
-                report_simple_allow_high_surface_ambiguity
-            ),
-            require_no_birth_residual=False,
-            birth_residual_min_support=int(birth_residual_min_support),
-            refresh_estimates=False,
+    report_simple_ready = (
+        not pure_pf
+        and bool(allow_report_simple_stop)
+        and (
+            _report_model_order_simple_ready_for_stop(
+                estimator,
+                remaining_measurement_estimate=remaining_measurement_estimate,
+                max_sources_per_isotope=int(report_simple_max_sources_per_isotope),
+                min_bic_margin=float(report_simple_min_bic_margin),
+                max_condition_number=float(report_simple_max_condition_number),
+                max_response_correlation=float(report_simple_max_response_correlation),
+                residual_budget_threshold=float(
+                    report_simple_residual_budget_threshold
+                ),
+                ambiguity_budget_threshold=float(
+                    report_simple_ambiguity_budget_threshold
+                ),
+                allow_high_surface_ambiguity=bool(
+                    report_simple_allow_high_surface_ambiguity
+                ),
+                require_no_birth_residual=False,
+                birth_residual_min_support=int(birth_residual_min_support),
+                refresh_estimates=False,
+            )
         )
     )
     report_ready = pure_pf or _report_model_order_ready_for_stop(
@@ -6830,7 +6914,9 @@ def _all_pf_filters_converged(
             return False
         if not bool(getattr(filt, "is_converged", False)):
             return False
-    if not _pure_pf_profile_active(estimator) and not _report_model_order_ready_for_stop(
+    if not _pure_pf_profile_active(
+        estimator
+    ) and not _report_model_order_ready_for_stop(
         estimator, refresh_estimates=bool(refresh_estimates)
     ):
         return False
@@ -9050,7 +9136,14 @@ def run_live_pf(
             runtime_config.get("random_seed", runtime_config.get("rng_seed", 0)),
         )
     )
-    np.random.seed(pf_random_seed)
+    _seed_pf_random_generators(pf_random_seed)
+    planning_candidate_seed = int(
+        runtime_config.get("planning_candidate_seed", pf_random_seed + 1000003)
+    )
+    planning_candidate_rng = np.random.default_rng(planning_candidate_seed)
+    measurement_log_runtime_config["planning_candidate_seed"] = int(
+        planning_candidate_seed
+    )
     print(
         "PF candidate isotopes: "
         f"{isotopes} (spectrum_library={list(decomposer.isotope_names)})"
@@ -9943,6 +10036,12 @@ def run_live_pf(
         if geant4_likelihood_defaults
         else 0.0,
     )
+    observation_count_variance_includes_counting_noise = bool(
+        _likelihood_config_value(
+            "observation_count_variance_includes_counting_noise",
+            False,
+        )
+    )
     count_likelihood_df = float(
         _likelihood_config_value(
             "count_likelihood_df",
@@ -10262,6 +10361,21 @@ def run_live_pf(
         )
     if init_num_sources[1] <= 0 and not birth_enabled:
         init_num_sources = (1, 1)
+    (
+        init_strength_prior,
+        init_strength_min,
+        init_strength_max,
+    ) = _resolve_pf_initial_strength_prior(runtime_config)
+    death_strength_threshold = max(
+        _runtime_float(
+            runtime_config,
+            "death_strength_threshold_cps_1m",
+            init_strength_min
+            if init_strength_prior in {"uniform", "log_uniform"}
+            else 0.0,
+        ),
+        0.0,
+    )
     parallel_isotope_workers_raw = runtime_config.get(
         "parallel_isotope_workers",
         python_worker_count_resolved,
@@ -10308,6 +10422,9 @@ def run_live_pf(
         spectrum_count_abs_sigma=spectrum_count_abs_sigma,
         low_count_abs_sigma=low_count_abs_sigma,
         low_count_transition_counts=low_count_transition_counts,
+        observation_count_variance_includes_counting_noise=(
+            observation_count_variance_includes_counting_noise
+        ),
         count_likelihood_df=count_likelihood_df,
         station_view_covariance_enable=station_view_covariance_enable,
         station_view_correlated_spectrum_fraction=(
@@ -10336,6 +10453,18 @@ def run_live_pf(
         min_strength=5.0,
         p_birth=0.05,
         p_kill=0.1,
+        death_strength_threshold=death_strength_threshold,
+        death_require_low_strength=bool(
+            runtime_config.get("death_require_low_strength", False)
+        ),
+        # Zero means all causal history up to the current update.  Source
+        # removal requires multi-station evidence, so the one-record fallback
+        # cannot be a valid standard-runtime default.
+        support_window=max(0, int(runtime_config.get("support_window", 0))),
+        # Non-positive values deliberately retain all causal measurements for
+        # residual birth.  This must be wired explicitly because the library
+        # dataclass keeps the legacy finite-window default for API callers.
+        birth_window=max(0, int(runtime_config.get("birth_window", 0))),
         short_time_s=planning_live_time,
         max_dwell_time_s=10000.0,
         position_min=source_position_min,
@@ -10347,6 +10476,35 @@ def run_live_pf(
         init_num_sources=init_num_sources,
         init_grid_spacing_m=1.0,
         init_grid_repeats=max(1, int(runtime_config.get("init_grid_repeats", 1))),
+        init_joint_position_design=str(
+            runtime_config.get("pf_init_joint_position_design", "latin_hypercube")
+        ),
+        init_joint_position_retries=max(
+            1,
+            int(runtime_config.get("pf_init_joint_position_retries", 16)),
+        ),
+        init_source_min_separation_m=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "pf_init_source_min_separation_m",
+                    runtime_config.get(
+                        "random_source_same_isotope_min_distance_m",
+                        0.0,
+                    ),
+                )
+            ),
+        ),
+        init_strength_prior=init_strength_prior,
+        init_strength_min=init_strength_min,
+        init_strength_max=init_strength_max,
+        init_strength_log_mean=float(
+            runtime_config.get("pf_init_strength_log_mean", 9.0)
+        ),
+        init_strength_log_sigma=max(
+            0.0,
+            float(runtime_config.get("pf_init_strength_log_sigma", 1.0)),
+        ),
         cardinality_preserving_resample=bool(
             runtime_config.get("cardinality_preserving_resample", True)
         ),
@@ -10693,7 +10851,26 @@ def run_live_pf(
         ),
         birth_q_max=max(
             0.0,
-            float(runtime_config.get("birth_q_max", 5.0e6)),
+            float(
+                runtime_config.get(
+                    "birth_q_max",
+                    init_strength_max
+                    if init_strength_prior in {"uniform", "log_uniform"}
+                    and init_strength_max is not None
+                    else 5.0e6,
+                )
+            ),
+        ),
+        birth_q_min=max(
+            0.0,
+            float(
+                runtime_config.get(
+                    "birth_q_min",
+                    init_strength_min
+                    if init_strength_prior in {"uniform", "log_uniform"}
+                    else 1.0e2,
+                )
+            ),
         ),
         birth_orthogonalize_residual_candidates=bool(
             runtime_config.get("birth_orthogonalize_residual_candidates", False)
@@ -11998,9 +12175,7 @@ def run_live_pf(
             "candidate_grid_spacing_m": list(spacing),
             "candidate_grid_margin_m": float(candidate_grid_margin),
             "source_surface_prior": bool(source_surface_prior),
-            "obstacle_height_m": float(
-                runtime_config.get("obstacle_height_m", 2.0)
-            ),
+            "obstacle_height_m": float(runtime_config.get("obstacle_height_m", 2.0)),
             "pose_candidates": int(pose_candidates),
             "pose_min_dist_m": float(pose_min_dist),
             "path_planner": str(path_planner_resolved),
@@ -13011,6 +13186,8 @@ def run_live_pf(
         f"low_count_abs_sigma={pf_conf.low_count_abs_sigma} "
         f"low_count_transition={pf_conf.low_count_transition_counts} "
         f"df={float(pf_conf.count_likelihood_df):.2f} "
+        "obs_var_includes_counting_noise="
+        f"{bool(pf_conf.observation_count_variance_includes_counting_noise)} "
         "station_view_cov="
         f"{bool(pf_conf.station_view_covariance_enable)} "
         "station_view_spectrum_frac="
@@ -13891,6 +14068,7 @@ def run_live_pf(
                         height_partner_min_z_separation_m=(
                             detector_height_pair_min_separation_m
                         ),
+                        rng=planning_candidate_rng,
                     )
                     (
                         next_pose_gain_rate,
@@ -14279,9 +14457,7 @@ def run_live_pf(
                                     log_covariance[row_index, column_index] = float(
                                         row_payload[column_isotope]
                                     )
-                    log_covariance = 0.5 * (
-                        log_covariance + log_covariance.T
-                    )
+                    log_covariance = 0.5 * (log_covariance + log_covariance.T)
                     measurement_log_writer.append_before_update(
                         MeasurementLogRecord(
                             step_id=int(step_counter),
@@ -14291,8 +14467,7 @@ def run_live_pf(
                                 float(value) for value in pose_for_pf
                             ),
                             detector_quat_wxyz=tuple(
-                                float(value)
-                                for value in observation.detector_quat_wxyz
+                                float(value) for value in observation.detector_quat_wxyz
                             ),
                             fe_orientation_index=int(fe_idx),
                             pb_orientation_index=int(pb_idx),
@@ -15134,6 +15309,7 @@ def run_live_pf(
                     height_partner_min_z_separation_m=(
                         detector_height_pair_min_separation_m
                     ),
+                    rng=planning_candidate_rng,
                 )
             )
             if relaxed_retry:
@@ -15163,12 +15339,10 @@ def run_live_pf(
             planned_program_for_next: tuple[int, ...] | None = None
             dss_diagnostics: dict[str, Any] | None = None
             dss_first_node = None
-            height_partner_program_for_scoring = (
-                _height_partner_program_for_scoring(
-                    reuse_enabled=height_partner_reuse_shield_program,
-                    executed_pair_ids=executed_pair_ids_this_pose,
-                    baseline_shield_policy=baseline_shield_policy,
-                )
+            height_partner_program_for_scoring = _height_partner_program_for_scoring(
+                reuse_enabled=height_partner_reuse_shield_program,
+                executed_pair_ids=executed_pair_ids_this_pose,
+                baseline_shield_policy=baseline_shield_policy,
             )
             baseline_path_selection = select_baseline_next_pose(
                 baseline_path_policy,
@@ -15675,9 +15849,7 @@ def run_live_pf(
             is_height_partner_action = _validate_selected_station_action(
                 current_pose_xyz=np.asarray(pose, dtype=float),
                 next_pose_xyz=np.asarray(next_pose, dtype=float),
-                previous_move_was_height_partner=(
-                    previous_move_was_height_partner
-                ),
+                previous_move_was_height_partner=(previous_move_was_height_partner),
                 xy_tolerance_m=detector_height_pair_xy_tolerance_m,
                 z_tolerance_m=detector_height_pair_z_tolerance_m,
                 min_z_separation_m=detector_height_pair_min_separation_m,
@@ -16598,9 +16770,7 @@ def run_live_pf(
         except (RuntimeError, ValueError, TypeError):
             final_sparse_poisson_evidence = {}
     report_model_order_diagnostics = (
-        {}
-        if pure_pf_profile
-        else dict(estimator.report_model_order_diagnostics())
+        {} if pure_pf_profile else dict(estimator.report_model_order_diagnostics())
     )
     model_evaluation_diagnostics = summarize_model_diagnostics(
         report_model_order_diagnostics, final_sparse_poisson_evidence

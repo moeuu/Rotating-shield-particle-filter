@@ -100,6 +100,71 @@ from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from visualization.realtime_viz import PFFrame
 
 
+def test_pf_strength_prior_uses_predeclared_generator_population() -> None:
+    """Generated simulations should share their declared strength population prior."""
+    prior, minimum, maximum = realtime_demo_module._resolve_pf_initial_strength_prior(
+        {
+            "source_rate_model": "detector_cps_1m",
+            "random_source_intensity_min_cps_1m": 300000.0,
+            "random_source_intensity_max_cps_1m": 2000000.0,
+        }
+    )
+
+    assert prior == "uniform"
+    assert minimum == pytest.approx(300000.0)
+    assert maximum == pytest.approx(2000000.0)
+
+
+def test_null_pf_strength_bounds_use_predeclared_generator_population() -> None:
+    """JSON null bounds should retain the declared generator population prior."""
+    prior, minimum, maximum = realtime_demo_module._resolve_pf_initial_strength_prior(
+        {
+            "source_rate_model": "detector_cps_1m",
+            "random_source_intensity_min_cps_1m": 300000.0,
+            "random_source_intensity_max_cps_1m": 2000000.0,
+            "pf_init_strength_min_cps_1m": None,
+            "pf_init_strength_max_cps_1m": None,
+        }
+    )
+
+    assert prior == "uniform"
+    assert minimum == pytest.approx(300000.0)
+    assert maximum == pytest.approx(2000000.0)
+
+
+def test_pf_random_seed_controls_numpy_and_torch_planning_draws() -> None:
+    """One PF seed should reproduce both CPU and GPU planning randomness."""
+    torch = pytest.importorskip("torch")
+    realtime_demo_module._seed_pf_random_generators(314159)
+    numpy_first = np.random.random(4)
+    torch_first = torch.rand(4)
+
+    realtime_demo_module._seed_pf_random_generators(314159)
+    numpy_second = np.random.random(4)
+    torch_second = torch.rand(4)
+
+    np.testing.assert_array_equal(numpy_first, numpy_second)
+    torch.testing.assert_close(torch_first, torch_second, rtol=0.0, atol=0.0)
+
+
+def test_explicit_pf_strength_prior_bounds_override_generator_population() -> None:
+    """Explicit PF prior settings must take precedence over generator defaults."""
+    prior, minimum, maximum = realtime_demo_module._resolve_pf_initial_strength_prior(
+        {
+            "source_rate_model": "detector_cps_1m",
+            "random_source_intensity_min_cps_1m": 300000.0,
+            "random_source_intensity_max_cps_1m": 2000000.0,
+            "pf_init_strength_prior": "log_uniform",
+            "pf_init_strength_min_cps_1m": 100000.0,
+            "pf_init_strength_max_cps_1m": 3000000.0,
+        }
+    )
+
+    assert prior == "log_uniform"
+    assert minimum == pytest.approx(100000.0)
+    assert maximum == pytest.approx(3000000.0)
+
+
 def test_surface_report_quality_gate_rejects_off_surface_estimate() -> None:
     """The runtime must fail closed before publishing an invalid surface report."""
     estimates = {
@@ -234,10 +299,13 @@ def test_measurement_log_obstacle_layout_path_is_portable_and_physical(
     fixed_environment = SimpleNamespace(mode="fixed", layout_path=fixed_layout)
     random_environment = SimpleNamespace(mode="random", layout_path=fixed_layout)
 
-    assert _measurement_log_obstacle_layout_path(
-        fixed_environment,
-        repository_root=repository_root,
-    ) == "obstacle_layouts/fixed.json"
+    assert (
+        _measurement_log_obstacle_layout_path(
+            fixed_environment,
+            repository_root=repository_root,
+        )
+        == "obstacle_layouts/fixed.json"
+    )
     assert (
         _measurement_log_obstacle_layout_path(
             random_environment,
@@ -292,6 +360,18 @@ def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
         "uses_batch_model_order": False,
         "batch_feedback_to_particles": False,
         "batch_methods_invoked": [],
+        "posterior_semantics": "fixed_cardinality_sequential_particle_filter",
+        "structural_kernel_family": "fixed_cardinality_no_structural_moves",
+        "structural_kernel_target_preserving": True,
+        "structural_kernel_exact_rj": False,
+        "reversible_jump_mcmc_used": False,
+        "structural_transition_provenance": {
+            "posterior_semantics": "fixed_cardinality_sequential_particle_filter",
+            "structural_kernel_family": "fixed_cardinality_no_structural_moves",
+            "structural_kernel_target_preserving": True,
+            "structural_kernel_exact_rj": False,
+            "reversible_jump_mcmc_used": False,
+        },
         "planner_belief_sources": ["pf_posterior", "pf_tentative"],
         "repository_commit": "a" * 40,
         "measurement_log_schema_version": 1,
@@ -314,6 +394,8 @@ def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
     assert summary["measurement_log_sha256"] == "b" * 64
     assert summary["resolved_config_sha256"] == "d" * 64
     assert summary["batch_methods_invoked"] == []
+    assert summary["structural_kernel_target_preserving"] is True
+    assert summary["structural_kernel_exact_rj"] is False
     assert summary["pf_posterior"] == payload
 
 
@@ -1242,6 +1324,89 @@ def test_reachable_candidate_filter_removes_disconnected_free_cells() -> None:
 
     assert filtered.shape == (1, 3)
     assert filtered[0, 0] == pytest.approx(1.5)
+
+
+def test_planning_candidate_batches_are_reproducible_from_explicit_rng() -> None:
+    """Planning candidates should be replayable without the global PF RNG."""
+    kwargs = {
+        "current_pose_xyz": np.array([1.0, 1.0, 0.5], dtype=float),
+        "map_api": None,
+        "n_candidates": 24,
+        "min_dist_from_visited": 0.5,
+        "visited_poses_xyz": np.array([[1.0, 1.0, 0.5]], dtype=float),
+        "bounds_xyz": (
+            np.array([0.0, 0.0, 0.5], dtype=float),
+            np.array([10.0, 10.0, 2.0], dtype=float),
+        ),
+    }
+
+    first = realtime_demo_module._generate_planning_candidates(
+        **kwargs,
+        rng=np.random.default_rng(91),
+    )
+    second = realtime_demo_module._generate_planning_candidates(
+        **kwargs,
+        rng=np.random.default_rng(91),
+    )
+
+    np.testing.assert_allclose(first[0], second[0], rtol=0.0, atol=0.0)
+    assert first[1:] == second[1:]
+
+
+def test_final_count_bias_preserves_full_isotope_names() -> None:
+    """Count-bias grouping must not truncate Co-60 and Cs-137 to one character."""
+
+    class _Estimator:
+        """Provide the minimal count-bias reporting interface."""
+
+        filters = {"Co-60": object(), "Cs-137": object()}
+        num_orientations = 8
+        measurements = [
+            SimpleNamespace(z_k={"Co-60": 10.0, "Cs-137": 20.0}),
+        ]
+
+        @staticmethod
+        def configured_isotope_order() -> list[str]:
+            """Return two isotope labels sharing their first character."""
+            return ["Co-60", "Cs-137"]
+
+        @staticmethod
+        def _measurement_data_for_iso(
+            isotope: str,
+            window: int | None,
+            records: object,
+        ) -> MeasurementData:
+            """Return one deterministic record for either isotope."""
+            del window, records
+            count = 10.0 if isotope == "Co-60" else 20.0
+            return MeasurementData(
+                z_k=np.array([count], dtype=float),
+                observation_variances=np.array([count], dtype=float),
+                detector_positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
+                fe_indices=np.array([0], dtype=int),
+                pb_indices=np.array([0], dtype=int),
+                live_times=np.array([1.0], dtype=float),
+            )
+
+        @staticmethod
+        def _background_counts_for_report_refit(
+            isotope: str,
+            live_times: np.ndarray,
+        ) -> np.ndarray:
+            """Return a zero background for the reporting regression."""
+            del isotope
+            return np.zeros_like(live_times, dtype=float)
+
+    summary = realtime_demo_module._final_count_bias_diagnostics(
+        _Estimator(),
+        {
+            "Co-60": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+            "Cs-137": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+        },
+        count_regime_lower_edges=(0.0, 10.0),
+    )
+
+    assert set(summary["by_isotope"]) == {"Co-60", "Cs-137"}
 
 
 def test_candidate_spacing_retry_triggers_for_height_only_actions(
@@ -3371,6 +3536,7 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
             "orientation_k": 1,
             "min_particles": 8,
             "max_particles": 8,
+            "observation_count_variance_includes_counting_noise": True,
         },
         save_outputs=False,
         return_state=True,
@@ -3379,6 +3545,10 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         measurement_log_output=str(tmp_path / "measurement-log"),
     )
     assert estimator is not None
+    assert estimator.pf_config.birth_window == 0
+    assert (
+        estimator.pf_config.observation_count_variance_includes_counting_noise is True
+    )
     assert len(estimator.measurements) >= 2
     assert len(estimator.poses) >= 2
     metrics = estimator.mission_metrics
@@ -3428,9 +3598,10 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     assert "consecutive_matched_cluster_shift_m" in evaluation["cluster_stability"]
     assert evaluation["operational"]["station_count"] == 2
     assert evaluation["operational"]["station_visit_count"] == 2
-    assert evaluation["operational"]["online_wall_clock_s"] <= evaluation[
-        "operational"
-    ]["end_to_end_wall_clock_s"]
+    assert (
+        evaluation["operational"]["online_wall_clock_s"]
+        <= evaluation["operational"]["end_to_end_wall_clock_s"]
+    )
     json.dumps(estimator.final_run_summary, allow_nan=False)
     assert estimator.isotopes == list(ANALYSIS_ISOTOPES)
     for rec in estimator.measurements:
@@ -4558,19 +4729,27 @@ def test_height_partner_reoptimizes_shield_program_by_default() -> None:
     """Height changes should not force the prior station's shield program."""
     pair_ids = (3, 4, 6, 13, 17, 36, 43, 52)
 
-    assert realtime_demo_module._height_partner_program_for_scoring(
-        reuse_enabled=False,
-        executed_pair_ids=pair_ids,
-        baseline_shield_policy=None,
-    ) is None
-    assert realtime_demo_module._height_partner_program_for_scoring(
-        reuse_enabled=True,
-        executed_pair_ids=pair_ids,
-        baseline_shield_policy=None,
-    ) == pair_ids
+    assert (
+        realtime_demo_module._height_partner_program_for_scoring(
+            reuse_enabled=False,
+            executed_pair_ids=pair_ids,
+            baseline_shield_policy=None,
+        )
+        is None
+    )
+    assert (
+        realtime_demo_module._height_partner_program_for_scoring(
+            reuse_enabled=True,
+            executed_pair_ids=pair_ids,
+            baseline_shield_policy=None,
+        )
+        == pair_ids
+    )
 
 
-def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances() -> None:
+def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances() -> (
+    None
+):
     """Operational counts should use actual measurement poses and tolerate jitter."""
     recorded_positions = [
         (1.0, 2.0, 0.5),
@@ -4603,9 +4782,7 @@ def test_operational_station_metrics_use_recorded_poses_and_planner_tolerances()
     assert metrics["height_pair_station_count"] == 1
     assert metrics["height_transition_count"] == 2
     assert metrics["station_count"] == metrics["unique_xy_station_count"]
-    assert metrics["detector_pose_station_count"] == metrics[
-        "unique_xyz_action_count"
-    ]
+    assert metrics["detector_pose_station_count"] == metrics["unique_xyz_action_count"]
     assert metrics["height_change_count"] == metrics["height_transition_count"]
     assert "position_source" in metrics["station_height_count_definitions"]
 

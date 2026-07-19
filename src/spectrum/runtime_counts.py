@@ -98,11 +98,22 @@ class RuntimeCountExtractor:
             )
             for iso, val in counts_out.items()
         }
+        variance_stages = {"formal_input": dict(variances)}
+        # The configured ceiling is a guard for the formal regression
+        # covariance.  Statistical and model-discrepancy components are
+        # applied afterwards, so they remain visible instead of being folded
+        # into an opaque, order-dependent exception to the ceiling.
+        variances = self._apply_response_poisson_variance_ceiling(
+            counts_out,
+            variances,
+        )
+        variance_stages["formal_after_ceiling"] = dict(variances)
         variances = self._apply_spectrum_variance_floor(
             counts_out,
             variances,
             spectrum_variance=spectrum_variance,
         )
+        variance_stages["spectrum_statistical"] = dict(variances)
         variances = self._apply_effective_entries_floor(
             counts_out,
             variances,
@@ -110,19 +121,20 @@ class RuntimeCountExtractor:
             spectrum_variance=spectrum_variance,
             transport_metadata=transport_metadata,
         )
+        variance_stages["transport_statistical"] = dict(variances)
         variances = self._apply_response_diagnostics_floor(counts_out, variances)
+        variance_stages["isotope_diagnostic"] = dict(variances)
         variances = self._apply_shield_systematic_variance_floor(
             counts_out,
             variances,
             transport_metadata=transport_metadata,
         )
-        variances = self._apply_response_poisson_variance_ceiling(
-            counts_out,
-            variances,
-        )
+        variance_stages["shield_systematic"] = dict(variances)
+        self._record_runtime_variance_components(counts_out, variance_stages)
         covariance = self._count_covariance_with_runtime_variances(
             counts_out,
             variances,
+            formal_variances=variance_stages["formal_after_ceiling"],
         )
         return RuntimeCountResult(counts_out, variances, set(detected), covariance)
 
@@ -130,6 +142,8 @@ class RuntimeCountExtractor:
         self,
         counts: dict[str, float],
         variances: dict[str, float],
+        *,
+        formal_variances: Mapping[str, float] | None = None,
     ) -> dict[str, dict[str, float]]:
         """Return isotope count covariance after runtime variance guards."""
         isotopes = [str(isotope) for isotope in counts]
@@ -182,19 +196,61 @@ class RuntimeCountExtractor:
                 if not reciprocal_values:
                     continue
                 source_offdiag = float(np.mean(reciprocal_values))
-                corr = source_offdiag / float(
-                    np.sqrt(source_row_var * source_col_var)
-                )
-                corr = float(np.clip(corr, -1.0, 1.0))
-                scaled = float(
-                    corr
-                    * np.sqrt(
+                if formal_variances is not None:
+                    # The ceiling acts on the complete formal covariance, not
+                    # only its diagonal.  Congruence scaling preserves the
+                    # fitted correlation and positive-semidefinite structure.
+                    row_formal = max(
+                        float(formal_variances.get(row_iso, source_row_var)),
+                        0.0,
+                    )
+                    col_formal = max(
+                        float(formal_variances.get(col_iso, source_col_var)),
+                        0.0,
+                    )
+                    row_scale = np.sqrt(min(row_formal / source_row_var, 1.0))
+                    col_scale = np.sqrt(min(col_formal / source_col_var, 1.0))
+                    source_offdiag *= float(row_scale * col_scale)
+                # Extra runtime floors represent independent statistical or
+                # model-discrepancy components.  Preserve the formal off-
+                # diagonal covariance itself; rescaling its correlation to the
+                # enlarged runtime diagonal would incorrectly correlate those
+                # independent components and make the later conservative
+                # projection grow a second time.
+                runtime_bound = float(
+                    np.sqrt(
                         runtime_variances[row_iso] * runtime_variances[col_iso]
                     )
                 )
-                covariance[row_iso][col_iso] = scaled
-                covariance[col_iso][row_iso] = scaled
+                formal_offdiag = float(
+                    np.clip(source_offdiag, -runtime_bound, runtime_bound)
+                )
+                covariance[row_iso][col_iso] = formal_offdiag
+                covariance[col_iso][row_iso] = formal_offdiag
         return covariance
+
+    def _record_runtime_variance_components(
+        self,
+        counts: Mapping[str, float],
+        stages: Mapping[str, Mapping[str, float]],
+    ) -> None:
+        """Record the sequential contribution of each runtime variance stage."""
+        diagnostics = dict(
+            getattr(self.decomposer, "last_response_poisson_diagnostics", {})
+        )
+        components: dict[str, dict[str, float]] = {}
+        for isotope in counts:
+            previous = 0.0
+            payload: dict[str, float] = {}
+            for stage_name, stage_values in stages.items():
+                value = max(float(stage_values.get(isotope, previous)), 1.0)
+                payload[f"{stage_name}_variance"] = value
+                payload[f"{stage_name}_increment"] = max(value - previous, 0.0)
+                previous = value
+            payload["final_variance"] = previous
+            components[str(isotope)] = payload
+        diagnostics["runtime_variance_components"] = components
+        self.decomposer.last_response_poisson_diagnostics = diagnostics
 
     def _apply_spectrum_variance_floor(
         self,
@@ -421,10 +477,10 @@ class RuntimeCountExtractor:
 
         Ill-conditioned full-spectrum regressions can produce enormous formal
         coefficient covariance even when independent replay shows the retained
-        count is accurate in ordinary high-count cases. Diagnostic floors from
-        photopeak disagreement, low-SNR suppression, and shield systematics are
-        preserved so max-tail measurements are down-weighted rather than forced
-        through the ordinary covariance cap.
+        count is accurate in ordinary high-count cases. Runtime configurations
+        should apply diagnostic and guard floors in the later explicit
+        diagnostic stage. The preserve flags remain only for compatibility with
+        legacy callers that already embedded those floors in the formal input.
         """
         config = getattr(self.decomposer, "config", None)
         if config is None or not bool(
@@ -621,6 +677,19 @@ class RuntimeCountExtractor:
     def _diagnostic_relative_sigma(self, diagnostics: Mapping[str, object]) -> float:
         """Return a global relative sigma implied by response-fit diagnostics."""
         config = self.decomposer.config
+        # A full-spectrum goodness-of-fit statistic is not an isotope-count
+        # calibration.  Applying it to every isotope made one continuum/tail
+        # mismatch flatten all PF channels.  Keep this legacy diagnostic path
+        # opt-in until an independent Geant4 calibration establishes a mapping
+        # from global fit residuals to isotope-count error.
+        if not bool(
+            getattr(
+                config,
+                "response_poisson_global_diagnostic_variance_enable",
+                False,
+            )
+        ):
+            return 0.0
         rel_sigma = 0.0
         reduced_chi2 = self._mapping_float(diagnostics, "reduced_chi2")
         chi2_threshold = max(

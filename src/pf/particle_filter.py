@@ -12,7 +12,7 @@ import time
 import numpy as np
 from numpy.typing import NDArray
 from scipy.special import logsumexp
-from scipy.stats import chi2
+from scipy.stats import chi2, qmc
 
 from measurement.model import EnvironmentConfig
 from measurement.kernels import KernelPrecomputer, ShieldParams
@@ -26,6 +26,7 @@ from measurement.source_surfaces import (
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.diagnostics import build_source_event_record, reset_step_diagnostics
 from pf.likelihood import (
+    CountLikelihoodSpec,
     count_log_likelihood,
     count_likelihood_variance,
     count_likelihood_variance_torch,
@@ -72,6 +73,7 @@ class PFConfig:
     spectrum_count_abs_sigma: float | dict[str, float] = 0.0
     low_count_abs_sigma: float | dict[str, float] = 0.0
     low_count_transition_counts: float | dict[str, float] = 0.0
+    observation_count_variance_includes_counting_noise: bool = False
     count_likelihood_df: float = 5.0
     shield_contrast_likelihood_enable: bool = False
     shield_contrast_likelihood_weight: float = 1.0
@@ -92,6 +94,8 @@ class PFConfig:
     p_birth: float = 0.05
     p_kill: float = 0.1
     death_low_q_streak: int = 10
+    death_strength_threshold: float = 0.0
+    death_require_low_strength: bool = True
     death_delta_ll_threshold: float = 0.0
     support_ema_alpha: float = 0.3
     support_window: int = 1
@@ -290,11 +294,18 @@ class PFConfig:
     roughening_decay: float = 0.5
     roughening_min_mult: float = 0.25
     init_num_sources: Tuple[int, int] = (0, 3)  # inclusive range
-    # Strength prior (cps@1m scale). Defaults cover ~1e3–1e5 cps via log-normal.
+    # Strength prior (cps@1m scale). The uniform form is used when a simulation
+    # declares its source-population bounds before evaluation.
+    init_strength_prior: str = "lognormal"
+    init_strength_min: float = 0.0
+    init_strength_max: float | None = None
     init_strength_log_mean: float = 9.0  # exp(9) ~ 8e3
     init_strength_log_sigma: float = 1.0
     init_grid_spacing_m: float | None = None
     init_grid_repeats: int = 1
+    init_joint_position_design: str = "independent"
+    init_joint_position_retries: int = 1
+    init_source_min_separation_m: float = 0.0
     strength_log_sigma: float = 0.3
     use_gpu: bool = True
     gpu_device: str = "cuda"
@@ -783,7 +794,7 @@ class IsotopeParticleFilter:
             return max(float(value.get(self.isotope, default)), 0.0)
         return max(float(value), 0.0)
 
-    def _count_likelihood_kwargs(self) -> dict[str, float | str]:
+    def _count_likelihood_kwargs(self) -> dict[str, bool | float | str]:
         """Return likelihood keyword arguments for this isotope filter."""
         return {
             "model": str(self.config.count_likelihood_model),
@@ -805,8 +816,15 @@ class IsotopeParticleFilter:
             "low_count_transition_counts": self._isotope_float_config(
                 self.config.low_count_transition_counts,
             ),
+            "observation_count_variance_includes_counting_noise": bool(
+                self.config.observation_count_variance_includes_counting_noise
+            ),
             "student_t_df": max(float(self.config.count_likelihood_df), 1.0),
         }
+
+    def count_likelihood_spec(self) -> CountLikelihoodSpec:
+        """Return the resolved isotope-specific likelihood configuration."""
+        return CountLikelihoodSpec(**self._count_likelihood_kwargs())
 
     def _count_log_likelihood_np(
         self,
@@ -859,6 +877,9 @@ class IsotopeParticleFilter:
             low_count_abs_sigma=float(kwargs["low_count_abs_sigma"]),
             low_count_transition_counts=float(kwargs["low_count_transition_counts"]),
             observation_count_variance=obs_var[:, None],
+            observation_count_variance_includes_counting_noise=bool(
+                kwargs["observation_count_variance_includes_counting_noise"]
+            ),
         )
         residual = z_col - lam
         if model == "gaussian":
@@ -1180,17 +1201,43 @@ class IsotopeParticleFilter:
         return grid.reshape(-1, 3)
 
     def _initial_source_count_for_particle(self, particle_index: int) -> int:
-        """Return an initial source count that respects the configured prior range."""
+        """Return one cyclic source count as a small deterministic test oracle."""
+        min_r, max_r = self._initial_source_count_bounds()
+        if max_r <= min_r:
+            return min_r
+        span = max_r - min_r + 1
+        return min_r + (int(particle_index) % span)
+
+    def _initial_source_count_bounds(self) -> tuple[int, int]:
+        """Return normalized inclusive bounds for initial source cardinality."""
         min_r, max_r = self.config.init_num_sources
         min_r = max(0, int(min_r))
         max_r = max(min_r, int(max_r))
         if self.config.max_sources is not None:
             max_r = min(max_r, max(0, int(self.config.max_sources)))
             min_r = min(min_r, max_r)
+        return min_r, max_r
+
+    def _initial_source_counts_for_particles(
+        self,
+        particle_count: int,
+        *,
+        cyclic: bool,
+    ) -> NDArray[np.int64]:
+        """Draw all initial source counts in one batched NumPy operation."""
+        count = max(0, int(particle_count))
+        if count <= 0:
+            return np.zeros(0, dtype=np.int64)
+        min_r, max_r = self._initial_source_count_bounds()
         if max_r <= min_r:
-            return min_r
-        span = max_r - min_r + 1
-        return min_r + (int(particle_index) % span)
+            return np.full(count, min_r, dtype=np.int64)
+        if cyclic:
+            span = max_r - min_r + 1
+            return min_r + (np.arange(count, dtype=np.int64) % span)
+        return np.asarray(
+            np.random.randint(min_r, max_r + 1, size=count),
+            dtype=np.int64,
+        )
 
     def _initial_grid_state_positions(
         self,
@@ -1198,7 +1245,7 @@ class IsotopeParticleFilter:
         source_count: int,
         grid_positions: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Return initial source positions for one grid-anchored particle."""
+        """Return one legacy grid tuple as a small scalar test oracle."""
         count = max(0, int(source_count))
         if count <= 0:
             return np.zeros((0, 3), dtype=float)
@@ -1213,6 +1260,176 @@ class IsotopeParticleFilter:
         extra_idx = np.random.choice(grid.shape[0], size=count - 1, replace=replace)
         return np.vstack([anchor, grid[extra_idx]])
 
+    def _initial_grid_state_positions_batched(
+        self,
+        anchor_positions: NDArray[np.float64],
+        source_counts: NDArray[np.int64],
+        grid_positions: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return batched, diversity-aware source tuples for grid initialization."""
+        anchors = np.asarray(anchor_positions, dtype=float).reshape(-1, 3)
+        counts = np.asarray(source_counts, dtype=np.int64).reshape(-1)
+        grid = np.asarray(grid_positions, dtype=float).reshape(-1, 3)
+        if anchors.shape[0] != counts.size:
+            raise ValueError("source_counts must match anchor_positions.")
+        if grid.shape[0] == 0:
+            raise ValueError("grid_positions must be non-empty.")
+        if np.any(counts < 0):
+            raise ValueError("source_counts must be non-negative.")
+        particle_count = int(anchors.shape[0])
+        max_sources = int(np.max(counts)) if counts.size else 0
+        if max_sources <= 0:
+            return np.zeros((particle_count, 0, 3), dtype=float)
+        retry_count = max(int(self.config.init_joint_position_retries), 1)
+        extra_slots = max_sources - 1
+        anchor_block = np.broadcast_to(
+            anchors[:, None, None, :],
+            (particle_count, retry_count, 1, 3),
+        )
+        if extra_slots <= 0:
+            return anchor_block[:, 0, :, :].copy()
+
+        design = (
+            str(self.config.init_joint_position_design)
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        sample_shape = (particle_count, retry_count, extra_slots)
+        if design == "latin_hypercube":
+            seed = int(np.random.randint(0, np.iinfo(np.uint32).max))
+            unit = qmc.LatinHypercube(d=extra_slots, seed=seed).random(
+                particle_count * retry_count
+            )
+            unit = np.asarray(unit, dtype=float).reshape(sample_shape)
+            indices = np.minimum(
+                np.floor(unit * grid.shape[0]).astype(np.int64),
+                grid.shape[0] - 1,
+            )
+        elif design == "independent":
+            indices = np.random.randint(0, grid.shape[0], size=sample_shape)
+        else:
+            raise ValueError(
+                "init_joint_position_design must be independent or latin_hypercube."
+            )
+        extra_positions = grid[indices]
+        tuples = np.concatenate([anchor_block, extra_positions], axis=2)
+
+        min_separation = max(float(self.config.init_source_min_separation_m), 0.0)
+        if min_separation <= 0.0 or max_sources <= 1:
+            return tuples[:, 0, :, :].copy()
+        selected_retry = self._select_initial_tuple_retry_indices(
+            tuples,
+            counts,
+            min_separation_m=min_separation,
+        )
+        return tuples[np.arange(particle_count), selected_retry, :, :].copy()
+
+    @staticmethod
+    def _select_initial_tuple_retry_indices(
+        tuple_positions: NDArray[np.float64],
+        source_counts: NDArray[np.int64],
+        *,
+        min_separation_m: float,
+    ) -> NDArray[np.int64]:
+        """Select the first valid retry per particle using batched pair distances."""
+        tuples = np.asarray(tuple_positions, dtype=float)
+        counts = np.asarray(source_counts, dtype=np.int64).reshape(-1)
+        if tuples.ndim != 4 or tuples.shape[-1] != 3:
+            raise ValueError("tuple_positions must have shape P x R x S x 3.")
+        particle_count, retry_count, source_slots, _ = tuples.shape
+        if counts.size != particle_count:
+            raise ValueError("source_counts must match tuple_positions particles.")
+        if retry_count <= 0:
+            raise ValueError("tuple_positions must include at least one retry.")
+        if np.any(counts < 0) or np.any(counts > source_slots):
+            raise ValueError("source_counts must lie within tuple source slots.")
+        if source_slots <= 1 or float(min_separation_m) <= 0.0:
+            return np.zeros(particle_count, dtype=np.int64)
+
+        left_slots, right_slots = np.triu_indices(source_slots, k=1)
+        pair_delta = tuples[:, :, left_slots, :] - tuples[:, :, right_slots, :]
+        pair_distance_sq = np.einsum(
+            "...d,...d->...",
+            pair_delta,
+            pair_delta,
+            optimize=True,
+        )
+        active_pairs = right_slots[None, :] < counts[:, None]
+        relevant_distance_sq = np.where(
+            active_pairs[:, None, :],
+            pair_distance_sq,
+            np.inf,
+        )
+        min_distance_sq = np.min(relevant_distance_sq, axis=2)
+        threshold_sq = max(float(min_separation_m), 0.0) ** 2
+        valid = min_distance_sq >= threshold_sq
+        selected = np.argmax(valid, axis=1).astype(np.int64, copy=False)
+        no_valid = ~np.any(valid, axis=1)
+        if np.any(no_valid):
+            raise ValueError(
+                "Unable to construct separated initial source tuples for "
+                f"{int(np.count_nonzero(no_valid))} particles; increase "
+                "init_joint_position_retries or revise the physically declared "
+                "minimum separation."
+            )
+        return selected
+
+    def _sample_initial_strengths(
+        self,
+        shape: int | tuple[int, ...],
+    ) -> NDArray[np.float64]:
+        """Draw a batched initial-strength array from the configured PF prior."""
+        prior = str(self.config.init_strength_prior).strip().lower().replace("-", "_")
+        if prior == "uniform":
+            lower = max(float(self.config.init_strength_min), 0.0)
+            upper = (
+                float("inf")
+                if self.config.init_strength_max is None
+                else float(self.config.init_strength_max)
+            )
+            if not np.isfinite(upper) or upper < lower:
+                raise ValueError(
+                    "uniform init strength prior requires finite max >= min."
+                )
+            return np.asarray(np.random.uniform(lower, upper, size=shape), dtype=float)
+        if prior == "log_uniform":
+            lower = max(float(self.config.init_strength_min), np.finfo(float).tiny)
+            upper = (
+                float("inf")
+                if self.config.init_strength_max is None
+                else float(self.config.init_strength_max)
+            )
+            if not np.isfinite(upper) or upper < lower:
+                raise ValueError(
+                    "log_uniform init strength prior requires finite max >= min > 0."
+                )
+            return np.asarray(
+                np.exp(np.random.uniform(np.log(lower), np.log(upper), size=shape)),
+                dtype=float,
+            )
+        if prior != "lognormal":
+            raise ValueError(
+                "init_strength_prior must be lognormal, uniform, or log_uniform."
+            )
+        sampled = np.asarray(
+            np.random.lognormal(
+                mean=self.config.init_strength_log_mean,
+                sigma=self.config.init_strength_log_sigma,
+                size=shape,
+            ),
+            dtype=float,
+        )
+        lower = max(float(self.config.init_strength_min), 0.0)
+        upper = (
+            float("inf")
+            if self.config.init_strength_max is None
+            else float(self.config.init_strength_max)
+        )
+        if lower > 0.0 or np.isfinite(upper):
+            sampled = np.clip(sampled, lower, upper)
+        return sampled
+
     def _init_continuous_particles(self) -> None:
         """Sample continuous positions/strengths/background from broad priors (Sec. 3.3.2)."""
         self.continuous_particles = []
@@ -1225,19 +1442,26 @@ class IsotopeParticleFilter:
             self.config.min_particles = target_n
             self.config.max_particles = target_n
             repeated_positions = np.repeat(grid_positions, repeat_count, axis=0)
-            for particle_idx, pos in enumerate(repeated_positions):
-                r_h = self._initial_source_count_for_particle(particle_idx)
+            source_counts = self._initial_source_counts_for_particles(
+                target_n,
+                cyclic=True,
+            )
+            tuple_positions = self._initial_grid_state_positions_batched(
+                repeated_positions,
+                source_counts,
+                grid_positions,
+            )
+            max_initial_sources = (
+                int(np.max(source_counts)) if source_counts.size else 0
+            )
+            strength_draws = self._sample_initial_strengths(
+                (target_n, max_initial_sources)
+            )
+            for particle_idx in range(target_n):
+                r_h = int(source_counts[particle_idx])
                 if r_h > 0:
-                    positions = self._initial_grid_state_positions(
-                        anchor_position=pos,
-                        source_count=r_h,
-                        grid_positions=grid_positions,
-                    )
-                    strengths = np.random.lognormal(
-                        mean=self.config.init_strength_log_mean,
-                        sigma=self.config.init_strength_log_sigma,
-                        size=r_h,
-                    )
+                    positions = tuple_positions[particle_idx, :r_h, :].copy()
+                    strengths = strength_draws[particle_idx, :r_h].copy()
                     ages = np.zeros(r_h, dtype=int)
                     low_q_streaks = np.zeros(r_h, dtype=int)
                     support_scores = np.zeros(r_h, dtype=float)
@@ -1267,18 +1491,17 @@ class IsotopeParticleFilter:
                     IsotopeParticle(state=st, log_weight=float(np.log(1.0 / self.N)))
                 )
             return
-        min_r, max_r = self.config.init_num_sources
-        for _ in range(self.N):
-            r_h = int(np.random.randint(min_r, max_r + 1))
-            if self.config.max_sources is not None and self.config.max_sources > 0:
-                r_h = min(r_h, self.config.max_sources)
+        source_counts = self._initial_source_counts_for_particles(
+            self.N,
+            cyclic=False,
+        )
+        max_initial_sources = int(np.max(source_counts)) if source_counts.size else 0
+        strength_draws = self._sample_initial_strengths((self.N, max_initial_sources))
+        for particle_idx in range(self.N):
+            r_h = int(source_counts[particle_idx])
             if r_h > 0:
                 positions = self._sample_prior_positions(r_h)
-                strengths = np.random.lognormal(
-                    mean=self.config.init_strength_log_mean,
-                    sigma=self.config.init_strength_log_sigma,
-                    size=r_h,
-                )
+                strengths = strength_draws[particle_idx, :r_h].copy()
                 ages = np.zeros(r_h, dtype=int)
                 low_q_streaks = np.zeros(r_h, dtype=int)
                 support_scores = np.zeros(r_h, dtype=float)
@@ -1937,6 +2160,9 @@ class IsotopeParticleFilter:
             low_count_abs_sigma=float(low_count_abs),
             low_count_transition_counts=float(low_count_transition),
             observation_count_variance=obs_var,
+            observation_count_variance_includes_counting_noise=bool(
+                self.config.observation_count_variance_includes_counting_noise
+            ),
         )
         residual = z - lam_t
         if model == "gaussian":
@@ -2023,6 +2249,9 @@ class IsotopeParticleFilter:
             low_count_abs_sigma=float(low_count_abs),
             low_count_transition_counts=float(low_count_transition),
             observation_count_variance=obs_var,
+            observation_count_variance_includes_counting_noise=bool(
+                self.config.observation_count_variance_includes_counting_noise
+            ),
         )
         residual = z - lam
         if model == "gaussian":
@@ -2427,6 +2656,9 @@ class IsotopeParticleFilter:
             low_count_abs_sigma=float(low_count_abs),
             low_count_transition_counts=float(low_count_transition),
             observation_count_variance=obs_var,
+            observation_count_variance_includes_counting_noise=bool(
+                self.config.observation_count_variance_includes_counting_noise
+            ),
         )
 
     def _sequence_observation_offdiag_torch(
@@ -5256,7 +5488,7 @@ class IsotopeParticleFilter:
         refit-after-remove matrix when no pseudo-source prune or death/prune branch
         could consume the mask during the current structural update.
         """
-        if st.num_sources <= 1:
+        if st.num_sources <= 0:
             return False
         self._ensure_source_metadata(st)
         count = int(st.num_sources)
@@ -5276,16 +5508,24 @@ class IsotopeParticleFilter:
                     return True
         if suppress_death:
             return False
+        if not bool(self.config.death_require_low_strength):
+            # Evidence-driven death needs the refit-after-remove mask even when
+            # the current strength is numerically large.
+            return True
         projected_low_q = np.asarray(st.low_q_streaks[:count], dtype=int).copy()
-        below_strength = np.asarray(st.strengths[:count], dtype=float) < float(
-            self.config.min_strength,
+        death_strength_threshold = max(
+            float(self.config.death_strength_threshold),
+            float(self.config.min_strength),
+        )
+        below_strength = (
+            np.asarray(st.strengths[:count], dtype=float) < death_strength_threshold
         )
         projected_low_q[below_strength] += 1
         projected_low_q[~below_strength] = 0
         eligible = projected_low_q >= int(self.config.death_low_q_streak)
         if not np.any(eligible):
             return False
-        q_min = float(self.config.min_strength)
+        q_min = death_strength_threshold
         if q_min <= 0.0:
             q_min = float(self.config.birth_q_min)
         if np.any(eligible & (np.asarray(st.strengths[:count], dtype=float) < q_min)):
@@ -7131,7 +7371,7 @@ class IsotopeParticleFilter:
         data: MeasurementData,
     ) -> NDArray[np.bool_]:
         """Return sources removable after refitting the remaining strengths."""
-        if st.num_sources <= 1 or data.z_k.size == 0:
+        if st.num_sources <= 0 or data.z_k.size == 0:
             return np.zeros(max(0, int(st.num_sources)), dtype=bool)
         full = st.copy()
         self._ensure_source_metadata(full)
@@ -7152,14 +7392,13 @@ class IsotopeParticleFilter:
         removable = np.zeros(int(st.num_sources), dtype=bool)
         for source_idx in range(int(st.num_sources)):
             reduced = self._remove_source_trial(full, source_idx)
-            if reduced.num_sources <= 0:
-                continue
-            self._refit_strengths_for_particle(
-                reduced,
-                data,
-                iters=max(1, int(self.config.refit_iters)),
-                eps=float(self.config.refit_eps),
-            )
+            if reduced.num_sources > 0:
+                self._refit_strengths_for_particle(
+                    reduced,
+                    data,
+                    iters=max(1, int(self.config.refit_iters)),
+                    eps=float(self.config.refit_eps),
+                )
             ll_without = self._trial_log_likelihood(reduced, data)
             if not np.isfinite(ll_without):
                 continue
@@ -7491,7 +7730,7 @@ class IsotopeParticleFilter:
             raise ValueError("k_tensor must have shape K x P x S.")
         _, particle_count, source_count = k_arr.shape
         removable = np.zeros((particle_count, source_count), dtype=bool)
-        if source_count <= 1 or data.z_k.size == 0:
+        if source_count <= 0 or data.z_k.size == 0:
             return removable
         if not self._source_prune_support_ready(data):
             return removable
@@ -7510,8 +7749,6 @@ class IsotopeParticleFilter:
         for source_idx in range(source_count):
             keep = np.ones(source_count, dtype=bool)
             keep[source_idx] = False
-            if int(np.count_nonzero(keep)) <= 0:
-                continue
             _, lambda_without = self._solve_strengths_for_kernel_tensor_batched(
                 data,
                 k_tensor=k_arr[:, :, keep],
@@ -7552,7 +7789,7 @@ class IsotopeParticleFilter:
             raise ValueError("k_tensor must have shape K x P x S.")
         num_meas, particle_count, source_count = k_arr.shape
         removable = np.zeros((particle_count, source_count), dtype=bool)
-        if source_count <= 1 or data.z_k.size == 0:
+        if source_count <= 0 or data.z_k.size == 0:
             return removable
         if not self._source_prune_support_ready(data):
             return removable
@@ -7643,7 +7880,10 @@ class IsotopeParticleFilter:
                 self._source_prune_refit_after_remove_mask(st, data)
                 & separation_allowed
             )
-        threshold = self._source_prune_delta_threshold()
+        allowed_loss = self._bic_model_penalty(
+            int(data.z_k.size),
+            int(self.config.source_prune_bic_penalty_params),
+        ) + self._source_prune_delta_threshold()
         if delta_ll is None or delta_ll.shape != (int(st.num_sources),):
             delta_ll = self._delta_log_likelihood_remove(
                 data.z_k,
@@ -7660,15 +7900,19 @@ class IsotopeParticleFilter:
             rows = station_labels == int(label)
             if not np.any(rows):
                 continue
+            station_allowed_loss = self._bic_model_penalty(
+                int(np.count_nonzero(rows)),
+                int(self.config.source_prune_bic_penalty_params),
+            ) + self._source_prune_delta_threshold()
             station_delta = self._delta_log_likelihood_remove(
                 data.z_k[rows],
                 lambda_total[rows],
                 lambda_m[rows, :],
                 observation_count_variance=data.observation_variances[rows],
             )
-            fail_counts += (station_delta < threshold).astype(int)
+            fail_counts += (station_delta <= station_allowed_loss).astype(int)
         min_stations = max(1, int(self.config.source_prune_min_distinct_stations))
-        global_failed = np.asarray(delta_ll, dtype=float) < threshold
+        global_failed = np.asarray(delta_ll, dtype=float) <= allowed_loss
         return (fail_counts >= min_stations) & global_failed & separation_allowed
 
     def _tentative_response_separation_prune_mask(
@@ -9125,10 +9369,9 @@ class IsotopeParticleFilter:
 
         The proposal adds a residual-supported candidate as a split-off
         component from an existing high-strength source, then refits all
-        strengths jointly with fixed positions. This is a general RJ-style
-        structural move: it is accepted only when the observed count vector is
-        better explained by two same-isotope components than by the original
-        component.
+        strengths jointly with fixed positions. This is a likelihood-scored
+        heuristic structural move, not reversible-jump MCMC: it does not apply
+        forward/reverse proposal densities or a dimension-matching Jacobian.
         """
         if not bool(self.config.split_residual_guided):
             return None, -np.inf
@@ -10600,9 +10843,9 @@ class IsotopeParticleFilter:
         """
         Return posterior-diverse particle indices for expensive structural moves.
 
-        Structural birth/split/merge proposals are exact likelihood-tested moves,
-        but evaluating them for every particle can dominate runtime without
-        changing transport fidelity.  This selector keeps the highest posterior
+        Structural birth/split/merge proposals are likelihood-scored heuristic
+        moves. Evaluating them for every particle can dominate runtime without
+        changing transport fidelity. This selector keeps the highest posterior
         particles while reserving quota for each active source cardinality so
         low-probability multi-source hypotheses are not discarded solely by a
         global weight sort.
@@ -10692,7 +10935,9 @@ class IsotopeParticleFilter:
         When ``reference_log_likelihood_by_index`` and ``moved_indices`` are
         given, only moved particles are corrected by the likelihood ratio
         ``new_window_ll - old_window_ll``.  This preserves all previous
-        posterior evidence already accumulated before the structural move.
+        posterior evidence already accumulated before the structural move. It
+        is not a forward/reverse proposal-density, prior, or Jacobian correction,
+        so it does not turn the structural heuristic into an exact RJ move.
         """
         if data is None or data.z_k.size == 0 or not self.continuous_particles:
             return
@@ -11431,7 +11676,7 @@ class IsotopeParticleFilter:
                 )
                 if (
                     bool(self.config.source_prune_refit_after_remove)
-                    and source_count > 1
+                    and source_count > 0
                 ):
                     needs_prune_rows = np.asarray(
                         [
@@ -11553,9 +11798,14 @@ class IsotopeParticleFilter:
             global_birth_moved = False
             if st.num_sources > 0:
                 st.ages = st.ages + 1
-                below = st.strengths < float(self.config.min_strength)
-                st.low_q_streaks[below] += 1
-                st.low_q_streaks[~below] = 0
+                if bool(self.config.death_require_low_strength):
+                    death_strength_threshold = max(
+                        float(self.config.death_strength_threshold),
+                        float(self.config.min_strength),
+                    )
+                    below = st.strengths < death_strength_threshold
+                    st.low_q_streaks[below] += 1
+                    st.low_q_streaks[~below] = 0
             lambda_m = None
             lambda_total = None
             cached_prune_allowed = None
@@ -11642,23 +11892,31 @@ class IsotopeParticleFilter:
                             lambda_total=lambda_total,
                             delta_ll=delta_ll,
                         )
-                    q_min = float(self.config.min_strength)
+                    if not bool(self.config.death_require_low_strength):
+                        evidence_poor = prune_allowed
+                        st.low_q_streaks[evidence_poor] += 1
+                        st.low_q_streaks[~evidence_poor] = 0
+                    q_min = max(
+                        float(self.config.death_strength_threshold),
+                        float(self.config.min_strength),
+                    )
                     if q_min <= 0.0:
                         q_min = float(self.config.birth_q_min)
-                    deterministic = (
-                        (st.low_q_streaks >= int(self.config.death_low_q_streak))
-                        & (st.strengths < q_min)
-                        & prune_allowed
-                    )
+                    deterministic = np.zeros(st.num_sources, dtype=bool)
+                    if bool(self.config.death_require_low_strength):
+                        deterministic = (
+                            (st.low_q_streaks >= int(self.config.death_low_q_streak))
+                            & (st.strengths < q_min)
+                            & prune_allowed
+                        )
                     kill_mask[deterministic] = False
                     kill_candidates = (
-                        (st.low_q_streaks >= int(self.config.death_low_q_streak))
-                        & (
-                            st.support_scores
-                            < float(self.config.death_delta_ll_threshold)
+                        st.low_q_streaks >= int(self.config.death_low_q_streak)
+                    ) & prune_allowed
+                    if bool(self.config.death_require_low_strength):
+                        kill_candidates &= st.support_scores < float(
+                            self.config.death_delta_ll_threshold
                         )
-                        & prune_allowed
-                    )
                     for idx, do_kill in enumerate(kill_candidates):
                         if (
                             kill_mask[idx]
@@ -11688,6 +11946,7 @@ class IsotopeParticleFilter:
                                     "death_low_q_streak": int(
                                         self.config.death_low_q_streak
                                     ),
+                                    "death_strength_threshold": float(q_min),
                                 },
                             )
                         st.positions = st.positions[kill_mask]

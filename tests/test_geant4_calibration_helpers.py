@@ -105,6 +105,368 @@ def test_validation_outputs_export_runtime_transport_model(tmp_path: Path) -> No
     assert payload["pf_transport_response_model"] == model
 
 
+def test_validation_uses_runtime_covariance_projection_helper() -> None:
+    """Validation projection should exactly match the runtime PF envelope."""
+    projector = VALIDATION_SCRIPT.build_runtime_covariance_projector(
+        {
+            "observation_covariance_projection_enable": True,
+            "observation_covariance_projection_weight": 1.0,
+            "observation_covariance_projection_max_corr": 0.999,
+        }
+    )
+    counts = {"Cs-137": 100.0, "Co-60": 80.0}
+    variances = {"Cs-137": 25.0, "Co-60": 16.0}
+    covariance = {
+        "Cs-137": {"Cs-137": 25.0, "Co-60": -12.0},
+        "Co-60": {"Cs-137": -12.0, "Co-60": 16.0},
+    }
+
+    projected, sanitized = (
+        VALIDATION_SCRIPT.project_runtime_observation_covariance(
+            projector,
+            counts,
+            variances,
+            covariance,
+        )
+    )
+
+    assert projected == pytest.approx({"Cs-137": 37.0, "Co-60": 28.0})
+    assert sanitized is not None
+    assert sanitized["Cs-137"]["Co-60"] == pytest.approx(-12.0)
+    assert sanitized["Co-60"]["Cs-137"] == pytest.approx(-12.0)
+
+
+def test_validation_covariance_summary_reports_stages_and_coverage() -> None:
+    """Covariance summary should retain stage ratios, ceilings, and coverage."""
+    stage = {
+        "formal_variance": 100.0,
+        "ceilinged_formal_variance": 25.0,
+        "runtime_variance": 36.0,
+        "projected_variance": 45.0,
+        "formal_ceiling_applied": True,
+    }
+    mahalanobis = {
+        "formal_full": 1.0,
+        "formal_diagonal": 1.0,
+        "runtime_full": 2.0,
+        "runtime_diagonal": 2.0,
+        "estimator_sanitized_full": 2.0,
+        "projected_diagonal": 1.6,
+    }
+    result = {
+        "case": {"include_in_accuracy_summary": True},
+        "response_poisson_covariance": {
+            "residual_diagnostics": {
+                "degrees_of_freedom": 1,
+                "mahalanobis_squared": mahalanobis,
+            }
+        },
+        "per_isotope": {
+            "Cs-137": {
+                "transport_truth_counts": 90.0,
+                "method_counts": {"response_poisson": 100.0},
+                "response_poisson_formal_variance": 100.0,
+                "response_poisson_ceilinged_formal_variance": 25.0,
+                "response_poisson_variance": 36.0,
+                "response_poisson_projected_variance": 45.0,
+                "response_poisson_variance_stages": stage,
+            }
+        },
+    }
+
+    summary = VALIDATION_SCRIPT.summarize_response_poisson_covariance(
+        [result],
+        min_target=25.0,
+    )
+
+    assert summary["num_isotope_records"] == 1
+    assert summary["variance_ratios"]["runtime_over_formal"]["median"] == (
+        pytest.approx(0.36)
+    )
+    assert summary["variance_ratios"]["projected_over_runtime"]["median"] == (
+        pytest.approx(1.25)
+    )
+    assert summary["ceiling_exceedance_counts"] == {
+        "formal_ceiling_applied": 1,
+        "runtime_above_ceilinged_formal": 1,
+        "projected_above_ceilinged_formal": 1,
+        "projected_above_runtime": 1,
+    }
+    projected_coverage = summary[
+        "normalized_residual_coverage_vs_transport_truth"
+    ]["projected"]
+    assert projected_coverage["num_points"] == 1
+    assert projected_coverage["coverage_within_2sigma"] == pytest.approx(1.0)
+    projected_mahalanobis = summary["mahalanobis_vs_transport_truth"][
+        "projected_diagonal"
+    ]
+    assert projected_mahalanobis["num_cases"] == 1
+    assert projected_mahalanobis["pooled_squared_per_degree_of_freedom"] == (
+        pytest.approx(1.6)
+    )
+
+
+def _pair_screening_case() -> object:
+    """Return a compact multi-isotope case for pair-screening tests."""
+    return VALIDATION_SCRIPT.ValidationCase(
+        name="pair_screening",
+        description="test",
+        detector_pose_xyz=(1.0, 1.0, 0.5),
+        sources=(
+            VALIDATION_SCRIPT.ValidationSource(
+                "Cs-137",
+                (2.0, 1.0, 0.5),
+                1000.0,
+            ),
+            VALIDATION_SCRIPT.ValidationSource(
+                "Co-60",
+                (1.0, 2.0, 0.5),
+                1500.0,
+            ),
+            VALIDATION_SCRIPT.ValidationSource(
+                "Eu-154",
+                (1.0, 1.0, 1.5),
+                2000.0,
+            ),
+        ),
+        dwell_time_s=2.0,
+    )
+
+
+def _empty_obstacle_grid() -> ObstacleGrid:
+    """Return a single-cell free obstacle grid for selection-helper tests."""
+    return ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+    )
+
+
+def test_all_pair_count_batch_matches_serial_oracle() -> None:
+    """Torch all-pair batching should preserve the scalar PF response exactly."""
+    case = _pair_screening_case()
+    runtime_config = {
+        "measurement_scale_by_isotope": {"Cs-137": 1.1, "Co-60": 0.9},
+        "measurement_scale_by_isotope_and_pair": {
+            "Cs-137": {"7": 1.25},
+        },
+    }
+    scalar_kernel = ContinuousKernel(use_gpu=False)
+    batched_kernel = ContinuousKernel(
+        use_gpu=True,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+    )
+    pair_ids = (0, 7, 18, 63)
+
+    expected = VALIDATION_SCRIPT._expected_count_matrix_over_shield_pairs_serial(
+        case,
+        runtime_config,
+        scalar_kernel,
+        pair_ids=pair_ids,
+    )
+    actual = VALIDATION_SCRIPT._expected_count_matrix_over_shield_pairs(
+        case,
+        runtime_config,
+        batched_kernel,
+        pair_ids=pair_ids,
+    )
+
+    assert actual == pytest.approx(expected, rel=1.0e-10, abs=1.0e-10)
+
+
+def test_all_pair_screening_enables_batched_torch_backend() -> None:
+    """Exact validation screening should never retain the scalar kernel path."""
+    kernel = ContinuousKernel(use_gpu=False)
+
+    selected = VALIDATION_SCRIPT._enable_batched_pair_screening(
+        kernel,
+        {
+            "validation_pair_screening_device": "cpu",
+            "validation_pair_screening_dtype": "float64",
+        },
+    )
+
+    assert selected is kernel
+    assert selected.use_gpu is True
+    assert selected.gpu_device == "cpu"
+    assert selected.gpu_dtype == "float64"
+
+
+def test_exact_detector_gate_rejects_higher_ranked_proxy_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy winner below the exact all-pair target must not be selected."""
+    candidates = [
+        VALIDATION_SCRIPT.DetectorPoseCandidate((1.0, 0.0, 0.5), 2.0, {}),
+        VALIDATION_SCRIPT.DetectorPoseCandidate((2.0, 0.0, 0.5), 1.0, {}),
+    ]
+
+    def fake_features(
+        _base_case: object,
+        detector_xyz: tuple[float, float, float],
+        **_kwargs: object,
+    ) -> dict[str, float]:
+        """Return an exact minimum determined by the candidate x coordinate."""
+        return {
+            "min_isotope_target": 5000.0 if detector_xyz[0] == 1.0 else 12000.0
+        }
+
+    monkeypatch.setattr(
+        VALIDATION_SCRIPT,
+        "_detector_selection_features",
+        fake_features,
+    )
+
+    selected, exact_features, attempts = (
+        VALIDATION_SCRIPT._select_exact_target_qualified_detector(
+            candidates,
+            base_case=_pair_screening_case(),
+            transport_grid=_empty_obstacle_grid(),
+            runtime_config={},
+            target_kernel=ContinuousKernel(use_gpu=False),
+            min_target_counts=10000.0,
+            all_shield_pairs=True,
+        )
+    )
+
+    assert selected.pose_xyz[0] == pytest.approx(2.0)
+    assert exact_features["min_isotope_target"] == pytest.approx(12000.0)
+    assert attempts == 2
+
+
+def test_exact_detector_gate_fails_when_no_candidate_meets_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scenario without a qualifying exact pose should fail explicitly."""
+    candidate = VALIDATION_SCRIPT.DetectorPoseCandidate(
+        (1.0, 0.0, 0.5),
+        1.0,
+        {},
+    )
+
+    def fake_features(*_args: object, **_kwargs: object) -> dict[str, float]:
+        """Return a deterministic below-threshold exact response."""
+        return {"min_isotope_target": 9000.0}
+
+    monkeypatch.setattr(
+        VALIDATION_SCRIPT,
+        "_detector_selection_features",
+        fake_features,
+    )
+
+    with pytest.raises(ValueError, match="all 64 shield pairs"):
+        VALIDATION_SCRIPT._select_exact_target_qualified_detector(
+            [candidate],
+            base_case=_pair_screening_case(),
+            transport_grid=_empty_obstacle_grid(),
+            runtime_config={},
+            target_kernel=ContinuousKernel(use_gpu=False),
+            min_target_counts=10000.0,
+            all_shield_pairs=True,
+        )
+
+
+def test_runtime_likelihood_specs_match_nested_standard_config() -> None:
+    """Validation should resolve nested PF likelihood values isotope-wise."""
+    specs = VALIDATION_SCRIPT.build_runtime_count_likelihood_specs(
+        {
+            "backend": "geant4",
+            "spectrum_count_method": "response_poisson",
+            "pf_count_likelihood": {
+                "count_likelihood_model": "student_t",
+                "count_likelihood_df": 7.0,
+                "transport_model_rel_sigma": {"Cs-137": 0.2, "Co-60": 0.1},
+                "spectrum_count_rel_sigma": 0.05,
+                "transport_model_abs_sigma": 4.0,
+                "spectrum_count_abs_sigma": 3.0,
+                "low_count_abs_sigma": 10.0,
+                "low_count_transition_counts": 50.0,
+                "observation_count_variance_includes_counting_noise": True,
+            },
+        }
+    )
+
+    assert specs["Cs-137"].model == "student_t"
+    assert specs["Cs-137"].student_t_df == pytest.approx(7.0)
+    assert specs["Cs-137"].transport_model_rel_sigma == pytest.approx(0.2)
+    assert specs["Co-60"].transport_model_rel_sigma == pytest.approx(0.1)
+    assert specs["Eu-154"].transport_model_rel_sigma == pytest.approx(0.0)
+    assert specs["Eu-154"].spectrum_count_rel_sigma == pytest.approx(0.05)
+    assert specs["Cs-137"].observation_count_variance_includes_counting_noise is True
+
+
+def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
+    """Final PF diagnostics should include projected variance in Student-t scale."""
+    counts = {"Cs-137": 110.0, "Co-60": 70.0, "Eu-154": 55.0}
+    targets = {"Cs-137": 100.0, "Co-60": 80.0, "Eu-154": 50.0}
+    projected = {"Cs-137": 25.0, "Co-60": 16.0, "Eu-154": 9.0}
+    specs = {
+        isotope: VALIDATION_SCRIPT.CountLikelihoodSpec(
+            model="student_t",
+            transport_model_rel_sigma=0.1,
+            transport_model_abs_sigma=5.0,
+            spectrum_count_rel_sigma=0.05,
+            spectrum_count_abs_sigma=5.0,
+            low_count_abs_sigma=20.0,
+            low_count_transition_counts=100.0,
+            observation_count_variance_includes_counting_noise=True,
+            student_t_df=5.0,
+        )
+        for isotope in VALIDATION_SCRIPT.ISOTOPES
+    }
+
+    diagnostic = VALIDATION_SCRIPT._pf_count_likelihood_diagnostics(
+        counts,
+        targets,
+        targets,
+        projected,
+        specs,
+        min_target=25.0,
+    )
+    runtime_target = diagnostic["targets"]["runtime_pf_forward"]
+    expected_cs_scale = VALIDATION_SCRIPT.count_likelihood_variance(
+        np.asarray([110.0]),
+        np.asarray([100.0]),
+        transport_model_rel_sigma=0.1,
+        transport_model_abs_sigma=5.0,
+        spectrum_count_rel_sigma=0.05,
+        spectrum_count_abs_sigma=5.0,
+        low_count_abs_sigma=20.0,
+        low_count_transition_counts=100.0,
+        observation_count_variance=25.0,
+        observation_count_variance_includes_counting_noise=True,
+    )[0]
+
+    assert runtime_target["likelihood_scale_squared_by_isotope"]["Cs-137"] == (
+        pytest.approx(expected_cs_scale)
+    )
+    assert diagnostic["likelihood_spec_by_isotope"]["Cs-137"][
+        "observation_count_variance_includes_counting_noise"
+    ] is True
+    assert "not its marginal variance" in diagnostic["scale_semantics"]
+
+    summary = VALIDATION_SCRIPT.summarize_pf_count_likelihood_diagnostics(
+        [
+            {
+                "case": {"include_in_accuracy_summary": True},
+                "pf_count_likelihood_diagnostics": diagnostic,
+            }
+        ],
+        min_target=25.0,
+    )
+    runtime_summary = summary["targets"]["runtime_pf_forward"]
+    expected_distance = sum(
+        float(value) ** 2
+        for value in runtime_target["normalized_residual_by_isotope"].values()
+    )
+    assert runtime_summary["num_records"] == 3
+    assert runtime_summary["diagonal_squared_distance"][
+        "pooled_squared_per_degree_of_freedom"
+    ] == pytest.approx(expected_distance / 3.0)
+
+
 def test_validation_calibration_defaults_match_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     """Calibration helper defaults should match validation CLI defaults."""
     monkeypatch.setattr(sys, "argv", ["validate_geant4_spectrum_decomposition.py"])

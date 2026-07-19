@@ -537,31 +537,40 @@ def _stability_scope_summary(
         for row in transition_rows
         for value in row["matched_strength_abs_relative_drifts_pct"]
     ]
+    appearance_count = int(
+        sum(int(row["birth_count"]) for row in transition_rows)
+    )
+    disappearance_count = int(
+        sum(int(row["death_count"]) for row in transition_rows)
+    )
+    replacement_transition_count = int(
+        sum(
+            int(
+                row["previous_count"] == row["current_count"]
+                and (row["birth_count"] or row["death_count"])
+            )
+            for row in transition_rows
+        )
+    )
     return {
         "transition_count": int(len(transition_rows)),
         "matched_transition_mode_count": int(
             sum(int(row["matched_count"]) for row in transition_rows)
         ),
-        "birth_event_count": int(
-            sum(int(row["birth_count"]) for row in transition_rows)
+        "unmatched_cluster_appearance_count": appearance_count,
+        "unmatched_cluster_disappearance_count": disappearance_count,
+        "unmatched_cluster_event_count": appearance_count + disappearance_count,
+        "same_cardinality_cluster_replacement_transition_count": (
+            replacement_transition_count
         ),
-        "death_event_count": int(
-            sum(int(row["death_count"]) for row in transition_rows)
-        ),
-        "birth_death_event_count": int(
-            sum(
-                int(row["birth_count"]) + int(row["death_count"])
-                for row in transition_rows
-            )
-        ),
-        "same_count_birth_death_transition_count": int(
-            sum(
-                int(
-                    row["previous_count"] == row["current_count"]
-                    and (row["birth_count"] or row["death_count"])
-                )
-                for row in transition_rows
-            )
+        # These aliases keep old result readers working.  They count unmatched
+        # reported clusters and must not be interpreted as accepted PF moves.
+        "birth_event_count": appearance_count,
+        "death_event_count": disappearance_count,
+        "birth_death_event_count": appearance_count + disappearance_count,
+        "same_count_birth_death_transition_count": replacement_transition_count,
+        "legacy_birth_death_key_semantics": (
+            "unmatched_reported_clusters_not_accepted_pf_transitions"
         ),
         "consecutive_matched_cluster_shift_m": _distribution_summary(shifts),
         "consecutive_matched_strength_abs_drift_cps_1m": _distribution_summary(
@@ -630,6 +639,8 @@ def summarize_cluster_stability(
                     absolute_strength_drifts.append(absolute)
                     relative_strength_drifts.append(relative)
             matched_count = int(len(assignments))
+            unmatched_appearances = int(current.shape[0] - matched_count)
+            unmatched_disappearances = int(previous.shape[0] - matched_count)
             transition_rows.append(
                 {
                     "previous_step_index": int(step_index),
@@ -637,8 +648,15 @@ def summarize_cluster_stability(
                     "previous_count": int(previous.shape[0]),
                     "current_count": int(current.shape[0]),
                     "matched_count": matched_count,
-                    "birth_count": int(current.shape[0] - matched_count),
-                    "death_count": int(previous.shape[0] - matched_count),
+                    "unmatched_cluster_appearance_count": unmatched_appearances,
+                    "unmatched_cluster_disappearance_count": (
+                        unmatched_disappearances
+                    ),
+                    "birth_count": unmatched_appearances,
+                    "death_count": unmatched_disappearances,
+                    "legacy_birth_death_key_semantics": (
+                        "unmatched_reported_clusters_not_accepted_pf_transitions"
+                    ),
                     "matched_position_shifts_m": shifts,
                     "matched_strength_abs_drifts_cps_1m": absolute_strength_drifts,
                     "matched_strength_abs_relative_drifts_pct": (
@@ -675,11 +693,26 @@ def summarize_cluster_stability(
             "modal_final_window_count": modal_count,
             "final_window_count_stability_fraction": stable_fraction,
             "match_gate_m": gate,
+            "unmatched_cluster_appearance_count": all_summary[
+                "unmatched_cluster_appearance_count"
+            ],
+            "unmatched_cluster_disappearance_count": all_summary[
+                "unmatched_cluster_disappearance_count"
+            ],
+            "unmatched_cluster_event_count": all_summary[
+                "unmatched_cluster_event_count"
+            ],
+            "same_cardinality_cluster_replacement_transition_count": all_summary[
+                "same_cardinality_cluster_replacement_transition_count"
+            ],
             "birth_death_event_count": all_summary["birth_death_event_count"],
             "birth_event_count": all_summary["birth_event_count"],
             "death_event_count": all_summary["death_event_count"],
             "same_count_birth_death_transition_count": all_summary[
                 "same_count_birth_death_transition_count"
+            ],
+            "legacy_birth_death_key_semantics": all_summary[
+                "legacy_birth_death_key_semantics"
             ],
             "consecutive_matched_cluster_shift_m": all_summary[
                 "consecutive_matched_cluster_shift_m"
