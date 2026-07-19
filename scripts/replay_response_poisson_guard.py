@@ -561,13 +561,13 @@ def _runtime_variance_ceiling_settings(
         "preserve_diagnostic_floors": bool(
             runtime_config.get(
                 "response_poisson_count_variance_preserve_diagnostic_floors",
-                True,
+                False,
             )
         ),
         "preserve_guard_floors": bool(
             runtime_config.get(
                 "response_poisson_count_variance_preserve_guard_floors",
-                True,
+                False,
             )
         ),
     }
@@ -598,7 +598,7 @@ def _cap_response_poisson_variance(
         return float(base_variance)
     preserved_floor = _preserved_response_poisson_variance_floor(
         diagnostic_payload,
-        preserve_guard=bool(ceiling_settings.get("preserve_guard_floors", True)),
+        preserve_guard=bool(ceiling_settings.get("preserve_guard_floors", False)),
         base_variance=base_variance,
     )
     return float(max(variance_ceiling, min(base_variance, preserved_floor)))

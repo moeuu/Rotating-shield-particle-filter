@@ -145,6 +145,8 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
     proposed_config = json.loads(by_variant["proposed"].config_path.read_text())
     round_robin = json.loads(by_variant["round_robin_shield"].config_path.read_text())
+    assert proposed_config["primary_sampling_fraction"] == 1.0
+    assert proposed_config["thread_count"] > 1
     assert proposed_config["response_poisson_low_snr_suppress_count"] is False
     assert proposed_config["precision_diagnostic_birth_candidate_enable"] is False
     assert proposed_config["precision_diagnostic_birth_candidate_log_limit"] == 0

@@ -99,5 +99,5 @@
     }
   ],
   "secondary_transport_mode": "gamma_only",
-  "primary_sampling_fraction": 0.02
+  "primary_sampling_fraction": 1.0
 }

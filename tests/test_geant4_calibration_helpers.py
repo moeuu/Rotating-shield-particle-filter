@@ -44,6 +44,59 @@ CALIBRATION_SCRIPT = _load_calibration_script()
 VALIDATION_SCRIPT = _load_validation_script()
 
 
+def test_relative_error_omits_zero_target_at_zero_threshold() -> None:
+    """A diagnostic threshold of zero must not divide by a zero target."""
+    assert VALIDATION_SCRIPT.relative_error(0.0, 0.0, 0.0) is None
+
+
+def test_validation_metadata_keeps_native_fidelity_provenance() -> None:
+    """Validation artifacts should prove threading and full-history semantics."""
+    metadata = {
+        "backend": "geant4",
+        "requested_threads": 32,
+        "multithreaded_run_manager": True,
+        "source_rate_model": "detector_cps_1m",
+        "source_bias_mode": "detector_cone",
+        "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
+        "line_intensities_normalized": True,
+        "detector_response_applied_in_native": False,
+        "secondary_transport_mode": "gamma_only",
+        "gamma_only_secondary_transport": True,
+        "theory_tvl_attenuation": False,
+        "background_cps": 12.0,
+        "poisson_background": True,
+        "expected_detector_equivalent_primaries": 1234.5,
+        "expected_sampled_primaries": 1234.5,
+        "expected_primary_semantics": "detector_equivalent_histories",
+        "primary_sampling_fraction": 1.0,
+        "primary_history_weight": 1.0,
+        "unrelated_internal_field": "omit",
+    }
+
+    retained = VALIDATION_SCRIPT.validation_observation_metadata(metadata)
+
+    assert retained == {
+        "backend": "geant4",
+        "background_cps": 12.0,
+        "detector_response_applied_in_native": False,
+        "expected_detector_equivalent_primaries": 1234.5,
+        "expected_primary_semantics": "detector_equivalent_histories",
+        "expected_sampled_primaries": 1234.5,
+        "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
+        "gamma_only_secondary_transport": True,
+        "line_intensities_normalized": True,
+        "multithreaded_run_manager": True,
+        "primary_history_weight": 1.0,
+        "primary_sampling_fraction": 1.0,
+        "poisson_background": True,
+        "requested_threads": 32,
+        "secondary_transport_mode": "gamma_only",
+        "source_bias_mode": "detector_cone",
+        "source_rate_model": "detector_cps_1m",
+        "theory_tvl_attenuation": False,
+    }
+
+
 def test_source_tally_counts_are_history_normalized() -> None:
     """Native source-equivalent tallies should be divided by history scale."""
     metadata = {

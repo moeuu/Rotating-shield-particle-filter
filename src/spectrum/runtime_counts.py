@@ -318,7 +318,7 @@ class RuntimeCountExtractor:
         """Soften PF updates when response regression diagnostics are unreliable."""
         config = getattr(self.decomposer, "config", None)
         if config is None or not bool(
-            getattr(config, "response_poisson_diagnostic_variance_enable", True)
+            getattr(config, "response_poisson_diagnostic_variance_enable", False)
         ):
             return variances
         diagnostics = dict(
@@ -331,10 +331,6 @@ class RuntimeCountExtractor:
         rel_sigma_by_isotope = self._diagnostic_relative_sigma_by_isotope(
             diagnostics
         )
-        max_count = max(
-            (max(float(value), 0.0) for value in counts.values()),
-            default=0.0,
-        )
         floors: dict[str, float] = {}
         inflated: dict[str, float] = {}
         for isotope, count in counts.items():
@@ -345,7 +341,11 @@ class RuntimeCountExtractor:
             if iso_rel_sigma <= 0.0:
                 inflated[isotope] = float(max(variances.get(isotope, 1.0), 1.0))
                 continue
-            reference_count = max(float(count), 0.05 * max_count, 1.0)
+            # Each diagnostic sigma is relative to this isotope's extracted
+            # count. Borrowing a fixed fraction of the strongest other isotope
+            # transfers channel magnitude without a probabilistic crosstalk
+            # model and can make a weak isotope's covariance arbitrarily large.
+            reference_count = max(float(count), 1.0)
             floor = float((iso_rel_sigma * reference_count) ** 2)
             floors[isotope] = floor
             inflated[isotope] = float(max(variances.get(isotope, 1.0), floor, 1.0))
@@ -576,21 +576,21 @@ class RuntimeCountExtractor:
     ) -> float:
         """Return diagnostic variance that must survive the formal covariance cap."""
         config = getattr(self.decomposer, "config", None)
-        preserve_diagnostic = True
-        preserve_guard = True
+        preserve_diagnostic = False
+        preserve_guard = False
         if config is not None:
             preserve_diagnostic = bool(
                 getattr(
                     config,
                     "response_poisson_count_variance_preserve_diagnostic_floors",
-                    True,
+                    False,
                 )
             )
             preserve_guard = bool(
                 getattr(
                     config,
                     "response_poisson_count_variance_preserve_guard_floors",
-                    True,
+                    False,
                 )
             )
         preserved = 0.0
@@ -806,8 +806,11 @@ class RuntimeCountExtractor:
             for isotope, payload in low_snr.items():
                 if not isinstance(payload, Mapping):
                     continue
-                reason = str(payload.get("reason", ""))
-                if reason:
+                # A retained Poisson estimate was not suppressed. Its fused
+                # variance already entered the formal covariance before the
+                # ceiling, so treating any diagnostic reason as another 50%
+                # floor would count the same heuristic twice.
+                if bool(payload.get("suppressed", False)):
                     rel_by_isotope[str(isotope)] = max(
                         rel_by_isotope.get(str(isotope), 0.0),
                         0.5,

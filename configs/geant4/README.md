@@ -2,6 +2,10 @@
 
 Use these top-level configs for current simulations:
 
+All current top-level configs use `primary_sampling_fraction=1.0`. The Python
+Geant4 application rejects fractional primary-history sampling and also checks
+the native response provenance before returning an observation to the PF.
+
 - `variance_reduction_external_no_isaac_32threads.json`: standard no-GUI
   Geant4/PF full simulation config. This is the default for `main.py`,
   `--cui`, and `--full-simulation`. It loads the repo-stable PF
@@ -20,6 +24,7 @@ Use these top-level configs for current simulations:
 - `shield_validation_scene.json`: material/shield validation config.
 
 Older duplicated or scene-specific configs are isolated under `legacy/`.
-Do not select those from standard runtime entry points. If a legacy config is
-needed for a benchmark or reproduction, keep it explicit in the command and do
-not promote it back to the top-level runtime set.
+They are archival inputs and some still document the former fractional-history
+mode. The standard Python runtime rejects those values. Migrate a legacy config
+to full-history sampling before using it in a current benchmark; do not promote
+it back to the top-level runtime set unchanged.

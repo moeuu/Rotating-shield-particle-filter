@@ -73,7 +73,10 @@ from pf.likelihood import (
     count_likelihood_variance,
 )
 from pf.pure_estimator import PurePFEstimator
-from sim.geant4_app.app import Geant4Application
+from sim.geant4_app.app import (
+    Geant4Application,
+    Geant4AppConfig,
+)
 from sim.isaacsim_app.scene_builder import SceneDescription, SourceDescription
 from sim.isaacsim_app.stage_backend import FakeStageBackend
 from sim.protocol import SimulationCommand
@@ -115,6 +118,68 @@ DEFAULT_TRANSPORT_RESPONSE_TAU_FEATURE_CAPS = {
     "distance_pb": 8.0,
     "distance_obstacle": 8.0,
 }
+
+VALIDATION_METADATA_PREFIXES = (
+    "backend",
+    "engine_mode",
+    "emission_model",
+    "physics_profile",
+    "source_equivalent",
+    "transport_detected",
+    "transport_uncollided",
+    "transport_interacted",
+    "transport_secondary",
+    "transport_non_uncollided",
+    "geant4_mu_cm_inv",
+    "detector_crystal",
+    "detector_housing",
+    "detector_target",
+    "reference_detector",
+    "num_primaries",
+    "expected_physical_primaries",
+    "expected_detector_equivalent_primaries",
+    "expected_sampled_primaries",
+    "expected_primary_semantics",
+    "primary_sampling",
+    "primary_history",
+    "weighted",
+    "source_rate",
+    "source_bias",
+    "intensity_cps_1m_definition",
+    "line_intensities_normalized",
+    "detector_scoring",
+    "detector_fast",
+    "detector_response_applied",
+    "secondary_transport",
+    "gamma_only_secondary_transport",
+    "theory_tvl",
+    "background",
+    "poisson_background",
+    "fe_shield_normal",
+    "pb_shield_normal",
+    "runtime_s",
+    "run_time_s",
+    "thread_count",
+    "requested_threads",
+    "multithreaded_run_manager",
+    "total_track_steps",
+    "detector_hit_events",
+    "process_count",
+    "secondary_count",
+    "total_spectrum_counts",
+    "volume_step_counts",
+)
+
+
+def validation_observation_metadata(
+    metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the transport provenance retained in validation artifacts."""
+    return {
+        str(key): metadata[key]
+        for key in sorted(metadata)
+        if str(key).startswith(VALIDATION_METADATA_PREFIXES)
+    }
 
 
 def build_runtime_covariance_projector(
@@ -2363,7 +2428,8 @@ def transport_truth_counts(metadata: dict[str, Any]) -> dict[str, float]:
 
 def relative_error(value: float, target: float, min_target: float) -> float | None:
     """Return relative error when the target is large enough."""
-    if abs(float(target)) < float(min_target):
+    target_magnitude = abs(float(target))
+    if target_magnitude == 0.0 or target_magnitude < float(min_target):
         return None
     return (float(value) - float(target)) / float(target)
 
@@ -3148,45 +3214,7 @@ def run_case(
         "raw_total_spectrum_counts": float(np.sum(raw_spectrum)),
         "total_spectrum_counts": float(np.sum(spectrum)),
         "num_primaries": float(observation.metadata.get("num_primaries", 0.0)),
-        "metadata": {
-            key: observation.metadata[key]
-            for key in sorted(observation.metadata)
-            if str(key).startswith(
-                    (
-                        "backend",
-                        "engine_mode",
-                        "emission_model",
-                        "physics_profile",
-                        "source_equivalent",
-                        "transport_detected",
-                        "transport_uncollided",
-                        "transport_interacted",
-                        "transport_secondary",
-                        "transport_non_uncollided",
-                        "geant4_mu_cm_inv",
-                        "detector_crystal",
-                        "detector_housing",
-                        "detector_target",
-                        "reference_detector",
-                        "num_primaries",
-                        "primary_sampling",
-                        "weighted",
-                        "detector_scoring",
-                        "detector_fast",
-                        "fe_shield_normal",
-                        "pb_shield_normal",
-                        "runtime_s",
-                        "run_time_s",
-                        "thread_count",
-                        "total_track_steps",
-                        "detector_hit_events",
-                        "process_count",
-                        "secondary_count",
-                        "total_spectrum_counts",
-                        "volume_step_counts",
-                )
-            )
-        },
+        "metadata": validation_observation_metadata(observation.metadata),
         "kernel_diagnostics": kernel_diagnostics,
         "target_diagnostics": target_diagnostics,
         "response_poisson_diagnostics": response_poisson_diagnostics,
@@ -6504,7 +6532,10 @@ def parse_args() -> argparse.Namespace:
         "--primary-sampling-fraction",
         type=float,
         default=None,
-        help="Override Geant4 primary_sampling_fraction for high-statistics validation.",
+        help=(
+            "Override Geant4 primary_sampling_fraction; fidelity validation "
+            "requires the value to remain 1.0."
+        ),
     )
     parser.add_argument("--num-cases", type=int, default=50)
     parser.add_argument("--case-seed", type=int, default=20260430)
@@ -6639,6 +6670,10 @@ def main() -> None:
         runtime_config["thread_count"] = int(args.thread_count)
     if args.primary_sampling_fraction is not None:
         runtime_config["primary_sampling_fraction"] = float(args.primary_sampling_fraction)
+    validated_app_config = Geant4AppConfig.from_dict(runtime_config)
+    runtime_config["primary_sampling_fraction"] = (
+        validated_app_config.primary_sampling_fraction
+    )
     runtime_config["validation_usd_path"] = (
         resolve_path(str(args.usd_path)).as_posix() if args.usd_path else None
     )

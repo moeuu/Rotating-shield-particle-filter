@@ -2963,6 +2963,39 @@ def _metadata_float(metadata: dict[str, object], key: str) -> float | None:
         return None
 
 
+def _measurement_transport_provenance(
+    metadata: dict[str, object],
+) -> dict[str, object]:
+    """Return Geant4 fidelity fields that must survive in measurement logs."""
+    keys = (
+        "background_cps",
+        "detector_response_applied_in_native",
+        "detector_scoring_mode",
+        "emission_model",
+        "engine_mode",
+        "expected_detector_equivalent_primaries",
+        "expected_physical_primaries",
+        "expected_primary_semantics",
+        "expected_sampled_primaries",
+        "gamma_only_secondary_transport",
+        "intensity_cps_1m_definition",
+        "line_intensities_normalized",
+        "multithreaded_run_manager",
+        "num_primaries",
+        "primary_history_weight",
+        "primary_sampling_fraction",
+        "poisson_background",
+        "physics_profile",
+        "requested_threads",
+        "secondary_transport_mode",
+        "source_bias_mode",
+        "source_rate_model",
+        "theory_tvl_attenuation",
+        "weighted_transport",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
+
+
 def _fmt_count_map(counts: dict[str, float], precision: int = 2) -> str:
     """Format isotope count maps for compact step diagnostics."""
     if not counts:
@@ -14496,6 +14529,9 @@ def run_live_pf(
                                 "spectrum_count_method": str(spectrum_count_method),
                                 "dwell_ready_reason": str(dwell_ready_reason),
                                 "dwell_chunks": int(dwell_chunks),
+                                **_measurement_transport_provenance(
+                                    observation.metadata
+                                ),
                             },
                         )
                     )

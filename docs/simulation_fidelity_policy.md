@@ -19,6 +19,8 @@ definition, statistics, and observation path.
 - Do not use surrogate transport in Geant4 runtime modes.
 - Do not bypass spectrum generation with expected-count observations.
 - Do not cap, downsample, or weight Geant4 histories to shorten runtime.
+  Standard Python/Geant4 runtime and validation entry points must reject
+  `primary_sampling_fraction` values other than `1.0` before transport starts.
 - Do not silently reinterpret `intensity_cps_1m` as total isotropic source
   emission. Runtime defaults use the explicit `detector_cps_1m` source-rate
   model: `intensity_cps_1m` is the expected net detector count rate at 1 m for
@@ -34,6 +36,10 @@ definition, statistics, and observation path.
   the calibrated full-spectrum Poisson response regression that reports
   observation covariance to the PF likelihood. Photopeak NNLS remains a
   diagnostic/calibration method, not a standard runtime input.
+- Do not reinterpret crosstalk, low-SNR, or fit-quality classification flags as
+  calibrated PF covariance. Heuristic diagnostic variance inflation must be
+  opt-in; standard runtime covariance must keep formal extraction, counting,
+  transport, and spectrum-model components separate.
 - Do not make CUI mode a low-fidelity mode. CUI only means no Isaac Sim GUI.
 - Do not ignore concrete/environment obstacles in PF observation likelihoods
   when an obstacle layout or generated environment is active.

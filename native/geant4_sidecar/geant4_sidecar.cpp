@@ -2040,8 +2040,18 @@ G4RunManager* CreateConfiguredRunManager(const int thread_count, bool* use_multi
             if (use_multithreaded != nullptr) {
                 *use_multithreaded = true;
             }
+            return run_manager;
         }
-        return run_manager;
+        delete run_manager;
+        throw std::runtime_error(
+            "Requested multiple Geant4 threads, but the MT run manager could not be created."
+        );
+    }
+#else
+    if (requested_threads > 1) {
+        throw std::runtime_error(
+            "Requested multiple Geant4 threads, but this binary has no multithreaded Geant4 support."
+        );
     }
 #endif
     return G4RunManagerFactory::CreateRunManager(G4RunManagerType::SerialOnly);
@@ -2329,7 +2339,7 @@ public:
         std::vector<EnergyDeposit> energy_deposits;
         const auto start_time = std::chrono::steady_clock::now();
         long total_primaries = 0;
-        double expected_physical_primaries = 0.0;
+        double expected_unthinned_primaries = 0.0;
         double expected_sampled_primaries = 0.0;
         std::map<std::string, double> source_equivalent_counts;
         std::map<std::string, double> transport_detected_counts;
@@ -2430,7 +2440,7 @@ public:
                 if (mean_events <= 0.0) {
                     continue;
                 }
-                expected_physical_primaries += mean_events;
+                expected_unthinned_primaries += mean_events;
                 const double sampled_mean_events = mean_events * primary_sampling_fraction;
                 expected_sampled_primaries += sampled_mean_events;
                 std::poisson_distribution<long> distribution(sampled_mean_events);
@@ -2601,10 +2611,18 @@ public:
         result.metadata["theory_tvl_attenuation"] = use_theory_tvl_ ? "true" : "false";
         result.metadata["scene_hash"] = scene_.scene_hash;
         result.metadata["num_primaries"] = std::to_string(total_primaries);
-        result.metadata["expected_physical_primaries"] = std::to_string(expected_physical_primaries);
-        result.metadata["expected_detector_equivalent_primaries"] = std::to_string(
-            expected_physical_primaries
-        );
+        result.metadata["expected_primary_semantics"] = detector_cps_rate_model
+            ? "detector_equivalent_histories"
+            : "isotropic_physical_histories";
+        if (detector_cps_rate_model) {
+            result.metadata["expected_detector_equivalent_primaries"] = std::to_string(
+                expected_unthinned_primaries
+            );
+        } else {
+            result.metadata["expected_physical_primaries"] = std::to_string(
+                expected_unthinned_primaries
+            );
+        }
         result.metadata["expected_sampled_primaries"] = std::to_string(expected_sampled_primaries);
         result.metadata["primary_sampling_fraction"] = std::to_string(primary_sampling_fraction);
         result.metadata["primary_history_weight"] = std::to_string(primary_history_weight);

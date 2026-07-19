@@ -62,7 +62,10 @@ class _BridgeRequestHandler(socketserver.BaseRequestHandler):
             raise RuntimeError("Unexpected server type.")
         if msg_type == "reset":
             server.app.reset(build_scene_description(payload))
-            return {"status": "reset"}
+            return {
+                "status": "reset",
+                "runtime_fidelity": server.app.runtime_fidelity_metadata(),
+            }
         if msg_type == "step":
             command = SimulationCommand.from_dict(payload)
             observation = server.app.step(command)

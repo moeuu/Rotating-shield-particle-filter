@@ -419,6 +419,29 @@ def _run_shot(
                 "geant4_source_tally_counts": float(geant4_source_tally_counts.get(isotope, 0.0)),
                 "raw_total_counts": float(np.sum(spectrum)),
                 "num_primaries": float(metadata.get("num_primaries", 0.0)),
+                "source_rate_model": str(metadata.get("source_rate_model", "")),
+                "expected_primary_semantics": str(
+                    metadata.get("expected_primary_semantics", "")
+                ),
+                "expected_physical_primaries": metadata.get(
+                    "expected_physical_primaries", ""
+                ),
+                "expected_detector_equivalent_primaries": metadata.get(
+                    "expected_detector_equivalent_primaries", ""
+                ),
+                "expected_sampled_primaries": metadata.get(
+                    "expected_sampled_primaries", ""
+                ),
+                "primary_sampling_fraction": float(
+                    metadata.get("primary_sampling_fraction", 0.0)
+                ),
+                "primary_history_weight": float(
+                    metadata.get("primary_history_weight", 0.0)
+                ),
+                "requested_threads": int(metadata.get("requested_threads", 0)),
+                "multithreaded_run_manager": bool(
+                    metadata.get("multithreaded_run_manager", False)
+                ),
                 "measurement_replicates": int(metadata.get("measurement_replicates", 1)),
                 "history_scale": float(history_scale),
             }

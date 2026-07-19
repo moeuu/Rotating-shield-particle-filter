@@ -162,6 +162,144 @@ class IsaacSimTCPClientRuntime(TCPSidecarClientRuntime):
 class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
     """TCP client for the Geant4 sidecar."""
 
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout_s: float = 10.0,
+        *,
+        expected_source_rate_model: str | None = None,
+        expected_thread_count: int | None = None,
+        expected_physics_profile: str | None = None,
+        expected_detector_scoring_mode: str | None = None,
+        expected_secondary_transport_mode: str | None = None,
+        expected_source_bias_mode: str | None = None,
+        expected_background_cps: float | None = None,
+    ) -> None:
+        """Store connection parameters and expected sidecar fidelity."""
+        super().__init__(host=host, port=port, timeout_s=timeout_s)
+        self.expected_source_rate_model = (
+            None
+            if expected_source_rate_model is None
+            else str(expected_source_rate_model)
+        )
+        self.expected_thread_count = (
+            None if expected_thread_count is None else int(expected_thread_count)
+        )
+        self.expected_physics_profile = (
+            None if expected_physics_profile is None else str(expected_physics_profile)
+        )
+        self.expected_detector_scoring_mode = (
+            None
+            if expected_detector_scoring_mode is None
+            else str(expected_detector_scoring_mode)
+        )
+        self.expected_secondary_transport_mode = (
+            None
+            if expected_secondary_transport_mode is None
+            else str(expected_secondary_transport_mode)
+        )
+        self.expected_source_bias_mode = (
+            None if expected_source_bias_mode is None else str(expected_source_bias_mode)
+        )
+        self.expected_background_cps = (
+            None if expected_background_cps is None else float(expected_background_cps)
+        )
+
+    def reset(self, payload: dict[str, Any] | None = None) -> None:
+        """Reset the sidecar only after validating its fidelity handshake."""
+        response = self._round_trip("reset", payload or {})
+        self._validate_fidelity_handshake(response)
+
+    def step(self, command: SimulationCommand) -> SimulationObservation:
+        """Execute one step and validate native fidelity before PF ingestion."""
+        from sim.geant4_app.app import validate_full_history_transport_metadata
+
+        payload = self._round_trip("step", command.to_dict())
+        observation = SimulationObservation.from_dict(payload["observation"])
+        validate_full_history_transport_metadata(
+            observation.metadata,
+            expected_source_rate_model=self.expected_source_rate_model,
+            expected_thread_count=self.expected_thread_count,
+            expected_physics_profile=self.expected_physics_profile,
+            expected_detector_scoring_mode=self.expected_detector_scoring_mode,
+            expected_secondary_transport_mode=(
+                self.expected_secondary_transport_mode
+            ),
+            expected_source_bias_mode=self.expected_source_bias_mode,
+            expected_background_cps=self.expected_background_cps,
+        )
+        return observation
+
+    def _validate_fidelity_handshake(self, response: dict[str, Any]) -> None:
+        """Reject stale or mismatched Geant4 bridge processes."""
+        fidelity = response.get("runtime_fidelity")
+        if not isinstance(fidelity, dict):
+            raise RuntimeError(
+                "Geant4 sidecar reset did not return a runtime_fidelity "
+                "handshake; refusing to reuse an unverified process."
+            )
+        for key in ("primary_sampling_fraction", "primary_history_weight"):
+            try:
+                value = float(fidelity[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Geant4 sidecar fidelity handshake is missing valid {key}."
+                ) from exc
+            if value != 1.0:
+                raise RuntimeError(
+                    f"Geant4 sidecar requires {key}=1.0, got {value}."
+                )
+        if self.expected_source_rate_model is not None:
+            actual_model = str(fidelity.get("source_rate_model", ""))
+            if actual_model != self.expected_source_rate_model:
+                raise RuntimeError(
+                    "Geant4 sidecar source-rate model mismatch: "
+                    f"expected {self.expected_source_rate_model}, "
+                    f"got {actual_model or 'missing'}."
+                )
+        if self.expected_thread_count is not None:
+            try:
+                actual_threads = int(fidelity["requested_threads"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Geant4 sidecar fidelity handshake is missing "
+                    "requested_threads."
+                ) from exc
+            if actual_threads != self.expected_thread_count:
+                raise RuntimeError(
+                    "Geant4 sidecar thread-count mismatch: "
+                    f"expected {self.expected_thread_count}, got {actual_threads}."
+                )
+        expected_text_fields = {
+            "physics_profile": self.expected_physics_profile,
+            "detector_scoring_mode": self.expected_detector_scoring_mode,
+            "secondary_transport_mode": self.expected_secondary_transport_mode,
+            "source_bias_mode": self.expected_source_bias_mode,
+        }
+        for key, expected_value in expected_text_fields.items():
+            if expected_value is None:
+                continue
+            actual_value = str(fidelity.get(key, ""))
+            if actual_value != expected_value:
+                raise RuntimeError(
+                    f"Geant4 sidecar {key} mismatch: expected {expected_value}, "
+                    f"got {actual_value or 'missing'}."
+                )
+        if self.expected_background_cps is not None:
+            try:
+                actual_background_cps = float(fidelity["background_cps"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Geant4 sidecar fidelity handshake is missing background_cps."
+                ) from exc
+            if actual_background_cps != self.expected_background_cps:
+                raise RuntimeError(
+                    "Geant4 sidecar background rate mismatch: "
+                    f"expected {self.expected_background_cps}, "
+                    f"got {actual_background_cps}."
+                )
+
 
 class Geant4WithIsaacSimRuntime(SimulationRuntime):
     """Route robot motion to Isaac Sim while using Geant4 observations."""
@@ -271,9 +409,27 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         log_handle: object | None = None,
         temp_config_path: Path | None = None,
         restart_config: dict[str, Any] | None = None,
+        expected_source_rate_model: str | None = None,
+        expected_thread_count: int | None = None,
+        expected_physics_profile: str | None = None,
+        expected_detector_scoring_mode: str | None = None,
+        expected_secondary_transport_mode: str | None = None,
+        expected_source_bias_mode: str | None = None,
+        expected_background_cps: float | None = None,
     ) -> None:
         """Store the client parameters and owned process handles."""
-        super().__init__(host=host, port=port, timeout_s=timeout_s)
+        super().__init__(
+            host=host,
+            port=port,
+            timeout_s=timeout_s,
+            expected_source_rate_model=expected_source_rate_model,
+            expected_thread_count=expected_thread_count,
+            expected_physics_profile=expected_physics_profile,
+            expected_detector_scoring_mode=expected_detector_scoring_mode,
+            expected_secondary_transport_mode=expected_secondary_transport_mode,
+            expected_source_bias_mode=expected_source_bias_mode,
+            expected_background_cps=expected_background_cps,
+        )
         self.process = process
         self.log_handle = log_handle
         self.temp_config_path = temp_config_path
@@ -285,7 +441,8 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         """Reset the sidecar and retain the payload for crash recovery."""
         reset_payload = {} if payload is None else dict(payload)
         self._last_reset_payload = reset_payload
-        self._round_trip("reset", reset_payload)
+        response = self._round_trip("reset", reset_payload)
+        self._validate_fidelity_handshake(response)
 
     def _round_trip(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Send a request, restarting a crashed managed sidecar when safe."""
@@ -300,7 +457,10 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
                     raise RuntimeError(
                         "Managed Geant4 sidecar crashed before any reset payload was recorded."
                     )
-                super()._round_trip("reset", self._last_reset_payload)
+                reset_response = super()._round_trip(
+                    "reset", self._last_reset_payload
+                )
+                self._validate_fidelity_handshake(reset_response)
             return super()._round_trip(message_type, payload)
 
     def _can_restart_for(self, message_type: str) -> bool:
@@ -602,12 +762,25 @@ def _start_geant4_sidecar(
     runtime_config_path: str | Path | None,
 ) -> ManagedGeant4TCPClientRuntime:
     """Start a Geant4 bridge sidecar subprocess and return its managed client."""
+    from sim.geant4_app.app import Geant4AppConfig
+
+    validated_geant4_config = Geant4AppConfig.from_dict(config)
     root = _repo_root()
     script_path = root / "scripts" / "run_geant4_bridge.py"
     config_path, temp_config_path = _resolve_geant4_sidecar_config_path(
         config,
         runtime_config_path,
     )
+    sidecar_geant4_config = Geant4AppConfig.from_dict(
+        load_runtime_config(config_path)
+    )
+    if sidecar_geant4_config != validated_geant4_config:
+        if temp_config_path is not None:
+            temp_config_path.unlink(missing_ok=True)
+        raise ValueError(
+            "runtime_config and the Geant4 sidecar config path resolve to "
+            "different Geant4 application settings."
+        )
     log_path = Path(
         str(config.get("sidecar_log_path", root / "results" / "sidecars" / f"geant4_bridge_{port}.log"))
     ).expanduser()
@@ -637,6 +810,17 @@ def _start_geant4_sidecar(
         process=process,
         log_handle=log_handle,
         temp_config_path=temp_config_path,
+        expected_source_rate_model=validated_geant4_config.source_rate_model,
+        expected_thread_count=validated_geant4_config.thread_count,
+        expected_physics_profile=validated_geant4_config.physics_profile,
+        expected_detector_scoring_mode=(
+            validated_geant4_config.detector_scoring_mode
+        ),
+        expected_secondary_transport_mode=(
+            validated_geant4_config.secondary_transport_mode
+        ),
+        expected_source_bias_mode=validated_geant4_config.source_bias_mode,
+        expected_background_cps=validated_geant4_config.background_cps,
         restart_config={
             "enabled": bool(config.get("sidecar_restart_on_disconnect", True)),
             "max_restarts": int(config.get("sidecar_max_restarts", 2)),
@@ -843,6 +1027,9 @@ def create_simulation_runtime(
             close_on_close=not keep_alive,
         )
     if normalized == "geant4":
+        from sim.geant4_app.app import Geant4AppConfig
+
+        validated_geant4_config = Geant4AppConfig.from_dict(config)
         host = str(config.get("host", "127.0.0.1"))
         port = int(config.get("port", 5556))
         timeout_s = float(config.get("timeout_s", 120.0))
@@ -855,6 +1042,21 @@ def create_simulation_runtime(
                 runtime_config_path=runtime_config_path,
             )
         else:
-            geant4_runtime = Geant4TCPClientRuntime(host=host, port=port, timeout_s=timeout_s)
+            geant4_runtime = Geant4TCPClientRuntime(
+                host=host,
+                port=port,
+                timeout_s=timeout_s,
+                expected_source_rate_model=validated_geant4_config.source_rate_model,
+                expected_thread_count=validated_geant4_config.thread_count,
+                expected_physics_profile=validated_geant4_config.physics_profile,
+                expected_detector_scoring_mode=(
+                    validated_geant4_config.detector_scoring_mode
+                ),
+                expected_secondary_transport_mode=(
+                    validated_geant4_config.secondary_transport_mode
+                ),
+                expected_source_bias_mode=validated_geant4_config.source_bias_mode,
+                expected_background_cps=validated_geant4_config.background_cps,
+            )
         return _maybe_pair_geant4_with_isaacsim(config, geant4_runtime)
     raise ValueError(f"Unknown simulation backend: {backend}")

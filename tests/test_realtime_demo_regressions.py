@@ -63,6 +63,7 @@ from realtime_demo import (
     _online_absent_pruning_supported_isotopes,
     _prune_online_absent_isotopes,
     _measurement_log_obstacle_layout_path,
+    _measurement_transport_provenance,
     _resolve_ig_workers,
     _resolve_runtime_use_gpu,
     _resolve_mission_max_poses,
@@ -98,6 +99,39 @@ from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from visualization.realtime_viz import PFFrame
+
+
+def test_measurement_transport_provenance_keeps_full_history_evidence() -> None:
+    """Measurement logs should retain transport fidelity for every PF update."""
+    provenance = _measurement_transport_provenance(
+        {
+            "backend": "geant4",
+            "source_rate_model": "detector_cps_1m",
+            "expected_primary_semantics": "detector_equivalent_histories",
+            "expected_detector_equivalent_primaries": 1234.0,
+            "expected_sampled_primaries": 1234.0,
+            "physics_profile": "balanced",
+            "primary_sampling_fraction": 1.0,
+            "primary_history_weight": 1.0,
+            "requested_threads": 32,
+            "source_bias_mode": "detector_cone",
+            "multithreaded_run_manager": True,
+            "unrelated": "omit",
+        }
+    )
+
+    assert provenance == {
+        "expected_detector_equivalent_primaries": 1234.0,
+        "expected_primary_semantics": "detector_equivalent_histories",
+        "expected_sampled_primaries": 1234.0,
+        "multithreaded_run_manager": True,
+        "physics_profile": "balanced",
+        "primary_history_weight": 1.0,
+        "primary_sampling_fraction": 1.0,
+        "requested_threads": 32,
+        "source_bias_mode": "detector_cone",
+        "source_rate_model": "detector_cps_1m",
+    }
 
 
 def test_pf_strength_prior_uses_predeclared_generator_population() -> None:

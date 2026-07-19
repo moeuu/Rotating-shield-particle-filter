@@ -44,7 +44,7 @@
   },
   "stage_material_rules": [],
   "secondary_transport_mode": "gamma_only",
-  "primary_sampling_fraction": 0.02,
+  "primary_sampling_fraction": 1.0,
   "response_poisson_photopeak_fusion": false,
   "response_poisson_low_snr_photopeak_anchor": true,
   "response_poisson_low_snr_suppress_enable": true,

@@ -663,6 +663,20 @@ def _variant_config(
     """Return the runtime config for one ablation variant."""
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
+    primary_sampling_fraction = float(
+        config.get("primary_sampling_fraction", 1.0)
+    )
+    if primary_sampling_fraction != 1.0:
+        raise ValueError(
+            "RA-L full simulations require primary_sampling_fraction=1.0; "
+            "regenerate from the current full-history base config."
+        )
+    thread_count = int(config.get("thread_count", 1))
+    if thread_count <= 1:
+        raise ValueError(
+            "RA-L full simulations require a multithreaded Geant4 runtime; "
+            "thread_count must be greater than one."
+        )
     config["random_seed_base"] = int(seed)
     config["measurement_log_output_dir"] = (
         DEFAULT_MEASUREMENT_LOG_ROOT / output_tag

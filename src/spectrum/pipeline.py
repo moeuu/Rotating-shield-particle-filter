@@ -117,7 +117,7 @@ class SpectrumConfig:
     response_poisson_underallocation_count_guard_enable: bool = True
     response_poisson_underallocation_count_guard_ratio: float = 1.05
     response_poisson_underallocation_count_guard_photo_snr: float = 8.0
-    response_poisson_diagnostic_variance_enable: bool = True
+    response_poisson_diagnostic_variance_enable: bool = False
     response_poisson_global_diagnostic_variance_enable: bool = False
     response_poisson_diagnostic_reduced_chi2_threshold: float = 2.0
     response_poisson_diagnostic_reduced_chi2_scale: float = 0.5
@@ -126,8 +126,8 @@ class SpectrumConfig:
     response_poisson_count_variance_ceiling_enable: bool = True
     response_poisson_count_variance_max_rel_sigma: float = 0.15
     response_poisson_count_variance_max_abs_sigma: float = 40.0
-    response_poisson_count_variance_preserve_diagnostic_floors: bool = True
-    response_poisson_count_variance_preserve_guard_floors: bool = True
+    response_poisson_count_variance_preserve_diagnostic_floors: bool = False
+    response_poisson_count_variance_preserve_guard_floors: bool = False
     response_poisson_line_resolved_fit: bool = True
     response_poisson_line_min_intensity: float | None = None
     response_poisson_line_resolved_bic_margin: float = 0.0

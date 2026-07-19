@@ -105,7 +105,7 @@ def _write_fake_external_geant4(path: Path) -> Path:
                 "    *) shift ;;",
                 "  esac",
                 "done",
-                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
+                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
             ]
         ),
         encoding="utf-8",
@@ -143,7 +143,7 @@ def _write_fake_persistent_geant4(path: Path) -> Path:
                 "  done",
                 '  RESPONSE="${RESPONSE//%20/ }"',
                 "  RUN_INDEX=$((RUN_INDEX + 1))",
-                '  printf \'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n\' "$RUN_INDEX" > "$RESPONSE"',
+                '  printf \'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n\' "$RUN_INDEX" > "$RESPONSE"',
                 '  echo "SIMBRIDGE_OK response=$RESPONSE"',
                 "done",
             ]
@@ -722,6 +722,120 @@ def test_geant4_bridge_server_round_trip(tmp_path: Path) -> None:
     assert "scene_hash" in observation.metadata
     assert len(observation.spectrum_counts) > 0
     assert not thread.is_alive()
+
+
+def test_geant4_tcp_reset_rejects_unverified_or_weighted_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused bridge must prove full-history sampling before its first step."""
+    responses = iter(
+        [
+            {"status": "reset"},
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.02,
+                    "primary_history_weight": 50.0,
+                },
+            },
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 1.0,
+                    "primary_history_weight": 1.0,
+                    "source_rate_model": "detector_cps_1m",
+                    "requested_threads": 32,
+                },
+            },
+        ]
+    )
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_source_rate_model="detector_cps_1m",
+        expected_thread_count=32,
+    )
+
+    def _fake_round_trip(
+        message_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Return successive reset handshakes without opening a socket."""
+        assert message_type == "reset"
+        assert payload == {}
+        return next(responses)
+
+    monkeypatch.setattr(runtime, "_round_trip", _fake_round_trip)
+
+    with pytest.raises(RuntimeError, match="runtime_fidelity"):
+        runtime.reset()
+    with pytest.raises(RuntimeError, match="primary_sampling_fraction=1.0"):
+        runtime.reset()
+    runtime.reset()
+
+
+def test_geant4_tcp_step_revalidates_observation_fidelity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TCP observations must pass the native postcondition on every step."""
+    import sim.geant4_app.app as geant4_app_module
+
+    validated: dict[str, object] = {}
+    observation = SimulationObservation(
+        step_id=4,
+        detector_pose_xyz=(1.0, 2.0, 0.5),
+        detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+        fe_orientation_index=1,
+        pb_orientation_index=2,
+        spectrum_counts=[1.0],
+        energy_bin_edges_keV=[0.0, 1.0],
+        metadata={"backend": "geant4"},
+    )
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_source_rate_model="detector_cps_1m",
+        expected_thread_count=32,
+    )
+
+    def _fake_round_trip(
+        message_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Return one observation without opening a socket."""
+        assert message_type == "step"
+        assert payload["step_id"] == 4
+        return {"observation": observation.to_dict()}
+
+    def _fake_validate(
+        metadata: dict[str, object],
+        **kwargs: object,
+    ) -> None:
+        """Record that client-side validation received the observation."""
+        validated["metadata"] = dict(metadata)
+        validated["kwargs"] = dict(kwargs)
+
+    monkeypatch.setattr(runtime, "_round_trip", _fake_round_trip)
+    monkeypatch.setattr(
+        geant4_app_module,
+        "validate_full_history_transport_metadata",
+        _fake_validate,
+    )
+
+    result = runtime.step(
+        SimulationCommand(
+            step_id=4,
+            target_pose_xyz=(1.0, 2.0, 0.5),
+            target_base_yaw_rad=0.0,
+            fe_orientation_index=1,
+            pb_orientation_index=2,
+            dwell_time_s=1.0,
+        )
+    )
+
+    assert result == observation
+    assert validated["metadata"] == {"backend": "geant4"}
+    assert validated["kwargs"]["expected_thread_count"] == 32
 
 
 def test_geant4_real_stage_does_not_fall_back_to_fake_backend(
@@ -1539,7 +1653,31 @@ def test_geant4_application_forwards_commanded_detector_height(
             """Record one request and return an empty Geant4 spectrum."""
             self.requests.append(request)
             spectrum = np.zeros_like(SpectralDecomposer().energy_axis, dtype=float)
-            return spectrum, {"backend": "geant4"}
+            return spectrum, {
+                "backend": "geant4",
+                "source_rate_model": "detector_cps_1m",
+                "emission_model": "detector_equivalent_cone",
+                "engine_mode": "external",
+                "physics_profile": "balanced",
+                "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
+                "line_intensities_normalized": True,
+                "source_bias_mode": "detector_cone",
+                "weighted_transport": False,
+                "detector_scoring_mode": "full_transport",
+                "detector_response_applied_in_native": True,
+                "secondary_transport_mode": "full_transport",
+                "gamma_only_secondary_transport": False,
+                "theory_tvl_attenuation": False,
+                "background_cps": 0.0,
+                "poisson_background": True,
+                "expected_primary_semantics": "detector_equivalent_histories",
+                "expected_detector_equivalent_primaries": 0.0,
+                "expected_sampled_primaries": 0.0,
+                "primary_sampling_fraction": 1.0,
+                "primary_history_weight": 1.0,
+                "requested_threads": 1,
+                "multithreaded_run_manager": False,
+            }
 
         def close(self) -> None:
             """Record that the application closed the engine."""
@@ -2097,6 +2235,32 @@ def test_create_simulation_runtime_supports_geant4() -> None:
     assert isinstance(runtime, Geant4TCPClientRuntime)
 
 
+def test_create_simulation_runtime_rejects_weighted_geant4_before_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listening bridge must not bypass local full-history config validation."""
+    import sim.runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_tcp_server_available",
+        lambda *args, **kwargs: True,
+    )
+
+    with pytest.raises(ValueError, match="primary_sampling_fraction=1.0"):
+        create_simulation_runtime(
+            "geant4",
+            sources=[],
+            decomposer=SpectralDecomposer(),
+            mu_by_isotope={},
+            shield_params=None,
+            runtime_config={
+                "primary_sampling_fraction": 0.02,
+                "start_isaacsim_sidecar_with_geant4": False,
+            },
+        )
+
+
 def test_sidecar_python_resolves_from_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2233,6 +2397,33 @@ def test_create_simulation_runtime_auto_starts_geant4_sidecar(
     runtime.process.wait(timeout=5.0)
 
 
+def test_geant4_sidecar_rejects_config_path_mismatch(tmp_path: Path) -> None:
+    """Auto-start must reject config dictionaries that differ from the file."""
+    import sim.runtime as runtime_module
+
+    config_path = tmp_path / "geant4.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "primary_sampling_fraction": 1.0,
+                "thread_count": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="different Geant4 application settings"):
+        runtime_module._start_geant4_sidecar(
+            {
+                "primary_sampling_fraction": 1.0,
+                "thread_count": 1,
+            },
+            host="127.0.0.1",
+            port=5556,
+            runtime_config_path=config_path,
+        )
+
+
 def test_managed_geant4_sidecar_restart_replays_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2254,6 +2445,14 @@ def test_managed_geant4_sidecar_restart_replays_reset(
         if message_type == "step" and not failed_once:
             failed_once = True
             raise ConnectionRefusedError("sidecar stopped")
+        if message_type == "reset":
+            return {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 1.0,
+                    "primary_history_weight": 1.0,
+                },
+            }
         return {"status": message_type}
 
     def _fake_start_sidecar_process(
@@ -2734,7 +2933,7 @@ def test_external_geant4_engine_reads_file_protocol(tmp_path: Path) -> None:
                 "grep -q 'shape=spherical_octant_shell' \"$SCENE\"",
                 "grep -q 'inner_radius_m=' \"$SCENE\"",
                 "grep -q '^STEP ' \"$REQUEST\"",
-                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
+                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
             ]
         ),
         encoding="utf-8",

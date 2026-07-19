@@ -163,9 +163,12 @@ control the PF size instead of the default grid initialization.
 
 The standard full-simulation config is
 `configs/geant4/variance_reduction_external_no_isaac_32threads.json`. It uses
-explicit shield and obstacle geometry, does not cap histories, and does not use
-deterministic background smoothing. For detector/secondary-transport validation
-only, use `configs/geant4/high_fidelity_external_no_isaac.json`. The main
+explicit shield and obstacle geometry, sets `primary_sampling_fraction=1.0`,
+and never reweights thinned primary histories. Python runtime and validation
+entry points reject any other primary sampling fraction, including overrides
+hidden in native executable arguments. It also does not use deterministic
+background smoothing. For detector/secondary-transport validation only, use
+`configs/geant4/high_fidelity_external_no_isaac.json`. The main
 `result_spectrum*.png` output uses the highest-count measurement as the
 representative spectrum; the last measurement is also saved as
 `result_spectrum_last*.png`.
