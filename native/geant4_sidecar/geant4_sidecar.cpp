@@ -215,6 +215,7 @@ struct TransportOptions {
     std::string detector_scoring_mode = "full_transport";
     std::string secondary_transport_mode = "full_transport";
     double primary_sampling_fraction = 1.0;
+    long long target_sampled_primaries = 0;
 };
 
 struct EnergyDeposit {
@@ -278,6 +279,12 @@ std::string JoinSet(const std::set<std::string>& values, const std::string& sepa
         stream << value;
         first = false;
     }
+    return stream.str();
+}
+
+std::string SerializeDouble(const double value) {
+    std::ostringstream stream;
+    stream << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
     return stream.str();
 }
 
@@ -2349,20 +2356,102 @@ public:
         const double reference_acceptance = DetectorReferenceAcceptance(scene_.detector);
         const std::string source_rate_model = NormalizeSourceRateModel(options.source_rate_model);
         const bool detector_cps_rate_model = source_rate_model == "detector_cps_1m";
-        const bool weighted_transport = !detector_cps_rate_model && UsesSourceBias(options);
+        const bool source_bias_weighted_transport = (
+            !detector_cps_rate_model && UsesSourceBias(options)
+        );
         const std::string source_bias_mode = NormalizeSourceBiasMode(options.source_bias_mode);
         const std::string effective_source_bias_mode = detector_cps_rate_model
             ? "detector_cone"
             : source_bias_mode;
         const bool cone_sampled_transport = (
-            weighted_transport || effective_source_bias_mode == "detector_cone"
+            source_bias_weighted_transport || effective_source_bias_mode == "detector_cone"
         );
-        const double primary_sampling_fraction = std::clamp(
+        const double requested_primary_sampling_fraction = std::clamp(
             options.primary_sampling_fraction,
             1.0e-6,
             1.0
         );
+        const bool primary_sampling_budget_enabled = options.target_sampled_primaries > 0;
+        if (primary_sampling_budget_enabled && !detector_cps_rate_model) {
+            throw std::runtime_error(
+                "target_sampled_primaries requires source_rate_model=detector_cps_1m"
+            );
+        }
+        for (const auto& source : scene_.sources) {
+            const double point_geom_scale = InverseSquareScale(
+                source.x,
+                source.y,
+                source.z,
+                request.detector_pose.x,
+                request.detector_pose.y,
+                request.detector_pose.z
+            );
+            const double detector_cps_geom_scale = DetectorCpsGeometryScale(
+                source.x,
+                source.y,
+                source.z,
+                request.detector_pose.x,
+                request.detector_pose.y,
+                request.detector_pose.z,
+                scene_.detector
+            );
+            const double geom_scale = detector_cps_rate_model
+                ? detector_cps_geom_scale
+                : point_geom_scale;
+            const auto lines = GammaLinesForIsotope(source.isotope);
+            const double shield_transmission = use_theory_tvl_
+                ? TheoryTvlTransmission(source, scene_, request)
+                : 1.0;
+            double total_line_intensity = 0.0;
+            for (const auto& line : lines) {
+                total_line_intensity += std::max(0.0, line.intensity);
+            }
+            for (const auto& line : lines) {
+                const double source_rate_scale = detector_cps_rate_model
+                    ? geom_scale
+                    : 1.0 / reference_acceptance;
+                const double line_weight = (
+                    detector_cps_rate_model && total_line_intensity > 0.0
+                )
+                    ? line.intensity / total_line_intensity
+                    : line.intensity;
+                const double mean_events = source.intensity_cps_1m
+                    * request.dwell_time_s
+                    * shield_transmission
+                    * line_weight
+                    * source_rate_scale;
+                if (mean_events > 0.0) {
+                    expected_unthinned_primaries += mean_events;
+                }
+            }
+        }
+        if (
+            !std::isfinite(expected_unthinned_primaries)
+            || expected_unthinned_primaries < 0.0
+        ) {
+            throw std::runtime_error(
+                "Expected detector-equivalent primary count is invalid"
+            );
+        }
+        double primary_sampling_fraction = requested_primary_sampling_fraction;
+        std::string primary_sampling_fraction_resolution = "fixed_fraction";
+        if (primary_sampling_budget_enabled) {
+            const double budget_fraction = expected_unthinned_primaries > 0.0
+                ? static_cast<double>(options.target_sampled_primaries)
+                    / expected_unthinned_primaries
+                : std::numeric_limits<double>::infinity();
+            if (budget_fraction < requested_primary_sampling_fraction) {
+                primary_sampling_fraction = std::clamp(budget_fraction, 1.0e-6, 1.0);
+                primary_sampling_fraction_resolution = "target_budget_limited";
+            } else {
+                primary_sampling_fraction_resolution = "maximum_fraction_limited";
+            }
+        }
         const double primary_history_weight = 1.0 / primary_sampling_fraction;
+        const bool history_thinning_enabled = primary_sampling_fraction < 1.0;
+        const bool transport_tally_weighted = (
+            source_bias_weighted_transport || history_thinning_enabled
+        );
         double effective_cone_min_deg = std::numeric_limits<double>::infinity();
         double effective_cone_max_deg = 0.0;
         const G4ThreeVector detector_center(
@@ -2380,6 +2469,7 @@ public:
         std::map<std::string, double> transport_uncollided_primary_counts_by_line;
         std::map<std::string, double> transport_interacted_primary_counts_by_line;
         std::map<std::string, double> transport_secondary_counts_by_line;
+        double scheduled_unthinned_primaries = 0.0;
         for (std::size_t source_index = 0; source_index < scene_.sources.size(); ++source_index) {
             const auto& source = scene_.sources[source_index];
             const std::string source_token = "src" + std::to_string(source_index)
@@ -2440,7 +2530,7 @@ public:
                 if (mean_events <= 0.0) {
                     continue;
                 }
-                expected_unthinned_primaries += mean_events;
+                scheduled_unthinned_primaries += mean_events;
                 const double sampled_mean_events = mean_events * primary_sampling_fraction;
                 expected_sampled_primaries += sampled_mean_events;
                 std::poisson_distribution<long> distribution(sampled_mean_events);
@@ -2467,7 +2557,9 @@ public:
                     source_rate_model,
                     detector_center,
                     cone_half_angle_rad,
-                    weighted_transport ? options.source_bias_isotropic_fraction : 1.0,
+                    source_bias_weighted_transport
+                        ? options.source_bias_isotropic_fraction
+                        : 1.0,
                     primary_history_weight
                 );
                 const auto deposit_start = event_store_.EventDepositsMeV().size();
@@ -2502,6 +2594,18 @@ public:
                 }
             }
         }
+        const double primary_expectation_tolerance = 1.0e-9
+            + 1.0e-12 * std::abs(expected_unthinned_primaries);
+        if (
+            !std::isfinite(scheduled_unthinned_primaries)
+            || std::abs(
+                scheduled_unthinned_primaries - expected_unthinned_primaries
+            ) > primary_expectation_tolerance
+        ) {
+            throw std::runtime_error(
+                "Precomputed and scheduled unthinned primary expectations disagree"
+            );
+        }
         constexpr double kBinWidthKeV = 2.0;
         constexpr double kEnergyMaxKeV = 1500.0;
         const int num_bins = static_cast<int>(kEnergyMaxKeV / kBinWidthKeV) + 1;
@@ -2525,6 +2629,11 @@ public:
         }
         AddBackgroundSpectrum(spectrum, &spectrum_variance, kBinWidthKeV, request.dwell_time_s, options, rng);
         const double total_counts = std::accumulate(spectrum.begin(), spectrum.end(), 0.0);
+        const double pre_dead_time_total_variance = std::accumulate(
+            spectrum_variance.begin(),
+            spectrum_variance.end(),
+            0.0
+        );
         const double dwell_time_s = std::max(1.0e-6, request.dwell_time_s);
         const double true_rate = total_counts / dwell_time_s;
         const double observed_scale = 1.0 / (1.0 + std::max(0.0, true_rate * dead_time_tau_s));
@@ -2594,7 +2703,7 @@ public:
         result.metadata["engine_mode"] = "external";
         result.metadata["emission_model"] = detector_cps_rate_model
             ? "detector_equivalent_cone"
-            : (weighted_transport ? "weighted_isotropic" : "isotropic");
+            : (source_bias_weighted_transport ? "weighted_isotropic" : "isotropic");
         result.metadata["source_rate_model"] = source_rate_model;
         result.metadata["intensity_cps_1m_definition"] = "net_detector_count_rate_at_1m";
         result.metadata["line_intensities_normalized"] = detector_cps_rate_model ? "true" : "false";
@@ -2615,17 +2724,37 @@ public:
             ? "detector_equivalent_histories"
             : "isotropic_physical_histories";
         if (detector_cps_rate_model) {
-            result.metadata["expected_detector_equivalent_primaries"] = std::to_string(
+            result.metadata["expected_detector_equivalent_primaries"] = SerializeDouble(
                 expected_unthinned_primaries
             );
         } else {
-            result.metadata["expected_physical_primaries"] = std::to_string(
+            result.metadata["expected_physical_primaries"] = SerializeDouble(
                 expected_unthinned_primaries
             );
         }
-        result.metadata["expected_sampled_primaries"] = std::to_string(expected_sampled_primaries);
-        result.metadata["primary_sampling_fraction"] = std::to_string(primary_sampling_fraction);
-        result.metadata["primary_history_weight"] = std::to_string(primary_history_weight);
+        result.metadata["expected_unthinned_primaries"] = SerializeDouble(
+            expected_unthinned_primaries
+        );
+        result.metadata["expected_sampled_primaries"] = SerializeDouble(expected_sampled_primaries);
+        result.metadata["primary_sampling_fraction"] = SerializeDouble(primary_sampling_fraction);
+        result.metadata["primary_history_weight"] = SerializeDouble(primary_history_weight);
+        result.metadata["requested_primary_sampling_fraction"] = SerializeDouble(
+            requested_primary_sampling_fraction
+        );
+        result.metadata["target_sampled_primaries"] = std::to_string(
+            options.target_sampled_primaries
+        );
+        result.metadata["primary_sampling_budget_enabled"] = (
+            primary_sampling_budget_enabled ? "true" : "false"
+        );
+        result.metadata["primary_sampling_fraction_resolution"] = (
+            primary_sampling_fraction_resolution
+        );
+        result.metadata["history_thinning_enabled"] = history_thinning_enabled ? "true" : "false";
+        result.metadata["transport_history_mode"] = history_thinning_enabled
+            ? "weighted_thinning"
+            : "full_unit_weight";
+        result.metadata["transport_tally_weighted"] = transport_tally_weighted ? "true" : "false";
         result.metadata["reference_detector_acceptance"] = std::to_string(reference_acceptance);
         result.metadata["detector_crystal_radius_m"] = std::to_string(scene_.detector.crystal_radius_m);
         result.metadata["detector_housing_thickness_m"] = std::to_string(scene_.detector.housing_thickness_m);
@@ -2660,11 +2789,16 @@ public:
         result.metadata["multithreaded_run_manager"] = run_manager_multithreaded_ ? "true" : "false";
         result.metadata["background_cps"] = std::to_string(options.background_cps);
         result.metadata["poisson_background"] = "true";
-        result.metadata["weighted_transport"] = weighted_transport ? "true" : "false";
+        result.metadata["source_bias_weighted_transport"] = source_bias_weighted_transport
+            ? "true"
+            : "false";
+        result.metadata["weighted_transport"] = transport_tally_weighted ? "true" : "false";
         result.metadata["source_bias"] = effective_source_bias_mode;
         result.metadata["source_bias_mode"] = effective_source_bias_mode;
         result.metadata["source_bias_isotropic_fraction"] = std::to_string(
-            weighted_transport ? std::clamp(options.source_bias_isotropic_fraction, 1.0e-6, 1.0) : 1.0
+            source_bias_weighted_transport
+                ? std::clamp(options.source_bias_isotropic_fraction, 1.0e-6, 1.0)
+                : 1.0
         );
         result.metadata["source_bias_configured_cone_half_angle_deg"] = std::to_string(
             std::max(0.0, options.source_bias_cone_half_angle_deg)
@@ -2680,8 +2814,19 @@ public:
         result.metadata["source_bias_effective_cone_half_angle_deg_max"] = std::to_string(
             cone_sampled_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
         );
-        result.metadata["weighted_spectrum_sumw2"] = std::to_string(total_variance);
-        result.metadata["weighted_spectrum_effective_entries"] = std::to_string(effective_spectrum_entries);
+        result.metadata["weighted_spectrum_sumw2"] = SerializeDouble(total_variance);
+        result.metadata["weighted_spectrum_effective_entries"] = SerializeDouble(effective_spectrum_entries);
+        result.metadata["spectrum_variance_semantics"] = (
+            "compound_poisson_sumw2_includes_counting"
+        );
+        result.metadata["spectrum_variance_dead_time_propagation"] = "fixed_observed_scale";
+        result.metadata["dead_time_tau_s"] = SerializeDouble(dead_time_tau_s);
+        result.metadata["dead_time_observed_scale"] = SerializeDouble(observed_scale);
+        result.metadata["dwell_time_s"] = SerializeDouble(dwell_time_s);
+        result.metadata["pre_dead_time_total_spectrum_counts"] = SerializeDouble(total_counts);
+        result.metadata["pre_dead_time_weighted_spectrum_sumw2"] = SerializeDouble(
+            pre_dead_time_total_variance
+        );
         result.metadata["absorbing_volume_count"] = std::to_string(absorbing_volume_names_.size());
         result.metadata["absorbing_transport_groups"] = JoinSet(absorbing_transport_groups_, ",");
         result.metadata["persistent_process"] = persistent_process ? "true" : "false";
@@ -2928,6 +3073,13 @@ int main(int argc, char** argv) {
                     1.0e-6,
                     1.0
                 );
+            } else if (arg == "--target-sampled-primaries" && index + 1 < argc) {
+                transport_options.target_sampled_primaries = std::stoll(argv[++index]);
+                if (transport_options.target_sampled_primaries <= 0) {
+                    throw std::runtime_error(
+                        "--target-sampled-primaries requires a positive integer"
+                    );
+                }
             } else if (arg == "--persistent") {
                 persistent = true;
             }

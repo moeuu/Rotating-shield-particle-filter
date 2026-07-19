@@ -20,6 +20,7 @@ from runtime_defaults import (
     DEFAULT_NO_ROTATION_OVERHEAD_S,
     DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
 )
+from sim.runtime import load_runtime_config
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BASE_CONFIG = (
@@ -426,7 +427,9 @@ def _parallel_runtime_overrides(base_config: Mapping[str, Any]) -> dict[str, Any
     }
 
 
-def _deep_update(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+def _deep_update(
+    base: Mapping[str, Any], overrides: Mapping[str, Any]
+) -> dict[str, Any]:
     """Return a recursive dictionary merge of base and overrides."""
     merged: dict[str, Any] = dict(base)
     for key, value in overrides.items():
@@ -438,9 +441,8 @@ def _deep_update(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    """Load a JSON object from a path."""
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    """Load a runtime JSON object, including an inherited parent config."""
+    payload = load_runtime_config(path)
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object in {path}")
     return payload
@@ -527,7 +529,9 @@ def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]
     preferred_raw = base_config.get("random_source_preferred_max_z_m", 5.0)
     preferred_max_z_m = None if preferred_raw is None else float(preferred_raw)
     return {
-        "visibility_filter": bool(base_config.get("random_source_visibility_filter", True)),
+        "visibility_filter": bool(
+            base_config.get("random_source_visibility_filter", True)
+        ),
         "visibility_min_fraction": float(
             base_config.get("random_source_min_visible_fraction", 0.1)
         ),
@@ -663,14 +667,7 @@ def _variant_config(
     """Return the runtime config for one ablation variant."""
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
-    primary_sampling_fraction = float(
-        config.get("primary_sampling_fraction", 1.0)
-    )
-    if primary_sampling_fraction != 1.0:
-        raise ValueError(
-            "RA-L full simulations require primary_sampling_fraction=1.0; "
-            "regenerate from the current full-history base config."
-        )
+    transport_history_mode = _validate_ral_transport_sampling(config)
     thread_count = int(config.get("thread_count", 1))
     if thread_count <= 1:
         raise ValueError(
@@ -699,9 +696,67 @@ def _variant_config(
                 "ral_ablation_case": case.name,
                 "ral_ablation_variant": variant.name,
                 "ral_ablation_seed": int(seed),
+                "ral_transport_history_mode": transport_history_mode,
+                "ral_accelerated_transport_exception": bool(
+                    transport_history_mode != "full_unit_weight"
+                ),
+                "ral_primary_sampling_fraction": float(
+                    config.get("primary_sampling_fraction", 1.0)
+                ),
+                "ral_target_sampled_primaries": config.get(
+                    "target_sampled_primaries"
+                ),
             }
         )
     return config
+
+
+def _validate_ral_transport_sampling(config: Mapping[str, Any]) -> str:
+    """Validate and label the transport-history policy for one RA-L run.
+
+    RA-L generation remains full-history by default. Fractional sampling is
+    accepted only for the explicit, user-authorized accelerated experiment
+    mode and only with detector-equivalent source-rate semantics.
+    """
+    fraction = float(config.get("primary_sampling_fraction", 1.0))
+    if not np.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        raise ValueError("primary_sampling_fraction must be in (0, 1].")
+    accelerated = bool(config.get("accelerated_weighted_transport_enable", False))
+    target_value = config.get("target_sampled_primaries")
+    if target_value is None:
+        target = None
+    else:
+        if isinstance(target_value, bool) or not isinstance(target_value, int):
+            raise ValueError(
+                "target_sampled_primaries must be a positive JSON integer."
+            )
+        if target_value <= 0:
+            raise ValueError(
+                "target_sampled_primaries must be a positive JSON integer."
+            )
+        target = int(target_value)
+    if fraction == 1.0 and target is None:
+        if accelerated:
+            raise ValueError(
+                "accelerated_weighted_transport_enable requires fractional "
+                "sampling or target_sampled_primaries."
+            )
+        return "full_unit_weight"
+    if not accelerated:
+        raise ValueError(
+            "RA-L full simulations require primary_sampling_fraction=1.0 unless "
+            "accelerated_weighted_transport_enable=true is explicitly selected."
+        )
+    if str(config.get("source_rate_model", "detector_cps_1m")) != "detector_cps_1m":
+        raise ValueError(
+            "RA-L weighted history thinning is restricted to "
+            "source_rate_model=detector_cps_1m."
+        )
+    return (
+        "budgeted_weighted_transport"
+        if target is not None
+        else "weighted_thinning"
+    )
 
 
 def build_ablation_plan(
@@ -712,12 +767,21 @@ def build_ablation_plan(
     cases: Sequence[AblationCase] = DEFAULT_ABLATION_CASES,
     variants: Sequence[AblationVariant] = DEFAULT_ABLATION_VARIANTS,
     intensity_cps_1m: float | Sequence[float] = DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
+    output_tag_suffix: str = "",
 ) -> list[AblationPlanEntry]:
     """Build and write config/source files for RA-L ablation trials."""
     base_config_path = Path(base_config_path).expanduser().resolve()
     base_config = _load_json(base_config_path)
     source_options = _source_generation_options(base_config)
     entries: list[AblationPlanEntry] = []
+    normalized_suffix = str(output_tag_suffix).strip().strip("_")
+    if normalized_suffix and any(
+        not (character.isalnum() or character in {"-", "_"})
+        for character in normalized_suffix
+    ):
+        raise ValueError(
+            "output_tag_suffix may contain only letters, digits, '-' and '_'."
+        )
     config_dir = Path(output_dir) / "configs"
     source_dir = Path(output_dir) / "sources"
     for case in cases:
@@ -734,6 +798,8 @@ def build_ablation_plan(
             _write_json(source_path, source_payload)
             for variant in variants:
                 tag = f"{case.name}_{variant.name}_seed_{seed}"
+                if normalized_suffix:
+                    tag = f"{tag}_{normalized_suffix}"
                 config = _variant_config(
                     base_config,
                     base_config_path=base_config_path,

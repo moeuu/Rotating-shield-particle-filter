@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import matplotlib
 
+from measurement.detector_geometry import (
+    DEFAULT_CRYSTAL_RADIUS_M,
+    detector_active_radius_m,
+)
 from measurement.observation_model import build_runtime_observation_model
 
 if TYPE_CHECKING:
@@ -271,6 +275,123 @@ def _runtime_float(
     return float(value)
 
 
+def _planning_primary_history_weight(
+    runtime_config: Mapping[str, Any],
+) -> float:
+    """Return the minimum DSS history weight allowed by transport sampling."""
+    sampling_fraction = _runtime_float(
+        runtime_config,
+        "primary_sampling_fraction",
+        1.0,
+    )
+    if (
+        not np.isfinite(sampling_fraction)
+        or sampling_fraction <= 0.0
+        or sampling_fraction > 1.0
+    ):
+        raise ValueError("primary_sampling_fraction must be finite and in (0, 1].")
+    return 1.0 / sampling_fraction
+
+
+def _target_sampled_primaries(
+    runtime_config: Mapping[str, Any],
+) -> int | None:
+    """Return a validated per-transport-invocation primary budget when enabled."""
+    raw_target = runtime_config.get("target_sampled_primaries")
+    if raw_target in (None, ""):
+        return None
+    if isinstance(raw_target, bool) or not isinstance(raw_target, int):
+        raise ValueError("target_sampled_primaries must be a positive integer.")
+    if raw_target <= 0:
+        raise ValueError("target_sampled_primaries must be a positive integer.")
+    return int(raw_target)
+
+
+def _transport_detector_budget_radius_m(
+    runtime_config: Mapping[str, Any],
+) -> float:
+    """Return the physical crystal radius used by native history budgeting."""
+    detector_model = runtime_config.get("detector_model", {})
+    if not isinstance(detector_model, Mapping):
+        detector_model = {}
+    return detector_active_radius_m(
+        detector_model,
+        default_radius_m=DEFAULT_CRYSTAL_RADIUS_M,
+    )
+
+
+def _validate_adaptive_primary_budget_contract(
+    runtime_config: Mapping[str, Any],
+    *,
+    adaptive_dwell: bool,
+) -> None:
+    """Reject adaptive dwell when a per-invocation primary budget is configured."""
+    if not bool(adaptive_dwell):
+        return
+    if _target_sampled_primaries(runtime_config) is None:
+        return
+    raise ValueError(
+        "target_sampled_primaries is a target budget per Geant4 transport "
+        "invocation; adaptive planning with an unknown number of transport "
+        "chunks is unsupported. Use fixed dwell or a fixed "
+        "primary_sampling_fraction."
+    )
+
+
+def _validate_weighted_pf_runtime_contract(
+    runtime_config: Mapping[str, Any],
+    *,
+    count_likelihood_model: str,
+    observation_variance_semantics: str,
+    direct_spectrum_likelihood_enable: bool,
+    shield_contrast_likelihood_enable: bool,
+    shield_view_ratio_likelihood_enable: bool,
+    planning_primary_history_weight: float,
+) -> None:
+    """Fail closed when weighted transport would double-count PF evidence."""
+    fraction = _runtime_float(runtime_config, "primary_sampling_fraction", 1.0)
+    target_sampled_primaries = _target_sampled_primaries(runtime_config)
+    weighted_requested = (
+        fraction < 1.0 - 1.0e-12 or target_sampled_primaries is not None
+    )
+    if not weighted_requested:
+        return
+    if runtime_config.get("accelerated_weighted_transport_enable") is not True:
+        raise ValueError(
+            "Weighted PF runtime requires accelerated_weighted_transport_enable=true."
+        )
+    if str(observation_variance_semantics) != "complete_statistical":
+        raise ValueError(
+            "Weighted PF runtime requires complete_statistical observation variance."
+        )
+    if str(count_likelihood_model).strip().lower() not in {"gaussian", "student_t"}:
+        raise ValueError(
+            "Weighted PF runtime requires a gaussian or student_t count likelihood."
+        )
+    if bool(direct_spectrum_likelihood_enable):
+        raise ValueError(
+            "Weighted PF runtime cannot reuse counts in the direct spectrum likelihood."
+        )
+    if bool(shield_contrast_likelihood_enable) or bool(
+        shield_view_ratio_likelihood_enable
+    ):
+        raise ValueError(
+            "Weighted PF runtime requires shield contrast and view-ratio "
+            "auxiliary likelihoods to be disabled."
+        )
+    minimum_weight = 1.0 / fraction
+    if not np.isclose(
+        float(planning_primary_history_weight),
+        minimum_weight,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        raise ValueError(
+            "DSS minimum primary history weight must be reciprocal to the "
+            "maximum transport sampling fraction."
+        )
+
+
 def _seed_pf_random_generators(seed: int) -> None:
     """Seed NumPy and Torch PF/planning draws from one declared run seed."""
     resolved_seed = int(seed)
@@ -409,7 +530,11 @@ from measurement.shielding import (
 )
 from spectrum.library import get_detection_lines_keV
 from spectrum.peak_detection import detect_peaks
-from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
+from spectrum.pipeline import (
+    ResponsePoissonCovarianceChunk,
+    SpectralDecomposer,
+    SpectrumConfig,
+)
 from spectrum.runtime_config import (
     spectrum_config_from_runtime_config as build_spectrum_config_from_runtime_config,
 )
@@ -2963,34 +3088,81 @@ def _metadata_float(metadata: dict[str, object], key: str) -> float | None:
         return None
 
 
+def _metadata_bool(metadata: Mapping[str, object], key: str) -> bool | None:
+    """Read one strict boolean-like metadata field when present."""
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
 def _measurement_transport_provenance(
     metadata: dict[str, object],
 ) -> dict[str, object]:
     """Return Geant4 fidelity fields that must survive in measurement logs."""
     keys = (
+        "accelerated_weighted_transport_enable",
+        "adaptive_dwell",
+        "adaptive_dwell_child_step_ids",
+        "adaptive_dwell_chunk_live_times_s",
+        "adaptive_dwell_chunk_primary_history_weights",
+        "adaptive_dwell_chunk_primary_sampling_fractions",
+        "adaptive_dwell_chunks",
+        "adaptive_dwell_effective_primary_sampling_fraction",
+        "adaptive_dwell_live_time_s",
+        "adaptive_dwell_primary_history_weight_semantics",
+        "adaptive_dwell_primary_sampling_fraction_semantics",
+        "adaptive_dwell_target_sampled_primaries_semantics",
+        "adaptive_dwell_transport_chunk_provenance",
         "background_cps",
+        "dead_time_observed_scale",
+        "dead_time_tau_s",
         "detector_response_applied_in_native",
         "detector_scoring_mode",
+        "dwell_time_s",
         "emission_model",
         "engine_mode",
         "expected_detector_equivalent_primaries",
         "expected_physical_primaries",
         "expected_primary_semantics",
         "expected_sampled_primaries",
+        "expected_unthinned_primaries",
         "gamma_only_secondary_transport",
+        "history_thinning_enabled",
         "intensity_cps_1m_definition",
         "line_intensities_normalized",
         "multithreaded_run_manager",
         "num_primaries",
+        "pre_dead_time_total_spectrum_counts",
+        "pre_dead_time_weighted_spectrum_sumw2",
         "primary_history_weight",
+        "primary_sampling_budget_enabled",
         "primary_sampling_fraction",
+        "primary_sampling_fraction_resolution",
         "poisson_background",
         "physics_profile",
         "requested_threads",
+        "requested_primary_sampling_fraction",
         "secondary_transport_mode",
+        "source_bias_weighted_transport",
         "source_bias_mode",
         "source_rate_model",
+        "spectrum_variance_dead_time_propagation",
+        "spectrum_variance_semantics",
+        "target_sampled_primaries",
         "theory_tvl_attenuation",
+        "transport_history_mode",
+        "transport_tally_weighted",
+        "weighted_spectrum_effective_entries",
+        "weighted_spectrum_sumw2",
         "weighted_transport",
     )
     return {key: metadata[key] for key in keys if key in metadata}
@@ -5595,6 +5767,12 @@ def _count_error_model_diagnostics(
             "observation_count_variance_includes_counting_noise": bool(
                 pf_config.observation_count_variance_includes_counting_noise
             ),
+            "observation_count_variance_semantics": str(
+                pf_config.observation_count_variance_semantics
+            ),
+            "direct_spectrum_likelihood_enabled": bool(
+                pf_config.direct_spectrum_likelihood_enable
+            ),
             "station_view_covariance_enabled": bool(
                 pf_config.station_view_covariance_enable
             ),
@@ -7624,6 +7802,8 @@ def _evaluate_spectrum_counts(
     min_peaks_by_isotope: dict[str, int] | None,
     spectrum_variance: NDArray[np.float64] | None = None,
     transport_metadata: dict[str, object] | None = None,
+    transport_spectrum: NDArray[np.float64] | None = None,
+    transport_covariance_chunks: tuple[ResponsePoissonCovarianceChunk, ...] = (),
     candidate_isotopes: Sequence[str] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], set[str]]:
     """Extract isotope counts, count variances, and detected labels."""
@@ -7638,6 +7818,8 @@ def _evaluate_spectrum_counts(
         min_peaks_by_isotope=min_peaks_by_isotope,
         spectrum_variance=spectrum_variance,
         transport_metadata=transport_metadata,
+        transport_spectrum=transport_spectrum,
+        transport_covariance_chunks=transport_covariance_chunks,
         candidate_isotopes=candidate_isotopes,
     )
     return result.counts, result.variances, result.detected
@@ -7655,6 +7837,8 @@ def _evaluate_spectrum_count_result(
     min_peaks_by_isotope: dict[str, int] | None,
     spectrum_variance: NDArray[np.float64] | None = None,
     transport_metadata: dict[str, object] | None = None,
+    transport_spectrum: NDArray[np.float64] | None = None,
+    transport_covariance_chunks: tuple[ResponsePoissonCovarianceChunk, ...] = (),
     candidate_isotopes: Sequence[str] | None = None,
 ) -> RuntimeCountResult:
     """Extract PF-ready count means, variances, detections, and covariance."""
@@ -7671,6 +7855,8 @@ def _evaluate_spectrum_count_result(
         min_peaks_by_isotope=min_peaks_by_isotope,
         spectrum_variance=spectrum_variance,
         transport_metadata=transport_metadata,
+        transport_spectrum=transport_spectrum,
+        transport_covariance_chunks=transport_covariance_chunks,
     )
     if candidate_isotopes is None:
         return result
@@ -8048,10 +8234,23 @@ def _merge_adaptive_observation_chunks(
             spectrum_variance_total += chunk_variance
             has_spectrum_variance = True
     metadata = dict(observations[-1].metadata)
+    chunk_transport_provenance: list[dict[str, object]] = []
+    for chunk_index, (observation, chunk_live_time_s) in enumerate(
+        zip(observations, chunk_live_times_s, strict=True)
+    ):
+        provenance: dict[str, object] = {
+            "chunk_index": int(chunk_index),
+            "step_id": int(observation.step_id),
+            "commanded_dwell_time_s": float(chunk_live_time_s),
+        }
+        provenance.update(_measurement_transport_provenance(observation.metadata))
+        chunk_transport_provenance.append(provenance)
     additive_metadata_keys = {
+        "dwell_time_s",
         "num_primaries",
         "expected_physical_primaries",
         "expected_detector_equivalent_primaries",
+        "expected_unthinned_primaries",
         "expected_sampled_primaries",
         "total_spectrum_counts",
         "total_track_steps",
@@ -8062,9 +8261,17 @@ def _merge_adaptive_observation_chunks(
         "process_count_compton",
         "process_count_rayleigh",
         "process_count_photoelectric",
+        "pre_dead_time_total_spectrum_counts",
+        "pre_dead_time_weighted_spectrum_sumw2",
         "weighted_spectrum_sumw2",
         "run_time_s",
     }
+    transport_count_prefixes = (
+        "transport_detected_counts_",
+        "transport_uncollided_primary_counts_",
+        "transport_interacted_primary_counts_",
+        "transport_secondary_counts_",
+    )
     additive_metadata_keys.update(
         key
         for observation in observations
@@ -8075,17 +8282,145 @@ def _merge_adaptive_observation_chunks(
         key
         for observation in observations
         for key in observation.metadata
-        if str(key).startswith("transport_detected_counts_")
+        if str(key).startswith(transport_count_prefixes)
     )
     for key in sorted(additive_metadata_keys):
         values = [
             _metadata_float(observation.metadata, key) for observation in observations
         ]
         finite_values = [value for value in values if value is not None]
-        if finite_values:
+        sparse_counter = str(key).startswith("source_equivalent_counts_")
+        if len(finite_values) == len(observations) or (
+            sparse_counter and finite_values
+        ):
             metadata[key] = float(sum(finite_values))
+        elif key in metadata:
+            metadata.pop(key)
+    metadata["dwell_time_s"] = float(sum(chunk_live_times_s))
+
+    chunk_sampling_fractions = [
+        _metadata_float(observation.metadata, "primary_sampling_fraction")
+        for observation in observations
+    ]
+    chunk_history_weights = [
+        _metadata_float(observation.metadata, "primary_history_weight")
+        for observation in observations
+    ]
+    finite_sampling_fractions = [
+        float(value) for value in chunk_sampling_fractions if value is not None
+    ]
+    finite_history_weights = [
+        float(value) for value in chunk_history_weights if value is not None
+    ]
+    if len(finite_sampling_fractions) == len(observations):
+        metadata["adaptive_dwell_chunk_primary_sampling_fractions"] = (
+            finite_sampling_fractions
+        )
+    else:
+        metadata.pop("primary_sampling_fraction", None)
+    if len(finite_history_weights) == len(observations):
+        metadata["adaptive_dwell_chunk_primary_history_weights"] = (
+            finite_history_weights
+        )
+    else:
+        metadata.pop("primary_history_weight", None)
+
+    aggregate_unthinned = _metadata_float(metadata, "expected_unthinned_primaries")
+    aggregate_sampled = _metadata_float(metadata, "expected_sampled_primaries")
+    aggregate_fraction: float | None = None
+    if (
+        aggregate_unthinned is not None
+        and aggregate_sampled is not None
+        and aggregate_unthinned > 0.0
+    ):
+        aggregate_fraction = float(aggregate_sampled / aggregate_unthinned)
+    elif finite_sampling_fractions and np.allclose(
+        finite_sampling_fractions,
+        finite_sampling_fractions[0],
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        aggregate_fraction = float(finite_sampling_fractions[0])
+    if (
+        aggregate_fraction is not None
+        and np.isfinite(aggregate_fraction)
+        and aggregate_fraction > 0.0
+        and aggregate_fraction <= 1.0
+    ):
+        metadata["primary_sampling_fraction"] = aggregate_fraction
+        metadata["primary_history_weight"] = float(1.0 / aggregate_fraction)
+        metadata["adaptive_dwell_effective_primary_sampling_fraction"] = (
+            aggregate_fraction
+        )
+    else:
+        metadata.pop("primary_sampling_fraction", None)
+        metadata.pop("primary_history_weight", None)
+
+    if len(observations) > 1:
+        metadata["primary_sampling_fraction_resolution"] = "adaptive_chunk_aggregate"
+        metadata["adaptive_dwell_primary_sampling_fraction_semantics"] = (
+            "expected_primary_weighted_aggregate_across_independent_chunks"
+        )
+        metadata["adaptive_dwell_primary_history_weight_semantics"] = (
+            "inverse_aggregate_fraction_diagnostic_only; exact_weights_are_per_chunk"
+        )
+        metadata.pop("dead_time_observed_scale", None)
+    budget_flags = [
+        _metadata_bool(observation.metadata, "primary_sampling_budget_enabled")
+        for observation in observations
+    ]
+    if len([value for value in budget_flags if value is not None]) == len(observations):
+        metadata["primary_sampling_budget_enabled"] = bool(any(budget_flags))
+    else:
+        metadata.pop("primary_sampling_budget_enabled", None)
+    history_thinning_flags = [
+        _metadata_bool(observation.metadata, "history_thinning_enabled")
+        for observation in observations
+    ]
+    if len([value for value in history_thinning_flags if value is not None]) == len(
+        observations
+    ):
+        any_history_thinning = bool(any(history_thinning_flags))
+        metadata["history_thinning_enabled"] = any_history_thinning
+        metadata["transport_history_mode"] = (
+            "adaptive_mixed_weighted_thinning"
+            if any_history_thinning and not all(history_thinning_flags)
+            else "weighted_thinning"
+            if any_history_thinning
+            else "full_unit_weight"
+        )
+    else:
+        metadata.pop("history_thinning_enabled", None)
+        metadata.pop("transport_history_mode", None)
+    target_values = [
+        _metadata_float(observation.metadata, "target_sampled_primaries")
+        for observation in observations
+    ]
+    finite_targets = [float(value) for value in target_values if value is not None]
+    targets_consistent = len(finite_targets) == len(observations) and np.allclose(
+        finite_targets,
+        finite_targets[0],
+        rtol=0.0,
+        atol=0.0,
+    )
+    if targets_consistent:
+        metadata["target_sampled_primaries"] = int(finite_targets[0])
+    else:
+        metadata.pop("target_sampled_primaries", None)
+    if any(value is True for value in budget_flags):
+        metadata["adaptive_dwell_target_sampled_primaries_semantics"] = (
+            "per_geant4_transport_invocation_not_per_logical_observation"
+        )
     spectrum_total_sum = float(np.sum(np.clip(spectrum_total, a_min=0.0, a_max=None)))
     metadata["total_spectrum_counts"] = spectrum_total_sum
+    dead_time_scales: list[float] = []
+    for observation in observations:
+        dead_time_scale = _metadata_float(
+            observation.metadata,
+            "dead_time_observed_scale",
+        )
+        if dead_time_scale is not None:
+            dead_time_scales.append(float(dead_time_scale))
     metadata.update(
         {
             "adaptive_dwell": True,
@@ -8099,6 +8434,10 @@ def _merge_adaptive_observation_chunks(
             "adaptive_dwell_live_time_s": float(sum(chunk_live_times_s)),
             "adaptive_dwell_ready_reason": str(ready_reason),
             "adaptive_dwell_detected_isotopes": sorted(detected_isotopes),
+            "adaptive_dwell_dead_time_observed_scales": [
+                float(value) for value in dead_time_scales
+            ],
+            "adaptive_dwell_transport_chunk_provenance": (chunk_transport_provenance),
             "adaptive_dwell_counts_by_isotope": {
                 iso: float(value) for iso, value in counts_by_isotope.items()
             },
@@ -8107,6 +8446,10 @@ def _merge_adaptive_observation_chunks(
             },
         }
     )
+    if len(observations) > 1 and dead_time_scales:
+        metadata["spectrum_variance_dead_time_propagation"] = (
+            "independent_chunk_factored_dead_time_jacobians"
+        )
     if count_covariance_by_isotope is not None:
         metadata["adaptive_dwell_count_covariance_by_isotope"] = {
             str(row_iso): {
@@ -8217,6 +8560,7 @@ def _acquire_spectrum_observation(
         )
         spectrum = _analysis_spectrum_array(observation, decomposer)
         spectrum_variance = _analysis_spectrum_variance(observation, decomposer)
+        transport_spectrum = _observation_spectrum_array(observation, decomposer)
         count_result = _evaluate_spectrum_count_result(
             decomposer,
             spectrum,
@@ -8228,6 +8572,7 @@ def _acquire_spectrum_observation(
             min_peaks_by_isotope=min_peaks_by_isotope,
             spectrum_variance=spectrum_variance,
             transport_metadata=observation.metadata,
+            transport_spectrum=transport_spectrum,
             candidate_isotopes=candidate_isotopes,
         )
         _store_count_covariance_metadata(
@@ -8249,6 +8594,8 @@ def _acquire_spectrum_observation(
     accumulated_spectrum = np.zeros_like(decomposer.energy_axis, dtype=float)
     accumulated_spectrum_variance = np.zeros_like(decomposer.energy_axis, dtype=float)
     has_spectrum_variance = False
+    native_covariance_chunks: list[ResponsePoissonCovarianceChunk] = []
+    native_covariance_mode: bool | None = None
     accumulated_live_time_s = 0.0
     last_counts: dict[str, float] = {}
     last_variances: dict[str, float] = {}
@@ -8285,6 +8632,7 @@ def _acquire_spectrum_observation(
         )
         spectrum = _analysis_spectrum_array(observation, decomposer)
         spectrum_variance = _analysis_spectrum_variance(observation, decomposer)
+        transport_spectrum = _observation_spectrum_array(observation, decomposer)
         observations.append(observation)
         chunk_live_times_s.append(chunk_live_time_s)
         accumulated_spectrum += spectrum
@@ -8292,6 +8640,48 @@ def _acquire_spectrum_observation(
             accumulated_spectrum_variance += spectrum_variance
             has_spectrum_variance = True
         accumulated_live_time_s += chunk_live_time_s
+        evaluation_metadata = dict(observation.metadata)
+        evaluation_transport_spectrum: NDArray[np.float64] | None = transport_spectrum
+        native_covariance = (
+            str(observation.metadata.get("spectrum_variance_semantics", ""))
+            == "compound_poisson_sumw2_includes_counting"
+            and str(
+                observation.metadata.get(
+                    "spectrum_variance_dead_time_propagation",
+                    "",
+                )
+            )
+            == "fixed_observed_scale"
+        )
+        if native_covariance_mode is None:
+            native_covariance_mode = bool(native_covariance)
+        elif native_covariance_mode != bool(native_covariance):
+            raise ValueError(
+                "Adaptive dwell cannot mix native and approximate covariance chunks."
+            )
+        if native_covariance:
+            if spectrum_variance is None:
+                raise ValueError(
+                    "Native adaptive dwell chunk is missing spectrum variance."
+                )
+            native_covariance_chunks.append(
+                ResponsePoissonCovarianceChunk(
+                    analysis_spectrum=np.asarray(spectrum, dtype=float),
+                    analysis_variance=np.asarray(spectrum_variance, dtype=float),
+                    transport_spectrum=np.asarray(transport_spectrum, dtype=float),
+                    transport_metadata=dict(observation.metadata),
+                    live_time_s=float(chunk_live_time_s),
+                )
+            )
+        evaluation_covariance_chunks: tuple[ResponsePoissonCovarianceChunk, ...] = ()
+        if len(native_covariance_chunks) == len(observations) > 1:
+            evaluation_covariance_chunks = tuple(native_covariance_chunks)
+            evaluation_transport_spectrum = None
+        elif len(observations) > 1:
+            evaluation_metadata["spectrum_variance_dead_time_propagation"] = (
+                "independent_chunk_sum_post_transform"
+            )
+            evaluation_transport_spectrum = None
         count_result = _evaluate_spectrum_count_result(
             decomposer,
             accumulated_spectrum,
@@ -8304,7 +8694,9 @@ def _acquire_spectrum_observation(
             spectrum_variance=(
                 accumulated_spectrum_variance if has_spectrum_variance else None
             ),
-            transport_metadata=observation.metadata,
+            transport_metadata=evaluation_metadata,
+            transport_spectrum=evaluation_transport_spectrum,
+            transport_covariance_chunks=evaluation_covariance_chunks,
             candidate_isotopes=candidate_isotopes,
         )
         last_counts = count_result.counts
@@ -8556,6 +8948,10 @@ def run_live_pf(
             Path(sim_config_path).expanduser().read_bytes()
         ).hexdigest()
     runtime_config = enforce_pure_runtime_settings(load_runtime_config(sim_config_path))
+    _validate_adaptive_primary_budget_contract(
+        runtime_config,
+        adaptive_dwell=bool(adaptive_dwell),
+    )
     joint_observation_update, delayed_resample_update = _resolve_station_update_modes(
         runtime_config
     )
@@ -9481,6 +9877,9 @@ def run_live_pf(
             else str(dss_planning_method_resolved)
         ),
         live_time_s=planning_live_time,
+        primary_history_weight=_planning_primary_history_weight(runtime_config),
+        target_sampled_primaries=_target_sampled_primaries(runtime_config),
+        transport_detector_radius_m=_transport_detector_budget_radius_m(runtime_config),
         lambda_eig=float(_dss_value("eig_weight", 1.0)),
         lambda_signature=max(0.0, dss_signature_weight_resolved),
         lambda_distance=(
@@ -10075,6 +10474,18 @@ def run_live_pf(
             False,
         )
     )
+    observation_count_variance_semantics = str(
+        _likelihood_config_value(
+            "observation_count_variance_semantics",
+            "",
+        )
+    )
+    direct_spectrum_likelihood_enable = bool(
+        _likelihood_config_value(
+            "direct_spectrum_likelihood_enable",
+            True,
+        )
+    )
     count_likelihood_df = float(
         _likelihood_config_value(
             "count_likelihood_df",
@@ -10164,6 +10575,17 @@ def run_live_pf(
     shield_view_ratio_likelihood_min_views = max(
         2,
         int(_shield_view_ratio_config_value("min_views", 2)),
+    )
+    _validate_weighted_pf_runtime_contract(
+        runtime_config,
+        count_likelihood_model=count_likelihood_model,
+        observation_variance_semantics=observation_count_variance_semantics,
+        direct_spectrum_likelihood_enable=direct_spectrum_likelihood_enable,
+        shield_contrast_likelihood_enable=shield_contrast_likelihood_enable,
+        shield_view_ratio_likelihood_enable=shield_view_ratio_likelihood_enable,
+        planning_primary_history_weight=_planning_primary_history_weight(
+            runtime_config
+        ),
     )
     adaptive_mission_stop = bool(runtime_config.get("adaptive_mission_stop", False))
     max_steps = _resolve_mission_max_steps(max_steps, runtime_config)
@@ -10458,11 +10880,13 @@ def run_live_pf(
         observation_count_variance_includes_counting_noise=(
             observation_count_variance_includes_counting_noise
         ),
+        observation_count_variance_semantics=(observation_count_variance_semantics),
         count_likelihood_df=count_likelihood_df,
         station_view_covariance_enable=station_view_covariance_enable,
         station_view_correlated_spectrum_fraction=(
             station_view_correlated_spectrum_fraction
         ),
+        direct_spectrum_likelihood_enable=direct_spectrum_likelihood_enable,
         spectrum_likelihood_bin_chunk=max(
             1,
             int(runtime_config.get("spectrum_likelihood_bin_chunk", 512)),
@@ -13142,6 +13566,10 @@ def run_live_pf(
         f"dss_horizon={int(dss_config.horizon)} "
         f"dss_beam={int(dss_config.beam_width)} "
         f"dss_program_len={int(dss_config.program_length)} "
+        "dss_min_primary_history_weight="
+        f"{float(dss_config.primary_history_weight):.6g} "
+        "dss_target_sampled_primaries="
+        f"{_target_sampled_primaries(runtime_config)} "
         f"signature_w={float(dss_config.lambda_signature):.3f} "
         f"temporal_sep_w={float(dss_config.lambda_temporal_separation):.3f} "
         f"residual_signature_w={float(dss_config.residual_signature_weight):.3f} "
@@ -13221,6 +13649,10 @@ def run_live_pf(
         f"df={float(pf_conf.count_likelihood_df):.2f} "
         "obs_var_includes_counting_noise="
         f"{bool(pf_conf.observation_count_variance_includes_counting_noise)} "
+        "obs_var_semantics="
+        f"{pf_conf.observation_count_variance_semantics} "
+        "direct_spectrum_likelihood="
+        f"{bool(pf_conf.direct_spectrum_likelihood_enable)} "
         "station_view_cov="
         f"{bool(pf_conf.station_view_covariance_enable)} "
         "station_view_spectrum_frac="
@@ -13773,6 +14205,16 @@ def run_live_pf(
             "dss_horizon": int(dss_config.horizon),
             "dss_beam_width": int(dss_config.beam_width),
             "dss_program_length": int(dss_config.program_length),
+            "dss_primary_history_weight": float(dss_config.primary_history_weight),
+            "dss_minimum_primary_history_weight": float(
+                dss_config.primary_history_weight
+            ),
+            "dss_primary_history_weight_semantics": (
+                "minimum_from_maximum_sampling_fraction"
+                if _target_sampled_primaries(runtime_config) is not None
+                else "fixed_transport_history_weight"
+            ),
+            "dss_target_sampled_primaries": _target_sampled_primaries(runtime_config),
             "dss_signature_weight": float(dss_config.lambda_signature),
             "dss_temporal_separation_weight": float(
                 dss_config.lambda_temporal_separation
@@ -16300,6 +16742,14 @@ def run_live_pf(
         "dss_horizon": int(dss_config.horizon),
         "dss_beam_width": int(dss_config.beam_width),
         "dss_program_length": int(dss_config.program_length),
+        "dss_primary_history_weight": float(dss_config.primary_history_weight),
+        "dss_minimum_primary_history_weight": float(dss_config.primary_history_weight),
+        "dss_primary_history_weight_semantics": (
+            "minimum_from_maximum_sampling_fraction"
+            if _target_sampled_primaries(runtime_config) is not None
+            else "fixed_transport_history_weight"
+        ),
+        "dss_target_sampled_primaries": _target_sampled_primaries(runtime_config),
         "dss_signature_weight": float(dss_config.lambda_signature),
         "dss_differential_weight": float(dss_config.eta_differential),
         "dss_rotation_weight": float(dss_config.lambda_rotation),

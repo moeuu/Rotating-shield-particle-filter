@@ -54,6 +54,11 @@ def main() -> None:
         default=float(DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M[1]),
         help="Maximum detector cps@1m for uniformly sampled generated sources.",
     )
+    parser.add_argument(
+        "--output-tag-suffix",
+        default="",
+        help="Optional safe suffix for isolated result and measurement-log paths.",
+    )
     args = parser.parse_args()
     intensity_spec: float | tuple[float, float]
     if args.intensity_cps_1m is not None:
@@ -68,8 +73,11 @@ def main() -> None:
         output_dir=args.output_dir,
         seeds=tuple(int(seed) for seed in args.seeds),
         intensity_cps_1m=intensity_spec,
+        output_tag_suffix=str(args.output_tag_suffix),
     )
-    manifest_path, script_path = write_ablation_plan(entries, output_dir=args.output_dir)
+    manifest_path, script_path = write_ablation_plan(
+        entries, output_dir=args.output_dir
+    )
     print(f"Wrote {len(entries)} ablation trials.")
     print(f"Manifest: {manifest_path}")
     print(f"Run script: {script_path}")

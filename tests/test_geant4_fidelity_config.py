@@ -11,7 +11,9 @@ import pytest
 
 from measurement.kernels import ShieldParams
 from measurement.detector_geometry import detector_active_radius_m
-from measurement.detector_geometry import detector_observation_geometry_from_runtime_config
+from measurement.detector_geometry import (
+    detector_observation_geometry_from_runtime_config,
+)
 from measurement.detector_geometry import detector_outer_radius_cm
 from measurement.observation_model import build_runtime_observation_model
 from measurement.observation_model import continuous_kernel_from_observation_model
@@ -30,8 +32,12 @@ from pf.likelihood import (
 from pf.profiles import enforce_pure_runtime_settings
 from sim.geant4_app.app import (
     Geant4AppConfig,
+    Geant4Application,
+    _validate_native_weighted_response,
     validate_full_history_transport_metadata,
+    validate_transport_metadata,
 )
+from sim.geant4_app.engine import ExternalCommandGeant4Engine, Geant4EngineConfig
 from sim.geant4_app.scene_export import (
     DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
     DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
@@ -81,9 +87,7 @@ def test_standard_runtime_uses_continuous_collision_checked_measurement_space() 
     assert "detector_height_max_m" not in payload
     assert payload["measurement_pose_clearance_enabled"] is True
     assert float(payload["measurement_pose_clearance_margin_m"]) >= 0.0
-    assert float(payload["measurement_route_grid_cell_size_m"]) == pytest.approx(
-        0.25
-    )
+    assert float(payload["measurement_route_grid_cell_size_m"]) == pytest.approx(0.25)
     assert int(payload["measurement_route_workers"]) > 1
     assert float(payload["detector_transport_height_m"]) >= 0.0
     assert payload["height_partner_reuse_shield_program"] is False
@@ -115,17 +119,14 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
             int(payload.get("precision_diagnostic_birth_candidate_log_limit", 0)) == 0
         )
         assert int(payload.get("precision_diagnostic_particle_log_limit", 0)) == 0
-        assert (
-            int(payload.get("surface_observability_diagnostic_candidates", 0)) == 0
-        )
+        assert int(payload.get("surface_observability_diagnostic_candidates", 0)) == 0
         assert (
             payload.get("response_poisson_crosstalk_count_guard_adjust_count", False)
             is True
         )
-        assert (
-            float(payload.get("pf_obstacle_source_extent_radius_m", 0.0))
-            == pytest.approx(0.0)
-        )
+        assert float(
+            payload.get("pf_obstacle_source_extent_radius_m", 0.0)
+        ) == pytest.approx(0.0)
         assert int(payload.get("pf_obstacle_source_extent_samples", 1)) == 1
         suppress_fraction = float(
             payload.get("response_poisson_low_snr_suppress_fraction", 0.0)
@@ -184,9 +185,20 @@ def test_geant4_configs_use_detector_cps_source_rate_by_default() -> None:
         assert float(payload.get("scatter_gain", 0.0)) == 0.0
         source_bias_mode = str(payload.get("source_bias_mode", "detector_cone"))
         assert source_bias_mode == "detector_cone"
-        assert float(payload.get("primary_sampling_fraction", 1.0)) == pytest.approx(
-            1.0
-        )
+        accelerated = bool(payload.get("accelerated_weighted_transport_enable", False))
+        if accelerated:
+            assert config_path.name == (
+                "accelerated_weighted_external_no_isaac_32threads.json"
+            )
+            assert float(payload["primary_sampling_fraction"]) == pytest.approx(1.0)
+            assert int(payload["target_sampled_primaries"]) == 1_500_000
+            assert payload["accelerated_weighted_transport_label"] == (
+                "nonstandard_user_authorized_weighted_history"
+            )
+        else:
+            assert float(
+                payload.get("primary_sampling_fraction", 1.0)
+            ) == pytest.approx(1.0)
         if "high_fidelity" in config_path.name:
             assert payload.get("detector_scoring_mode") == "full_transport"
             assert payload.get("secondary_transport_mode") == "full_transport"
@@ -225,9 +237,7 @@ def _assert_validated_geant4_count_likelihood(payload: dict[str, object]) -> Non
         pytest.approx(DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS)
     )
     assert (
-        pf_count_likelihood[
-            "observation_count_variance_includes_counting_noise"
-        ]
+        pf_count_likelihood["observation_count_variance_includes_counting_noise"]
         is True
     )
 
@@ -345,8 +355,7 @@ def _assert_response_poisson_variance_ceiling(payload: dict[str, object]) -> Non
         pytest.approx(40.0)
     )
     assert (
-        payload["response_poisson_count_variance_preserve_diagnostic_floors"]
-        is False
+        payload["response_poisson_count_variance_preserve_diagnostic_floors"] is False
     )
     assert payload["response_poisson_count_variance_preserve_guard_floors"] is False
     assert payload["response_poisson_diagnostic_variance_enable"] is False
@@ -430,14 +439,11 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
         > 0.0
     )
     assert (
-        float(payload["remaining_measurement_estimate"]["report_residual_weight"])
-        > 0.0
+        float(payload["remaining_measurement_estimate"]["report_residual_weight"]) > 0.0
     )
     assert (
         float(
-            payload["remaining_measurement_estimate"][
-                "high_surface_ambiguity_weight"
-            ]
+            payload["remaining_measurement_estimate"]["high_surface_ambiguity_weight"]
         )
         > 0.0
     )
@@ -490,6 +496,7 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert config.detector_scoring_mode == "incident_gamma_energy"
     assert config.secondary_transport_mode == "gamma_only"
     assert config.primary_sampling_fraction == pytest.approx(1.0)
+    assert config.accelerated_weighted_transport_enable is False
     assert payload["source_surface_prior"] is True
     assert payload["pf_obstacle_attenuation"] is True
     assert payload["joint_observation_update"] is True
@@ -542,14 +549,11 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
         > 0.0
     )
     assert (
-        float(payload["remaining_measurement_estimate"]["report_residual_weight"])
-        > 0.0
+        float(payload["remaining_measurement_estimate"]["report_residual_weight"]) > 0.0
     )
     assert (
         float(
-            payload["remaining_measurement_estimate"][
-                "high_surface_ambiguity_weight"
-            ]
+            payload["remaining_measurement_estimate"]["high_surface_ambiguity_weight"]
         )
         > 0.0
     )
@@ -586,6 +590,31 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
 
 
+def test_accelerated_config_is_an_explicit_standard_config_overlay() -> None:
+    """Accelerated transport should change only labelled history sampling policy."""
+    root = Path(__file__).resolve().parents[1]
+    config_path = (
+        root
+        / "configs"
+        / "geant4"
+        / "accelerated_weighted_external_no_isaac_32threads.json"
+    )
+    payload = load_runtime_config(config_path)
+    config = Geant4AppConfig.from_dict(payload)
+
+    assert config.accelerated_weighted_transport_enable is True
+    assert config.primary_sampling_fraction == pytest.approx(1.0)
+    assert config.target_sampled_primaries == 1_500_000
+    assert config.thread_count == 32
+    assert config.physics_profile == "balanced"
+    assert config.source_rate_model == "detector_cps_1m"
+    assert config.detector_scoring_mode == "incident_gamma_energy"
+    assert config.secondary_transport_mode == "gamma_only"
+    assert payload["accelerated_weighted_transport_label"] == (
+        "nonstandard_user_authorized_weighted_history"
+    )
+
+
 def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
     """The default GUI runtime should differ from CUI only by Isaac Sim controls."""
     root = Path(__file__).resolve().parents[1]
@@ -596,10 +625,7 @@ def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
         / "variance_reduction_external_no_isaac_32threads.json"
     )
     gui_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_gui_32threads.json"
+        root / "configs" / "geant4" / "variance_reduction_external_gui_32threads.json"
     )
     standard_payload = _load_geant4_runtime_config(standard_path)
     gui_payload = _load_geant4_runtime_config(gui_path)
@@ -614,9 +640,7 @@ def test_gui_config_matches_standard_cui_except_isaacsim_sidecar() -> None:
     assert standard_payload["start_isaacsim_sidecar_with_geant4"] is False
     assert gui_payload["start_isaacsim_sidecar_with_geant4"] is True
     assert {
-        key: value
-        for key, value in gui_payload.items()
-        if key not in gui_only_keys
+        key: value for key, value in gui_payload.items() if key not in gui_only_keys
     } == {
         key: value
         for key, value in standard_payload.items()
@@ -634,16 +658,10 @@ def test_standard_variance_reduction_loads_transport_response_model() -> None:
         / "variance_reduction_external_no_isaac_32threads.json"
     )
     gui_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_gui_32threads.json"
+        root / "configs" / "geant4" / "variance_reduction_external_gui_32threads.json"
     )
     high_fidelity_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "high_fidelity_external_no_isaac.json"
+        root / "configs" / "geant4" / "high_fidelity_external_no_isaac.json"
     )
     standard_payload = _load_geant4_runtime_config(standard_path)
     gui_payload = _load_geant4_runtime_config(gui_path)
@@ -688,10 +706,7 @@ def test_standard_transport_response_model_does_not_stack_legacy_scales() -> Non
         / "variance_reduction_external_no_isaac_32threads.json"
     )
     gui_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_gui_32threads.json"
+        root / "configs" / "geant4" / "variance_reduction_external_gui_32threads.json"
     )
     for config_path in (standard_path, gui_path):
         payload = _load_geant4_runtime_config(config_path)
@@ -766,29 +781,23 @@ def test_standard_variance_reduction_uses_conservative_line_basis_margin() -> No
         / "variance_reduction_external_no_isaac_32threads.json"
     )
     gui_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "variance_reduction_external_gui_32threads.json"
+        root / "configs" / "geant4" / "variance_reduction_external_gui_32threads.json"
     )
     high_fidelity_path = (
-        root
-        / "configs"
-        / "geant4"
-        / "high_fidelity_external_no_isaac.json"
+        root / "configs" / "geant4" / "high_fidelity_external_no_isaac.json"
     )
     standard_payload = _load_geant4_runtime_config(standard_path)
     gui_payload = _load_geant4_runtime_config(gui_path)
     high_fidelity_payload = _load_geant4_runtime_config(high_fidelity_path)
 
     assert standard_payload.get("response_poisson_line_resolved_fit") is True
-    assert float(
-        standard_payload.get("response_poisson_line_resolved_bic_margin", 0.0)
-    ) >= 3500.0
     assert (
-        gui_payload.get("response_poisson_line_resolved_bic_margin")
-        == standard_payload.get("response_poisson_line_resolved_bic_margin")
+        float(standard_payload.get("response_poisson_line_resolved_bic_margin", 0.0))
+        >= 3500.0
     )
+    assert gui_payload.get(
+        "response_poisson_line_resolved_bic_margin"
+    ) == standard_payload.get("response_poisson_line_resolved_bic_margin")
     assert "response_poisson_line_resolved_bic_margin" not in high_fidelity_payload
 
 
@@ -820,15 +829,21 @@ def test_geant4_configs_use_large_detector_model() -> None:
         payload = _load_geant4_runtime_config(config_path)
         detector = payload.get("detector_model", {})
 
-        assert detector["crystal_radius_m"] == pytest.approx(DEFAULT_DETECTOR_CRYSTAL_RADIUS_M)
-        assert detector["crystal_length_m"] == pytest.approx(DEFAULT_DETECTOR_CRYSTAL_LENGTH_M)
+        assert detector["crystal_radius_m"] == pytest.approx(
+            DEFAULT_DETECTOR_CRYSTAL_RADIUS_M
+        )
+        assert detector["crystal_length_m"] == pytest.approx(
+            DEFAULT_DETECTOR_CRYSTAL_LENGTH_M
+        )
         assert detector["crystal_shape"] == "sphere"
 
 
 def test_geant4_default_detector_model_matches_native_sidecar() -> None:
     """Python defaults and native fallback defaults should describe the same detector."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
     model = ExportedDetectorModel()
     config = Geant4AppConfig.from_dict({})
 
@@ -848,11 +863,13 @@ def test_geant4_default_detector_model_matches_native_sidecar() -> None:
     assert "constexpr double kDefaultCrystalRadiusM = 0.038;" in source
     assert "constexpr double kDefaultCrystalLengthM = 0.076;" in source
     assert 'std::string crystal_shape = "sphere";' in source
-    assert "constexpr double kDefaultFeShieldInnerRadiusM = kDefaultShieldContactRadiusM;" in source
+    assert (
+        "constexpr double kDefaultFeShieldInnerRadiusM = kDefaultShieldContactRadiusM;"
+        in source
+    )
     assert (
         "constexpr double kDefaultPbShieldInnerRadiusM =\n"
-        "    kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;"
-        in source
+        "    kDefaultFeShieldInnerRadiusM + kDefaultFeShieldThicknessM;" in source
     )
     assert FE_SHIELD_INNER_RADIUS_M == pytest.approx(
         DEFAULT_DETECTOR_CRYSTAL_RADIUS_M + 0.0015
@@ -895,7 +912,8 @@ def test_pf_and_geant4_share_spherical_octant_shield_geometry() -> None:
     assert pf_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
     assert pf_params.use_angle_attenuation is False
     assert pf_params.inner_radius_fe_cm == pytest.approx(
-        100.0 * (DEFAULT_DETECTOR_CRYSTAL_RADIUS_M + DEFAULT_DETECTOR_HOUSING_THICKNESS_M)
+        100.0
+        * (DEFAULT_DETECTOR_CRYSTAL_RADIUS_M + DEFAULT_DETECTOR_HOUSING_THICKNESS_M)
     )
     assert pf_params.inner_radius_pb_cm == pytest.approx(
         pf_params.inner_radius_fe_cm + pf_params.thickness_fe_cm
@@ -997,12 +1015,16 @@ def test_runtime_observation_model_builds_shared_continuous_kernel() -> None:
     assert model.detector_geometry.aperture_radius_m == pytest.approx(0.052)
     assert model.detector_geometry.aperture_samples == 33
     assert model.detector_geometry.aperture_sampling == "solid_angle_cone"
-    assert kernel.detector_radius_m == pytest.approx(model.detector_geometry.count_radius_m)
+    assert kernel.detector_radius_m == pytest.approx(
+        model.detector_geometry.count_radius_m
+    )
     assert kernel.detector_aperture_radius_m == pytest.approx(
         model.detector_geometry.aperture_radius_m
     )
     assert kernel.detector_aperture_samples == model.detector_geometry.aperture_samples
-    assert kernel.detector_aperture_sampling == model.detector_geometry.aperture_sampling
+    assert (
+        kernel.detector_aperture_sampling == model.detector_geometry.aperture_sampling
+    )
     assert kernel.shield_params.buildup_fe_coeff == pytest.approx(0.1)
     assert kernel.shield_params.buildup_pb_coeff == pytest.approx(0.2)
     assert kernel.obstacle_buildup_coeff == pytest.approx(0.0)
@@ -1043,9 +1065,9 @@ def test_runtime_observation_model_loads_transport_response_model_path(
         use_gpu=False,
     )
 
-    assert model.transport_response_model == model_payload[
-        "pf_transport_response_model"
-    ]
+    assert (
+        model.transport_response_model == model_payload["pf_transport_response_model"]
+    )
     assert kernel.transport_response_model == model.transport_response_model
 
 
@@ -1103,7 +1125,9 @@ def test_runtime_observation_model_uses_explicit_obstacle_mu_override() -> None:
 def test_native_sidecar_detector_crystal_is_spherical() -> None:
     """The native detector crystal and housing should be Geant4 spheres."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert 'new G4Sphere(\n            "DetectorCrystalSolid"' in source
     assert 'new G4Sphere(\n            "DetectorHousingSolid"' in source
@@ -1113,7 +1137,9 @@ def test_native_sidecar_detector_crystal_is_spherical() -> None:
 def test_native_sidecar_does_not_expose_history_weighting_shortcuts() -> None:
     """The native sidecar should not expose capped history shortcuts."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
     forbidden = (
         "--min-histories-per-line",
         "--max-histories-per-line",
@@ -1128,7 +1154,9 @@ def test_native_sidecar_does_not_expose_history_weighting_shortcuts() -> None:
 def test_native_sidecar_uses_physical_detector_deposit_pulses() -> None:
     """Native Geant4 spectra should keep physical deposits available for high fidelity."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert "DetectorEfficiency" not in source
     assert "spectrum[index] += deposit.weight;" in source
@@ -1143,7 +1171,9 @@ def test_native_sidecar_uses_physical_detector_deposit_pulses() -> None:
 def test_native_sidecar_exposes_detector_cps_source_rate_model() -> None:
     """Native Geant4 should not convert detector cps@1m through area acceptance."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "--source-rate-model",
@@ -1162,7 +1192,9 @@ def test_native_sidecar_exposes_detector_cps_source_rate_model() -> None:
 def test_native_theory_tvl_table_matches_python_shielding_constants() -> None:
     """Native theory-TVL fallback should mirror the Python/PF shielding table."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
     pattern = re.compile(
         r'if \(isotope == "([^"]+)"\) \{\s*'
         r"return is_fe \? ([0-9.]+) : ([0-9.]+);\s*"
@@ -1186,7 +1218,9 @@ def test_native_theory_tvl_table_matches_python_shielding_constants() -> None:
 def test_native_sidecar_exposes_fast_detector_scoring_mode() -> None:
     """Native Geant4 should expose an explicit fast detector scoring mode."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "--detector-scoring-mode",
@@ -1207,7 +1241,9 @@ def test_native_sidecar_exposes_fast_detector_scoring_mode() -> None:
 def test_native_sidecar_exposes_gamma_only_secondary_transport_mode() -> None:
     """Native Geant4 should expose explicit gamma-only secondary transport."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "--secondary-transport-mode",
@@ -1223,16 +1259,30 @@ def test_native_sidecar_exposes_gamma_only_secondary_transport_mode() -> None:
 def test_native_sidecar_exposes_unbiased_primary_sampling_fraction() -> None:
     """Native Geant4 should report any explicit weighted diagnostic sampling."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "--primary-sampling-fraction",
+        "--target-sampled-primaries",
         "primary_history_weight",
         'result.metadata["primary_sampling_fraction"]',
         'result.metadata["expected_sampled_primaries"]',
+        'result.metadata["requested_primary_sampling_fraction"]',
+        'result.metadata["target_sampled_primaries"]',
+        'result.metadata["primary_sampling_budget_enabled"]',
+        'result.metadata["primary_sampling_fraction_resolution"]',
+        'result.metadata["transport_history_mode"]',
+        'result.metadata["transport_tally_weighted"]',
+        'result.metadata["spectrum_variance_semantics"]',
+        'result.metadata["dead_time_observed_scale"]',
         "this binary has no multithreaded Geant4 support",
     ):
         assert token in source
+
+    assert "scheduled_unthinned_primaries" in source
+    assert "Precomputed and scheduled unthinned primary expectations disagree" in source
 
 
 def test_python_geant4_runtime_rejects_weighted_primary_sampling() -> None:
@@ -1257,6 +1307,107 @@ def test_python_geant4_runtime_rejects_weighted_primary_sampling() -> None:
         )
 
 
+def test_python_geant4_runtime_requires_explicit_accelerated_weighting() -> None:
+    """Weighted thinning must be explicit, bounded, and detector-rate only."""
+    config = Geant4AppConfig.from_dict(
+        {
+            "accelerated_weighted_transport_enable": True,
+            "primary_sampling_fraction": 0.02,
+            "source_rate_model": "detector_cps_1m",
+        }
+    )
+
+    assert config.accelerated_weighted_transport_enable is True
+    assert config.primary_sampling_fraction == pytest.approx(0.02)
+
+    minimum_config = Geant4AppConfig.from_dict(
+        {
+            "accelerated_weighted_transport_enable": True,
+            "primary_sampling_fraction": 1.0e-6,
+            "source_rate_model": "detector_cps_1m",
+        }
+    )
+    assert minimum_config.primary_sampling_fraction == pytest.approx(1.0e-6)
+
+    with pytest.raises(ValueError, match="requires primary_sampling_fraction<1.0"):
+        Geant4AppConfig.from_dict({"accelerated_weighted_transport_enable": True})
+    with pytest.raises(ValueError, match=r"\[1e-6, 1\]"):
+        Geant4AppConfig.from_dict(
+            {
+                "accelerated_weighted_transport_enable": True,
+                "primary_sampling_fraction": 0.999e-6,
+            }
+        )
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        Geant4AppConfig.from_dict(
+            {
+                "accelerated_weighted_transport_enable": "true",
+                "primary_sampling_fraction": 0.02,
+            }
+        )
+    with pytest.raises(ValueError, match="source_rate_model=detector_cps_1m"):
+        Geant4AppConfig.from_dict(
+            {
+                "accelerated_weighted_transport_enable": True,
+                "primary_sampling_fraction": 0.02,
+                "source_rate_model": "isotropic_emission_equivalent",
+            }
+        )
+
+
+def test_python_geant4_runtime_validates_dynamic_primary_budget() -> None:
+    """Dynamic sampling budgets must be explicit positive integer requests."""
+    config = Geant4AppConfig.from_dict(
+        {
+            "accelerated_weighted_transport_enable": True,
+            "primary_sampling_fraction": 1.0,
+            "target_sampled_primaries": 1_500_000,
+            "source_rate_model": "detector_cps_1m",
+        }
+    )
+
+    assert config.primary_sampling_fraction == pytest.approx(1.0)
+    assert config.target_sampled_primaries == 1_500_000
+
+    application = Geant4Application.__new__(Geant4Application)
+    application.config = config
+    reset_metadata = application.runtime_fidelity_metadata()
+    assert reset_metadata["history_thinning_resolution"] == ("per_observation_pending")
+    assert "history_thinning_enabled" not in reset_metadata
+    assert "transport_history_mode" not in reset_metadata
+
+    for invalid in (0, -1, 1.5, "1500000", True):
+        with pytest.raises(ValueError, match="positive JSON integer"):
+            Geant4AppConfig.from_dict(
+                {
+                    "accelerated_weighted_transport_enable": True,
+                    "primary_sampling_fraction": 0.2,
+                    "target_sampled_primaries": invalid,
+                }
+            )
+    with pytest.raises(
+        ValueError,
+        match="accelerated_weighted_transport_enable=true",
+    ):
+        Geant4AppConfig.from_dict({"target_sampled_primaries": 1_500_000})
+
+
+def test_external_engine_passes_dynamic_primary_budget_to_native() -> None:
+    """External Geant4 commands must pass the configured sampled-primary target."""
+    engine = ExternalCommandGeant4Engine(
+        Geant4EngineConfig(
+            executable_path="build/geant4_sidecar",
+            primary_sampling_fraction=0.2,
+            target_sampled_primaries=1_500_000,
+        )
+    )
+
+    arguments = engine._source_bias_args()
+
+    option_index = arguments.index("--target-sampled-primaries")
+    assert arguments[option_index + 1] == "1500000"
+
+
 def test_native_transport_fidelity_postcondition_is_fail_closed() -> None:
     """Every Geant4 observation must prove full-history MT transport semantics."""
     metadata: dict[str, object] = {
@@ -1268,7 +1419,11 @@ def test_native_transport_fidelity_postcondition_is_fail_closed() -> None:
         "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
         "line_intensities_normalized": True,
         "source_bias_mode": "detector_cone",
+        "source_bias_weighted_transport": False,
         "weighted_transport": False,
+        "transport_tally_weighted": False,
+        "history_thinning_enabled": False,
+        "transport_history_mode": "full_unit_weight",
         "detector_scoring_mode": "incident_gamma_energy",
         "detector_response_applied_in_native": False,
         "secondary_transport_mode": "gamma_only",
@@ -1278,9 +1433,18 @@ def test_native_transport_fidelity_postcondition_is_fail_closed() -> None:
         "poisson_background": True,
         "expected_primary_semantics": "detector_equivalent_histories",
         "expected_detector_equivalent_primaries": 12345.0,
+        "expected_unthinned_primaries": 12345.0,
         "expected_sampled_primaries": 12345.0,
         "primary_sampling_fraction": 1.0,
         "primary_history_weight": 1.0,
+        "spectrum_variance_semantics": ("compound_poisson_sumw2_includes_counting"),
+        "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+        "dead_time_tau_s": 0.0,
+        "dead_time_observed_scale": 1.0,
+        "dwell_time_s": 1.0,
+        "pre_dead_time_total_spectrum_counts": 0.0,
+        "pre_dead_time_weighted_spectrum_sumw2": 0.0,
+        "weighted_spectrum_sumw2": 0.0,
         "requested_threads": 32,
         "multithreaded_run_manager": True,
     }
@@ -1299,7 +1463,7 @@ def test_native_transport_fidelity_postcondition_is_fail_closed() -> None:
     invalid_cases = (
         ("primary_sampling_fraction", 0.02, "primary_sampling_fraction=1.0"),
         ("primary_history_weight", 50.0, "primary_history_weight=1.0"),
-        ("weighted_transport", True, "source-bias weighting"),
+        ("weighted_transport", True, "aggregate weighting provenance"),
         ("multithreaded_run_manager", "false", "multithreaded run manager"),
         ("theory_tvl_attenuation", True, "theory-TVL"),
     )
@@ -1310,10 +1474,173 @@ def test_native_transport_fidelity_postcondition_is_fail_closed() -> None:
             validate_full_history_transport_metadata(invalid, **expected)
 
 
+def test_accelerated_transport_fidelity_postcondition_is_fail_closed() -> None:
+    """Explicit weighted thinning must prove its sampling and variance semantics."""
+    metadata: dict[str, object] = {
+        "backend": "geant4",
+        "engine_mode": "external",
+        "emission_model": "detector_equivalent_cone",
+        "physics_profile": "balanced",
+        "source_rate_model": "detector_cps_1m",
+        "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
+        "line_intensities_normalized": True,
+        "source_bias_mode": "detector_cone",
+        "source_bias_weighted_transport": False,
+        "weighted_transport": True,
+        "transport_tally_weighted": True,
+        "history_thinning_enabled": True,
+        "transport_history_mode": "weighted_thinning",
+        "detector_scoring_mode": "incident_gamma_energy",
+        "detector_response_applied_in_native": False,
+        "secondary_transport_mode": "gamma_only",
+        "gamma_only_secondary_transport": True,
+        "theory_tvl_attenuation": False,
+        "background_cps": 12.0,
+        "poisson_background": True,
+        "expected_primary_semantics": "detector_equivalent_histories",
+        "expected_detector_equivalent_primaries": 12345.0,
+        "expected_unthinned_primaries": 12345.0,
+        "expected_sampled_primaries": 246.9,
+        "primary_sampling_fraction": 0.02,
+        "primary_history_weight": 50.0,
+        "spectrum_variance_semantics": ("compound_poisson_sumw2_includes_counting"),
+        "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+        "dead_time_tau_s": 0.0,
+        "dead_time_observed_scale": 1.0,
+        "dwell_time_s": 1.0,
+        "pre_dead_time_total_spectrum_counts": 100.0,
+        "pre_dead_time_weighted_spectrum_sumw2": 5000.0,
+        "weighted_spectrum_sumw2": 5000.0,
+        "requested_threads": 32,
+        "multithreaded_run_manager": True,
+    }
+    expected = {
+        "expected_primary_sampling_fraction": 0.02,
+        "accelerated_weighted_transport_enable": True,
+        "expected_source_rate_model": "detector_cps_1m",
+        "expected_thread_count": 32,
+        "expected_physics_profile": "balanced",
+        "expected_detector_scoring_mode": "incident_gamma_energy",
+        "expected_secondary_transport_mode": "gamma_only",
+        "expected_source_bias_mode": "detector_cone",
+        "expected_background_cps": 12.0,
+        "expected_dead_time_tau_s": 0.0,
+    }
+
+    validate_transport_metadata(metadata, **expected)
+
+    invalid_mode = dict(metadata, transport_history_mode="full_unit_weight")
+    with pytest.raises(RuntimeError, match="transport_history_mode"):
+        validate_transport_metadata(invalid_mode, **expected)
+
+    invalid_variance = dict(metadata, weighted_spectrum_sumw2=4999.0)
+    with pytest.raises(RuntimeError, match="post-dead-time sumw2"):
+        validate_transport_metadata(invalid_variance, **expected)
+
+    budget_metadata = dict(
+        metadata,
+        expected_detector_equivalent_primaries=10_000_000.0,
+        expected_unthinned_primaries=10_000_000.0,
+        expected_sampled_primaries=1_500_000.0,
+        primary_sampling_fraction=0.15,
+        primary_history_weight=1.0 / 0.15,
+        requested_primary_sampling_fraction=0.2,
+        target_sampled_primaries=1_500_000,
+        primary_sampling_budget_enabled=True,
+        primary_sampling_fraction_resolution="target_budget_limited",
+    )
+    budget_expected = dict(
+        expected,
+        expected_primary_sampling_fraction=0.2,
+        expected_target_sampled_primaries=1_500_000,
+    )
+    validate_transport_metadata(budget_metadata, **budget_expected)
+
+    maximum_limited_metadata = dict(
+        budget_metadata,
+        expected_detector_equivalent_primaries=5_000_000.0,
+        expected_unthinned_primaries=5_000_000.0,
+        expected_sampled_primaries=1_000_000.0,
+        primary_sampling_fraction=0.2,
+        primary_history_weight=5.0,
+        primary_sampling_fraction_resolution="maximum_fraction_limited",
+    )
+    validate_transport_metadata(maximum_limited_metadata, **budget_expected)
+
+    invalid_budget = dict(
+        budget_metadata,
+        primary_sampling_fraction_resolution="maximum_fraction_limited",
+    )
+    with pytest.raises(RuntimeError, match="resolution provenance"):
+        validate_transport_metadata(invalid_budget, **budget_expected)
+
+
+def test_native_weighted_response_arrays_are_fail_closed() -> None:
+    """Weighted spectra must prove count and per-bin sum-w2 consistency."""
+    spectrum = [25.0, 75.0]
+    metadata: dict[str, object] = {
+        "total_spectrum_counts": 100.0,
+        "spectrum_count_variance": [2500.0, 2500.0],
+        "spectrum_count_variance_total": 5000.0,
+        "weighted_spectrum_sumw2": 5000.0,
+    }
+
+    _validate_native_weighted_response(spectrum, metadata)
+
+    invalid_cases: tuple[
+        tuple[list[float], dict[str, object], str],
+        ...,
+    ] = (
+        (
+            [24.0, 75.0],
+            metadata,
+            "total_spectrum_counts",
+        ),
+        (
+            spectrum,
+            dict(metadata, spectrum_count_variance=[2500.0]),
+            "variance shape",
+        ),
+        (
+            spectrum,
+            dict(metadata, spectrum_count_variance=[float("nan"), 2500.0]),
+            "variance is not finite",
+        ),
+        (
+            spectrum,
+            dict(metadata, spectrum_count_variance=[-1.0, 5001.0]),
+            "variance is negative",
+        ),
+        (
+            spectrum,
+            dict(metadata, spectrum_count_variance_total=4999.0),
+            "spectrum_count_variance_total",
+        ),
+        (
+            spectrum,
+            dict(metadata, weighted_spectrum_sumw2=4999.0),
+            "weighted_spectrum_sumw2",
+        ),
+    )
+    for invalid_spectrum, invalid_metadata, message in invalid_cases:
+        with pytest.raises(RuntimeError, match=message):
+            _validate_native_weighted_response(
+                invalid_spectrum,
+                invalid_metadata,
+            )
+
+    missing_variance = dict(metadata)
+    del missing_variance["spectrum_count_variance"]
+    with pytest.raises(RuntimeError, match="missing per-bin spectrum variance"):
+        _validate_native_weighted_response(spectrum, missing_variance)
+
+
 def test_native_sidecar_updates_shield_pose_without_geometry_rebuild() -> None:
     """Shield rotations should be runtime-updated instead of cache-busting."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert "UpdateShieldPoses" in source
     assert "UpdatePhysicalPose" in source
@@ -1325,7 +1652,9 @@ def test_native_sidecar_updates_shield_pose_without_geometry_rebuild() -> None:
 def test_native_sidecar_reports_transport_diagnostics() -> None:
     """Native Geant4 metadata should expose transport/decomposition diagnostics."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "TransportSteppingAction",
@@ -1338,14 +1667,14 @@ def test_native_sidecar_reports_transport_diagnostics() -> None:
         'result.metadata["transport_secondary_counts_" + item.first]',
         'result.metadata["transport_non_uncollided_fraction_" + item.first]',
         'result.metadata["source_equivalent_counts_" + item.first]',
-        'transport_detected_counts_by_source',
-        'transport_detected_counts_by_line',
-        'transport_uncollided_primary_counts_by_source',
-        'transport_uncollided_primary_counts_by_line',
-        'source_equivalent_counts_by_source',
-        'source_equivalent_counts_by_line',
-        "AddShieldAxisMetadata(result, \"fe\", request.fe_pose)",
-        "AddShieldAxisMetadata(result, \"pb\", request.pb_pose)",
+        "transport_detected_counts_by_source",
+        "transport_detected_counts_by_line",
+        "transport_uncollided_primary_counts_by_source",
+        "transport_uncollided_primary_counts_by_line",
+        "source_equivalent_counts_by_source",
+        "source_equivalent_counts_by_line",
+        'AddShieldAxisMetadata(result, "fe", request.fe_pose)',
+        'AddShieldAxisMetadata(result, "pb", request.pb_pose)',
         '"_shield_axis_"',
         "AddGeant4MaterialMuMetadata(result, scene_)",
         "ComputeGammaAttenuationLength",
@@ -1359,15 +1688,20 @@ def test_native_sidecar_reports_transport_diagnostics() -> None:
         'result.metadata["total_spectrum_counts"]',
     ):
         assert token in source
-    assert source.count(
-        "transport_secondary_counts_by_source[source_token] += detected_weight;"
-    ) == 1
+    assert (
+        source.count(
+            "transport_secondary_counts_by_source[source_token] += detected_weight;"
+        )
+        == 1
+    )
 
 
 def test_native_sidecar_classifies_detector_entry_transport_history() -> None:
     """Fast detector scoring should separate uncollided and interacted entries."""
     root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(encoding="utf-8")
+    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "enum class DetectorEntryClass",
@@ -1376,7 +1710,7 @@ def test_native_sidecar_classifies_detector_entry_transport_history() -> None:
         "kSecondary",
         "TrackHadGammaInteraction",
         "ClassifyDetectorEntryTrack",
-        "process_key != \"transportation\"",
+        'process_key != "transportation"',
         "SetUserAction(new EventAction(event_store_, diagnostics_))",
     ):
         assert token in source

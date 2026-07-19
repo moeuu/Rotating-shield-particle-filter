@@ -105,7 +105,7 @@ def _write_fake_external_geant4(path: Path) -> Path:
                 "    *) shift ;;",
                 "  esac",
                 "done",
-                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
+                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA source_bias_weighted_transport=false\\nMETA weighted_transport=false\\nMETA transport_tally_weighted=false\\nMETA history_thinning_enabled=false\\nMETA transport_history_mode=full_unit_weight\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_unthinned_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA spectrum_variance_semantics=compound_poisson_sumw2_includes_counting\\nMETA spectrum_variance_dead_time_propagation=fixed_observed_scale\\nMETA dead_time_tau_s=5.813e-9\\nMETA dead_time_observed_scale=1\\nMETA dwell_time_s=1\\nMETA pre_dead_time_total_spectrum_counts=0\\nMETA pre_dead_time_weighted_spectrum_sumw2=0\\nMETA weighted_spectrum_sumw2=0\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
             ]
         ),
         encoding="utf-8",
@@ -143,7 +143,7 @@ def _write_fake_persistent_geant4(path: Path) -> Path:
                 "  done",
                 '  RESPONSE="${RESPONSE//%20/ }"',
                 "  RUN_INDEX=$((RUN_INDEX + 1))",
-                '  printf \'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n\' "$RUN_INDEX" > "$RESPONSE"',
+                '  printf \'META backend=geant4\\nMETA engine_mode=external\\nMETA persistent_process=true\\nMETA run_index=%s\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA source_bias_weighted_transport=false\\nMETA weighted_transport=false\\nMETA transport_tally_weighted=false\\nMETA history_thinning_enabled=false\\nMETA transport_history_mode=full_unit_weight\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_unthinned_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA spectrum_variance_semantics=compound_poisson_sumw2_includes_counting\\nMETA spectrum_variance_dead_time_propagation=fixed_observed_scale\\nMETA dead_time_tau_s=5.813e-9\\nMETA dead_time_observed_scale=1\\nMETA dwell_time_s=1\\nMETA pre_dead_time_total_spectrum_counts=0\\nMETA pre_dead_time_weighted_spectrum_sumw2=0\\nMETA weighted_spectrum_sumw2=0\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n\' "$RUN_INDEX" > "$RESPONSE"',
                 '  echo "SIMBRIDGE_OK response=$RESPONSE"',
                 "done",
             ]
@@ -736,13 +736,19 @@ def test_geant4_tcp_reset_rejects_unverified_or_weighted_sidecar(
                 "runtime_fidelity": {
                     "primary_sampling_fraction": 0.02,
                     "primary_history_weight": 50.0,
+                    "accelerated_weighted_transport_enable": True,
                 },
             },
             {
                 "status": "reset",
                 "runtime_fidelity": {
                     "primary_sampling_fraction": 1.0,
+                    "requested_primary_sampling_fraction": 1.0,
                     "primary_history_weight": 1.0,
+                    "target_sampled_primaries": 0,
+                    "primary_sampling_budget_enabled": False,
+                    "primary_sampling_fraction_resolution": "fixed_fraction",
+                    "accelerated_weighted_transport_enable": False,
                     "source_rate_model": "detector_cps_1m",
                     "requested_threads": 32,
                 },
@@ -774,6 +780,194 @@ def test_geant4_tcp_reset_rejects_unverified_or_weighted_sidecar(
     runtime.reset()
 
 
+def test_geant4_tcp_reset_accepts_only_matching_accelerated_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accelerated reuse must match fraction, opt-in, and dead-time exactly."""
+    responses = iter(
+        [
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.02,
+                    "requested_primary_sampling_fraction": 0.02,
+                    "primary_history_weight": 50.0,
+                    "target_sampled_primaries": 0,
+                    "primary_sampling_budget_enabled": False,
+                    "primary_sampling_fraction_resolution": "fixed_fraction",
+                    "accelerated_weighted_transport_enable": False,
+                    "dead_time_tau_s": 5.813e-9,
+                },
+            },
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.02,
+                    "requested_primary_sampling_fraction": 0.02,
+                    "primary_history_weight": 50.0,
+                    "target_sampled_primaries": 0,
+                    "primary_sampling_budget_enabled": False,
+                    "primary_sampling_fraction_resolution": "fixed_fraction",
+                    "accelerated_weighted_transport_enable": True,
+                    "dead_time_tau_s": 1.0e-8,
+                },
+            },
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.02,
+                    "requested_primary_sampling_fraction": 0.02,
+                    "primary_history_weight": 50.0,
+                    "target_sampled_primaries": 0,
+                    "primary_sampling_budget_enabled": False,
+                    "primary_sampling_fraction_resolution": "fixed_fraction",
+                    "accelerated_weighted_transport_enable": True,
+                    "dead_time_tau_s": 5.813e-9,
+                },
+            },
+        ]
+    )
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_primary_sampling_fraction=0.02,
+        accelerated_weighted_transport_enable=True,
+        expected_dead_time_tau_s=5.813e-9,
+    )
+
+    def _fake_round_trip(
+        message_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Return successive accelerated handshakes without a socket."""
+        assert message_type == "reset"
+        assert payload == {}
+        return next(responses)
+
+    monkeypatch.setattr(runtime, "_round_trip", _fake_round_trip)
+
+    with pytest.raises(RuntimeError, match="accelerated weighted-transport"):
+        runtime.reset()
+    with pytest.raises(RuntimeError, match="dead_time_tau_s"):
+        runtime.reset()
+    runtime.reset()
+
+
+def test_geant4_tcp_reset_validates_dynamic_sampling_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Budgeted reuse should validate the cap and target without a fixed weight."""
+    responses = iter(
+        [
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.2,
+                    "requested_primary_sampling_fraction": 0.2,
+                    "primary_history_weight": 999.0,
+                    "target_sampled_primaries": 50000,
+                    "primary_sampling_budget_enabled": True,
+                    "primary_sampling_fraction_resolution": (
+                        "per_observation_pending"
+                    ),
+                    "history_thinning_resolution": "per_observation_pending",
+                    "accelerated_weighted_transport_enable": True,
+                },
+            },
+            {
+                "status": "reset",
+                "runtime_fidelity": {
+                    "primary_sampling_fraction": 0.2,
+                    "requested_primary_sampling_fraction": 0.2,
+                    "primary_history_weight": 999.0,
+                    "target_sampled_primaries": 100000,
+                    "primary_sampling_budget_enabled": True,
+                    "primary_sampling_fraction_resolution": (
+                        "per_observation_pending"
+                    ),
+                    "history_thinning_resolution": "per_observation_pending",
+                    "accelerated_weighted_transport_enable": True,
+                },
+            },
+        ]
+    )
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_primary_sampling_fraction=0.2,
+        expected_target_sampled_primaries=100000,
+        accelerated_weighted_transport_enable=True,
+    )
+
+    def _fake_round_trip(
+        message_type: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Return successive dynamic-budget handshakes without a socket."""
+        assert message_type == "reset"
+        assert payload == {}
+        return next(responses)
+
+    monkeypatch.setattr(runtime, "_round_trip", _fake_round_trip)
+
+    with pytest.raises(RuntimeError, match="target-sampled-primary mismatch"):
+        runtime.reset()
+    runtime.reset()
+
+
+def test_geant4_tcp_dynamic_budget_allows_unit_maximum_fraction() -> None:
+    """A target budget may thin observations even when the configured cap is one."""
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_primary_sampling_fraction=1.0,
+        expected_target_sampled_primaries=100000,
+        accelerated_weighted_transport_enable=True,
+    )
+
+    assert runtime.expected_primary_sampling_fraction == pytest.approx(1.0)
+    assert runtime.expected_target_sampled_primaries == 100000
+
+
+def test_geant4_tcp_budget_reset_rejects_unresolved_history_claim() -> None:
+    """A reset handshake must not present a budget cap as observed thinning."""
+    runtime = Geant4TCPClientRuntime(
+        host="127.0.0.1",
+        port=5556,
+        expected_primary_sampling_fraction=1.0,
+        expected_target_sampled_primaries=100000,
+        accelerated_weighted_transport_enable=True,
+    )
+    fidelity = {
+        "primary_sampling_fraction": 1.0,
+        "requested_primary_sampling_fraction": 1.0,
+        "primary_history_weight": 1.0,
+        "target_sampled_primaries": 100000,
+        "primary_sampling_budget_enabled": True,
+        "primary_sampling_fraction_resolution": "per_observation_pending",
+        "history_thinning_resolution": "per_observation_pending",
+        "history_thinning_enabled": False,
+        "accelerated_weighted_transport_enable": True,
+    }
+
+    with pytest.raises(RuntimeError, match="unresolved per-observation history"):
+        runtime._validate_fidelity_handshake({"runtime_fidelity": fidelity})
+
+
+@pytest.mark.parametrize("invalid_target", [0, -1, 100000.0, "100000", True])
+def test_geant4_tcp_dynamic_budget_requires_positive_integer(
+    invalid_target: object,
+) -> None:
+    """Client-side budget expectations should match the native integer contract."""
+    with pytest.raises(ValueError, match="positive integer"):
+        Geant4TCPClientRuntime(
+            host="127.0.0.1",
+            port=5556,
+            expected_target_sampled_primaries=invalid_target,  # type: ignore[arg-type]
+            accelerated_weighted_transport_enable=True,
+        )
+
+
 def test_geant4_tcp_step_revalidates_observation_fidelity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -794,8 +988,12 @@ def test_geant4_tcp_step_revalidates_observation_fidelity(
     runtime = Geant4TCPClientRuntime(
         host="127.0.0.1",
         port=5556,
+        expected_primary_sampling_fraction=0.02,
+        expected_target_sampled_primaries=100000,
+        accelerated_weighted_transport_enable=True,
         expected_source_rate_model="detector_cps_1m",
         expected_thread_count=32,
+        expected_dead_time_tau_s=5.813e-9,
     )
 
     def _fake_round_trip(
@@ -818,7 +1016,7 @@ def test_geant4_tcp_step_revalidates_observation_fidelity(
     monkeypatch.setattr(runtime, "_round_trip", _fake_round_trip)
     monkeypatch.setattr(
         geant4_app_module,
-        "validate_full_history_transport_metadata",
+        "validate_transport_metadata",
         _fake_validate,
     )
 
@@ -835,7 +1033,11 @@ def test_geant4_tcp_step_revalidates_observation_fidelity(
 
     assert result == observation
     assert validated["metadata"] == {"backend": "geant4"}
+    assert validated["kwargs"]["expected_primary_sampling_fraction"] == 0.02
+    assert validated["kwargs"]["expected_target_sampled_primaries"] == 100000
+    assert validated["kwargs"]["accelerated_weighted_transport_enable"] is True
     assert validated["kwargs"]["expected_thread_count"] == 32
+    assert validated["kwargs"]["expected_dead_time_tau_s"] == pytest.approx(5.813e-9)
 
 
 def test_geant4_real_stage_does_not_fall_back_to_fake_backend(
@@ -1662,7 +1864,11 @@ def test_geant4_application_forwards_commanded_detector_height(
                 "intensity_cps_1m_definition": "net_detector_count_rate_at_1m",
                 "line_intensities_normalized": True,
                 "source_bias_mode": "detector_cone",
+                "source_bias_weighted_transport": False,
                 "weighted_transport": False,
+                "transport_tally_weighted": False,
+                "history_thinning_enabled": False,
+                "transport_history_mode": "full_unit_weight",
                 "detector_scoring_mode": "full_transport",
                 "detector_response_applied_in_native": True,
                 "secondary_transport_mode": "full_transport",
@@ -1672,9 +1878,20 @@ def test_geant4_application_forwards_commanded_detector_height(
                 "poisson_background": True,
                 "expected_primary_semantics": "detector_equivalent_histories",
                 "expected_detector_equivalent_primaries": 0.0,
+                "expected_unthinned_primaries": 0.0,
                 "expected_sampled_primaries": 0.0,
                 "primary_sampling_fraction": 1.0,
                 "primary_history_weight": 1.0,
+                "spectrum_variance_semantics": (
+                    "compound_poisson_sumw2_includes_counting"
+                ),
+                "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+                "dead_time_tau_s": 5.813e-9,
+                "dead_time_observed_scale": 1.0,
+                "dwell_time_s": 1.0,
+                "pre_dead_time_total_spectrum_counts": 0.0,
+                "pre_dead_time_weighted_spectrum_sumw2": 0.0,
+                "weighted_spectrum_sumw2": 0.0,
                 "requested_threads": 1,
                 "multithreaded_run_manager": False,
             }
@@ -1727,6 +1944,7 @@ def test_geant4_application_forwards_commanded_detector_height(
     assert request.fe_shield_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
     assert request.pb_shield_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
     assert observation.detector_pose_xyz == pytest.approx((2.0, 3.0, 1.75))
+    assert observation.metadata["accelerated_weighted_transport_enable"] is False
     assert backend.get_world_pose(
         scene.prim_paths.robot_root
     ).translation_xyz == pytest.approx((2.0, 3.0, 0.0))
@@ -2233,6 +2451,47 @@ def test_create_simulation_runtime_supports_geant4() -> None:
     )
 
     assert isinstance(runtime, Geant4TCPClientRuntime)
+    assert runtime.expected_primary_sampling_fraction == pytest.approx(1.0)
+    assert runtime.accelerated_weighted_transport_enable is False
+    assert runtime.expected_dead_time_tau_s == pytest.approx(5.813e-9)
+
+
+def test_create_simulation_runtime_wires_accelerated_existing_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing-sidecar clients must retain accelerated fidelity expectations."""
+    import sim.runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_tcp_server_available",
+        lambda *args, **kwargs: True,
+    )
+
+    runtime = create_simulation_runtime(
+        "geant4",
+        sources=[],
+        decomposer=SpectralDecomposer(),
+        mu_by_isotope={},
+        shield_params=None,
+        runtime_config={
+            "host": "127.0.0.1",
+            "port": 5556,
+            "auto_start_sidecar": False,
+            "start_isaacsim_sidecar_with_geant4": False,
+            "source_rate_model": "detector_cps_1m",
+            "primary_sampling_fraction": 0.02,
+            "target_sampled_primaries": 100000,
+            "accelerated_weighted_transport_enable": True,
+            "dead_time_tau_s": 8.0e-9,
+        },
+    )
+
+    assert isinstance(runtime, Geant4TCPClientRuntime)
+    assert runtime.expected_primary_sampling_fraction == pytest.approx(0.02)
+    assert runtime.expected_target_sampled_primaries == 100000
+    assert runtime.accelerated_weighted_transport_enable is True
+    assert runtime.expected_dead_time_tau_s == pytest.approx(8.0e-9)
 
 
 def test_create_simulation_runtime_rejects_weighted_geant4_before_reuse(
@@ -2424,6 +2683,51 @@ def test_geant4_sidecar_rejects_config_path_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_start_geant4_sidecar_wires_accelerated_managed_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Auto-started managed clients must retain accelerated fidelity settings."""
+    import sim.runtime as runtime_module
+
+    config = {
+        "primary_sampling_fraction": 0.02,
+        "target_sampled_primaries": 100000,
+        "accelerated_weighted_transport_enable": True,
+        "source_rate_model": "detector_cps_1m",
+        "dead_time_tau_s": 7.0e-9,
+        "start_isaacsim_sidecar_with_geant4": False,
+    }
+    config_path = tmp_path / "accelerated_geant4.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    def _fake_start_sidecar_process(
+        **kwargs: object,
+    ) -> tuple[subprocess.Popen[str], None]:
+        """Return a completed process without starting a bridge."""
+        return subprocess.Popen(["true"]), None
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_start_sidecar_process",
+        _fake_start_sidecar_process,
+    )
+
+    runtime = runtime_module._start_geant4_sidecar(
+        config,
+        host="127.0.0.1",
+        port=5556,
+        runtime_config_path=config_path,
+    )
+
+    assert isinstance(runtime, ManagedGeant4TCPClientRuntime)
+    assert runtime.expected_primary_sampling_fraction == pytest.approx(0.02)
+    assert runtime.expected_target_sampled_primaries == 100000
+    assert runtime.accelerated_weighted_transport_enable is True
+    assert runtime.expected_dead_time_tau_s == pytest.approx(7.0e-9)
+    runtime.process.wait(timeout=5.0)
+
+
 def test_managed_geant4_sidecar_restart_replays_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2450,7 +2754,12 @@ def test_managed_geant4_sidecar_restart_replays_reset(
                 "status": "reset",
                 "runtime_fidelity": {
                     "primary_sampling_fraction": 1.0,
+                    "requested_primary_sampling_fraction": 1.0,
                     "primary_history_weight": 1.0,
+                    "target_sampled_primaries": 0,
+                    "primary_sampling_budget_enabled": False,
+                    "primary_sampling_fraction_resolution": "fixed_fraction",
+                    "accelerated_weighted_transport_enable": False,
                 },
             }
         return {"status": message_type}
@@ -2933,7 +3242,7 @@ def test_external_geant4_engine_reads_file_protocol(tmp_path: Path) -> None:
                 "grep -q 'shape=spherical_octant_shell' \"$SCENE\"",
                 "grep -q 'inner_radius_m=' \"$SCENE\"",
                 "grep -q '^STEP ' \"$REQUEST\"",
-                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA weighted_transport=false\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
+                "printf 'META backend=geant4\\nMETA engine_mode=external\\nMETA emission_model=detector_equivalent_cone\\nMETA physics_profile=balanced\\nMETA source_rate_model=detector_cps_1m\\nMETA intensity_cps_1m_definition=net_detector_count_rate_at_1m\\nMETA line_intensities_normalized=true\\nMETA source_bias_mode=detector_cone\\nMETA source_bias_weighted_transport=false\\nMETA weighted_transport=false\\nMETA transport_tally_weighted=false\\nMETA history_thinning_enabled=false\\nMETA transport_history_mode=full_unit_weight\\nMETA detector_scoring_mode=full_transport\\nMETA detector_response_applied_in_native=true\\nMETA secondary_transport_mode=full_transport\\nMETA gamma_only_secondary_transport=false\\nMETA theory_tvl_attenuation=false\\nMETA background_cps=0\\nMETA poisson_background=true\\nMETA expected_primary_semantics=detector_equivalent_histories\\nMETA expected_detector_equivalent_primaries=42\\nMETA expected_unthinned_primaries=42\\nMETA expected_sampled_primaries=42\\nMETA primary_sampling_fraction=1\\nMETA primary_history_weight=1\\nMETA spectrum_variance_semantics=compound_poisson_sumw2_includes_counting\\nMETA spectrum_variance_dead_time_propagation=fixed_observed_scale\\nMETA dead_time_tau_s=5.813e-9\\nMETA dead_time_observed_scale=1\\nMETA dwell_time_s=1\\nMETA pre_dead_time_total_spectrum_counts=0\\nMETA pre_dead_time_weighted_spectrum_sumw2=0\\nMETA weighted_spectrum_sumw2=0\\nMETA requested_threads=1\\nMETA multithreaded_run_manager=false\\nMETA num_primaries=42\\nSPECTRUM 1.0,2.0,3.0\\n' > \"$RESPONSE\"",
             ]
         ),
         encoding="utf-8",

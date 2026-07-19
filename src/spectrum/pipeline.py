@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -36,7 +36,13 @@ from spectrum.baseline import baseline_als
 from spectrum.dead_time import non_paralyzable_correction
 from spectrum.activity_estimation import estimate_activities
 from spectrum.decomposition import Peak, strip_overlaps
-from spectrum.peak_detection import detect_peaks, gaussian_smooth, has_peak_near, line_window_evidence, sigma_E_keV
+from spectrum.peak_detection import (
+    detect_peaks,
+    gaussian_smooth,
+    has_peak_near,
+    line_window_evidence,
+    sigma_E_keV,
+)
 from spectrum.nnls import nnls_solve
 
 # Background intensity (counts/s).
@@ -50,6 +56,7 @@ BASELINE_NITER = 10
 
 # Module logger for optional detection debugging.
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SpectrumConfig:
@@ -182,7 +189,11 @@ class SpectrumConfig:
 
     def energy_axis(self) -> NDArray[np.float64]:
         """Return the energy axis in keV."""
-        return np.arange(self.energy_min_keV, self.energy_max_keV + self.bin_width_keV, self.bin_width_keV)
+        return np.arange(
+            self.energy_min_keV,
+            self.energy_max_keV + self.bin_width_keV,
+            self.bin_width_keV,
+        )
 
 
 @dataclass
@@ -274,6 +285,228 @@ class ResponsePoissonColumn:
     label: str
 
 
+@dataclass(frozen=True)
+class ResponsePoissonCovarianceInputs:
+    """Describe bin-variance inputs used by response-regression covariance."""
+
+    analysis_variance: NDArray[np.float64]
+    source_variance: NDArray[np.float64] | None = None
+    folding_operator: NDArray[np.float64] | None = None
+    source_observed_spectrum: NDArray[np.float64] | None = None
+    dead_time_observed_scale: float | None = None
+    dead_time_tau_s: float | None = None
+    dead_time_live_time_s: float | None = None
+    independent_chunks: tuple[ResponsePoissonCovarianceInputs, ...] = ()
+    semantics: str = "diagonal_analysis_variance_approximation"
+
+
+@dataclass(frozen=True)
+class ResponsePoissonCovarianceChunk:
+    """Describe one independent native spectrum chunk before accumulation."""
+
+    analysis_spectrum: NDArray[np.float64]
+    analysis_variance: NDArray[np.float64]
+    transport_spectrum: NDArray[np.float64]
+    transport_metadata: Mapping[str, object]
+    live_time_s: float
+
+
+_COMPOUND_POISSON_SPECTRUM_VARIANCE_SEMANTICS = (
+    "compound_poisson_sumw2_includes_counting"
+)
+_NATIVE_FIXED_DEAD_TIME_VARIANCE_PROPAGATION = "fixed_observed_scale"
+_APPROXIMATE_DEAD_TIME_VARIANCE_PROPAGATIONS = frozenset(
+    {"independent_chunk_sum_post_transform"}
+)
+
+
+def _requires_native_compound_covariance(
+    transport_metadata: Mapping[str, object] | None,
+) -> bool:
+    """Return whether metadata promises native compound-Poisson covariance.
+
+    Legacy and explicitly approximate covariance descriptions retain the
+    diagonal fallback. Once native metadata advertises the fixed-scale
+    compound-Poisson contract, missing or unknown dead-time provenance is an
+    error rather than permission to weaken the observation model silently.
+    """
+    if transport_metadata is None:
+        return False
+    variance_semantics = (
+        str(transport_metadata.get("spectrum_variance_semantics", "")).strip().lower()
+    )
+    if variance_semantics != _COMPOUND_POISSON_SPECTRUM_VARIANCE_SEMANTICS:
+        return False
+    dead_time_propagation = (
+        str(transport_metadata.get("spectrum_variance_dead_time_propagation", ""))
+        .strip()
+        .lower()
+    )
+    if dead_time_propagation == _NATIVE_FIXED_DEAD_TIME_VARIANCE_PROPAGATION:
+        return True
+    if dead_time_propagation in _APPROXIMATE_DEAD_TIME_VARIANCE_PROPAGATIONS:
+        return False
+    if not dead_time_propagation:
+        raise ValueError(
+            "Native compound-Poisson spectrum variance requires "
+            "spectrum_variance_dead_time_propagation provenance."
+        )
+    raise ValueError(
+        "Native compound-Poisson spectrum variance has unsupported dead-time "
+        f"propagation provenance: {dead_time_propagation!r}."
+    )
+
+
+def _response_poisson_sandwich_covariance(
+    design: NDArray[np.float64],
+    fitted: NDArray[np.float64],
+    fisher: NDArray[np.float64],
+    spectrum_variance: NDArray[np.float64],
+    *,
+    source_spectrum_variance: NDArray[np.float64] | None = None,
+    folding_operator: NDArray[np.float64] | None = None,
+    source_observed_spectrum: NDArray[np.float64] | None = None,
+    dead_time_observed_scale: float | None = None,
+    dead_time_tau_s: float | None = None,
+    dead_time_live_time_s: float | None = None,
+    independent_chunks: Sequence[ResponsePoissonCovarianceInputs] = (),
+) -> NDArray[np.float64]:
+    """Return a quasi-Poisson sandwich covariance for response coefficients.
+
+    ``spectrum_variance`` describes independent bins in the fitted pulse-height
+    spectrum.  When detector-response folding was applied to independent
+    incident-energy tallies, callers instead supply
+    ``source_spectrum_variance`` and ``folding_operator``.  The score covariance
+    is then evaluated as a factored product, avoiding construction of the dense
+    folded-bin covariance ``R diag(v) R.T``.
+
+    A native non-paralyzable dead-time transform is propagated by supplying the
+    post-transform ``source_observed_spectrum``, scale, and tau.  Its Jacobian is
+    ``J = s I - (tau / T) s^2 x 1.T`` for pre-transform count spectrum
+    ``x = y / s`` and live time ``T``.
+    Applying ``J.T`` to the score retains the induced cross-bin covariance
+    without materializing a dense matrix.
+
+    The supplied ``fisher`` may include configured anchor curvature in the
+    sandwich bread.  Anchors are not added to the meat because they are fixed
+    penalties, not independent repeats of the observed spectrum.
+    """
+    design_arr = np.asarray(design, dtype=float)
+    fitted_arr = np.asarray(fitted, dtype=float).reshape(-1)
+    fisher_arr = np.asarray(fisher, dtype=float)
+    variance_arr = np.clip(
+        np.asarray(spectrum_variance, dtype=float).reshape(-1),
+        a_min=0.0,
+        a_max=None,
+    )
+    if design_arr.ndim != 2 or design_arr.shape[0] != fitted_arr.size:
+        raise ValueError("design rows must match the fitted spectrum length")
+    parameter_count = int(design_arr.shape[1])
+    if fisher_arr.shape != (parameter_count, parameter_count):
+        raise ValueError("fisher must be square with one row per design column")
+    if variance_arr.size != fitted_arr.size:
+        raise ValueError("spectrum_variance must match the fitted spectrum length")
+
+    if independent_chunks:
+        if source_spectrum_variance is not None or folding_operator is not None:
+            raise ValueError(
+                "independent covariance chunks cannot be mixed with one source factor"
+            )
+        covariance = np.zeros_like(fisher_arr, dtype=float)
+        for chunk in independent_chunks:
+            if chunk.independent_chunks:
+                raise ValueError("nested independent covariance chunks are unsupported")
+            covariance += _response_poisson_sandwich_covariance(
+                design_arr,
+                fitted_arr,
+                fisher_arr,
+                chunk.analysis_variance,
+                source_spectrum_variance=chunk.source_variance,
+                folding_operator=chunk.folding_operator,
+                source_observed_spectrum=chunk.source_observed_spectrum,
+                dead_time_observed_scale=chunk.dead_time_observed_scale,
+                dead_time_tau_s=chunk.dead_time_tau_s,
+                dead_time_live_time_s=chunk.dead_time_live_time_s,
+            )
+        return np.asarray(0.5 * (covariance + covariance.T), dtype=float)
+
+    inverse_mean_design = design_arr / np.maximum(
+        fitted_arr[:, np.newaxis],
+        1.0e-12,
+    )
+    if source_spectrum_variance is None and folding_operator is None:
+        meat = inverse_mean_design.T @ (
+            variance_arr[:, np.newaxis] * inverse_mean_design
+        )
+    else:
+        if source_spectrum_variance is None:
+            raise ValueError(
+                "source_spectrum_variance is required with a folding operator"
+            )
+        source_variance = np.clip(
+            np.asarray(source_spectrum_variance, dtype=float).reshape(-1),
+            a_min=0.0,
+            a_max=None,
+        )
+        source_score = inverse_mean_design
+        if folding_operator is not None:
+            operator = np.asarray(folding_operator, dtype=float)
+            if operator.shape != (fitted_arr.size, source_variance.size):
+                raise ValueError(
+                    "folding_operator must map source variances to fitted bins"
+                )
+            source_score = operator.T @ source_score
+        elif source_variance.size != fitted_arr.size:
+            raise ValueError(
+                "source_spectrum_variance must match fitted bins without folding"
+            )
+        dead_time_fields = (
+            source_observed_spectrum,
+            dead_time_observed_scale,
+            dead_time_tau_s,
+            dead_time_live_time_s,
+        )
+        if any(value is not None for value in dead_time_fields):
+            if any(value is None for value in dead_time_fields):
+                raise ValueError(
+                    "source_observed_spectrum, dead_time_observed_scale, "
+                    "dead_time_tau_s, and dead_time_live_time_s must be "
+                    "supplied together"
+                )
+            observed_arr = np.asarray(
+                source_observed_spectrum,
+                dtype=float,
+            ).reshape(-1)
+            if observed_arr.size != source_variance.size:
+                raise ValueError("source_observed_spectrum must match source variances")
+            observed_scale = float(dead_time_observed_scale)
+            tau_s = float(dead_time_tau_s)
+            live_time_s = float(dead_time_live_time_s)
+            if not np.isfinite(observed_scale) or observed_scale <= 0.0:
+                raise ValueError("dead_time_observed_scale must be positive")
+            if not np.isfinite(tau_s) or tau_s < 0.0:
+                raise ValueError("dead_time_tau_s must be nonnegative")
+            if not np.isfinite(live_time_s) or live_time_s <= 0.0:
+                raise ValueError("dead_time_live_time_s must be positive")
+            pre_dead_time = observed_arr / observed_scale
+            shared_score = pre_dead_time @ source_score
+            tau_per_count = tau_s / live_time_s
+            source_score = (
+                observed_scale * source_score
+                - tau_per_count
+                * observed_scale
+                * observed_scale
+                * np.ones((source_score.shape[0], 1), dtype=float)
+                * shared_score[np.newaxis, :]
+            )
+        meat = source_score.T @ (source_variance[:, np.newaxis] * source_score)
+
+    inverse_fisher = np.linalg.pinv(fisher_arr, rcond=1.0e-12)
+    covariance = inverse_fisher @ meat @ inverse_fisher
+    covariance = 0.5 * (covariance + covariance.T)
+    return np.asarray(covariance, dtype=float)
+
+
 class SpectralDecomposer:
     """Peak-based spectrum decomposer following the Chapter 2 pipeline."""
 
@@ -312,7 +545,9 @@ class SpectralDecomposer:
         elif efficiency_model == "cebr3":
             self.efficiency_fn = cebr3_efficiency
         else:
-            raise ValueError(f"Unsupported response_efficiency_model: {efficiency_model}")
+            raise ValueError(
+                f"Unsupported response_efficiency_model: {efficiency_model}"
+            )
         self._background_shape = default_background_shape(self.energy_axis)
         self.response_matrix = build_response_matrix(
             self.energy_axis,
@@ -337,13 +572,22 @@ class SpectralDecomposer:
         self.last_response_poisson_diagnostics: dict[str, object] = {}
         self.last_count_variances: Dict[str, float] = {}
         self.last_count_covariance: dict[str, dict[str, float]] = {}
+        self.last_count_covariance_semantics = "unavailable"
+        self.last_response_poisson_regression_covariance: dict[
+            str,
+            dict[str, float],
+        ] = {}
         self._incident_gamma_response_matrix: NDArray[np.float64] | None = None
         self._incident_gamma_isotope_response_matrix: NDArray[np.float64] | None = None
-        self._incident_gamma_photopeak_response_matrix: NDArray[np.float64] | None = None
+        self._incident_gamma_photopeak_response_matrix: NDArray[np.float64] | None = (
+            None
+        )
         self._photopeak_response_matrix: NDArray[np.float64] | None = None
         self._response_poisson_line_matrix: NDArray[np.float64] | None = None
         self._response_poisson_line_photopeak_matrix: NDArray[np.float64] | None = None
-        self._response_poisson_line_columns: tuple[ResponsePoissonColumn, ...] | None = None
+        self._response_poisson_line_columns: (
+            tuple[ResponsePoissonColumn, ...] | None
+        ) = None
 
     def configured_background_spectrum(
         self,
@@ -389,9 +633,13 @@ class SpectralDecomposer:
         """
         env = environment or EnvironmentConfig()
         detector = env.detector()
-        kernel = ContinuousKernel(mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams())
+        kernel = ContinuousKernel(
+            mu_by_isotope=mu_by_isotope, shield_params=shield_params or ShieldParams()
+        )
         expected = np.zeros_like(self.energy_axis, dtype=float)
-        effective_strengths: Dict[str, float] = {name: 0.0 for name in self.isotope_names}
+        effective_strengths: Dict[str, float] = {
+            name: 0.0 for name in self.isotope_names
+        }
         for source in sources:
             if source.isotope not in self.library:
                 continue
@@ -399,8 +647,16 @@ class SpectralDecomposer:
             effective_strength = source.intensity_cps_1m * geom
             atten = 1.0
             if fe_shield_orientation is not None or pb_shield_orientation is not None:
-                fe_idx = octant_index_from_normal(np.asarray(fe_shield_orientation)) if fe_shield_orientation is not None else None
-                pb_idx = octant_index_from_normal(np.asarray(pb_shield_orientation)) if pb_shield_orientation is not None else None
+                fe_idx = (
+                    octant_index_from_normal(np.asarray(fe_shield_orientation))
+                    if fe_shield_orientation is not None
+                    else None
+                )
+                pb_idx = (
+                    octant_index_from_normal(np.asarray(pb_shield_orientation))
+                    if pb_shield_orientation is not None
+                    else None
+                )
                 if fe_idx is not None and pb_idx is not None:
                     atten = kernel.attenuation_factor_pair(
                         isotope=source.isotope,
@@ -460,20 +716,26 @@ class SpectralDecomposer:
         incident_spectrum: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Fold a Geant4 incident-gamma spectrum into a detector pulse-height spectrum."""
-        spectrum = np.clip(np.asarray(incident_spectrum, dtype=float), a_min=0.0, a_max=None)
+        spectrum = np.clip(
+            np.asarray(incident_spectrum, dtype=float), a_min=0.0, a_max=None
+        )
         if spectrum.shape != self.energy_axis.shape:
             raise ValueError(
                 "incident_spectrum must match the decomposer energy axis shape: "
                 f"{spectrum.shape} != {self.energy_axis.shape}"
             )
-        return np.asarray(self._get_incident_gamma_response_matrix() @ spectrum, dtype=float)
+        return np.asarray(
+            self._get_incident_gamma_response_matrix() @ spectrum, dtype=float
+        )
 
     def fold_incident_gamma_spectrum_variance(
         self,
         incident_variance: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Propagate independent incident-bin variances through detector response folding."""
-        variance = np.clip(np.asarray(incident_variance, dtype=float), a_min=0.0, a_max=None)
+        variance = np.clip(
+            np.asarray(incident_variance, dtype=float), a_min=0.0, a_max=None
+        )
         if variance.shape != self.energy_axis.shape:
             raise ValueError(
                 "incident_variance must match the decomposer energy axis shape: "
@@ -481,6 +743,196 @@ class SpectralDecomposer:
             )
         operator = self._get_incident_gamma_response_matrix()
         return np.asarray((operator * operator) @ variance, dtype=float)
+
+    @staticmethod
+    def _metadata_float(
+        metadata: Mapping[str, object],
+        key: str,
+    ) -> float | None:
+        """Return one finite metadata float when present."""
+        value = metadata.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if np.isfinite(parsed) else None
+
+    def _response_poisson_covariance_inputs(
+        self,
+        spectrum_variance: NDArray[np.float64],
+        *,
+        observed_spectrum: NDArray[np.float64],
+        live_time_s: float,
+        transport_metadata: Mapping[str, object] | None,
+        transport_spectrum: NDArray[np.float64] | None,
+        transport_covariance_chunks: Sequence[
+            ResponsePoissonCovarianceChunk
+        ] = (),
+    ) -> ResponsePoissonCovarianceInputs:
+        """Return provenance-complete factored transport covariance inputs."""
+        observed = np.asarray(observed_spectrum, dtype=float).reshape(-1)
+        observed_size = int(observed.size)
+        analysis_variance = np.clip(
+            np.nan_to_num(
+                np.asarray(spectrum_variance, dtype=float).reshape(-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            a_min=0.0,
+            a_max=None,
+        )
+        if analysis_variance.size != int(observed_size):
+            raise ValueError("spectrum_variance must match the fitted spectrum length")
+        fallback = ResponsePoissonCovarianceInputs(
+            analysis_variance=analysis_variance,
+        )
+        if transport_covariance_chunks:
+            chunk_inputs: list[ResponsePoissonCovarianceInputs] = []
+            for chunk in transport_covariance_chunks:
+                chunk_input = self._response_poisson_covariance_inputs(
+                    chunk.analysis_variance,
+                    observed_spectrum=chunk.analysis_spectrum,
+                    live_time_s=float(chunk.live_time_s),
+                    transport_metadata=chunk.transport_metadata,
+                    transport_spectrum=chunk.transport_spectrum,
+                )
+                if not chunk_input.semantics.startswith(
+                    "compound_poisson_sumw2_"
+                ):
+                    raise ValueError(
+                        "Every independent covariance chunk must retain native "
+                        "compound-Poisson provenance."
+                    )
+                chunk_inputs.append(chunk_input)
+            chunk_semantics = (
+                "compound_poisson_sumw2_independent_chunks_"
+                "dead_time_delta_jacobian"
+            )
+            if any(
+                chunk.folding_operator is not None for chunk in chunk_inputs
+            ):
+                if not all(
+                    chunk.folding_operator is not None for chunk in chunk_inputs
+                ):
+                    raise ValueError(
+                        "Independent covariance chunks cannot mix folded and "
+                        "unfolded detector scoring."
+                    )
+                chunk_semantics += "_response_folded_factored"
+            return ResponsePoissonCovarianceInputs(
+                analysis_variance=analysis_variance,
+                independent_chunks=tuple(chunk_inputs),
+                semantics=chunk_semantics,
+            )
+        if transport_metadata is None:
+            return fallback
+
+        if not _requires_native_compound_covariance(transport_metadata):
+            return fallback
+        observed_scale = self._metadata_float(
+            transport_metadata,
+            "dead_time_observed_scale",
+        )
+        tau_s = self._metadata_float(transport_metadata, "dead_time_tau_s")
+        raw_variance_value = transport_metadata.get("spectrum_count_variance")
+        if (
+            observed_scale is None
+            or observed_scale <= 0.0
+            or tau_s is None
+            or tau_s < 0.0
+            or not np.isfinite(float(live_time_s))
+            or float(live_time_s) <= 0.0
+            or raw_variance_value is None
+        ):
+            raise ValueError(
+                "Native compound-Poisson spectrum covariance requires finite "
+                "dead_time_observed_scale, nonnegative dead_time_tau_s, "
+                "positive live_time_s, and per-bin spectrum_count_variance."
+            )
+        if observed_scale > 1.0:
+            raise ValueError(
+                "Native compound-Poisson dead_time_observed_scale must be in (0, 1]."
+            )
+        raw_post_variance = np.asarray(raw_variance_value, dtype=float).reshape(-1)
+        if raw_post_variance.size == 0:
+            raise ValueError(
+                "Native compound-Poisson spectrum_count_variance cannot be empty."
+            )
+        if not np.all(np.isfinite(raw_post_variance)) or np.any(
+            raw_post_variance < 0.0
+        ):
+            raise ValueError(
+                "Native compound-Poisson spectrum_count_variance must contain "
+                "finite nonnegative values."
+            )
+
+        scoring_mode = (
+            str(transport_metadata.get("detector_scoring_mode", "")).strip().lower()
+        )
+        fast_scoring = (
+            str(transport_metadata.get("detector_fast_scoring", "")).strip().lower()
+        )
+        response_was_folded = bool(
+            self.config.apply_incident_gamma_detector_response
+            and (scoring_mode == "incident_gamma_energy" or fast_scoring == "true")
+        )
+        raw_observed = None
+        if transport_spectrum is not None:
+            raw_observed = np.asarray(transport_spectrum, dtype=float).reshape(-1)
+            if not np.all(np.isfinite(raw_observed)) or np.any(raw_observed < 0.0):
+                raise ValueError(
+                    "Native compound-Poisson transport_spectrum must contain "
+                    "finite nonnegative values."
+                )
+        elif not response_was_folded and raw_post_variance.size == observed_size:
+            # In a pulse-height scoring mode the fitted spectrum is the native
+            # post-dead-time spectrum, so no separate transport array is needed.
+            raw_observed = np.asarray(observed, dtype=float)
+        if response_was_folded and raw_observed is None:
+            raise ValueError(
+                "Native compound-Poisson covariance for a folded detector "
+                "response requires the unfurled transport_spectrum."
+            )
+        if raw_observed is not None and raw_observed.size != raw_post_variance.size:
+            raise ValueError(
+                "Native compound-Poisson spectrum_count_variance must match the "
+                "transport_spectrum shape."
+            )
+        if not response_was_folded and raw_post_variance.size != observed_size:
+            raise ValueError(
+                "Native compound-Poisson spectrum_count_variance must match the "
+                "fitted spectrum shape."
+            )
+
+        source_variance = raw_post_variance / (observed_scale * observed_scale)
+        folding_operator = None
+        semantics = "compound_poisson_sumw2_dead_time_delta_jacobian"
+        if response_was_folded:
+            full_operator = self._get_incident_gamma_response_matrix()
+            if (
+                full_operator.shape[0] < observed_size
+                or full_operator.shape[1] < raw_post_variance.size
+            ):
+                raise ValueError(
+                    "Native compound-Poisson transport bins exceed the configured "
+                    "detector-response folding operator."
+                )
+            folding_operator = np.asarray(
+                full_operator[:observed_size, : raw_post_variance.size],
+                dtype=float,
+            )
+            semantics += "_response_folded_factored"
+        return ResponsePoissonCovarianceInputs(
+            analysis_variance=analysis_variance,
+            source_variance=source_variance,
+            folding_operator=folding_operator,
+            source_observed_spectrum=np.asarray(raw_observed, dtype=float),
+            dead_time_observed_scale=float(observed_scale),
+            dead_time_tau_s=float(tau_s),
+            dead_time_live_time_s=float(live_time_s),
+            semantics=semantics,
+        )
 
     def _incident_gamma_photopeak_fraction(self, energy_keV: float) -> float:
         """Return the full-energy-peak fraction after incident-gamma response folding."""
@@ -490,10 +942,14 @@ class SpectralDecomposer:
         peak_weight = max(float(self.efficiency(energy)), 0.0)
         continuum_weight = 0.0
         if compton_edge_energy(energy) > 0.0:
-            continuum_weight = max(float(self.config.response_continuum_to_peak), 0.0) * peak_weight
+            continuum_weight = (
+                max(float(self.config.response_continuum_to_peak), 0.0) * peak_weight
+            )
         backscatter_weight = 0.0
         if energy > 200.0 and float(self.config.response_backscatter_fraction) > 0.0:
-            backscatter_weight = max(float(self.config.response_backscatter_fraction), 0.0) * max(
+            backscatter_weight = max(
+                float(self.config.response_backscatter_fraction), 0.0
+            ) * max(
                 float(self.efficiency(backscatter_energy(energy))),
                 0.0,
             )
@@ -524,14 +980,19 @@ class SpectralDecomposer:
             nuclide = self.library[isotope]
             for line in nuclide.lines:
                 line_weight = self._line_weight(isotope, float(line.intensity))
-                matrix[:, column_index] += line_weight * detector_response_kernel_for_incident_gamma(
-                    self.energy_axis,
-                    float(line.energy_keV),
-                    self.resolution_fn,
-                    self.efficiency_fn,
-                    float(self.config.bin_width_keV),
-                    continuum_to_peak=float(self.config.response_continuum_to_peak),
-                    backscatter_fraction=float(self.config.response_backscatter_fraction),
+                matrix[:, column_index] += (
+                    line_weight
+                    * detector_response_kernel_for_incident_gamma(
+                        self.energy_axis,
+                        float(line.energy_keV),
+                        self.resolution_fn,
+                        self.efficiency_fn,
+                        float(self.config.bin_width_keV),
+                        continuum_to_peak=float(self.config.response_continuum_to_peak),
+                        backscatter_fraction=float(
+                            self.config.response_backscatter_fraction
+                        ),
+                    )
                 )
         self._incident_gamma_isotope_response_matrix = matrix
         return matrix
@@ -568,7 +1029,9 @@ class SpectralDecomposer:
             nuclide = self.library[isotope]
             for line in nuclide.lines:
                 sigma = self.resolution_fn(float(line.energy_keV))
-                peak_fraction = self._incident_gamma_photopeak_fraction(float(line.energy_keV))
+                peak_fraction = self._incident_gamma_photopeak_fraction(
+                    float(line.energy_keV)
+                )
                 if peak_fraction <= 0.0:
                     continue
                 peak = (
@@ -666,7 +1129,10 @@ class SpectralDecomposer:
             back = gaussian_peak(self.energy_axis, center=e_back, sigma=sigma_back)
             back_norm = float(np.sum(back) * float(self.config.bin_width_keV))
             if back_norm > 0.0:
-                area_back = max(float(self.config.response_backscatter_fraction), 0.0) * peak_area
+                area_back = (
+                    max(float(self.config.response_backscatter_fraction), 0.0)
+                    * peak_area
+                )
                 column += (
                     back
                     * (area_back / back_norm)
@@ -783,9 +1249,7 @@ class SpectralDecomposer:
                 self._get_response_poisson_line_basis()
             )
             keep = [
-                idx
-                for idx, spec in enumerate(line_specs)
-                if spec.isotope in requested
+                idx for idx, spec in enumerate(line_specs) if spec.isotope in requested
             ]
             if keep:
                 return (
@@ -906,8 +1370,14 @@ class SpectralDecomposer:
             isotopes: Optional subset of isotopes to fit; None fits all.
         """
         if isotopes is None:
-            return estimate_activities(self.response_matrix, spectrum, self.isotope_names)
-        indices = [self.isotope_names.index(iso) for iso in isotopes if iso in self.isotope_names]
+            return estimate_activities(
+                self.response_matrix, spectrum, self.isotope_names
+            )
+        indices = [
+            self.isotope_names.index(iso)
+            for iso in isotopes
+            if iso in self.isotope_names
+        ]
         if not indices:
             return {iso: 0.0 for iso in isotopes}
         design = self.response_matrix[:, indices]
@@ -933,10 +1403,17 @@ class SpectralDecomposer:
             indices = list(range(len(self.isotope_names)))
             iso_names = list(self.isotope_names)
         else:
-            indices = [self.isotope_names.index(iso) for iso in isotopes if iso in self.isotope_names]
+            indices = [
+                self.isotope_names.index(iso)
+                for iso in isotopes
+                if iso in self.isotope_names
+            ]
             iso_names = [self.isotope_names[i] for i in indices]
         if not indices:
-            return ({iso: 0.0 for iso in (isotopes or [])}, np.zeros_like(spectrum, dtype=float))
+            return (
+                {iso: 0.0 for iso in (isotopes or [])},
+                np.zeros_like(spectrum, dtype=float),
+            )
         design = self.response_matrix[:, indices]
         from scipy.optimize import nnls
 
@@ -1021,6 +1498,12 @@ class SpectralDecomposer:
         isotopes: Sequence[str],
         include_background: bool = True,
         live_time_s: float = 1.0,
+        spectrum_variance: NDArray[np.float64] | None = None,
+        transport_metadata: Mapping[str, object] | None = None,
+        transport_spectrum: NDArray[np.float64] | None = None,
+        transport_covariance_chunks: Sequence[
+            ResponsePoissonCovarianceChunk
+        ] = (),
     ) -> Dict[str, IsotopeCountEstimate]:
         """
         Estimate isotope counts by full-spectrum Poisson response regression.
@@ -1038,7 +1521,32 @@ class SpectralDecomposer:
         """
         energy_axis = np.asarray(self.energy_axis, dtype=float)
         observed = np.clip(np.asarray(spectrum, dtype=float), a_min=0.0, a_max=None)
+        requires_native_covariance = _requires_native_compound_covariance(
+            transport_metadata
+        )
+        variance_input = None
+        if spectrum_variance is not None:
+            variance_input = np.asarray(spectrum_variance, dtype=float).reshape(-1)
+            if variance_input.shape != observed.shape:
+                raise ValueError(
+                    "spectrum_variance must match the observed spectrum shape"
+                )
+            if requires_native_covariance and (
+                not np.all(np.isfinite(variance_input)) or np.any(variance_input < 0.0)
+            ):
+                raise ValueError(
+                    "Native compound-Poisson analysis spectrum_variance must "
+                    "contain finite nonnegative values."
+                )
+        elif requires_native_covariance:
+            raise ValueError(
+                "Native compound-Poisson covariance requires per-bin "
+                "spectrum_variance for response regression."
+            )
         requested = [str(isotope) for isotope in isotopes]
+        self.last_count_covariance = {}
+        self.last_count_covariance_semantics = "unavailable"
+        self.last_response_poisson_regression_covariance = {}
         estimates = {
             isotope: IsotopeCountEstimate(
                 isotope=isotope,
@@ -1067,6 +1575,8 @@ class SpectralDecomposer:
                 min_len,
             )
             observed = observed[:min_len]
+            if variance_input is not None:
+                variance_input = variance_input[:min_len]
             response_matrix = self._count_response_matrix()[:min_len, :]
             photopeak_response_matrix = self._count_photopeak_response_matrix()[
                 :min_len,
@@ -1130,6 +1640,7 @@ class SpectralDecomposer:
             "reason": "isotope_basis",
         }
         if signal_matrix.shape[1] > isotope_signal_matrix.shape[1] > 0:
+
             def _with_background(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
                 """Return a temporary design matrix for BIC model selection."""
                 columns = [matrix[:, col] for col in range(matrix.shape[1])]
@@ -1174,16 +1685,17 @@ class SpectralDecomposer:
         signal_count = int(signal_matrix.shape[1])
         signal_indices_by_isotope = {
             name: [
-                idx
-                for idx, spec in enumerate(signal_columns)
-                if spec.isotope == name
+                idx for idx, spec in enumerate(signal_columns) if spec.isotope == name
             ]
             for name in fit_names
         }
         aggregation_weights_by_isotope: dict[str, NDArray[np.float64]] = {}
         for name, local_indices in signal_indices_by_isotope.items():
             weights = np.asarray(
-                [max(float(signal_columns[idx].line_weight), 0.0) for idx in local_indices],
+                [
+                    max(float(signal_columns[idx].line_weight), 0.0)
+                    for idx in local_indices
+                ],
                 dtype=float,
             )
             total_weight = float(np.sum(weights))
@@ -1203,7 +1715,10 @@ class SpectralDecomposer:
         design = np.clip(np.column_stack(design_columns), a_min=0.0, a_max=None)
         initial = np.maximum(nnls_solve(design, observed), 0.0)
         background_anchor_term: tuple[int, float, float] | None = None
-        if include_background and self.config.response_poisson_background_rate_cps is not None:
+        if (
+            include_background
+            and self.config.response_poisson_background_rate_cps is not None
+        ):
             background_rate = max(
                 float(self.config.response_poisson_background_rate_cps),
                 0.0,
@@ -1222,7 +1737,9 @@ class SpectralDecomposer:
                 )
         photopeak_counts: dict[str, float] | None = None
         photopeak_variances: dict[str, float] | None = None
-        anchor_terms: list[tuple[tuple[int, ...], NDArray[np.float64], float, float]] = []
+        anchor_terms: list[
+            tuple[tuple[int, ...], NDArray[np.float64], float, float]
+        ] = []
         use_photopeak_fusion = include_background and bool(
             self.config.response_poisson_photopeak_fusion
         )
@@ -1339,20 +1856,47 @@ class SpectralDecomposer:
         coeffs = np.asarray(result.x if result.success else initial, dtype=float)
         coeffs = np.maximum(coeffs, 0.0)
         fitted = np.maximum(design @ coeffs, epsilon)
-        fisher = design.T @ (design / fitted[:, np.newaxis])
+        poisson_information = design.T @ (design / fitted[:, np.newaxis])
+        penalty_information = np.zeros_like(poisson_information, dtype=float)
         for local_indices, weights, _, variance in anchor_terms:
             for row_offset, row_idx in enumerate(local_indices):
                 for col_offset, col_idx in enumerate(local_indices):
-                    fisher[row_idx, col_idx] += (
+                    penalty_information[row_idx, col_idx] += (
                         float(weights[row_offset])
                         * float(weights[col_offset])
                         / variance
                     )
         if background_anchor_term is not None:
             bg_idx, _, bg_variance = background_anchor_term
-            fisher[bg_idx, bg_idx] += 1.0 / bg_variance
+            penalty_information[bg_idx, bg_idx] += 1.0 / bg_variance
+        fisher = poisson_information + penalty_information
         fisher = 0.5 * (fisher + fisher.T)
-        covariance = np.linalg.pinv(fisher, rcond=1e-12)
+        covariance_semantics = "inverse_fisher_poisson"
+        if variance_input is None:
+            covariance = np.linalg.pinv(fisher, rcond=1e-12)
+        else:
+            covariance_inputs = self._response_poisson_covariance_inputs(
+                variance_input,
+                observed_spectrum=observed,
+                live_time_s=float(live_time_s),
+                transport_metadata=transport_metadata,
+                transport_spectrum=transport_spectrum,
+                transport_covariance_chunks=transport_covariance_chunks,
+            )
+            covariance = _response_poisson_sandwich_covariance(
+                design,
+                fitted,
+                fisher,
+                covariance_inputs.analysis_variance,
+                source_spectrum_variance=covariance_inputs.source_variance,
+                folding_operator=covariance_inputs.folding_operator,
+                source_observed_spectrum=(covariance_inputs.source_observed_spectrum),
+                dead_time_observed_scale=(covariance_inputs.dead_time_observed_scale),
+                dead_time_tau_s=covariance_inputs.dead_time_tau_s,
+                dead_time_live_time_s=(covariance_inputs.dead_time_live_time_s),
+                independent_chunks=covariance_inputs.independent_chunks,
+            )
+            covariance_semantics = covariance_inputs.semantics
         covariance = 0.5 * (covariance + covariance.T)
         variances: Dict[str, float] = {isotope: 1.0 for isotope in requested}
         coefficient_correlation_by_isotope = {name: 0.0 for name in fit_names}
@@ -1385,6 +1929,13 @@ class SpectralDecomposer:
                     row_weights @ block @ col_weights
                 )
         isotope_covariance = 0.5 * (isotope_covariance + isotope_covariance.T)
+        self.last_response_poisson_regression_covariance = {
+            row_name: {
+                col_name: float(isotope_covariance[row_idx, col_idx])
+                for col_idx, col_name in enumerate(fit_names)
+            }
+            for row_idx, row_name in enumerate(fit_names)
+        }
         if len(fit_names) > 1:
             diag = np.maximum(np.diag(isotope_covariance), 0.0)
             denom = np.sqrt(np.maximum(np.outer(diag, diag), 1.0e-24))
@@ -1398,8 +1949,7 @@ class SpectralDecomposer:
             np.fill_diagonal(abs_corr, 0.0)
             coefficient_correlation_max_abs = float(np.max(abs_corr))
             coefficient_correlation_by_isotope = {
-                name: float(np.max(abs_corr[idx]))
-                for idx, name in enumerate(fit_names)
+                name: float(np.max(abs_corr[idx])) for idx, name in enumerate(fit_names)
             }
         max_fit_coefficient = max(
             (max(float(isotope_counts.get(name, 0.0)), 0.0) for name in fit_names),
@@ -1435,9 +1985,7 @@ class SpectralDecomposer:
                 sensitivity = max(sensitivity, 1e-12)
                 variance = max(value * sensitivity, 1.0) / (sensitivity**2)
             if bool(self.config.response_poisson_crosstalk_variance_enable):
-                corr_value = float(
-                    coefficient_correlation_by_isotope.get(name, 0.0)
-                )
+                corr_value = float(coefficient_correlation_by_isotope.get(name, 0.0))
                 corr_threshold = min(
                     max(
                         float(self.config.response_poisson_crosstalk_corr_threshold),
@@ -1509,7 +2057,9 @@ class SpectralDecomposer:
                 poisson_var = max(float(poisson_estimate.variance), 1.0)
                 poisson_snr = poisson_count / max(float(np.sqrt(poisson_var)), 1e-12)
                 poisson_fraction = poisson_count / max(max_poisson_count, 1e-12)
-                predicted_photo_snr = poisson_count / max(float(np.sqrt(photo_var)), 1e-12)
+                predicted_photo_snr = poisson_count / max(
+                    float(np.sqrt(photo_var)), 1e-12
+                )
                 if (
                     bool(self.config.response_poisson_low_snr_photopeak_anchor)
                     and photo_snr < min_snr
@@ -1540,8 +2090,7 @@ class SpectralDecomposer:
                         )
                         suppress_photo_to_poisson_ratio = max(
                             float(
-                                self.config
-                                .response_poisson_low_snr_suppress_photo_to_poisson_ratio
+                                self.config.response_poisson_low_snr_suppress_photo_to_poisson_ratio
                             ),
                             0.0,
                         )
@@ -1556,7 +2105,8 @@ class SpectralDecomposer:
                         missing_expected_photopeaks = (
                             photo_snr <= suppress_photo_snr
                             and poisson_fraction <= suppress_fraction
-                            and photo_to_poisson_ratio <= suppress_photo_to_poisson_ratio
+                            and photo_to_poisson_ratio
+                            <= suppress_photo_to_poisson_ratio
                             and predicted_photo_snr >= suppress_predicted_photo_snr
                         )
                         if suppress_enabled and (
@@ -1739,9 +2289,8 @@ class SpectralDecomposer:
             photopeak_integral = float(photopeak_integrals.get(name, 0.0))
             component = np.zeros_like(observed, dtype=float)
             for local_idx in local_indices:
-                component += (
-                    max(float(coeffs[local_idx]), 0.0)
-                    * np.asarray(signal_photopeak_matrix[:, local_idx], dtype=float)
+                component += max(float(coeffs[local_idx]), 0.0) * np.asarray(
+                    signal_photopeak_matrix[:, local_idx], dtype=float
                 )
             raw_component_total = float(np.sum(component))
             poisson_count = max(float(isotope_counts.get(name, 0.0)), 0.0)
@@ -1765,10 +2314,9 @@ class SpectralDecomposer:
             )
             variances[name] = source_equivalent_variance
         if include_background and coeffs.size > signal_count:
-            self.last_response_poisson_background = (
-                max(float(coeffs[signal_count]), 0.0)
-                * np.asarray(background_shape, dtype=float)
-            )
+            self.last_response_poisson_background = max(
+                float(coeffs[signal_count]), 0.0
+            ) * np.asarray(background_shape, dtype=float)
         else:
             self.last_response_poisson_background = None
         self.last_response_poisson_components = component_spectra
@@ -1776,15 +2324,6 @@ class SpectralDecomposer:
         self.last_count_variances = dict(variances)
         covariance_by_isotope: dict[str, dict[str, float]] = {}
         if fit_names:
-            raw_diag = np.maximum(np.diag(isotope_covariance), 0.0)
-            raw_denom = np.sqrt(np.maximum(np.outer(raw_diag, raw_diag), 1.0e-24))
-            raw_corr = np.divide(
-                isotope_covariance,
-                raw_denom,
-                out=np.zeros_like(isotope_covariance, dtype=float),
-                where=raw_denom > 0.0,
-            )
-            raw_corr = np.clip(raw_corr, -1.0, 1.0)
             for row_idx, row_name in enumerate(fit_names):
                 row: dict[str, float] = {}
                 row_var = max(float(variances.get(row_name, 1.0)), 1.0)
@@ -1793,13 +2332,22 @@ class SpectralDecomposer:
                     if row_idx == col_idx:
                         value = row_var
                     else:
-                        value = (
-                            float(raw_corr[row_idx, col_idx])
-                            * float(np.sqrt(row_var * col_var))
+                        # Later diagnostic guards add independent diagonal
+                        # uncertainty.  Preserve the regression covariance
+                        # itself instead of extending its correlation to those
+                        # independent floors.
+                        covariance_bound = float(np.sqrt(row_var * col_var))
+                        value = float(
+                            np.clip(
+                                isotope_covariance[row_idx, col_idx],
+                                -covariance_bound,
+                                covariance_bound,
+                            )
                         )
                     row[col_name] = float(value if np.isfinite(value) else 0.0)
                 covariance_by_isotope[row_name] = row
         self.last_count_covariance = covariance_by_isotope
+        self.last_count_covariance_semantics = covariance_semantics
         try:
             design_condition = float(np.linalg.cond(design))
         except np.linalg.LinAlgError:
@@ -1828,6 +2376,23 @@ class SpectralDecomposer:
             ),
             "design_condition_number": float(design_condition),
             "fisher_condition_number": float(fisher_condition),
+            "count_covariance_semantics": covariance_semantics,
+            "count_covariance_uses_supplied_spectrum_variance": bool(
+                variance_input is not None
+            ),
+            "count_covariance_bin_correlation_propagated": bool(
+                "factored" in covariance_semantics
+                or "dead_time_jacobian" in covariance_semantics
+                or "dead_time_delta_jacobian" in covariance_semantics
+            ),
+            "count_covariance_complete_transport_provenance": bool(
+                covariance_semantics.startswith("compound_poisson_sumw2_")
+            ),
+            "count_covariance_dead_time_linearization": (
+                "first_order_delta_jacobian"
+                if "dead_time_delta_jacobian" in covariance_semantics
+                else "none"
+            ),
             "reduced_chi2": float(reduced_chi2),
             "residual_l2": float(np.linalg.norm(residual)),
             "residual_l1": float(np.sum(np.abs(residual))),
@@ -1879,9 +2444,7 @@ class SpectralDecomposer:
                 for name in fit_names
                 if name in estimates
             },
-            "variances": {
-                name: float(variances.get(name, 1.0)) for name in fit_names
-            },
+            "variances": {name: float(variances.get(name, 1.0)) for name in fit_names},
             "count_covariance": covariance_by_isotope,
             "snr": {
                 name: float(
@@ -1897,14 +2460,12 @@ class SpectralDecomposer:
                 if name in estimates
             },
             "photopeak_counts": {
-                name: float(photopeak_counts.get(name, 0.0))
-                for name in fit_names
+                name: float(photopeak_counts.get(name, 0.0)) for name in fit_names
             }
             if photopeak_counts is not None
             else {},
             "photopeak_variances": {
-                name: float(photopeak_variances.get(name, 1.0))
-                for name in fit_names
+                name: float(photopeak_variances.get(name, 1.0)) for name in fit_names
             }
             if photopeak_variances is not None
             else {},
@@ -1914,9 +2475,7 @@ class SpectralDecomposer:
                 name: float(np.sum(component_spectra.get(name, np.zeros(0))))
                 for name in fit_names
             },
-            "coefficient_correlation_max_abs": float(
-                coefficient_correlation_max_abs
-            ),
+            "coefficient_correlation_max_abs": float(coefficient_correlation_max_abs),
             "coefficient_correlation_by_isotope": {
                 name: float(value)
                 for name, value in coefficient_correlation_by_isotope.items()
@@ -2048,10 +2607,14 @@ class SpectralDecomposer:
                     ),
                     1.0,
                 )
-                ratio_photo_weight = 1.0 - (
-                    underallocation_ratio_threshold
-                    / max(photo_to_poisson_ratio, underallocation_ratio_threshold)
-                ) ** 2
+                ratio_photo_weight = (
+                    1.0
+                    - (
+                        underallocation_ratio_threshold
+                        / max(photo_to_poisson_ratio, underallocation_ratio_threshold)
+                    )
+                    ** 2
+                )
                 blend_evidence = 1.0
                 for weight in (
                     disagreement_fraction,
@@ -2154,8 +2717,7 @@ class SpectralDecomposer:
             weak_channel = bool(
                 single_channel_fit
                 or dominant_count <= 0.0
-                or poisson_count
-                <= weak_channel_fraction * max(dominant_count, 1.0e-12)
+                or poisson_count <= weak_channel_fraction * max(dominant_count, 1.0e-12)
             )
             dominance_ratio = dominant_count / max(poisson_count, 1.0e-12)
             dominant_crosstalk = bool(
@@ -2164,9 +2726,9 @@ class SpectralDecomposer:
                 and not single_channel_fit
                 and dominance_ratio >= dominance_ratio_threshold
             )
-            ratio_photo_weight = 1.0 - (
-                ratio_threshold / max(ratio, ratio_threshold)
-            ) ** 2
+            ratio_photo_weight = (
+                1.0 - (ratio_threshold / max(ratio, ratio_threshold)) ** 2
+            )
             chi2_pressure_weight = (
                 min(max(float(reduced_chi2) / chi2_threshold, 0.0), 1.0)
                 if np.isfinite(reduced_chi2)
@@ -2175,9 +2737,7 @@ class SpectralDecomposer:
             dominance_pressure_weight = (
                 min(max(dominance_ratio / dominance_ratio_threshold, 0.0), 1.0)
                 if (
-                    allow_low_chi2_dominance
-                    and weak_channel
-                    and not single_channel_fit
+                    allow_low_chi2_dominance and weak_channel and not single_channel_fit
                 )
                 else 0.0
             )
@@ -2253,8 +2813,7 @@ class SpectralDecomposer:
                 )
                 blend_weight = min(
                     max(
-                        1.0
-                        - (1.0 - blend_weight) * (1.0 - extreme_dominant_boost),
+                        1.0 - (1.0 - blend_weight) * (1.0 - extreme_dominant_boost),
                         0.0,
                     ),
                     1.0,
@@ -2280,8 +2839,7 @@ class SpectralDecomposer:
                 )
                 blend_weight = min(
                     max(
-                        1.0
-                        - (1.0 - blend_weight) * (1.0 - high_chi2_ratio_boost),
+                        1.0 - (1.0 - blend_weight) * (1.0 - high_chi2_ratio_boost),
                         0.0,
                     ),
                     1.0,
@@ -2321,12 +2879,9 @@ class SpectralDecomposer:
                 1.0,
             )
             adjust_high_chi2_count = bool(
-                self.config
-                .response_poisson_crosstalk_count_guard_adjust_high_chi2_count
+                self.config.response_poisson_crosstalk_count_guard_adjust_high_chi2_count
             )
-            count_adjustable_crosstalk = bool(
-                high_chi2 or dominant_crosstalk
-            )
+            count_adjustable_crosstalk = bool(high_chi2 or dominant_crosstalk)
             adjust_count = bool(
                 self.config.response_poisson_crosstalk_count_guard_adjust_count
             ) and (
@@ -2395,6 +2950,12 @@ class SpectralDecomposer:
         isotopes: Sequence[str],
         include_background: bool = True,
         live_time_s: float = 1.0,
+        spectrum_variance: NDArray[np.float64] | None = None,
+        transport_metadata: Mapping[str, object] | None = None,
+        transport_spectrum: NDArray[np.float64] | None = None,
+        transport_covariance_chunks: Sequence[
+            ResponsePoissonCovarianceChunk
+        ] = (),
     ) -> Dict[str, float]:
         """Return source-equivalent photopeak counts from response regression."""
         estimates = self.compute_response_poisson_estimates(
@@ -2402,8 +2963,14 @@ class SpectralDecomposer:
             isotopes=isotopes,
             include_background=include_background,
             live_time_s=live_time_s,
+            spectrum_variance=spectrum_variance,
+            transport_metadata=transport_metadata,
+            transport_spectrum=transport_spectrum,
+            transport_covariance_chunks=transport_covariance_chunks,
         )
-        return {isotope: float(estimate.counts) for isotope, estimate in estimates.items()}
+        return {
+            isotope: float(estimate.counts) for isotope, estimate in estimates.items()
+        }
 
     def _photopeak_analysis_lines(
         self,
@@ -2432,10 +2999,7 @@ class SpectralDecomposer:
                     float(cfg.photopeak_roi_sigma) * sigma,
                     float(cfg.photopeak_roi_min_half_width_keV),
                 )
-                if (
-                    energy + half_width < min_energy
-                    or energy - half_width > max_energy
-                ):
+                if energy + half_width < min_energy or energy - half_width > max_energy:
                     continue
                 lines.append(
                     PhotopeakFitLine(
@@ -2575,7 +3139,9 @@ class SpectralDecomposer:
                     continue
                 peak_scale = eff
                 if bool(self.config.use_incident_gamma_response_matrix):
-                    peak_scale = self._incident_gamma_photopeak_fraction(line.energy_keV)
+                    peak_scale = self._incident_gamma_photopeak_fraction(
+                        line.energy_keV
+                    )
                     if peak_scale <= efficiency_floor:
                         continue
                 peak = gaussian_peak(
@@ -2867,9 +3433,7 @@ class SpectralDecomposer:
                 ],
                 "source_count_variances": source_variances,
                 "line_weights": [float(value) for value in line_weights],
-                "peak_sensitivities": [
-                    float(value) for value in peak_sensitivities
-                ],
+                "peak_sensitivities": [float(value) for value in peak_sensitivities],
                 "background_coefficients": [
                     float(value) for value in coeffs[len(fit_lines) :]
                 ],
@@ -2892,14 +3456,19 @@ class SpectralDecomposer:
             if np.isfinite(estimate.variance) and estimate.variance > 0.0
         ]
         if not finite_estimates:
-            value = max(float(np.mean([estimate.counts for estimate in estimates])), 0.0)
+            value = max(
+                float(np.mean([estimate.counts for estimate in estimates])), 0.0
+            )
             return value, max(value, 1.0)
         values = np.asarray(
             [estimate.counts for estimate in finite_estimates],
             dtype=float,
         )
         snr_values = np.asarray(
-            [max(float(estimate.signal_to_noise), 0.0) for estimate in finite_estimates],
+            [
+                max(float(estimate.signal_to_noise), 0.0)
+                for estimate in finite_estimates
+            ],
             dtype=float,
         )
         mixed_roi = np.asarray(
@@ -2924,7 +3493,9 @@ class SpectralDecomposer:
             and np.any(mixed_roi)
             and np.any(~mixed_roi)
         ):
-            support_snr = max(float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6)
+            support_snr = max(
+                float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6
+            )
             independent_snr = float(np.max(snr_values[~mixed_roi]))
             if independent_snr < support_snr:
                 variances[mixed_roi] = np.maximum(
@@ -2944,7 +3515,9 @@ class SpectralDecomposer:
                 and np.any(mixed_roi)
                 and np.any(~mixed_roi)
             ):
-                support_snr = max(float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6)
+                support_snr = max(
+                    float(self.config.photopeak_mixed_roi_support_snr), 1.0e-6
+                )
                 independent_snr = float(np.max(snr_values[~mixed_roi]))
                 if independent_snr < support_snr:
                     weights[mixed_roi] = 0.0
@@ -2968,7 +3541,9 @@ class SpectralDecomposer:
                         100.0,
                     )
                 )
-                reference = max(float(np.percentile(independent_values, percentile)), 1.0)
+                reference = max(
+                    float(np.percentile(independent_values, percentile)), 1.0
+                )
                 independent_variances = variances[~mixed_roi]
                 independent_variances = independent_variances[
                     np.isfinite(independent_variances) & (independent_variances > 0.0)
@@ -3019,7 +3594,9 @@ class SpectralDecomposer:
             weights *= huber
         weight_sum = float(np.sum(weights))
         if weight_sum <= 0.0:
-            value = max(float(np.median(values) if values.size >= 2 else np.mean(values)), 0.0)
+            value = max(
+                float(np.median(values) if values.size >= 2 else np.mean(values)), 0.0
+            )
             variance = float(np.mean(variances) / max(values.size, 1))
             return value, max(variance, value, 1.0)
         value = max(float(np.sum(weights * values) / weight_sum), 0.0)
@@ -3181,16 +3758,12 @@ class SpectralDecomposer:
                     "source_equivalent_variance": float(
                         estimate.source_equivalent_variance
                     ),
-                    "line_equivalent_counts": float(
-                        estimate.line_equivalent_counts
-                    ),
+                    "line_equivalent_counts": float(estimate.line_equivalent_counts),
                     "line_equivalent_variance": float(
                         estimate.line_equivalent_variance
                     ),
                     "observed_peak_counts": float(estimate.observed_peak_counts),
-                    "observed_peak_variance": float(
-                        estimate.observed_peak_variance
-                    ),
+                    "observed_peak_variance": float(estimate.observed_peak_variance),
                     "line_weight": float(estimate.line_weight),
                     "peak_sensitivity": float(estimate.peak_sensitivity),
                     "roi_min_keV": float(estimate.roi_min_keV),
@@ -3247,7 +3820,9 @@ class SpectralDecomposer:
         requested = [str(isotope) for isotope in isotopes]
         variances: Dict[str, float] = {isotope: 1.0 for isotope in requested}
         energy_axis = np.asarray(self.energy_axis, dtype=float)
-        bin_variance = np.clip(np.asarray(spectrum_variance, dtype=float), a_min=0.0, a_max=None)
+        bin_variance = np.clip(
+            np.asarray(spectrum_variance, dtype=float), a_min=0.0, a_max=None
+        )
         if energy_axis.size == 0 or bin_variance.size == 0:
             return variances
         if bin_variance.size != energy_axis.size:
@@ -3267,7 +3842,9 @@ class SpectralDecomposer:
                 if not np.any(mask):
                     continue
                 efficiency = max(float(self.efficiency(line.energy_keV)), 0.0)
-                sensitivity = self._line_weight(line.isotope, float(line.intensity)) * efficiency
+                sensitivity = (
+                    self._line_weight(line.isotope, float(line.intensity)) * efficiency
+                )
                 if sensitivity <= float(cfg.photopeak_efficiency_floor):
                     continue
                 peak_capture = float(
@@ -3281,7 +3858,9 @@ class SpectralDecomposer:
                     * bin_width
                 )
                 sensitivity *= max(peak_capture, 1.0e-6)
-                variance = float(np.sum(bin_variance[mask])) / max(sensitivity**2, 1.0e-24)
+                variance = float(np.sum(bin_variance[mask])) / max(
+                    sensitivity**2, 1.0e-24
+                )
                 if np.isfinite(variance) and variance > 0.0:
                     line_variances.append(variance)
             if line_variances:
@@ -3316,7 +3895,9 @@ class SpectralDecomposer:
                 lines.append((iso, float(energy), float(intensity)))
         return lines
 
-    def _dead_time_scale(self, spectrum: NDArray[np.float64], live_time_s: float) -> float:
+    def _dead_time_scale(
+        self, spectrum: NDArray[np.float64], live_time_s: float
+    ) -> float:
         """Return the dead-time correction scale factor."""
         tau = float(self.config.dead_time_tau_s)
         if live_time_s <= 0.0 or tau <= 0.0:
@@ -3324,7 +3905,9 @@ class SpectralDecomposer:
         m_tot = float(np.sum(spectrum)) / float(live_time_s)
         denom = 1.0 - m_tot * tau
         if denom <= 0.0:
-            logger.warning("Dead-time correction saturated (denom=%.3e); clamping scale.", denom)
+            logger.warning(
+                "Dead-time correction saturated (denom=%.3e); clamping scale.", denom
+            )
             denom = 1e-9
         return 1.0 / denom
 
@@ -3422,13 +4005,23 @@ class SpectralDecomposer:
         for iso, iso_lines in by_iso.items():
             weights = []
             for entry in iso_lines:
-                eff = float(self.efficiency_fn(entry.energy_keV)) if self.efficiency_fn is not None else 1.0
-                weights.append(self._line_weight(entry.isotope, float(entry.intensity)) * eff)
+                eff = (
+                    float(self.efficiency_fn(entry.energy_keV))
+                    if self.efficiency_fn is not None
+                    else 1.0
+                )
+                weights.append(
+                    self._line_weight(entry.isotope, float(entry.intensity)) * eff
+                )
             ref_weight[iso] = max(weights) if weights else 0.0
 
         line_ratio: list[float] = []
         for line in lines:
-            eff = float(self.efficiency_fn(line.energy_keV)) if self.efficiency_fn is not None else 1.0
+            eff = (
+                float(self.efficiency_fn(line.energy_keV))
+                if self.efficiency_fn is not None
+                else 1.0
+            )
             denom = ref_weight.get(line.isotope, 0.0)
             line_weight = self._line_weight(line.isotope, float(line.intensity))
             ratio = (line_weight * eff / denom) if denom > 0.0 else 0.0
@@ -3527,7 +4120,11 @@ class SpectralDecomposer:
             prominence=float(cfg.analysis_peak_prominence),
             distance=int(cfg.analysis_peak_distance),
         )
-        peak_energies = energy_axis[peak_indices] if peak_indices.size > 0 else np.array([], dtype=float)
+        peak_energies = (
+            energy_axis[peak_indices]
+            if peak_indices.size > 0
+            else np.array([], dtype=float)
+        )
 
         max_energy = float(np.max(energy_axis))
         line_specs = self._analysis_lines(max_energy_keV=max_energy)
@@ -3578,7 +4175,11 @@ class SpectralDecomposer:
             per_line_peak = [float(line.area) for line in iso_lines]
             per_line_beta_eff = []
             for line in iso_lines:
-                eff = float(self.efficiency_fn(line.energy_keV)) if self.efficiency_fn is not None else 1.0
+                eff = (
+                    float(self.efficiency_fn(line.energy_keV))
+                    if self.efficiency_fn is not None
+                    else 1.0
+                )
                 line_weight = self._line_weight(line.isotope, float(line.intensity))
                 per_line_beta_eff.append(line_weight * eff)
             denom_sum = float(np.sum(per_line_beta_eff))
@@ -3588,7 +4189,8 @@ class SpectralDecomposer:
             else:
                 counts[iso] = 0.0
             per_line_strength = [
-                (peak / be if be > 0.0 else 0.0) for peak, be in zip(per_line_peak, per_line_beta_eff)
+                (peak / be if be > 0.0 else 0.0)
+                for peak, be in zip(per_line_peak, per_line_beta_eff)
             ]
             debug[iso] = {
                 "line_energies": [float(line.energy_keV) for line in iso_lines],
@@ -3637,6 +4239,12 @@ class SpectralDecomposer:
         detection_state: DetectionState | None = None,
         active_isotopes: Sequence[str] | None = None,
         debug_detection: bool | None = None,
+        spectrum_variance: NDArray[np.float64] | None = None,
+        transport_metadata: Mapping[str, object] | None = None,
+        transport_spectrum: NDArray[np.float64] | None = None,
+        transport_covariance_chunks: Sequence[
+            ResponsePoissonCovarianceChunk
+        ] = (),
     ) -> Tuple[Dict[str, float], set[str]]:
         """
         Return isotope-wise counts plus detected isotopes.
@@ -3682,6 +4290,10 @@ class SpectralDecomposer:
                     spectrum,
                     isotopes=self._analysis_isotopes(),
                     live_time_s=live_time_s,
+                    spectrum_variance=spectrum_variance,
+                    transport_metadata=transport_metadata,
+                    transport_spectrum=transport_spectrum,
+                    transport_covariance_chunks=transport_covariance_chunks,
                 )
             elif normalized_count_method == "photopeak_nnls":
                 counts = self.compute_photopeak_nnls_counts(
@@ -3701,7 +4313,9 @@ class SpectralDecomposer:
         if not active_set and detection_state is not None and detection_state.active:
             active_set = set(detection_state.active)
         if cfg.detect_use_residual and active_set:
-            _, fitted_active = self.decompose_subset_with_fit(spectrum, isotopes=sorted(active_set))
+            _, fitted_active = self.decompose_subset_with_fit(
+                spectrum, isotopes=sorted(active_set)
+            )
         else:
             fitted_active = np.zeros_like(spectrum, dtype=float)
         if cfg.detect_use_residual:
@@ -3710,7 +4324,9 @@ class SpectralDecomposer:
             detect_spec = residual_pos
             candidates = [iso for iso in self.isotope_names if iso not in active_set]
         else:
-            detect_spec = spectrum if spectrum_for_detection is None else spectrum_for_detection
+            detect_spec = (
+                spectrum if spectrum_for_detection is None else spectrum_for_detection
+            )
             candidates = None
         detected, _ = self.detect_isotopes(
             spectrum,
@@ -3751,6 +4367,10 @@ class SpectralDecomposer:
                 spectrum,
                 isotopes=self._analysis_isotopes(),
                 live_time_s=live_time_s,
+                spectrum_variance=spectrum_variance,
+                transport_metadata=transport_metadata,
+                transport_spectrum=transport_spectrum,
+                transport_covariance_chunks=transport_covariance_chunks,
             )
         elif normalized_count_method == "photopeak_nnls":
             counts_full = self.compute_photopeak_nnls_counts(
@@ -3768,7 +4388,9 @@ class SpectralDecomposer:
         if "Eu-154" in new_active and counts_full.get("Eu-154", 0.0) > 0.0:
             active_wo_eu = [iso for iso in new_active if iso != "Eu-154"]
             if active_wo_eu:
-                _, fitted_wo_eu = self.decompose_subset_with_fit(spectrum, isotopes=sorted(active_wo_eu))
+                _, fitted_wo_eu = self.decompose_subset_with_fit(
+                    spectrum, isotopes=sorted(active_wo_eu)
+                )
             else:
                 fitted_wo_eu = np.zeros_like(spectrum, dtype=float)
             residual_wo = np.clip(spectrum - fitted_wo_eu, a_min=0.0, a_max=None)
@@ -3824,7 +4446,9 @@ class SpectralDecomposer:
             (detected_isotopes, peaks_by_iso)
         """
         cfg = self.config
-        detect_spec = spectrum if spectrum_for_detection is None else spectrum_for_detection
+        detect_spec = (
+            spectrum if spectrum_for_detection is None else spectrum_for_detection
+        )
         corrected = self.preprocess(detect_spec)
         work = corrected
         if float(np.max(work)) <= 0.0:
@@ -3835,22 +4459,48 @@ class SpectralDecomposer:
                 gpu_device=self.gpu_device,
                 gpu_dtype=self.gpu_dtype,
             )
-        peak_indices = detect_peaks(work, prominence=peak_prominence, distance=peak_distance)
+        peak_indices = detect_peaks(
+            work, prominence=peak_prominence, distance=peak_distance
+        )
         peaks_by_iso, _ = self._assign_peak_indices(
             self.energy_axis,
             peak_indices,
             self.library,
             tolerance_keV=peak_tolerance_keV,
         )
-        peak_energies = self.energy_axis[peak_indices] if peak_indices.size > 0 else np.array([], dtype=float)
-        min_lines = min_peaks_by_isotope if min_peaks_by_isotope is not None else cfg.detect_min_lines_by_iso
-        snr_threshold = cfg.detect_snr_threshold if detect_snr_threshold is None else detect_snr_threshold
-        strong_snr = cfg.detect_strong_snr if detect_strong_snr_threshold is None else detect_strong_snr_threshold
-        half_window = cfg.detect_half_window_keV if detect_window_keV is None else detect_window_keV
+        peak_energies = (
+            self.energy_axis[peak_indices]
+            if peak_indices.size > 0
+            else np.array([], dtype=float)
+        )
+        min_lines = (
+            min_peaks_by_isotope
+            if min_peaks_by_isotope is not None
+            else cfg.detect_min_lines_by_iso
+        )
+        snr_threshold = (
+            cfg.detect_snr_threshold
+            if detect_snr_threshold is None
+            else detect_snr_threshold
+        )
+        strong_snr = (
+            cfg.detect_strong_snr
+            if detect_strong_snr_threshold is None
+            else detect_strong_snr_threshold
+        )
+        half_window = (
+            cfg.detect_half_window_keV
+            if detect_window_keV is None
+            else detect_window_keV
+        )
         sideband_keV = cfg.detect_sideband_keV
         if detect_sideband_factor is not None:
             sideband_keV = max(float(half_window) * float(detect_sideband_factor), 1e-6)
-        require_peak_shape = cfg.detect_require_peak_shape if detect_require_peak_shape is None else detect_require_peak_shape
+        require_peak_shape = (
+            cfg.detect_require_peak_shape
+            if detect_require_peak_shape is None
+            else detect_require_peak_shape
+        )
         debug_enabled = cfg.detect_debug if debug_detection is None else debug_detection
         smoothed_raw = gaussian_smooth(
             np.asarray(detect_spec, dtype=float),
@@ -3885,7 +4535,10 @@ class SpectralDecomposer:
                     nuclide = self.library.get(iso)
                     if nuclide is not None:
                         keep = any(
-                            (abs(float(line.energy_keV) - float(line_keV)) <= peak_tolerance_keV)
+                            (
+                                abs(float(line.energy_keV) - float(line_keV))
+                                <= peak_tolerance_keV
+                            )
                             and (line.intensity >= float(detect_min_line_intensity))
                             for line in nuclide.lines
                         )
@@ -3916,7 +4569,9 @@ class SpectralDecomposer:
             hit = (good >= min_required) or (best_snr >= float(strong_snr))
             if debug_enabled and iso == "Eu-154":
                 for line_keV, ev in evidences:
-                    near = (ev.net >= 0.8 * net_abs_counts) or (ev.snr >= 0.8 * float(snr_threshold))
+                    near = (ev.net >= 0.8 * net_abs_counts) or (
+                        ev.snr >= 0.8 * float(snr_threshold)
+                    )
                     if near:
                         logger.debug(
                             "detect %s line=%.2f gross=%.2f bg=%.2f net=%.2f snr=%.2f",
@@ -3943,11 +4598,17 @@ class SpectralDecomposer:
             detection_state.miss_streak[iso] = misses
             if hits >= int(cfg.detect_hit_hysteresis):
                 detection_state.active.add(iso)
-            if iso in detection_state.active and misses >= int(cfg.detect_miss_hysteresis):
+            if iso in detection_state.active and misses >= int(
+                cfg.detect_miss_hysteresis
+            ):
                 detection_state.active.remove(iso)
         if detection_state is None:
             detected = detected_hits
-            if not detected and best_iso is not None and best_snr_overall >= float(strong_snr):
+            if (
+                not detected
+                and best_iso is not None
+                and best_snr_overall >= float(strong_snr)
+            ):
                 detected = {best_iso}
             return detected, peaks_by_iso
         return set(detection_state.active), peaks_by_iso
@@ -3984,17 +4645,37 @@ class SpectralDecomposer:
                 gpu_device=self.gpu_device,
                 gpu_dtype=self.gpu_dtype,
             )
-        peak_indices = detect_peaks(work, prominence=peak_prominence, distance=peak_distance)
-        peak_energies = (
-            self.energy_axis[peak_indices] if peak_indices.size > 0 else np.array([], dtype=float)
+        peak_indices = detect_peaks(
+            work, prominence=peak_prominence, distance=peak_distance
         )
-        snr_threshold = cfg.detect_snr_threshold if detect_snr_threshold is None else detect_snr_threshold
-        strong_snr = cfg.detect_strong_snr if detect_strong_snr_threshold is None else detect_strong_snr_threshold
-        half_window = cfg.detect_half_window_keV if detect_window_keV is None else detect_window_keV
+        peak_energies = (
+            self.energy_axis[peak_indices]
+            if peak_indices.size > 0
+            else np.array([], dtype=float)
+        )
+        snr_threshold = (
+            cfg.detect_snr_threshold
+            if detect_snr_threshold is None
+            else detect_snr_threshold
+        )
+        strong_snr = (
+            cfg.detect_strong_snr
+            if detect_strong_snr_threshold is None
+            else detect_strong_snr_threshold
+        )
+        half_window = (
+            cfg.detect_half_window_keV
+            if detect_window_keV is None
+            else detect_window_keV
+        )
         sideband_keV = cfg.detect_sideband_keV
         if detect_sideband_factor is not None:
             sideband_keV = max(float(half_window) * float(detect_sideband_factor), 1e-6)
-        require_peak_shape = cfg.detect_require_peak_shape if detect_require_peak_shape is None else detect_require_peak_shape
+        require_peak_shape = (
+            cfg.detect_require_peak_shape
+            if detect_require_peak_shape is None
+            else detect_require_peak_shape
+        )
         key_lines = get_detection_lines_keV(isotope)
         if not key_lines:
             nuclide = self.library.get(isotope)
@@ -4019,7 +4700,10 @@ class SpectralDecomposer:
                 nuclide = self.library.get(isotope)
                 if nuclide is not None:
                     keep = any(
-                        (abs(float(line.energy_keV) - float(line_keV)) <= peak_tolerance_keV)
+                        (
+                            abs(float(line.energy_keV) - float(line_keV))
+                            <= peak_tolerance_keV
+                        )
                         and (line.intensity >= float(detect_min_line_intensity))
                         for line in nuclide.lines
                     )
@@ -4084,18 +4768,28 @@ class SpectralDecomposer:
             )
             corrected = np.clip(corrected - base, a_min=0.0, a_max=None)
         energy_axis = np.asarray(self.energy_axis, dtype=float)
-        iso_names = list(isotopes) if isotopes is not None else self._analysis_isotopes()
+        iso_names = (
+            list(isotopes) if isotopes is not None else self._analysis_isotopes()
+        )
         iso_names = [iso for iso in iso_names if iso in self._analysis_isotopes()]
         max_energy = float(np.max(energy_axis)) if energy_axis.size else 0.0
 
-        prominence = cfg.analysis_peak_prominence if peak_prominence is None else peak_prominence
-        distance = cfg.analysis_peak_distance if peak_distance is None else peak_distance
+        prominence = (
+            cfg.analysis_peak_prominence if peak_prominence is None else peak_prominence
+        )
+        distance = (
+            cfg.analysis_peak_distance if peak_distance is None else peak_distance
+        )
         peak_indices = detect_peaks(
             corrected,
             prominence=float(prominence),
             distance=int(distance),
         )
-        peak_energies = energy_axis[peak_indices] if peak_indices.size > 0 else np.array([], dtype=float)
+        peak_energies = (
+            energy_axis[peak_indices]
+            if peak_indices.size > 0
+            else np.array([], dtype=float)
+        )
 
         line_specs: list[tuple[str, float, float]] = []
         line_indices_by_iso: Dict[str, list[int]] = {iso: [] for iso in iso_names}
@@ -4137,7 +4831,9 @@ class SpectralDecomposer:
             )
 
         if apply_stripping and observations:
-            stripped = self._strip_overlap_groups(observations, overlap_tol_keV=float(peak_tolerance_keV))
+            stripped = self._strip_overlap_groups(
+                observations, overlap_tol_keV=float(peak_tolerance_keV)
+            )
         else:
             stripped = observations
 
@@ -4169,7 +4865,9 @@ class SpectralDecomposer:
         scale. When apply_stripping is enabled, peak areas are corrected using
         spectral stripping.
         """
-        iso_names = list(isotopes) if isotopes is not None else self._analysis_isotopes()
+        iso_names = (
+            list(isotopes) if isotopes is not None else self._analysis_isotopes()
+        )
         iso_names = [iso for iso in iso_names if iso in self._analysis_isotopes()]
         energy_axis = np.asarray(self.energy_axis, dtype=float)
         max_energy = float(np.max(energy_axis)) if energy_axis.size else 0.0
@@ -4199,8 +4897,12 @@ class SpectralDecomposer:
             per_line = line_counts.get(iso, [])
             per_line_peak = [float(val) for val in per_line]
             per_line_beta_eff = []
-            for (energy, intensity) in lines:
-                eff = float(self.efficiency_fn(energy)) if self.efficiency_fn is not None else 1.0
+            for energy, intensity in lines:
+                eff = (
+                    float(self.efficiency_fn(energy))
+                    if self.efficiency_fn is not None
+                    else 1.0
+                )
                 per_line_beta_eff.append(float(intensity) * eff)
             denom_sum = float(np.sum(per_line_beta_eff))
             num_sum = float(np.sum(per_line_peak))
@@ -4209,7 +4911,8 @@ class SpectralDecomposer:
             else:
                 counts[iso] = 0.0
             per_line_strength = [
-                (peak / be if be > 0.0 else 0.0) for peak, be in zip(per_line_peak, per_line_beta_eff)
+                (peak / be if be > 0.0 else 0.0)
+                for peak, be in zip(per_line_peak, per_line_beta_eff)
             ]
             debug[iso] = {
                 "line_energies": [float(energy) for energy, _ in lines],
@@ -4297,7 +5000,11 @@ class SpectralDecomposer:
             prominence=float(cfg.analysis_peak_prominence),
             distance=int(cfg.analysis_peak_distance),
         )
-        peak_energies = energy_axis[peak_indices] if peak_indices.size > 0 else np.array([], dtype=float)
+        peak_energies = (
+            energy_axis[peak_indices]
+            if peak_indices.size > 0
+            else np.array([], dtype=float)
+        )
 
         max_energy = float(np.max(energy_axis)) if energy_axis.size else 0.0
         lines = self._analysis_lines(max_energy_keV=max_energy)
@@ -4380,7 +5087,9 @@ class SpectralDecomposer:
                 if iso in line_energies:
                     line_energy_map[iso] = np.asarray(line_energies[iso], dtype=float)
                 else:
-                    line_energy_map[iso] = np.array([line.energy_keV for line in nuclide.lines], dtype=float)
+                    line_energy_map[iso] = np.array(
+                        [line.energy_keV for line in nuclide.lines], dtype=float
+                    )
         for idx in peak_indices:
             energy = float(energy_axis[int(idx)])
             best_iso = None

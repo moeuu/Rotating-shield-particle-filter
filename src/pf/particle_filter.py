@@ -27,6 +27,8 @@ from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.diagnostics import build_source_event_record, reset_step_diagnostics
 from pf.likelihood import (
     CountLikelihoodSpec,
+    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
+    OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
     count_log_likelihood,
     count_likelihood_variance,
     count_likelihood_variance_torch,
@@ -34,6 +36,7 @@ from pf.likelihood import (
     delta_log_likelihood_update,
     expected_counts_per_source,
     normalize_count_likelihood_model,
+    normalize_observation_count_variance_semantics,
 )
 from pf.state import IsotopeState
 from pf.resampling import systematic_resample, systematic_resample_count
@@ -74,6 +77,7 @@ class PFConfig:
     low_count_abs_sigma: float | dict[str, float] = 0.0
     low_count_transition_counts: float | dict[str, float] = 0.0
     observation_count_variance_includes_counting_noise: bool = False
+    observation_count_variance_semantics: str = ""
     count_likelihood_df: float = 5.0
     shield_contrast_likelihood_enable: bool = False
     shield_contrast_likelihood_weight: float = 1.0
@@ -89,6 +93,7 @@ class PFConfig:
     shield_view_ratio_likelihood_min_views: int = 2
     station_view_covariance_enable: bool = False
     station_view_correlated_spectrum_fraction: float = 0.0
+    direct_spectrum_likelihood_enable: bool = True
     spectrum_likelihood_bin_chunk: int = 512
     min_strength: float = 0.01
     p_birth: float = 0.05
@@ -332,7 +337,7 @@ class PFConfig:
     converge_cluster_min_support_fraction: float = 0.0
 
     def __post_init__(self) -> None:
-        """Reject strength-profile settings with incompatible weight semantics."""
+        """Normalize likelihood semantics and reject incompatible settings."""
         if bool(self.conditional_strength_profile_before_likelihood) and bool(
             self.conditional_strength_refit_reweight
         ):
@@ -342,6 +347,36 @@ class PFConfig:
                 "profile changes the strength state without rebasing historical "
                 "particle weights."
             )
+        semantics = normalize_observation_count_variance_semantics(
+            self.observation_count_variance_semantics,
+            includes_counting_noise=(
+                self.observation_count_variance_includes_counting_noise
+            ),
+        )
+        self.observation_count_variance_semantics = semantics
+        self.observation_count_variance_includes_counting_noise = (
+            semantics != OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+        )
+        self.direct_spectrum_likelihood_enable = bool(
+            self.direct_spectrum_likelihood_enable
+        )
+        self.shield_contrast_likelihood_enable = bool(
+            self.shield_contrast_likelihood_enable
+        )
+        self.shield_view_ratio_likelihood_enable = bool(
+            self.shield_view_ratio_likelihood_enable
+        )
+        if semantics == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL:
+            model = normalize_count_likelihood_model(self.count_likelihood_model)
+            if model == "poisson":
+                raise ValueError(
+                    "complete_statistical observation variance requires gaussian "
+                    "or student_t count likelihood."
+                )
+            # Derived shield-shape terms reuse these count observations without
+            # their complete covariance, so they are inadmissible here.
+            self.shield_contrast_likelihood_enable = False
+            self.shield_view_ratio_likelihood_enable = False
 
 
 @dataclass
@@ -534,6 +569,7 @@ class IsotopeParticleFilter:
         self.last_pseudo_source_fail_reasons: dict[str, int] = {}
         self.last_source_event_diagnostics: list[dict[str, object]] = []
         self.last_structural_timing_s: dict[str, float] = {}
+        self.last_spectrum_likelihood_route = "none"
         self._deferred_resampled_any = False
         self._deferred_ess_min: float | None = None
         self._deferred_convergence_args: (
@@ -819,6 +855,9 @@ class IsotopeParticleFilter:
             "observation_count_variance_includes_counting_noise": bool(
                 self.config.observation_count_variance_includes_counting_noise
             ),
+            "observation_count_variance_semantics": str(
+                self.config.observation_count_variance_semantics
+            ),
             "student_t_df": max(float(self.config.count_likelihood_df), 1.0),
         }
 
@@ -879,6 +918,9 @@ class IsotopeParticleFilter:
             observation_count_variance=obs_var[:, None],
             observation_count_variance_includes_counting_noise=bool(
                 kwargs["observation_count_variance_includes_counting_noise"]
+            ),
+            observation_count_variance_semantics=str(
+                kwargs["observation_count_variance_semantics"]
             ),
         )
         residual = z_col - lam
@@ -2163,6 +2205,9 @@ class IsotopeParticleFilter:
             observation_count_variance_includes_counting_noise=bool(
                 self.config.observation_count_variance_includes_counting_noise
             ),
+            observation_count_variance_semantics=str(
+                self.config.observation_count_variance_semantics
+            ),
         )
         residual = z - lam_t
         if model == "gaussian":
@@ -2251,6 +2296,9 @@ class IsotopeParticleFilter:
             observation_count_variance=obs_var,
             observation_count_variance_includes_counting_noise=bool(
                 self.config.observation_count_variance_includes_counting_noise
+            ),
+            observation_count_variance_semantics=str(
+                self.config.observation_count_variance_semantics
             ),
         )
         residual = z - lam
@@ -2350,6 +2398,24 @@ class IsotopeParticleFilter:
                 (residual**2) / (df * variance)
             ) - 0.5 * torch.log(variance)
         return torch.sum(ll, dim=(0, 1))
+
+    def _direct_spectrum_likelihood_enabled(self) -> bool:
+        """Return whether independent-bin spectrum likelihoods are admissible.
+
+        Complete statistical covariance from weighted transport generally has
+        response-folding correlations between spectrum bins. The current
+        direct-bin likelihood accepts only diagonal variance, so that semantic
+        must route through isotope counts and their propagated covariance.
+        """
+        if not bool(self.config.direct_spectrum_likelihood_enable):
+            return False
+        semantics = normalize_observation_count_variance_semantics(
+            self.config.observation_count_variance_semantics,
+            includes_counting_noise=(
+                self.config.observation_count_variance_includes_counting_noise
+            ),
+        )
+        return semantics != OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
 
     @staticmethod
     def _spectrum_update_arrays(
@@ -2658,6 +2724,9 @@ class IsotopeParticleFilter:
             observation_count_variance=obs_var,
             observation_count_variance_includes_counting_noise=bool(
                 self.config.observation_count_variance_includes_counting_noise
+            ),
+            observation_count_variance_semantics=str(
+                self.config.observation_count_variance_semantics
             ),
         )
 
@@ -3540,13 +3609,24 @@ class IsotopeParticleFilter:
                 device="cpu",
             )
 
-        spectrum_arrays = self._spectrum_update_arrays(
+        candidate_spectrum_arrays = self._spectrum_update_arrays(
             spectrum_counts,
             spectrum_response_template,
             spectrum_background,
             spectrum_variance,
             sequence_length=1,
         )
+        spectrum_arrays = (
+            candidate_spectrum_arrays
+            if self._direct_spectrum_likelihood_enabled()
+            else None
+        )
+        if candidate_spectrum_arrays is None:
+            self.last_spectrum_likelihood_route = "count"
+        elif spectrum_arrays is None:
+            self.last_spectrum_likelihood_route = "count_covariance"
+        else:
+            self.last_spectrum_likelihood_route = "direct_spectrum"
 
         def _spectral_ll_fn() -> "torch.Tensor":
             """Return direct spectrum-bin likelihood increments for one view."""
@@ -3761,13 +3841,24 @@ class IsotopeParticleFilter:
             raise ValueError("Joint PF update arrays must have matching lengths.")
         if z_arr.size == 0:
             return
-        spectrum_arrays = self._spectrum_update_arrays(
+        candidate_spectrum_arrays = self._spectrum_update_arrays(
             spectrum_counts,
             spectrum_response_template,
             spectrum_background,
             spectrum_variance,
             sequence_length=z_arr.size,
         )
+        spectrum_arrays = (
+            candidate_spectrum_arrays
+            if self._direct_spectrum_likelihood_enabled()
+            else None
+        )
+        if candidate_spectrum_arrays is None:
+            self.last_spectrum_likelihood_route = "count"
+        elif spectrum_arrays is None:
+            self.last_spectrum_likelihood_route = "count_covariance"
+        else:
+            self.last_spectrum_likelihood_route = "direct_spectrum"
         profile_data: MeasurementData | None = None
         if bool(self.config.conditional_strength_profile_before_likelihood):
             if detector_pos is None:
@@ -7880,10 +7971,13 @@ class IsotopeParticleFilter:
                 self._source_prune_refit_after_remove_mask(st, data)
                 & separation_allowed
             )
-        allowed_loss = self._bic_model_penalty(
-            int(data.z_k.size),
-            int(self.config.source_prune_bic_penalty_params),
-        ) + self._source_prune_delta_threshold()
+        allowed_loss = (
+            self._bic_model_penalty(
+                int(data.z_k.size),
+                int(self.config.source_prune_bic_penalty_params),
+            )
+            + self._source_prune_delta_threshold()
+        )
         if delta_ll is None or delta_ll.shape != (int(st.num_sources),):
             delta_ll = self._delta_log_likelihood_remove(
                 data.z_k,
@@ -7900,10 +7994,13 @@ class IsotopeParticleFilter:
             rows = station_labels == int(label)
             if not np.any(rows):
                 continue
-            station_allowed_loss = self._bic_model_penalty(
-                int(np.count_nonzero(rows)),
-                int(self.config.source_prune_bic_penalty_params),
-            ) + self._source_prune_delta_threshold()
+            station_allowed_loss = (
+                self._bic_model_penalty(
+                    int(np.count_nonzero(rows)),
+                    int(self.config.source_prune_bic_penalty_params),
+                )
+                + self._source_prune_delta_threshold()
+            )
             station_delta = self._delta_log_likelihood_remove(
                 data.z_k[rows],
                 lambda_total[rows],

@@ -12,8 +12,529 @@ from measurement.shielding import (
     mu_by_isotope_from_tvl_mm,
 )
 from spectrum.library import get_analysis_lines_with_intensity
-from spectrum.pipeline import PhotopeakRoiEstimate, SpectralDecomposer, SpectrumConfig
+from spectrum.pipeline import (
+    PhotopeakRoiEstimate,
+    ResponsePoissonCovarianceChunk,
+    ResponsePoissonCovarianceInputs,
+    SpectralDecomposer,
+    SpectrumConfig,
+    _response_poisson_sandwich_covariance,
+)
 from spectrum.response_matrix import build_incident_gamma_response_matrix, gaussian_peak
+
+
+def test_response_poisson_sandwich_reduces_to_inverse_fisher_for_poisson_bins() -> None:
+    """Poisson bin variances should reproduce the inverse-Fisher covariance."""
+    design = np.asarray(
+        [
+            [1.0, 0.2],
+            [0.4, 1.0],
+            [0.7, 0.3],
+            [0.1, 0.8],
+        ],
+        dtype=float,
+    )
+    fitted = design @ np.asarray([30.0, 20.0], dtype=float)
+    fisher = design.T @ (design / fitted[:, np.newaxis])
+
+    covariance = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        fitted,
+    )
+
+    assert covariance == pytest.approx(np.linalg.inv(fisher), rel=1.0e-10)
+
+
+def test_response_poisson_sandwich_propagates_folding_and_dead_time() -> None:
+    """Factored covariance should retain folding and dead-time bin correlation."""
+    design = np.asarray(
+        [
+            [1.0, 0.1],
+            [0.3, 1.0],
+            [0.6, 0.4],
+        ],
+        dtype=float,
+    )
+    fitted = design @ np.asarray([25.0, 15.0], dtype=float)
+    fisher = design.T @ (design / fitted[:, np.newaxis])
+    folding = np.asarray(
+        [
+            [0.7, 0.1, 0.0],
+            [0.3, 0.7, 0.2],
+            [0.0, 0.2, 0.8],
+        ],
+        dtype=float,
+    )
+    pre_dead_time_spectrum = np.asarray([80.0, 50.0, 20.0], dtype=float)
+    source_variance = np.asarray([240.0, 150.0, 60.0], dtype=float)
+    live_time_s = 2.0
+    tau_s = 2.0e-3
+    scale = 1.0 / (1.0 + tau_s * float(np.sum(pre_dead_time_spectrum)) / live_time_s)
+    post_dead_time_spectrum = scale * pre_dead_time_spectrum
+    tau_per_count = tau_s / live_time_s
+    jacobian = scale * np.eye(3) - tau_per_count * scale * scale * np.outer(
+        pre_dead_time_spectrum, np.ones(3, dtype=float)
+    )
+    folded_covariance = (
+        folding @ jacobian @ np.diag(source_variance) @ jacobian.T @ folding.T
+    )
+    inverse_mean_design = design / fitted[:, np.newaxis]
+    meat = inverse_mean_design.T @ folded_covariance @ inverse_mean_design
+    inverse_fisher = np.linalg.inv(fisher)
+    expected = inverse_fisher @ meat @ inverse_fisher
+
+    covariance = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        np.diag(folded_covariance),
+        source_spectrum_variance=source_variance,
+        folding_operator=folding,
+        source_observed_spectrum=post_dead_time_spectrum,
+        dead_time_observed_scale=scale,
+        dead_time_tau_s=tau_s,
+        dead_time_live_time_s=live_time_s,
+    )
+    diagonal_only = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        np.diag(folded_covariance),
+    )
+
+    assert covariance == pytest.approx(expected, rel=1.0e-10)
+    assert not np.allclose(covariance, diagonal_only, rtol=1.0e-3, atol=1.0e-6)
+
+
+def test_response_poisson_sandwich_sums_independent_chunk_factors() -> None:
+    """Multi-chunk meat should equal the sum of dense chunk covariances."""
+    design = np.asarray(
+        [[1.0, 0.2], [0.3, 1.0], [0.7, 0.4]],
+        dtype=float,
+    )
+    fitted = design @ np.asarray([40.0, 25.0], dtype=float)
+    fisher = design.T @ (design / fitted[:, np.newaxis])
+    folding = np.asarray(
+        [[0.8, 0.1, 0.0], [0.2, 0.7, 0.1], [0.0, 0.2, 0.9]],
+        dtype=float,
+    )
+    chunks: list[ResponsePoissonCovarianceInputs] = []
+    dense_analysis_covariance = np.zeros((3, 3), dtype=float)
+    for pre, variance, live_time_s, tau_s in (
+        (
+            np.asarray([70.0, 40.0, 15.0]),
+            np.asarray([210.0, 120.0, 45.0]),
+            2.0,
+            1.0e-3,
+        ),
+        (
+            np.asarray([30.0, 55.0, 25.0]),
+            np.asarray([150.0, 275.0, 125.0]),
+            3.0,
+            2.0e-3,
+        ),
+    ):
+        scale = 1.0 / (1.0 + tau_s * float(np.sum(pre)) / live_time_s)
+        jacobian = scale * np.eye(3) - (
+            tau_s
+            / live_time_s
+            * scale
+            * scale
+            * np.outer(pre, np.ones(3, dtype=float))
+        )
+        analysis_covariance = (
+            folding @ jacobian @ np.diag(variance) @ jacobian.T @ folding.T
+        )
+        dense_analysis_covariance += analysis_covariance
+        chunks.append(
+            ResponsePoissonCovarianceInputs(
+                analysis_variance=np.diag(analysis_covariance),
+                source_variance=variance,
+                folding_operator=folding,
+                source_observed_spectrum=scale * pre,
+                dead_time_observed_scale=scale,
+                dead_time_tau_s=tau_s,
+                dead_time_live_time_s=live_time_s,
+                semantics=(
+                    "compound_poisson_sumw2_dead_time_delta_jacobian_"
+                    "response_folded_factored"
+                ),
+            )
+        )
+    inverse_mean_design = design / fitted[:, np.newaxis]
+    meat = (
+        inverse_mean_design.T
+        @ dense_analysis_covariance
+        @ inverse_mean_design
+    )
+    inverse_fisher = np.linalg.inv(fisher)
+    expected = inverse_fisher @ meat @ inverse_fisher
+
+    covariance = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        np.diag(dense_analysis_covariance),
+        independent_chunks=tuple(chunks),
+    )
+    first = chunks[0]
+    single_direct = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        first.analysis_variance,
+        source_spectrum_variance=first.source_variance,
+        folding_operator=first.folding_operator,
+        source_observed_spectrum=first.source_observed_spectrum,
+        dead_time_observed_scale=first.dead_time_observed_scale,
+        dead_time_tau_s=first.dead_time_tau_s,
+        dead_time_live_time_s=first.dead_time_live_time_s,
+    )
+    single_chunk_sequence = _response_poisson_sandwich_covariance(
+        design,
+        fitted,
+        fisher,
+        first.analysis_variance,
+        independent_chunks=(first,),
+    )
+
+    assert covariance == pytest.approx(expected, rel=1.0e-10)
+    assert single_chunk_sequence == pytest.approx(single_direct, rel=1.0e-12)
+
+
+def test_response_poisson_fit_uses_supplied_bin_variance_and_full_covariance() -> None:
+    """Regression should use supplied variance before exposing isotope covariance."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            dead_time_tau_s=0.0,
+            response_efficiency_model="unit",
+            response_poisson_line_resolved_fit=False,
+            response_poisson_crosstalk_variance_enable=False,
+            response_poisson_crosstalk_count_guard_enable=False,
+            response_poisson_underallocation_count_guard_enable=False,
+        )
+    )
+    isotopes = ["Cs-137", "Co-60", "Eu-154"]
+    indices = [decomposer.isotope_names.index(isotope) for isotope in isotopes]
+    truth = np.asarray([30_000.0, 20_000.0, 10_000.0], dtype=float)
+    spectrum = decomposer._count_response_matrix()[:, indices] @ truth
+
+    decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=isotopes,
+        include_background=False,
+    )
+    poisson_covariance = {
+        row: dict(values)
+        for row, values in decomposer.last_response_poisson_regression_covariance.items()
+    }
+    decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=isotopes,
+        include_background=False,
+        spectrum_variance=25.0 * spectrum,
+    )
+    weighted_covariance = decomposer.last_response_poisson_regression_covariance
+
+    assert decomposer.last_count_covariance_semantics == (
+        "diagonal_analysis_variance_approximation"
+    )
+    assert set(weighted_covariance) == set(isotopes)
+    for isotope in isotopes:
+        expected = 25.0 * poisson_covariance[isotope][isotope]
+        assert weighted_covariance[isotope][isotope] == pytest.approx(
+            expected,
+            rel=2.0e-5,
+        )
+    assert weighted_covariance["Cs-137"]["Co-60"] != pytest.approx(0.0)
+    assert decomposer.last_count_covariance["Cs-137"]["Co-60"] == pytest.approx(
+        weighted_covariance["Cs-137"]["Co-60"]
+    )
+
+
+def test_response_poisson_fit_uses_factored_native_transport_covariance() -> None:
+    """Native provenance should select the folded dead-time Jacobian path."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            dead_time_tau_s=5.0e-6,
+            response_efficiency_model="unit",
+            apply_incident_gamma_detector_response=True,
+            use_incident_gamma_response_matrix=True,
+            response_poisson_line_resolved_fit=False,
+            response_poisson_crosstalk_variance_enable=False,
+            response_poisson_crosstalk_count_guard_enable=False,
+            response_poisson_underallocation_count_guard_enable=False,
+        )
+    )
+    raw_pre_dead_time = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for energy_keV, counts in (
+        (662.0, 20_000.0),
+        (1174.0, 15_000.0),
+        (1332.0, 15_000.0),
+    ):
+        index = int(np.argmin(np.abs(decomposer.energy_axis - energy_keV)))
+        raw_pre_dead_time[index] = counts
+    live_time_s = 2.0
+    tau_s = 5.0e-6
+    scale = 1.0 / (1.0 + tau_s * float(np.sum(raw_pre_dead_time)) / live_time_s)
+    raw_post_dead_time = scale * raw_pre_dead_time
+    raw_post_variance = scale * scale * 20.0 * raw_pre_dead_time
+    spectrum = decomposer.fold_incident_gamma_spectrum(raw_post_dead_time)
+    folded_variance = decomposer.fold_incident_gamma_spectrum_variance(
+        raw_post_variance
+    )
+    metadata = {
+        "detector_scoring_mode": "incident_gamma_energy",
+        "spectrum_variance_semantics": ("compound_poisson_sumw2_includes_counting"),
+        "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+        "dead_time_observed_scale": scale,
+        "dead_time_tau_s": tau_s,
+        "spectrum_count_variance": raw_post_variance.tolist(),
+    }
+
+    decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=["Cs-137", "Co-60", "Eu-154"],
+        include_background=False,
+        live_time_s=live_time_s,
+        spectrum_variance=folded_variance,
+        transport_metadata=metadata,
+        transport_spectrum=raw_post_dead_time,
+    )
+
+    assert decomposer.last_count_covariance_semantics == (
+        "compound_poisson_sumw2_dead_time_delta_jacobian_response_folded_factored"
+    )
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["count_covariance_bin_correlation_propagated"] is True
+
+
+def test_response_poisson_fit_uses_independent_native_chunk_factors() -> None:
+    """Accumulated native chunks should retain every dead-time Jacobian factor."""
+    (
+        decomposer,
+        spectrum,
+        folded_variance,
+        raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+    chunk = ResponsePoissonCovarianceChunk(
+        analysis_spectrum=spectrum,
+        analysis_variance=folded_variance,
+        transport_spectrum=raw_post_dead_time,
+        transport_metadata=metadata,
+        live_time_s=live_time_s,
+    )
+
+    decomposer.compute_response_poisson_estimates(
+        2.0 * spectrum,
+        isotopes=["Cs-137", "Co-60", "Eu-154"],
+        include_background=False,
+        live_time_s=2.0 * live_time_s,
+        spectrum_variance=2.0 * folded_variance,
+        transport_metadata=metadata,
+        transport_covariance_chunks=(chunk, chunk),
+    )
+
+    assert decomposer.last_count_covariance_semantics == (
+        "compound_poisson_sumw2_independent_chunks_dead_time_delta_jacobian_"
+        "response_folded_factored"
+    )
+    diagnostics = decomposer.last_response_poisson_diagnostics
+    assert diagnostics["count_covariance_bin_correlation_propagated"] is True
+
+
+def _native_compound_covariance_case() -> tuple[
+    SpectralDecomposer,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, object],
+    float,
+]:
+    """Return a compact folded-spectrum native compound-covariance case."""
+    decomposer = SpectralDecomposer(
+        SpectrumConfig(
+            dead_time_tau_s=5.0e-6,
+            response_efficiency_model="unit",
+            apply_incident_gamma_detector_response=True,
+            use_incident_gamma_response_matrix=True,
+            response_poisson_line_resolved_fit=False,
+            response_poisson_crosstalk_variance_enable=False,
+            response_poisson_crosstalk_count_guard_enable=False,
+            response_poisson_underallocation_count_guard_enable=False,
+        )
+    )
+    raw_pre_dead_time = np.zeros_like(decomposer.energy_axis, dtype=float)
+    for energy_keV, counts in (
+        (662.0, 20_000.0),
+        (1174.0, 15_000.0),
+        (1332.0, 15_000.0),
+    ):
+        index = int(np.argmin(np.abs(decomposer.energy_axis - energy_keV)))
+        raw_pre_dead_time[index] = counts
+    live_time_s = 2.0
+    tau_s = 5.0e-6
+    scale = 1.0 / (1.0 + tau_s * float(np.sum(raw_pre_dead_time)) / live_time_s)
+    raw_post_dead_time = scale * raw_pre_dead_time
+    raw_post_variance = scale * scale * 20.0 * raw_pre_dead_time
+    spectrum = decomposer.fold_incident_gamma_spectrum(raw_post_dead_time)
+    folded_variance = decomposer.fold_incident_gamma_spectrum_variance(
+        raw_post_variance
+    )
+    metadata: dict[str, object] = {
+        "detector_scoring_mode": "incident_gamma_energy",
+        "spectrum_variance_semantics": ("compound_poisson_sumw2_includes_counting"),
+        "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+        "dead_time_observed_scale": scale,
+        "dead_time_tau_s": tau_s,
+        "spectrum_count_variance": raw_post_variance.tolist(),
+    }
+    return (
+        decomposer,
+        spectrum,
+        folded_variance,
+        raw_post_dead_time,
+        metadata,
+        live_time_s,
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    (
+        "spectrum_variance_dead_time_propagation",
+        "dead_time_observed_scale",
+        "dead_time_tau_s",
+        "spectrum_count_variance",
+    ),
+)
+def test_native_compound_covariance_fails_closed_on_missing_provenance(
+    missing_key: str,
+) -> None:
+    """Native compound semantics must not degrade when provenance is missing."""
+    (
+        decomposer,
+        spectrum,
+        folded_variance,
+        raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+    metadata.pop(missing_key)
+
+    with pytest.raises(ValueError, match="Native compound-Poisson"):
+        decomposer.compute_response_poisson_estimates(
+            spectrum,
+            isotopes=["Cs-137", "Co-60", "Eu-154"],
+            include_background=False,
+            live_time_s=live_time_s,
+            spectrum_variance=folded_variance,
+            transport_metadata=metadata,
+            transport_spectrum=raw_post_dead_time,
+        )
+
+
+def test_native_compound_covariance_requires_analysis_variance() -> None:
+    """Native compound semantics require the analysis-side variance vector."""
+    (
+        decomposer,
+        spectrum,
+        _folded_variance,
+        raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+
+    with pytest.raises(ValueError, match="requires per-bin spectrum_variance"):
+        decomposer.compute_response_poisson_estimates(
+            spectrum,
+            isotopes=["Cs-137", "Co-60", "Eu-154"],
+            include_background=False,
+            live_time_s=live_time_s,
+            transport_metadata=metadata,
+            transport_spectrum=raw_post_dead_time,
+        )
+
+
+def test_native_compound_covariance_rejects_per_bin_shape_mismatch() -> None:
+    """Native per-bin sumw2 must match the unfurled transport spectrum."""
+    (
+        decomposer,
+        spectrum,
+        folded_variance,
+        raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+    metadata["spectrum_count_variance"] = metadata["spectrum_count_variance"][:-1]
+
+    with pytest.raises(ValueError, match="must match the transport_spectrum shape"):
+        decomposer.compute_response_poisson_estimates(
+            spectrum,
+            isotopes=["Cs-137", "Co-60", "Eu-154"],
+            include_background=False,
+            live_time_s=live_time_s,
+            spectrum_variance=folded_variance,
+            transport_metadata=metadata,
+            transport_spectrum=raw_post_dead_time,
+        )
+
+
+def test_native_compound_covariance_requires_unfurled_folded_spectrum() -> None:
+    """Folded native covariance must retain its incident-energy spectrum."""
+    (
+        decomposer,
+        spectrum,
+        folded_variance,
+        _raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+
+    with pytest.raises(ValueError, match="requires the unfurled transport_spectrum"):
+        decomposer.compute_response_poisson_estimates(
+            spectrum,
+            isotopes=["Cs-137", "Co-60", "Eu-154"],
+            include_background=False,
+            live_time_s=live_time_s,
+            spectrum_variance=folded_variance,
+            transport_metadata=metadata,
+        )
+
+
+def test_approximate_compound_covariance_keeps_diagonal_fallback() -> None:
+    """Explicit chunk-sum approximation keeps the legacy diagonal covariance."""
+    (
+        decomposer,
+        spectrum,
+        folded_variance,
+        _raw_post_dead_time,
+        metadata,
+        live_time_s,
+    ) = _native_compound_covariance_case()
+    metadata = {
+        "spectrum_variance_semantics": metadata["spectrum_variance_semantics"],
+        "spectrum_variance_dead_time_propagation": (
+            "independent_chunk_sum_post_transform"
+        ),
+    }
+
+    decomposer.compute_response_poisson_estimates(
+        spectrum,
+        isotopes=["Cs-137", "Co-60", "Eu-154"],
+        include_background=False,
+        live_time_s=live_time_s,
+        spectrum_variance=folded_variance,
+        transport_metadata=metadata,
+    )
+
+    assert decomposer.last_count_covariance_semantics == (
+        "diagonal_analysis_variance_approximation"
+    )
 
 
 def test_configured_background_spectrum_does_not_reuse_observation_fit() -> None:
@@ -128,9 +649,13 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
 
     for isotope, expected in truth.items():
         index = decomposer.isotope_names.index(isotope)
-        photopeak_integral = float(np.sum(decomposer._get_photopeak_response_matrix()[:, index]))
+        photopeak_integral = float(
+            np.sum(decomposer._get_photopeak_response_matrix()[:, index])
+        )
         assert estimates[isotope].counts == pytest.approx(expected, rel=1e-4)
-        assert np.sum(decomposer.last_response_poisson_components[isotope]) == pytest.approx(
+        assert np.sum(
+            decomposer.last_response_poisson_components[isotope]
+        ) == pytest.approx(
             expected * photopeak_integral,
             rel=1e-4,
         )
@@ -143,7 +668,9 @@ def test_response_poisson_counts_recover_full_response_mixture() -> None:
     diagnostics = decomposer.last_response_poisson_diagnostics
     assert diagnostics["status"] == "ok"
     assert diagnostics["fit_isotopes"] == isotopes
-    assert diagnostics["observed_total_counts"] == pytest.approx(float(np.sum(spectrum)))
+    assert diagnostics["observed_total_counts"] == pytest.approx(
+        float(np.sum(spectrum))
+    )
     assert diagnostics["fitted_total_counts"] == pytest.approx(
         float(np.sum(decomposer.last_response_poisson_fit)),
     )
@@ -162,9 +689,7 @@ def test_response_poisson_selects_line_basis_for_shield_changed_line_ratio() -> 
     )
     line_matrix, _, line_columns = decomposer._get_response_poisson_line_basis()
     co_indices = [
-        idx
-        for idx, column in enumerate(line_columns)
-        if column.isotope == "Co-60"
+        idx for idx, column in enumerate(line_columns) if column.isotope == "Co-60"
     ]
     assert len(co_indices) == 2
     line_counts = np.array([1000.0, 500.0], dtype=float)
@@ -205,9 +730,7 @@ def test_response_poisson_incident_gamma_line_basis_preserves_count_units() -> N
     )
     line_matrix, _, line_columns = decomposer._get_response_poisson_line_basis()
     co_indices = [
-        idx
-        for idx, column in enumerate(line_columns)
-        if column.isotope == "Co-60"
+        idx for idx, column in enumerate(line_columns) if column.isotope == "Co-60"
     ]
     assert len(co_indices) == 2
     line_counts = np.array([1000.0, 500.0], dtype=float)
@@ -539,7 +1062,10 @@ def test_response_model_counts_match_shield_theory_for_mixed_python_spectrum() -
     """Full-response NNLS should recover theory for mixed shielded Python spectra."""
     import spectrum.pipeline as pipeline
 
-    background_backup = (pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND)
+    background_backup = (
+        pipeline.BACKGROUND_RATE_CPS,
+        pipeline.BACKGROUND_COUNTS_PER_SECOND,
+    )
     pipeline.BACKGROUND_RATE_CPS = 0.0
     pipeline.BACKGROUND_COUNTS_PER_SECOND = 0.0
     try:
@@ -593,16 +1119,23 @@ def test_response_model_counts_match_shield_theory_for_mixed_python_spectrum() -
             )
 
         for isotope in isotopes:
-            assert counts[isotope] == pytest.approx(theory[isotope], rel=1e-10, abs=1e-8)
+            assert counts[isotope] == pytest.approx(
+                theory[isotope], rel=1e-10, abs=1e-8
+            )
     finally:
-        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = background_backup
+        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = (
+            background_backup
+        )
 
 
 def test_photopeak_nnls_counts_match_shield_theory_for_mixed_python_spectrum() -> None:
     """Photopeak NNLS should recover shielded source-equivalent counts."""
     import spectrum.pipeline as pipeline
 
-    background_backup = (pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND)
+    background_backup = (
+        pipeline.BACKGROUND_RATE_CPS,
+        pipeline.BACKGROUND_COUNTS_PER_SECOND,
+    )
     pipeline.BACKGROUND_RATE_CPS = 0.0
     pipeline.BACKGROUND_COUNTS_PER_SECOND = 0.0
     try:
@@ -662,14 +1195,19 @@ def test_photopeak_nnls_counts_match_shield_theory_for_mixed_python_spectrum() -
         for isotope in isotopes:
             assert counts[isotope] == pytest.approx(theory[isotope], rel=0.02)
     finally:
-        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = background_backup
+        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = (
+            background_backup
+        )
 
 
 def test_peak_window_counts_are_not_conservative_for_mixed_spectra() -> None:
     """Peak-window counts should expose cross-talk in mixed shielded spectra."""
     import spectrum.pipeline as pipeline
 
-    background_backup = (pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND)
+    background_backup = (
+        pipeline.BACKGROUND_RATE_CPS,
+        pipeline.BACKGROUND_COUNTS_PER_SECOND,
+    )
     pipeline.BACKGROUND_RATE_CPS = 0.0
     pipeline.BACKGROUND_COUNTS_PER_SECOND = 0.0
     try:
@@ -715,12 +1253,18 @@ def test_peak_window_counts_are_not_conservative_for_mixed_spectra() -> None:
             live_time_s=30.0,
             isotopes=isotopes,
         )
-        free_response = decomposer.compute_response_model_counts(free_spectrum, isotopes=isotopes)
-        blocked_response = decomposer.compute_response_model_counts(blocked_spectrum, isotopes=isotopes)
+        free_response = decomposer.compute_response_model_counts(
+            free_spectrum, isotopes=isotopes
+        )
+        blocked_response = decomposer.compute_response_model_counts(
+            blocked_spectrum, isotopes=isotopes
+        )
 
         peak_ratio = blocked_peak["Eu-154"] / free_peak["Eu-154"]
         response_ratio = blocked_response["Eu-154"] / free_response["Eu-154"]
 
         assert peak_ratio > response_ratio * 1.2
     finally:
-        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = background_backup
+        pipeline.BACKGROUND_RATE_CPS, pipeline.BACKGROUND_COUNTS_PER_SECOND = (
+            background_backup
+        )

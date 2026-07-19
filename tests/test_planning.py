@@ -1180,9 +1180,7 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
         origin=(0.0, 0.0),
         cell_size=1.0,
         grid_shape=(4, 4),
-        traversable_cells=tuple(
-            (ix, iy) for ix in range(4) for iy in range(4)
-        ),
+        traversable_cells=tuple((ix, iy) for ix in range(4) for iy in range(4)),
     )
     planning_map = TrackingBatchMap(wrapped)
     candidates = np.array(
@@ -3205,6 +3203,653 @@ def test_signature_separation_uses_predictive_pf_variance() -> None:
     assert robust[0] == pytest.approx(scalar)
 
 
+def test_weighted_future_variance_is_batched_and_likelihood_matched() -> None:
+    """Weighted DSS variance should match compound-Poisson sum-w2 in one batch."""
+    mean = np.array([[2.0, 18.0], [4.0, 9.0]], dtype=float)
+    complete_spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    additional_spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="additional",
+        student_t_df=5.0,
+    )
+
+    complete = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=complete_spec,
+        primary_history_weight=50.0,
+    )
+    additional = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=additional_spec,
+        primary_history_weight=50.0,
+    )
+    complete_with_floor = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=CountLikelihoodSpec(
+            model="student_t",
+            observation_count_variance_semantics="complete_statistical",
+            transport_model_abs_sigma=3.0,
+            student_t_df=5.0,
+        ),
+        primary_history_weight=50.0,
+    )
+    inclusive_spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="counting_noise_inclusive",
+        transport_model_abs_sigma=3.0,
+        student_t_df=5.0,
+    )
+    unit_weight = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=inclusive_spec,
+        primary_history_weight=1.0,
+    )
+    legacy_unit_weight = dss_pp.predictive_count_likelihood_variance(
+        mean,
+        spec=inclusive_spec,
+    )
+    pure_background = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=complete_spec,
+        primary_history_weight=50.0,
+        background_counts=mean,
+    )
+    mixed_background = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=complete_spec,
+        primary_history_weight=50.0,
+        background_counts=0.25 * mean,
+    )
+    additional_background = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=additional_spec,
+        primary_history_weight=50.0,
+        background_counts=mean,
+    )
+
+    np.testing.assert_allclose(complete, mean * 50.0)
+    np.testing.assert_allclose(additional, mean * 50.0)
+    np.testing.assert_allclose(complete_with_floor, mean * 50.0 + 9.0)
+    np.testing.assert_allclose(unit_weight, legacy_unit_weight)
+    np.testing.assert_allclose(pure_background, mean)
+    np.testing.assert_allclose(mixed_background, 0.75 * mean * 50.0 + 0.25 * mean)
+    np.testing.assert_allclose(additional_background, mean)
+    with pytest.raises(ValueError, match="Weighted-history future observations"):
+        dss_pp._future_predictive_count_variance(
+            mean,
+            spec=CountLikelihoodSpec(model="poisson"),
+            primary_history_weight=50.0,
+        )
+
+
+def test_detector_equivalent_primary_budget_matches_scalar_geometry() -> None:
+    """Batched primary demand should match the native finite-sphere equation."""
+    detectors = np.array(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    states = [
+        IsotopeState(
+            num_sources=2,
+            positions=np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]),
+            strengths=np.array([10.0, 20.0]),
+            background=1.0e9,
+        ),
+        IsotopeState(
+            num_sources=1,
+            positions=np.array([[3.0, 0.0, 0.0]]),
+            strengths=np.array([40.0]),
+            background=2.0e9,
+        ),
+    ]
+    radius = 0.038
+    live_time = 3.0
+
+    batched = dss_pp._expected_detector_equivalent_primaries_for_states_at_detectors(
+        detectors,
+        states,
+        detector_radius_m=radius,
+        live_time_s=live_time,
+    )
+
+    def _scalar_geometry(detector: np.ndarray, source: np.ndarray) -> float:
+        """Return the native detector-cps finite-sphere geometric scale."""
+        distance = float(np.linalg.norm(detector - source))
+        if distance <= 1.0e-12:
+            return 0.0
+
+        def _fraction(distance_m: float) -> float:
+            """Return the solid-angle fraction of the active sphere."""
+            if distance_m <= radius:
+                return 0.5
+            ratio = min(radius / max(distance_m, 1.0e-12), 1.0)
+            return 0.5 * (1.0 - np.sqrt(max(1.0 - ratio * ratio, 0.0)))
+
+        return _fraction(max(distance, radius)) / max(
+            _fraction(max(1.0, radius)),
+            1.0e-12,
+        )
+
+    scalar = np.zeros_like(batched)
+    for detector_index, detector in enumerate(detectors):
+        for state_index, state in enumerate(states):
+            scalar[detector_index, state_index] = live_time * sum(
+                float(strength) * _scalar_geometry(detector, source)
+                for source, strength in zip(state.positions, state.strengths)
+            )
+    np.testing.assert_allclose(batched, scalar, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_transport_budget_radius_and_zero_radius_threshold_match_native() -> None:
+    """Budget geometry must use its physical radius and native near-zero cutoff."""
+    estimator = SimpleNamespace(detector_radius_m=0.25)
+    physical_config = DSSPPConfig(transport_detector_radius_m=0.038)
+    fallback_config = DSSPPConfig()
+
+    assert dss_pp._transport_detector_radius_m(
+        estimator,
+        config=physical_config,
+    ) == pytest.approx(0.038)
+    assert dss_pp._transport_detector_radius_m(
+        estimator,
+        config=fallback_config,
+    ) == pytest.approx(0.25)
+    zero_radius = dss_pp._finite_sphere_geometric_terms_batched(
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        np.array([[0.5e-6, 0.0, 0.0], [2.0e-6, 0.0, 0.0]], dtype=float),
+        detector_radius_m=0.0,
+    )
+    np.testing.assert_allclose(zero_radius[0, 0], 0.0)
+    np.testing.assert_allclose(zero_radius[0, 1], 1.0 / (2.0e-6) ** 2)
+    with pytest.raises(ValueError, match="transport_detector_radius_m"):
+        DSSPPConfig(transport_detector_radius_m=-1.0)
+
+
+def test_effective_primary_history_weight_uses_target_budget() -> None:
+    """Candidate weights should use the max fraction until the budget binds."""
+    expected = np.array([0.0, 1.0e6, 3.0e6, 15.0e6], dtype=float)
+    dynamic = dss_pp._effective_primary_history_weights(
+        expected,
+        minimum_history_weight=1.0,
+        target_sampled_primaries=1.5e6,
+    )
+    fixed = dss_pp._effective_primary_history_weights(
+        expected,
+        minimum_history_weight=1.0,
+        target_sampled_primaries=None,
+    )
+
+    np.testing.assert_allclose(dynamic, np.array([1.0, 1.0, 2.0, 10.0]))
+    np.testing.assert_allclose(fixed, 1.0)
+
+
+def test_candidate_history_weights_include_other_isotope_posterior_mean() -> None:
+    """Budget demand should combine each state with other-isotope mean demand."""
+    states_cs = [
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([5.0e6]), 0.0),
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([10.0e6]), 0.0),
+    ]
+    states_co = [
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([4.0e6]), 0.0),
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([8.0e6]), 0.0),
+    ]
+    estimator = SimpleNamespace(detector_radius_m=0.0)
+    config = DSSPPConfig(
+        live_time_s=1.0,
+        primary_history_weight=1.0,
+        target_sampled_primaries=1.5e6,
+    )
+
+    values = dss_pp._candidate_primary_history_weights_by_isotope(
+        estimator,
+        np.array([[0.0, 0.0, 0.0]], dtype=float),
+        {
+            "Cs-137": (states_cs, np.array([0.5, 0.5])),
+            "Co-60": (states_co, np.array([0.25, 0.75])),
+        },
+        config=config,
+    )
+
+    # Co mean demand is 7e6; Cs mean demand is 7.5e6.
+    np.testing.assert_allclose(values["Cs-137"], [[8.0, 17.0 / 1.5]])
+    np.testing.assert_allclose(values["Co-60"], [[11.5 / 1.5, 15.5 / 1.5]])
+
+
+def test_primary_history_budget_diagnostics_report_selected_pose_range() -> None:
+    """Selected-pose diagnostics should expose dynamic weight ranges."""
+    states = [
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([1.0e6]), 0.0),
+        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([6.0e6]), 0.0),
+    ]
+
+    class _Estimator:
+        """Provide deterministic planning particles for budget diagnostics."""
+
+        detector_radius_m = 0.0
+
+        def planning_particles(self, **_kwargs):
+            """Return the fixed two-particle posterior subset."""
+            return {"Cs-137": (states, np.array([0.5, 0.5]))}
+
+    diagnostics = dss_pp._primary_history_weight_diagnostics_at_pose(
+        _Estimator(),
+        np.array([0.0, 0.0, 0.0]),
+        config=DSSPPConfig(
+            live_time_s=1.0,
+            primary_history_weight=1.0,
+            target_sampled_primaries=1.5e6,
+        ),
+    )
+
+    assert diagnostics["mode"] == "candidate_particle_budget"
+    assert diagnostics["minimum"] == pytest.approx(1.0)
+    assert diagnostics["median"] == pytest.approx(2.5)
+    assert diagnostics["maximum"] == pytest.approx(4.0)
+    assert diagnostics["target_sampled_primaries"] == pytest.approx(1.5e6)
+    assert diagnostics["by_isotope"]["Cs-137"]["maximum"] == pytest.approx(4.0)
+    with pytest.raises(ValueError, match="target_sampled_primaries"):
+        DSSPPConfig(target_sampled_primaries=0.0)
+
+
+def test_array_history_weight_matches_scalar_and_changes_each_particle() -> None:
+    """Vector history weights should preserve scalar semantics elementwise."""
+    mean = np.array([[2.0, 18.0], [4.0, 9.0]], dtype=float)
+    history_weight = np.array([[5.0, 10.0], [20.0, 40.0]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    batched = dss_pp._future_predictive_count_variance(
+        mean,
+        spec=spec,
+        primary_history_weight=history_weight,
+    )
+    scalar = np.empty_like(mean)
+    for index in np.ndindex(mean.shape):
+        scalar[index] = dss_pp._future_predictive_count_variance(
+            np.asarray(mean[index]),
+            spec=spec,
+            primary_history_weight=float(history_weight[index]),
+        )
+    np.testing.assert_allclose(batched, scalar)
+    np.testing.assert_allclose(batched, mean * history_weight)
+
+
+def test_weighted_signature_separation_scalar_batch_equivalence() -> None:
+    """Batched weighted signature separation should match its scalar oracle."""
+    raw = np.array([[[2.0, 18.0], [3.0, 17.0]]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    batched = dss_pp._batched_signature_separation_scores(
+        raw,
+        variance_floor=1.0,
+        likelihood_spec=spec,
+        primary_history_weight=50.0,
+    )
+    scalar = dss_pp._signature_separation_score(
+        [raw[0, :, 0], raw[0, :, 1]],
+        variance_floor=1.0,
+        likelihood_spec=spec,
+        primary_history_weight=50.0,
+    )
+    unit_weight = dss_pp._batched_signature_separation_scores(
+        raw,
+        variance_floor=1.0,
+        likelihood_spec=spec,
+        primary_history_weight=1.0,
+    )
+
+    assert batched[0] == pytest.approx(scalar)
+    assert batched[0] == pytest.approx(unit_weight[0] / 50.0)
+
+
+def test_signature_preselection_ranking_uses_dynamic_weight_and_background() -> None:
+    """Cheap signature ranking should see pose weights and Poisson background."""
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    estimator = SimpleNamespace(
+        isotopes=["Cs-137"],
+        pf_config=SimpleNamespace(
+            alpha_weights={"Cs-137": 1.0},
+            position_max=(10.0, 10.0, 10.0),
+        ),
+        filters={
+            "Cs-137": SimpleNamespace(count_likelihood_spec=lambda: spec),
+        },
+    )
+    pair_cache = {
+        "Cs-137": (np.array([[10.0, 20.0]], dtype=float), [0.5, 0.5]),
+    }
+    statistics = dss_pp._SignatureFutureStatisticsBatch(
+        primary_history_weights_by_isotope={
+            "Cs-137": np.array([[1.0, 1.0], [10.0, 10.0], [1.0, 1.0]]),
+        },
+        background_counts_by_isotope={
+            "Cs-137": np.array([0.0, 0.0, 100.0]),
+        },
+    )
+    program = dss_pp.ShieldProgram("probe", (0,), "probe")
+    config = DSSPPConfig(count_variance_floor=1.0)
+
+    scores = np.asarray(
+        [
+            dss_pp._score_programs_from_pair_cache(
+                estimator=estimator,
+                pair_cache=pair_cache,
+                programs=[program],
+                config=config,
+                future_statistics=statistics,
+                pose_index=pose_index,
+            )[0][0]
+            for pose_index in range(3)
+        ],
+        dtype=float,
+    )
+
+    assert scores[0] == pytest.approx(100.0 / 30.0)
+    assert scores[1] == pytest.approx(100.0 / 300.0)
+    assert scores[2] == pytest.approx(100.0 / 230.0)
+    assert int(np.argmax(scores)) == 0
+
+
+def test_signature_future_statistics_batch_matches_budget_and_background() -> None:
+    """Signature statistics should batch candidate demand and mean background."""
+    states = [
+        IsotopeState(
+            1,
+            np.array([[1.0, 0.0, 0.0]]),
+            np.array([3.0e6]),
+            2.0,
+        ),
+        IsotopeState(
+            1,
+            np.array([[1.0, 0.0, 0.0]]),
+            np.array([9.0e6]),
+            4.0,
+        ),
+    ]
+    modes = {
+        "Cs-137": [
+            SignatureMode(
+                "Cs-137",
+                np.array([1.0, 0.0, 0.0]),
+                3.0e6,
+                0.5,
+                0.0,
+            ),
+            SignatureMode(
+                "Cs-137",
+                np.array([1.0, 0.0, 0.0]),
+                9.0e6,
+                0.5,
+                0.0,
+            ),
+        ]
+    }
+    estimator = SimpleNamespace(isotopes=["Cs-137"], detector_radius_m=0.0)
+
+    statistics = dss_pp._signature_future_statistics_for_poses(
+        estimator,
+        np.array([[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+        modes,
+        {"Cs-137": (states, np.array([0.5, 0.5]))},
+        config=DSSPPConfig(
+            live_time_s=2.0,
+            primary_history_weight=1.0,
+            target_sampled_primaries=1.5e6,
+        ),
+    )
+
+    np.testing.assert_allclose(
+        statistics.primary_history_weights_by_isotope["Cs-137"],
+        np.array([[4.0, 12.0], [1.0, 3.0]]),
+    )
+    np.testing.assert_allclose(
+        statistics.background_counts_by_isotope["Cs-137"],
+        np.array([6.0, 6.0]),
+    )
+
+
+def test_signature_preselection_fixed_statistics_preserve_legacy_score() -> None:
+    """Explicit fixed statistics should equal the fixed-mode fallback exactly."""
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    estimator = SimpleNamespace(
+        isotopes=["Cs-137"],
+        pf_config=SimpleNamespace(alpha_weights=None, position_max=(1.0, 1.0, 1.0)),
+        filters={
+            "Cs-137": SimpleNamespace(count_likelihood_spec=lambda: spec),
+        },
+    )
+    pair_cache = {
+        "Cs-137": (
+            np.array([[2.0, 18.0], [3.0, 17.0]], dtype=float),
+            [0.5, 0.5],
+        ),
+    }
+    programs = [dss_pp.ShieldProgram("probe", (0, 1), "probe")]
+    config = DSSPPConfig(primary_history_weight=5.0, count_variance_floor=1.0)
+    explicit = dss_pp._SignatureFutureStatisticsBatch(
+        primary_history_weights_by_isotope={
+            "Cs-137": np.full((1, 2), 5.0, dtype=float),
+        },
+        background_counts_by_isotope={"Cs-137": np.zeros(1, dtype=float)},
+    )
+
+    fallback_rows = dss_pp._score_programs_from_pair_cache(
+        estimator=estimator,
+        pair_cache=pair_cache,
+        programs=programs,
+        config=config,
+    )
+    explicit_rows = dss_pp._score_programs_from_pair_cache(
+        estimator=estimator,
+        pair_cache=pair_cache,
+        programs=programs,
+        config=config,
+        future_statistics=explicit,
+        pose_index=0,
+    )
+
+    for fallback, resolved in zip(fallback_rows, explicit_rows):
+        np.testing.assert_allclose(resolved, fallback, rtol=0.0, atol=0.0)
+
+
+def test_weighted_joint_program_eig_uses_candidate_sumw2() -> None:
+    """DSS EIG should use weighted sum-w2 for draws and candidate likelihoods."""
+    lambdas = np.array([[[2.0, 18.0], [2.0, 18.0]]], dtype=float)
+    weights = np.array([0.5, 0.5], dtype=float)
+    mask = np.ones((1, 2), dtype=bool)
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    unit_weight = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        weights,
+        mask,
+        spec=spec,
+        num_samples=4096,
+        rng=np.random.default_rng(71),
+        primary_history_weight=1.0,
+    )
+    weighted = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        weights,
+        mask,
+        spec=spec,
+        num_samples=4096,
+        rng=np.random.default_rng(71),
+        primary_history_weight=50.0,
+    )
+
+    assert weighted[0] < unit_weight[0]
+
+
+def test_joint_program_eig_array_weight_matches_fixed_scalar() -> None:
+    """A constant particle-weight vector should exactly preserve fixed EIG."""
+    lambdas = np.array([[[2.0, 18.0], [2.0, 18.0]]], dtype=float)
+    particle_weights = np.array([0.5, 0.5], dtype=float)
+    mask = np.ones((1, 2), dtype=bool)
+    spec = CountLikelihoodSpec(
+        model="student_t",
+        observation_count_variance_semantics="complete_statistical",
+        student_t_df=5.0,
+    )
+    scalar = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        particle_weights,
+        mask,
+        spec=spec,
+        num_samples=1024,
+        rng=np.random.default_rng(172),
+        primary_history_weight=5.0,
+    )
+    vector = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        particle_weights,
+        mask,
+        spec=spec,
+        num_samples=1024,
+        rng=np.random.default_rng(172),
+        primary_history_weight=np.array([5.0, 5.0]),
+    )
+    np.testing.assert_allclose(vector, scalar, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("model", ["gaussian", "student_t"])
+@pytest.mark.parametrize(
+    "semantics",
+    ["additional", "counting_noise_inclusive", "complete_statistical"],
+)
+def test_joint_program_eig_does_not_infer_candidate_from_supplied_covariance(
+    model: str,
+    semantics: str,
+) -> None:
+    """Equal candidate means must not separate through transport covariance."""
+    lambdas = np.array([[[10.0, 10.0], [10.0, 10.0]]], dtype=float)
+    particle_weights = np.array([0.25, 0.75], dtype=float)
+    mask = np.ones((1, 2), dtype=bool)
+    spec = CountLikelihoodSpec(
+        model=model,
+        observation_count_variance_semantics=semantics,
+        student_t_df=5.0,
+    )
+
+    information_gain = dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        particle_weights,
+        mask,
+        spec=spec,
+        num_samples=2048,
+        rng=np.random.default_rng(844),
+        primary_history_weight=np.array([2.0, 20.0]),
+        background_counts_n=np.array([2.0, 8.0]),
+    )
+
+    np.testing.assert_allclose(information_gain, 0.0, atol=1.0e-12, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("semantics", "expected_low", "expected_high"),
+    [
+        ("additional", 9.0, 64.0),
+        ("counting_noise_inclusive", 19.0, 84.0),
+        ("complete_statistical", 19.0, 84.0),
+    ],
+)
+def test_joint_program_eig_broadcasts_truth_transport_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+    semantics: str,
+    expected_low: float,
+    expected_high: float,
+) -> None:
+    """Truth weights should drive draws while supplied covariance stays fixed."""
+    lambdas = np.array([[[10.0, 20.0]]], dtype=float)
+    spec = CountLikelihoodSpec(
+        model="gaussian",
+        observation_count_variance_semantics=semantics,
+    )
+    captured_truth: list[np.ndarray] = []
+    captured_predictive: list[np.ndarray] = []
+    captured_supplied: list[np.ndarray] = []
+    original_terms = dss_pp.count_log_likelihood_terms_np
+
+    def _capture_draws(
+        truth_lambdas_pvs: np.ndarray,
+        predictive_variance_pvs: np.ndarray,
+        *,
+        spec: CountLikelihoodSpec,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        """Capture generative variances and return deterministic mean draws."""
+        del spec, rng
+        captured_truth.append(np.asarray(truth_lambdas_pvs, dtype=float).copy())
+        captured_predictive.append(
+            np.asarray(predictive_variance_pvs, dtype=float).copy()
+        )
+        return np.asarray(truth_lambdas_pvs, dtype=float).copy()
+
+    def _capture_terms(
+        z_k: np.ndarray,
+        lambda_k: np.ndarray,
+        *,
+        spec: CountLikelihoodSpec,
+        observation_count_variance: float | np.ndarray = 0.0,
+        epsilon: float = 1.0e-12,
+    ) -> np.ndarray:
+        """Capture the covariance tensor supplied to all candidate particles."""
+        captured_supplied.append(
+            np.asarray(observation_count_variance, dtype=float).copy()
+        )
+        return original_terms(
+            z_k,
+            lambda_k,
+            spec=spec,
+            observation_count_variance=observation_count_variance,
+            epsilon=epsilon,
+        )
+
+    monkeypatch.setattr(dss_pp, "_draw_program_future_counts", _capture_draws)
+    monkeypatch.setattr(dss_pp, "count_log_likelihood_terms_np", _capture_terms)
+
+    dss_pp._program_information_gain_from_lambdas(
+        lambdas,
+        np.array([0.5, 0.5]),
+        np.ones((1, 1), dtype=bool),
+        spec=spec,
+        num_samples=256,
+        rng=np.random.default_rng(923),
+        primary_history_weight=np.array([2.0, 5.0]),
+        background_counts_n=np.array([1.0, 4.0]),
+    )
+
+    truth = captured_truth[0]
+    predictive = captured_predictive[0]
+    supplied = captured_supplied[0]
+    expected_predictive = np.where(truth == 10.0, 19.0, 84.0)
+    expected_supplied = np.where(truth == 10.0, expected_low, expected_high)
+    np.testing.assert_allclose(predictive, expected_predictive)
+    assert supplied.shape == truth.shape + (2,)
+    np.testing.assert_allclose(supplied[..., 0], expected_supplied)
+    np.testing.assert_allclose(supplied[..., 1], expected_supplied)
+
+
 def test_height_optimized_twin_does_not_scale_first_action_penalty() -> None:
     """A non-executable height twin must not affect first-action normalization."""
 
@@ -4755,9 +5400,7 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
     assert len(calls) == 1
     assert calls[0].shape == (2, 3)
     assert result.diagnostics["planning_eig_joint_program_views"] is True
-    assert result.diagnostics["planning_eig_likelihood_models"] == {
-        "Cs-137": "poisson"
-    }
+    assert result.diagnostics["planning_eig_likelihood_models"] == {"Cs-137": "poisson"}
     assert result.diagnostics[
         "planning_eig_observation_variance_includes_counting_noise"
     ] == {"Cs-137": True}

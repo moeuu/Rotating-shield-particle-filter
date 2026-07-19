@@ -13,7 +13,11 @@ from typing import Any
 
 import numpy as np
 
-from sim.geant4_app.io_format import read_response_file, write_request_file, write_scene_file
+from sim.geant4_app.io_format import (
+    read_response_file,
+    write_request_file,
+    write_scene_file,
+)
 from sim.geant4_app.scene_export import ExportedGeant4Scene
 from sim.radiation_visualization import (
     RadiationVisualizationConfig,
@@ -71,7 +75,10 @@ class Geant4EngineConfig:
     detector_scoring_mode: str = "full_transport"
     secondary_transport_mode: str = "full_transport"
     primary_sampling_fraction: float = 1.0
-    radiation_visualization: RadiationVisualizationConfig = field(default_factory=RadiationVisualizationConfig)
+    target_sampled_primaries: int | None = None
+    radiation_visualization: RadiationVisualizationConfig = field(
+        default_factory=RadiationVisualizationConfig
+    )
 
 
 class Geant4Engine(ABC):
@@ -96,7 +103,9 @@ class ExternalCommandGeant4Engine(Geant4Engine):
     def __init__(self, config: Geant4EngineConfig) -> None:
         """Store external-engine launch configuration."""
         if config.executable_path in (None, ""):
-            raise ValueError("executable_path is required for the external Geant4 engine.")
+            raise ValueError(
+                "executable_path is required for the external Geant4 engine."
+            )
         self.config = config
         self.scene: ExportedGeant4Scene | None = None
         self._last_cache_hit = False
@@ -142,7 +151,9 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         )
         return spectrum, metadata
 
-    def _simulate_one_shot(self, request: Geant4StepRequest) -> tuple[np.ndarray, dict[str, Any]]:
+    def _simulate_one_shot(
+        self, request: Geant4StepRequest
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Run one request by launching a fresh native executable process."""
         if self.scene is None:
             raise RuntimeError("Geant4 scene was not loaded before simulate().")
@@ -185,7 +196,9 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             spectrum, metadata = read_response_file(response_path)
         return spectrum, metadata
 
-    def _simulate_persistent(self, request: Geant4StepRequest) -> tuple[np.ndarray, dict[str, Any]]:
+    def _simulate_persistent(
+        self, request: Geant4StepRequest
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         """Run one request through a persistent native executable process."""
         if self.scene is None:
             raise RuntimeError("Geant4 scene was not loaded before simulate().")
@@ -199,7 +212,8 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             except RuntimeError as exc:
                 if (
                     attempt > 0
-                    or "Persistent Geant4 executable exited unexpectedly" not in str(exc)
+                    or "Persistent Geant4 executable exited unexpectedly"
+                    not in str(exc)
                 ):
                     raise
                 restart_count += 1
@@ -235,11 +249,16 @@ class ExternalCommandGeant4Engine(Geant4Engine):
 
     def _ensure_persistent_process(self) -> subprocess.Popen[str]:
         """Start the persistent native process if it is not already running."""
-        if self._persistent_process is not None and self._persistent_process.poll() is None:
+        if (
+            self._persistent_process is not None
+            and self._persistent_process.poll() is None
+        ):
             return self._persistent_process
         if self._persistent_process is not None:
             self._persistent_process = None
-        self._persistent_tmpdir = tempfile.TemporaryDirectory(prefix="geant4_persistent_")
+        self._persistent_tmpdir = tempfile.TemporaryDirectory(
+            prefix="geant4_persistent_"
+        )
         command = [
             str(self.config.executable_path),
             "--persistent",
@@ -265,7 +284,9 @@ class ExternalCommandGeant4Engine(Geant4Engine):
     def _persistent_tmp_path(self) -> Path:
         """Return the persistent process temporary directory path."""
         if self._persistent_tmpdir is None:
-            raise RuntimeError("Persistent Geant4 temporary directory is not initialized.")
+            raise RuntimeError(
+                "Persistent Geant4 temporary directory is not initialized."
+            )
         return Path(self._persistent_tmpdir.name)
 
     def _ensure_persistent_scene_file(self, tmp_path: Path) -> Path:
@@ -319,7 +340,9 @@ class ExternalCommandGeant4Engine(Geant4Engine):
                             )
                         return
                     if stripped.startswith("SIMBRIDGE_ERR"):
-                        raise RuntimeError(f"Persistent Geant4 executable failed: {stripped}")
+                        raise RuntimeError(
+                            f"Persistent Geant4 executable failed: {stripped}"
+                        )
         finally:
             selector.close()
         tail = "\n".join(output_lines[-20:])
@@ -361,7 +384,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
 
     def _source_bias_args(self) -> list[str]:
         """Return native executable arguments for the configured source bias mode."""
-        return [
+        arguments = [
             "--source-rate-model",
             str(self.config.source_rate_model),
             "--source-bias-mode",
@@ -377,9 +400,19 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             "--primary-sampling-fraction",
             str(float(self.config.primary_sampling_fraction)),
         ]
+        if self.config.target_sampled_primaries is not None:
+            arguments.extend(
+                [
+                    "--target-sampled-primaries",
+                    str(int(self.config.target_sampled_primaries)),
+                ]
+            )
+        return arguments
 
 
-def build_geant4_engine(config: Geant4EngineConfig, *, engine_mode: str) -> Geant4Engine:
+def build_geant4_engine(
+    config: Geant4EngineConfig, *, engine_mode: str
+) -> Geant4Engine:
     """Instantiate the requested Geant4 engine implementation."""
     normalized = engine_mode.strip().lower()
     if normalized == "external":

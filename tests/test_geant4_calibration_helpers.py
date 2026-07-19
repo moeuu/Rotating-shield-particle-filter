@@ -31,7 +31,9 @@ def _load_validation_script() -> object:
     """Load the spectrum validation script as a module for helper tests."""
     root = Path(__file__).resolve().parents[1]
     script_path = root / "scripts" / "validate_geant4_spectrum_decomposition.py"
-    spec = spec_from_file_location("validate_geant4_spectrum_decomposition", script_path)
+    spec = spec_from_file_location(
+        "validate_geant4_spectrum_decomposition", script_path
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load script: {script_path}")
     module = module_from_spec(spec)
@@ -94,6 +96,40 @@ def test_validation_metadata_keeps_native_fidelity_provenance() -> None:
         "source_bias_mode": "detector_cone",
         "source_rate_model": "detector_cps_1m",
         "theory_tvl_attenuation": False,
+    }
+
+
+def test_validation_metadata_keeps_weighted_covariance_provenance() -> None:
+    """Weighted validation artifacts must retain every acceptance field."""
+    metadata = {
+        "accelerated_weighted_transport_enable": True,
+        "primary_sampling_budget_enabled": True,
+        "primary_sampling_fraction_resolution": "target_budget_limited",
+        "requested_primary_sampling_fraction": 1.0,
+        "target_sampled_primaries": 1_500_000,
+        "expected_unthinned_primaries": 10_000.0,
+        "history_thinning_enabled": True,
+        "transport_history_mode": "weighted_thinning",
+        "transport_tally_weighted": True,
+        "spectrum_variance_semantics": ("compound_poisson_sumw2_includes_counting"),
+        "spectrum_variance_dead_time_propagation": "fixed_observed_scale",
+        "dead_time_tau_s": 5.813e-9,
+        "dead_time_observed_scale": 0.99,
+        "pre_dead_time_total_spectrum_counts": 100.0,
+        "pre_dead_time_weighted_spectrum_sumw2": 5_000.0,
+        "dwell_time_s": 30.0,
+        "effective_entries_per_sec": 4.0,
+        "primaries_per_sec": 5.0,
+        "seed": 123,
+        "unrelated_internal_field": "omit",
+    }
+
+    retained = VALIDATION_SCRIPT.validation_observation_metadata(metadata)
+
+    assert retained == {
+        key: value
+        for key, value in metadata.items()
+        if key != "unrelated_internal_field"
     }
 
 
@@ -174,13 +210,11 @@ def test_validation_uses_runtime_covariance_projection_helper() -> None:
         "Co-60": {"Cs-137": -12.0, "Co-60": 16.0},
     }
 
-    projected, sanitized = (
-        VALIDATION_SCRIPT.project_runtime_observation_covariance(
-            projector,
-            counts,
-            variances,
-            covariance,
-        )
+    projected, sanitized = VALIDATION_SCRIPT.project_runtime_observation_covariance(
+        projector,
+        counts,
+        variances,
+        covariance,
     )
 
     assert projected == pytest.approx({"Cs-137": 37.0, "Co-60": 28.0})
@@ -245,9 +279,9 @@ def test_validation_covariance_summary_reports_stages_and_coverage() -> None:
         "projected_above_ceilinged_formal": 1,
         "projected_above_runtime": 1,
     }
-    projected_coverage = summary[
-        "normalized_residual_coverage_vs_transport_truth"
-    ]["projected"]
+    projected_coverage = summary["normalized_residual_coverage_vs_transport_truth"][
+        "projected"
+    ]
     assert projected_coverage["num_points"] == 1
     assert projected_coverage["coverage_within_2sigma"] == pytest.approx(1.0)
     projected_mahalanobis = summary["mahalanobis_vs_transport_truth"][
@@ -362,9 +396,7 @@ def test_exact_detector_gate_rejects_higher_ranked_proxy_candidate(
         **_kwargs: object,
     ) -> dict[str, float]:
         """Return an exact minimum determined by the candidate x coordinate."""
-        return {
-            "min_isotope_target": 5000.0 if detector_xyz[0] == 1.0 else 12000.0
-        }
+        return {"min_isotope_target": 5000.0 if detector_xyz[0] == 1.0 else 12000.0}
 
     monkeypatch.setattr(
         VALIDATION_SCRIPT,
@@ -495,9 +527,12 @@ def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
     assert runtime_target["likelihood_scale_squared_by_isotope"]["Cs-137"] == (
         pytest.approx(expected_cs_scale)
     )
-    assert diagnostic["likelihood_spec_by_isotope"]["Cs-137"][
-        "observation_count_variance_includes_counting_noise"
-    ] is True
+    assert (
+        diagnostic["likelihood_spec_by_isotope"]["Cs-137"][
+            "observation_count_variance_includes_counting_noise"
+        ]
+        is True
+    )
     assert "not its marginal variance" in diagnostic["scale_semantics"]
 
     summary = VALIDATION_SCRIPT.summarize_pf_count_likelihood_diagnostics(
@@ -520,7 +555,9 @@ def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
     ] == pytest.approx(expected_distance / 3.0)
 
 
-def test_validation_calibration_defaults_match_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_validation_calibration_defaults_match_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Calibration helper defaults should match validation CLI defaults."""
     monkeypatch.setattr(sys, "argv", ["validate_geant4_spectrum_decomposition.py"])
 

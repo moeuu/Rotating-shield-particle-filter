@@ -27,11 +27,14 @@ from measurement.surface_patches import SurfacePatchDictionary
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.likelihood import (
     CountLikelihoodSpec,
+    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
+    OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
     count_log_likelihood_terms_np,
     count_log_likelihood_terms_torch,
     expected_counts_per_source,
     predictive_count_likelihood_variance,
     predictive_count_likelihood_variance_torch,
+    normalize_observation_count_variance_semantics,
 )
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
@@ -348,6 +351,8 @@ class RotatingShieldPFConfig:
         - spectrum_count_abs_sigma: additive spectrum-decomposition count uncertainty
         - observation_count_variance_includes_counting_noise: whether propagated
           extraction variance already contains its source-equivalent Poisson term
+        - observation_count_variance_semantics: explicit covariance meaning;
+          complete_statistical prevents adding a second Poisson term
         - low_count_abs_sigma: extra low-count uncertainty floor in counts
         - low_count_transition_counts: count scale where the low-count floor decays
         - count_likelihood_df: Student-t degrees of freedom for robust count likelihood
@@ -393,6 +398,7 @@ class RotatingShieldPFConfig:
     low_count_abs_sigma: float | Dict[str, float] = 0.0
     low_count_transition_counts: float | Dict[str, float] = 0.0
     observation_count_variance_includes_counting_noise: bool = False
+    observation_count_variance_semantics: str = ""
     count_likelihood_df: float = 5.0
     shield_contrast_likelihood_enable: bool = False
     shield_contrast_likelihood_weight: float = 1.0
@@ -408,6 +414,7 @@ class RotatingShieldPFConfig:
     shield_view_ratio_likelihood_min_views: int = 2
     station_view_covariance_enable: bool = False
     station_view_correlated_spectrum_fraction: float = 0.0
+    direct_spectrum_likelihood_enable: bool = True
     spectrum_likelihood_bin_chunk: int = 512
     min_strength: float = 0.01
     p_birth: float = 0.05
@@ -838,9 +845,7 @@ class RotatingShieldPFConfig:
             )
         self.init_strength_min = max(float(self.init_strength_min), 0.0)
         self.init_strength_max = (
-            None
-            if self.init_strength_max is None
-            else float(self.init_strength_max)
+            None if self.init_strength_max is None else float(self.init_strength_max)
         )
         if (
             self.init_strength_max is not None
@@ -921,13 +926,43 @@ class RotatingShieldPFConfig:
                 "count_likelihood_model must be poisson, gaussian, or student_t."
             )
         self.count_likelihood_model = normalized_likelihood
-        self.observation_count_variance_includes_counting_noise = bool(
-            self.observation_count_variance_includes_counting_noise
+        self.observation_count_variance_semantics = (
+            normalize_observation_count_variance_semantics(
+                self.observation_count_variance_semantics,
+                includes_counting_noise=(
+                    self.observation_count_variance_includes_counting_noise
+                ),
+            )
         )
+        self.observation_count_variance_includes_counting_noise = (
+            self.observation_count_variance_semantics
+            != OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+        )
+        if (
+            self.observation_count_variance_semantics
+            == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
+            and self.count_likelihood_model == "poisson"
+        ):
+            raise ValueError(
+                "complete_statistical observation variance requires gaussian "
+                "or student_t count likelihood."
+            )
         self.count_likelihood_df = max(float(self.count_likelihood_df), 1.0)
+        self.shield_contrast_likelihood_enable = bool(
+            self.shield_contrast_likelihood_enable
+        )
         self.shield_view_ratio_likelihood_enable = bool(
             self.shield_view_ratio_likelihood_enable
         )
+        if (
+            self.observation_count_variance_semantics
+            == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
+        ):
+            # These auxiliary terms reuse the same shield-view counts without
+            # the supplied cross-view covariance. Applying them would count the
+            # observation twice under complete statistical semantics.
+            self.shield_contrast_likelihood_enable = False
+            self.shield_view_ratio_likelihood_enable = False
         self.shield_view_ratio_likelihood_weight = max(
             0.0,
             float(self.shield_view_ratio_likelihood_weight),
@@ -948,6 +983,9 @@ class RotatingShieldPFConfig:
         self.station_view_correlated_spectrum_fraction = max(
             0.0,
             float(self.station_view_correlated_spectrum_fraction),
+        )
+        self.direct_spectrum_likelihood_enable = bool(
+            self.direct_spectrum_likelihood_enable
         )
         self.spectrum_likelihood_bin_chunk = max(
             1,
@@ -3060,6 +3098,9 @@ class RotatingShieldPFEstimator:
             observation_count_variance_includes_counting_noise=(
                 self.pf_config.observation_count_variance_includes_counting_noise
             ),
+            observation_count_variance_semantics=(
+                self.pf_config.observation_count_variance_semantics
+            ),
             count_likelihood_df=self.pf_config.count_likelihood_df,
             shield_contrast_likelihood_enable=(
                 self.pf_config.shield_contrast_likelihood_enable
@@ -3098,6 +3139,9 @@ class RotatingShieldPFEstimator:
             ),
             station_view_correlated_spectrum_fraction=(
                 self.pf_config.station_view_correlated_spectrum_fraction
+            ),
+            direct_spectrum_likelihood_enable=(
+                self.pf_config.direct_spectrum_likelihood_enable
             ),
             spectrum_likelihood_bin_chunk=(
                 self.pf_config.spectrum_likelihood_bin_chunk
@@ -3468,9 +3512,7 @@ class RotatingShieldPFEstimator:
             init_grid_repeats=self.pf_config.init_grid_repeats,
             init_joint_position_design=self.pf_config.init_joint_position_design,
             init_joint_position_retries=self.pf_config.init_joint_position_retries,
-            init_source_min_separation_m=(
-                self.pf_config.init_source_min_separation_m
-            ),
+            init_source_min_separation_m=(self.pf_config.init_source_min_separation_m),
             roughening_k=self.pf_config.roughening_k,
             surface_rejuvenation_enable=self.pf_config.surface_rejuvenation_enable,
             min_sigma_pos=self.pf_config.min_sigma_pos,
@@ -4593,7 +4635,9 @@ class RotatingShieldPFEstimator:
         if state_count == 0:
             return np.zeros((detectors.shape[0], num_pairs, 0), dtype=float)
 
-        max_sources = max((max(0, int(state.num_sources)) for state in states), default=0)
+        max_sources = max(
+            (max(0, int(state.num_sources)) for state in states), default=0
+        )
         backgrounds = np.asarray(
             [max(float(state.background), 0.0) for state in states],
             dtype=float,
@@ -4617,10 +4661,12 @@ class RotatingShieldPFEstimator:
                     np.asarray(state.strengths[:source_count], dtype=float),
                     0.0,
                 )
-            kernel_values = self._continuous_kernel().kernel_values_all_pairs_for_detectors(
-                isotope=isotope,
-                detector_positions=detectors,
-                sources=positions.reshape(-1, 3),
+            kernel_values = (
+                self._continuous_kernel().kernel_values_all_pairs_for_detectors(
+                    isotope=isotope,
+                    detector_positions=detectors,
+                    sources=positions.reshape(-1, 3),
+                )
             )
             expected_shape = (
                 detectors.shape[0],
@@ -4652,9 +4698,8 @@ class RotatingShieldPFEstimator:
             fe_indices,
             pb_indices,
         )
-        rates = (
-            backgrounds[None, None, :]
-            + source_scales[None, :, None] * np.maximum(source_rates, 0.0)
+        rates = backgrounds[None, None, :] + source_scales[None, :, None] * np.maximum(
+            source_rates, 0.0
         )
         return np.maximum(float(live_time_s) * rates, 0.0)
 
@@ -7667,7 +7712,9 @@ class RotatingShieldPFEstimator:
         required = tuple(dict.fromkeys(str(isotope) for isotope in required_isotopes))
         configured = set(self.configured_isotope_order())
 
-        def _clean_template(values: object, count_bins: int) -> tuple[float, ...] | None:
+        def _clean_template(
+            values: object, count_bins: int
+        ) -> tuple[float, ...] | None:
             """Return one finite non-negative response with exact binning."""
             try:
                 array = np.asarray(values, dtype=float).reshape(-1)
@@ -7695,8 +7742,7 @@ class RotatingShieldPFEstimator:
         selected_records: list[MeasurementRecord] = []
         resolved_templates: list[dict[str, tuple[float, ...]]] = []
         template_source_counts = {
-            isotope: {"record": 0, "configured_registry": 0}
-            for isotope in required
+            isotope: {"record": 0, "configured_registry": 0} for isotope in required
         }
         background_source_counts: dict[str, int] = {}
         rejected_fitted_background_count = 0
@@ -7707,9 +7753,10 @@ class RotatingShieldPFEstimator:
             count_bins = len(record.spectrum_counts)
             if bin_count is not None and count_bins != bin_count:
                 continue
-            if record.spectrum_background is not None and len(
-                record.spectrum_background
-            ) != count_bins:
+            if (
+                record.spectrum_background is not None
+                and len(record.spectrum_background) != count_bins
+            ):
                 continue
             direct = record.spectrum_response_templates_by_isotope or {}
             resolved: dict[str, tuple[float, ...]] = {}
@@ -7827,7 +7874,10 @@ class RotatingShieldPFEstimator:
         column_metadata: list[Dict[str, Any]] = []
         background = np.asarray(history.get("background_spectrum"), dtype=float)
         pose_indices = np.asarray(
-            [int(getattr(record, "pose_idx", index)) for index, record in enumerate(records)],
+            [
+                int(getattr(record, "pose_idx", index))
+                for index, record in enumerate(records)
+            ],
             dtype=np.int64,
         )
         if pose_indices.size != counts.shape[0]:
@@ -7849,8 +7899,7 @@ class RotatingShieldPFEstimator:
             clean_background = np.zeros_like(counts, dtype=float)
         configured_rows = np.sum(clean_background, axis=1) > 0.0
         configured_basis = (
-            clean_background[:, :, None]
-            * visit_indicator[:, None, :]
+            clean_background[:, :, None] * visit_indicator[:, None, :]
         ).reshape(counts.size, visit_count)
         matrix_blocks.append(configured_basis)
         column_metadata.extend(
@@ -7887,13 +7936,10 @@ class RotatingShieldPFEstimator:
                 dtype=float,
             )
         unknown_row_basis = (
-            live_times[:, None]
-            * bin_weights[None, :]
-            * (~configured_rows)[:, None]
+            live_times[:, None] * bin_weights[None, :] * (~configured_rows)[:, None]
         )
         unknown_basis = (
-            unknown_row_basis[:, :, None]
-            * visit_indicator[:, None, :]
+            unknown_row_basis[:, :, None] * visit_indicator[:, None, :]
         ).reshape(counts.size, visit_count)
         matrix_blocks.append(unknown_basis)
         column_metadata.extend(
@@ -12962,7 +13008,9 @@ class RotatingShieldPFEstimator:
 
         counts = np.asarray(history.get("spectrum_counts"), dtype=float)
         if counts.ndim != 2 or counts.shape[1] < 1:
-            raise ValueError("surface-map spectrum history must be measurements x bins.")
+            raise ValueError(
+                "surface-map spectrum history must be measurements x bins."
+            )
         aggregation = contiguous_poisson_bin_aggregation(
             int(counts.shape[1]),
             int(max_spectrum_bins),
@@ -12997,9 +13045,7 @@ class RotatingShieldPFEstimator:
                 axis=1,
             )
         aggregated["templates_by_isotope"] = aggregated_templates
-        aggregated["spectrum_original_bin_count"] = int(
-            aggregation.original_bin_count
-        )
+        aggregated["spectrum_original_bin_count"] = int(aggregation.original_bin_count)
         aggregated["spectrum_bin_group_widths"] = aggregation.group_widths.copy()
         aggregated["spectrum_bin_group_starts"] = aggregation.group_starts.copy()
         aggregated["spectrum_bin_group_ends"] = aggregation.group_ends.copy()
@@ -13123,9 +13169,7 @@ class RotatingShieldPFEstimator:
                 "spectrum_aggregation": {
                     "method": "contiguous_full_spectrum_poisson_sum",
                     "max_spectrum_bins": int(solver_config.max_spectrum_bins),
-                    "original_bin_count": int(
-                        spectrum_aggregation.original_bin_count
-                    ),
+                    "original_bin_count": int(spectrum_aggregation.original_bin_count),
                     "aggregated_bin_count": int(
                         spectrum_aggregation.aggregated_bin_count
                     ),
@@ -14439,14 +14483,12 @@ class RotatingShieldPFEstimator:
             spec=spec,
             epsilon=epsilon,
         )
-        observations = (
-            RotatingShieldPFEstimator._sample_planning_count_observations_np(
-                selected_lambdas,
-                predictive_variance,
-                spec=spec,
-                rng=rng,
-                epsilon=epsilon,
-            )
+        observations = RotatingShieldPFEstimator._sample_planning_count_observations_np(
+            selected_lambdas,
+            predictive_variance,
+            spec=spec,
+            rng=rng,
+            epsilon=epsilon,
         )
         likelihood_terms = count_log_likelihood_terms_np(
             observations[:, None],
@@ -14678,9 +14720,7 @@ class RotatingShieldPFEstimator:
             eps = 1.0e-12
             alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
             alpha_sum = sum(float(value) for value in alphas.values()) or 1.0
-            alphas = {
-                key: float(value) / alpha_sum for key, value in alphas.items()
-            }
+            alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
             rng = np.random.default_rng()
             scores = np.zeros(num_pairs, dtype=float)
             for iso, filt in self.filters.items():

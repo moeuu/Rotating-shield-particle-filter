@@ -27,7 +27,9 @@ def test_spectral_decomposition_recovers_sources():
         PointSource("Co-60", position=(8.0, 5.0, 2.0), intensity_cps_1m=20000.0),
         PointSource("Eu-154", position=(1.0, 10.0, 1.0), intensity_cps_1m=20000.0),
     ]
-    spectrum, effective = decomposer.simulate_spectrum(sources, environment=env, acquisition_time=2.0, rng=None)
+    spectrum, effective = decomposer.simulate_spectrum(
+        sources, environment=env, acquisition_time=2.0, rng=None
+    )
     estimates = decomposer.decompose(spectrum)
     pipeline.BACKGROUND_COUNTS_PER_SECOND = original_bg
 
@@ -71,7 +73,10 @@ def test_response_poisson_fuses_visible_photopeak_at_boundary(
 
     assert estimates["Cs-137"].counts == pytest.approx(50.0, rel=1e-3)
     assert estimates["Cs-137"].variance > estimates["Cs-137"].counts
-    assert estimates["Cs-137"].method == "response_poisson_photopeak_fused_source_equivalent"
+    assert (
+        estimates["Cs-137"].method
+        == "response_poisson_photopeak_fused_source_equivalent"
+    )
     assert estimates["Co-60"].counts == pytest.approx(0.0)
 
 
@@ -130,6 +135,52 @@ def test_runtime_response_poisson_variance_ceiling_preserves_count() -> None:
     assert diagnostics["runtime_variance_ceiling"]["Cs-137"]["count"] == (
         pytest.approx(1000.0)
     )
+
+
+def test_runtime_count_extractor_forwards_transport_covariance_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime extraction must send variance provenance into response fitting."""
+    decomposer = SpectralDecomposer(SpectrumConfig())
+    extractor = RuntimeCountExtractor(decomposer)
+    captured: dict[str, object] = {}
+
+    def _fake_counts(
+        _spectrum: np.ndarray,
+        **kwargs: object,
+    ) -> tuple[dict[str, float], set[str]]:
+        """Capture the response-regression keyword arguments."""
+        captured.update(kwargs)
+        counts = {"Cs-137": 100.0, "Co-60": 50.0, "Eu-154": 25.0}
+        decomposer.last_count_variances = dict(counts)
+        decomposer.last_count_covariance = {
+            isotope: {other: (value if isotope == other else 0.0) for other in counts}
+            for isotope, value in counts.items()
+        }
+        decomposer.last_count_covariance_semantics = "inverse_fisher_poisson"
+        return counts, set(counts)
+
+    monkeypatch.setattr(decomposer, "isotope_counts_with_detection", _fake_counts)
+    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+    variance = 3.0 * spectrum
+    transport_spectrum = 2.0 * spectrum
+    metadata = {"spectrum_variance_semantics": "test"}
+
+    extractor.extract(
+        spectrum,
+        live_time_s=1.0,
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+        spectrum_variance=variance,
+        transport_metadata=metadata,
+        transport_spectrum=transport_spectrum,
+    )
+
+    assert captured["spectrum_variance"] is variance
+    assert captured["transport_metadata"] is metadata
+    assert captured["transport_spectrum"] is transport_spectrum
 
 
 def test_photopeak_channel_estimates_preserve_line_semantics() -> None:
@@ -223,7 +274,10 @@ def test_response_poisson_keeps_low_snr_photopeak_with_large_uncertainty(
 
     assert estimates["Cs-137"].counts == pytest.approx(10.0)
     assert estimates["Cs-137"].variance >= 400.0
-    assert estimates["Cs-137"].method == "response_poisson_photopeak_fused_source_equivalent"
+    assert (
+        estimates["Cs-137"].method
+        == "response_poisson_photopeak_fused_source_equivalent"
+    )
     assert estimates["Co-60"].counts == pytest.approx(0.0)
 
 
@@ -282,12 +336,12 @@ def test_response_poisson_suppresses_low_support_continuum_crosstalk(
 ) -> None:
     """Weak low-SNR continuum-only components should not become isotope counts."""
     decomposer = SpectralDecomposer(
-            SpectrumConfig(
-                response_poisson_photopeak_fusion=True,
-                response_poisson_low_snr_photopeak_anchor=True,
-                response_poisson_low_snr_suppress_count=True,
-            )
+        SpectrumConfig(
+            response_poisson_photopeak_fusion=True,
+            response_poisson_low_snr_photopeak_anchor=True,
+            response_poisson_low_snr_suppress_count=True,
         )
+    )
     cs_index = decomposer.isotope_names.index("Cs-137")
     eu_index = decomposer.isotope_names.index("Eu-154")
     spectrum = (
@@ -303,8 +357,7 @@ def test_response_poisson_suppresses_low_support_continuum_crosstalk(
     ) -> dict[str, float]:
         """Return no local Eu photopeak evidence despite a continuum coefficient."""
         decomposer.last_count_variances = {
-            name: (100.0 if name == "Cs-137" else 1.0)
-            for name in isotopes
+            name: (100.0 if name == "Cs-137" else 1.0) for name in isotopes
         }
         return {name: (10000.0 if name == "Cs-137" else 0.0) for name in isotopes}
 
@@ -354,8 +407,7 @@ def test_response_poisson_low_snr_guard_runs_without_photopeak_fusion(
     ) -> dict[str, float]:
         """Return no Eu photopeak evidence despite a continuum coefficient."""
         decomposer.last_count_variances = {
-            name: (100.0 if name == "Co-60" else 1.0)
-            for name in isotopes
+            name: (100.0 if name == "Co-60" else 1.0) for name in isotopes
         }
         return {name: (100000.0 if name == "Co-60" else 0.0) for name in isotopes}
 
@@ -408,8 +460,7 @@ def test_response_poisson_low_snr_guard_retains_partial_photopeak_support(
     ) -> dict[str, float]:
         """Return low-SNR but non-missing Co photopeak support."""
         decomposer.last_count_variances = {
-            name: (1.0e8 if name == "Co-60" else 1.0)
-            for name in isotopes
+            name: (1.0e8 if name == "Co-60" else 1.0) for name in isotopes
         }
         return {name: (25000.0 if name == "Co-60" else 1000000.0) for name in isotopes}
 
@@ -427,14 +478,9 @@ def test_response_poisson_low_snr_guard_retains_partial_photopeak_support(
 
     assert estimates["Co-60"].counts == pytest.approx(50000.0, rel=0.05)
     assert estimates["Co-60"].method.endswith("source_equivalent")
+    assert diagnostics["low_snr_photopeak_suppression"]["Co-60"]["suppressed"] is False
     assert (
-        diagnostics["low_snr_photopeak_suppression"]["Co-60"]["suppressed"]
-        is False
-    )
-    assert (
-        diagnostics["low_snr_photopeak_suppression"]["Co-60"][
-            "photo_to_poisson_ratio"
-        ]
+        diagnostics["low_snr_photopeak_suppression"]["Co-60"]["photo_to_poisson_ratio"]
         > 0.2
     )
 
@@ -443,9 +489,7 @@ def test_response_poisson_retains_low_snr_full_spectrum_count_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Runtime counts should keep weak full-spectrum evidence with high variance."""
-    decomposer = SpectralDecomposer(
-        SpectrumConfig()
-    )
+    decomposer = SpectralDecomposer(SpectrumConfig())
     cs_index = decomposer.isotope_names.index("Cs-137")
     eu_index = decomposer.isotope_names.index("Eu-154")
     spectrum = (
@@ -461,8 +505,7 @@ def test_response_poisson_retains_low_snr_full_spectrum_count_by_default(
     ) -> dict[str, float]:
         """Return no local Eu photopeak evidence despite a continuum coefficient."""
         decomposer.last_count_variances = {
-            name: (100.0 if name == "Cs-137" else 1.0)
-            for name in isotopes
+            name: (100.0 if name == "Cs-137" else 1.0) for name in isotopes
         }
         return {name: (10000.0 if name == "Cs-137" else 0.0) for name in isotopes}
 
@@ -514,10 +557,7 @@ def test_response_poisson_count_guard_blends_high_chi2_crosstalk() -> None:
     assert 0.0 < diagnostics["Cs-137"]["blend_weight"] < 1.0
     assert diagnostics["Cs-137"]["disagreement_fraction"] == pytest.approx(0.9)
     assert estimates["Cs-137"].variance > estimates["Cs-137"].counts
-    assert (
-        estimates["Cs-137"].method
-        == "response_poisson_photopeak_crosstalk_blend"
-    )
+    assert estimates["Cs-137"].method == "response_poisson_photopeak_crosstalk_blend"
     assert "Cs-137" in diagnostics
 
 
@@ -550,14 +590,10 @@ def test_response_poisson_count_guard_uses_high_snr_photopeak_support() -> None:
         requested=["Co-60"],
     )
     assert 25000.0 <= estimates["Co-60"].counts < 0.5 * (50000.0 + 25000.0)
-    assert (
-        estimates["Co-60"].method
-        == "response_poisson_photopeak_crosstalk_blend"
-    )
+    assert estimates["Co-60"].method == "response_poisson_photopeak_crosstalk_blend"
     assert estimates["Co-60"].variance > estimates["Co-60"].counts
     assert (
-        diagnostics["Co-60"]["reason"]
-        == "high_chi2_full_response_photopeak_log_blend"
+        diagnostics["Co-60"]["reason"] == "high_chi2_full_response_photopeak_log_blend"
     )
 
 
@@ -602,13 +638,9 @@ def test_response_poisson_count_guard_keeps_dominant_channel_count() -> None:
     assert diagnostics["Cs-137"]["weak_channel"] is False
     assert diagnostics["Co-60"]["weak_channel"] is True
     assert (
-        estimates["Cs-137"].method
-        == "response_poisson_photopeak_crosstalk_uncertain"
+        estimates["Cs-137"].method == "response_poisson_photopeak_crosstalk_uncertain"
     )
-    assert (
-        estimates["Co-60"].method
-        == "response_poisson_photopeak_crosstalk_blend"
-    )
+    assert estimates["Co-60"].method == "response_poisson_photopeak_crosstalk_blend"
 
 
 def test_response_poisson_count_guard_can_adjust_high_chi2_dominant_count() -> None:
@@ -653,10 +685,7 @@ def test_response_poisson_count_guard_can_adjust_high_chi2_dominant_count() -> N
     assert diagnostics["Cs-137"]["weak_channel"] is False
     assert diagnostics["Cs-137"]["high_chi2"] is True
     assert diagnostics["Cs-137"]["adjust_high_chi2_count"] is True
-    assert (
-        estimates["Cs-137"].method
-        == "response_poisson_photopeak_crosstalk_blend"
-    )
+    assert estimates["Cs-137"].method == "response_poisson_photopeak_crosstalk_blend"
 
 
 def test_response_poisson_count_guard_handles_low_chi2_dominant_crosstalk() -> None:
@@ -856,8 +885,7 @@ def test_response_poisson_count_guard_boosts_extreme_dominant_crosstalk() -> Non
 
     assert diagnostics["Eu-154"]["extreme_dominant_boost"] > 0.0
     assert (
-        diagnostics["Eu-154"]["blend_weight"]
-        > diagnostics["Eu-154"]["snr_reliability"]
+        diagnostics["Eu-154"]["blend_weight"] > diagnostics["Eu-154"]["snr_reliability"]
     )
     assert 18_200.0 < estimates["Eu-154"].counts < 22_000.0
     assert estimates["Cs-137"].counts == pytest.approx(1_960_000.0)
@@ -995,13 +1023,9 @@ def test_response_poisson_count_guard_combines_subthreshold_evidence() -> None:
     assert diagnostics["Eu-154"]["adjust_count"] is False
     assert diagnostics["Eu-154"]["count_adjustable_crosstalk"] is False
     assert diagnostics["Eu-154"]["combined_crosstalk_weight"] > 0.8
+    assert diagnostics["Eu-154"]["reason"] == "combined_crosstalk_photopeak_log_blend"
     assert (
-        diagnostics["Eu-154"]["reason"]
-        == "combined_crosstalk_photopeak_log_blend"
-    )
-    assert (
-        estimates["Eu-154"].method
-        == "response_poisson_photopeak_crosstalk_uncertain"
+        estimates["Eu-154"].method == "response_poisson_photopeak_crosstalk_uncertain"
     )
 
 
@@ -1037,10 +1061,7 @@ def test_response_poisson_count_guard_uses_chi2_mismatch_weight() -> None:
     assert 139775.6243 <= estimates["Cs-137"].counts < 160000.0
     assert diagnostics["Cs-137"]["blend_weight"] > 0.85
     assert diagnostics["Cs-137"]["chi2_mismatch_weight"] > 0.85
-    assert (
-        estimates["Cs-137"].method
-        == "response_poisson_photopeak_crosstalk_blend"
-    )
+    assert estimates["Cs-137"].method == "response_poisson_photopeak_crosstalk_blend"
 
 
 def test_response_poisson_count_guard_partially_blends_near_threshold() -> None:
@@ -1108,8 +1129,7 @@ def test_response_poisson_count_guard_blends_high_chi2_underallocation() -> None
     assert 1000.0 < estimates["Co-60"].counts < 1200.0
     assert estimates["Co-60"].variance >= (1200.0 - 1000.0) ** 2
     assert (
-        estimates["Co-60"].method
-        == "response_poisson_photopeak_underallocation_blend"
+        estimates["Co-60"].method == "response_poisson_photopeak_underallocation_blend"
     )
     assert (
         diagnostics["Co-60"]["reason"]
@@ -1119,7 +1139,9 @@ def test_response_poisson_count_guard_blends_high_chi2_underallocation() -> None
     assert diagnostics["Co-60"]["snr_reliability"] == pytest.approx(1.0)
 
 
-def test_response_poisson_count_guard_soft_weights_subthreshold_underallocation() -> None:
+def test_response_poisson_count_guard_soft_weights_subthreshold_underallocation() -> (
+    None
+):
     """Subthreshold photopeak support should move high-chi2 undercounts softly."""
     decomposer = SpectralDecomposer(
         SpectrumConfig(

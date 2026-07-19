@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -108,7 +109,9 @@ class TCPSidecarClientRuntime(SimulationRuntime):
 
     def _round_trip(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Send a single request and return the response payload."""
-        with socket.create_connection((self.host, self.port), timeout=self.timeout_s) as conn:
+        with socket.create_connection(
+            (self.host, self.port), timeout=self.timeout_s
+        ) as conn:
             conn.sendall(encode_message(message_type, payload))
             conn.shutdown(socket.SHUT_WR)
             chunks: list[bytes] = []
@@ -121,7 +124,9 @@ class TCPSidecarClientRuntime(SimulationRuntime):
             raise RuntimeError("Simulator sidecar returned an empty response.")
         response_type, response_payload = decode_message(b"".join(chunks).strip())
         if response_type == "error":
-            raise RuntimeError(str(response_payload.get("message", "Unknown sidecar error.")))
+            raise RuntimeError(
+                str(response_payload.get("message", "Unknown sidecar error."))
+            )
         if response_type != "ok":
             raise RuntimeError(f"Unexpected sidecar response type: {response_type}")
         return response_payload
@@ -168,6 +173,9 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         port: int,
         timeout_s: float = 10.0,
         *,
+        expected_primary_sampling_fraction: float = 1.0,
+        expected_target_sampled_primaries: int | None = None,
+        accelerated_weighted_transport_enable: bool = False,
         expected_source_rate_model: str | None = None,
         expected_thread_count: int | None = None,
         expected_physics_profile: str | None = None,
@@ -175,9 +183,55 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         expected_secondary_transport_mode: str | None = None,
         expected_source_bias_mode: str | None = None,
         expected_background_cps: float | None = None,
+        expected_dead_time_tau_s: float | None = None,
     ) -> None:
         """Store connection parameters and expected sidecar fidelity."""
+        from sim.geant4_app.app import require_primary_sampling_fraction
+
         super().__init__(host=host, port=port, timeout_s=timeout_s)
+        if not isinstance(accelerated_weighted_transport_enable, bool):
+            raise ValueError("accelerated_weighted_transport_enable must be a boolean.")
+        self.accelerated_weighted_transport_enable = bool(
+            accelerated_weighted_transport_enable
+        )
+        if expected_target_sampled_primaries is None:
+            self.expected_target_sampled_primaries = None
+        else:
+            if isinstance(expected_target_sampled_primaries, bool) or not isinstance(
+                expected_target_sampled_primaries,
+                int,
+            ):
+                raise ValueError(
+                    "expected_target_sampled_primaries must be a positive integer."
+                )
+            if expected_target_sampled_primaries <= 0:
+                raise ValueError(
+                    "expected_target_sampled_primaries must be a positive integer."
+                )
+            self.expected_target_sampled_primaries = int(
+                expected_target_sampled_primaries
+            )
+        self.expected_primary_sampling_fraction = require_primary_sampling_fraction(
+            expected_primary_sampling_fraction,
+            accelerated_weighted_transport_enable=(
+                self.accelerated_weighted_transport_enable
+            ),
+            target_sampled_primaries=self.expected_target_sampled_primaries,
+        )
+        weighted_requested = (
+            self.expected_primary_sampling_fraction < 1.0
+            or self.expected_target_sampled_primaries is not None
+        )
+        if weighted_requested and not self.accelerated_weighted_transport_enable:
+            raise ValueError(
+                "Weighted Geant4 sampling requires "
+                "accelerated_weighted_transport_enable=true."
+            )
+        if self.accelerated_weighted_transport_enable and not weighted_requested:
+            raise ValueError(
+                "accelerated_weighted_transport_enable=true requires a reduced "
+                "primary_sampling_fraction or target_sampled_primaries."
+            )
         self.expected_source_rate_model = (
             None
             if expected_source_rate_model is None
@@ -200,11 +254,23 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             else str(expected_secondary_transport_mode)
         )
         self.expected_source_bias_mode = (
-            None if expected_source_bias_mode is None else str(expected_source_bias_mode)
+            None
+            if expected_source_bias_mode is None
+            else str(expected_source_bias_mode)
         )
         self.expected_background_cps = (
             None if expected_background_cps is None else float(expected_background_cps)
         )
+        self.expected_dead_time_tau_s = (
+            None
+            if expected_dead_time_tau_s is None
+            else float(expected_dead_time_tau_s)
+        )
+        if self.expected_dead_time_tau_s is not None and (
+            not math.isfinite(self.expected_dead_time_tau_s)
+            or self.expected_dead_time_tau_s < 0.0
+        ):
+            raise ValueError("expected_dead_time_tau_s must be finite and nonnegative.")
 
     def reset(self, payload: dict[str, Any] | None = None) -> None:
         """Reset the sidecar only after validating its fidelity handshake."""
@@ -213,23 +279,44 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
 
     def step(self, command: SimulationCommand) -> SimulationObservation:
         """Execute one step and validate native fidelity before PF ingestion."""
-        from sim.geant4_app.app import validate_full_history_transport_metadata
+        from sim.geant4_app.app import validate_transport_metadata
 
         payload = self._round_trip("step", command.to_dict())
         observation = SimulationObservation.from_dict(payload["observation"])
-        validate_full_history_transport_metadata(
+        validate_transport_metadata(
             observation.metadata,
+            expected_primary_sampling_fraction=(
+                self.expected_primary_sampling_fraction
+            ),
+            expected_target_sampled_primaries=(
+                self.expected_target_sampled_primaries
+            ),
+            accelerated_weighted_transport_enable=(
+                self.accelerated_weighted_transport_enable
+            ),
             expected_source_rate_model=self.expected_source_rate_model,
             expected_thread_count=self.expected_thread_count,
             expected_physics_profile=self.expected_physics_profile,
             expected_detector_scoring_mode=self.expected_detector_scoring_mode,
-            expected_secondary_transport_mode=(
-                self.expected_secondary_transport_mode
-            ),
+            expected_secondary_transport_mode=(self.expected_secondary_transport_mode),
             expected_source_bias_mode=self.expected_source_bias_mode,
             expected_background_cps=self.expected_background_cps,
+            expected_dead_time_tau_s=self.expected_dead_time_tau_s,
         )
         return observation
+
+    @staticmethod
+    def _required_handshake_bool(
+        fidelity: dict[str, Any],
+        key: str,
+    ) -> bool:
+        """Return a strict boolean from a reset handshake or fail closed."""
+        value = fidelity.get(key)
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                f"Geant4 sidecar fidelity handshake is missing valid {key}."
+            )
+        return value
 
     def _validate_fidelity_handshake(self, response: dict[str, Any]) -> None:
         """Reject stale or mismatched Geant4 bridge processes."""
@@ -239,17 +326,116 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 "Geant4 sidecar reset did not return a runtime_fidelity "
                 "handshake; refusing to reuse an unverified process."
             )
-        for key in ("primary_sampling_fraction", "primary_history_weight"):
+        expected_float_fields = {
+            "primary_sampling_fraction": self.expected_primary_sampling_fraction,
+            "requested_primary_sampling_fraction": (
+                self.expected_primary_sampling_fraction
+            ),
+        }
+        if self.expected_target_sampled_primaries is None:
+            expected_float_fields["primary_history_weight"] = (
+                1.0 / self.expected_primary_sampling_fraction
+            )
+        if self.expected_dead_time_tau_s is not None:
+            expected_float_fields["dead_time_tau_s"] = self.expected_dead_time_tau_s
+        for key, expected_value in expected_float_fields.items():
             try:
                 value = float(fidelity[key])
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
                     f"Geant4 sidecar fidelity handshake is missing valid {key}."
                 ) from exc
-            if value != 1.0:
+            if not math.isfinite(value) or not math.isclose(
+                value,
+                expected_value,
+                rel_tol=1.0e-12,
+                abs_tol=1.0e-18,
+            ):
                 raise RuntimeError(
-                    f"Geant4 sidecar requires {key}=1.0, got {value}."
+                    f"Geant4 sidecar requires {key}={expected_value}, got {value}."
                 )
+        try:
+            actual_target_value = fidelity["target_sampled_primaries"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Geant4 sidecar fidelity handshake is missing valid "
+                "target_sampled_primaries."
+            ) from exc
+        if isinstance(actual_target_value, bool) or not isinstance(
+            actual_target_value,
+            int,
+        ):
+            raise RuntimeError(
+                "Geant4 sidecar fidelity handshake has invalid "
+                "target_sampled_primaries."
+            )
+        actual_target_sampled_primaries = int(actual_target_value)
+        expected_target_sampled_primaries = (
+            0
+            if self.expected_target_sampled_primaries is None
+            else self.expected_target_sampled_primaries
+        )
+        if actual_target_sampled_primaries != expected_target_sampled_primaries:
+            raise RuntimeError(
+                "Geant4 sidecar target-sampled-primary mismatch: expected "
+                f"{expected_target_sampled_primaries}, got "
+                f"{actual_target_sampled_primaries}."
+            )
+        actual_budget_enabled = self._required_handshake_bool(
+            fidelity,
+            "primary_sampling_budget_enabled",
+        )
+        expected_budget_enabled = self.expected_target_sampled_primaries is not None
+        if actual_budget_enabled != expected_budget_enabled:
+            raise RuntimeError(
+                "Geant4 sidecar primary-sampling budget mismatch: expected "
+                f"{expected_budget_enabled}, got {actual_budget_enabled}."
+            )
+        expected_fraction_resolution = (
+            "per_observation_pending" if expected_budget_enabled else "fixed_fraction"
+        )
+        actual_fraction_resolution = str(
+            fidelity.get("primary_sampling_fraction_resolution", "")
+        )
+        if actual_fraction_resolution != expected_fraction_resolution:
+            raise RuntimeError(
+                "Geant4 sidecar primary-sampling fraction resolution mismatch: "
+                f"expected {expected_fraction_resolution}, got "
+                f"{actual_fraction_resolution or 'missing'}."
+            )
+        if expected_budget_enabled:
+            actual_history_resolution = str(
+                fidelity.get("history_thinning_resolution", "")
+            )
+            if actual_history_resolution != "per_observation_pending":
+                raise RuntimeError(
+                    "Geant4 sidecar history-thinning resolution mismatch: "
+                    "expected per_observation_pending."
+                )
+            premature_history_fields = sorted(
+                key
+                for key in (
+                    "history_thinning_enabled",
+                    "transport_history_mode",
+                )
+                if key in fidelity
+            )
+            if premature_history_fields:
+                raise RuntimeError(
+                    "Budgeted Geant4 reset handshake must not report unresolved "
+                    "per-observation history state: "
+                    f"{premature_history_fields}."
+                )
+        actual_accelerated = self._required_handshake_bool(
+            fidelity,
+            "accelerated_weighted_transport_enable",
+        )
+        if actual_accelerated != self.accelerated_weighted_transport_enable:
+            raise RuntimeError(
+                "Geant4 sidecar accelerated weighted-transport mismatch: "
+                f"expected {self.accelerated_weighted_transport_enable}, "
+                f"got {actual_accelerated}."
+            )
         if self.expected_source_rate_model is not None:
             actual_model = str(fidelity.get("source_rate_model", ""))
             if actual_model != self.expected_source_rate_model:
@@ -263,8 +449,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 actual_threads = int(fidelity["requested_threads"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    "Geant4 sidecar fidelity handshake is missing "
-                    "requested_threads."
+                    "Geant4 sidecar fidelity handshake is missing requested_threads."
                 ) from exc
             if actual_threads != self.expected_thread_count:
                 raise RuntimeError(
@@ -363,7 +548,9 @@ class ManagedIsaacSimTCPClientRuntime(IsaacSimTCPClientRuntime):
         close_on_close: bool = True,
     ) -> None:
         """Store the client parameters and owned process handles."""
-        super().__init__(host=host, port=port, timeout_s=timeout_s, close_on_close=close_on_close)
+        super().__init__(
+            host=host, port=port, timeout_s=timeout_s, close_on_close=close_on_close
+        )
         self.process = process
         self.log_handle = log_handle
         self.temp_config_path = temp_config_path
@@ -409,6 +596,9 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         log_handle: object | None = None,
         temp_config_path: Path | None = None,
         restart_config: dict[str, Any] | None = None,
+        expected_primary_sampling_fraction: float = 1.0,
+        expected_target_sampled_primaries: int | None = None,
+        accelerated_weighted_transport_enable: bool = False,
         expected_source_rate_model: str | None = None,
         expected_thread_count: int | None = None,
         expected_physics_profile: str | None = None,
@@ -416,12 +606,20 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         expected_secondary_transport_mode: str | None = None,
         expected_source_bias_mode: str | None = None,
         expected_background_cps: float | None = None,
+        expected_dead_time_tau_s: float | None = None,
     ) -> None:
         """Store the client parameters and owned process handles."""
         super().__init__(
             host=host,
             port=port,
             timeout_s=timeout_s,
+            expected_primary_sampling_fraction=(expected_primary_sampling_fraction),
+            expected_target_sampled_primaries=(
+                expected_target_sampled_primaries
+            ),
+            accelerated_weighted_transport_enable=(
+                accelerated_weighted_transport_enable
+            ),
             expected_source_rate_model=expected_source_rate_model,
             expected_thread_count=expected_thread_count,
             expected_physics_profile=expected_physics_profile,
@@ -429,6 +627,7 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
             expected_secondary_transport_mode=expected_secondary_transport_mode,
             expected_source_bias_mode=expected_source_bias_mode,
             expected_background_cps=expected_background_cps,
+            expected_dead_time_tau_s=expected_dead_time_tau_s,
         )
         self.process = process
         self.log_handle = log_handle
@@ -457,9 +656,7 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
                     raise RuntimeError(
                         "Managed Geant4 sidecar crashed before any reset payload was recorded."
                     )
-                reset_response = super()._round_trip(
-                    "reset", self._last_reset_payload
-                )
+                reset_response = super()._round_trip("reset", self._last_reset_payload)
                 self._validate_fidelity_handshake(reset_response)
             return super()._round_trip(message_type, payload)
 
@@ -652,10 +849,7 @@ def _resolve_sidecar_python(config: dict[str, Any], sidecar_name: str) -> str:
     configured_env = config.get("sidecar_python_env")
     if configured_env not in (None, ""):
         env_names.insert(0, str(configured_env))
-    if (
-        _config_requires_isaacsim_python(config)
-        and "ISAACSIM_PYTHON" not in env_names
-    ):
+    if _config_requires_isaacsim_python(config) and "ISAACSIM_PYTHON" not in env_names:
         env_names.append("ISAACSIM_PYTHON")
     for env_name in env_names:
         env_value = os.environ.get(env_name)
@@ -716,7 +910,9 @@ def _start_sidecar_process(
                 f"See log: {log_path}"
             )
         if _tcp_server_available(host, port):
-            print(f"Auto-started {sidecar_name} sidecar on {host}:{port} (log: {log_path})")
+            print(
+                f"Auto-started {sidecar_name} sidecar on {host}:{port} (log: {log_path})"
+            )
             return process, log_handle
         time.sleep(0.1)
     process.terminate()
@@ -771,9 +967,7 @@ def _start_geant4_sidecar(
         config,
         runtime_config_path,
     )
-    sidecar_geant4_config = Geant4AppConfig.from_dict(
-        load_runtime_config(config_path)
-    )
+    sidecar_geant4_config = Geant4AppConfig.from_dict(load_runtime_config(config_path))
     if sidecar_geant4_config != validated_geant4_config:
         if temp_config_path is not None:
             temp_config_path.unlink(missing_ok=True)
@@ -782,7 +976,12 @@ def _start_geant4_sidecar(
             "different Geant4 application settings."
         )
     log_path = Path(
-        str(config.get("sidecar_log_path", root / "results" / "sidecars" / f"geant4_bridge_{port}.log"))
+        str(
+            config.get(
+                "sidecar_log_path",
+                root / "results" / "sidecars" / f"geant4_bridge_{port}.log",
+            )
+        )
     ).expanduser()
     if not log_path.is_absolute():
         log_path = (root / log_path).resolve()
@@ -797,7 +996,9 @@ def _start_geant4_sidecar(
             timeout_s=startup_timeout_s,
             log_path=log_path,
             sidecar_name="Geant4",
-            extra_args=["--mock-stage"] if bool(config.get("sidecar_mock_stage", False)) else None,
+            extra_args=["--mock-stage"]
+            if bool(config.get("sidecar_mock_stage", False))
+            else None,
         )
     except Exception:
         if temp_config_path is not None:
@@ -810,17 +1011,25 @@ def _start_geant4_sidecar(
         process=process,
         log_handle=log_handle,
         temp_config_path=temp_config_path,
+        expected_primary_sampling_fraction=(
+            validated_geant4_config.primary_sampling_fraction
+        ),
+        expected_target_sampled_primaries=(
+            validated_geant4_config.target_sampled_primaries
+        ),
+        accelerated_weighted_transport_enable=(
+            validated_geant4_config.accelerated_weighted_transport_enable
+        ),
         expected_source_rate_model=validated_geant4_config.source_rate_model,
         expected_thread_count=validated_geant4_config.thread_count,
         expected_physics_profile=validated_geant4_config.physics_profile,
-        expected_detector_scoring_mode=(
-            validated_geant4_config.detector_scoring_mode
-        ),
+        expected_detector_scoring_mode=(validated_geant4_config.detector_scoring_mode),
         expected_secondary_transport_mode=(
             validated_geant4_config.secondary_transport_mode
         ),
         expected_source_bias_mode=validated_geant4_config.source_bias_mode,
         expected_background_cps=validated_geant4_config.background_cps,
+        expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
         restart_config={
             "enabled": bool(config.get("sidecar_restart_on_disconnect", True)),
             "max_restarts": int(config.get("sidecar_max_restarts", 2)),
@@ -830,7 +1039,9 @@ def _start_geant4_sidecar(
             "log_path": log_path.as_posix(),
             "startup_timeout_s": startup_timeout_s,
             "extra_args": (
-                ["--mock-stage"] if bool(config.get("sidecar_mock_stage", False)) else []
+                ["--mock-stage"]
+                if bool(config.get("sidecar_mock_stage", False))
+                else []
             ),
         },
     )
@@ -1001,7 +1212,9 @@ def create_simulation_runtime(
             obstacle_height_m=float(config.get("obstacle_height_m", 2.0)),
             obstacle_material=str(config.get("obstacle_material", "concrete")),
             scatter_gain=float(config.get("scatter_gain", 0.03)),
-            dead_time_s=float(config.get("dead_time_tau_s", config.get("dead_time_s", 0.0))),
+            dead_time_s=float(
+                config.get("dead_time_tau_s", config.get("dead_time_s", 0.0))
+            ),
             detector_model=(
                 dict(config["detector_model"])
                 if isinstance(config.get("detector_model"), dict)
@@ -1046,6 +1259,15 @@ def create_simulation_runtime(
                 host=host,
                 port=port,
                 timeout_s=timeout_s,
+                expected_primary_sampling_fraction=(
+                    validated_geant4_config.primary_sampling_fraction
+                ),
+                expected_target_sampled_primaries=(
+                    validated_geant4_config.target_sampled_primaries
+                ),
+                accelerated_weighted_transport_enable=(
+                    validated_geant4_config.accelerated_weighted_transport_enable
+                ),
                 expected_source_rate_model=validated_geant4_config.source_rate_model,
                 expected_thread_count=validated_geant4_config.thread_count,
                 expected_physics_profile=validated_geant4_config.physics_profile,
@@ -1057,6 +1279,7 @@ def create_simulation_runtime(
                 ),
                 expected_source_bias_mode=validated_geant4_config.source_bias_mode,
                 expected_background_cps=validated_geant4_config.background_cps,
+                expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
             )
         return _maybe_pair_geant4_with_isaacsim(config, geant4_runtime)
     raise ValueError(f"Unknown simulation backend: {backend}")

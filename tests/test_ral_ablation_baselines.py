@@ -6,11 +6,14 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from baselines.ral_ablation.config_factory import (
     DEFAULT_ABLATION_CASES,
     DEFAULT_ABLATION_VARIANTS,
     DEFAULT_CUI_SPLIT_VIEW_DIR,
+    _load_json,
+    _validate_ral_transport_sampling,
     build_ablation_plan,
 )
 from baselines.ral_ablation.path_policies import select_baseline_next_pose
@@ -42,6 +45,135 @@ def test_pf_max_sources_default_is_shared() -> None:
     """PF entry points should use one shared default source-count support."""
     assert RotatingShieldPFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
     assert PFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
+
+
+def test_ral_transport_sampling_requires_explicit_accelerated_mode() -> None:
+    """RA-L generation should label full histories and fail closed on thinning."""
+    assert _validate_ral_transport_sampling({}) == "full_unit_weight"
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "accelerated_weighted_transport_enable=true",
+    ):
+        _validate_ral_transport_sampling({"primary_sampling_fraction": 0.02})
+
+
+def test_ral_transport_sampling_accepts_labeled_detector_cps_thinning() -> None:
+    """The user-authorized accelerated mode should remain explicit and scoped."""
+    config = {
+        "primary_sampling_fraction": 0.02,
+        "accelerated_weighted_transport_enable": True,
+        "source_rate_model": "detector_cps_1m",
+        "target_sampled_primaries": 1500000,
+    }
+    assert _validate_ral_transport_sampling(config) == "budgeted_weighted_transport"
+    config["source_rate_model"] = "isotropic_emission_equivalent"
+    with np.testing.assert_raises_regex(ValueError, "detector_cps_1m"):
+        _validate_ral_transport_sampling(config)
+
+
+def test_ral_transport_sampling_rejects_invalid_history_budget() -> None:
+    """A sampled-primary budget must be positive and explicitly accelerated."""
+    with pytest.raises(ValueError, match="target_sampled_primaries"):
+        _validate_ral_transport_sampling(
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+                "target_sampled_primaries": 0,
+            }
+        )
+    with pytest.raises(ValueError, match="accelerated_weighted_transport_enable"):
+        _validate_ral_transport_sampling({"target_sampled_primaries": 1_500_000})
+
+
+@pytest.mark.parametrize(
+    "invalid_target",
+    [True, 1.5, 1_500_000.0, "1500000"],
+)
+def test_ral_transport_sampling_requires_json_integer_history_budget(
+    invalid_target: object,
+) -> None:
+    """RA-L generation should enforce the runtime's JSON-integer budget type."""
+    with pytest.raises(ValueError, match="positive JSON integer"):
+        _validate_ral_transport_sampling(
+            {
+                "primary_sampling_fraction": 1.0,
+                "accelerated_weighted_transport_enable": True,
+                "source_rate_model": "detector_cps_1m",
+                "target_sampled_primaries": invalid_target,
+            }
+        )
+
+
+def test_ral_base_config_loader_resolves_accelerated_inheritance(
+    tmp_path: Path,
+) -> None:
+    """A compact accelerated child config should retain its standard parent."""
+    parent_path = tmp_path / "parent.json"
+    child_path = tmp_path / "accelerated.json"
+    parent_path.write_text(
+        json.dumps(
+            {
+                "thread_count": 32,
+                "source_rate_model": "detector_cps_1m",
+                "primary_sampling_fraction": 1.0,
+                "pf_count_likelihood": {"count_likelihood_model": "student_t"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    child_path.write_text(
+        json.dumps(
+            {
+                "extends": "parent.json",
+                "primary_sampling_fraction": 0.02,
+                "accelerated_weighted_transport_enable": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolved = _load_json(child_path)
+    assert resolved["thread_count"] == 32
+    assert resolved["pf_count_likelihood"]["count_likelihood_model"] == "student_t"
+    assert _validate_ral_transport_sampling(resolved) == "weighted_thinning"
+
+
+def test_ablation_plan_preserves_accelerated_transport_provenance(
+    tmp_path: Path,
+) -> None:
+    """Generated accelerated RAL configs should stay explicit and guarded."""
+    root = Path(__file__).resolve().parents[1]
+    entries = build_ablation_plan(
+        base_config_path=(
+            root
+            / "configs"
+            / "geant4"
+            / "accelerated_weighted_external_no_isaac_32threads.json"
+        ),
+        output_dir=tmp_path,
+        seeds=(1234,),
+        cases=DEFAULT_ABLATION_CASES[:1],
+        variants=DEFAULT_ABLATION_VARIANTS[:1],
+        intensity_cps_1m=30000.0,
+        output_tag_suffix="weighted_budget1500k_test",
+    )
+    payload = json.loads(entries[0].config_path.read_text(encoding="utf-8"))
+    assert payload["thread_count"] == 32
+    assert payload["primary_sampling_fraction"] == pytest.approx(1.0)
+    assert payload["target_sampled_primaries"] == pytest.approx(1500000.0)
+    assert payload["accelerated_weighted_transport_enable"] is True
+    assert payload["pf_observation_count_variance_semantics"] == "complete_statistical"
+    assert payload["pf_direct_spectrum_likelihood_enable"] is False
+    assert payload["pf_shield_contrast_likelihood"]["enabled"] is False
+    assert payload["pf_shield_view_ratio_likelihood"]["enabled"] is False
+    assert payload["metadata"]["ral_transport_history_mode"] == (
+        "budgeted_weighted_transport"
+    )
+    assert payload["metadata"]["ral_accelerated_transport_exception"] is True
+    assert payload["metadata"]["ral_target_sampled_primaries"] == 1_500_000
+    assert payload["measurement_log_run_id"].endswith(
+        "_weighted_budget1500k_test"
+    )
+    assert entries[0].command[-1].endswith("_weighted_budget1500k_test")
 
 
 def test_round_robin_shield_policy_advances_by_pose() -> None:
@@ -201,9 +333,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert pf_obstacle_off["pf_obstacle_attenuation"] is False
     assert pf_obstacle_off["author_obstacle_prims"] is True
     assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
-    volume_prior = json.loads(
-        by_variant["volume_source_prior"].config_path.read_text()
-    )
+    volume_prior = json.loads(by_variant["volume_source_prior"].config_path.read_text())
     assert volume_prior["source_surface_prior"] is False
     no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
     assert no_birth["birth_max_per_update"] == 0
@@ -288,9 +418,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert one_step_no_shield["min_rotations_per_pose"] == 1
     assert one_step_no_shield["dss_pp"]["program_length"] == 1
     assert one_step_no_shield["dss_pp"]["residual_program_length"] == 1
-    one_step_path = json.loads(
-        by_variant["one_step_path"].config_path.read_text()
-    )
+    one_step_path = json.loads(by_variant["one_step_path"].config_path.read_text())
     assert one_step_path["path_planner"] == "one_step"
     assert one_step_path["strict_planned_shield_program"] is True
     assert "one_step_pose_eval_use_gpu" not in one_step_path
@@ -339,12 +467,14 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert by_variant["proposed"].command[measurement_time_idx] == (
         f"{DEFAULT_MEASUREMENT_TIME_S:g}"
     )
-    assert "--rotation-overhead-s" in by_variant[
-        "baseline_passive_no_shield_single_view"
-    ].command
-    assert f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}" in by_variant[
-        "baseline_passive_no_shield_single_view"
-    ].command
+    assert (
+        "--rotation-overhead-s"
+        in by_variant["baseline_passive_no_shield_single_view"].command
+    )
+    assert (
+        f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"
+        in by_variant["baseline_passive_no_shield_single_view"].command
+    )
 
 
 def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None:
@@ -358,8 +488,7 @@ def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None
     rows = manifest_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 6
     manifest = {
-        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5)
-        for line in rows[1:]
+        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5) for line in rows[1:]
     }
     assert set(manifest) == {
         "feature_all_on",
@@ -395,9 +524,10 @@ def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None
     assert no_condition_config["dss_pp"]["station_condition_weight"] == 0.0
     assert no_condition_config["dss_pp"]["elevation_condition_weight"] == 0.0
     assert no_recovery_config["dss_pp"]["include_runtime_rescue_modes"] is False
-    assert no_recovery_config["remaining_measurement_estimate"][
-        "verification_weight"
-    ] == 0.0
+    assert (
+        no_recovery_config["remaining_measurement_estimate"]["verification_weight"]
+        == 0.0
+    )
     assert no_orthogonal_config["birth_orthogonalize_residual_candidates"] is False
 
 
@@ -415,8 +545,7 @@ def test_mix9_feature_validation_plan_uses_all_candidate_isotopes(
     rows = manifest_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 6
     manifest = {
-        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5)
-        for line in rows[1:]
+        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5) for line in rows[1:]
     }
     all_on_config = json.loads(Path(manifest["feature_all_on"][3]).read_text())
     source_payload = json.loads(Path(manifest["feature_all_on"][4]).read_text())

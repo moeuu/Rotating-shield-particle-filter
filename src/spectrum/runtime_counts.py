@@ -8,7 +8,7 @@ from typing import Mapping
 import numpy as np
 from numpy.typing import NDArray
 
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.pipeline import ResponsePoissonCovarianceChunk, SpectralDecomposer
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,10 @@ class RuntimeCountExtractor:
         min_peaks_by_isotope: dict[str, int] | None,
         spectrum_variance: NDArray[np.float64] | None = None,
         transport_metadata: Mapping[str, object] | None = None,
+        transport_spectrum: NDArray[np.float64] | None = None,
+        transport_covariance_chunks: tuple[
+            ResponsePoissonCovarianceChunk, ...
+        ] = (),
     ) -> RuntimeCountResult:
         """Extract isotope counts and conservative variances for PF updates."""
         counts, detected = self.decomposer.isotope_counts_with_detection(
@@ -87,6 +91,10 @@ class RuntimeCountExtractor:
             detect_threshold_rel=detect_threshold_rel,
             detect_threshold_rel_by_isotope=detect_threshold_rel_by_isotope,
             min_peaks_by_isotope=min_peaks_by_isotope,
+            spectrum_variance=spectrum_variance,
+            transport_metadata=transport_metadata,
+            transport_spectrum=transport_spectrum,
+            transport_covariance_chunks=transport_covariance_chunks,
         )
         counts_out = {iso: float(val) for iso, val in counts.items()}
         variances = {
@@ -150,6 +158,13 @@ class RuntimeCountExtractor:
         source_covariance = getattr(self.decomposer, "last_count_covariance", {})
         if not isinstance(source_covariance, Mapping):
             source_covariance = {}
+        covariance_semantics = str(
+            getattr(self.decomposer, "last_count_covariance_semantics", "")
+        )
+        covariance_contains_spectrum_statistics = (
+            covariance_semantics != "inverse_fisher_poisson"
+            and covariance_semantics != "unavailable"
+        )
         runtime_variances = {
             isotope: max(
                 float(variances.get(isotope, counts.get(isotope, 1.0))),
@@ -160,9 +175,7 @@ class RuntimeCountExtractor:
         covariance = {
             row_iso: {
                 col_iso: (
-                    float(runtime_variances[row_iso])
-                    if row_iso == col_iso
-                    else 0.0
+                    float(runtime_variances[row_iso]) if row_iso == col_iso else 0.0
                 )
                 for col_iso in isotopes
             }
@@ -196,7 +209,10 @@ class RuntimeCountExtractor:
                 if not reciprocal_values:
                     continue
                 source_offdiag = float(np.mean(reciprocal_values))
-                if formal_variances is not None:
+                if (
+                    formal_variances is not None
+                    and not covariance_contains_spectrum_statistics
+                ):
                     # The ceiling acts on the complete formal covariance, not
                     # only its diagonal.  Congruence scaling preserves the
                     # fitted correlation and positive-semidefinite structure.
@@ -218,9 +234,7 @@ class RuntimeCountExtractor:
                 # independent components and make the later conservative
                 # projection grow a second time.
                 runtime_bound = float(
-                    np.sqrt(
-                        runtime_variances[row_iso] * runtime_variances[col_iso]
-                    )
+                    np.sqrt(runtime_variances[row_iso] * runtime_variances[col_iso])
                 )
                 formal_offdiag = float(
                     np.clip(source_offdiag, -runtime_bound, runtime_bound)
@@ -262,12 +276,35 @@ class RuntimeCountExtractor:
         """Apply count-variance floors propagated from weighted spectra."""
         if spectrum_variance is None:
             return variances
-        variance_floor = (
-            self.decomposer.estimate_count_variances_from_spectrum_variance(
-                spectrum_variance,
-                isotopes=list(counts.keys()),
-            )
+        covariance_semantics = str(
+            getattr(self.decomposer, "last_count_covariance_semantics", "")
         )
+        regression_covariance = getattr(
+            self.decomposer,
+            "last_response_poisson_regression_covariance",
+            {},
+        )
+        if covariance_semantics not in {
+            "",
+            "unavailable",
+            "inverse_fisher_poisson",
+        } and isinstance(regression_covariance, Mapping):
+            variance_floor = {}
+            for isotope in counts:
+                row = regression_covariance.get(isotope, {})
+                value = (
+                    self._mapping_float(row, isotope)
+                    if isinstance(row, Mapping)
+                    else None
+                )
+                variance_floor[isotope] = max(float(value or 0.0), 1.0)
+        else:
+            variance_floor = (
+                self.decomposer.estimate_count_variances_from_spectrum_variance(
+                    spectrum_variance,
+                    isotopes=list(counts.keys()),
+                )
+            )
         return {
             iso: float(max(variances.get(iso, 1.0), variance_floor.get(iso, 1.0)))
             for iso in counts
@@ -303,8 +340,7 @@ class RuntimeCountExtractor:
             iso: float(
                 max(
                     variances.get(iso, 1.0),
-                    (max(float(count), 0.0) ** 2)
-                    / max(float(effective_entries), 1.0),
+                    (max(float(count), 0.0) ** 2) / max(float(effective_entries), 1.0),
                 )
             )
             for iso, count in counts.items()
@@ -328,9 +364,7 @@ class RuntimeCountExtractor:
             return variances
 
         rel_sigma = self._diagnostic_relative_sigma(diagnostics)
-        rel_sigma_by_isotope = self._diagnostic_relative_sigma_by_isotope(
-            diagnostics
-        )
+        rel_sigma_by_isotope = self._diagnostic_relative_sigma_by_isotope(diagnostics)
         floors: dict[str, float] = {}
         inflated: dict[str, float] = {}
         for isotope, count in counts.items():

@@ -1,0 +1,16 @@
+{
+  "extends": "variance_reduction_external_no_isaac_32threads.json",
+  "accelerated_weighted_transport_enable": true,
+  "accelerated_weighted_transport_label": "nonstandard_user_authorized_weighted_history",
+  "primary_sampling_fraction": 1.0,
+  "target_sampled_primaries": 1500000,
+  "random_seed_base": 2026072900,
+  "pf_observation_count_variance_semantics": "complete_statistical",
+  "pf_direct_spectrum_likelihood_enable": false,
+  "pf_shield_contrast_likelihood": {
+    "enabled": false
+  },
+  "pf_shield_view_ratio_likelihood": {
+    "enabled": false
+  }
+}

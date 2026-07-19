@@ -98,6 +98,7 @@ from planning.dss_pp import DSSPPConfig
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
+from spectrum.runtime_counts import RuntimeCountResult
 from visualization.realtime_viz import PFFrame
 
 
@@ -132,6 +133,303 @@ def test_measurement_transport_provenance_keeps_full_history_evidence() -> None:
         "source_bias_mode": "detector_cone",
         "source_rate_model": "detector_cps_1m",
     }
+
+
+def test_measurement_transport_provenance_keeps_dynamic_sampling_budget() -> None:
+    """Measurement logs should distinguish configured and effective sampling."""
+    provenance = _measurement_transport_provenance(
+        {
+            "primary_sampling_fraction": 0.04,
+            "primary_history_weight": 25.0,
+            "requested_primary_sampling_fraction": 0.2,
+            "target_sampled_primaries": 100000,
+            "primary_sampling_budget_enabled": True,
+            "primary_sampling_fraction_resolution": "target_budget_limited",
+            "unrelated": "omit",
+        }
+    )
+
+    assert provenance == {
+        "primary_history_weight": 25.0,
+        "primary_sampling_budget_enabled": True,
+        "primary_sampling_fraction": 0.04,
+        "primary_sampling_fraction_resolution": "target_budget_limited",
+        "requested_primary_sampling_fraction": 0.2,
+        "target_sampled_primaries": 100000,
+    }
+
+
+def test_dss_history_weight_is_derived_from_transport_sampling_fraction() -> None:
+    """RAL/DSS planning should inherit the configured minimum history weight."""
+    assert realtime_demo_module._planning_primary_history_weight({}) == pytest.approx(
+        1.0
+    )
+    assert realtime_demo_module._planning_primary_history_weight(
+        {"primary_sampling_fraction": 0.02}
+    ) == pytest.approx(50.0)
+    assert realtime_demo_module._planning_primary_history_weight(
+        {
+            "primary_sampling_fraction": 0.2,
+            "target_sampled_primaries": 100000,
+        }
+    ) == pytest.approx(5.0)
+    with pytest.raises(ValueError, match="primary_sampling_fraction"):
+        realtime_demo_module._planning_primary_history_weight(
+            {"primary_sampling_fraction": 0.0}
+        )
+
+
+def test_target_sampled_primaries_validation_is_fail_closed() -> None:
+    """Dynamic transport budgets must be absent or positive JSON integers."""
+    assert realtime_demo_module._target_sampled_primaries({}) is None
+    assert (
+        realtime_demo_module._target_sampled_primaries(
+            {"target_sampled_primaries": 100000}
+        )
+        == 100000
+    )
+    for invalid in (
+        0,
+        -1,
+        100000.0,
+        "100000",
+        True,
+        float("inf"),
+        float("nan"),
+    ):
+        with pytest.raises(ValueError, match="target_sampled_primaries"):
+            realtime_demo_module._target_sampled_primaries(
+                {"target_sampled_primaries": invalid}
+            )
+
+
+def test_transport_budget_radius_ignores_pf_count_radius_override() -> None:
+    """DSS budgeting must use the native crystal instead of a PF-only override."""
+    runtime_config = {
+        "detector_model": {"crystal_radius_m": 0.041},
+        "pf_detector_count_radius_m": 0.25,
+    }
+
+    assert realtime_demo_module._transport_detector_budget_radius_m(
+        runtime_config
+    ) == pytest.approx(0.041)
+    assert realtime_demo_module._transport_detector_budget_radius_m(
+        {}
+    ) == pytest.approx(0.038)
+
+
+def test_adaptive_target_budget_fails_before_transport_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-invocation primary budgets must reject adaptive dwell before transport."""
+    runtime_config = {
+        "target_sampled_primaries": 1_500_000,
+        "primary_sampling_fraction": 1.0,
+        "accelerated_weighted_transport_enable": True,
+    }
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "load_runtime_config",
+        lambda _path: dict(runtime_config),
+    )
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "enforce_pure_runtime_settings",
+        lambda config: dict(config),
+    )
+    transport_setup_called = False
+
+    def _unexpected_transport_setup(**_kwargs: object) -> None:
+        """Record transport setup if the budget guard runs too late."""
+        nonlocal transport_setup_called
+        transport_setup_called = True
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "build_runtime_obstacle_environment",
+        _unexpected_transport_setup,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "target budget per Geant4 transport invocation.*adaptive planning.*"
+            "unsupported"
+        ),
+    ):
+        run_live_pf(
+            live=False,
+            adaptive_dwell=True,
+            measurement_time_s=30.0,
+            sim_config_path=None,
+            save_outputs=False,
+        )
+
+    assert transport_setup_called is False
+
+
+def test_weighted_pf_runtime_contract_accepts_single_evidence_path() -> None:
+    """Weighted transport should pass only with complete covariance evidence."""
+    realtime_demo_module._validate_weighted_pf_runtime_contract(
+        {
+            "primary_sampling_fraction": 0.2,
+            "accelerated_weighted_transport_enable": True,
+        },
+        count_likelihood_model="student_t",
+        observation_variance_semantics="complete_statistical",
+        direct_spectrum_likelihood_enable=False,
+        shield_contrast_likelihood_enable=False,
+        shield_view_ratio_likelihood_enable=False,
+        planning_primary_history_weight=5.0,
+    )
+    realtime_demo_module._validate_weighted_pf_runtime_contract(
+        {
+            "primary_sampling_fraction": 1.0,
+            "target_sampled_primaries": 100000,
+            "accelerated_weighted_transport_enable": True,
+        },
+        count_likelihood_model="student_t",
+        observation_variance_semantics="complete_statistical",
+        direct_spectrum_likelihood_enable=False,
+        shield_contrast_likelihood_enable=False,
+        shield_view_ratio_likelihood_enable=False,
+        planning_primary_history_weight=1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "runtime_config",
+        "count_likelihood_model",
+        "variance_semantics",
+        "direct_enabled",
+        "contrast_enabled",
+        "ratio_enabled",
+        "history_weight",
+        "error_match",
+    ),
+    [
+        (
+            {"primary_sampling_fraction": 0.2},
+            "student_t",
+            "complete_statistical",
+            False,
+            False,
+            False,
+            5.0,
+            "accelerated_weighted_transport_enable",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "student_t",
+            "additional_model_uncertainty",
+            False,
+            False,
+            False,
+            5.0,
+            "complete_statistical",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "poisson",
+            "complete_statistical",
+            False,
+            False,
+            False,
+            5.0,
+            "gaussian or student_t",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "student_t",
+            "complete_statistical",
+            True,
+            False,
+            False,
+            5.0,
+            "direct spectrum",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "student_t",
+            "complete_statistical",
+            False,
+            True,
+            False,
+            5.0,
+            "auxiliary likelihoods",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "student_t",
+            "complete_statistical",
+            False,
+            False,
+            True,
+            5.0,
+            "auxiliary likelihoods",
+        ),
+        (
+            {
+                "primary_sampling_fraction": 0.2,
+                "accelerated_weighted_transport_enable": True,
+            },
+            "student_t",
+            "complete_statistical",
+            False,
+            False,
+            False,
+            50.0,
+            "reciprocal",
+        ),
+        (
+            {"primary_sampling_fraction": 1.0, "target_sampled_primaries": 100000},
+            "student_t",
+            "complete_statistical",
+            False,
+            False,
+            False,
+            1.0,
+            "accelerated_weighted_transport_enable",
+        ),
+    ],
+)
+def test_weighted_pf_runtime_contract_fails_closed(
+    runtime_config: dict[str, object],
+    count_likelihood_model: str,
+    variance_semantics: str,
+    direct_enabled: bool,
+    contrast_enabled: bool,
+    ratio_enabled: bool,
+    history_weight: float,
+    error_match: str,
+) -> None:
+    """Each weighted-runtime double-counting guard should fail independently."""
+    with pytest.raises(ValueError, match=error_match):
+        realtime_demo_module._validate_weighted_pf_runtime_contract(
+            runtime_config,
+            count_likelihood_model=count_likelihood_model,
+            observation_variance_semantics=variance_semantics,
+            direct_spectrum_likelihood_enable=direct_enabled,
+            shield_contrast_likelihood_enable=contrast_enabled,
+            shield_view_ratio_likelihood_enable=ratio_enabled,
+            planning_primary_history_weight=history_weight,
+        )
 
 
 def test_pf_strength_prior_uses_predeclared_generator_population() -> None:
@@ -4278,6 +4576,422 @@ def test_adaptive_dwell_chunks_stop_at_ready_counts(
         (1.5, 2.5, 0.5),
     )
     assert commands[1].travel_waypoints_xyz is None
+
+
+def test_adaptive_chunk_metadata_aggregates_dynamic_transport_provenance() -> None:
+    """Merged adaptive observations must not expose the final chunk as aggregate."""
+    energy_edges = [0.0, 1.0, 2.0]
+
+    def _observation(
+        *,
+        step_id: int,
+        dwell_time_s: float,
+        spectrum: list[float],
+        spectrum_variance: list[float],
+        expected_unthinned: float,
+        expected_sampled: float,
+        sampling_fraction: float,
+        actual_primaries: int,
+        dead_time_scale: float,
+    ) -> SimulationObservation:
+        """Build one native-like dynamic-budget transport chunk."""
+        return SimulationObservation(
+            step_id=step_id,
+            detector_pose_xyz=(1.0, 2.0, 0.5),
+            detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+            fe_orientation_index=0,
+            pb_orientation_index=1,
+            spectrum_counts=spectrum,
+            energy_bin_edges_keV=energy_edges,
+            metadata={
+                "dwell_time_s": dwell_time_s,
+                "num_primaries": actual_primaries,
+                "expected_detector_equivalent_primaries": expected_unthinned,
+                "expected_unthinned_primaries": expected_unthinned,
+                "expected_sampled_primaries": expected_sampled,
+                "primary_sampling_fraction": sampling_fraction,
+                "primary_history_weight": 1.0 / sampling_fraction,
+                "requested_primary_sampling_fraction": 1.0,
+                "target_sampled_primaries": 1_500_000,
+                "primary_sampling_budget_enabled": True,
+                "primary_sampling_fraction_resolution": (
+                    "target_budget_limited"
+                    if sampling_fraction < 1.0
+                    else "maximum_fraction_limited"
+                ),
+                "history_thinning_enabled": sampling_fraction < 1.0,
+                "transport_history_mode": (
+                    "weighted_thinning"
+                    if sampling_fraction < 1.0
+                    else "full_unit_weight"
+                ),
+                "dead_time_observed_scale": dead_time_scale,
+                "spectrum_count_variance": spectrum_variance,
+                "spectrum_variance_semantics": (
+                    "compound_poisson_sumw2_includes_counting"
+                ),
+                "spectrum_variance_dead_time_propagation": ("fixed_observed_scale"),
+                "weighted_spectrum_sumw2": float(sum(spectrum_variance)),
+                "run_time_s": 7.5,
+                "total_spectrum_counts": float(sum(spectrum)),
+            },
+        )
+
+    observations = [
+        _observation(
+            step_id=100,
+            dwell_time_s=2.0,
+            spectrum=[10.0, 20.0],
+            spectrum_variance=[12.0, 24.0],
+            expected_unthinned=2_000_000.0,
+            expected_sampled=1_500_000.0,
+            sampling_fraction=0.75,
+            actual_primaries=1_499_000,
+            dead_time_scale=0.98,
+        ),
+        _observation(
+            step_id=101,
+            dwell_time_s=1.0,
+            spectrum=[5.0, 8.0],
+            spectrum_variance=[5.0, 8.0],
+            expected_unthinned=1_000_000.0,
+            expected_sampled=1_000_000.0,
+            sampling_fraction=1.0,
+            actual_primaries=1_001_000,
+            dead_time_scale=0.99,
+        ),
+    ]
+
+    merged = realtime_demo_module._merge_adaptive_observation_chunks(
+        logical_step_id=1,
+        observations=observations,
+        chunk_live_times_s=[2.0, 1.0],
+        ready_reason="isotope_count_estimates_ready",
+        counts_by_isotope={"Cs-137": 10.0},
+        count_variance_by_isotope={"Cs-137": 4.0},
+        detected_isotopes={"Cs-137"},
+    )
+    metadata = merged.metadata
+
+    assert metadata["dwell_time_s"] == pytest.approx(3.0)
+    assert metadata["expected_unthinned_primaries"] == pytest.approx(3_000_000.0)
+    assert metadata["expected_sampled_primaries"] == pytest.approx(2_500_000.0)
+    assert metadata["num_primaries"] == pytest.approx(2_500_000.0)
+    assert metadata["primary_sampling_fraction"] == pytest.approx(5.0 / 6.0)
+    assert metadata["primary_history_weight"] == pytest.approx(1.2)
+    assert metadata["primary_sampling_fraction_resolution"] == (
+        "adaptive_chunk_aggregate"
+    )
+    assert metadata["adaptive_dwell_chunk_primary_sampling_fractions"] == [
+        0.75,
+        1.0,
+    ]
+    assert metadata["adaptive_dwell_chunk_primary_history_weights"] == pytest.approx(
+        [4.0 / 3.0, 1.0]
+    )
+    assert metadata["adaptive_dwell_target_sampled_primaries_semantics"] == (
+        "per_geant4_transport_invocation_not_per_logical_observation"
+    )
+    assert "dead_time_observed_scale" not in metadata
+    assert metadata["adaptive_dwell_dead_time_observed_scales"] == pytest.approx(
+        [0.98, 0.99]
+    )
+    assert metadata["spectrum_variance_dead_time_propagation"] == (
+        "independent_chunk_factored_dead_time_jacobians"
+    )
+    provenance = metadata["adaptive_dwell_transport_chunk_provenance"]
+    assert len(provenance) == 2
+    assert provenance[0]["step_id"] == 100
+    assert provenance[0]["expected_unthinned_primaries"] == pytest.approx(2_000_000.0)
+    assert provenance[0]["primary_sampling_fraction"] == pytest.approx(0.75)
+    assert provenance[1]["step_id"] == 101
+    assert provenance[1]["primary_history_weight"] == pytest.approx(1.0)
+
+    logged_provenance = _measurement_transport_provenance(metadata)
+    assert logged_provenance["adaptive_dwell_transport_chunk_provenance"] == (
+        provenance
+    )
+    assert logged_provenance["adaptive_dwell_effective_primary_sampling_fraction"] == (
+        pytest.approx(5.0 / 6.0)
+    )
+
+
+def test_adaptive_transport_decomposition_requires_every_chunk() -> None:
+    """Adaptive transport decomposition totals must cover every child chunk."""
+    complete_values = {
+        "transport_detected_counts_Cs-137": (1.0, 2.0),
+        "transport_uncollided_primary_counts_src0_Cs-137": (3.0, 4.0),
+        "transport_interacted_primary_counts_src0_Cs-137_661p657keV": (
+            5.0,
+            6.0,
+        ),
+        "transport_secondary_counts_src0_Cs-137_661p657keV": (7.0, 8.0),
+    }
+    incomplete_keys = (
+        "transport_detected_counts_missing_isotope",
+        "transport_uncollided_primary_counts_missing_source",
+        "transport_interacted_primary_counts_missing_line",
+        "transport_secondary_counts_missing_line",
+    )
+    observations: list[SimulationObservation] = []
+    for chunk_index in range(2):
+        metadata = {key: values[chunk_index] for key, values in complete_values.items()}
+        if chunk_index == 1:
+            metadata.update({key: 100.0 for key in incomplete_keys})
+        observations.append(
+            SimulationObservation(
+                step_id=200 + chunk_index,
+                detector_pose_xyz=(1.0, 2.0, 0.5),
+                detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+                fe_orientation_index=0,
+                pb_orientation_index=0,
+                spectrum_counts=[1.0, 2.0],
+                energy_bin_edges_keV=[0.0, 1.0, 2.0],
+                metadata=metadata,
+            )
+        )
+
+    merged = realtime_demo_module._merge_adaptive_observation_chunks(
+        logical_step_id=2,
+        observations=observations,
+        chunk_live_times_s=[1.0, 1.0],
+        ready_reason="isotope_count_estimates_ready",
+        counts_by_isotope={},
+        count_variance_by_isotope={},
+        detected_isotopes=set(),
+    )
+
+    for key, values in complete_values.items():
+        assert merged.metadata[key] == pytest.approx(sum(values))
+    for key in incomplete_keys:
+        assert key not in merged.metadata
+
+
+def test_adaptive_dwell_preserves_native_covariance_contract_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adaptive evaluation should pass raw transport only for one native chunk."""
+    config = _spectrum_config_from_runtime_config(
+        {"detector_scoring_mode": "incident_gamma_energy"}
+    )
+    decomposer = SpectralDecomposer(config)
+    calls: list[
+        tuple[
+            dict[str, object],
+            np.ndarray | None,
+            tuple[object, ...],
+        ]
+    ] = []
+
+    class _FakeRuntime:
+        """Return native-like incident-energy chunks with count variance."""
+
+        def step(self, command: SimulationCommand) -> SimulationObservation:
+            """Return one deterministic weighted incident-energy tally."""
+            energy = np.asarray(decomposer.energy_axis, dtype=float)
+            step = float(np.median(np.diff(energy)))
+            spectrum = np.zeros_like(energy, dtype=float)
+            spectrum[100] = 60.0
+            variance = np.zeros_like(energy, dtype=float)
+            variance[100] = 300.0
+            return SimulationObservation(
+                step_id=command.step_id,
+                detector_pose_xyz=command.target_pose_xyz,
+                detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+                fe_orientation_index=command.fe_orientation_index,
+                pb_orientation_index=command.pb_orientation_index,
+                spectrum_counts=spectrum.tolist(),
+                energy_bin_edges_keV=np.concatenate(
+                    [energy, [energy[-1] + step]]
+                ).tolist(),
+                metadata={
+                    "backend": "geant4",
+                    "detector_scoring_mode": "incident_gamma_energy",
+                    "detector_fast_scoring": True,
+                    "spectrum_count_variance": variance.tolist(),
+                    "spectrum_variance_semantics": (
+                        "compound_poisson_sumw2_includes_counting"
+                    ),
+                    "spectrum_variance_dead_time_propagation": ("fixed_observed_scale"),
+                    "dead_time_observed_scale": 1.0,
+                    "dead_time_tau_s": 0.0,
+                    "dwell_time_s": float(command.dwell_time_s),
+                },
+            )
+
+    def _fake_evaluate(
+        _decomposer: SpectralDecomposer,
+        _spectrum: np.ndarray,
+        **kwargs: object,
+    ) -> RuntimeCountResult:
+        """Capture covariance inputs and become ready on the second chunk."""
+        metadata = dict(kwargs["transport_metadata"])
+        transport = kwargs.get("transport_spectrum")
+        chunks = tuple(kwargs.get("transport_covariance_chunks", ()))
+        calls.append(
+            (
+                metadata,
+                None if transport is None else np.asarray(transport, dtype=float),
+                chunks,
+            )
+        )
+        count = 60.0 * len(calls)
+        return RuntimeCountResult(
+            counts={"Cs-137": count},
+            variances={"Cs-137": 100.0},
+            detected={"Cs-137"},
+            covariance={"Cs-137": {"Cs-137": 100.0}},
+        )
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_evaluate_spectrum_count_result",
+        _fake_evaluate,
+    )
+    result = _acquire_spectrum_observation(
+        simulation_runtime=_FakeRuntime(),
+        decomposer=decomposer,
+        step_id=11,
+        pose_xyz=np.array([1.0, 2.0, 0.5], dtype=float),
+        fe_idx=0,
+        pb_idx=0,
+        live_time_s=4.0,
+        travel_time_s=0.0,
+        shield_actuation_time_s=0.0,
+        adaptive_dwell=True,
+        adaptive_dwell_chunk_s=2.0,
+        adaptive_min_dwell_s=2.0,
+        adaptive_ready_min_counts=100.0,
+        adaptive_ready_min_isotopes=1,
+        adaptive_ready_min_snr=0.0,
+        spectrum_count_method="response_poisson",
+        detect_threshold_abs=0.0,
+        detect_threshold_rel=0.0,
+        detect_threshold_rel_by_isotope={},
+        min_peaks_by_isotope=None,
+    )
+
+    assert result[-1] == 2
+    assert len(calls) == 2
+    assert calls[0][0]["spectrum_variance_dead_time_propagation"] == (
+        "fixed_observed_scale"
+    )
+    assert calls[0][1] is not None
+    assert calls[0][2] == ()
+    assert calls[1][0]["spectrum_variance_dead_time_propagation"] == (
+        "fixed_observed_scale"
+    )
+    assert calls[1][1] is None
+    assert len(calls[1][2]) == 2
+    assert result[0].metadata["spectrum_variance_dead_time_propagation"] == (
+        "independent_chunk_factored_dead_time_jacobians"
+    )
+
+
+@pytest.mark.parametrize("native_first", (False, True))
+def test_adaptive_dwell_rejects_mixed_covariance_chunks_in_either_order(
+    monkeypatch: pytest.MonkeyPatch,
+    native_first: bool,
+) -> None:
+    """Adaptive dwell must fail closed for either covariance-mode ordering."""
+    config = _spectrum_config_from_runtime_config(
+        {"detector_scoring_mode": "incident_gamma_energy"}
+    )
+    decomposer = SpectralDecomposer(config)
+
+    class _FakeRuntime:
+        """Return one native and one approximate covariance chunk."""
+
+        def __init__(self) -> None:
+            """Initialize the deterministic chunk counter."""
+            self.calls = 0
+
+        def step(self, command: SimulationCommand) -> SimulationObservation:
+            """Return covariance metadata in the parameterized order."""
+            is_native = native_first if self.calls == 0 else not native_first
+            self.calls += 1
+            energy = np.asarray(decomposer.energy_axis, dtype=float)
+            step = float(np.median(np.diff(energy)))
+            spectrum = np.zeros_like(energy, dtype=float)
+            spectrum[100] = 1.0
+            variance = np.zeros_like(energy, dtype=float)
+            variance[100] = 1.0
+            metadata: dict[str, object] = {
+                "backend": "geant4",
+                "spectrum_count_variance": variance.tolist(),
+            }
+            if is_native:
+                metadata.update(
+                    {
+                        "detector_scoring_mode": "incident_gamma_energy",
+                        "detector_fast_scoring": True,
+                        "spectrum_variance_semantics": (
+                            "compound_poisson_sumw2_includes_counting"
+                        ),
+                        "spectrum_variance_dead_time_propagation": (
+                            "fixed_observed_scale"
+                        ),
+                        "dead_time_observed_scale": 1.0,
+                        "dead_time_tau_s": 0.0,
+                        "dwell_time_s": float(command.dwell_time_s),
+                    }
+                )
+            return SimulationObservation(
+                step_id=command.step_id,
+                detector_pose_xyz=command.target_pose_xyz,
+                detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+                fe_orientation_index=command.fe_orientation_index,
+                pb_orientation_index=command.pb_orientation_index,
+                spectrum_counts=spectrum.tolist(),
+                energy_bin_edges_keV=np.concatenate(
+                    [energy, [energy[-1] + step]]
+                ).tolist(),
+                metadata=metadata,
+            )
+
+    def _fake_evaluate(
+        _decomposer: SpectralDecomposer,
+        _spectrum: np.ndarray,
+        **_kwargs: object,
+    ) -> RuntimeCountResult:
+        """Keep acquisition running until the second chunk is inspected."""
+        return RuntimeCountResult(
+            counts={"Cs-137": 0.0},
+            variances={"Cs-137": 1.0},
+            detected=set(),
+        )
+
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_evaluate_spectrum_count_result",
+        _fake_evaluate,
+    )
+    with pytest.raises(
+        ValueError,
+        match="cannot mix native and approximate covariance chunks",
+    ):
+        _acquire_spectrum_observation(
+            simulation_runtime=_FakeRuntime(),
+            decomposer=decomposer,
+            step_id=12,
+            pose_xyz=np.array([1.0, 2.0, 0.5], dtype=float),
+            fe_idx=0,
+            pb_idx=0,
+            live_time_s=4.0,
+            travel_time_s=0.0,
+            shield_actuation_time_s=0.0,
+            adaptive_dwell=True,
+            adaptive_dwell_chunk_s=2.0,
+            adaptive_min_dwell_s=2.0,
+            adaptive_ready_min_counts=100.0,
+            adaptive_ready_min_isotopes=1,
+            adaptive_ready_min_snr=0.0,
+            spectrum_count_method="response_poisson",
+            detect_threshold_abs=0.0,
+            detect_threshold_rel=0.0,
+            detect_threshold_rel_by_isotope={},
+            min_peaks_by_isotope=None,
+        )
 
 
 def test_adaptive_dwell_can_run_without_cap(monkeypatch: pytest.MonkeyPatch) -> None:

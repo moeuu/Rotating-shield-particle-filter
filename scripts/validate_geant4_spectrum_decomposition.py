@@ -124,6 +124,7 @@ VALIDATION_METADATA_PREFIXES = (
     "engine_mode",
     "emission_model",
     "physics_profile",
+    "accelerated_weighted_transport_enable",
     "source_equivalent",
     "transport_detected",
     "transport_uncollided",
@@ -138,11 +139,25 @@ VALIDATION_METADATA_PREFIXES = (
     "num_primaries",
     "expected_physical_primaries",
     "expected_detector_equivalent_primaries",
+    "expected_unthinned_primaries",
     "expected_sampled_primaries",
     "expected_primary_semantics",
     "primary_sampling",
+    "requested_primary_sampling",
+    "target_sampled_primaries",
     "primary_history",
+    "transport_history",
+    "history_thinning",
+    "transport_tally",
     "weighted",
+    "spectrum_variance",
+    "dead_time",
+    "pre_dead_time",
+    "post_dead_time",
+    "effective_entries",
+    "dwell_time_s",
+    "primaries_per_sec",
+    "seed",
     "source_rate",
     "source_bias",
     "intensity_cps_1m_definition",
@@ -301,6 +316,13 @@ def build_runtime_count_likelihood_specs(
             False,
         )
     )
+    observation_variance_semantics = str(
+        _runtime_count_likelihood_value(
+            runtime_config,
+            "observation_count_variance_semantics",
+            "",
+        )
+    )
     student_t_df = float(
         _runtime_count_likelihood_value(
             runtime_config,
@@ -338,6 +360,7 @@ def build_runtime_count_likelihood_specs(
             observation_count_variance_includes_counting_noise=(
                 observation_variance_includes_counting_noise
             ),
+            observation_count_variance_semantics=(observation_variance_semantics),
             student_t_df=max(student_t_df, 1.0),
         )
         for isotope in ISOTOPES
@@ -361,6 +384,9 @@ def _count_likelihood_spec_payload(spec: CountLikelihoodSpec) -> dict[str, Any]:
         "low_count_transition_counts": spec.low_count_transition_counts,
         "observation_count_variance_includes_counting_noise": bool(
             spec.observation_count_variance_includes_counting_noise
+        ),
+        "observation_count_variance_semantics": str(
+            spec.observation_count_variance_semantics
         ),
         "student_t_df": spec.student_t_df,
         "student_t_marginal_variance_over_scale_squared": marginal_factor,
@@ -538,7 +564,11 @@ def _is_inside_known_obstacle_transport_volume(
             box = np.asarray(component.box_m, dtype=float)
             lower = box[:3] + tol
             upper = box[3:] - tol
-            if np.all(upper > lower) and np.all(point > lower) and np.all(point < upper):
+            if (
+                np.all(upper > lower)
+                and np.all(point > lower)
+                and np.all(point < upper)
+            ):
                 return True
     return False
 
@@ -590,7 +620,11 @@ def _surface_source_position(
                 x, y = float(rng.uniform(x0, x1)), y0 - 0.08
             else:
                 x, y = float(rng.uniform(x0, x1)), y1 + 0.08
-            z = float(rng.uniform(0.45, min(_component_top_z(instance), room_size_xyz[2] - 0.2)))
+            z = float(
+                rng.uniform(
+                    0.45, min(_component_top_z(instance), room_size_xyz[2] - 0.2)
+                )
+            )
         else:
             x = float(rng.uniform(x0 + 0.12, x1 - 0.12))
             y = float(rng.uniform(y0 + 0.12, y1 - 0.12))
@@ -888,9 +922,7 @@ def _enable_batched_pair_screening(
 ) -> ContinuousKernel:
     """Select Torch batching for exact all-pair detector-pose validation."""
     if not _TORCH_AVAILABLE or torch is None:
-        raise RuntimeError(
-            "Exact all-shield-pair screening requires torch batching."
-        )
+        raise RuntimeError("Exact all-shield-pair screening requires torch batching.")
     requested_device = str(
         runtime_config.get("validation_pair_screening_device", "")
     ).strip()
@@ -1006,7 +1038,9 @@ def _detector_selection_features(
         }
         features["screened_shield_pair_count"] = int(count_matrix.shape[0])
         return features
-    counts = expected_pf_counts_with_kernel(candidate_case, runtime_config, target_kernel)
+    counts = expected_pf_counts_with_kernel(
+        candidate_case, runtime_config, target_kernel
+    )
     count_vector = np.asarray(
         [float(counts[isotope]) for isotope in ISOTOPES],
         dtype=float,
@@ -1215,13 +1249,19 @@ def generated_cases(
     distances = (1.0, 1.5, 2.2, 3.0, 4.0, 5.2, 6.5)
     cases: list[ValidationCase] = []
     for case_index in range(max(0, int(num_cases))):
-        detector = np.asarray(detector_positions[case_index % len(detector_positions)], dtype=float)
+        detector = np.asarray(
+            detector_positions[case_index % len(detector_positions)], dtype=float
+        )
         source_count = 1 + (case_index % 5)
         isotope_program = _source_isotope_program(case_index, source_count)
         sources: list[ValidationSource] = []
         for source_index in range(source_count):
-            direction = directions[(case_index * 3 + source_index * 5) % len(directions)]
-            distance = float(distances[(case_index + source_index * 2) % len(distances)])
+            direction = directions[
+                (case_index * 3 + source_index * 5) % len(directions)
+            ]
+            distance = float(
+                distances[(case_index + source_index * 2) % len(distances)]
+            )
             jitter = rng.normal(0.0, 0.18, size=3)
             jitter[2] *= 0.35
             position = _clamp_room_position(
@@ -1342,7 +1382,9 @@ def generated_environment_sweep_cases(
         source_tuple = tuple(sources)
         template_counts: dict[str, int] = {}
         for instance in instances:
-            template_counts[instance.template] = template_counts.get(instance.template, 0) + 1
+            template_counts[instance.template] = (
+                template_counts.get(instance.template, 0) + 1
+            )
         template_summary = ",".join(
             f"{template}:{count}" for template, count in sorted(template_counts.items())
         )
@@ -1370,8 +1412,12 @@ def generated_environment_sweep_cases(
                         ),
                         detector_pose_xyz=detector,
                         sources=source_tuple,
-                        fe_index=int((rotation_index + 2 * point_index + env_index) % 8),
-                        pb_index=int((3 * rotation_index + point_index + 2 * env_index) % 8),
+                        fe_index=int(
+                            (rotation_index + 2 * point_index + env_index) % 8
+                        ),
+                        pb_index=int(
+                            (3 * rotation_index + point_index + 2 * env_index) % 8
+                        ),
                         dwell_time_s=float(dwell_time_s),
                         obstacle_cells=tuple(grid.blocked_cells),
                         obstacle_instances=instances,
@@ -1532,7 +1578,9 @@ def _generated_multi_isotope_source_case(
         score = _detector_selection_score(
             features,
             mode=effective_selection_mode,
-            min_target_counts=float(min_isotope_target_counts) if require_target else 0.0,
+            min_target_counts=float(min_isotope_target_counts)
+            if require_target
+            else 0.0,
         )
         candidates.append(
             DetectorPoseCandidate(
@@ -1578,30 +1626,28 @@ def _generated_multi_isotope_source_case(
         )
     template_counts: dict[str, int] = {}
     for instance in instances:
-        template_counts[instance.template] = template_counts.get(instance.template, 0) + 1
+        template_counts[instance.template] = (
+            template_counts.get(instance.template, 0) + 1
+        )
     template_summary = ",".join(
         f"{template}:{count}" for template, count in sorted(template_counts.items())
     )
     max_tau = _obstacle_tau_for_sources(transport_grid, best_detector, source_tuple)
     min_target_text = (
-        f"; min_isotope_target={best_min_target:.1f}"
-        if require_target
-        else ""
+        f"; min_isotope_target={best_min_target:.1f}" if require_target else ""
     )
     detector_metadata: dict[str, Any] = {
         "detector_selection_requested_mode": requested_selection_mode,
         "detector_selection_effective_mode": effective_selection_mode,
         "detector_selection_score": float(best_score),
         "detector_selection_attempts": int(max_detector_attempts),
-        "detector_selection_preselection_features": dict(
-            selected.proxy_features
-        ),
-        "detector_selection_exact_validation_attempts": int(
-            exact_validation_attempts
-        ),
+        "detector_selection_preselection_features": dict(selected.proxy_features),
+        "detector_selection_exact_validation_attempts": int(exact_validation_attempts),
         "detector_selection_target_gate_passed": target_gate_passed,
         "detector_selection_exact_pair_count": (
-            64 if require_target and screen_all_shield_pairs else (1 if require_target else 0)
+            64
+            if require_target and screen_all_shield_pairs
+            else (1 if require_target else 0)
         ),
         "detector_selection_batch_backend": (
             None
@@ -1653,7 +1699,9 @@ def _min_expected_count_over_shield_pairs(
     return min_count if np.isfinite(min_count) else 0.0
 
 
-def _expand_case_over_all_shield_pairs(case: ValidationCase) -> Iterator[ValidationCase]:
+def _expand_case_over_all_shield_pairs(
+    case: ValidationCase,
+) -> Iterator[ValidationCase]:
     """Yield copies of one scenario for every Fe/Pb shield orientation pair."""
     for fe_index in range(8):
         for pb_index in range(8):
@@ -1868,7 +1916,7 @@ def default_cases() -> list[ValidationCase]:
         ),
         ValidationCase(
             name="three_isotope_obstacle_stress",
-                description="Three-isotope mixture with a concrete obstacle.",
+            description="Three-isotope mixture with a concrete obstacle.",
             detector_pose_xyz=(1.0, 1.5, 0.5),
             dwell_time_s=20.0,
             obstacle_cells=((2, 1),),
@@ -1907,7 +1955,9 @@ def build_scene(case: ValidationCase, usd_path: str | None) -> SceneDescription:
     )
 
 
-def spectrum_config_from_runtime_config(runtime_config: dict[str, Any]) -> SpectrumConfig:
+def spectrum_config_from_runtime_config(
+    runtime_config: dict[str, Any],
+) -> SpectrumConfig:
     """Build the spectrum configuration used by the runtime count extractor."""
     return build_spectrum_config_from_runtime_config(runtime_config)
 
@@ -1921,9 +1971,8 @@ def analysis_spectrum_from_observation(
     spectrum = np.asarray(raw_spectrum, dtype=float)
     scoring_mode = str(metadata.get("detector_scoring_mode", "")).strip().lower()
     fast_scoring = str(metadata.get("detector_fast_scoring", "")).strip().lower()
-    should_fold = (
-        bool(decomposer.config.apply_incident_gamma_detector_response)
-        and (scoring_mode == "incident_gamma_energy" or fast_scoring == "true")
+    should_fold = bool(decomposer.config.apply_incident_gamma_detector_response) and (
+        scoring_mode == "incident_gamma_energy" or fast_scoring == "true"
     )
     if should_fold:
         return decomposer.fold_incident_gamma_spectrum(spectrum)
@@ -1944,9 +1993,8 @@ def analysis_spectrum_variance_from_observation(
         return None
     scoring_mode = str(metadata.get("detector_scoring_mode", "")).strip().lower()
     fast_scoring = str(metadata.get("detector_fast_scoring", "")).strip().lower()
-    should_fold = (
-        bool(decomposer.config.apply_incident_gamma_detector_response)
-        and (scoring_mode == "incident_gamma_energy" or fast_scoring == "true")
+    should_fold = bool(decomposer.config.apply_incident_gamma_detector_response) and (
+        scoring_mode == "incident_gamma_energy" or fast_scoring == "true"
     )
     variance = np.clip(variance, a_min=0.0, a_max=None)
     if should_fold:
@@ -2005,7 +2053,9 @@ def _metadata_vector(
     components: tuple[str, str, str] = ("x", "y", "z"),
 ) -> np.ndarray | None:
     """Read a finite metadata vector with ``prefix_component`` keys."""
-    values = [_metadata_float(metadata, f"{prefix}_{component}") for component in components]
+    values = [
+        _metadata_float(metadata, f"{prefix}_{component}") for component in components
+    ]
     if any(value is None for value in values):
         return None
     return np.asarray(values, dtype=float)
@@ -2146,8 +2196,12 @@ def weighted_mu_diagnostics(
             "pf_mu_pb_weighted_cm_inv": float(pf_pb),
             "geant4_mu_fe_weighted_cm_inv": float(g4_fe),
             "geant4_mu_pb_weighted_cm_inv": float(g4_pb),
-            "pf_minus_geant4_mu_fe_rel": float((pf_fe - g4_fe) / max(abs(g4_fe), 1.0e-12)),
-            "pf_minus_geant4_mu_pb_rel": float((pf_pb - g4_pb) / max(abs(g4_pb), 1.0e-12)),
+            "pf_minus_geant4_mu_fe_rel": float(
+                (pf_fe - g4_fe) / max(abs(g4_fe), 1.0e-12)
+            ),
+            "pf_minus_geant4_mu_pb_rel": float(
+                (pf_pb - g4_pb) / max(abs(g4_pb), 1.0e-12)
+            ),
         }
     return diagnostics
 
@@ -2204,7 +2258,9 @@ def measurement_source_scale_for_case(
     if isinstance(pair_scales, dict):
         isotope_pair_scales = pair_scales.get(str(isotope), {})
         if isinstance(isotope_pair_scales, dict):
-            value = isotope_pair_scales.get(str(pair_id), isotope_pair_scales.get(pair_id))
+            value = isotope_pair_scales.get(
+                str(pair_id), isotope_pair_scales.get(pair_id)
+            )
             if value is not None:
                 return max(float(value), 0.0)
     scales = runtime_config.get("measurement_scale_by_isotope", {})
@@ -2314,9 +2370,7 @@ def expected_pf_count_diagnostics(
                     "scaled_base_counts": base_counts * source_scale,
                     "adjusted_counts": adjusted_counts,
                     "scaled_adjusted_counts": adjusted_counts * source_scale,
-                    "shield_tau_feature": float(
-                        term.get("shield_tau_feature", 0.0)
-                    ),
+                    "shield_tau_feature": float(term.get("shield_tau_feature", 0.0)),
                     "fe_tau_feature": float(term.get("fe_tau_feature", 0.0)),
                     "pb_tau_feature": float(term.get("pb_tau_feature", 0.0)),
                     "obstacle_tau_feature": float(
@@ -2326,12 +2380,8 @@ def expected_pf_count_diagnostics(
                     "distance_shield_feature": float(
                         term.get("distance_shield_feature", 0.0)
                     ),
-                    "distance_fe_feature": float(
-                        term.get("distance_fe_feature", 0.0)
-                    ),
-                    "distance_pb_feature": float(
-                        term.get("distance_pb_feature", 0.0)
-                    ),
+                    "distance_fe_feature": float(term.get("distance_fe_feature", 0.0)),
+                    "distance_pb_feature": float(term.get("distance_pb_feature", 0.0)),
                     "distance_obstacle_feature": float(
                         term.get("distance_obstacle_feature", 0.0)
                     ),
@@ -2342,29 +2392,31 @@ def expected_pf_count_diagnostics(
             case.dwell_time_s * source.intensity_cps_1m * full_kernel
         )
         row = {
-                "source_index": int(source_index),
-                "isotope": source.isotope,
-                "position_xyz": [float(value) for value in source.position_xyz],
-                "source_distance_m": float(source_distance_m),
-                "intensity_cps_1m": float(source.intensity_cps_1m),
-                "measurement_source_scale": float(source_scale),
-                "geometric_factor": float(geom),
-                "shield_attenuation": float(shield_att),
-                "obstacle_tau_center_ray": float(obstacle_tau),
-                "obstacle_attenuation_center_ray": float(obstacle_att),
-                "obstacle_tau_area_averaged": float(obstacle_tau_area),
-                "obstacle_attenuation_area_averaged": float(obstacle_att_area),
-                "source_extent_radius_m": float(kernel.source_extent_radius_m),
-                "source_extent_samples": int(kernel.source_extent_samples),
-                "full_kernel": float(full_kernel),
-                "geometric_counts": float(case.dwell_time_s * source.intensity_cps_1m * geom),
-                "shield_only_counts": float(
-                    case.dwell_time_s * source.intensity_cps_1m * geom * shield_att
-                ),
-                "full_target_counts": full_target_counts,
-                "scaled_full_target_counts": float(full_target_counts * source_scale),
-                "transport_response_terms": transport_terms,
-            }
+            "source_index": int(source_index),
+            "isotope": source.isotope,
+            "position_xyz": [float(value) for value in source.position_xyz],
+            "source_distance_m": float(source_distance_m),
+            "intensity_cps_1m": float(source.intensity_cps_1m),
+            "measurement_source_scale": float(source_scale),
+            "geometric_factor": float(geom),
+            "shield_attenuation": float(shield_att),
+            "obstacle_tau_center_ray": float(obstacle_tau),
+            "obstacle_attenuation_center_ray": float(obstacle_att),
+            "obstacle_tau_area_averaged": float(obstacle_tau_area),
+            "obstacle_attenuation_area_averaged": float(obstacle_att_area),
+            "source_extent_radius_m": float(kernel.source_extent_radius_m),
+            "source_extent_samples": int(kernel.source_extent_samples),
+            "full_kernel": float(full_kernel),
+            "geometric_counts": float(
+                case.dwell_time_s * source.intensity_cps_1m * geom
+            ),
+            "shield_only_counts": float(
+                case.dwell_time_s * source.intensity_cps_1m * geom * shield_att
+            ),
+            "full_target_counts": full_target_counts,
+            "scaled_full_target_counts": float(full_target_counts * source_scale),
+            "transport_response_terms": transport_terms,
+        }
         if metadata is not None:
             detected = _metadata_float(
                 metadata,
@@ -2485,8 +2537,7 @@ def _covariance_payload(
         for column_isotope in isotopes:
             fallback = (
                 _finite_variance(diagonal_variances.get(row_isotope, 1.0))
-                if row_isotope == column_isotope
-                and diagonal_variances is not None
+                if row_isotope == column_isotope and diagonal_variances is not None
                 else 0.0
             )
             try:
@@ -2511,9 +2562,7 @@ def _response_poisson_variance_stages(
     )
     component_diagnostics = diagnostics.get("runtime_variance_components", {})
     components_by_isotope = (
-        component_diagnostics
-        if isinstance(component_diagnostics, Mapping)
-        else {}
+        component_diagnostics if isinstance(component_diagnostics, Mapping) else {}
     )
     stages: dict[str, dict[str, float | bool]] = {}
     for isotope in ISOTOPES:
@@ -2570,10 +2619,7 @@ def _mahalanobis_squared(
         dtype=float,
     )
     matrix = np.asarray(
-        [
-            [float(covariance[row][column]) for column in isotopes]
-            for row in isotopes
-        ],
+        [[float(covariance[row][column]) for column in isotopes] for row in isotopes],
         dtype=float,
     )
     if not np.all(np.isfinite(residual)) or not np.all(np.isfinite(matrix)):
@@ -2606,8 +2652,7 @@ def _response_poisson_residual_diagnostics(
         if float(truth_counts.get(isotope, 0.0)) >= float(min_target)
     ]
     residuals = {
-        isotope: float(counts.get(isotope, 0.0))
-        - float(truth_counts.get(isotope, 0.0))
+        isotope: float(counts.get(isotope, 0.0)) - float(truth_counts.get(isotope, 0.0))
         for isotope in ISOTOPES
     }
     normalized: dict[str, dict[str, float]] = {
@@ -2780,10 +2825,11 @@ def _pf_count_likelihood_diagnostics(
             "for Student-t this is not its marginal variance"
         ),
         "observation_variance_semantics": (
-            "PF-projected response-Poisson observation variance; when its spec "
-            "declares included counting noise, max(observed_count, 1) is replaced "
-            "by the particle-dependent Poisson mean, then transport, spectrum, "
-            "and low-count components are added"
+            "PF-projected response-Poisson observation variance interpreted by "
+            "each likelihood spec: additional adds candidate Poisson variance, "
+            "counting_noise_inclusive replaces the observed plug-in term, and "
+            "complete_statistical adds no second Poisson term; configured model "
+            "discrepancy components remain separate"
         ),
         "likelihood_spec_by_isotope": {
             isotope: _count_likelihood_spec_payload(likelihood_specs[isotope])
@@ -2837,13 +2883,12 @@ def run_case(
         detect_threshold_abs=float(runtime_config.get("detect_threshold_abs", 50.0)),
         detect_threshold_rel=float(runtime_config.get("detect_threshold_rel", 0.0)),
         detect_threshold_rel_by_isotope={
-            "Co-60": float(
-                runtime_config.get("detect_threshold_rel_by_co60", 0.1)
-            )
+            "Co-60": float(runtime_config.get("detect_threshold_rel_by_co60", 0.1))
         },
         min_peaks_by_isotope={"Co-60": 2, "Eu-154": 2},
         spectrum_variance=spectrum_variance,
         transport_metadata=metadata,
+        transport_spectrum=raw_spectrum,
     )
     response_poisson_diagnostics = dict(
         getattr(decomposer, "last_response_poisson_diagnostics", {})
@@ -2858,8 +2903,7 @@ def run_case(
         for isotope in ISOTOPES
     }
     response_poisson_counts = {
-        isotope: float(runtime_counts.counts.get(isotope, 0.0))
-        for isotope in ISOTOPES
+        isotope: float(runtime_counts.counts.get(isotope, 0.0)) for isotope in ISOTOPES
     }
     response_poisson_variances = {
         isotope: float(runtime_counts.variances.get(isotope, 1.0))
@@ -2935,6 +2979,32 @@ def run_case(
         likelihood_specs,
         min_target=float(min_target),
     )
+    shield_contrast_config = runtime_config.get(
+        "pf_shield_contrast_likelihood",
+        {},
+    )
+    shield_ratio_config = runtime_config.get(
+        "pf_shield_view_ratio_likelihood",
+        {},
+    )
+    pf_count_likelihood_diagnostics["runtime_likelihood_guards"] = {
+        "observation_count_variance_semantics": str(
+            runtime_config.get("pf_observation_count_variance_semantics", "")
+        ),
+        "direct_spectrum_likelihood_enable": bool(
+            runtime_config.get("pf_direct_spectrum_likelihood_enable", True)
+        ),
+        "shield_contrast_likelihood_enable": bool(
+            shield_contrast_config.get("enabled", False)
+            if isinstance(shield_contrast_config, Mapping)
+            else False
+        ),
+        "shield_view_ratio_likelihood_enable": bool(
+            shield_ratio_config.get("enabled", False)
+            if isinstance(shield_ratio_config, Mapping)
+            else False
+        ),
+    }
     line_mu_diagnostics = weighted_mu_diagnostics(metadata, target_kernel)
     target_diagnostics = expected_pf_count_diagnostics(
         case,
@@ -2954,11 +3024,15 @@ def run_case(
         min_target=float(min_target),
     )
     uncollided_primary_counts = {
-        isotope: float(metadata.get(f"transport_uncollided_primary_counts_{isotope}", 0.0))
+        isotope: float(
+            metadata.get(f"transport_uncollided_primary_counts_{isotope}", 0.0)
+        )
         for isotope in ISOTOPES
     }
     interacted_primary_counts = {
-        isotope: float(metadata.get(f"transport_interacted_primary_counts_{isotope}", 0.0))
+        isotope: float(
+            metadata.get(f"transport_interacted_primary_counts_{isotope}", 0.0)
+        )
         for isotope in ISOTOPES
     }
     secondary_counts = {
@@ -2966,7 +3040,9 @@ def run_case(
         for isotope in ISOTOPES
     }
     non_uncollided_fraction = {
-        isotope: float(metadata.get(f"transport_non_uncollided_fraction_{isotope}", 0.0))
+        isotope: float(
+            metadata.get(f"transport_non_uncollided_fraction_{isotope}", 0.0)
+        )
         for isotope in ISOTOPES
     }
     orientation_count = int(len(target_kernel.orientations))
@@ -3051,10 +3127,14 @@ def run_case(
         "native_pb_shield_normal_y": _metadata_float(metadata, "pb_shield_normal_y"),
         "native_pb_shield_normal_z": _metadata_float(metadata, "pb_shield_normal_z"),
         "fe_shield_normal_dot": (
-            None if native_fe_float is None else float(np.dot(pf_fe_normal, native_fe_float))
+            None
+            if native_fe_float is None
+            else float(np.dot(pf_fe_normal, native_fe_float))
         ),
         "pb_shield_normal_dot": (
-            None if native_pb_float is None else float(np.dot(pf_pb_normal, native_pb_float))
+            None
+            if native_pb_float is None
+            else float(np.dot(pf_pb_normal, native_pb_float))
         ),
         "fe_shield_normal_max_abs_delta": (
             None
@@ -3224,8 +3304,7 @@ def run_case(
             "runtime": runtime_covariance,
             "estimator_sanitized": estimator_covariance,
             "projected_variance_by_isotope": {
-                isotope: float(projected_variances[isotope])
-                for isotope in ISOTOPES
+                isotope: float(projected_variances[isotope]) for isotope in ISOTOPES
             },
             "projection_config": {
                 "enabled": bool(
@@ -3286,18 +3365,10 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         covariance_payload = dict(result.get("response_poisson_covariance", {}))
         formal_covariance = dict(covariance_payload.get("formal", {}))
         runtime_covariance = dict(covariance_payload.get("runtime", {}))
-        estimator_covariance = dict(
-            covariance_payload.get("estimator_sanitized", {})
-        )
-        residual_diagnostics = dict(
-            covariance_payload.get("residual_diagnostics", {})
-        )
-        case_mahalanobis = dict(
-            residual_diagnostics.get("mahalanobis_squared", {})
-        )
-        pf_likelihood_payload = dict(
-            result.get("pf_count_likelihood_diagnostics", {})
-        )
+        estimator_covariance = dict(covariance_payload.get("estimator_sanitized", {}))
+        residual_diagnostics = dict(covariance_payload.get("residual_diagnostics", {}))
+        case_mahalanobis = dict(residual_diagnostics.get("mahalanobis_squared", {}))
+        pf_likelihood_payload = dict(result.get("pf_count_likelihood_diagnostics", {}))
         pf_likelihood_targets = dict(pf_likelihood_payload.get("targets", {}))
         runtime_pf_likelihood = dict(
             pf_likelihood_targets.get("runtime_pf_forward", {})
@@ -3322,9 +3393,7 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             interacted_primary_counts = float(
                 item.get("transport_interacted_primary_counts", 0.0)
             )
-            secondary_counts = float(
-                item.get("transport_secondary_counts", 0.0)
-            )
+            secondary_counts = float(item.get("transport_secondary_counts", 0.0))
             non_uncollided_fraction = float(
                 item.get("transport_non_uncollided_fraction", 0.0)
             )
@@ -3334,7 +3403,9 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     {
                         "case": case["name"],
                         "description": case["description"],
-                        "include_in_accuracy_summary": case["include_in_accuracy_summary"],
+                        "include_in_accuracy_summary": case[
+                            "include_in_accuracy_summary"
+                        ],
                         "isotope": isotope,
                         "method": method,
                         "target_pf_counts": item["target_pf_counts"],
@@ -3645,14 +3716,25 @@ def flatten_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         if item["pf_target_relative_error_vs_transport_truth"] is None
                         else item["pf_target_relative_error_vs_transport_truth"],
                         "pf_target_relative_error_vs_uncollided_primary": ""
-                        if item.get("pf_target_relative_error_vs_uncollided_primary") is None
+                        if item.get("pf_target_relative_error_vs_uncollided_primary")
+                        is None
                         else item["pf_target_relative_error_vs_uncollided_primary"],
                         "pf_geant4_mu_target_relative_error_vs_transport_truth": ""
-                        if item.get("pf_geant4_mu_target_relative_error_vs_transport_truth") is None
-                        else item["pf_geant4_mu_target_relative_error_vs_transport_truth"],
+                        if item.get(
+                            "pf_geant4_mu_target_relative_error_vs_transport_truth"
+                        )
+                        is None
+                        else item[
+                            "pf_geant4_mu_target_relative_error_vs_transport_truth"
+                        ],
                         "pf_geant4_mu_target_relative_error_vs_uncollided_primary": ""
-                        if item.get("pf_geant4_mu_target_relative_error_vs_uncollided_primary") is None
-                        else item["pf_geant4_mu_target_relative_error_vs_uncollided_primary"],
+                        if item.get(
+                            "pf_geant4_mu_target_relative_error_vs_uncollided_primary"
+                        )
+                        is None
+                        else item[
+                            "pf_geant4_mu_target_relative_error_vs_uncollided_primary"
+                        ],
                         "pf_transport_shield_tau_feature": transport_feature_diagnostics.get(
                             "shield_tau_feature",
                             "",
@@ -3908,28 +3990,18 @@ def _normalized_residual_coverage(values: list[float]) -> dict[str, float | int]
     summary = _finite_distribution(absolute.tolist())
     summary.update(
         {
-            "mean_signed": (
-                float(np.mean(array)) if array.size else float("nan")
-            ),
+            "mean_signed": (float(np.mean(array)) if array.size else float("nan")),
             "rms": (
-                float(np.sqrt(np.mean(array * array)))
-                if array.size
-                else float("nan")
+                float(np.sqrt(np.mean(array * array))) if array.size else float("nan")
             ),
             "coverage_within_1sigma": (
-                float(np.mean(absolute <= 1.0))
-                if absolute.size
-                else float("nan")
+                float(np.mean(absolute <= 1.0)) if absolute.size else float("nan")
             ),
             "coverage_within_2sigma": (
-                float(np.mean(absolute <= 2.0))
-                if absolute.size
-                else float("nan")
+                float(np.mean(absolute <= 2.0)) if absolute.size else float("nan")
             ),
             "coverage_within_3sigma": (
-                float(np.mean(absolute <= 3.0))
-                if absolute.size
-                else float("nan")
+                float(np.mean(absolute <= 3.0)) if absolute.size else float("nan")
             ),
         }
     )
@@ -3995,9 +4067,7 @@ def _accumulate_covariance_record(
         accumulator["ratios"][name].append(float(value))
     if include_coverage:
         residual = float(count) - float(truth)
-        accumulator["normalized_residuals"]["formal"].append(
-            residual / np.sqrt(formal)
-        )
+        accumulator["normalized_residuals"]["formal"].append(residual / np.sqrt(formal))
         accumulator["normalized_residuals"]["runtime"].append(
             residual / np.sqrt(runtime)
         )
@@ -4066,9 +4136,7 @@ def _mahalanobis_distribution(
         "num_cases": int(len(finite)),
         "total_degrees_of_freedom": total_degrees,
         "pooled_squared_per_degree_of_freedom": (
-            total_squared / total_degrees
-            if total_degrees
-            else float("nan")
+            total_squared / total_degrees if total_degrees else float("nan")
         ),
         "mahalanobis_squared": _finite_distribution(squared),
         "squared_per_degree_of_freedom": _finite_distribution(per_degree),
@@ -4081,9 +4149,7 @@ def summarize_response_poisson_covariance(
 ) -> dict[str, Any]:
     """Summarize formal, runtime, and PF-projected count uncertainty."""
     total = _covariance_summary_accumulator()
-    by_isotope = {
-        isotope: _covariance_summary_accumulator() for isotope in ISOTOPES
-    }
+    by_isotope = {isotope: _covariance_summary_accumulator() for isotope in ISOTOPES}
     mahalanobis: dict[str, list[tuple[float, int]]] = {
         "formal_full": [],
         "formal_diagonal": [],
@@ -4103,9 +4169,7 @@ def summarize_response_poisson_covariance(
         )
         residual_diagnostics = covariance_payload.get("residual_diagnostics", {})
         residual_diagnostics = (
-            residual_diagnostics
-            if isinstance(residual_diagnostics, Mapping)
-            else {}
+            residual_diagnostics if isinstance(residual_diagnostics, Mapping) else {}
         )
         degrees = int(residual_diagnostics.get("degrees_of_freedom", 0))
         case_mahalanobis = residual_diagnostics.get("mahalanobis_squared", {})
@@ -4205,15 +4269,11 @@ def _finalize_pf_likelihood_summary(
     relative_scales = list(accumulator.get("relative_scales", []))
     case_distances = list(accumulator.get("case_squared_distances", []))
     by_isotope_payload = accumulator.get("by_isotope", {})
-    by_isotope = (
-        by_isotope_payload if isinstance(by_isotope_payload, Mapping) else {}
-    )
+    by_isotope = by_isotope_payload if isinstance(by_isotope_payload, Mapping) else {}
     return {
         "num_records": int(len(normalized)),
         "num_cases": int(len(case_distances)),
-        "normalized_residual_coverage": _normalized_residual_coverage(
-            normalized
-        ),
+        "normalized_residual_coverage": _normalized_residual_coverage(normalized),
         "likelihood_scale_over_target": _finite_distribution(relative_scales),
         "diagonal_squared_distance": _mahalanobis_distribution(case_distances),
         "by_isotope": {
@@ -4299,19 +4359,13 @@ def summarize_pf_count_likelihood_diagnostics(
                 if target < float(min_target):
                     continue
                 normalized_value = float(normalized.get(isotope, float("nan")))
-                relative_scale = float(
-                    relative_scales.get(isotope, float("nan"))
-                )
-                if not np.isfinite(normalized_value) or not np.isfinite(
-                    relative_scale
-                ):
+                relative_scale = float(relative_scales.get(isotope, float("nan")))
+                if not np.isfinite(normalized_value) or not np.isfinite(relative_scale):
                     continue
                 accumulator["normalized_residuals"].append(normalized_value)
                 accumulator["relative_scales"].append(relative_scale)
                 isotope_accumulator = accumulator["by_isotope"][isotope]
-                isotope_accumulator["normalized_residuals"].append(
-                    normalized_value
-                )
+                isotope_accumulator["normalized_residuals"].append(normalized_value)
                 isotope_accumulator["relative_scales"].append(relative_scale)
                 case_values.append(normalized_value)
             if case_values:
@@ -4381,7 +4435,9 @@ def summarize_accuracy(
             target = float(item["target_pf_counts"])
             truth = float(item["transport_truth_counts"])
             uncollided = float(item.get("transport_uncollided_primary_counts", 0.0))
-            non_uncollided_fraction = float(item.get("transport_non_uncollided_fraction", 0.0))
+            non_uncollided_fraction = float(
+                item.get("transport_non_uncollided_fraction", 0.0)
+            )
             target_truth_err = item.get("pf_target_relative_error_vs_transport_truth")
             if target_truth_err is not None:
                 pf_target_vs_truth.append(abs(float(target_truth_err)))
@@ -4423,8 +4479,12 @@ def summarize_accuracy(
         truth_fp = np.asarray(false_positive_vs_truth_by_method[method], dtype=float)
         summary[method] = {
             "num_accuracy_points": float(arr.size),
-            "mean_abs_relative_error": float(np.mean(arr)) if arr.size else float("nan"),
-            "median_abs_relative_error": float(np.median(arr)) if arr.size else float("nan"),
+            "mean_abs_relative_error": float(np.mean(arr))
+            if arr.size
+            else float("nan"),
+            "median_abs_relative_error": float(np.median(arr))
+            if arr.size
+            else float("nan"),
             "max_abs_relative_error": float(np.max(arr)) if arr.size else float("nan"),
             "num_absent_isotope_points": float(fp.size),
             "max_absent_isotope_counts": float(np.max(fp)) if fp.size else 0.0,
@@ -4440,25 +4500,39 @@ def summarize_accuracy(
                 float(np.max(truth_arr)) if truth_arr.size else float("nan")
             ),
             "num_absent_truth_isotope_points": float(truth_fp.size),
-            "max_absent_truth_isotope_counts": float(np.max(truth_fp)) if truth_fp.size else 0.0,
-            "mean_absent_truth_isotope_counts": float(np.mean(truth_fp)) if truth_fp.size else 0.0,
+            "max_absent_truth_isotope_counts": float(np.max(truth_fp))
+            if truth_fp.size
+            else 0.0,
+            "mean_absent_truth_isotope_counts": float(np.mean(truth_fp))
+            if truth_fp.size
+            else 0.0,
         }
     pf_arr = np.asarray(pf_target_vs_truth, dtype=float)
     summary["pf_theory_target_vs_transport_truth"] = {
         "num_accuracy_points": float(pf_arr.size),
-        "mean_abs_relative_error": float(np.mean(pf_arr)) if pf_arr.size else float("nan"),
-        "median_abs_relative_error": float(np.median(pf_arr)) if pf_arr.size else float("nan"),
-        "max_abs_relative_error": float(np.max(pf_arr)) if pf_arr.size else float("nan"),
+        "mean_abs_relative_error": float(np.mean(pf_arr))
+        if pf_arr.size
+        else float("nan"),
+        "median_abs_relative_error": float(np.median(pf_arr))
+        if pf_arr.size
+        else float("nan"),
+        "max_abs_relative_error": float(np.max(pf_arr))
+        if pf_arr.size
+        else float("nan"),
     }
     pf_uncollided_arr = np.asarray(pf_target_vs_uncollided, dtype=float)
     non_uncollided_arr = np.asarray(non_uncollided_fractions, dtype=float)
     summary["pf_theory_target_vs_uncollided_primary"] = {
         "num_accuracy_points": float(pf_uncollided_arr.size),
         "mean_abs_relative_error": (
-            float(np.mean(pf_uncollided_arr)) if pf_uncollided_arr.size else float("nan")
+            float(np.mean(pf_uncollided_arr))
+            if pf_uncollided_arr.size
+            else float("nan")
         ),
         "median_abs_relative_error": (
-            float(np.median(pf_uncollided_arr)) if pf_uncollided_arr.size else float("nan")
+            float(np.median(pf_uncollided_arr))
+            if pf_uncollided_arr.size
+            else float("nan")
         ),
         "max_abs_relative_error": (
             float(np.max(pf_uncollided_arr)) if pf_uncollided_arr.size else float("nan")
@@ -4481,20 +4555,32 @@ def summarize_accuracy(
     summary["pf_geant4_mu_target_vs_uncollided_primary"] = {
         "num_accuracy_points": float(pf_g4_uncollided_arr.size),
         "mean_abs_relative_error": (
-            float(np.mean(pf_g4_uncollided_arr)) if pf_g4_uncollided_arr.size else float("nan")
+            float(np.mean(pf_g4_uncollided_arr))
+            if pf_g4_uncollided_arr.size
+            else float("nan")
         ),
         "median_abs_relative_error": (
-            float(np.median(pf_g4_uncollided_arr)) if pf_g4_uncollided_arr.size else float("nan")
+            float(np.median(pf_g4_uncollided_arr))
+            if pf_g4_uncollided_arr.size
+            else float("nan")
         ),
         "max_abs_relative_error": (
-            float(np.max(pf_g4_uncollided_arr)) if pf_g4_uncollided_arr.size else float("nan")
+            float(np.max(pf_g4_uncollided_arr))
+            if pf_g4_uncollided_arr.size
+            else float("nan")
         ),
     }
     summary["transport_non_uncollided_fraction"] = {
         "num_accuracy_points": float(non_uncollided_arr.size),
-        "mean": float(np.mean(non_uncollided_arr)) if non_uncollided_arr.size else float("nan"),
-        "median": float(np.median(non_uncollided_arr)) if non_uncollided_arr.size else float("nan"),
-        "max": float(np.max(non_uncollided_arr)) if non_uncollided_arr.size else float("nan"),
+        "mean": float(np.mean(non_uncollided_arr))
+        if non_uncollided_arr.size
+        else float("nan"),
+        "median": float(np.median(non_uncollided_arr))
+        if non_uncollided_arr.size
+        else float("nan"),
+        "max": float(np.max(non_uncollided_arr))
+        if non_uncollided_arr.size
+        else float("nan"),
     }
     return summary
 
@@ -4540,7 +4626,9 @@ def summarize_shield_pair_diagnostics(
             )
     by_pair: dict[str, Any] = {}
     by_pair_isotope: dict[str, Any] = {}
-    for pair_key, isotope_payload in sorted(grouped.items(), key=lambda item: int(item[0])):
+    for pair_key, isotope_payload in sorted(
+        grouped.items(), key=lambda item: int(item[0])
+    ):
         merged: dict[str, list[float]] = {
             "response_vs_pf_target": [],
             "response_vs_transport_truth": [],
@@ -4664,9 +4752,11 @@ def summarize_response_poisson_calibration(
         ),
     }
     if runtime_config is not None:
-        payload["runtime_config_effective_snippet"] = _effective_measurement_scale_snippet(
-            runtime_config,
-            payload,
+        payload["runtime_config_effective_snippet"] = (
+            _effective_measurement_scale_snippet(
+                runtime_config,
+                payload,
+            )
         )
     payload["pair_coverage"] = _response_poisson_pair_coverage(records)
     payload["calibrated_residual_summary"] = _calibrated_residual_summary(
@@ -4889,7 +4979,7 @@ def summarize_pf_transport_calibration(
                     "shield_pair_id": pair_id,
                     "weight": 1.0 / max(truth, 1.0),
                 }
-    )
+            )
     response_groups = _pf_transport_response_groups(
         results,
         min_target,
@@ -5011,14 +5101,10 @@ def _pf_transport_response_records(
                     "pb_tau_feature": features["pb_tau_feature"],
                     "obstacle_tau_feature": features["obstacle_tau_feature"],
                     "distance_feature": features["distance_feature"],
-                    "distance_shield_feature": features[
-                        "distance_shield_feature"
-                    ],
+                    "distance_shield_feature": features["distance_shield_feature"],
                     "distance_fe_feature": features["distance_fe_feature"],
                     "distance_pb_feature": features["distance_pb_feature"],
-                    "distance_obstacle_feature": features[
-                        "distance_obstacle_feature"
-                    ],
+                    "distance_obstacle_feature": features["distance_obstacle_feature"],
                     "weight": 1.0 / max(truth, 1.0),
                 }
             )
@@ -5063,9 +5149,7 @@ def _pf_transport_response_groups(
                         "pb_tau_feature": features["pb_tau_feature"],
                         "obstacle_tau_feature": features["obstacle_tau_feature"],
                         "distance_feature": features["distance_feature"],
-                        "distance_shield_feature": features[
-                            "distance_shield_feature"
-                        ],
+                        "distance_shield_feature": features["distance_shield_feature"],
                         "distance_fe_feature": features["distance_fe_feature"],
                         "distance_pb_feature": features["distance_pb_feature"],
                         "distance_obstacle_feature": features[
@@ -5087,14 +5171,10 @@ def _pf_transport_response_groups(
                     "pb_tau_feature": features["pb_tau_feature"],
                     "obstacle_tau_feature": features["obstacle_tau_feature"],
                     "distance_feature": features["distance_feature"],
-                    "distance_shield_feature": features[
-                        "distance_shield_feature"
-                    ],
+                    "distance_shield_feature": features["distance_shield_feature"],
                     "distance_fe_feature": features["distance_fe_feature"],
                     "distance_pb_feature": features["distance_pb_feature"],
-                    "distance_obstacle_feature": features[
-                        "distance_obstacle_feature"
-                    ],
+                    "distance_obstacle_feature": features["distance_obstacle_feature"],
                     "weight": 1.0 / max(truth, 1.0),
                 }
             )
@@ -5204,10 +5284,7 @@ def _pf_transport_source_terms(
                     ),
                     0.0,
                 )
-                if (
-                    "scaled_base_counts" not in nested
-                    and "scaled_counts" not in nested
-                ):
+                if "scaled_base_counts" not in nested and "scaled_counts" not in nested:
                     base_counts *= source_scale
                 if base_counts <= 0.0:
                     continue
@@ -5363,10 +5440,7 @@ def _weighted_pf_transport_feature_diagnostics(
                     ),
                     0.0,
                 )
-                if (
-                    "scaled_base_counts" not in nested
-                    and "scaled_counts" not in nested
-                ):
+                if "scaled_base_counts" not in nested and "scaled_counts" not in nested:
                     contribution *= source_scale
                 if contribution <= 0.0:
                     continue
@@ -5377,7 +5451,9 @@ def _weighted_pf_transport_feature_diagnostics(
                 source_term_count += 1
             continue
         contribution = max(
-            float(row.get("scaled_full_target_counts", row.get("full_target_counts", 0.0))),
+            float(
+                row.get("scaled_full_target_counts", row.get("full_target_counts", 0.0))
+            ),
             0.0,
         )
         if "scaled_full_target_counts" not in row:
@@ -5389,7 +5465,9 @@ def _weighted_pf_transport_feature_diagnostics(
         factors.append(1.0)
         source_term_count += 1
     if factors:
-        summary["response_factor_weighted"] = float(factor_sum / max(total_weight, 1.0e-12))
+        summary["response_factor_weighted"] = float(
+            factor_sum / max(total_weight, 1.0e-12)
+        )
         summary["response_factor_min"] = float(min(factors))
         summary["response_factor_max"] = float(max(factors))
     summary["source_count"] = float(source_count)
@@ -5576,9 +5654,7 @@ def _fit_pf_transport_response_model(
                     "distance_pb": 0.0,
                     "distance_obstacle": 0.0,
                 },
-                "tau_feature_caps": dict(
-                    DEFAULT_TRANSPORT_RESPONSE_TAU_FEATURE_CAPS
-                ),
+                "tau_feature_caps": dict(DEFAULT_TRANSPORT_RESPONSE_TAU_FEATURE_CAPS),
                 "min_log_scale": -2.0,
                 "max_log_scale": 2.0,
                 "num_fit_records": len(isotope_groups),
@@ -5838,11 +5914,14 @@ def _aggregate_transport_response_initial_beta(
         total = sum(max(float(term.get("counts", 0.0)), 0.0) for term in source_terms)
         if total <= 0.0:
             continue
-        weighted_feature = sum(
-            max(float(term.get("counts", 0.0)), 0.0)
-            * _transport_response_feature_vector(term)
-            for term in source_terms
-        ) / total
+        weighted_feature = (
+            sum(
+                max(float(term.get("counts", 0.0)), 0.0)
+                * _transport_response_feature_vector(term)
+                for term in source_terms
+            )
+            / total
+        )
         rows.append(weighted_feature.tolist())
         targets.append(
             np.log(
@@ -6346,7 +6425,9 @@ def summarize_requested_cases(
             )
     case_names = [case.name for case in cases]
     return {
-        "num_requested_cases": int(case_total) if case_total is not None else len(cases),
+        "num_requested_cases": int(case_total)
+        if case_total is not None
+        else len(cases),
         "first_case_names": case_names[:10],
         "last_case_names": case_names[-10:] if len(case_names) > 10 else case_names,
         "source_counts_by_isotope": source_counts_by_isotope,
@@ -6355,7 +6436,9 @@ def summarize_requested_cases(
     }
 
 
-def summarize_detector_selection_diagnostics(cases: list[ValidationCase]) -> dict[str, Any]:
+def summarize_detector_selection_diagnostics(
+    cases: list[ValidationCase],
+) -> dict[str, Any]:
     """Summarize generated detector-pose stress metrics by base scenario."""
     scenarios: dict[str, ValidationCase] = {}
     for case in cases:
@@ -6370,7 +6453,11 @@ def summarize_detector_selection_diagnostics(cases: list[ValidationCase]) -> dic
     }
     rows: list[dict[str, Any]] = []
     for base_name, case in sorted(scenarios.items()):
-        metadata = case.generation_metadata if isinstance(case.generation_metadata, dict) else {}
+        metadata = (
+            case.generation_metadata
+            if isinstance(case.generation_metadata, dict)
+            else {}
+        )
         mode = str(metadata.get("detector_selection_effective_mode", "unknown"))
         mode_counts[mode] = int(mode_counts.get(mode, 0)) + 1
         row = {
@@ -6378,7 +6465,9 @@ def summarize_detector_selection_diagnostics(cases: list[ValidationCase]) -> dic
             "mode": mode,
             "detector_pose_xyz": [float(value) for value in case.detector_pose_xyz],
             "max_obstacle_tau": float(metadata.get("max_obstacle_tau", 0.0)),
-            "target_count_imbalance": float(metadata.get("target_count_imbalance", 1.0)),
+            "target_count_imbalance": float(
+                metadata.get("target_count_imbalance", 1.0)
+            ),
             "shield_dynamic_range": float(metadata.get("shield_dynamic_range", 1.0)),
             "min_isotope_target": float(metadata.get("min_isotope_target", 0.0)),
         }
@@ -6438,11 +6527,17 @@ def build_summary(
         ),
         "interrupted": bool(interrupted),
         "environment_sweep": bool(args.environment_sweep),
-        "num_environments": int(args.num_environments) if args.environment_sweep else None,
+        "num_environments": int(args.num_environments)
+        if args.environment_sweep
+        else None,
         "measurement_points_per_environment": (
-            int(args.measurement_points_per_environment) if args.environment_sweep else None
+            int(args.measurement_points_per_environment)
+            if args.environment_sweep
+            else None
         ),
-        "rotations_per_point": int(args.rotations_per_point) if args.environment_sweep else None,
+        "rotations_per_point": int(args.rotations_per_point)
+        if args.environment_sweep
+        else None,
         "elapsed_s": float(time.time() - sweep_start),
         "min_target_counts": float(args.min_target_counts),
         "accuracy_summary": summarize_accuracy(results, float(args.min_target_counts)),
@@ -6496,9 +6591,7 @@ def build_summary(
             "multi_source_min_isotope_target_counts": float(
                 args.multi_source_min_isotope_target_counts
             ),
-            "all_shield_pairs_per_scenario": bool(
-                args.all_shield_pairs_per_scenario
-            ),
+            "all_shield_pairs_per_scenario": bool(args.all_shield_pairs_per_scenario),
             "multi_source_detector_selection": str(
                 args.multi_source_detector_selection
             ),
@@ -6514,7 +6607,12 @@ def parse_args() -> argparse.Namespace:
         default="configs/geant4/variance_reduction_external_no_isaac_32threads.json",
     )
     parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--case", action="append", default=None, help="Run only the named case; repeatable.")
+    parser.add_argument(
+        "--case",
+        action="append",
+        default=None,
+        help="Run only the named case; repeatable.",
+    )
     parser.add_argument("--max-cases", type=int, default=None)
     parser.add_argument("--min-target-counts", type=float, default=25.0)
     parser.add_argument("--timeout-s", type=float, default=3600.0)
@@ -6533,9 +6631,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Override Geant4 primary_sampling_fraction; fidelity validation "
-            "requires the value to remain 1.0."
+            "Override Geant4 primary_sampling_fraction. Values below 1 require "
+            "an input config with accelerated_weighted_transport_enable=true."
         ),
+    )
+    parser.add_argument(
+        "--random-seed-base",
+        type=int,
+        default=None,
+        help="Override only the Geant4 transport seed base for repeat diagnostics.",
     )
     parser.add_argument("--num-cases", type=int, default=50)
     parser.add_argument("--case-seed", type=int, default=20260430)
@@ -6669,7 +6773,11 @@ def main() -> None:
     if args.thread_count is not None:
         runtime_config["thread_count"] = int(args.thread_count)
     if args.primary_sampling_fraction is not None:
-        runtime_config["primary_sampling_fraction"] = float(args.primary_sampling_fraction)
+        runtime_config["primary_sampling_fraction"] = float(
+            args.primary_sampling_fraction
+        )
+    if args.random_seed_base is not None:
+        runtime_config["random_seed_base"] = int(args.random_seed_base)
     validated_app_config = Geant4AppConfig.from_dict(runtime_config)
     runtime_config["primary_sampling_fraction"] = (
         validated_app_config.primary_sampling_fraction
@@ -6682,7 +6790,9 @@ def main() -> None:
 
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=ISOTOPES)
 
-    stream_multi_isotope_cases = bool(args.multi_isotope_multi_source_cases and not args.case)
+    stream_multi_isotope_cases = bool(
+        args.multi_isotope_multi_source_cases and not args.case
+    )
     if stream_multi_isotope_cases:
         base_case_total = max(0, int(args.num_cases))
         if args.max_cases is not None:
@@ -6734,7 +6844,9 @@ def main() -> None:
         elif args.environment_sweep:
             all_cases = generated_environment_sweep_cases(
                 num_environments=int(args.num_environments),
-                measurement_points_per_environment=int(args.measurement_points_per_environment),
+                measurement_points_per_environment=int(
+                    args.measurement_points_per_environment
+                ),
                 rotations_per_point=int(args.rotations_per_point),
                 seed=int(args.case_seed),
                 dwell_time_s=float(args.dwell_time_s),
@@ -6770,7 +6882,10 @@ def main() -> None:
     output_dir = (
         resolve_path(args.output_dir)
         if args.output_dir
-        else ROOT / "results" / "spectrum_validation" / f"geant4_photopeak_nnls_sweep_{timestamp}"
+        else ROOT
+        / "results"
+        / "spectrum_validation"
+        / f"geant4_photopeak_nnls_sweep_{timestamp}"
     )
 
     decomposer = SpectralDecomposer(spectrum_config_from_runtime_config(runtime_config))
@@ -6803,7 +6918,9 @@ def main() -> None:
             results.append(result)
             spectra[case.name] = spectrum
             response = {
-                isotope: result["per_isotope"][isotope]["method_counts"]["response_poisson"]
+                isotope: result["per_isotope"][isotope]["method_counts"][
+                    "response_poisson"
+                ]
                 for isotope in ISOTOPES
             }
             target = {
@@ -6815,11 +6932,15 @@ def main() -> None:
                 for isotope in ISOTOPES
             }
             rel = {
-                isotope: result["per_isotope"][isotope]["relative_errors"]["response_poisson"]
+                isotope: result["per_isotope"][isotope]["relative_errors"][
+                    "response_poisson"
+                ]
                 for isotope in ISOTOPES
             }
             rel_truth = {
-                isotope: result["per_isotope"][isotope]["relative_errors_vs_transport_truth"]["response_poisson"]
+                isotope: result["per_isotope"][isotope][
+                    "relative_errors_vs_transport_truth"
+                ]["response_poisson"]
                 for isotope in ISOTOPES
             }
             print(
@@ -6849,7 +6970,9 @@ def main() -> None:
                     cases=cases_seen,
                     write_detailed_results=False,
                 )
-                print(f"  checkpoint wrote partial outputs to: {output_dir}", flush=True)
+                print(
+                    f"  checkpoint wrote partial outputs to: {output_dir}", flush=True
+                )
     except KeyboardInterrupt:
         interrupted = True
         print("Interrupted; writing partial validation outputs.", flush=True)
