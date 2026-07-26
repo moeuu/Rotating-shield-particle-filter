@@ -636,6 +636,7 @@ from runtime_environment import (
     build_runtime_obstacle_environment,
 )
 from runtime.measurement_log import (
+    MeasurementLog,
     MeasurementLogRecord,
     MeasurementLogStreamWriter,
     build_forward_model_manifest,
@@ -662,6 +663,30 @@ _RESUME_RUNTIME_EXACT_PATHS = frozenset(
     }
 )
 _LIVE_CONTROLLER_CHECKPOINT_KEY = "live_controller_checkpoint"
+
+
+def _build_resume_replay_estimator(
+    prefix_log: MeasurementLog,
+    *,
+    profile: str,
+    seed: int,
+    config_hash: str,
+    resolved_config_hash: str,
+) -> RotatingShieldPFEstimator:
+    """Build a resume estimator from the PF settings stored in the prefix."""
+    external_config: Mapping[str, Any]
+    if prefix_log.runtime_config.get("effective_pf_replay") is None:
+        external_config = prefix_log.runtime_config
+    else:
+        external_config = {}
+    return build_replay_estimator(
+        prefix_log,
+        external_config,
+        profile=profile,
+        seed=seed,
+        config_hash=config_hash,
+        resolved_config_hash=resolved_config_hash,
+    )
 
 
 def _git_command_text(repository_root: Path, *args: str) -> str:
@@ -14014,9 +14039,8 @@ def run_live_pf(
                 prefix_log = measurement_log_writer.write_canonical_prefix(
                     prefix_path
                 )
-                estimator = build_replay_estimator(
+                estimator = _build_resume_replay_estimator(
                     prefix_log,
-                    runtime_config,
                     profile=str(pf_conf.estimator_profile),
                     seed=int(pf_random_seed),
                     config_hash=input_config_hash,

@@ -9,10 +9,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from pf.provenance import canonical_json_bytes
+from pf.profiles import apply_profile_to_config
+from pf.provenance import canonical_json_bytes, sha256_json
+from pf.pure_estimator import RotatingShieldPFConfig
+from pf.replay import PFReplayError, build_replay_estimator
 from realtime_demo import (
     _advance_resume_planning_candidate_rng,
+    _build_effective_live_runtime_config,
     _build_resume_compatibility_provenance,
+    _build_resume_replay_estimator,
     _build_live_controller_checkpoint,
     _online_compute_timing_provenance,
     _planning_candidate_checkpoint_parameters,
@@ -25,11 +30,13 @@ from runtime.measurement_log import (
     MeasurementLogStreamWriter,
     MeasurementLogValidationError,
     build_forward_model_manifest,
+    load_measurement_log,
 )
 from tests.pure_pf_test_support import (
     TEST_COMMIT,
     TEST_ISOTOPES,
     environment,
+    make_measurement_log,
     records,
     runtime_config,
 )
@@ -136,6 +143,80 @@ def test_online_compute_timing_scope_distinguishes_resumed_suffix() -> None:
     }
     with pytest.raises(ValueError, match="non-negative"):
         _online_compute_timing_provenance(-1)
+
+
+def test_resume_replay_uses_logged_effective_pf_over_legacy_alias(
+    tmp_path: Path,
+) -> None:
+    """Resume must not reinterpret legacy top-level fields as PF overrides."""
+    candidates = np.asarray(
+        [
+            [x, y, z]
+            for x in (0.0, 2.0)
+            for y in (0.0, 2.0)
+            for z in (0.0, 1.5)
+        ],
+        dtype=np.float64,
+    )
+    pf_config = RotatingShieldPFConfig(
+        estimator_profile="pf_strict",
+        num_particles=12,
+        max_sources=2,
+        init_num_sources=[1, 1],
+        birth_enable=False,
+        use_gpu=False,
+        parallel_isotope_updates=False,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(2.0, 2.0, 1.5),
+        converge_min_stations=0,
+    )
+    apply_profile_to_config(pf_config)
+    effective_runtime = _build_effective_live_runtime_config(
+        {
+            **runtime_config(),
+            "converge_min_stations": 4,
+        },
+        pf_config=pf_config,
+        candidate_sources_xyz=candidates,
+        source_position_bounds=(
+            np.zeros(3, dtype=np.float64),
+            np.asarray([2.0, 2.0, 1.5], dtype=np.float64),
+        ),
+        api_settings={
+            "candidate_grid_spacing_m": [2.0, 2.0, 1.5],
+            "candidate_grid_margin_m": 0.0,
+            "source_surface_prior": False,
+            "obstacle_height_m": 1.0,
+            "joint_observation_update": True,
+            "delayed_resample_update": False,
+            "pf_random_seed": 41,
+        },
+    )
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="converge_min_stations"):
+        build_replay_estimator(
+            log,
+            effective_runtime,
+            profile="pf_strict",
+            seed=41,
+        )
+
+    estimator = _build_resume_replay_estimator(
+        log,
+        profile="pf_strict",
+        seed=41,
+        config_hash=sha256_json(effective_runtime),
+        resolved_config_hash=str(log.resolved_config_sha256),
+    )
+    assert estimator.pf_config.converge_min_stations == 0
 
 
 def test_resume_compatibility_requires_every_runtime_delta_explicitly(
