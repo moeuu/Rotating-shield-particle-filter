@@ -18,6 +18,10 @@ from measurement.model import EnvironmentConfig
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
+from measurement.shielding import (
+    generate_octant_orientations,
+    resolve_mu_values,
+)
 from measurement.source_surfaces import (
     build_surface_candidate_sources,
     project_positions_to_allowed_surfaces,
@@ -614,6 +618,9 @@ class IsotopeParticleFilter:
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
         )
+        self._continuous_kernel_physics_signature = (
+            self._incoming_kernel_physics_signature(kernel)
+        )
         self.continuous_particles: List[IsotopeParticle] = []
         self._label_reference: IsotopeState | None = None
         self.last_ess: float | None = None
@@ -881,6 +888,65 @@ class IsotopeParticleFilter:
             line_mu_by_isotope=self.line_mu_by_isotope,
             transport_response_model=self.transport_response_model,
             **kernel_kwargs,
+        )
+
+    def _incoming_kernel_physics_signature(
+        self,
+        kernel: KernelPrecomputer | None,
+    ) -> tuple[object, ...]:
+        """Return canonical incoming physics that affects this isotope's kernel."""
+        shield_params = (
+            getattr(kernel, "shield_params", ShieldParams())
+            if kernel is not None
+            else ShieldParams()
+        )
+        mu_by_isotope = (
+            getattr(kernel, "mu_by_isotope", None)
+            if kernel is not None
+            else None
+        )
+        mu_fe, mu_pb = resolve_mu_values(
+            mu_by_isotope,
+            self.isotope,
+            default_fe=float(shield_params.mu_fe),
+            default_pb=float(shield_params.mu_pb),
+        )
+        incoming_orientations = (
+            getattr(kernel, "orientations", None)
+            if kernel is not None
+            else None
+        )
+        orientations = (
+            generate_octant_orientations()
+            if incoming_orientations is None
+            or len(incoming_orientations) <= 1
+            else np.asarray(incoming_orientations, dtype=np.float64)
+        )
+        orientation_array = np.asarray(
+            orientations,
+            dtype=np.float64,
+        )
+        canonical_orientations = np.ascontiguousarray(
+            np.where(orientation_array == 0.0, 0.0, orientation_array),
+            dtype="<f8",
+        )
+        shield_signature = (
+            float(shield_params.mu_pb),
+            float(shield_params.mu_fe),
+            float(shield_params.thickness_pb_cm),
+            float(shield_params.thickness_fe_cm),
+            float(shield_params.inner_radius_fe_cm),
+            float(shield_params.inner_radius_pb_cm),
+            max(float(shield_params.buildup_fe_coeff), 0.0),
+            max(float(shield_params.buildup_pb_coeff), 0.0),
+            str(shield_params.shield_geometry_model),
+            bool(shield_params.use_angle_attenuation),
+        )
+        return (
+            (float(mu_fe), float(mu_pb)),
+            shield_signature,
+            canonical_orientations.shape,
+            canonical_orientations.tobytes(order="C"),
         )
 
     def _measurement_source_scale(
@@ -2016,12 +2082,16 @@ class IsotopeParticleFilter:
         return float(base_ll) - np.asarray(reduced_ll, dtype=float)
 
     def set_kernel(self, kernel: KernelPrecomputer) -> None:
-        """Attach a kernel and refresh the continuous-kernel configuration."""
+        """Attach a discrete kernel and refresh only changed continuous physics."""
+        incoming_signature = self._incoming_kernel_physics_signature(kernel)
         self.kernel = kernel
+        if incoming_signature == self._continuous_kernel_physics_signature:
+            return
         self.continuous_kernel = self._build_continuous_kernel(
             mu_by_isotope=getattr(kernel, "mu_by_isotope", None),
             shield_params=getattr(kernel, "shield_params", ShieldParams()),
         )
+        self._continuous_kernel_physics_signature = incoming_signature
         self._structural_rj_response_cache = None
         self._structural_rj_response_cache_signatures = None
 

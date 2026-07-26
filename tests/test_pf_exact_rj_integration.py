@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from measurement.kernels import KernelPrecomputer, ShieldParams
+from measurement.shielding import generate_octant_orientations
+from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.particle_filter import (
     IsotopeParticleFilter,
     MeasurementData,
@@ -97,6 +100,74 @@ def _build_filter(**config_overrides: object) -> IsotopeParticleFilter:
         "Cs-137",
         kernel=None,
         config=_exact_config(**config_overrides),
+    )
+
+
+def _discrete_kernel(
+    *,
+    poses: np.ndarray | None = None,
+    orientations: np.ndarray | None = None,
+    shield_params: ShieldParams | None = None,
+    mu_by_isotope: dict[str, object] | None = None,
+) -> KernelPrecomputer:
+    """Build a CPU discrete kernel for cache-replacement tests."""
+    return KernelPrecomputer(
+        candidate_sources=np.asarray([[0.5, 0.5, 0.5]], dtype=float),
+        poses=(
+            np.asarray([[0.4, 0.6, 0.5]], dtype=float)
+            if poses is None
+            else np.asarray(poses, dtype=float)
+        ),
+        orientations=(
+            generate_octant_orientations()
+            if orientations is None
+            else np.asarray(orientations, dtype=float)
+        ),
+        shield_params=ShieldParams() if shield_params is None else shield_params,
+        mu_by_isotope={} if mu_by_isotope is None else mu_by_isotope,
+        use_gpu=False,
+    )
+
+
+def _build_exact_estimator() -> RotatingShieldPFEstimator:
+    """Build a small exact estimator for appended-pose cache tests."""
+    config = RotatingShieldPFConfig(
+        num_particles=18,
+        min_particles=18,
+        max_particles=18,
+        max_sources=2,
+        use_gpu=False,
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(2.0, 2.0, 2.0),
+        source_position_prior="surface",
+        init_num_sources=(0, 2),
+        init_strength_prior="uniform",
+        init_strength_min=1.0,
+        init_strength_max=3.0,
+        structural_kernel_mode="rj_mh",
+        structural_rj_patch_spacing_m=1.0,
+        cardinality_preserving_resample=False,
+        mode_preserving_resample=False,
+        surface_rejuvenation_enable=False,
+        pseudo_source_verification_enable=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+        source_detector_exclusion_m=0.0,
+        init_source_min_separation_m=0.0,
+    )
+    shield = ShieldParams()
+    return RotatingShieldPFEstimator(
+        isotopes=("Cs-137",),
+        candidate_sources=np.asarray([[0.5, 0.5, 0.5]], dtype=float),
+        shield_normals=generate_octant_orientations(),
+        mu_by_isotope={
+            "Cs-137": {
+                "fe": shield.mu_fe,
+                "pb": shield.mu_pb,
+            }
+        },
+        pf_config=config,
+        shield_params=shield,
     )
 
 
@@ -303,6 +374,199 @@ def test_exact_response_cache_is_lazy_and_extends_only_missing_suffixes() -> Non
         )
     )
     assert np.all(np.isnan(reset_dictionary))
+
+
+def test_appended_pose_reuses_exact_prefix_across_equivalent_kernel_rebuild() -> None:
+    """A pose-only discrete rebuild must evaluate only the new response suffix."""
+    estimator = _build_exact_estimator()
+    data = _measurement_data(live_time=1.0)
+    for pose in data.detector_positions:
+        estimator.add_measurement_pose(pose, reset_filters=False)
+    estimator._ensure_kernel_cache()
+    particle_filter = estimator.filters["Cs-137"]
+    selected_patch = np.asarray([0], dtype=np.int64)
+    response = particle_filter._structural_rj_response_dictionary(
+        data,
+        patch_indices=selected_patch,
+    )
+    prefix = response[:, selected_patch].copy()
+    old_discrete_kernel = estimator.kernel_cache
+    old_continuous_kernel = particle_filter.continuous_kernel
+    old_response_cache = particle_filter._structural_rj_response_cache
+    evaluated_before = (
+        particle_filter._structural_rj_response_evaluated_cells
+    )
+
+    estimator.normals = np.asarray(estimator.normals, dtype=float).copy()
+    estimator.shield_params = ShieldParams()
+    estimator.mu_by_isotope = {
+        "Cs-137": (
+            float(ShieldParams().mu_fe),
+            float(ShieldParams().mu_pb),
+        )
+    }
+    extended = _extended_measurement_data(live_time=1.0)
+    estimator.add_measurement_pose(
+        extended.detector_positions[-1],
+        reset_filters=False,
+    )
+    estimator._ensure_kernel_cache()
+
+    assert estimator.filters["Cs-137"] is particle_filter
+    assert estimator.kernel_cache is not old_discrete_kernel
+    assert particle_filter.kernel is estimator.kernel_cache
+    assert particle_filter.continuous_kernel is old_continuous_kernel
+    assert particle_filter._structural_rj_response_cache is old_response_cache
+    extended_response = (
+        particle_filter._structural_rj_response_dictionary(
+            extended,
+            patch_indices=np.zeros(0, dtype=np.int64),
+        )
+    )
+    np.testing.assert_array_equal(
+        extended_response[: data.z_k.size, selected_patch],
+        prefix,
+    )
+    assert np.all(
+        np.isnan(extended_response[data.z_k.size :, selected_patch])
+    )
+
+    particle_filter._structural_rj_response_dictionary(
+        extended,
+        patch_indices=selected_patch,
+    )
+    assert (
+        particle_filter._structural_rj_response_evaluated_cells
+        - evaluated_before
+        == 1
+    )
+    eager_filter = _build_filter()
+    eager_response = eager_filter._structural_rj_response_dictionary(
+        extended,
+        patch_indices=selected_patch,
+    )
+    np.testing.assert_allclose(
+        extended_response[:, selected_patch],
+        eager_response[:, selected_patch],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "physics_change",
+    ["effective_mu", "shield_geometry", "orientation_order"],
+)
+def test_exact_response_cache_invalidates_on_kernel_physics_change(
+    physics_change: str,
+) -> None:
+    """Changed continuous physics must discard every cached response row."""
+    particle_filter = _build_filter()
+    data = _measurement_data(live_time=1.0)
+    selected_patch = np.asarray([0], dtype=np.int64)
+    particle_filter._structural_rj_response_dictionary(
+        data,
+        patch_indices=selected_patch,
+    )
+    previous_continuous_kernel = particle_filter.continuous_kernel
+    default_shield = ShieldParams()
+    orientations = generate_octant_orientations()
+    shield_params = default_shield
+    mu_by_isotope: dict[str, object] = {}
+    if physics_change == "effective_mu":
+        mu_by_isotope = {
+            "Cs-137": {
+                "fe": 1.01 * default_shield.mu_fe,
+                "pb": default_shield.mu_pb,
+            }
+        }
+    elif physics_change == "shield_geometry":
+        shield_params = ShieldParams(
+            thickness_pb_cm=default_shield.thickness_pb_cm + 0.1
+        )
+    else:
+        orientations = orientations.copy()
+        orientations[[0, 1]] = orientations[[1, 0]]
+    incoming = _discrete_kernel(
+        orientations=orientations,
+        shield_params=shield_params,
+        mu_by_isotope=mu_by_isotope,
+    )
+
+    particle_filter.set_kernel(incoming)
+
+    assert particle_filter.kernel is incoming
+    assert particle_filter.continuous_kernel is not previous_continuous_kernel
+    assert particle_filter._structural_rj_response_cache is None
+    assert particle_filter._structural_rj_response_cache_signatures is None
+    reset_response = particle_filter._structural_rj_response_dictionary(
+        data,
+        patch_indices=np.zeros(0, dtype=np.int64),
+    )
+    assert np.all(np.isnan(reset_response))
+    evaluated_before = (
+        particle_filter._structural_rj_response_evaluated_cells
+    )
+    particle_filter._structural_rj_response_dictionary(
+        data,
+        patch_indices=selected_patch,
+    )
+    assert (
+        particle_filter._structural_rj_response_evaluated_cells
+        - evaluated_before
+        == data.z_k.size
+    )
+
+
+def test_equivalent_kernel_replacement_preserves_nonexact_runtime_output() -> None:
+    """Legacy mode must update its discrete kernel without changing responses."""
+    original = _discrete_kernel()
+    particle_filter = IsotopeParticleFilter(
+        "Cs-137",
+        kernel=original,
+        config=PFConfig(
+            num_particles=4,
+            min_particles=4,
+            max_particles=4,
+            max_sources=1,
+            use_gpu=False,
+        ),
+    )
+    continuous_kernel = particle_filter.continuous_kernel
+    detector_positions = np.asarray([[0.4, 0.6, 0.5]], dtype=float)
+    sources = np.asarray([[1.2, 1.0, 0.8]], dtype=float)
+    before = continuous_kernel.kernel_values_selected_pairs_for_detectors(
+        isotope="Cs-137",
+        detector_positions=detector_positions,
+        sources=sources,
+        fe_indices=np.asarray([0], dtype=np.int64),
+        pb_indices=np.asarray([1], dtype=np.int64),
+    )
+    replacement = _discrete_kernel(
+        poses=np.asarray(
+            [[0.4, 0.6, 0.5], [1.4, 1.2, 0.5]],
+            dtype=float,
+        ),
+        mu_by_isotope={
+            "Cs-137": {
+                "fe": ShieldParams().mu_fe,
+                "pb": ShieldParams().mu_pb,
+            }
+        },
+    )
+
+    particle_filter.set_kernel(replacement)
+    after = particle_filter.continuous_kernel.kernel_values_selected_pairs_for_detectors(
+        isotope="Cs-137",
+        detector_positions=detector_positions,
+        sources=sources,
+        fe_indices=np.asarray([0], dtype=np.int64),
+        pb_indices=np.asarray([1], dtype=np.int64),
+    )
+
+    assert particle_filter.kernel is replacement
+    assert particle_filter.continuous_kernel is continuous_kernel
+    np.testing.assert_array_equal(after, before)
 
 
 def test_lazy_response_cache_matches_eager_exact_move_results() -> None:
