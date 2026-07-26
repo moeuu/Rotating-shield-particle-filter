@@ -12,6 +12,7 @@ import pytest
 from mission_control import resolve_mission_max_poses, resolve_mission_max_steps
 from measurement.model import EnvironmentConfig
 from measurement.source_surfaces import source_surface_kind
+from measurement.surface_patches import build_surface_patch_dictionary
 from pf.estimator import MeasurementRecord, RotatingShieldPFConfig
 from pf.particle_filter import IsotopeParticle
 from pf.posterior import posterior_point_estimate_from_states
@@ -28,6 +29,27 @@ from pf.pure_estimator import PurePFEstimator
 from pf.state import IsotopeState
 from planning.dss_pp import extract_signature_modes
 from sim.runtime import load_runtime_config
+
+
+def _exact_rj_config(**overrides: object) -> RotatingShieldPFConfig:
+    """Build an exact finite-surface RJ-MH config for focused tests."""
+    values: dict[str, object] = {
+        "estimator_profile": "pf_strict",
+        "structural_kernel_mode": "rj_mh",
+        "source_position_prior": "surface",
+        "max_sources": 5,
+        "init_num_sources": (0, 5),
+        "split_prob": 0.0,
+        "merge_prob": 0.0,
+        "surface_rejuvenation_enable": False,
+        "mode_preserving_resample": False,
+        "cardinality_preserving_resample": False,
+        "pseudo_source_verification_enable": False,
+        "source_detector_exclusion_m": 0.0,
+        "init_source_min_separation_m": 0.0,
+    }
+    values.update(overrides)
+    return RotatingShieldPFConfig(**values)
 
 
 @pytest.mark.parametrize("profile", [None, "pf_strict", "strict", "pure_pf", "pf_only"])
@@ -250,6 +272,100 @@ def test_static_cardinality_mixture_without_moves_is_target_preserving() -> None
     assert provenance["structural_kernel_target_preserving"] is True
 
 
+def test_exact_rj_provenance_declares_target_preserving_pf_kernel() -> None:
+    """Exact RJ-MH mode must report its finite-surface posterior semantics."""
+    config = _exact_rj_config(
+        init_num_sources=(0, 5),
+        birth_enable=True,
+    )
+    capabilities = apply_profile_to_config(config)
+    provenance = resolve_structural_transition_provenance(
+        config,
+        capabilities=capabilities,
+    ).to_dict()
+
+    assert provenance["posterior_semantics"] == (
+        "sequential_particle_filter_with_target_preserving_rj_mh_rejuvenation"
+    )
+    assert provenance["structural_kernel_family"] == (
+        "area_weighted_surface_birth_death_rj_mh"
+    )
+    assert provenance["structural_moves_enabled"] is True
+    assert provenance["structural_kernel_target_preserving"] is True
+    assert provenance["structural_kernel_exact_rj"] is True
+    assert provenance["reversible_jump_mcmc_used"] is True
+    assert provenance["data_conditioned_structural_proposal"] is False
+    assert provenance["data_conditioned_strength_proposal"] is False
+    assert provenance["structural_evidence_uses_pf_likelihood"] is True
+
+
+@pytest.mark.parametrize(
+    ("override", "invalid_field"),
+    [
+        ({"source_position_prior": "volume"}, "source_position_prior"),
+        ({"split_prob": 0.1}, "split_prob"),
+        ({"merge_prob": 0.1}, "merge_prob"),
+        ({"surface_rejuvenation_enable": True}, "surface_rejuvenation_enable"),
+        ({"mode_preserving_resample": True}, "mode_preserving_resample"),
+        (
+            {"cardinality_preserving_resample": True},
+            "cardinality_preserving_resample",
+        ),
+        (
+            {"pseudo_source_verification_enable": True},
+            "pseudo_source_verification_enable",
+        ),
+        ({"source_detector_exclusion_m": 0.25}, "source_detector_exclusion_m"),
+        ({"init_source_min_separation_m": 1.0}, "init_source_min_separation_m"),
+    ],
+)
+def test_exact_rj_rejects_target_changing_heuristics(
+    override: dict[str, object],
+    invalid_field: str,
+) -> None:
+    """Exact mode must fail fast when a legacy operation changes its target."""
+    with pytest.raises(ValueError, match=invalid_field):
+        _exact_rj_config(**override)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("structural_rj_patch_spacing_m", 0.0),
+        ("structural_rj_move_probability", -0.1),
+        ("structural_rj_birth_probability", 1.1),
+        ("structural_rj_death_probability", float("nan")),
+        ("structural_rj_position_move_probability", -1.0),
+        ("structural_rj_local_position_move_probability", 1.1),
+        ("structural_rj_strength_move_probability", 2.0),
+    ],
+)
+def test_exact_rj_numeric_configuration_is_validated(
+    field_name: str,
+    field_value: float,
+) -> None:
+    """RJ-MH spacing and attempt probabilities must stay in their domains."""
+    with pytest.raises(ValueError, match=field_name):
+        _exact_rj_config(**{field_name: field_value})
+
+
+def test_structural_cardinality_prior_is_positive_and_canonical() -> None:
+    """Cardinality prior masses must be finite, positive, and tuple-normalized."""
+    config = _exact_rj_config(
+        max_sources=2,
+        init_num_sources=(0, 2),
+        structural_cardinality_prior_probs=[1.0, 2.0, 3.0]
+    )
+    assert config.structural_cardinality_prior_probs == (1.0, 2.0, 3.0)
+
+    with pytest.raises(ValueError, match="structural_cardinality_prior_probs"):
+        _exact_rj_config(
+            max_sources=1,
+            init_num_sources=(0, 1),
+            structural_cardinality_prior_probs=[1.0, 0.0],
+        )
+
+
 def test_pure_estimator_initializes_the_single_strict_profile() -> None:
     """PurePFEstimator must expose the positive strict-PF capability contract."""
     estimator = PurePFEstimator(
@@ -266,8 +382,104 @@ def test_pure_estimator_initializes_the_single_strict_profile() -> None:
     assert estimator.profile_capabilities.sequential_updates_only is True
 
 
-def test_structural_history_preserves_runtime_spectrum_and_view_covariance() -> None:
-    """Structural evidence must receive the exact runtime likelihood payload."""
+def test_structural_model_manifest_resolves_priors_and_surface_dictionaries() -> None:
+    """Structural provenance must be complete without assuming shared dictionaries."""
+    estimator = PurePFEstimator(
+        isotopes=("Cs-137", "Co-60"),
+        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={"Cs-137": 0.0, "Co-60": 0.0},
+        pf_config=_exact_rj_config(
+            max_sources=2,
+            init_num_sources=(0, 2),
+            structural_cardinality_prior_probs=[1.0, 2.0, 3.0],
+            init_strength_prior="uniform",
+            init_strength_min=300_000.0,
+            init_strength_max=2_000_000.0,
+            use_gpu=False,
+        ),
+        measurement_log_sha256="b" * 64,
+    )
+
+    before_filters = estimator.structural_model_manifest()
+    assert before_filters["manifest_completeness"] == "config_only"
+    cardinality_prior = before_filters["cardinality_prior"]
+    assert cardinality_prior["support"] == [0, 1, 2]
+    assert cardinality_prior["probabilities"] == pytest.approx(
+        [1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0]
+    )
+    assert cardinality_prior["configuration_source"] == "explicit"
+    assert cardinality_prior["applies_independently_per_isotope"] is True
+    assert before_filters["strength_prior"]["units"] == "detector_cps_1m"
+    assert before_filters["strength_prior"]["minimum_cps_1m"] == 300_000.0
+    assert before_filters["strength_prior"]["maximum_cps_1m"] == 2_000_000.0
+    surface_prior = before_filters["surface_set_prior"]
+    assert surface_prior["semantics"] == "area_product_distinct_patch_sets"
+    assert surface_prior["dictionary_status"] == "not_initialized"
+    assert surface_prior["dictionaries_identical_across_isotopes"] is None
+    assert surface_prior["missing_isotopes"] == ["Co-60", "Cs-137"]
+    rj_kernel = before_filters["rj_move_kernel"]
+    assert rj_kernel["position_move_attempt_probability"] == 1.0
+    assert rj_kernel["local_position_move_attempt_probability"] == 1.0
+    assert rj_kernel["boundary_normalization"]["at_k_zero"] == {
+        "birth": 1.0,
+        "death": 0.0,
+    }
+    assert rj_kernel["boundary_normalization"]["at_k_max"] == {
+        "cardinality": 2,
+        "birth": 0.0,
+        "death": 1.0,
+    }
+    assert (
+        rj_kernel["dimension_matching"]["absolute_jacobian_determinant"]
+        == 1.0
+    )
+
+    environment = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
+    shared_patches = build_surface_patch_dictionary(environment, None, 1.0)
+    estimator.filters = {
+        isotope: SimpleNamespace(
+            _structural_rj_surface_patches=shared_patches,
+        )
+        for isotope in estimator.all_isotopes
+    }
+    shared_manifest = estimator.structural_model_manifest()
+    shared_surface = shared_manifest["surface_set_prior"]
+    assert shared_manifest["manifest_completeness"] == "complete"
+    assert shared_surface["dictionaries_identical_across_isotopes"] is True
+    assert len(shared_surface["dictionary_groups"]) == 1
+    assert shared_surface["dictionary_groups"][0]["isotopes"] == [
+        "Co-60",
+        "Cs-137",
+    ]
+
+    different_patches = build_surface_patch_dictionary(
+        EnvironmentConfig(size_x=3.0, size_y=2.0, size_z=2.0),
+        None,
+        1.0,
+    )
+    estimator.filters["Co-60"] = SimpleNamespace(
+        _structural_rj_surface_patches=different_patches,
+    )
+    different_surface = estimator.structural_model_manifest()[
+        "surface_set_prior"
+    ]
+    assert different_surface["dictionaries_identical_across_isotopes"] is False
+    assert len(different_surface["dictionary_groups"]) == 2
+    different_hashes = {
+        group["ordered_centers_areas_sha256"]
+        for group in different_surface["dictionary_groups"]
+    }
+    assert (
+        shared_surface["dictionary_groups"][0][
+            "ordered_centers_areas_sha256"
+        ]
+        in different_hashes
+    )
+
+
+def test_structural_history_prefers_view_covariance_over_unrecorded_spectrum() -> None:
+    """Legacy structural history must infer the covariance runtime route."""
     covariance = ((4.0, 1.5), (1.5, 9.0))
     common = {
         "z_k": {"Cs-137": 12.0},
@@ -306,16 +518,21 @@ def test_structural_history_preserves_runtime_spectrum_and_view_covariance() -> 
 
     assert data is not None
     np.testing.assert_allclose(data.observation_count_covariance, covariance)
-    np.testing.assert_allclose(data.spectrum_counts, [[4.0, 8.0], [7.0, 13.0]])
-    np.testing.assert_allclose(
-        data.spectrum_response_template,
-        [[0.25, 0.75], [0.25, 0.75]],
-    )
-    np.testing.assert_allclose(data.spectrum_background, [[1.0, 2.0], [1.0, 2.0]])
+    assert data.runtime_likelihood_routes is not None
+    assert data.runtime_likelihood_routes.tolist() == [
+        "count_covariance",
+        "count_covariance",
+    ]
+    assert data.spectrum_counts is None
+    assert data.spectrum_response_template is None
+    assert data.spectrum_background is None
 
     final_row = estimator._measurement_data_for_iso("Cs-137", window=1)
     assert final_row is not None
     np.testing.assert_allclose(final_row.observation_count_covariance, [[9.0]])
+    assert final_row.runtime_likelihood_routes is not None
+    assert final_row.runtime_likelihood_routes.tolist() == ["direct_spectrum"]
+    np.testing.assert_allclose(final_row.spectrum_counts, [[7.0, 13.0]])
 
 
 def test_removed_estimator_methods_are_physically_absent() -> None:
@@ -466,6 +683,34 @@ def test_standard_runtime_configs_declare_strict_pf_boundary(
     assert dss.get("adaptive_program_length_enable", False) is False
     assert "include_runtime_rescue_modes" not in dss
     assert "include_global_surface_rescue_modes" not in dss
+
+
+def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
+    """The production Geant4 config must disable target-changing PF heuristics."""
+    root = Path(__file__).resolve().parents[1]
+    payload = load_runtime_config(
+        root
+        / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
+    )
+
+    assert payload["structural_kernel_mode"] == "rj_mh"
+    assert payload["birth_enable"] is True
+    assert float(payload["structural_rj_patch_spacing_m"]) > 0.0
+    assert (
+        float(payload["structural_rj_local_position_move_probability"])
+        == 1.0
+    )
+    assert payload["source_surface_prior"] is True
+    assert float(payload["split_prob"]) == 0.0
+    assert float(payload["merge_prob"]) == 0.0
+    assert payload["surface_rejuvenation_enable"] is False
+    assert payload["mode_preserving_resample"] is False
+    assert payload["cardinality_preserving_resample"] is False
+    assert payload["pseudo_source_verification_enable"] is False
+    assert float(payload["source_detector_exclusion_m"]) == 0.0
+    assert float(payload["pf_init_source_min_separation_m"]) == 0.0
+    assert float(payload["deferred_resample_roughening_scale"]) == 0.0
+    assert payload["disable_regularize_on_temper_resample"] is True
 
 
 @pytest.mark.parametrize(

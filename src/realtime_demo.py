@@ -91,6 +91,27 @@ def _resolve_station_update_modes(
     return joint_observation_update, delayed_resample_update
 
 
+def _resolve_structural_moves_enabled(
+    requested: bool | None,
+    runtime_config: Mapping[str, Any],
+) -> bool:
+    """Resolve an explicit structural-move override or the runtime default."""
+    if requested is not None:
+        return bool(requested)
+    return bool(runtime_config.get("birth_enable", False))
+
+
+def resolve_runtime_structural_moves_enabled(
+    requested: bool | None,
+    sim_config_path: str | Path | None,
+) -> bool:
+    """Resolve structural moves from a CLI override and a runtime config path."""
+    runtime_config = enforce_pure_runtime_settings(
+        load_runtime_config(sim_config_path)
+    )
+    return _resolve_structural_moves_enabled(requested, runtime_config)
+
+
 def _resolve_required_measurement_log_target(
     explicit_output: str | None,
     runtime_config: Mapping[str, Any],
@@ -8929,7 +8950,7 @@ def run_live_pf(
     eval_match_radius_m: float = 0.5,
     candidate_grid_spacing: tuple[float, float, float] | None = None,
     candidate_grid_margin: float = CANDIDATE_GRID_MARGIN,
-    birth_enabled: bool = False,
+    birth_enabled: bool | None = None,
     num_particles: int = 2000,
     pf_config_overrides: dict[str, object] | None = None,
     save_outputs: bool = True,
@@ -9008,7 +9029,7 @@ def run_live_pf(
         return_state: When True, return the estimator for inspection/testing.
         candidate_grid_spacing: Optional (x, y, z) spacing for birth candidate grid.
         candidate_grid_margin: Margin from the environment bounds for candidate sources.
-        birth_enabled: Enable birth/death/split/merge moves.
+        birth_enabled: Override structural moves; None uses the runtime config.
         num_particles: Particle count used by each isotope filter.
         converge: Enable per-isotope convergence gating.
         environment_mode: Obstacle environment mode ("fixed" or "random").
@@ -9074,6 +9095,10 @@ def run_live_pf(
             Path(sim_config_path).expanduser().read_bytes()
         ).hexdigest()
     runtime_config = enforce_pure_runtime_settings(load_runtime_config(sim_config_path))
+    birth_enabled = _resolve_structural_moves_enabled(
+        birth_enabled,
+        runtime_config,
+    )
     _validate_adaptive_primary_budget_contract(
         runtime_config,
         adaptive_dwell=bool(adaptive_dwell),
@@ -10772,6 +10797,16 @@ def run_live_pf(
             )
         ),
     )
+    structural_kernel_mode = (
+        str(runtime_config.get("structural_kernel_mode", "heuristic"))
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
+    if not birth_enabled and structural_kernel_mode == "rj_mh":
+        # An explicit no-birth override selects the exact fixed/static-K PF
+        # boundary instead of constructing an unused variable-dimension kernel.
+        structural_kernel_mode = "heuristic"
     pf_max_sources_raw = runtime_config.get(
         "pf_max_sources",
         DEFAULT_MAX_SOURCES_PER_ISOTOPE,
@@ -10848,6 +10883,41 @@ def run_live_pf(
         min_particles=num_particles,
         max_particles=num_particles,
         max_sources=pf_max_sources,
+        birth_enable=bool(birth_enabled),
+        structural_kernel_mode=structural_kernel_mode,
+        structural_rj_patch_spacing_m=float(
+            runtime_config.get("structural_rj_patch_spacing_m", 1.0)
+        ),
+        structural_rj_move_probability=float(
+            runtime_config.get("structural_rj_move_probability", 1.0)
+        ),
+        structural_rj_birth_probability=float(
+            runtime_config.get("structural_rj_birth_probability", 0.5)
+        ),
+        structural_rj_death_probability=float(
+            runtime_config.get("structural_rj_death_probability", 0.5)
+        ),
+        structural_rj_position_move_probability=float(
+            runtime_config.get(
+                "structural_rj_position_move_probability",
+                1.0,
+            )
+        ),
+        structural_rj_local_position_move_probability=float(
+            runtime_config.get(
+                "structural_rj_local_position_move_probability",
+                1.0,
+            )
+        ),
+        structural_rj_strength_move_probability=float(
+            runtime_config.get(
+                "structural_rj_strength_move_probability",
+                1.0,
+            )
+        ),
+        structural_cardinality_prior_probs=runtime_config.get(
+            "structural_cardinality_prior_probs"
+        ),
         resample_threshold=0.7,
         position_sigma=0.5,
         background_level=background_by_isotope,
@@ -11069,6 +11139,9 @@ def run_live_pf(
         deferred_resample_roughening_scale=max(
             0.0,
             float(runtime_config.get("deferred_resample_roughening_scale", 0.15)),
+        ),
+        disable_regularize_on_temper_resample=bool(
+            runtime_config.get("disable_regularize_on_temper_resample", False)
         ),
         pose_min_observation_counts=pose_min_observation_counts_resolved,
         pose_min_observation_penalty_scale=pose_min_observation_penalty_scale,
@@ -11364,6 +11437,16 @@ def run_live_pf(
             if not hasattr(pf_conf, key):
                 raise ValueError(f"Unknown PF config override: {key}")
             setattr(pf_conf, key, value)
+        if (
+            "observation_count_variance_includes_counting_noise"
+            in pf_config_overrides
+            and "observation_count_variance_semantics"
+            not in pf_config_overrides
+        ):
+            # Let the explicitly overridden legacy boolean choose its canonical
+            # semantics instead of retaining the value normalized before the
+            # override was applied.
+            pf_conf.observation_count_variance_semantics = ""
     pf_conf.birth_enable = bool(birth_enabled)
     if birth_enabled:
         if not pf_config_overrides or "p_birth" not in pf_config_overrides:
@@ -11372,10 +11455,22 @@ def run_live_pf(
         if not pf_config_overrides or "p_kill" not in pf_config_overrides:
             if pf_conf.p_kill <= 0.0:
                 pf_conf.p_kill = 0.1
-        if not pf_config_overrides or "split_prob" not in pf_config_overrides:
+        if (
+            pf_conf.structural_kernel_mode == "heuristic"
+            and (
+                not pf_config_overrides
+                or "split_prob" not in pf_config_overrides
+            )
+        ):
             if pf_conf.split_prob <= 0.0:
                 pf_conf.split_prob = 0.05
-        if not pf_config_overrides or "merge_prob" not in pf_config_overrides:
+        if (
+            pf_conf.structural_kernel_mode == "heuristic"
+            and (
+                not pf_config_overrides
+                or "merge_prob" not in pf_config_overrides
+            )
+        ):
             if pf_conf.merge_prob <= 0.0:
                 pf_conf.merge_prob = 0.05
     if not birth_enabled:
@@ -11388,6 +11483,9 @@ def run_live_pf(
             pf_conf.init_num_sources = (1, 1)
     if ig_threshold_min is not None:
         pf_conf.ig_threshold = float(ig_threshold_min)
+    # Overrides and the runtime birth switch are applied after dataclass
+    # construction, so rerun normalization and exact-kernel compatibility checks.
+    pf_conf.__post_init__()
     strict_planned_shield_program = bool(
         runtime_config.get(
             "strict_planned_shield_program",

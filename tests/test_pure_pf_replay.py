@@ -233,6 +233,14 @@ def test_replay_outputs_are_deterministic_and_provenance_hashes_bind_inputs(
         diagnostics["structural_transition_provenance"]
         == (posterior["structural_transition_provenance"])
     )
+    assert (
+        diagnostics["structural_model_manifest"]
+        == posterior["structural_model_manifest"]
+    )
+    assert (
+        posterior["provenance"]["structural_model_manifest"]
+        == posterior["structural_model_manifest"]
+    )
 
 
 def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(

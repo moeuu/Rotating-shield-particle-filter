@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -28,6 +29,64 @@ from pf.provenance import canonical_json_bytes, repository_commit, sha256_json
 
 class PurePFBoundaryError(RuntimeError):
     """Signal a violation of the sequential PF result contract."""
+
+
+def _ordered_surface_dictionary_sha256(
+    centers_xyz: NDArray[np.float64],
+    areas_m2: NDArray[np.float64],
+) -> str:
+    """Hash ordered patch centers and areas using a stable binary encoding."""
+    digest = hashlib.sha256()
+    digest.update(b"pure-pf-surface-centers-areas-float64-le-v1\0")
+    arrays = (
+        (b"centers_xyz\0", np.asarray(centers_xyz, dtype="<f8")),
+        (b"areas_m2\0", np.asarray(areas_m2, dtype="<f8")),
+    )
+    for label, values in arrays:
+        contiguous = np.ascontiguousarray(values)
+        shape = np.asarray(
+            (contiguous.ndim, *contiguous.shape),
+            dtype="<u8",
+        )
+        digest.update(label)
+        digest.update(shape.tobytes(order="C"))
+        digest.update(contiguous.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _resolved_cardinality_prior(
+    config: RotatingShieldPFConfig,
+) -> tuple[tuple[int, ...], tuple[float, ...], str]:
+    """Return resolved cardinality support, normalized mass, and its source."""
+    max_sources = config.max_sources
+    if max_sources is None:
+        return (), (), "unbounded_support_unavailable"
+    support = tuple(range(int(max_sources) + 1))
+    configured = config.structural_cardinality_prior_probs
+    if configured is None:
+        probability = 1.0 / float(len(support))
+        return (
+            support,
+            tuple(probability for _ in support),
+            "uniform_default",
+        )
+    probabilities = np.asarray(configured, dtype=float).reshape(-1)
+    if probabilities.size != len(support):
+        raise PurePFBoundaryError(
+            "Structural cardinality prior length differs from resolved support."
+        )
+    total = float(np.sum(probabilities))
+    if (
+        not np.all(np.isfinite(probabilities))
+        or np.any(probabilities <= 0.0)
+        or not np.isfinite(total)
+        or total <= 0.0
+    ):
+        raise PurePFBoundaryError(
+            "Structural cardinality prior must contain finite positive mass."
+        )
+    normalized = probabilities / total
+    return support, tuple(float(value) for value in normalized), "explicit"
 
 
 class PurePFEstimator(_PFEstimatorCore):
@@ -103,6 +162,214 @@ class PurePFEstimator(_PFEstimatorCore):
             capabilities=self.profile_capabilities,
         ).to_dict()
 
+    def structural_model_manifest(self) -> dict[str, Any]:
+        """Return outcome-independent structural-prior and RJ-kernel provenance."""
+        support, probabilities, prior_source = _resolved_cardinality_prior(
+            self.pf_config
+        )
+        structural_moves_enabled = bool(self.pf_config.birth_enable)
+        exact_enabled = structural_moves_enabled and (
+            str(self.pf_config.structural_kernel_mode)
+            .strip()
+            .lower()
+            .replace("-", "_")
+            == "rj_mh"
+        )
+        configured_isotopes = sorted(
+            {
+                str(isotope)
+                for isotope in (
+                    *getattr(self, "all_isotopes", ()),
+                    *getattr(self, "isotopes", ()),
+                    *getattr(self, "filters", {}).keys(),
+                )
+            }
+        )
+        dictionary_groups: dict[str, dict[str, Any]] = {}
+        missing_isotopes: list[str] = []
+        if exact_enabled:
+            for isotope in configured_isotopes:
+                filt = self.filters.get(isotope)
+                patches = (
+                    None
+                    if filt is None
+                    else getattr(filt, "_structural_rj_surface_patches", None)
+                )
+                if patches is None:
+                    missing_isotopes.append(isotope)
+                    continue
+                centers = np.asarray(patches.centers_xyz, dtype=float)
+                areas = np.asarray(patches.areas_m2, dtype=float)
+                dictionary_hash = _ordered_surface_dictionary_sha256(
+                    centers,
+                    areas,
+                )
+                group = dictionary_groups.setdefault(
+                    dictionary_hash,
+                    {
+                        "ordered_centers_areas_sha256": dictionary_hash,
+                        "patch_count": int(patches.patch_count),
+                        "total_area_m2": float(np.sum(areas, dtype=np.float64)),
+                        "geometry_metadata": dict(patches.geometry_metadata),
+                        "isotopes": [],
+                    },
+                )
+                group["isotopes"].append(isotope)
+        if not exact_enabled:
+            dictionary_status = "not_applicable"
+            dictionaries_identical: bool | None = None
+            missing_isotopes = []
+        elif not dictionary_groups:
+            dictionary_status = "not_initialized"
+            dictionaries_identical = None
+        elif missing_isotopes:
+            dictionary_status = "partially_initialized"
+            dictionaries_identical = (
+                False if len(dictionary_groups) > 1 else None
+            )
+        else:
+            dictionary_status = "complete"
+            dictionaries_identical = len(dictionary_groups) == 1
+        grouped_dictionaries = sorted(
+            dictionary_groups.values(),
+            key=lambda item: str(item["ordered_centers_areas_sha256"]),
+        )
+        for group in grouped_dictionaries:
+            group["isotopes"] = sorted(str(value) for value in group["isotopes"])
+
+        birth_weight = float(self.pf_config.structural_rj_birth_probability)
+        death_weight = float(self.pf_config.structural_rj_death_probability)
+        interior_total = birth_weight + death_weight
+        interior_birth = (
+            birth_weight / interior_total if interior_total > 0.0 else 0.0
+        )
+        interior_death = (
+            death_weight / interior_total if interior_total > 0.0 else 0.0
+        )
+        max_cardinality = None if not support else int(support[-1])
+        manifest_completeness = (
+            "complete"
+            if dictionary_status in {"complete", "not_applicable"}
+            else (
+                "partial"
+                if dictionary_status == "partially_initialized"
+                else "config_only"
+            )
+        )
+        return {
+            "schema_version": 1,
+            "manifest_completeness": manifest_completeness,
+            "structural_moves_enabled": structural_moves_enabled,
+            "structural_kernel_mode": str(
+                self.pf_config.structural_kernel_mode
+            ),
+            "cardinality_prior": {
+                "support": [int(value) for value in support],
+                "probabilities": [float(value) for value in probabilities],
+                "configuration_source": prior_source,
+                "applies_independently_per_isotope": True,
+            },
+            "strength_prior": {
+                "kind": str(self.pf_config.init_strength_prior),
+                "minimum_cps_1m": float(self.pf_config.init_strength_min),
+                "maximum_cps_1m": (
+                    None
+                    if self.pf_config.init_strength_max is None
+                    else float(self.pf_config.init_strength_max)
+                ),
+                "log_mean": float(self.pf_config.init_strength_log_mean),
+                "log_sigma": float(self.pf_config.init_strength_log_sigma),
+                "units": "detector_cps_1m",
+                "unit_definition": (
+                    "expected_net_detector_count_rate_at_1m"
+                ),
+                "shared_by_initialization_and_rj_moves": exact_enabled,
+            },
+            "surface_set_prior": {
+                "semantics": (
+                    "area_product_distinct_patch_sets"
+                    if exact_enabled
+                    else "not_applicable"
+                ),
+                "probability_mass": (
+                    "product(patch_area_m2)/"
+                    "elementary_symmetric_normalizer(K)"
+                    if exact_enabled
+                    else "not_applicable"
+                ),
+                "canonical_strictly_increasing_patch_indices": exact_enabled,
+                "duplicate_patch_indices_allowed": (
+                    False if exact_enabled else None
+                ),
+                "patch_spacing_m": float(
+                    self.pf_config.structural_rj_patch_spacing_m
+                ),
+                "dictionary_hash_encoding": (
+                    "ordered_centers_xyz_and_areas_m2_float64_little_endian_v1"
+                ),
+                "dictionary_status": dictionary_status,
+                "configured_isotopes": configured_isotopes,
+                "missing_isotopes": sorted(missing_isotopes),
+                "dictionaries_identical_across_isotopes": (
+                    dictionaries_identical
+                ),
+                "dictionary_groups": grouped_dictionaries,
+            },
+            "rj_move_kernel": {
+                "enabled": exact_enabled,
+                "structural_attempt_probability": float(
+                    self.pf_config.structural_rj_move_probability
+                ),
+                "birth_death_direction_weights": {
+                    "birth": birth_weight,
+                    "death": death_weight,
+                },
+                "interior_birth_death_probabilities": {
+                    "birth": float(interior_birth),
+                    "death": float(interior_death),
+                },
+                "position_move_attempt_probability": float(
+                    self.pf_config.structural_rj_position_move_probability
+                ),
+                "position_move_proposal": (
+                    "area_weighted_conditional_prior_independence"
+                ),
+                "local_position_move_attempt_probability": float(
+                    self.pf_config
+                    .structural_rj_local_position_move_probability
+                ),
+                "local_position_move_proposal": (
+                    "uniform_unoccupied_physical_surface_neighbor"
+                ),
+                "local_position_reverse_correction": (
+                    "forward_available_degree_over_reverse_available_degree"
+                ),
+                "global_position_move_retained_for_irreducibility": True,
+                "strength_move_attempt_probability": float(
+                    self.pf_config.structural_rj_strength_move_probability
+                ),
+                "boundary_normalization": {
+                    "rule": (
+                        "renormalize_admissible_birth_death_direction_weights"
+                    ),
+                    "at_k_zero": {"birth": 1.0, "death": 0.0},
+                    "at_k_max": (
+                        None
+                        if max_cardinality is None
+                        else {
+                            "cardinality": max_cardinality,
+                            "birth": 0.0,
+                            "death": 1.0,
+                        }
+                    ),
+                },
+                "dimension_matching": {
+                    "absolute_jacobian_determinant": 1.0,
+                    "log_absolute_jacobian_determinant": 0.0,
+                },
+            },
+        }
+
     def accepts_proposal_origin(self, origin: ProposalOrigin | str) -> bool:
         """Return whether a proposal origin may alter this PF."""
         try:
@@ -170,6 +437,7 @@ class PurePFEstimator(_PFEstimatorCore):
             structural_transition_provenance=(
                 self.structural_transition_diagnostics()
             ),
+            structural_model_manifest=self.structural_model_manifest(),
         )
 
     def estimates(

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from sim.runtime import load_runtime_config
+
 
 def _load_main_module() -> object:
     """Load the repository main.py module for CLI tests."""
@@ -317,6 +319,20 @@ def test_main_default_selects_standard_geant4_full_simulation(monkeypatch) -> No
         "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     assert captured["live"] is False
+    assert captured["birth_enabled"] is True
+    runtime_config = load_runtime_config(Path(str(captured["sim_config_path"])))
+    assert runtime_config["birth_enable"] is True
+    assert runtime_config["structural_kernel_mode"] == "rj_mh"
+    assert runtime_config["pf_max_sources"] == 5
+    assert runtime_config["structural_cardinality_prior_probs"] == pytest.approx(
+        [1.0 / 6.0] * 6
+    )
+    assert runtime_config["surface_rejuvenation_enable"] is False
+    assert runtime_config["mode_preserving_resample"] is False
+    assert runtime_config["cardinality_preserving_resample"] is False
+    assert runtime_config["pseudo_source_verification_enable"] is False
+    assert float(runtime_config["split_prob"]) == 0.0
+    assert float(runtime_config["merge_prob"]) == 0.0
 
 
 def test_main_backend_override_without_mode_keeps_matching_default_config(
@@ -389,6 +405,30 @@ def test_main_standard_full_aliases_select_geant4_cui(
         "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     assert captured["live"] is False
+    assert captured["birth_enabled"] is True
+
+
+def test_main_can_explicitly_disable_standard_structural_moves(monkeypatch) -> None:
+    """The no-birth CLI override must win over the standard exact config."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--full-simulation", "--no-birth"],
+    )
+
+    module.main()
+
+    assert captured["birth_enabled"] is False
+    runtime_config = load_runtime_config(Path(str(captured["sim_config_path"])))
+    assert runtime_config["birth_enable"] is True
 
 
 def test_main_matplotlib_live_can_be_requested(monkeypatch) -> None:

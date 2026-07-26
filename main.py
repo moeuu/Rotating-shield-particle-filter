@@ -17,6 +17,7 @@ from realtime_demo import (
     DEFAULT_OBSTACLE_CONFIG,
     DEFAULT_SOURCE_CONFIG,
     load_sources_from_json,
+    resolve_runtime_structural_moves_enabled,
     run_live_pf,
 )
 from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
@@ -425,8 +426,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--birth",
+        dest="birth",
         action="store_true",
-        help="Enable birth/death/split/merge moves (default: disabled).",
+        default=None,
+        help="Enable PF structural moves, overriding the runtime config.",
+    )
+    parser.add_argument(
+        "--no-birth",
+        dest="birth",
+        action="store_false",
+        help="Disable PF structural moves, overriding the runtime config.",
     )
     parser.add_argument(
         "--num-particles",
@@ -781,6 +790,10 @@ def main() -> None:
         args,
         parser,
     )
+    structural_moves_enabled = resolve_runtime_structural_moves_enabled(
+        args.birth,
+        sim_config_path,
+    )
     if args.max_sources is None:
         args.max_sources = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     pf_overrides: dict[str, object] = {
@@ -880,7 +893,7 @@ def main() -> None:
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
         eval_match_radius_m=args.eval_match_radius,
-        birth_enabled=args.birth,
+        birth_enabled=structural_moves_enabled,
         num_particles=args.num_particles,
         pf_config_overrides=pf_overrides,
         output_tag=args.output_tag,

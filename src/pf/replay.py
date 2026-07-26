@@ -738,6 +738,7 @@ def _write_replay_outputs(
         (temporary / "pf_trace.jsonl").write_bytes(trace_bytes)
         final_state = estimator.serialized_state()
         structural = estimator.structural_transition_diagnostics()
+        structural_model = dict(posterior["structural_model_manifest"])
         diagnostics = {
             "schema_version": 1,
             "estimator_family": "particle_filter",
@@ -761,6 +762,7 @@ def _write_replay_outputs(
             ),
             "reversible_jump_mcmc_used": bool(structural["reversible_jump_mcmc_used"]),
             "structural_transition_provenance": dict(structural),
+            "structural_model_manifest": structural_model,
         }
         (temporary / "pf_diagnostics.json").write_bytes(
             canonical_json_bytes(diagnostics)

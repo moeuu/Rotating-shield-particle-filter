@@ -561,7 +561,13 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert float(payload["birth_q_max"]) >= float(
         payload["random_source_intensity_max_cps_1m"]
     )
-    assert payload["cardinality_preserving_resample"] is True
+    assert payload["structural_kernel_mode"] == "rj_mh"
+    assert payload["birth_enable"] is True
+    assert (
+        float(payload["structural_rj_local_position_move_probability"])
+        == 1.0
+    )
+    assert payload["cardinality_preserving_resample"] is False
     assert int(payload["cardinality_preserving_min_stations"]) == 0
     assert payload["cardinality_preserving_require_confirmed_structure"] is False
     assert payload["split_residual_guided"] is True
@@ -587,7 +593,7 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert float(payload["dss_pp"]["correlation_reduction_weight"]) > 0.0
     assert float(payload["dss_pp"]["isotope_balance_weight"]) > 0.0
     assert float(payload["dss_pp"]["coverage_weight"]) <= 2.0
-    assert payload["mode_preserving_resample"] is True
+    assert payload["mode_preserving_resample"] is False
     assert int(payload["mode_preserving_max_modes"]) >= 12
     assert int(payload["mode_preserving_particles_per_mode"]) >= 8
     assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)

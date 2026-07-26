@@ -1,5 +1,7 @@
 """Tests for dynamic source cardinality with birth/death moves (Chapter 3, Sec. 3.4.2)."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from numpy.typing import NDArray
@@ -61,7 +63,7 @@ def _build_filter(
 def test_structural_count_likelihood_matches_runtime_sequence(
     likelihood_model: str,
 ) -> None:
-    """Batched structural evidence should equal the runtime count likelihood."""
+    """Structural evidence must keep count covariance despite spectrum payloads."""
     import torch
 
     filt = _build_filter(
@@ -107,8 +109,14 @@ def test_structural_count_likelihood_matches_runtime_sequence(
         [[0.0, 0.12, 0.08], [0.12, 0.0, 0.11], [0.08, 0.11, 0.0]],
         dtype=float,
     )
+    z_values = np.array([72.0, 48.0, 31.0, 26.0, 39.0, 57.0], dtype=float)
+    spectrum_template = np.repeat(
+        np.asarray([[0.4, 0.6]], dtype=float),
+        z_values.size,
+        axis=0,
+    )
     data = MeasurementData(
-        z_k=np.array([72.0, 48.0, 31.0, 26.0, 39.0, 57.0], dtype=float),
+        z_k=z_values,
         observation_variances=np.array(
             [4.0, 5.0, 3.5, 2.5, 4.5, 6.0],
             dtype=float,
@@ -119,6 +127,10 @@ def test_structural_count_likelihood_matches_runtime_sequence(
         live_times=np.ones(6, dtype=float),
         station_sequence_ids=np.array([0, 0, 0, 1, 1, 1], dtype=int),
         observation_count_covariance=covariance,
+        spectrum_counts=z_values[:, None] * spectrum_template,
+        spectrum_response_template=spectrum_template,
+        spectrum_background=np.zeros_like(spectrum_template),
+        spectrum_variance=np.ones_like(spectrum_template),
     )
     lambda_kp = np.array(
         [
@@ -613,6 +625,96 @@ def test_mixed_runtime_likelihood_history_matches_runtime_updates() -> None:
     )
 
     assert np.allclose(structural, runtime.numpy(), rtol=1.0e-11, atol=1.0e-10)
+
+
+def test_legacy_route_inference_prefers_covariance_and_keeps_explicit_direct() -> None:
+    """Legacy inference must not rewrite an explicitly recorded direct route."""
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        min_particles=1,
+        max_particles=1,
+        max_sources=1,
+        init_num_sources=(0, 0),
+        birth_enable=False,
+        count_likelihood_model="student_t",
+        spectrum_count_rel_sigma=0.05,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=1.0,
+        direct_spectrum_likelihood_enable=True,
+        use_gpu=False,
+        parallel_isotope_updates=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.5},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    records = (
+        MeasurementRecord(
+            z_k={"Cs-137": 18.0},
+            pose_idx=0,
+            orient_idx=0,
+            fe_index=0,
+            pb_index=1,
+            live_time_s=1.0,
+            station_sequence_id=7,
+            station_view_index=0,
+        ),
+        MeasurementRecord(
+            z_k={"Cs-137": 27.0},
+            pose_idx=0,
+            orient_idx=1,
+            fe_index=1,
+            pb_index=0,
+            live_time_s=1.0,
+            station_sequence_id=7,
+            station_view_index=1,
+        ),
+    )
+    payloads = (
+        {
+            "spectrum_counts": np.array([7.0, 11.0], dtype=float),
+            "spectrum_response_template": np.array([0.4, 0.6], dtype=float),
+            "spectrum_background": np.zeros(2, dtype=float),
+        },
+        {
+            "spectrum_counts": np.array([10.0, 17.0], dtype=float),
+            "spectrum_response_template": np.array([0.4, 0.6], dtype=float),
+            "spectrum_background": np.zeros(2, dtype=float),
+        },
+    )
+
+    inferred_routes = estimator._runtime_likelihood_routes_for_records(
+        "Cs-137",
+        records,
+        payloads,
+    )
+    explicit_records = tuple(
+        replace(
+            record,
+            runtime_likelihood_route_by_isotope={"Cs-137": "direct_spectrum"},
+        )
+        for record in records
+    )
+    explicit_routes = estimator._runtime_likelihood_routes_for_records(
+        "Cs-137",
+        explicit_records,
+        payloads,
+    )
+
+    assert inferred_routes.tolist() == [
+        "count_covariance",
+        "count_covariance",
+    ]
+    assert explicit_routes.tolist() == [
+        "direct_spectrum",
+        "direct_spectrum",
+    ]
 
 
 def test_joint_spectrum_route_retains_present_row_variance() -> None:

@@ -251,9 +251,15 @@ def resolve_structural_transition_provenance(
     *,
     capabilities: EstimatorCapabilities | None = None,
 ) -> StructuralTransitionProvenance:
-    """Resolve truthful provenance for likelihood-scored PF structural moves."""
+    """Resolve truthful provenance for the configured PF structural kernel."""
     del capabilities
     structural_moves_enabled = bool(getattr(config, "birth_enable", False))
+    structural_kernel_mode = (
+        str(getattr(config, "structural_kernel_mode", "heuristic"))
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
     raw_initial_support = getattr(config, "init_num_sources", (0, 0))
     try:
         initial_lower, initial_upper = raw_initial_support
@@ -261,13 +267,28 @@ def resolve_structural_transition_provenance(
     except (TypeError, ValueError):
         fixed_initial_cardinality = True
 
-    if structural_moves_enabled:
+    if structural_moves_enabled and structural_kernel_mode == "rj_mh":
+        kernel_family = "area_weighted_surface_birth_death_rj_mh"
+        posterior_semantics = (
+            "sequential_particle_filter_with_"
+            "target_preserving_rj_mh_rejuvenation"
+        )
+        target_preserving = True
+        exact_rj = True
+        reversible_jump_used = True
+        data_conditioned_proposal = False
+        data_conditioned_strength = False
+    elif structural_moves_enabled:
         kernel_family = "likelihood_scored_residual_pf_structural_moves"
         posterior_semantics = (
             "approximate_sequential_particle_ensemble_with_"
             "likelihood_scored_structural_moves"
         )
         target_preserving = False
+        exact_rj = False
+        reversible_jump_used = False
+        data_conditioned_proposal = True
+        data_conditioned_strength = True
     else:
         kernel_family = (
             "fixed_cardinality_no_structural_moves"
@@ -280,16 +301,20 @@ def resolve_structural_transition_provenance(
             else "static_cardinality_mixture_sequential_particle_filter"
         )
         target_preserving = True
+        exact_rj = False
+        reversible_jump_used = False
+        data_conditioned_proposal = False
+        data_conditioned_strength = False
 
     return StructuralTransitionProvenance(
         posterior_semantics=posterior_semantics,
         structural_kernel_family=kernel_family,
         structural_moves_enabled=structural_moves_enabled,
         structural_kernel_target_preserving=target_preserving,
-        structural_kernel_exact_rj=False,
-        reversible_jump_mcmc_used=False,
-        data_conditioned_structural_proposal=structural_moves_enabled,
-        data_conditioned_strength_proposal=structural_moves_enabled,
+        structural_kernel_exact_rj=exact_rj,
+        reversible_jump_mcmc_used=reversible_jump_used,
+        data_conditioned_structural_proposal=data_conditioned_proposal,
+        data_conditioned_strength_proposal=data_conditioned_strength,
         data_conditioned_strength_proposal_importance_corrected=False,
         structural_evidence_uses_pf_likelihood=True,
     )

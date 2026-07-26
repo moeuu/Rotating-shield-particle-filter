@@ -153,6 +153,15 @@ class RotatingShieldPFConfig:
         - structural_proposal_topk_particles: posterior-support cap for split/merge proposals
         - structural_trial_workers: worker count for deterministic split/merge trial chunks
         - structural_trial_parallel_min_trials: minimum trial count before worker chunks
+        - structural_kernel_mode: heuristic legacy moves or target-preserving RJ-MH
+        - structural_rj_patch_spacing_m: finite surface-patch spacing for RJ-MH
+        - structural_rj_move_probability: per-particle RJ birth/death attempt rate
+        - structural_rj_birth_probability: interior-state birth move weight
+        - structural_rj_death_probability: interior-state death move weight
+        - structural_rj_position_move_probability: global within-K move rate
+        - structural_rj_local_position_move_probability: adjacent-patch move rate
+        - structural_rj_strength_move_probability: within-K strength-move attempt rate
+        - structural_cardinality_prior_probs: optional positive prior masses for K
         - source_position_prior: environment-surface PF source-position support
         - init_num_sources: inclusive range for initial source count per particle
         - init_grid_spacing_m: grid spacing for deterministic particle initialization
@@ -363,6 +372,15 @@ class RotatingShieldPFConfig:
     structural_proposal_topk_particles: int | None = None
     structural_trial_workers: int = 1
     structural_trial_parallel_min_trials: int = 8
+    structural_kernel_mode: str = "heuristic"
+    structural_rj_patch_spacing_m: float = 1.0
+    structural_rj_move_probability: float = 1.0
+    structural_rj_birth_probability: float = 0.5
+    structural_rj_death_probability: float = 0.5
+    structural_rj_position_move_probability: float = 1.0
+    structural_rj_local_position_move_probability: float = 1.0
+    structural_rj_strength_move_probability: float = 1.0
+    structural_cardinality_prior_probs: tuple[float, ...] | list[float] | None = None
     short_time_s: float = 0.5  # Recommended short-time measurement (Sec. 3.4.3).
     ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
@@ -791,6 +809,124 @@ class RotatingShieldPFConfig:
             raise ValueError("source_position_prior must be 'volume' or 'surface'.")
         self.source_position_prior = prior
         self.surface_rejuvenation_enable = bool(self.surface_rejuvenation_enable)
+        self.structural_kernel_mode = (
+            str(self.structural_kernel_mode).strip().lower().replace("-", "_")
+        )
+        if self.structural_kernel_mode not in {"heuristic", "rj_mh"}:
+            raise ValueError(
+                "structural_kernel_mode must be 'heuristic' or 'rj_mh'."
+            )
+        self.structural_rj_patch_spacing_m = float(
+            self.structural_rj_patch_spacing_m
+        )
+        if (
+            not np.isfinite(self.structural_rj_patch_spacing_m)
+            or self.structural_rj_patch_spacing_m <= 0.0
+        ):
+            raise ValueError("structural_rj_patch_spacing_m must be positive.")
+        for probability_field in (
+            "structural_rj_move_probability",
+            "structural_rj_birth_probability",
+            "structural_rj_death_probability",
+            "structural_rj_position_move_probability",
+            "structural_rj_local_position_move_probability",
+            "structural_rj_strength_move_probability",
+        ):
+            probability = float(getattr(self, probability_field))
+            if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                raise ValueError(f"{probability_field} must be in [0, 1].")
+            setattr(self, probability_field, probability)
+        if self.structural_cardinality_prior_probs is not None:
+            if not isinstance(
+                self.structural_cardinality_prior_probs,
+                (tuple, list),
+            ):
+                raise ValueError(
+                    "structural_cardinality_prior_probs must be a tuple, "
+                    "list, or None."
+                )
+            cardinality_prior = tuple(
+                float(value)
+                for value in self.structural_cardinality_prior_probs
+            )
+            if not cardinality_prior or any(
+                not np.isfinite(value) or value <= 0.0
+                for value in cardinality_prior
+            ):
+                raise ValueError(
+                    "structural_cardinality_prior_probs must contain only "
+                    "positive finite values."
+                )
+            self.structural_cardinality_prior_probs = cardinality_prior
+        self.cardinality_preserving_resample = bool(
+            self.cardinality_preserving_resample
+        )
+        self.mode_preserving_resample = bool(self.mode_preserving_resample)
+        if self.structural_kernel_mode == "rj_mh" and bool(self.birth_enable):
+            if self.source_position_prior != "surface":
+                raise ValueError(
+                    "structural_kernel_mode='rj_mh' requires "
+                    "source_position_prior='surface'."
+                )
+            if self.max_sources is None or int(self.max_sources) < 1:
+                raise ValueError(
+                    "structural_kernel_mode='rj_mh' requires a finite "
+                    "positive max_sources."
+                )
+            expected_cardinalities = int(self.max_sources) + 1
+            if (
+                self.structural_cardinality_prior_probs is not None
+                and len(self.structural_cardinality_prior_probs)
+                != expected_cardinalities
+            ):
+                raise ValueError(
+                    "structural_cardinality_prior_probs must contain "
+                    "max_sources + 1 entries in rj_mh mode."
+                )
+            initial_lower, initial_upper = self.init_num_sources
+            if (
+                int(initial_lower) != 0
+                or int(initial_upper) != int(self.max_sources)
+            ):
+                raise ValueError(
+                    "structural_kernel_mode='rj_mh' requires "
+                    "init_num_sources=(0, max_sources)."
+                )
+            if (
+                self.structural_rj_birth_probability <= 0.0
+                or self.structural_rj_death_probability <= 0.0
+            ):
+                raise ValueError(
+                    "structural_kernel_mode='rj_mh' with structural moves "
+                    "enabled requires positive birth and death probabilities."
+                )
+            incompatible = {
+                "split_prob": float(self.split_prob) != 0.0,
+                "merge_prob": float(self.merge_prob) != 0.0,
+                "surface_rejuvenation_enable": self.surface_rejuvenation_enable,
+                "mode_preserving_resample": self.mode_preserving_resample,
+                "cardinality_preserving_resample": (
+                    self.cardinality_preserving_resample
+                ),
+                "pseudo_source_verification_enable": bool(
+                    self.pseudo_source_verification_enable
+                ),
+                "source_detector_exclusion_m": (
+                    self.source_detector_exclusion_m > 0.0
+                ),
+                "init_source_min_separation_m": (
+                    self.init_source_min_separation_m > 0.0
+                ),
+            }
+            enabled_incompatible = [
+                name for name, enabled in incompatible.items() if enabled
+            ]
+            if enabled_incompatible:
+                joined = ", ".join(enabled_incompatible)
+                raise ValueError(
+                    "structural_kernel_mode='rj_mh' requires incompatible "
+                    f"options to be disabled or zero: {joined}."
+                )
         if (
             bool(self.birth_enable)
             and self.max_sources is not None
@@ -1999,14 +2135,12 @@ class RotatingShieldPFEstimator:
         elif pf_config is None:
             direct_enabled = True
         else:
-            direct_enabled = bool(
-                pf_config.direct_spectrum_likelihood_enable
-            ) and normalize_observation_count_variance_semantics(
-                pf_config.observation_count_variance_semantics,
-                includes_counting_noise=bool(
-                    pf_config.observation_count_variance_includes_counting_noise
-                ),
-            ) != OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
+            direct_enabled = (
+                IsotopeParticleFilter._direct_spectrum_likelihood_config_enabled(
+                    pf_config,
+                    str(isotope),
+                )
+            )
         routes: list[str] = []
         explicit_routes: list[bool] = []
         for record, spectrum_payload in zip(records, spectrum_payloads):
@@ -2030,7 +2164,7 @@ class RotatingShieldPFEstimator:
                 )
             routes.append(normalized)
         sequence_ids = self._station_sequence_ids_for_records(records)
-        route_array = np.asarray(routes, dtype=str)
+        route_array = np.asarray(routes, dtype="<U16")
         explicit_array = np.asarray(explicit_routes, dtype=bool)
         likelihood_config = getattr(filt, "config", pf_config)
         configured_station_covariance = bool(
@@ -2049,8 +2183,6 @@ class RotatingShieldPFEstimator:
         for sequence_id in np.unique(sequence_ids):
             block_mask = sequence_ids == int(sequence_id)
             if np.any(explicit_array[block_mask]) or np.count_nonzero(block_mask) < 2:
-                continue
-            if np.any(route_array[block_mask] == "direct_spectrum"):
                 continue
             supplied_station_covariance = any(
                 isinstance(

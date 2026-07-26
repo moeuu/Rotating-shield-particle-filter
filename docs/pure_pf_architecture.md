@@ -28,40 +28,69 @@ estimator and rescue paths are invalid rather than dormant switches.
 ## Physical source support
 
 The standard Python, Geant4, and Isaac Sim entry points set
-`source_surface_prior=true`. Source candidates are generated on the physical
-environment surfaces:
+`source_surface_prior=true`. The exact structural kernel discretizes the
+physical environment into a finite dictionary of surface patches:
 
 - floor and ceiling;
 - room walls;
 - exposed obstacle tops and sides.
 
-The same surface support is used for initial particles, structural proposals,
-roughening, and the final posterior projection. The standard RAL factory does
-not provide a full-volume source-prior ablation. Detector measurement poses
-remain collision-free points in reachable free space; detector support and
-source support are intentionally different physical domains.
+Each patch carries its physical area. Initial positions and structural
+proposals use the same area-weighted dictionary, prohibit duplicate patch
+indices within one isotope state, and store positions in canonical patch-index
+order. The finite patch spacing is part of the declared model and sets a
+discretization error floor; exactness below refers to this finite-state target,
+not to an undiscretized continuous surface.
+
+The standard exact kernel does not project or jitter positions after
+resampling, exclude source patches near measured detector poses, or impose an
+initial-only pairwise separation rule. Those operations would change the
+declared position prior without a reversible transition. The standard RAL
+factory does not provide a full-volume source-prior ablation. Detector
+measurement poses remain collision-free points in reachable free space;
+detector support and source support are intentionally different physical
+domains.
 
 ## Sequential likelihood and structural moves
 
 The PF likelihood consumes the logged `response_poisson` isotope counts and
 their covariance. Transport-model, spectrum-model, counting, and correlated
 station-view uncertainty are composed once by the production likelihood.
-Residual birth and death evidence is evaluated with that same effective
-likelihood and covariance semantics.
+Sequential weight updates and structural trials call the same likelihood
+implementation.
 
-Birth, death, split, and merge remain PF-internal structural proposals. They do
-not invoke an independent strength fit. A birth uses a residual-conditioned
-strength proposal bounded by the predeclared physical support, then assesses
-that fixed proposed state with the PF likelihood.
-Birth is admitted by positive likelihood evidence; death is admitted when
-removing a source improves the same likelihood after the configured structural
-penalty. There is no unconditional forced-birth path and no rule that suppresses
-death merely because a raw residual gate fired.
+The standard RA-L Geant4 configuration selects
+`structural_kernel_mode=rj_mh`. It applies a PF-internal resample-move kernel
+whose invariant target is the current finite-surface PF posterior:
 
-The structural matching-pursuit proposal is still an approximate
-data-conditioned proposal unless its forward/reverse density, prior ratio, and
-dimension-matching Jacobian are included. Result provenance must therefore
-distinguish ordinary pure-PF execution from exact reversible-jump inference.
+- the cardinality prior is declared before inference;
+- a distinct set of source patches has probability proportional to the product
+  of its patch areas;
+- each source strength is sampled from the same normalized physical prior used
+  at initialization;
+- birth and death include the forward and reverse move probabilities, proposal
+  densities, cardinality and source priors, and the unit dimension-matching
+  Jacobian in the Metropolis-Hastings ratio;
+- within-cardinality patch moves compose an area-prior independence proposal
+  for global reachability with a local proposal over physically adjacent,
+  unoccupied patches; the local acceptance ratio includes the forward/reverse
+  available-neighbor degree correction;
+- strength moves use a reversible prior-independence
+  Metropolis-Hastings transition; and
+- accepted rejuvenation moves leave the outer particle weights unchanged.
+
+Move probabilities are normalized at the `K=0` and `K=max_sources`
+boundaries. Split/merge, BIC thresholds, residual matching pursuit,
+pseudo-source pruning, mode-preserving injection, and post-resample
+position/strength roughening are disabled in this standard mode. No MLE, batch
+fit, surface-map rescue, or strength refit is invoked.
+
+The legacy `structural_kernel_mode=heuristic` remains available only for
+explicit diagnostics and historical replay. It uses data-conditioned residual
+proposals and likelihood/BIC gates without a reverse proposal, complete prior
+ratio, or Jacobian. Its provenance is therefore
+`structural_kernel_target_preserving=false`, and its cardinality mass must not
+be interpreted as an exact Bayesian posterior.
 
 ## Posterior reporting
 

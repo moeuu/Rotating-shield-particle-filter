@@ -96,6 +96,7 @@ class PFPosteriorSnapshot:
     record_count: int
     structural_transition_provenance: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = 1
+    structural_model_manifest: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the required JSON-safe PF result contract."""
@@ -115,6 +116,7 @@ class PFPosteriorSnapshot:
                 "data_conditioned_strength_proposal": False,
                 "data_conditioned_strength_proposal_importance_corrected": False,
             }
+        structural_model = dict(self.structural_model_manifest)
         provenance = {
             "estimator_repository": "moeuu/Rotating-shield-particle-filter",
             "estimator_commit": str(self.repository_commit),
@@ -126,6 +128,7 @@ class PFPosteriorSnapshot:
             "planner_belief_sources": list(self.planner_belief_sources),
             "posterior_semantics": str(structural["posterior_semantics"]),
             "structural_transition_provenance": dict(structural),
+            "structural_model_manifest": dict(structural_model),
         }
         return {
             "schema_version": int(self.schema_version),
@@ -143,6 +146,7 @@ class PFPosteriorSnapshot:
             ),
             "reversible_jump_mcmc_used": bool(structural["reversible_jump_mcmc_used"]),
             "structural_transition_provenance": dict(structural),
+            "structural_model_manifest": dict(structural_model),
             "planner_belief_sources": list(self.planner_belief_sources),
             "repository_commit": str(self.repository_commit),
             "measurement_log_schema_version": int(self.measurement_log_schema_version),

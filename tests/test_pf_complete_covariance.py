@@ -237,3 +237,201 @@ def test_standard_defaults_keep_direct_spectrum_likelihood_enabled() -> None:
 
     assert filt.config.observation_count_variance_semantics == "additional"
     assert filt._direct_spectrum_likelihood_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "transport_kwargs",
+    [
+        {"transport_model_rel_sigma": 0.1},
+        {"transport_model_abs_sigma": {"Cs-137": 5.0}},
+    ],
+)
+def test_transport_uncertainty_disables_independent_spectrum_bins(
+    transport_kwargs: dict[str, object],
+) -> None:
+    """Count-level transport discrepancy must not be copied across spectrum bins."""
+    filt = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=None,
+        config=PFConfig(
+            num_particles=1,
+            count_likelihood_model="student_t",
+            **transport_kwargs,
+        ),
+    )
+
+    assert filt._direct_spectrum_likelihood_enabled() is False
+    assert (
+        filt._direct_spectrum_route_admissible(
+            sequence_length=1,
+            observation_count_covariance=None,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_covariance", "supplied_covariance"),
+    [
+        (True, None),
+        (
+            False,
+            np.asarray(
+                [[0.0, 2.0], [2.0, 0.0]],
+                dtype=float,
+            ),
+        ),
+    ],
+)
+def test_station_covariance_disables_independent_spectrum_bins(
+    configured_covariance: bool,
+    supplied_covariance: np.ndarray | None,
+) -> None:
+    """A cross-view covariance must take precedence over direct spectrum bins."""
+    filt = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=None,
+        config=PFConfig(
+            num_particles=1,
+            count_likelihood_model="student_t",
+            station_view_covariance_enable=configured_covariance,
+            station_view_correlated_spectrum_fraction=(
+                1.0 if configured_covariance else 0.0
+            ),
+        ),
+    )
+
+    assert filt._direct_spectrum_likelihood_enabled() is True
+    assert (
+        filt._direct_spectrum_route_admissible(
+            sequence_length=2,
+            observation_count_covariance=supplied_covariance,
+        )
+        is False
+    )
+
+
+def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RAL transport and station uncertainty must select batched count covariance."""
+    torch = pytest.importorskip("torch")
+    config = PFConfig(
+        num_particles=2,
+        min_particles=2,
+        max_particles=2,
+        count_likelihood_model="student_t",
+        count_likelihood_df=5.0,
+        transport_model_rel_sigma=0.1,
+        transport_model_abs_sigma=5.0,
+        spectrum_count_rel_sigma=0.05,
+        spectrum_count_abs_sigma=5.0,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=1.0,
+        use_gpu=True,
+        use_tempering=False,
+        resample_threshold=0.0,
+    )
+    dummy_kernel = type("K", (), {})()
+    dummy_kernel.poses = [np.asarray([0.0, 0.0, 0.0], dtype=float)]
+    dummy_kernel.orientations = [np.asarray([1.0, 0.0, 0.0], dtype=float)]
+    dummy_kernel.num_sources = 1
+    filt = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=dummy_kernel,
+        config=config,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=np.log(0.5),
+        )
+        for _ in range(2)
+    ]
+    expected_counts = torch.as_tensor(
+        [[12.0, 30.0], [18.0, 45.0]],
+        dtype=torch.float64,
+    )
+    z_obs = np.asarray([13.0, 20.0], dtype=float)
+    count_variances = np.asarray([4.0, 6.0], dtype=float)
+    count_covariance = np.asarray(
+        [[0.0, 2.0], [2.0, 0.0]],
+        dtype=float,
+    )
+    expected_ll = filt._log_likelihood_sequence_gpu(
+        expected_counts,
+        z_obs,
+        count_variances,
+        observation_count_covariance=count_covariance,
+    )
+    expected_weights = torch.softmax(expected_ll, dim=0).numpy()
+
+    def fake_gpu_enabled() -> bool:
+        """Pretend that the torch backend is available for the route test."""
+        return True
+
+    def fake_counts(**_kwargs: object) -> "torch.Tensor":
+        """Return deterministic batched particle count predictions."""
+        return expected_counts
+
+    def forbidden_spectrum(*_args: object, **_kwargs: object) -> "torch.Tensor":
+        """Fail if the inadmissible independent-bin helper is reached."""
+        raise AssertionError("direct spectrum likelihood was invoked")
+
+    def noop() -> None:
+        """Skip non-likelihood side effects in this route test."""
+        return None
+
+    def noop_kwargs(**_kwargs: object) -> None:
+        """Skip keyword-only non-likelihood side effects in this route test."""
+        return None
+
+    monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
+    monkeypatch.setattr(
+        filt,
+        "_continuous_expected_counts_pair_sequence_torch",
+        fake_counts,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_spectral_bin_sequence_log_likelihood_from_lambda_gpu",
+        forbidden_spectrum,
+    )
+    monkeypatch.setattr(filt, "_maybe_resample_continuous", noop)
+    monkeypatch.setattr(filt, "align_continuous_labels", noop)
+    monkeypatch.setattr(filt, "_advance_adapt_cooldown", noop)
+    monkeypatch.setattr(filt, "adapt_num_particles", noop_kwargs)
+    monkeypatch.setattr(filt, "_maybe_update_convergence", noop_kwargs)
+
+    filt.update_continuous_pair_sequence(
+        z_obs=z_obs,
+        pose_idx=0,
+        fe_indices=np.asarray([0, 0], dtype=int),
+        pb_indices=np.asarray([0, 0], dtype=int),
+        live_times_s=np.ones(2, dtype=float),
+        observation_count_variances=count_variances,
+        observation_count_covariance=count_covariance,
+        spectrum_counts=np.asarray(
+            [[4.0, 9.0], [7.0, 13.0]],
+            dtype=float,
+        ),
+        spectrum_response_template=np.asarray(
+            [[0.4, 0.6], [0.4, 0.6]],
+            dtype=float,
+        ),
+        spectrum_background=np.zeros((2, 2), dtype=float),
+        spectrum_variance=np.ones((2, 2), dtype=float),
+    )
+
+    assert filt.last_spectrum_likelihood_route == "count_covariance"
+    np.testing.assert_allclose(
+        filt.continuous_weights,
+        expected_weights,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )

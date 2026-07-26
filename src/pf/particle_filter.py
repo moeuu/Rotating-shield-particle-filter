@@ -23,6 +23,10 @@ from measurement.source_surfaces import (
     project_positions_to_allowed_surfaces,
     source_surface_kinds,
 )
+from measurement.surface_patches import (
+    SurfacePatchDictionary,
+    build_surface_patch_dictionary,
+)
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.diagnostics import build_source_event_record, reset_step_diagnostics
 from pf.likelihood import (
@@ -38,6 +42,20 @@ from pf.likelihood import (
 )
 from pf.state import IsotopeState
 from pf.resampling import systematic_resample, systematic_resample_count
+from pf.strength_prior import StrengthPrior
+from pf.structural_rj import (
+    BirthDeathMoveProbabilities,
+    CardinalityPrior,
+    SurfaceAdjacency,
+    SurfaceSetPrior,
+    add_surface_indices,
+    birth_log_acceptance_ratio,
+    conditional_birth_surface_log_probability,
+    death_log_acceptance_ratio,
+    local_position_log_acceptance_ratio,
+    remove_surface_columns,
+    uniform_death_index_log_probability,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -174,6 +192,15 @@ class PFConfig:
     structural_proposal_topk_particles: int | None = None
     structural_trial_workers: int = 1
     structural_trial_parallel_min_trials: int = 8
+    structural_kernel_mode: str = "heuristic"
+    structural_rj_patch_spacing_m: float = 1.0
+    structural_rj_move_probability: float = 1.0
+    structural_rj_birth_probability: float = 0.5
+    structural_rj_death_probability: float = 0.5
+    structural_rj_position_move_probability: float = 1.0
+    structural_rj_local_position_move_probability: float = 1.0
+    structural_rj_strength_move_probability: float = 1.0
+    structural_cardinality_prior_probs: tuple[float, ...] | None = None
     ess_low: float = 0.5
     ess_high: float = 0.9
     target_ess_ratio: float = 0.5
@@ -260,6 +287,117 @@ class PFConfig:
 
     def __post_init__(self) -> None:
         """Normalize likelihood semantics and reject incompatible settings."""
+        self.structural_kernel_mode = (
+            str(self.structural_kernel_mode).strip().lower().replace("-", "_")
+        )
+        if self.structural_kernel_mode not in {"heuristic", "rj_mh"}:
+            raise ValueError(
+                "structural_kernel_mode must be heuristic or rj_mh."
+            )
+        self.structural_rj_patch_spacing_m = float(
+            self.structural_rj_patch_spacing_m
+        )
+        if (
+            not np.isfinite(self.structural_rj_patch_spacing_m)
+            or self.structural_rj_patch_spacing_m <= 0.0
+        ):
+            raise ValueError(
+                "structural_rj_patch_spacing_m must be finite and positive."
+            )
+        for probability_name in (
+            "structural_rj_move_probability",
+            "structural_rj_birth_probability",
+            "structural_rj_death_probability",
+            "structural_rj_position_move_probability",
+            "structural_rj_local_position_move_probability",
+            "structural_rj_strength_move_probability",
+        ):
+            probability = float(getattr(self, probability_name))
+            if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                raise ValueError(f"{probability_name} must lie in [0, 1].")
+            setattr(self, probability_name, probability)
+        if (
+            (
+                self.structural_rj_birth_probability <= 0.0
+                or self.structural_rj_death_probability <= 0.0
+            )
+            and self.birth_enable
+            and self.structural_kernel_mode == "rj_mh"
+        ):
+            raise ValueError(
+                "rj_mh requires positive birth and death proposal probabilities "
+                "so every dimension change has a reverse move."
+            )
+        if self.structural_cardinality_prior_probs is not None:
+            cardinality_prior = np.asarray(
+                self.structural_cardinality_prior_probs,
+                dtype=float,
+            ).reshape(-1)
+            if (
+                cardinality_prior.size == 0
+                or np.any(~np.isfinite(cardinality_prior))
+                or np.any(cardinality_prior <= 0.0)
+            ):
+                raise ValueError(
+                    "structural_cardinality_prior_probs must contain finite "
+                    "positive values."
+                )
+            cardinality_prior /= float(np.sum(cardinality_prior))
+            self.structural_cardinality_prior_probs = tuple(
+                float(value) for value in cardinality_prior
+            )
+        if self.structural_kernel_mode == "rj_mh" and bool(self.birth_enable):
+            if not self._source_prior_name_is_surface(self.source_position_prior):
+                raise ValueError(
+                    "rj_mh requires source_position_prior='surface'."
+                )
+            if self.max_sources is None or int(self.max_sources) < 1:
+                raise ValueError("rj_mh requires a finite positive max_sources.")
+            expected_cardinalities = int(self.max_sources) + 1
+            if (
+                self.structural_cardinality_prior_probs is not None
+                and len(self.structural_cardinality_prior_probs)
+                != expected_cardinalities
+            ):
+                raise ValueError(
+                    "structural_cardinality_prior_probs must have "
+                    "max_sources + 1 entries."
+                )
+            initial_lower, initial_upper = self.init_num_sources
+            if (
+                int(initial_lower) != 0
+                or int(initial_upper) != int(self.max_sources)
+            ):
+                raise ValueError(
+                    "rj_mh initialization must cover every cardinality from "
+                    "zero through max_sources."
+                )
+            incompatible = {
+                "cardinality_preserving_resample": bool(
+                    self.cardinality_preserving_resample
+                ),
+                "mode_preserving_resample": bool(self.mode_preserving_resample),
+                "surface_rejuvenation_enable": bool(
+                    self.surface_rejuvenation_enable
+                ),
+                "pseudo_source_verification_enable": bool(
+                    self.pseudo_source_verification_enable
+                ),
+                "split_prob": float(self.split_prob) > 0.0,
+                "merge_prob": float(self.merge_prob) > 0.0,
+                "source_detector_exclusion_m": (
+                    float(self.source_detector_exclusion_m) > 0.0
+                ),
+                "init_source_min_separation_m": (
+                    float(self.init_source_min_separation_m) > 0.0
+                ),
+            }
+            enabled = [name for name, value in incompatible.items() if value]
+            if enabled:
+                raise ValueError(
+                    "rj_mh is incompatible with heuristic or state-dependent "
+                    f"support settings: {', '.join(enabled)}."
+                )
         semantics = normalize_observation_count_variance_semantics(
             self.observation_count_variance_semantics,
             includes_counting_noise=(
@@ -290,6 +428,17 @@ class PFConfig:
             # their complete covariance, so they are inadmissible here.
             self.shield_contrast_likelihood_enable = False
             self.shield_view_ratio_likelihood_enable = False
+
+    @staticmethod
+    def _source_prior_name_is_surface(value: object) -> bool:
+        """Return whether a configuration value denotes surface support."""
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower().replace("-", "_") in {
+            "surface",
+            "surfaces",
+            "surface_constrained",
+        }
 
 
 @dataclass
@@ -424,6 +573,35 @@ class IsotopeParticleFilter:
         self.line_mu_by_isotope = line_mu_by_isotope
         self.transport_response_model = transport_response_model
         self._surface_candidate_cache: dict[float, NDArray[np.float64]] = {}
+        self._random_generator = np.random.default_rng(
+            int(np.random.randint(0, np.iinfo(np.uint32).max))
+        )
+        self._strength_prior = self._build_strength_prior()
+        self._structural_rj_surface_patches: SurfacePatchDictionary | None = None
+        self._structural_rj_patch_key_to_index: dict[tuple[float, float, float], int] = (
+            {}
+        )
+        self._structural_rj_cardinality_prior_probs = (
+            self._build_structural_cardinality_prior()
+        )
+        self._structural_rj_cardinality_prior: CardinalityPrior | None = None
+        self._structural_rj_surface_prior: SurfaceSetPrior | None = None
+        self._structural_rj_surface_adjacency: SurfaceAdjacency | None = None
+        self._structural_rj_move_probabilities: (
+            BirthDeathMoveProbabilities | None
+        ) = None
+        self._structural_rj_response_cache: NDArray[np.float64] | None = None
+        self._structural_rj_response_cache_signatures: (
+            NDArray[np.float64] | None
+        ) = None
+        self._structural_rj_response_evaluation_batches = 0
+        self._structural_rj_response_evaluated_cells = 0
+        self._structural_rj_response_touched_mask: (
+            NDArray[np.bool_] | None
+        ) = None
+        self._structural_rj_move_counts: dict[str, int] = {}
+        if self._structural_kernel_is_exact():
+            self._initialize_structural_rj_surface_support()
         mu_by_isotope = (
             getattr(kernel, "mu_by_isotope", None) if kernel is not None else None
         )
@@ -507,6 +685,172 @@ class IsotopeParticleFilter:
             else None
         )
         self._init_continuous_particles()
+
+    def _structural_kernel_is_exact(self) -> bool:
+        """Return whether the target-preserving surface RJ-MH kernel is active."""
+        return bool(self.config.birth_enable) and (
+            str(getattr(self.config, "structural_kernel_mode", "heuristic"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+            == "rj_mh"
+        )
+
+    def _build_strength_prior(self) -> StrengthPrior:
+        """Build the normalized strength prior shared by initialization and moves."""
+        return StrengthPrior(
+            kind=str(self.config.init_strength_prior),
+            minimum=float(self.config.init_strength_min),
+            maximum=(
+                None
+                if self.config.init_strength_max is None
+                else float(self.config.init_strength_max)
+            ),
+            log_mean=float(self.config.init_strength_log_mean),
+            log_sigma=float(self.config.init_strength_log_sigma),
+        )
+
+    def _build_structural_cardinality_prior(self) -> NDArray[np.float64]:
+        """Return the normalized prior mass for cardinalities zero through max."""
+        max_sources = self.config.max_sources
+        if max_sources is None:
+            return np.zeros(0, dtype=float)
+        count = max(0, int(max_sources)) + 1
+        configured = self.config.structural_cardinality_prior_probs
+        if configured is None:
+            return np.full(count, 1.0 / max(count, 1), dtype=float)
+        probabilities = np.asarray(configured, dtype=float).reshape(-1)
+        if probabilities.size != count:
+            raise ValueError(
+                "structural_cardinality_prior_probs must have max_sources + 1 "
+                "entries."
+            )
+        return probabilities / float(np.sum(probabilities))
+
+    @staticmethod
+    def _surface_patch_key(position: NDArray[np.float64]) -> tuple[float, float, float]:
+        """Return a stable exact-mode lookup key for one patch center."""
+        values = np.asarray(position, dtype=float).reshape(3)
+        rounded = np.round(values, decimals=12)
+        return float(rounded[0]), float(rounded[1]), float(rounded[2])
+
+    def _initialize_structural_rj_surface_support(self) -> None:
+        """Build complete area-aware surface support for exact structural moves."""
+        position_min = np.asarray(self.config.position_min, dtype=float).reshape(3)
+        if not np.allclose(position_min, 0.0, rtol=0.0, atol=1.0e-12):
+            raise ValueError(
+                "rj_mh currently requires position_min=(0, 0, 0) so the "
+                "environment surface measure is unambiguous."
+            )
+        patches = build_surface_patch_dictionary(
+            self._source_prior_environment(),
+            self.obstacle_grid,
+            float(self.config.structural_rj_patch_spacing_m),
+            obstacle_height_m=self.obstacle_height_m,
+        )
+        if not patches.obstacle_surfaces_available:
+            warning = patches.obstacle_geometry_warning or (
+                "Obstacle component surfaces are unavailable."
+            )
+            raise ValueError(
+                "rj_mh requires complete obstacle component geometry: "
+                f"{warning}"
+            )
+        if patches.patch_count <= int(self.config.max_sources or 0):
+            raise ValueError(
+                "rj_mh surface dictionary must contain more patches than "
+                "max_sources."
+            )
+        keys = [
+            self._surface_patch_key(position)
+            for position in np.asarray(patches.centers_xyz, dtype=float)
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "rj_mh surface dictionary contains duplicate patch centers."
+            )
+        self._structural_rj_surface_patches = patches
+        self._structural_rj_patch_key_to_index = {
+            key: int(index) for index, key in enumerate(keys)
+        }
+        max_sources = int(self.config.max_sources or 0)
+        self._structural_rj_surface_prior = SurfaceSetPrior(
+            patches.areas_m2,
+            max_cardinality=max_sources,
+        )
+        self._structural_rj_surface_adjacency = SurfaceAdjacency(
+            dictionary_size=patches.patch_count,
+            edges=patches.adjacency_edges,
+        )
+        self._structural_rj_cardinality_prior = CardinalityPrior(
+            self._structural_rj_cardinality_prior_probs
+        )
+        self._structural_rj_move_probabilities = BirthDeathMoveProbabilities(
+            max_cardinality=max_sources,
+            birth_weight=float(self.config.structural_rj_birth_probability),
+            death_weight=float(self.config.structural_rj_death_probability),
+        )
+
+    def _structural_rj_patch_indices_for_state(
+        self,
+        state: IsotopeState,
+    ) -> NDArray[np.int64]:
+        """Resolve and validate the canonical surface indices of one exact state."""
+        source_count = int(state.num_sources)
+        positions = np.asarray(state.positions, dtype=float).reshape(-1, 3)
+        if positions.shape[0] != source_count:
+            raise ValueError("rj_mh state positions must match num_sources.")
+        if source_count == 0:
+            return np.zeros(0, dtype=np.int64)
+        try:
+            indices = np.asarray(
+                [
+                    self._structural_rj_patch_key_to_index[
+                        self._surface_patch_key(position)
+                    ]
+                    for position in positions
+                ],
+                dtype=np.int64,
+            )
+        except KeyError as exc:
+            raise ValueError(
+                "rj_mh state contains a position outside the finite surface "
+                "dictionary."
+            ) from exc
+        if np.unique(indices).size != indices.size:
+            raise ValueError(
+                "rj_mh does not permit duplicate surface patches in one state."
+            )
+        return indices
+
+    def _canonicalize_structural_rj_state(
+        self,
+        state: IsotopeState,
+    ) -> NDArray[np.int64]:
+        """Sort one exact state by surface index and return the sorted indices."""
+        self._ensure_source_metadata(state)
+        indices = self._structural_rj_patch_indices_for_state(state)
+        if indices.size <= 1:
+            return indices
+        order = np.argsort(indices, kind="stable")
+        if not np.array_equal(order, np.arange(indices.size)):
+            state.positions = np.asarray(state.positions, dtype=float)[order]
+            state.strengths = np.asarray(state.strengths, dtype=float)[order]
+            state.ages = np.asarray(state.ages, dtype=int)[order]
+            state.support_scores = np.asarray(
+                state.support_scores,
+                dtype=float,
+            )[order]
+            state.tentative_sources = np.asarray(
+                state.tentative_sources,
+                dtype=bool,
+            )[order]
+            state.verification_fail_streaks = np.asarray(
+                state.verification_fail_streaks,
+                dtype=int,
+            )[order]
+            indices = indices[order]
+        return np.asarray(indices, dtype=np.int64)
 
     def _build_continuous_kernel(
         self,
@@ -788,13 +1132,26 @@ class IsotopeParticleFilter:
             )
         )
 
+    @staticmethod
+    def _isotope_float_config_for(
+        value: float | Mapping[str, float],
+        isotope: str,
+        default: float = 0.0,
+    ) -> float:
+        """Resolve a scalar or isotope-indexed float for one isotope."""
+        if isinstance(value, Mapping):
+            return max(float(value.get(str(isotope), default)), 0.0)
+        return max(float(value), 0.0)
+
     def _isotope_float_config(
         self, value: float | dict[str, float], default: float = 0.0
     ) -> float:
         """Resolve a scalar or isotope-indexed float config value."""
-        if isinstance(value, dict):
-            return max(float(value.get(self.isotope, default)), 0.0)
-        return max(float(value), 0.0)
+        return self._isotope_float_config_for(
+            value,
+            self.isotope,
+            default,
+        )
 
     def _count_likelihood_kwargs(self) -> dict[str, bool | float | str]:
         """Return likelihood keyword arguments for this isotope filter."""
@@ -1519,7 +1876,11 @@ class IsotopeParticleFilter:
             sequence_length=int(data.z_k.size),
         )
         direct_route = (
-            spectrum_arrays is not None and self._direct_spectrum_likelihood_enabled()
+            spectrum_arrays is not None
+            and self._direct_spectrum_route_admissible(
+                sequence_length=int(data.z_k.size),
+                observation_count_covariance=data.observation_count_covariance,
+            )
             if use_direct_spectrum is None
             else bool(use_direct_spectrum)
         )
@@ -1661,6 +2022,8 @@ class IsotopeParticleFilter:
             mu_by_isotope=getattr(kernel, "mu_by_isotope", None),
             shield_params=getattr(kernel, "shield_params", ShieldParams()),
         )
+        self._structural_rj_response_cache = None
+        self._structural_rj_response_cache_signatures = None
 
     def _source_prior_is_surface(self) -> bool:
         """Return True when source positions should be constrained to surfaces."""
@@ -1944,59 +2307,109 @@ class IsotopeParticleFilter:
         shape: int | tuple[int, ...],
     ) -> NDArray[np.float64]:
         """Draw a batched initial-strength array from the configured PF prior."""
-        prior = str(self.config.init_strength_prior).strip().lower().replace("-", "_")
-        if prior == "uniform":
-            lower = max(float(self.config.init_strength_min), 0.0)
-            upper = (
-                float("inf")
-                if self.config.init_strength_max is None
-                else float(self.config.init_strength_max)
-            )
-            if not np.isfinite(upper) or upper < lower:
-                raise ValueError(
-                    "uniform init strength prior requires finite max >= min."
-                )
-            return np.asarray(np.random.uniform(lower, upper, size=shape), dtype=float)
-        if prior == "log_uniform":
-            lower = max(float(self.config.init_strength_min), np.finfo(float).tiny)
-            upper = (
-                float("inf")
-                if self.config.init_strength_max is None
-                else float(self.config.init_strength_max)
-            )
-            if not np.isfinite(upper) or upper < lower:
-                raise ValueError(
-                    "log_uniform init strength prior requires finite max >= min > 0."
-                )
-            return np.asarray(
-                np.exp(np.random.uniform(np.log(lower), np.log(upper), size=shape)),
-                dtype=float,
-            )
-        if prior != "lognormal":
-            raise ValueError(
-                "init_strength_prior must be lognormal, uniform, or log_uniform."
-            )
-        sampled = np.asarray(
-            np.random.lognormal(
-                mean=self.config.init_strength_log_mean,
-                sigma=self.config.init_strength_log_sigma,
-                size=shape,
+        return np.asarray(
+            self._strength_prior.sample(
+                shape,
+                rng=self._random_generator,
             ),
             dtype=float,
         )
-        lower = max(float(self.config.init_strength_min), 0.0)
-        upper = (
-            float("inf")
-            if self.config.init_strength_max is None
-            else float(self.config.init_strength_max)
+
+    def _exact_initial_cardinality_counts(
+        self,
+        particle_count: int,
+    ) -> NDArray[np.int64]:
+        """Allocate at least one exact-mode particle to every positive K prior."""
+        count = max(1, int(particle_count))
+        probabilities = np.asarray(
+            self._structural_rj_cardinality_prior_probs,
+            dtype=float,
         )
-        if lower > 0.0 or np.isfinite(upper):
-            sampled = np.clip(sampled, lower, upper)
-        return sampled
+        positive = probabilities > 0.0
+        positive_count = int(np.count_nonzero(positive))
+        if count < positive_count:
+            raise ValueError(
+                "rj_mh needs at least one initial particle for every positive "
+                "cardinality-prior entry."
+            )
+        allocation = np.zeros(probabilities.size, dtype=np.int64)
+        allocation[positive] = 1
+        remaining = count - positive_count
+        if remaining <= 0:
+            return allocation
+        expected = remaining * probabilities
+        extra = np.floor(expected).astype(np.int64)
+        allocation += extra
+        leftover = remaining - int(np.sum(extra))
+        if leftover > 0:
+            fractions = expected - extra
+            order = np.argsort(fractions, kind="stable")[::-1]
+            allocation[order[:leftover]] += 1
+        return allocation
+
+    def _init_exact_structural_particles(self) -> None:
+        """Initialize the exact PF from its K, surface-set, and strength priors."""
+        patches = self._structural_rj_surface_patches
+        surface_prior = self._structural_rj_surface_prior
+        cardinality_prior = self._structural_rj_cardinality_prior
+        if patches is None or surface_prior is None or cardinality_prior is None:
+            raise RuntimeError("rj_mh surface and cardinality priors are unavailable.")
+        # Exact-mode particles are Monte Carlo samples from the normalized
+        # surface-set prior. The legacy grid-repeat setting must not turn the
+        # finite support dictionary into one particle per patch: doing so
+        # changes the configured particle budget and makes obstacle-rich scenes
+        # orders of magnitude larger than requested.
+        target_n = int(self.config.num_particles)
+        allocation = self._exact_initial_cardinality_counts(target_n)
+        particles: list[IsotopeParticle] = []
+        for cardinality, cardinality_count in enumerate(allocation.tolist()):
+            if cardinality_count <= 0:
+                continue
+            surface_sets = surface_prior.sample_rejection(
+                cardinality,
+                cardinality_count,
+                rng=self._random_generator,
+            )
+            strengths = self._sample_initial_strengths(
+                (cardinality_count, cardinality)
+            )
+            per_particle_mass = (
+                float(cardinality_prior.probabilities[cardinality])
+                / float(cardinality_count)
+            )
+            log_weight = float(np.log(per_particle_mass))
+            for row in range(cardinality_count):
+                patch_indices = surface_sets[row]
+                positions = np.asarray(
+                    patches.centers_xyz[patch_indices],
+                    dtype=float,
+                ).reshape(cardinality, 3)
+                state = IsotopeState(
+                    num_sources=cardinality,
+                    positions=positions,
+                    strengths=np.asarray(strengths[row], dtype=float).copy(),
+                    background=self._background_level(),
+                    ages=np.zeros(cardinality, dtype=int),
+                    support_scores=np.zeros(cardinality, dtype=float),
+                    tentative_sources=np.zeros(cardinality, dtype=bool),
+                    verification_fail_streaks=np.zeros(cardinality, dtype=int),
+                )
+                particles.append(
+                    IsotopeParticle(state=state, log_weight=log_weight)
+                )
+        permutation = self._random_generator.permutation(len(particles))
+        self.continuous_particles = [particles[int(index)] for index in permutation]
+        self.N = len(self.continuous_particles)
+        self.config.num_particles = self.N
+        self.config.min_particles = self.N
+        self.config.max_particles = self.N
 
     def _init_continuous_particles(self) -> None:
         """Sample continuous positions/strengths/background from broad priors (Sec. 3.3.2)."""
         self.continuous_particles = []
+        if self._structural_kernel_is_exact():
+            self._init_exact_structural_particles()
+            return
         grid_positions = self._initial_grid_positions()
         if grid_positions.size:
             repeat_count = max(1, int(self.config.init_grid_repeats))
@@ -2915,23 +3328,70 @@ class IsotopeParticleFilter:
             ) - 0.5 * torch.log(variance)
         return torch.sum(ll, dim=(0, 1))
 
-    def _direct_spectrum_likelihood_enabled(self) -> bool:
-        """Return whether independent-bin spectrum likelihoods are admissible.
+    @classmethod
+    def _direct_spectrum_likelihood_config_enabled(
+        cls,
+        config: Any,
+        isotope: str,
+    ) -> bool:
+        """Return whether config permits independent-bin spectrum likelihoods.
 
         Complete statistical covariance from weighted transport generally has
         response-folding correlations between spectrum bins. The current
         direct-bin likelihood accepts only diagonal variance, so that semantic
         must route through isotope counts and their propagated covariance.
+        Gaussian and Student-t transport discrepancy is also defined on the
+        isotope count, not independently on every spectrum bin, and therefore
+        must use the count likelihood.
         """
-        if not bool(self.config.direct_spectrum_likelihood_enable):
+        if not bool(config.direct_spectrum_likelihood_enable):
             return False
         semantics = normalize_observation_count_variance_semantics(
-            self.config.observation_count_variance_semantics,
+            config.observation_count_variance_semantics,
             includes_counting_noise=(
-                self.config.observation_count_variance_includes_counting_noise
+                config.observation_count_variance_includes_counting_noise
             ),
         )
-        return semantics != OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
+        if semantics == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL:
+            return False
+        model = normalize_count_likelihood_model(
+            str(config.count_likelihood_model)
+        )
+        if model != "poisson" and (
+            cls._isotope_float_config_for(
+                config.transport_model_rel_sigma,
+                isotope,
+            )
+            > 0.0
+            or cls._isotope_float_config_for(
+                config.transport_model_abs_sigma,
+                isotope,
+            )
+            > 0.0
+        ):
+            return False
+        return True
+
+    def _direct_spectrum_likelihood_enabled(self) -> bool:
+        """Return whether this filter permits independent spectrum bins."""
+        return self._direct_spectrum_likelihood_config_enabled(
+            self.config,
+            self.isotope,
+        )
+
+    def _direct_spectrum_route_admissible(
+        self,
+        *,
+        sequence_length: int,
+        observation_count_covariance: NDArray[np.float64] | None,
+    ) -> bool:
+        """Return whether one runtime update may use independent spectrum bins."""
+        return self._direct_spectrum_likelihood_enabled() and not (
+            self._sequence_covariance_enabled(
+                int(sequence_length),
+                observation_count_covariance,
+            )
+        )
 
     @staticmethod
     def _spectrum_update_arrays(
@@ -4128,7 +4588,10 @@ class IsotopeParticleFilter:
         )
         spectrum_arrays = (
             candidate_spectrum_arrays
-            if self._direct_spectrum_likelihood_enabled()
+            if self._direct_spectrum_route_admissible(
+                sequence_length=1,
+                observation_count_covariance=None,
+            )
             else None
         )
         if spectrum_arrays is not None:
@@ -4358,7 +4821,10 @@ class IsotopeParticleFilter:
         )
         spectrum_arrays = (
             candidate_spectrum_arrays
-            if self._direct_spectrum_likelihood_enabled()
+            if self._direct_spectrum_route_admissible(
+                sequence_length=int(z_arr.size),
+                observation_count_covariance=covariance,
+            )
             else None
         )
         if spectrum_arrays is not None:
@@ -5494,6 +5960,11 @@ class IsotopeParticleFilter:
         Uses Hungarian assignment against a reference ordering built from the
         highest-weight particle, then refines the reference iteratively.
         """
+        if self._structural_kernel_is_exact():
+            for particle in self.continuous_particles:
+                self._canonicalize_structural_rj_state(particle.state)
+            self._label_reference = None
+            return
         if not self.config.label_enable or not self.continuous_particles:
             return
         ref_state = self._label_reference or self.best_particle().state
@@ -7352,6 +7823,17 @@ class IsotopeParticleFilter:
 
         Source-cardinality moves are handled in apply_structural_moves().
         """
+        if self._structural_kernel_is_exact():
+            for particle in self.continuous_particles:
+                self._canonicalize_structural_rj_state(particle.state)
+                if not np.all(
+                    self._strength_prior.in_support(particle.state.strengths)
+                ):
+                    raise ValueError(
+                        "rj_mh state strength escaped the configured prior "
+                        "support."
+                    )
+            return
         sigma_pos_arr = np.asarray(sigma_pos, dtype=float)
         if sigma_pos_arr.size not in (1, 3):
             raise ValueError("sigma_pos must be a scalar or a 3-element vector.")
@@ -9358,6 +9840,1134 @@ class IsotopeParticleFilter:
             if len(members) >= sample_floor
         ]
 
+    def _structural_rj_response_signatures(
+        self,
+        data: MeasurementData,
+    ) -> NDArray[np.float64]:
+        """Return response-relevant row signatures for safe prefix caching."""
+        measurement_count = int(data.z_k.size)
+        detector_positions = np.asarray(
+            data.detector_positions,
+            dtype=float,
+        ).reshape(measurement_count, 3)
+        live_times = np.asarray(
+            data.live_times,
+            dtype=float,
+        ).reshape(measurement_count)
+        fe_indices = np.asarray(
+            data.fe_indices,
+            dtype=np.int64,
+        ).reshape(measurement_count)
+        pb_indices = np.asarray(
+            data.pb_indices,
+            dtype=np.int64,
+        ).reshape(measurement_count)
+        source_scales = self._measurement_source_scale_vector(
+            fe_indices,
+            pb_indices,
+        )
+        signatures = np.column_stack(
+            [
+                detector_positions,
+                live_times,
+                fe_indices,
+                pb_indices,
+                source_scales,
+            ]
+        ).astype(np.float64, copy=False)
+        if not np.all(np.isfinite(signatures)):
+            raise ValueError(
+                "rj_mh response signatures must contain finite values."
+            )
+        return signatures
+
+    def _structural_rj_prepare_response_cache(
+        self,
+        data: MeasurementData,
+    ) -> NDArray[np.float64]:
+        """Return a prefix-safe lazy response cache for the supplied history."""
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        signatures = self._structural_rj_response_signatures(data)
+        measurement_count = int(signatures.shape[0])
+        patch_count = int(patches.patch_count)
+        cached = self._structural_rj_response_cache
+        cached_signatures = self._structural_rj_response_cache_signatures
+
+        matching_prefix = 0
+        if cached is not None and cached_signatures is not None:
+            matching_prefix = min(
+                measurement_count,
+                int(cached_signatures.shape[0]),
+            )
+            prefix_matches = np.array_equal(
+                signatures[:matching_prefix],
+                cached_signatures[:matching_prefix],
+            )
+        else:
+            prefix_matches = False
+
+        if (
+            cached is None
+            or cached_signatures is None
+            or cached.shape[1] != patch_count
+            or not prefix_matches
+        ):
+            cached = np.full(
+                (measurement_count, patch_count),
+                np.nan,
+                dtype=float,
+            )
+            cached_signatures = signatures.copy()
+        elif measurement_count > int(cached.shape[0]):
+            added_rows = measurement_count - int(cached.shape[0])
+            cached = np.vstack(
+                [
+                    cached,
+                    np.full((added_rows, patch_count), np.nan, dtype=float),
+                ]
+            )
+            cached_signatures = signatures.copy()
+
+        self._structural_rj_response_cache = cached
+        self._structural_rj_response_cache_signatures = cached_signatures
+        return cached[:measurement_count]
+
+    def _structural_rj_evaluate_response_columns(
+        self,
+        data: MeasurementData,
+        patch_indices: NDArray[np.int64],
+        *,
+        row_start: int,
+    ) -> NDArray[np.float64]:
+        """Evaluate one batched suffix for selected global surface patches."""
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        indices = np.unique(
+            np.asarray(patch_indices, dtype=np.int64).reshape(-1)
+        )
+        start = max(0, int(row_start))
+        measurement_count = int(data.z_k.size)
+        if start > measurement_count:
+            raise ValueError("row_start exceeds the measurement history.")
+        if np.any(indices < 0) or np.any(indices >= patches.patch_count):
+            raise ValueError("rj_mh response request contains an invalid patch.")
+        if indices.size == 0 or start == measurement_count:
+            return np.zeros(
+                (measurement_count - start, indices.size),
+                dtype=float,
+            )
+        fe_indices = np.asarray(data.fe_indices, dtype=np.int64)[start:]
+        pb_indices = np.asarray(data.pb_indices, dtype=np.int64)[start:]
+        responses = expected_counts_per_source(
+            kernel=self.continuous_kernel,
+            isotope=self.isotope,
+            detector_positions=np.asarray(
+                data.detector_positions,
+                dtype=float,
+            )[start:],
+            sources=np.asarray(
+                patches.centers_xyz,
+                dtype=float,
+            )[indices],
+            strengths=np.ones(indices.size, dtype=float),
+            live_times=np.asarray(data.live_times, dtype=float)[start:],
+            fe_indices=fe_indices,
+            pb_indices=pb_indices,
+            source_scale=self._measurement_source_scale_vector(
+                fe_indices,
+                pb_indices,
+            ),
+        )
+        response_array = np.asarray(responses, dtype=float)
+        expected_shape = (measurement_count - start, int(indices.size))
+        if response_array.shape != expected_shape:
+            raise ValueError("rj_mh response columns have an unexpected shape.")
+        if not np.all(np.isfinite(response_array)):
+            raise ValueError("rj_mh response columns must be finite.")
+        self._structural_rj_response_evaluation_batches += 1
+        self._structural_rj_response_evaluated_cells += int(
+            response_array.size
+        )
+        touched_mask = self._structural_rj_response_touched_mask
+        if touched_mask is None or touched_mask.size != patches.patch_count:
+            touched_mask = np.zeros(patches.patch_count, dtype=bool)
+            self._structural_rj_response_touched_mask = touched_mask
+        touched_mask[indices] = True
+        return response_array
+
+    def _structural_rj_ensure_response_columns(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+        patch_indices: NDArray[np.int64],
+    ) -> None:
+        """Fill only missing cached row suffixes for required patch columns."""
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        response_array = np.asarray(response_dictionary, dtype=float)
+        expected_shape = (int(data.z_k.size), int(patches.patch_count))
+        if response_array.shape != expected_shape:
+            raise ValueError("rj_mh response dictionary has an unexpected shape.")
+        required = np.unique(
+            np.asarray(patch_indices, dtype=np.int64).reshape(-1)
+        )
+        if required.size == 0:
+            return
+        if np.any(required < 0) or np.any(required >= patches.patch_count):
+            raise ValueError("rj_mh response request contains an invalid patch.")
+
+        finite = np.isfinite(response_array[:, required])
+        valid_prefixes = np.sum(finite, axis=0).astype(
+            np.int64,
+            copy=False,
+        )
+        row_indices = np.arange(response_array.shape[0])[:, None]
+        prefix_mask = row_indices < valid_prefixes[None, :]
+        if not np.array_equal(finite, prefix_mask):
+            raise ValueError(
+                "rj_mh response cache contains a non-prefix validity pattern."
+            )
+        for valid_prefix in np.unique(valid_prefixes).tolist():
+            if int(valid_prefix) >= response_array.shape[0]:
+                continue
+            selected = required[valid_prefixes == int(valid_prefix)]
+            evaluated = self._structural_rj_evaluate_response_columns(
+                data,
+                selected,
+                row_start=int(valid_prefix),
+            )
+            response_array[int(valid_prefix) :, selected] = evaluated
+
+    def _structural_rj_response_dictionary(
+        self,
+        data: MeasurementData,
+        patch_indices: NDArray[np.int64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return a prefix-cached response matrix, eagerly filling requested columns."""
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        response_dictionary = self._structural_rj_prepare_response_cache(data)
+        requested = (
+            np.arange(patches.patch_count, dtype=np.int64)
+            if patch_indices is None
+            else np.asarray(patch_indices, dtype=np.int64).reshape(-1)
+        )
+        self._structural_rj_ensure_response_columns(
+            data,
+            response_dictionary,
+            requested,
+        )
+        return response_dictionary
+
+    def _structural_rj_group_arrays(
+        self,
+        particle_indices: NDArray[np.int64],
+        cardinality: int,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return canonical patch, strength, and background arrays for one K."""
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        source_count = max(0, int(cardinality))
+        patch_rows: list[NDArray[np.int64]] = []
+        strength_rows: list[NDArray[np.float64]] = []
+        backgrounds = np.empty(indices.size, dtype=float)
+        for row, particle_index in enumerate(indices.tolist()):
+            state = self.continuous_particles[int(particle_index)].state
+            if int(state.num_sources) != source_count:
+                raise ValueError("rj_mh particle group mixes cardinalities.")
+            patch_rows.append(self._canonicalize_structural_rj_state(state))
+            strength_rows.append(
+                np.asarray(state.strengths, dtype=float).reshape(source_count)
+            )
+            backgrounds[row] = float(state.background)
+        if source_count == 0:
+            patch_sets = np.zeros((indices.size, 0), dtype=np.int64)
+            strengths = np.zeros((indices.size, 0), dtype=float)
+        else:
+            patch_sets = np.vstack(patch_rows).astype(np.int64, copy=False)
+            strengths = np.vstack(strength_rows).astype(float, copy=False)
+        if strengths.size and not np.all(self._strength_prior.in_support(strengths)):
+            raise ValueError(
+                "rj_mh particle strength lies outside the configured prior."
+            )
+        return patch_sets, strengths, backgrounds
+
+    @staticmethod
+    def _structural_rj_lambda_from_arrays(
+        response_dictionary: NDArray[np.float64],
+        patch_sets: NDArray[np.int64],
+        strengths: NDArray[np.float64],
+        backgrounds: NDArray[np.float64],
+        live_times: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return expected counts for an equal-cardinality state batch."""
+        responses = np.asarray(response_dictionary, dtype=float)
+        patches = np.asarray(patch_sets, dtype=np.int64)
+        strength_array = np.asarray(strengths, dtype=float)
+        background_array = np.asarray(backgrounds, dtype=float).reshape(-1)
+        if patches.ndim != 2 or strength_array.shape != patches.shape:
+            raise ValueError("rj_mh patch and strength arrays must share P x K.")
+        if background_array.size != patches.shape[0]:
+            raise ValueError("rj_mh background array must contain P entries.")
+        background_counts = (
+            np.asarray(live_times, dtype=float)[:, None]
+            * background_array[None, :]
+        )
+        if patches.shape[1] == 0:
+            return background_counts
+        selected = responses[:, patches]
+        source_counts = np.einsum(
+            "mpk,pk->mp",
+            selected,
+            strength_array,
+            optimize=True,
+        )
+        return background_counts + source_counts
+
+    def _structural_rj_group_log_likelihood(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+        patch_sets: NDArray[np.int64],
+        strengths: NDArray[np.float64],
+        backgrounds: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate one equal-cardinality group with the shared PF likelihood."""
+        self._structural_rj_ensure_response_columns(
+            data,
+            response_dictionary,
+            patch_sets,
+        )
+        lambda_total = self._structural_rj_lambda_from_arrays(
+            response_dictionary,
+            patch_sets,
+            strengths,
+            backgrounds,
+            data.live_times,
+        )
+        return self._structural_count_log_likelihood_matrix_np(data, lambda_total)
+
+    def _sample_structural_rj_unused_indices(
+        self,
+        occupied_sets: NDArray[np.int64],
+    ) -> NDArray[np.int64]:
+        """Sample area-weighted unused patches for a same-cardinality batch."""
+        surface_prior = self._structural_rj_surface_prior
+        if surface_prior is None:
+            raise RuntimeError("rj_mh surface prior is unavailable.")
+        occupied = np.asarray(occupied_sets, dtype=np.int64)
+        if occupied.ndim != 2:
+            raise ValueError("occupied_sets must have shape P x K.")
+        if occupied.shape[1] >= surface_prior.dictionary_size:
+            raise ValueError("rj_mh birth has no unused surface patch.")
+        sample_count = int(occupied.shape[0])
+        sampled = self._random_generator.choice(
+            surface_prior.dictionary_size,
+            size=sample_count,
+            p=surface_prior.area_masses,
+        ).astype(np.int64, copy=False)
+        if occupied.shape[1] == 0 or sample_count == 0:
+            return sampled
+        rejected = np.any(occupied == sampled[:, None], axis=1)
+        while np.any(rejected):
+            sampled[rejected] = self._random_generator.choice(
+                surface_prior.dictionary_size,
+                size=int(np.count_nonzero(rejected)),
+                p=surface_prior.area_masses,
+            )
+            rejected = np.any(occupied == sampled[:, None], axis=1)
+        return sampled
+
+    @staticmethod
+    def _structural_rj_insert_values(
+        current_sets: NDArray[np.int64],
+        current_values: NDArray[np.float64],
+        new_indices: NDArray[np.int64],
+        new_values: NDArray[np.float64],
+        *,
+        dictionary_size: int,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+        """Insert one indexed scalar per row while preserving canonical order."""
+        sets = np.asarray(current_sets, dtype=np.int64)
+        values = np.asarray(current_values, dtype=float)
+        indices = np.asarray(new_indices, dtype=np.int64).reshape(-1)
+        additions = np.asarray(new_values, dtype=float).reshape(-1)
+        if values.shape != sets.shape:
+            raise ValueError("current_values must match current_sets.")
+        if indices.size != sets.shape[0] or additions.size != sets.shape[0]:
+            raise ValueError("new_indices and new_values must contain P entries.")
+        proposed_sets = add_surface_indices(
+            sets,
+            indices,
+            dictionary_size=dictionary_size,
+        )
+        combined_indices = np.concatenate([sets, indices[:, None]], axis=1)
+        combined_values = np.concatenate([values, additions[:, None]], axis=1)
+        order = np.argsort(combined_indices, axis=1, kind="stable")
+        proposed_values = np.take_along_axis(combined_values, order, axis=1)
+        return proposed_sets, np.asarray(proposed_values, dtype=float)
+
+    @staticmethod
+    def _structural_rj_remove_values(
+        current_sets: NDArray[np.int64],
+        current_values: NDArray[np.float64],
+        columns: NDArray[np.int64],
+        *,
+        dictionary_size: int,
+    ) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+        """Remove one indexed scalar per row from canonical state arrays."""
+        sets = np.asarray(current_sets, dtype=np.int64)
+        values = np.asarray(current_values, dtype=float)
+        removed_columns = np.asarray(columns, dtype=np.int64).reshape(-1)
+        if values.shape != sets.shape:
+            raise ValueError("current_values must match current_sets.")
+        if removed_columns.size != sets.shape[0]:
+            raise ValueError("columns must contain one entry per row.")
+        proposed_sets = remove_surface_columns(
+            sets,
+            removed_columns,
+            dictionary_size=dictionary_size,
+        )
+        keep = np.arange(sets.shape[1])[None, :] != removed_columns[:, None]
+        proposed_values = values[keep].reshape(sets.shape[0], sets.shape[1] - 1)
+        return proposed_sets, np.asarray(proposed_values, dtype=float)
+
+    def _commit_structural_rj_states(
+        self,
+        particle_indices: NDArray[np.int64],
+        accepted: NDArray[np.bool_],
+        patch_sets: NDArray[np.int64],
+        strengths: NDArray[np.float64],
+    ) -> int:
+        """Commit accepted canonical state arrays after batched RJ/MH scoring."""
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        acceptance = np.asarray(accepted, dtype=bool).reshape(-1)
+        sets = np.asarray(patch_sets, dtype=np.int64)
+        strength_array = np.asarray(strengths, dtype=float)
+        if (
+            acceptance.size != indices.size
+            or sets.shape[0] != indices.size
+            or strength_array.shape != sets.shape
+        ):
+            raise ValueError("rj_mh commit arrays must share one particle axis.")
+        accepted_rows = np.flatnonzero(acceptance)
+        cardinality = int(sets.shape[1])
+        for row in accepted_rows.tolist():
+            state = self.continuous_particles[int(indices[row])].state
+            state.num_sources = cardinality
+            state.positions = np.asarray(
+                patches.centers_xyz[sets[row]],
+                dtype=float,
+            ).reshape(cardinality, 3)
+            state.strengths = strength_array[row].copy()
+            # Background is not proposed by this kernel and must stay fixed.
+            state.ages = np.zeros(cardinality, dtype=int)
+            state.support_scores = np.zeros(cardinality, dtype=float)
+            state.tentative_sources = np.zeros(cardinality, dtype=bool)
+            state.verification_fail_streaks = np.zeros(cardinality, dtype=int)
+        return int(accepted_rows.size)
+
+    def _apply_structural_rj_birth_death(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+    ) -> tuple[int, int]:
+        """Apply one exact batched birth/death RJ-MH attempt per selected particle."""
+        surface_prior = self._structural_rj_surface_prior
+        cardinality_prior = self._structural_rj_cardinality_prior
+        move_probabilities = self._structural_rj_move_probabilities
+        if (
+            surface_prior is None
+            or cardinality_prior is None
+            or move_probabilities is None
+        ):
+            raise RuntimeError("rj_mh priors or move probabilities are unavailable.")
+        particle_count = len(self.continuous_particles)
+        attempt = self._random_generator.random(particle_count) < float(
+            self.config.structural_rj_move_probability
+        )
+        cardinalities = np.asarray(
+            [particle.state.num_sources for particle in self.continuous_particles],
+            dtype=np.int64,
+        )
+        accepted_births = 0
+        accepted_deaths = 0
+        attempted_births = 0
+        attempted_deaths = 0
+        for cardinality in np.unique(cardinalities[attempt]).tolist():
+            group_indices = np.flatnonzero(
+                attempt & (cardinalities == int(cardinality))
+            ).astype(np.int64, copy=False)
+            if group_indices.size == 0:
+                continue
+            birth_probability, _ = move_probabilities.probabilities(
+                int(cardinality)
+            )
+            birth_move = (
+                self._random_generator.random(group_indices.size)
+                < float(birth_probability)
+            )
+            for is_birth in (True, False):
+                selected_rows = np.flatnonzero(birth_move == is_birth)
+                if selected_rows.size == 0:
+                    continue
+                selected_indices = group_indices[selected_rows]
+                if is_birth:
+                    attempted_births += int(selected_indices.size)
+                else:
+                    attempted_deaths += int(selected_indices.size)
+                patch_sets, strengths, backgrounds = (
+                    self._structural_rj_group_arrays(
+                        selected_indices,
+                        int(cardinality),
+                    )
+                )
+                base_ll = self._structural_rj_group_log_likelihood(
+                    data,
+                    response_dictionary,
+                    patch_sets,
+                    strengths,
+                    backgrounds,
+                )
+                if is_birth:
+                    new_patch_indices = (
+                        self._sample_structural_rj_unused_indices(patch_sets)
+                    )
+                    new_strengths = np.asarray(
+                        self._strength_prior.sample(
+                            selected_indices.size,
+                            rng=self._random_generator,
+                        ),
+                        dtype=float,
+                    )
+                    proposed_sets, proposed_strengths = (
+                        self._structural_rj_insert_values(
+                            patch_sets,
+                            strengths,
+                            new_patch_indices,
+                            new_strengths,
+                            dictionary_size=surface_prior.dictionary_size,
+                        )
+                    )
+                    proposed_ll = self._structural_rj_group_log_likelihood(
+                        data,
+                        response_dictionary,
+                        proposed_sets,
+                        proposed_strengths,
+                        backgrounds,
+                    )
+                    position_log_proposal = (
+                        conditional_birth_surface_log_probability(
+                            surface_prior,
+                            patch_sets,
+                            new_patch_indices,
+                        )
+                    )
+                    strength_log_density = np.asarray(
+                        self._strength_prior.log_prob(new_strengths),
+                        dtype=float,
+                    )
+                    log_ratio = birth_log_acceptance_ratio(
+                        current_surface_sets=patch_sets,
+                        birth_surface_indices=new_patch_indices,
+                        log_likelihood_ratio=proposed_ll - base_ll,
+                        surface_prior=surface_prior,
+                        cardinality_prior=cardinality_prior,
+                        move_probabilities=move_probabilities,
+                        log_strength_prior_density=strength_log_density,
+                        log_forward_position_proposal=position_log_proposal,
+                        log_forward_strength_proposal=strength_log_density,
+                        log_reverse_death_index_probability=(
+                            uniform_death_index_log_probability(
+                                int(cardinality) + 1
+                            )
+                        ),
+                    )
+                    accepted = np.log(
+                        self._random_generator.random(selected_indices.size)
+                    ) < np.minimum(log_ratio, 0.0)
+                    accepted_births += self._commit_structural_rj_states(
+                        selected_indices,
+                        accepted,
+                        proposed_sets,
+                        proposed_strengths,
+                    )
+                    for row in np.flatnonzero(accepted).tolist():
+                        state = self.continuous_particles[
+                            int(selected_indices[row])
+                        ].state
+                        source_column = int(
+                            np.flatnonzero(
+                                proposed_sets[row] == new_patch_indices[row]
+                            )[0]
+                        )
+                        self._record_source_event(
+                            "source_birth_accepted",
+                            state,
+                            source_column,
+                            reason="rj_mh_birth",
+                            extra={
+                                "delta_ll": float(proposed_ll[row] - base_ll[row]),
+                                "log_acceptance_ratio": float(log_ratio[row]),
+                                "surface_patch_index": int(
+                                    new_patch_indices[row]
+                                ),
+                            },
+                        )
+                    continue
+
+                death_columns = self._random_generator.integers(
+                    0,
+                    int(cardinality),
+                    size=selected_indices.size,
+                    dtype=np.int64,
+                )
+                row_indices = np.arange(selected_indices.size, dtype=np.int64)
+                removed_patch_indices = patch_sets[row_indices, death_columns]
+                removed_strengths = strengths[row_indices, death_columns]
+                proposed_sets, proposed_strengths = (
+                    self._structural_rj_remove_values(
+                        patch_sets,
+                        strengths,
+                        death_columns,
+                        dictionary_size=surface_prior.dictionary_size,
+                    )
+                )
+                proposed_ll = self._structural_rj_group_log_likelihood(
+                    data,
+                    response_dictionary,
+                    proposed_sets,
+                    proposed_strengths,
+                    backgrounds,
+                )
+                removed_strength_log_density = np.asarray(
+                    self._strength_prior.log_prob(removed_strengths),
+                    dtype=float,
+                )
+                reverse_position_log_proposal = (
+                    conditional_birth_surface_log_probability(
+                        surface_prior,
+                        proposed_sets,
+                        removed_patch_indices,
+                    )
+                )
+                log_ratio = death_log_acceptance_ratio(
+                    current_surface_sets=patch_sets,
+                    death_columns=death_columns,
+                    log_likelihood_ratio=proposed_ll - base_ll,
+                    surface_prior=surface_prior,
+                    cardinality_prior=cardinality_prior,
+                    move_probabilities=move_probabilities,
+                    log_removed_strength_prior_density=(
+                        removed_strength_log_density
+                    ),
+                    log_forward_death_index_probability=(
+                        uniform_death_index_log_probability(int(cardinality))
+                    ),
+                    log_reverse_position_proposal=(
+                        reverse_position_log_proposal
+                    ),
+                    log_reverse_strength_proposal=(
+                        removed_strength_log_density
+                    ),
+                )
+                accepted = np.log(
+                    self._random_generator.random(selected_indices.size)
+                ) < np.minimum(log_ratio, 0.0)
+                for row in np.flatnonzero(accepted).tolist():
+                    state = self.continuous_particles[
+                        int(selected_indices[row])
+                    ].state
+                    self._record_source_event(
+                        "source_removed",
+                        state,
+                        int(death_columns[row]),
+                        reason="rj_mh_death",
+                        extra={
+                            "delta_ll": float(proposed_ll[row] - base_ll[row]),
+                            "log_acceptance_ratio": float(log_ratio[row]),
+                            "surface_patch_index": int(
+                                removed_patch_indices[row]
+                            ),
+                        },
+                    )
+                accepted_deaths += self._commit_structural_rj_states(
+                    selected_indices,
+                    accepted,
+                    proposed_sets,
+                    proposed_strengths,
+                )
+        self._structural_rj_move_counts.update(
+            {
+                "birth_attempted": int(attempted_births),
+                "birth_accepted": int(accepted_births),
+                "death_attempted": int(attempted_deaths),
+                "death_accepted": int(accepted_deaths),
+            }
+        )
+        return accepted_births, accepted_deaths
+
+    def _apply_structural_rj_position_moves(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+    ) -> int:
+        """Relocate sources with an exact area-prior-cancelling MH proposal."""
+        surface_prior = self._structural_rj_surface_prior
+        if surface_prior is None:
+            raise RuntimeError("rj_mh surface prior is unavailable.")
+        particle_count = len(self.continuous_particles)
+        cardinalities = np.asarray(
+            [particle.state.num_sources for particle in self.continuous_particles],
+            dtype=np.int64,
+        )
+        attempt = (
+            self._random_generator.random(particle_count)
+            < float(self.config.structural_rj_position_move_probability)
+        ) & (cardinalities > 0)
+        attempted_count = int(np.count_nonzero(attempt))
+        accepted_count = 0
+        for cardinality in np.unique(cardinalities[attempt]).tolist():
+            particle_indices = np.flatnonzero(
+                attempt & (cardinalities == int(cardinality))
+            ).astype(np.int64, copy=False)
+            patch_sets, strengths, backgrounds = self._structural_rj_group_arrays(
+                particle_indices,
+                int(cardinality),
+            )
+            base_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                patch_sets,
+                strengths,
+                backgrounds,
+            )
+            source_columns = self._random_generator.integers(
+                0,
+                int(cardinality),
+                size=particle_indices.size,
+                dtype=np.int64,
+            )
+            rows = np.arange(particle_indices.size, dtype=np.int64)
+            relocated_strengths = strengths[rows, source_columns]
+            old_patch_indices = patch_sets[rows, source_columns]
+            reduced_sets, reduced_strengths = self._structural_rj_remove_values(
+                patch_sets,
+                strengths,
+                source_columns,
+                dictionary_size=surface_prior.dictionary_size,
+            )
+            new_patch_indices = self._sample_structural_rj_unused_indices(
+                reduced_sets
+            )
+            proposed_sets, proposed_strengths = (
+                self._structural_rj_insert_values(
+                    reduced_sets,
+                    reduced_strengths,
+                    new_patch_indices,
+                    relocated_strengths,
+                    dictionary_size=surface_prior.dictionary_size,
+                )
+            )
+            proposed_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                proposed_sets,
+                proposed_strengths,
+                backgrounds,
+            )
+            log_ratio = proposed_ll - base_ll
+            accepted = (
+                np.log(self._random_generator.random(particle_indices.size))
+                < np.minimum(log_ratio, 0.0)
+            ) & (new_patch_indices != old_patch_indices)
+            accepted_count += self._commit_structural_rj_states(
+                particle_indices,
+                accepted,
+                proposed_sets,
+                proposed_strengths,
+            )
+        self._structural_rj_move_counts.update(
+            {
+                "global_position_attempted": int(attempted_count),
+                "global_position_accepted": int(accepted_count),
+            }
+        )
+        return accepted_count
+
+    def _apply_structural_rj_local_position_moves(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+    ) -> int:
+        """Relocate sources to adjacent free patches with exact local MH."""
+        surface_prior = self._structural_rj_surface_prior
+        adjacency = self._structural_rj_surface_adjacency
+        if surface_prior is None or adjacency is None:
+            raise RuntimeError(
+                "rj_mh surface prior or adjacency is unavailable."
+            )
+        particle_count = len(self.continuous_particles)
+        cardinalities = np.asarray(
+            [
+                particle.state.num_sources
+                for particle in self.continuous_particles
+            ],
+            dtype=np.int64,
+        )
+        attempt = (
+            self._random_generator.random(particle_count)
+            < float(
+                self.config.structural_rj_local_position_move_probability
+            )
+        ) & (cardinalities > 0)
+        attempted_count = int(np.count_nonzero(attempt))
+        movable_count = 0
+        accepted_count = 0
+        for cardinality in np.unique(cardinalities[attempt]).tolist():
+            particle_indices = np.flatnonzero(
+                attempt & (cardinalities == int(cardinality))
+            ).astype(np.int64, copy=False)
+            patch_sets, strengths, backgrounds = (
+                self._structural_rj_group_arrays(
+                    particle_indices,
+                    int(cardinality),
+                )
+            )
+            base_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                patch_sets,
+                strengths,
+                backgrounds,
+            )
+            source_columns = self._random_generator.integers(
+                0,
+                int(cardinality),
+                size=particle_indices.size,
+                dtype=np.int64,
+            )
+            rows = np.arange(particle_indices.size, dtype=np.int64)
+            old_patch_indices = patch_sets[rows, source_columns]
+            relocated_strengths = strengths[rows, source_columns]
+            reduced_sets, reduced_strengths = (
+                self._structural_rj_remove_values(
+                    patch_sets,
+                    strengths,
+                    source_columns,
+                    dictionary_size=surface_prior.dictionary_size,
+                )
+            )
+            (
+                new_patch_indices,
+                forward_degrees,
+                movable,
+            ) = adjacency.sample_unoccupied_neighbors(
+                patch_sets,
+                source_columns,
+                rng=self._random_generator,
+            )
+            movable_count += int(np.count_nonzero(movable))
+            proposed_sets, proposed_strengths = (
+                self._structural_rj_insert_values(
+                    reduced_sets,
+                    reduced_strengths,
+                    new_patch_indices,
+                    relocated_strengths,
+                    dictionary_size=surface_prior.dictionary_size,
+                )
+            )
+            reverse_degrees = adjacency.available_neighbor_degrees(
+                new_patch_indices,
+                reduced_sets,
+            )
+            proposed_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                proposed_sets,
+                proposed_strengths,
+                backgrounds,
+            )
+            log_ratio = local_position_log_acceptance_ratio(
+                old_surface_indices=old_patch_indices,
+                new_surface_indices=new_patch_indices,
+                forward_available_degrees=forward_degrees,
+                reverse_available_degrees=reverse_degrees,
+                log_likelihood_ratio=proposed_ll - base_ll,
+                surface_prior=surface_prior,
+            )
+            accepted = (
+                movable
+                & (new_patch_indices != old_patch_indices)
+                & (
+                    np.log(
+                        self._random_generator.random(
+                            particle_indices.size
+                        )
+                    )
+                    < np.minimum(log_ratio, 0.0)
+                )
+            )
+            accepted_count += self._commit_structural_rj_states(
+                particle_indices,
+                accepted,
+                proposed_sets,
+                proposed_strengths,
+            )
+        self._structural_rj_move_counts.update(
+            {
+                "local_position_attempted": int(attempted_count),
+                "local_position_movable": int(movable_count),
+                "local_position_accepted": int(accepted_count),
+            }
+        )
+        return accepted_count
+
+    def _apply_structural_rj_strength_moves(
+        self,
+        data: MeasurementData,
+        response_dictionary: NDArray[np.float64],
+    ) -> int:
+        """Update strengths with an exact prior-independence MH proposal."""
+        particle_count = len(self.continuous_particles)
+        cardinalities = np.asarray(
+            [particle.state.num_sources for particle in self.continuous_particles],
+            dtype=np.int64,
+        )
+        attempt = (
+            self._random_generator.random(particle_count)
+            < float(self.config.structural_rj_strength_move_probability)
+        ) & (cardinalities > 0)
+        attempted_count = int(np.count_nonzero(attempt))
+        accepted_count = 0
+        for cardinality in np.unique(cardinalities[attempt]).tolist():
+            particle_indices = np.flatnonzero(
+                attempt & (cardinalities == int(cardinality))
+            ).astype(np.int64, copy=False)
+            patch_sets, strengths, backgrounds = self._structural_rj_group_arrays(
+                particle_indices,
+                int(cardinality),
+            )
+            base_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                patch_sets,
+                strengths,
+                backgrounds,
+            )
+            source_columns = self._random_generator.integers(
+                0,
+                int(cardinality),
+                size=particle_indices.size,
+                dtype=np.int64,
+            )
+            proposed_strengths = strengths.copy()
+            proposed_values = np.asarray(
+                self._strength_prior.sample(
+                    particle_indices.size,
+                    rng=self._random_generator,
+                ),
+                dtype=float,
+            )
+            proposed_strengths[
+                np.arange(particle_indices.size),
+                source_columns,
+            ] = proposed_values
+            proposed_ll = self._structural_rj_group_log_likelihood(
+                data,
+                response_dictionary,
+                patch_sets,
+                proposed_strengths,
+                backgrounds,
+            )
+            log_ratio = proposed_ll - base_ll
+            accepted = np.log(
+                self._random_generator.random(particle_indices.size)
+            ) < np.minimum(log_ratio, 0.0)
+            accepted_count += self._commit_structural_rj_states(
+                particle_indices,
+                accepted,
+                patch_sets,
+                proposed_strengths,
+            )
+        self._structural_rj_move_counts.update(
+            {
+                "strength_attempted": int(attempted_count),
+                "strength_accepted": int(accepted_count),
+            }
+        )
+        return accepted_count
+
+    def _apply_exact_structural_rj_moves(
+        self,
+        evidence_data: MeasurementData,
+        *,
+        allow_structural_birth_proposals: bool,
+    ) -> None:
+        """Apply target-preserving RJ/MH rejuvenation without changing PF weights."""
+        structural_start = time.perf_counter()
+        original_log_weights = np.asarray(
+            [particle.log_weight for particle in self.continuous_particles],
+            dtype=float,
+        )
+        self._structural_rj_response_evaluation_batches = 0
+        self._structural_rj_response_evaluated_cells = 0
+        self._structural_rj_move_counts = {
+            "birth_attempted": 0,
+            "birth_accepted": 0,
+            "death_attempted": 0,
+            "death_accepted": 0,
+            "global_position_attempted": 0,
+            "global_position_accepted": 0,
+            "local_position_attempted": 0,
+            "local_position_movable": 0,
+            "local_position_accepted": 0,
+            "strength_attempted": 0,
+            "strength_accepted": 0,
+        }
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("rj_mh surface patches are unavailable.")
+        self._structural_rj_response_touched_mask = np.zeros(
+            patches.patch_count,
+            dtype=bool,
+        )
+        response_start = time.perf_counter()
+        response_dictionary = self._structural_rj_response_dictionary(
+            evidence_data,
+            patch_indices=np.zeros(0, dtype=np.int64),
+        )
+        response_elapsed = time.perf_counter() - response_start
+        birth_count = 0
+        death_count = 0
+        birth_death_elapsed = 0.0
+        if allow_structural_birth_proposals:
+            move_start = time.perf_counter()
+            birth_count, death_count = self._apply_structural_rj_birth_death(
+                evidence_data,
+                response_dictionary,
+            )
+            birth_death_elapsed = time.perf_counter() - move_start
+        position_start = time.perf_counter()
+        position_count = self._apply_structural_rj_position_moves(
+            evidence_data,
+            response_dictionary,
+        )
+        position_elapsed = time.perf_counter() - position_start
+        local_position_start = time.perf_counter()
+        local_position_count = (
+            self._apply_structural_rj_local_position_moves(
+                evidence_data,
+                response_dictionary,
+            )
+        )
+        local_position_elapsed = (
+            time.perf_counter() - local_position_start
+        )
+        strength_start = time.perf_counter()
+        strength_count = self._apply_structural_rj_strength_moves(
+            evidence_data,
+            response_dictionary,
+        )
+        strength_elapsed = time.perf_counter() - strength_start
+        current_log_weights = np.asarray(
+            [particle.log_weight for particle in self.continuous_particles],
+            dtype=float,
+        )
+        outer_weight_array_equal = bool(
+            np.array_equal(original_log_weights, current_log_weights)
+        )
+        with np.errstate(invalid="ignore"):
+            outer_weight_differences = np.where(
+                original_log_weights == current_log_weights,
+                0.0,
+                np.abs(original_log_weights - current_log_weights),
+            )
+        outer_weight_differences = np.where(
+            np.isfinite(outer_weight_differences),
+            outer_weight_differences,
+            float("inf"),
+        )
+        outer_weight_max_abs_diff = (
+            float(np.max(outer_weight_differences))
+            if outer_weight_differences.size
+            else 0.0
+        )
+        self.last_birth_count += int(birth_count)
+        self.last_kill_count += int(death_count)
+        self._reset_structural_residual_gate()
+        self.last_birth_residual_layer = "not_used_by_rj_mh"
+        self.last_structural_timing_s = {
+            "total": float(time.perf_counter() - structural_start),
+            "response_dictionary": float(response_elapsed),
+            "rj_birth_death": float(birth_death_elapsed),
+            "rj_position": float(position_elapsed),
+            "rj_global_position": float(position_elapsed),
+            "rj_local_position": float(local_position_elapsed),
+            "rj_strength": float(strength_elapsed),
+            "rj_birth_attempted": float(
+                self._structural_rj_move_counts["birth_attempted"]
+            ),
+            "rj_birth_accepted": float(birth_count),
+            "rj_death_attempted": float(
+                self._structural_rj_move_counts["death_attempted"]
+            ),
+            "rj_death_accepted": float(death_count),
+            "rj_global_position_attempted": float(
+                self._structural_rj_move_counts[
+                    "global_position_attempted"
+                ]
+            ),
+            "rj_global_position_accepted": float(position_count),
+            "rj_position_attempted": float(
+                self._structural_rj_move_counts[
+                    "global_position_attempted"
+                ]
+            ),
+            "rj_position_accepted": float(position_count),
+            "rj_local_position_attempted": float(
+                self._structural_rj_move_counts[
+                    "local_position_attempted"
+                ]
+            ),
+            "rj_local_position_movable": float(
+                self._structural_rj_move_counts[
+                    "local_position_movable"
+                ]
+            ),
+            "rj_local_position_accepted": float(local_position_count),
+            "rj_strength_attempted": float(
+                self._structural_rj_move_counts["strength_attempted"]
+            ),
+            "rj_strength_accepted": float(strength_count),
+            "rj_response_evaluation_batches": float(
+                self._structural_rj_response_evaluation_batches
+            ),
+            "rj_response_evaluated_cells": float(
+                self._structural_rj_response_evaluated_cells
+            ),
+            "rj_response_touched_columns": float(
+                np.count_nonzero(self._structural_rj_response_touched_mask)
+            ),
+            "outer_log_weight_max_abs_diff": float(
+                outer_weight_max_abs_diff
+            ),
+            "outer_log_weight_array_equal": float(
+                outer_weight_array_equal
+            ),
+            "weights_preserved": float(outer_weight_array_equal),
+        }
+        if not outer_weight_array_equal:
+            raise RuntimeError("rj_mh rejuvenation must not alter PF weights.")
+        self.align_continuous_labels()
+
     def apply_structural_moves(
         self,
         evidence_data: MeasurementData | None,
@@ -9375,6 +10985,22 @@ class IsotopeParticleFilter:
                 "total": 0.0,
                 "structural_moves_gated": 1.0,
             }
+            return
+        if self._structural_kernel_is_exact():
+            if evidence_data is None or evidence_data.z_k.size == 0:
+                self._reset_structural_residual_gate()
+                self.last_structural_timing_s = {
+                    "total": 0.0,
+                    "rj_mh_no_evidence": 1.0,
+                    "weights_preserved": 1.0,
+                }
+                return
+            self._apply_exact_structural_rj_moves(
+                evidence_data,
+                allow_structural_birth_proposals=(
+                    allow_structural_birth_proposals
+                ),
+            )
             return
         timing: dict[str, float] = {
             "total": 0.0,

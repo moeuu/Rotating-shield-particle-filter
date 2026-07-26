@@ -370,7 +370,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
     no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
     assert no_birth["birth_max_per_update"] == 0
-    assert no_birth.get("pf_max_sources") is None
+    assert no_birth["pf_max_sources"] == 5
     passive_no_shield = json.loads(
         by_variant["baseline_passive_no_shield"].config_path.read_text()
     )
@@ -468,7 +468,10 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         isotope_counts[source["isotope"]] = isotope_counts.get(source["isotope"], 0) + 1
     assert isotope_counts == {"Cs-137": 4, "Co-60": 3, "Eu-154": 2}
     assert source_payload["metadata"]["visibility_filter"] is True
-    assert proposed_config.get("pf_max_sources") is None
+    assert proposed_config["pf_max_sources"] == 5
+    assert proposed_config["structural_cardinality_prior_probs"] == pytest.approx(
+        [1.0 / 6.0] * 6
+    )
     assert proposed_config.get("init_num_sources_max") is None
     assert proposed_config["measurement_log_output_dir"] == (
         "results/ral_ablation/measurement_logs/"
