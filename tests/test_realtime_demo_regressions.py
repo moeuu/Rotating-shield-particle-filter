@@ -25,6 +25,7 @@ from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
     DeferredPFVisualizer,
     _acquire_spectrum_observation,
+    _adapt_dss_config_from_pf_evidence,
     _adaptive_mission_stop_reason,
     _all_pf_filters_converged,
     _apply_baseline_shield_program_to_dss_config,
@@ -2623,6 +2624,66 @@ def test_baseline_shield_program_preserves_adapted_dss_length() -> None:
     assert len(baseline_program.pair_ids) == 16
     assert forced_config.program_length == 16
     assert forced_config.forced_program_pair_ids == baseline_program.pair_ids
+
+
+def test_dss_pf_adaptation_keeps_fixed_length_and_applies_recovery_mode() -> None:
+    """Fixed view counts must not disable independent PF recovery guidance."""
+    config = DSSPPConfig(
+        program_length=8,
+        explicit_mode_switch=True,
+        planner_mode="balanced",
+        lambda_frontier=1.0,
+        lambda_coverage=1.0,
+    )
+
+    adapted, reason = _adapt_dss_config_from_pf_evidence(
+        config,
+        adaptive_program_length_enabled=False,
+        residual_unresolved=True,
+        ambiguity_unresolved=False,
+        require_cardinality_gap=True,
+        cardinality_ready=False,
+        remaining_ready=False,
+        residual_program_length=16,
+        simple_program_length=2,
+        priority_isotopes=("Cs-137", "Co-60"),
+        planner_mode="global_recovery",
+    )
+
+    assert reason == "disabled"
+    assert adapted.program_length == 8
+    assert adapted.recovery_isotopes == ("Cs-137", "Co-60")
+    assert adapted.planner_mode == "global_recovery"
+    assert adapted.lambda_frontier == pytest.approx(2.0)
+    assert adapted.lambda_coverage == pytest.approx(2.0)
+
+
+def test_dss_forced_program_disables_all_pf_adaptation() -> None:
+    """A forced shield program must remain completely unchanged."""
+    config = DSSPPConfig(
+        program_length=8,
+        forced_program_pair_ids=(1, 8, 1, 8, 1, 8, 1, 8),
+        explicit_mode_switch=True,
+        planner_mode="balanced",
+        recovery_isotopes=(),
+    )
+
+    adapted, reason = _adapt_dss_config_from_pf_evidence(
+        config,
+        adaptive_program_length_enabled=True,
+        residual_unresolved=True,
+        ambiguity_unresolved=True,
+        require_cardinality_gap=False,
+        cardinality_ready=False,
+        remaining_ready=True,
+        residual_program_length=16,
+        simple_program_length=2,
+        priority_isotopes=("Eu-154",),
+        planner_mode="global_recovery",
+    )
+
+    assert reason == "forced_program"
+    assert adapted is config
 
 
 def test_shield_selection_uses_signature_floor_and_dependency() -> None:

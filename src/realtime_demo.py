@@ -1425,6 +1425,104 @@ def _apply_baseline_shield_program_to_dss_config(
     )
 
 
+def _adapt_dss_config_from_pf_evidence(
+    config: DSSPPConfig,
+    *,
+    adaptive_program_length_enabled: bool,
+    residual_unresolved: bool,
+    ambiguity_unresolved: bool,
+    require_cardinality_gap: bool,
+    cardinality_ready: bool,
+    remaining_ready: bool,
+    residual_program_length: int,
+    simple_program_length: int,
+    priority_isotopes: Sequence[str],
+    planner_mode: str,
+) -> tuple[DSSPPConfig, str]:
+    """
+    Return a DSS config adapted from already-computed PF evidence.
+
+    A forced shield program disables every adaptive change. Otherwise the
+    program-length switch controls only the number of views; PF isotope
+    priorities and the explicit planner mode remain independent controls.
+    """
+    if config.forced_program_pair_ids is not None:
+        return config, "forced_program"
+
+    adapted = config
+    reason = "disabled" if not adaptive_program_length_enabled else "full"
+    base_length = max(1, int(config.program_length))
+    if adaptive_program_length_enabled:
+        residual_length = max(base_length, int(residual_program_length))
+        resolved_simple_length = max(
+            1,
+            min(base_length, int(simple_program_length)),
+        )
+        if residual_unresolved and (
+            not require_cardinality_gap or not cardinality_ready
+        ):
+            adapted = replace(adapted, program_length=residual_length)
+            reason = "pf_residual"
+        elif ambiguity_unresolved:
+            reason = "pf_ambiguity"
+        elif remaining_ready and cardinality_ready and (
+            resolved_simple_length < base_length
+        ):
+            adapted = replace(adapted, program_length=resolved_simple_length)
+            reason = "pf_ready"
+
+    priorities = tuple(str(isotope) for isotope in priority_isotopes)
+    if priorities:
+        adapted = replace(adapted, recovery_isotopes=priorities)
+
+    if bool(adapted.explicit_mode_switch):
+        if planner_mode == "global_recovery":
+            adapted = replace(
+                adapted,
+                planner_mode=planner_mode,
+                lambda_frontier=max(float(adapted.lambda_frontier), 2.0),
+                lambda_coverage=max(float(adapted.lambda_coverage), 2.0),
+            )
+        elif planner_mode == "local_disambiguation":
+            adapted = replace(
+                adapted,
+                planner_mode=planner_mode,
+                lambda_signature=max(float(adapted.lambda_signature), 3.0),
+                lambda_temporal_separation=max(
+                    float(adapted.lambda_temporal_separation),
+                    10.0,
+                ),
+                lambda_correlation_reduction=max(
+                    float(adapted.lambda_correlation_reduction),
+                    6.0,
+                ),
+                lambda_station_condition=max(
+                    float(adapted.lambda_station_condition),
+                    8.0,
+                ),
+                lambda_elevation_condition=max(
+                    float(adapted.lambda_elevation_condition),
+                    5.0,
+                ),
+            )
+        elif planner_mode == "verification":
+            adapted = replace(
+                adapted,
+                planner_mode=planner_mode,
+                lambda_correlation_reduction=max(
+                    float(adapted.lambda_correlation_reduction),
+                    6.0,
+                ),
+                lambda_temporal_separation=max(
+                    float(adapted.lambda_temporal_separation),
+                    8.0,
+                ),
+            )
+        else:
+            adapted = replace(adapted, planner_mode=planner_mode)
+    return adapted, reason
+
+
 def _resolve_rotation_limit_for_active_program(
     *,
     base_rotation_limit: int,
@@ -12147,8 +12245,6 @@ def run_live_pf(
         label: str,
     ) -> DSSPPConfig:
         """Adapt DSS-PP using only PF posterior-predictive budget evidence."""
-        if not bool(dss_adaptive_program_length_enabled):
-            return config
         if config.forced_program_pair_ids is not None:
             return config
         payload = _remaining_measurement_payload(remaining_estimate)
@@ -12184,32 +12280,28 @@ def run_live_pf(
         require_cardinality_gap = bool(
             dss_residual_extension_requires_cardinality_evidence
         )
-        base_length = max(1, int(config.program_length))
-        residual_length = max(
-            base_length,
-            int(dss_residual_program_length_resolved),
+        priority_isotopes = _pf_priority_isotopes_from_remaining(remaining_estimate)
+        planner_mode, mode_scores = (
+            _pf_planner_mode_from_remaining(remaining_estimate)
+            if bool(config.explicit_mode_switch)
+            else (str(config.planner_mode), {})
         )
-        simple_length = max(
-            1,
-            min(base_length, int(dss_adaptive_simple_program_length)),
+        adapted, reason = _adapt_dss_config_from_pf_evidence(
+            config,
+            adaptive_program_length_enabled=bool(
+                dss_adaptive_program_length_enabled
+            ),
+            residual_unresolved=residual_unresolved,
+            ambiguity_unresolved=ambiguity_unresolved,
+            require_cardinality_gap=require_cardinality_gap,
+            cardinality_ready=cardinality_ready,
+            remaining_ready=_remaining_measurement_ready_for_stop(payload),
+            residual_program_length=int(dss_residual_program_length_resolved),
+            simple_program_length=int(dss_adaptive_simple_program_length),
+            priority_isotopes=priority_isotopes,
+            planner_mode=planner_mode,
         )
-        adapted = config
-        reason = "full"
-        if residual_unresolved and (
-            not require_cardinality_gap or not cardinality_ready
-        ):
-            adapted = replace(config, program_length=residual_length)
-            reason = "pf_residual"
-        elif ambiguity_unresolved:
-            reason = "pf_ambiguity"
-        elif (
-            _remaining_measurement_ready_for_stop(payload)
-            and cardinality_ready
-            and simple_length < base_length
-        ):
-            adapted = replace(config, program_length=simple_length)
-            reason = "pf_ready"
-        if reason != "full":
+        if bool(dss_adaptive_program_length_enabled) and reason != "full":
             print(
                 "DSS-PP adaptive shield program length: "
                 f"context={label} reason={reason} "
@@ -12217,64 +12309,12 @@ def run_live_pf(
                 f"base={int(config.program_length)} "
                 f"residual={int(dss_residual_program_length_resolved)}"
             )
-        priority_isotopes = _pf_priority_isotopes_from_remaining(remaining_estimate)
         if priority_isotopes:
-            adapted = replace(
-                adapted,
-                recovery_isotopes=priority_isotopes,
-            )
             print(
                 "DSS-PP PF-priority isotopes: "
                 f"context={label} isotopes={list(priority_isotopes)}"
             )
         if bool(adapted.explicit_mode_switch):
-            planner_mode, mode_scores = _pf_planner_mode_from_remaining(
-                remaining_estimate
-            )
-            if planner_mode == "global_recovery":
-                adapted = replace(
-                    adapted,
-                    planner_mode=planner_mode,
-                    lambda_frontier=max(float(adapted.lambda_frontier), 2.0),
-                    lambda_coverage=max(float(adapted.lambda_coverage), 2.0),
-                )
-            elif planner_mode == "local_disambiguation":
-                adapted = replace(
-                    adapted,
-                    planner_mode=planner_mode,
-                    lambda_signature=max(float(adapted.lambda_signature), 3.0),
-                    lambda_temporal_separation=max(
-                        float(adapted.lambda_temporal_separation),
-                        10.0,
-                    ),
-                    lambda_correlation_reduction=max(
-                        float(adapted.lambda_correlation_reduction),
-                        6.0,
-                    ),
-                    lambda_station_condition=max(
-                        float(adapted.lambda_station_condition),
-                        8.0,
-                    ),
-                    lambda_elevation_condition=max(
-                        float(adapted.lambda_elevation_condition),
-                        5.0,
-                    ),
-                )
-            elif planner_mode == "verification":
-                adapted = replace(
-                    adapted,
-                    planner_mode=planner_mode,
-                    lambda_correlation_reduction=max(
-                        float(adapted.lambda_correlation_reduction),
-                        6.0,
-                    ),
-                    lambda_temporal_separation=max(
-                        float(adapted.lambda_temporal_separation),
-                        8.0,
-                    ),
-                )
-            else:
-                adapted = replace(adapted, planner_mode=planner_mode)
             print(
                 "DSS-PP explicit planner mode: "
                 f"context={label} mode={adapted.planner_mode} "
