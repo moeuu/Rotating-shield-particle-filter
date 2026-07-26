@@ -322,9 +322,8 @@ def forward_model_component_payloads(
     line_table = production_line_mu_by_isotope(isotope_order)
     payloads: dict[str, dict[str, object]] = {
         "detector": _selected(runtime, "detector", "aperture", "crystal", "housing"),
-        # These two component identities are shared across PF/MLE repositories.
         # The shield hash is the full production line table and the spectrum
-        # hash is exactly its energy/weight projection.  Runtime-specific
+        # hash is exactly its energy/weight projection. Runtime-specific
         # settings remain bound by the resolved-config artifact hash.
         "shield": line_table,
         "environment": environment_payload,

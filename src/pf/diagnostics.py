@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 from pf.state import IsotopeState
 
 
@@ -32,26 +30,8 @@ def reset_step_diagnostics(target: Any) -> None:
     target.last_birth_residual_distinct_poses = 0
     target.last_birth_residual_distinct_stations = 0
     target.last_birth_residual_gate_passed = False
-    target.last_birth_residual_refit_fraction = 1.0
-    target.last_birth_residual_refit_gate_passed = True
     target.last_birth_residual_layer = "none"
     target.last_birth_residual_layer_count = 0
-    target.last_birth_forced_attempts = 0
-    target.last_birth_forced_accepts = 0
-    target.last_birth_forced_mask_relaxations = 0
-    target.last_birth_forced_no_candidate = 0
-    target.last_birth_forced_rejected = 0
-    target.last_birth_forced_best_delta = -np.inf
-    target.last_birth_global_rescue_candidates = 0
-    target.last_birth_global_rescue_attempts = 0
-    target.last_birth_global_rescue_accepts = 0
-    target.last_birth_global_rescue_rejected = 0
-    target.last_birth_global_rescue_best_delta = -np.inf
-    target.last_runtime_report_rescue_candidates = 0
-    target.last_runtime_report_rescue_sources = 0
-    target.last_runtime_report_rescue_injected = 0
-    target.last_runtime_report_rescue_weight = 0.0
-    target.last_weak_source_prune_occlusion_protected = 0
     target.last_birth_structural_eligible = 0
     target.last_pseudo_source_verified = 0
     target.last_pseudo_source_failed = 0
@@ -85,9 +65,6 @@ def build_source_event_record(
         "position": [float(value) for value in state.positions[idx]],
         "strength": float(state.strengths[idx]),
         "age": int(state.ages[idx]) if state.ages is not None else None,
-        "low_q_streak": int(state.low_q_streaks[idx])
-        if state.low_q_streaks is not None
-        else None,
         "support_score": float(state.support_scores[idx])
         if state.support_scores is not None
         else None,

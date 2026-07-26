@@ -391,14 +391,6 @@ def _dsspp_config_from_mapping(payload: object) -> DSSPPConfig:
             "Hybrid planning requires dsspp_config.augment_candidates=false; "
             "internally generated poses have no upstream collision attestation."
         )
-    if raw.get("include_runtime_rescue_modes", False) is not False:
-        raise HybridPlanningBoundaryError(
-            "Hybrid planning cannot enable legacy runtime rescue modes."
-        )
-    if raw.get("include_global_surface_rescue_modes", False) is not False:
-        raise HybridPlanningBoundaryError(
-            "Hybrid planning cannot enable legacy surface rescue modes."
-        )
     try:
         return DSSPPConfig(**raw)
     except TypeError as exc:
@@ -883,7 +875,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--directive-schedule", type=Path)
     parser.add_argument(
         "--profile",
-        choices=("pf_strict", "pf_profiled"),
+        choices=("pf_strict",),
         default="pf_strict",
     )
     parser.add_argument("--seed", type=int, default=0)

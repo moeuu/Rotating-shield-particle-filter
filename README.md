@@ -1,6 +1,8 @@
 # Rotating-shield-particle-filter
 
-Demo simulations assume strong sources (≈20,000 cps at 1 m) for Cs-137, Co-60, and Eu-154 to mimic high-dose environments. Core APIs remain unchanged; only example defaults are scaled.
+Demo simulations assume strong sources (≈20,000 cps at 1 m) for Cs-137,
+Co-60, and Eu-154 to mimic high-dose environments. The scientific estimator
+API is the sequential `pf_strict` particle filter described below.
 
 ## Environment setup (uv)
 
@@ -24,9 +26,9 @@ uv run pytest
 
 ## Pure-PF replay and opt-in hybrid boundary
 
-The scientific baseline is `pf_strict`: count-domain sequential PF localization
-without all-history batch refinement. Its public MeasurementLog replay and posterior
-reporting semantics are unchanged:
+The scientific runtime has one estimator profile, `pf_strict`: count-domain
+sequential PF localization on physical environment surfaces. Its public
+MeasurementLog replay and posterior reporting semantics are:
 
 ```bash
 uv run python -m pf.replay \
@@ -36,13 +38,11 @@ uv run python -m pf.replay \
   --output-dir results/pf-replay
 ```
 
-Hybrid support is deliberately isolated in separate opt-in entry points for the
-orchestrator repository. `pf.hybrid_replay` applies MLE-shaped position proposals only
-as fixed-cardinality Metropolis-within-Gibbs moves. The PF evaluates its complete
-target through the declared cutoff plus the forward/reverse proposal correction;
-particle weights, strengths, backgrounds, and source count are not overwritten by an
-MLE objective. Receipts retain particle-level decisions and honest aggregate
-attempt/accept/reject/not-sampled counts.
+Hybrid support is deliberately isolated from the scientific runtime. The
+experimental `pf.hybrid_replay` relocation kernel is defined only for a uniform
+volume prior, so every non-empty schedule fails closed under the required
+surface-constrained `pf_strict` profile. An empty schedule remains a byte-for-byte
+no-op.
 
 `pf.hybrid_planning` causally replays the same prefix and emits one algorithmic DSS-PP
 XYZ/height/shield-program recommendation from PF modes plus pending/verified external

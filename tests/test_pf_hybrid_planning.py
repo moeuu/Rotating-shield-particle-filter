@@ -27,8 +27,6 @@ def _dsspp_config() -> dict[str, object]:
     """Return a small deterministic DSS-PP configuration for boundary tests."""
     return {
         "augment_candidates": False,
-        "include_runtime_rescue_modes": False,
-        "include_global_surface_rescue_modes": False,
         "horizon": 1,
         "beam_width": 2,
         "max_programs": 1,

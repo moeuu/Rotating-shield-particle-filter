@@ -39,7 +39,6 @@ from tests.pure_pf_test_support import (
 
 def _effective_runtime_overrides(
     *,
-    profile: str = "pf_strict",
     seed: int = 41,
     joint: bool = True,
     delayed: bool = False,
@@ -49,7 +48,7 @@ def _effective_runtime_overrides(
         replay_config()["replay_candidate_sources_xyz"], dtype=float
     )
     config = RotatingShieldPFConfig(
-        estimator_profile=profile,
+        estimator_profile="pf_strict",
         num_particles=12,
         max_sources=2,
         init_num_sources=[1, 1],
@@ -58,9 +57,6 @@ def _effective_runtime_overrides(
         parallel_isotope_updates=False,
         position_min=(0.0, 0.0, 0.0),
         position_max=(2.0, 2.0, 1.5),
-        conditional_strength_refit=profile == "pf_profiled",
-        conditional_strength_profile_before_likelihood=profile == "pf_profiled",
-        refit_after_moves=profile == "pf_profiled",
     )
     apply_profile_to_config(config)
     return {
@@ -147,7 +143,7 @@ def test_measurement_log_schema_rejects_invalid_energy_axis() -> None:
 
 
 def test_active_pure_modules_do_not_import_batch_estimators() -> None:
-    """The active estimator/replay boundary must not import forbidden solvers."""
+    """The active runtime must not import deleted solvers at any scope."""
     root = Path(__file__).resolve().parents[1]
     active_modules = (
         root / "src/pf/pure_estimator.py",
@@ -165,9 +161,7 @@ def test_active_pure_modules_do_not_import_batch_estimators() -> None:
     imported: set[str] = set()
     for module in active_modules:
         tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
-        # Legacy batch solvers may be imported lazily inside legacy-only method
-        # bodies, but they cannot enter the active pure runtime import graph.
-        for node in tree.body:
+        for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
@@ -175,10 +169,10 @@ def test_active_pure_modules_do_not_import_batch_estimators() -> None:
     assert imported.isdisjoint(forbidden)
 
 
-def test_replay_outputs_are_deterministic_and_provenance_hashes_are_distinct(
+def test_replay_outputs_are_deterministic_and_provenance_hashes_bind_inputs(
     tmp_path: Path,
 ) -> None:
-    """The same log/config/seed must produce the same three-file result bundle."""
+    """The same strict input must produce one reproducible, causally bound bundle."""
     log_path = make_measurement_log(tmp_path / "measurement-log", record_count=3)
     config_path = tmp_path / "pf-config.json"
     config_path.write_bytes(canonical_json_bytes(replay_config()))
@@ -214,14 +208,18 @@ def test_replay_outputs_are_deterministic_and_provenance_hashes_are_distinct(
     diagnostics = json.loads((first_output / "pf_diagnostics.json").read_text())
     provenance = posterior["provenance"]
     assert provenance["config_sha256"] == sha256(config_path.read_bytes()).hexdigest()
-    assert provenance["resolved_config_sha256"] != provenance["config_sha256"]
     assert provenance["resolved_config_sha256"] == sha256_json(
         enforce_pure_runtime_settings(replay_config(), profile="pf_strict")
     )
+    assert provenance["resolved_config_sha256"] == provenance["config_sha256"]
     assert diagnostics["record_count"] == 3
-    assert diagnostics["forbidden_batch_methods_invoked"] == []
     assert posterior["final_estimate_source"] == "pf_posterior"
-    assert posterior["uses_all_history_batch_fit"] is False
+    assert "forbidden_batch_methods_invoked" not in diagnostics
+    assert "batch_methods_invoked" not in diagnostics
+    assert "uses_all_history_batch_fit" not in posterior
+    assert "mle_estimate" not in posterior
+    assert "surface_map_estimate" not in posterior
+    assert "strength_refit_applied" not in posterior
     assert posterior["posterior_semantics"] == (
         "fixed_cardinality_sequential_particle_filter"
     )
@@ -553,10 +551,10 @@ def test_serialized_live_station_ingestion_matches_replay_covariance_path(
     assert replayed.serialized_state() == live.serialized_state()
 
 
-def test_same_effective_log_supports_both_profiles_with_truthful_hashes(
+def test_same_effective_log_supports_only_strict_profile(
     tmp_path: Path,
 ) -> None:
-    """The recorded strict run can be replayed as either declared PF variant."""
+    """A strict recorded run must reject the removed profiled estimator."""
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
@@ -566,55 +564,16 @@ def test_same_effective_log_supports_both_profiles_with_truthful_hashes(
         )
     )
     strict = build_replay_estimator(log, replay_config(), profile="pf_strict", seed=41)
-    profiled_config = {
-        **replay_config(),
-        "estimator_profile": "pf_profiled",
-        "conditional_strength_refit": True,
-        "conditional_strength_profile_before_likelihood": True,
-        "refit_after_moves": True,
-    }
-    profiled = build_replay_estimator(
-        log, profiled_config, profile="pf_profiled", seed=41
-    )
 
     assert strict.resolved_config_hash == log.resolved_config_sha256
-    assert profiled.resolved_config_hash != log.resolved_config_sha256
-    assert strict.resolved_config_hash != profiled.resolved_config_hash
     assert strict.estimator_variant == "pf_strict"
-    assert profiled.estimator_variant == "pf_profiled"
-
-
-@pytest.mark.parametrize("profile", ("pf_strict", "pf_profiled"))
-def test_pure_replay_never_invokes_direct_spectrum_likelihood_helpers(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    profile: str,
-) -> None:
-    """Raw logged bins remain inert for strict and profiled count PFs."""
-    log = load_measurement_log(make_measurement_log(tmp_path / profile, record_count=2))
-    config = {**replay_config(), "estimator_profile": profile}
-    if profile == "pf_profiled":
-        config.update(
-            {
-                "conditional_strength_refit": True,
-                "conditional_strength_profile_before_likelihood": True,
-                "refit_after_moves": True,
-            }
+    with pytest.raises(ValueError, match="only 'pf_strict' is available"):
+        build_replay_estimator(
+            log,
+            replay_config(),
+            profile="pf_profiled",
+            seed=41,
         )
-    estimator = build_replay_estimator(log, config, profile=profile, seed=53)
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("direct spectrum-bin PF helper was invoked")
-
-    for name in (
-        "_sanitize_spectrum_payload",
-        "_complete_spectrum_payload_with_configured_responses",
-        "_pf_spectrum_update_payload_for_isotope",
-        "_stack_pf_spectrum_sequence_payloads",
-    ):
-        monkeypatch.setattr(estimator, name, forbidden)
-    replay_records(log, estimator)
 
 
 def test_tiny_live_run_finalized_log_replays_to_identical_state(
@@ -694,26 +653,22 @@ def test_tiny_live_run_finalized_log_replays_to_identical_state(
     assert replayed.serialized_state() == live_estimator.serialized_state()
 
 
-def test_full_strict_replay_never_calls_forbidden_batch_methods(
+def test_full_strict_replay_exposes_no_removed_estimator_methods(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Hostile batch entry points must remain untouched during a complete replay."""
-
-    def forbidden(*args: object, **kwargs: object) -> object:
-        """Fail if replay touches a forbidden batch entry point."""
-        del args, kwargs
-        raise AssertionError("forbidden batch method was invoked")
-
-    for name in (
+    """A complete replay must finish without reintroducing deleted API stubs."""
+    removed_methods = (
+        "_refit_reported_strengths",
+        "final_report_estimate",
+        "fit_surface_map",
+        "planning_surface_rescue_modes",
         "refresh_sparse_poisson_evidence",
-        "sparse_poisson_evidence_diagnostics",
         "report_model_order_diagnostics",
         "runtime_report_rescue_modes",
-        "planning_surface_rescue_modes",
-        "fit_surface_map",
-    ):
-        monkeypatch.setattr(PurePFEstimator, name, forbidden)
+        "sparse_poisson_evidence_diagnostics",
+    )
+    for name in removed_methods:
+        assert not hasattr(PurePFEstimator, name)
 
     estimator, trace = replay_measurement_log(
         make_measurement_log(tmp_path / "measurement-log", record_count=3),
@@ -722,7 +677,8 @@ def test_full_strict_replay_never_calls_forbidden_batch_methods(
         seed=31,
     )
     assert len(trace) == 3
-    assert estimator.batch_methods_invoked == []
+    for name in removed_methods:
+        assert not hasattr(estimator, name)
 
 
 def test_replay_rejects_forward_model_mismatch_and_existing_output(

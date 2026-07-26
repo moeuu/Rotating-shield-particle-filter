@@ -301,158 +301,12 @@ def summarize_count_bias(
     }
 
 
-def _selected_heldout_deviance(payload: Mapping[str, Any]) -> float | None:
-    """Return held-out spectrum deviance at the selected source count."""
-    values = payload.get("heldout_deviance_by_count", ())
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        return None
-    try:
-        selected = int(payload.get("selected_count", -1))
-    except (TypeError, ValueError):
-        return None
-    if selected < 0 or selected >= len(values):
-        return None
-    selected_value = _finite_or_none(values[selected])
-    if selected_value is None or selected_value < 0.0:
-        return None
-    return selected_value
 
 
-def _integer_or_none(value: Any, *, minimum: int = 0) -> int | None:
-    """Return an integer at or above ``minimum``, otherwise ``None``."""
-    try:
-        numeric = float(value)
-        integer = int(numeric)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not np.isfinite(numeric) or numeric != integer or integer < minimum:
-        return None
-    return integer
 
 
-def _finite_deviance_sequence(payload: Mapping[str, Any]) -> list[float | None]:
-    """Return a strict-JSON sequence of finite non-negative deviances."""
-    values = payload.get("heldout_deviance_by_count", ())
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
-        return []
-    result: list[float | None] = []
-    for value in values:
-        numeric = _finite_or_none(value)
-        result.append(numeric if numeric is not None and numeric >= 0.0 else None)
-    return result
 
 
-def summarize_model_diagnostics(
-    report_model_order: Mapping[str, Mapping[str, Any]] | None,
-    sparse_poisson_evidence: Mapping[str, Mapping[str, Any]] | None,
-) -> dict[str, Any]:
-    """Extract BIC margins, response conditioning, and held-out deviance."""
-    report = {} if report_model_order is None else dict(report_model_order)
-    sparse = {} if sparse_poisson_evidence is None else dict(sparse_poisson_evidence)
-    isotope_names = sorted(
-        set(str(key) for key in report)
-        | {str(key) for key in sparse if str(key) != "joint_multi_isotope"}
-    )
-    margins: list[float] = []
-    conditions: list[float] = []
-    heldout: list[float] = []
-    normalized_heldout: list[float] = []
-    by_isotope: dict[str, dict[str, Any]] = {}
-    for isotope in isotope_names:
-        report_row = report.get(isotope, {})
-        sparse_row_raw = sparse.get(isotope, {})
-        sparse_available = bool(sparse_row_raw) and bool(
-            sparse_row_raw.get("available", True)
-        )
-        sparse_row = sparse_row_raw if sparse_available else {}
-        report_margin = _finite_or_none(report_row.get("criterion_margin_to_runner_up"))
-        sparse_margin = _finite_or_none(sparse_row.get("bic_margin_to_runner_up"))
-        condition = _finite_or_none(
-            sparse_row.get("condition_number", report_row.get("condition_number"))
-        )
-        selected_heldout = _selected_heldout_deviance(sparse_row)
-        observation_count = _integer_or_none(
-            sparse_row.get("heldout_observation_count"),
-            minimum=1,
-        )
-        normalized_selected_heldout = (
-            selected_heldout / float(observation_count)
-            if selected_heldout is not None and observation_count is not None
-            else None
-        )
-        margin = sparse_margin if sparse_margin is not None else report_margin
-        if margin is not None:
-            margins.append(margin)
-        if condition is not None:
-            conditions.append(condition)
-        if selected_heldout is not None:
-            heldout.append(selected_heldout)
-        if normalized_selected_heldout is not None:
-            normalized_heldout.append(normalized_selected_heldout)
-        sparse_selected_count = _integer_or_none(sparse_row.get("selected_count"))
-        report_selected_count = _integer_or_none(report_row.get("selected_count"))
-        selected_count = (
-            sparse_selected_count
-            if sparse_selected_count is not None
-            else report_selected_count
-        )
-        by_isotope[isotope] = {
-            "available": bool(
-                margin is not None
-                or condition is not None
-                or selected_heldout is not None
-            ),
-            "sparse_evidence_available": sparse_available,
-            "selected_count": selected_count,
-            "bic_margin_to_runner_up": margin,
-            "report_criterion_margin_to_runner_up": report_margin,
-            "sparse_bic_margin_to_runner_up": sparse_margin,
-            "response_condition_number": condition,
-            "selected_spectrum_bin_heldout_deviance": selected_heldout,
-            "selected_spectrum_bin_heldout_deviance_per_observation": (
-                normalized_selected_heldout
-            ),
-            "heldout_deviance_observation_count": observation_count,
-            "heldout_deviance_per_observation_available": bool(
-                normalized_selected_heldout is not None
-            ),
-            "heldout_deviance_normalization": (
-                "selected_heldout_deviance_divided_by_actual_heldout_observation_count"
-            ),
-            "best_heldout_count": _integer_or_none(
-                sparse_row.get("best_heldout_count")
-            ),
-            "heldout_deviance_by_count": _finite_deviance_sequence(sparse_row),
-        }
-    joint = sparse.get("joint_multi_isotope", {})
-    joint_available = bool(joint.get("available", False))
-    joint_cardinality_key = joint.get("selected_cardinality_key")
-    isotope_metric_available = any(
-        bool(row.get("available", False)) for row in by_isotope.values()
-    )
-    return {
-        "available": isotope_metric_available or joint_available,
-        "by_isotope": by_isotope,
-        "bic_margin_to_runner_up": _distribution_summary(margins),
-        "response_condition_number": _distribution_summary(conditions),
-        "spectrum_bin_heldout_deviance": _distribution_summary(heldout),
-        "spectrum_bin_heldout_deviance_per_observation": _distribution_summary(
-            normalized_heldout
-        ),
-        "joint_multi_isotope": {
-            "available": joint_available,
-            "selected_cardinality_key": (
-                str(joint_cardinality_key)
-                if joint_available and joint_cardinality_key is not None
-                else None
-            ),
-            "bic_margin_to_runner_up": (
-                _finite_or_none(joint.get("bic_margin_to_runner_up"))
-                if joint_available
-                else None
-            ),
-        },
-    }
 
 
 def _estimate_state(
@@ -538,16 +392,25 @@ def _stability_scope_summary(
         for value in row["matched_strength_abs_relative_drifts_pct"]
     ]
     appearance_count = int(
-        sum(int(row["birth_count"]) for row in transition_rows)
+        sum(
+            int(row["unmatched_cluster_appearance_count"])
+            for row in transition_rows
+        )
     )
     disappearance_count = int(
-        sum(int(row["death_count"]) for row in transition_rows)
+        sum(
+            int(row["unmatched_cluster_disappearance_count"])
+            for row in transition_rows
+        )
     )
     replacement_transition_count = int(
         sum(
             int(
                 row["previous_count"] == row["current_count"]
-                and (row["birth_count"] or row["death_count"])
+                and (
+                    row["unmatched_cluster_appearance_count"]
+                    or row["unmatched_cluster_disappearance_count"]
+                )
             )
             for row in transition_rows
         )
@@ -562,15 +425,6 @@ def _stability_scope_summary(
         "unmatched_cluster_event_count": appearance_count + disappearance_count,
         "same_cardinality_cluster_replacement_transition_count": (
             replacement_transition_count
-        ),
-        # These aliases keep old result readers working.  They count unmatched
-        # reported clusters and must not be interpreted as accepted PF moves.
-        "birth_event_count": appearance_count,
-        "death_event_count": disappearance_count,
-        "birth_death_event_count": appearance_count + disappearance_count,
-        "same_count_birth_death_transition_count": replacement_transition_count,
-        "legacy_birth_death_key_semantics": (
-            "unmatched_reported_clusters_not_accepted_pf_transitions"
         ),
         "consecutive_matched_cluster_shift_m": _distribution_summary(shifts),
         "consecutive_matched_strength_abs_drift_cps_1m": _distribution_summary(
@@ -652,11 +506,6 @@ def summarize_cluster_stability(
                     "unmatched_cluster_disappearance_count": (
                         unmatched_disappearances
                     ),
-                    "birth_count": unmatched_appearances,
-                    "death_count": unmatched_disappearances,
-                    "legacy_birth_death_key_semantics": (
-                        "unmatched_reported_clusters_not_accepted_pf_transitions"
-                    ),
                     "matched_position_shifts_m": shifts,
                     "matched_strength_abs_drifts_cps_1m": absolute_strength_drifts,
                     "matched_strength_abs_relative_drifts_pct": (
@@ -704,15 +553,6 @@ def summarize_cluster_stability(
             ],
             "same_cardinality_cluster_replacement_transition_count": all_summary[
                 "same_cardinality_cluster_replacement_transition_count"
-            ],
-            "birth_death_event_count": all_summary["birth_death_event_count"],
-            "birth_event_count": all_summary["birth_event_count"],
-            "death_event_count": all_summary["death_event_count"],
-            "same_count_birth_death_transition_count": all_summary[
-                "same_count_birth_death_transition_count"
-            ],
-            "legacy_birth_death_key_semantics": all_summary[
-                "legacy_birth_death_key_semantics"
             ],
             "consecutive_matched_cluster_shift_m": all_summary[
                 "consecutive_matched_cluster_shift_m"

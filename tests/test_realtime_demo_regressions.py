@@ -18,8 +18,6 @@ from pf.estimator import (
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator,
 )
-from pf.likelihood import expected_counts_per_source
-from pf.mixing import prune_spurious_sources_continuous
 from pf.particle_filter import IsotopeParticle, MeasurementData
 from pf.profiles import resolve_estimator_profile
 from pf.state import IsotopeState
@@ -27,7 +25,6 @@ from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
     DeferredPFVisualizer,
     _acquire_spectrum_observation,
-    _adapt_dss_program_length_for_budget,
     _adaptive_mission_stop_reason,
     _all_pf_filters_converged,
     _apply_baseline_shield_program_to_dss_config,
@@ -37,16 +34,16 @@ from realtime_demo import (
     _build_intermediate_estimate_trace_payload,
     _build_robot_path_segment,
     _compute_shield_selection_grid,
+    _complete_count_covariance,
     _diagnostic_detail_order,
     _evaluate_spectrum_count_result,
     _evaluate_spectrum_counts,
-    _filter_absent_final_estimates,
     _filter_reachable_candidates,
     _format_pf_timing_item,
     _format_estimate_trace_log_line,
     _format_truth_coverage_log_line,
     _best_dss_first_step_guard_candidate,
-    _final_model_order_status,
+    _final_pf_cardinality_status,
     _has_birth_residual_evidence,
     _has_unresolved_discriminative_pseudo_failures,
     _inflate_low_signal_variances,
@@ -60,8 +57,6 @@ from realtime_demo import (
     _pf_obstacle_grid_for_runtime,
     _pure_pf_primary_estimates,
     _pure_pf_summary_provenance,
-    _online_absent_pruning_supported_isotopes,
-    _prune_online_absent_isotopes,
     _measurement_log_obstacle_layout_path,
     _measurement_transport_provenance,
     _resolve_ig_workers,
@@ -72,14 +67,11 @@ from realtime_demo import (
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
     _resolve_candidate_isotopes,
-    _resolve_display_prune_refresh_interval,
     _resolve_structural_trial_parallelism,
     _resolve_station_update_modes,
     _resolve_required_measurement_log_target,
     _particle_surface_diagnostics,
-    _report_model_order_simple_ready_for_stop,
     _select_best_pair_from_scores,
-    _should_refresh_display_pruned_estimates,
     _signature_vector_is_dependent,
     _resolve_source_position_bounds,
     _spectrum_evidence_payload,
@@ -90,16 +82,32 @@ from realtime_demo import (
     _remaining_measurement_progress,
     run_live_pf,
 )
-from mission_control import (
-    report_model_order_ready_for_stop,
-    sparse_cardinality_evidence_gap_unresolved,
-)
 from planning.dss_pp import DSSPPConfig
 from sim import SimulationCommand, SimulationObservation
 from spectrum.library import ANALYSIS_ISOTOPES
 from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
 from spectrum.runtime_counts import RuntimeCountResult
 from visualization.realtime_viz import PFFrame
+
+
+def test_complete_count_covariance_preserves_cross_isotope_terms() -> None:
+    """Build one full symmetric covariance without losing one-sided terms."""
+    completed = _complete_count_covariance(
+        {"Cs-137": 9.0, "Co-60": 16.0, "Eu-154": 25.0},
+        {
+            "Cs-137": {"Cs-137": 10.0, "Co-60": -3.0},
+            "Co-60": {"Cs-137": -5.0},
+        },
+        ("Cs-137", "Co-60", "Eu-154"),
+    )
+
+    assert completed["Cs-137"]["Cs-137"] == pytest.approx(10.0)
+    assert completed["Co-60"]["Co-60"] == pytest.approx(16.0)
+    assert completed["Eu-154"]["Eu-154"] == pytest.approx(25.0)
+    assert completed["Cs-137"]["Co-60"] == pytest.approx(-4.0)
+    assert completed["Co-60"]["Cs-137"] == pytest.approx(-4.0)
+    assert completed["Cs-137"]["Eu-154"] == pytest.approx(0.0)
+    assert completed["Eu-154"]["Cs-137"] == pytest.approx(0.0)
 
 
 def test_measurement_transport_provenance_keeps_full_history_evidence() -> None:
@@ -658,12 +666,13 @@ def test_measurement_log_obstacle_layout_path_is_portable_and_physical(
 
 
 def test_pure_primary_estimates_preserve_low_strength_posterior_modes() -> None:
-    """Primary pure-PF output must bypass legacy report and display filters."""
+    """Primary pure-PF output must preserve every posterior source mode."""
     _profile, capabilities = resolve_estimator_profile("pf_strict")
     expected_positions = np.asarray([[1.0, 2.0, 0.5]], dtype=float)
     expected_strengths = np.asarray([25.0], dtype=float)
     estimator = SimpleNamespace(
         profile_capabilities=capabilities,
+        pf_config=SimpleNamespace(estimator_profile="pf_strict"),
         estimates=lambda: {
             "Cs-137": (expected_positions.copy(), expected_strengths.copy())
         },
@@ -678,7 +687,7 @@ def test_pure_primary_estimates_preserve_low_strength_posterior_modes() -> None:
     assert actual["Co-60"][1].shape == (0,)
 
 
-def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
+def test_pure_pf_summary_embeds_complete_posterior_provenance() -> None:
     """Every pure-PF result file must identify its log, config, and PF origin."""
     _profile, capabilities = resolve_estimator_profile("pf_strict")
     payload = {
@@ -687,11 +696,6 @@ def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
         "estimator_variant": "pf_strict",
         "estimator_profile": "pf_strict",
         "final_estimate_source": "pf_posterior",
-        "uses_all_history_batch_fit": False,
-        "uses_surface_map": False,
-        "uses_batch_model_order": False,
-        "batch_feedback_to_particles": False,
-        "batch_methods_invoked": [],
         "posterior_semantics": "fixed_cardinality_sequential_particle_filter",
         "structural_kernel_family": "fixed_cardinality_no_structural_moves",
         "structural_kernel_target_preserving": True,
@@ -717,6 +721,7 @@ def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
     }
     estimator = SimpleNamespace(
         profile_capabilities=capabilities,
+        pf_config=SimpleNamespace(estimator_profile="pf_strict"),
         posterior_snapshot=lambda: SimpleNamespace(to_dict=lambda: dict(payload)),
     )
 
@@ -725,7 +730,6 @@ def test_pure_legacy_summary_embeds_complete_posterior_provenance() -> None:
     assert summary["final_estimate_source"] == "pf_posterior"
     assert summary["measurement_log_sha256"] == "b" * 64
     assert summary["resolved_config_sha256"] == "d" * 64
-    assert summary["batch_methods_invoked"] == []
     assert summary["structural_kernel_target_preserving"] is True
     assert summary["structural_kernel_exact_rj"] is False
     assert summary["pf_posterior"] == payload
@@ -861,8 +865,8 @@ def test_remaining_measurement_progress_requires_full_history_improvement() -> N
     assert progress["best_previous_residual_budget"] == pytest.approx(3.0)
 
 
-def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
-    """Final particle surface diagnostics should count report-visible sources."""
+def test_particle_surface_diagnostics_use_all_posterior_sources() -> None:
+    """Final surface diagnostics should cover every PF posterior source slot."""
     isotope = "Cs-137"
     env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
     estimator = RotatingShieldPFEstimator(
@@ -873,7 +877,6 @@ def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
             max_sources=2,
-            report_exclude_unverified_sources=True,
             use_gpu=False,
         ),
     )
@@ -885,7 +888,6 @@ def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
         strengths=np.array([100.0, 50.0], dtype=float),
         background=0.0,
         ages=np.array([3, 0], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.array([0, 0], dtype=int),
@@ -901,98 +903,9 @@ def test_particle_surface_diagnostics_use_report_visible_sources() -> None:
         obstacle_height_m=2.0,
     )[isotope]
 
-    assert diagnostics["raw_source_slots"] == 2
-    assert diagnostics["report_visible_source_slots"] == 1
-    assert diagnostics["report_excluded_source_slots"] == 1
+    assert diagnostics["posterior_source_slots"] == 2
     assert diagnostics["surface_counts"]["floor"] == 1
-    assert diagnostics["off_surface_count"] == 0
-
-
-def test_report_mle_rescue_global_surface_candidates_recover_modes() -> None:
-    """Global report rescue should recover separated sources from all candidates."""
-    isotope = "Cs-137"
-    candidates = np.array(
-        [
-            [1.0, 1.0, 1.0],
-            [4.0, 4.0, 1.0],
-            [2.5, 2.5, 2.0],
-            [1.0, 4.0, 1.0],
-            [4.0, 1.2, 2.0],
-        ],
-        dtype=float,
-    )
-    truth = np.array([[1.0, 4.0, 1.0], [4.0, 1.2, 2.0]], dtype=float)
-    strengths = np.array([450.0, 450.0], dtype=float)
-    detector_positions = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [5.0, 0.0, 0.0],
-            [0.0, 5.0, 0.0],
-            [5.0, 5.0, 0.0],
-            [2.5, 0.0, 1.0],
-            [0.0, 2.5, 1.0],
-            [5.0, 2.5, 1.0],
-            [2.5, 5.0, 1.0],
-        ],
-        dtype=float,
-    )
-    fe_indices = np.zeros(detector_positions.shape[0], dtype=int)
-    pb_indices = np.zeros(detector_positions.shape[0], dtype=int)
-    live_times = np.full(detector_positions.shape[0], 5.0, dtype=float)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=candidates,
-        shield_normals=None,
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=4,
-            use_gpu=False,
-            report_mle_rescue_enable=True,
-            report_mle_rescue_max_candidates=4,
-            report_mle_rescue_max_residual_candidates=3,
-            report_mle_rescue_dedup_radius_m=0.25,
-            report_mle_rescue_min_residual_fraction=0.0,
-        ),
-    )
-    estimator.add_measurement_pose(detector_positions[0])
-    estimator._ensure_kernel_cache()
-    filt = estimator.filters[isotope]
-    design = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=isotope,
-        detector_positions=detector_positions,
-        sources=truth,
-        strengths=np.ones(truth.shape[0], dtype=float),
-        live_times=live_times,
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-        source_scale=estimator.response_scale_for_isotope(isotope),
-    )
-    z_obs = design @ strengths
-    data = MeasurementData(
-        z_k=z_obs,
-        observation_variances=np.maximum(z_obs, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-        live_times=live_times,
-    )
-
-    rescued_pos, rescued_q, stats = estimator._rank_global_surface_candidates(
-        isotope,
-        filt,
-        data,
-        existing_positions=np.zeros((0, 3), dtype=float),
-        background=np.zeros_like(z_obs),
-        eps=1.0e-9,
-        q_max=0.0,
-    )
-
-    assert rescued_pos.shape == (3, 3)
-    assert rescued_q.shape == (3,)
-    assert int(stats["global_rescue_candidate_count"]) == 3
-    distances = np.linalg.norm(rescued_pos[:, None, :] - truth[None, :, :], axis=2)
-    assert np.max(np.min(distances, axis=0)) < 0.25
+    assert diagnostics["off_surface_count"] == 1
 
 
 def test_intermediate_estimate_trace_reports_position_and_strength_error() -> None:
@@ -1094,7 +1007,6 @@ def test_intermediate_estimate_trace_includes_source_slot_metadata() -> None:
                     "tentative": True,
                     "verification_fail_streak": 2,
                     "support_score": 3.5,
-                    "low_q_streak": 1,
                 }
             ],
         },
@@ -1249,51 +1161,6 @@ def test_cui_split_view_defaults_to_saved_runs() -> None:
     )
 
 
-def test_display_pruned_estimate_refresh_interval_is_clamped() -> None:
-    """Display pruning refresh intervals should parse safely."""
-    assert _resolve_display_prune_refresh_interval({}) == 1
-    assert (
-        _resolve_display_prune_refresh_interval(
-            {"display_pruned_estimates_every": 8},
-        )
-        == 8
-    )
-    assert (
-        _resolve_display_prune_refresh_interval(
-            {"display_pruned_estimates_every": 0},
-        )
-        == 0
-    )
-    assert (
-        _resolve_display_prune_refresh_interval(
-            {"display_pruned_estimates_every": "bad"},
-        )
-        == 1
-    )
-
-
-def test_display_pruned_estimate_disable_overrides_forced_refresh() -> None:
-    """Disabled display pruning should not recompute expensive report previews."""
-    assert (
-        _should_refresh_display_pruned_estimates(
-            step_index=8,
-            refresh_every=0,
-            cache_available=False,
-            force_refresh=True,
-        )
-        is False
-    )
-    assert (
-        _should_refresh_display_pruned_estimates(
-            step_index=8,
-            refresh_every=0,
-            cache_available=True,
-            force_refresh=True,
-        )
-        is False
-    )
-
-
 def test_diagnostic_detail_limit_uses_zero_as_no_details() -> None:
     """High-detail diagnostic limits should avoid accidental full log dumps."""
     order = np.array([4, 2, 0, 1, 3], dtype=int)
@@ -1343,12 +1210,12 @@ def test_pf_timing_formatter_keeps_counters_unitless() -> None:
     """PF timing logs should not print diagnostic counters as seconds."""
     assert _format_pf_timing_item("total", 1.25) == "total=1.250s"
     assert (
-        _format_pf_timing_item("sparse_evidence_synced_particles", 6130.0)
-        == "sparse_evidence_synced_particles=6130"
+        _format_pf_timing_item("birth_proposals_gated", 1.0)
+        == "birth_proposals_gated=1"
     )
     assert (
-        _format_pf_timing_item("sparse_evidence_cardinality_ready", 1.0)
-        == "sparse_evidence_cardinality_ready=1"
+        _format_pf_timing_item("structural_moves_gated", 1.0)
+        == "structural_moves_gated=1"
     )
 
 
@@ -1682,40 +1549,6 @@ def test_deferred_pf_visualizer_renders_only_on_save() -> None:
     assert calls[2] == ("save_final", "out.png")
 
 
-def test_display_pruned_estimates_refresh_policy() -> None:
-    """Display-only pruning should refresh on cache miss, force, or interval."""
-    assert _should_refresh_display_pruned_estimates(
-        step_index=3,
-        refresh_every=8,
-        cache_available=False,
-        force_refresh=False,
-    )
-    assert _should_refresh_display_pruned_estimates(
-        step_index=3,
-        refresh_every=8,
-        cache_available=True,
-        force_refresh=True,
-    )
-    assert _should_refresh_display_pruned_estimates(
-        step_index=16,
-        refresh_every=8,
-        cache_available=True,
-        force_refresh=False,
-    )
-    assert not _should_refresh_display_pruned_estimates(
-        step_index=17,
-        refresh_every=8,
-        cache_available=True,
-        force_refresh=False,
-    )
-    assert not _should_refresh_display_pruned_estimates(
-        step_index=16,
-        refresh_every=0,
-        cache_available=True,
-        force_refresh=False,
-    )
-
-
 def test_reachable_candidate_filter_removes_disconnected_free_cells() -> None:
     """Pose candidates should be reachable, not merely outside obstacle cells."""
     grid = ObstacleGrid(
@@ -1776,6 +1609,7 @@ def test_final_count_bias_preserves_full_isotope_names() -> None:
         """Provide the minimal count-bias reporting interface."""
 
         filters = {"Co-60": object(), "Cs-137": object()}
+        pf_config = SimpleNamespace(background_level=0.0)
         num_orientations = 8
         measurements = [
             SimpleNamespace(z_k={"Co-60": 10.0, "Cs-137": 20.0}),
@@ -1803,15 +1637,6 @@ def test_final_count_bias_preserves_full_isotope_names() -> None:
                 pb_indices=np.array([0], dtype=int),
                 live_times=np.array([1.0], dtype=float),
             )
-
-        @staticmethod
-        def _background_counts_for_report_refit(
-            isotope: str,
-            live_times: np.ndarray,
-        ) -> np.ndarray:
-            """Return a zero background for the reporting regression."""
-            del isotope
-            return np.zeros_like(live_times, dtype=float)
 
     summary = realtime_demo_module._final_count_bias_diagnostics(
         _Estimator(),
@@ -2012,10 +1837,6 @@ def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
             """Return a non-converged local rotation state."""
             return False
 
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this non-model-order test."""
-            return True
-
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -2070,10 +1891,6 @@ def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
-
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this discriminative-failure test."""
-            return True
 
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -2141,10 +1958,6 @@ def test_adaptive_mission_waits_for_remaining_measurement_budget() -> None:
             """Return a non-converged local rotation state."""
             return False
 
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this remaining-budget test."""
-            return True
-
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -2190,850 +2003,116 @@ def test_adaptive_mission_waits_for_remaining_measurement_budget() -> None:
     assert reason_without_guard == "environment_coverage:1.000"
 
 
-def test_final_model_order_status_marks_unresolved_pseudo_sources_not_ready() -> None:
-    """Final model-order status should include pseudo-source structural gates."""
-
-    class _DummyFilter:
-        """Minimal filter state exposing unresolved pseudo-source verification."""
-
-        last_pseudo_source_verified = 0
-        last_pseudo_source_failed = 2
-        last_pseudo_source_pruned = 0
-        last_pseudo_source_quarantined = 0
-        last_pseudo_source_quarantine_active = 0
-        last_pseudo_source_fail_reasons = {
-            "needs_discriminative_views": 2,
-            "high_response_corr": 1,
-        }
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-
-    class _DummyEstimator:
-        """Minimal estimator with ready BIC but unresolved structural evidence."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty report estimate."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return report-level BIC diagnostics that are locally ready."""
-            return {
-                "Cs-137": {
-                    "model_order_ready": True,
-                    "condition_number": 1.0,
-                    "criterion_margin_to_simpler": float("inf"),
-                    "selected_max_response_correlation": 0.0,
-                }
-            }
-
-        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return unresolved structural evidence as the estimator does."""
-            return {
-                "Cs-137": {
-                    "pseudo_source_fail_reasons": {
-                        "needs_discriminative_views": 2,
-                        "high_response_corr": 1,
-                    }
-                }
-            }
-
-    status = _final_model_order_status(_DummyEstimator())
-
-    assert status["all_model_order_ready"] is False
-    assert status["all_model_order_ready_before_structural_gates"] is True
-    assert status["unresolved_structural_evidence"]["Cs-137"]
-
-
-def test_final_model_order_status_marks_missing_diagnostics_not_ready() -> None:
-    """Final model-order status should not treat absent evidence as ready."""
-
-    class _DummyEstimator:
-        """Minimal estimator before report diagnostics have been generated."""
-
-        filters: dict[str, object] = {}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty report estimate."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return no model-order diagnostics."""
-            return {}
-
-        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return no separately tracked structural evidence."""
-            return {}
-
-    status = _final_model_order_status(_DummyEstimator())
-
-    assert status["all_model_order_ready"] is False
-    assert status["all_model_order_ready_before_structural_gates"] is False
-
-
 def test_cardinality_dwell_waits_for_unresolved_structural_evidence() -> None:
     """Adaptive cardinality dwell should not stop while structural evidence is open."""
 
     class _DummyEstimator:
-        """Minimal estimator exposing unresolved report-underfit evidence."""
+        """Minimal estimator exposing unresolved PF structural evidence."""
 
         filters: dict[str, object] = {}
 
         def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty report estimate."""
+            """Return an empty PF posterior estimate."""
             return {}
 
         def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return unresolved report-level evidence."""
-            return {"Cs-137": {"report_underfit": {"reason": "count_supported_zero"}}}
+            """Return unresolved residual evidence from the PF structural gate."""
+            return {"Cs-137": {"birth": {"reason": "residual_supported"}}}
 
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return ready-looking diagnostics that should still be blocked."""
-            return {"Cs-137": {"model_order_ready": True, "selected_count": 0}}
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-    )
+    ready, reason = _source_cardinality_dwell_status(_DummyEstimator())
 
     assert ready is False
     assert reason == "unresolved_structural:Cs-137"
 
 
-def test_cardinality_dwell_waits_for_model_order_diagnostics() -> None:
-    """Adaptive cardinality dwell should wait until report evidence exists."""
+def test_final_pf_cardinality_status_uses_only_pf_structural_evidence() -> None:
+    """Final cardinality output should summarize the PF posterior and its gates."""
+
+    class _DummyFilter:
+        """Expose current PF pseudo-source transition diagnostics."""
+
+        last_pseudo_source_verified = 1
+        last_pseudo_source_failed = 2
+        last_pseudo_source_pruned = 0
+        last_pseudo_source_quarantined = 1
+        last_pseudo_source_quarantine_active = 1
+        last_pseudo_source_fail_reasons = {"needs_discriminative_views": 2}
 
     class _DummyEstimator:
-        """Minimal estimator before report diagnostics have been generated."""
+        """Expose one normalized PF cardinality distribution."""
 
-        filters: dict[str, object] = {}
+        filters = {"Cs-137": _DummyFilter()}
 
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty report estimate."""
-            return {}
+        def posterior_cardinality_distribution(
+            self,
+        ) -> dict[str, dict[int, float]]:
+            """Return deliberately unnormalized posterior mass."""
+            return {"Cs-137": {1: 1.0, 2: 3.0}}
 
         def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return no separately tracked structural evidence."""
+            """Return one open PF structural decision."""
+            return {"Cs-137": {"birth": {"reason": "needs_discriminative_views"}}}
+
+    status = _final_pf_cardinality_status(_DummyEstimator())
+    cs_status = status["pf_cardinality"]["Cs-137"]
+
+    assert status["source"] == "pf_posterior"
+    assert status["all_structural_evidence_resolved"] is False
+    assert cs_status["distribution"] == {"1": 0.25, "2": 0.75}
+    assert cs_status["mean"] == pytest.approx(1.75)
+    assert cs_status["variance"] == pytest.approx(0.1875)
+    assert cs_status["entropy_nats"] > 0.0
+    assert status["unresolved_pseudo_source_reasons"] == {
+        "needs_discriminative_views": 2
+    }
+
+
+def test_cardinality_dwell_waits_for_diffuse_pf_count_posterior() -> None:
+    """Adaptive dwell should wait while PF source-count variance is too large."""
+
+    class _DummyConfig:
+        """Set the accepted PF cardinality variance."""
+
+        converge_cardinality_var_max = 0.05
+
+    class _DummyState:
+        """Store one particle source count."""
+
+        def __init__(self, num_sources: int) -> None:
+            """Initialize the source count."""
+            self.num_sources = num_sources
+
+    class _DummyParticle:
+        """Wrap a PF state."""
+
+        def __init__(self, num_sources: int) -> None:
+            """Initialize the wrapped PF state."""
+            self.state = _DummyState(num_sources)
+
+    class _DummyFilter:
+        """Expose a posterior split evenly between one and two sources."""
+
+        continuous_particles = [_DummyParticle(1), _DummyParticle(2)]
+        continuous_weights = np.asarray([0.5, 0.5], dtype=float)
+
+    class _DummyEstimator:
+        """Expose an unresolved PF cardinality posterior."""
+
+        pf_config = _DummyConfig()
+        filters = {"Cs-137": _DummyFilter()}
+
+        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+            """Return an available PF estimate."""
             return {}
 
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return no report-level model-order diagnostics."""
+        def unresolved_structural_evidence(self) -> dict[str, object]:
+            """Return no separate open structural trial."""
             return {}
 
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-    )
+    ready, reason = _source_cardinality_dwell_status(_DummyEstimator())
 
     assert ready is False
-    assert reason == "no_model_order_diagnostics"
-
-
-def test_cardinality_dwell_requires_explicit_model_order_ready() -> None:
-    """Active multi-source diagnostics need an explicit ready flag."""
-
-    class _DummyEstimator:
-        """Minimal estimator with active diagnostics missing readiness."""
-
-        filters: dict[str, object] = {}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a two-source report estimate."""
-            return {
-                "Cs-137": (
-                    np.zeros((2, 3), dtype=float),
-                    np.ones(2, dtype=float),
-                )
-            }
-
-        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return no separately tracked structural evidence."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return active diagnostics without an explicit readiness decision."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 2,
-                    "condition_number": 1.0,
-                    "criterion_margin_to_simpler": 20.0,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-    )
-
-    assert ready is False
-    assert reason == "Cs-137:model_order"
-
-
-def test_cardinality_dwell_ignores_inactive_zero_source_candidates() -> None:
-    """Candidate pools without count support should not activate absent isotopes."""
-
-    class _DummyEstimator:
-        """Minimal estimator with candidate-only zero-source diagnostics."""
-
-        filters: dict[str, object] = {}
-        pf_config = RotatingShieldPFConfig(
-            structural_update_min_counts=25.0,
-            conditional_strength_refit_min_count=5.0,
-            structural_update_min_snr=2.0,
-        )
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty report estimate."""
-            return {}
-
-        def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
-            """Return no open structural evidence."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return zero-source diagnostics with candidate pool but no signal."""
-            return {
-                "Eu-154": {
-                    "candidate_count": 10,
-                    "selected_count": 0,
-                    "model_order_ready": True,
-                    "condition_number": 1.0,
-                    "criterion_margin_to_simpler": float("inf"),
-                    "observed_signal_total_counts": 0.0,
-                    "observed_signal_max_count": 0.0,
-                    "observed_signal_snr": 0.0,
-                    "count_supported_zero_source": False,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-    )
-
-    assert ready is True
-    assert reason == "model_order_ready"
-
-
-def test_adaptive_mission_waits_for_model_order_readiness() -> None:
-    """Mission stop should not accept low IG while model order is unresolved."""
-
-    class _DummyEstimator:
-        """Minimal estimator with unresolved report-level source count."""
-
-        filters: dict[str, object] = {}
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a quiet global IG state."""
-            return True
-
-        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
-            """Return a quiet local shield state."""
-            return True
-
-        def report_model_order_ready(self) -> bool:
-            """Return unresolved model-order readiness."""
-            return False
-
-    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
-    estimator = _DummyEstimator()
-
-    reason = _adaptive_mission_stop_reason(
-        estimator,  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=visited,
-        map_api=None,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=1.0,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-    )
-
-    assert reason is None
-
-    reason_without_guard = _adaptive_mission_stop_reason(
-        estimator,  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=visited,
-        map_api=None,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=1.0,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        require_model_order_ready=False,
-    )
-
-    assert reason_without_guard == "pf_converged_low_information_gain"
-
-
-def test_adaptive_mission_accepts_strong_simple_report_bic() -> None:
-    """A simple report BIC should stop despite low-weight pseudo-source failures."""
-
-    class _DummyFilter:
-        """Minimal filter with pseudo failures but no residual birth support."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-        last_pseudo_source_fail_reasons = {"needs_discriminative_views": 3}
-
-    class _DummyEstimator:
-        """Estimator whose strict readiness is false but report BIC is simple."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Populate report diagnostics without changing test state."""
-            return {}
-
-        def report_model_order_ready(self) -> bool:
-            """Return strict unresolved readiness."""
-            return False
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a strong one-source BIC margin."""
-            return {
-                "Cs-137": {
-                    "selected_count": 1,
-                    "criterion_margin_to_simpler": 25.0,
-                    "condition_number": 1.0,
-                    "selected_max_response_correlation": 0.0,
-                    "model_order_ready": False,
-                }
-            }
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a non-converged global exploration state."""
-            return False
-
-        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
-            """Return a non-converged local rotation state."""
-            return False
-
-    remaining_ready = {
-        "estimated_remaining_stations": 0,
-        "current_budget": 0.0,
-        "unresolved_factors": ["pseudo_source_verification"],
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    reason = _adaptive_mission_stop_reason(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=[np.array([0.0, 0.0, 0.5], dtype=float)],
-        map_api=None,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=1.0,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        remaining_measurement_estimate=remaining_ready,
-    )
-
-    assert reason == "report_simple_model_order"
-
-
-def test_adaptive_mission_simple_report_waits_for_residual_budget() -> None:
-    """A strong simple BIC should not stop while residual evidence remains."""
-
-    class _DummyFilter:
-        """Minimal filter without direct birth gate support."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-        last_pseudo_source_fail_reasons: dict[str, int] = {}
-
-    class _DummyEstimator:
-        """Estimator with simple BIC but unresolved residual budget."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Populate report diagnostics without changing test state."""
-            return {}
-
-        def report_model_order_ready(self) -> bool:
-            """Return strict unresolved readiness."""
-            return False
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a strong one-source BIC margin."""
-            return {
-                "Cs-137": {
-                    "selected_count": 1,
-                    "criterion_margin_to_simpler": 25.0,
-                    "condition_number": 1.0,
-                    "selected_max_response_correlation": 0.0,
-                }
-            }
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a non-converged global exploration state."""
-            return False
-
-        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
-            """Return a non-converged local rotation state."""
-            return False
-
-    unresolved_residual = {
-        "estimated_remaining_stations": 2,
-        "current_budget": 10.0,
-        "unresolved_factors": ["residual"],
-        "components": {
-            "residual": 3.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    reason = _adaptive_mission_stop_reason(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=[np.array([0.0, 0.0, 0.5], dtype=float)],
-        map_api=None,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=1.0,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        remaining_measurement_estimate=unresolved_residual,
-    )
-
-    assert reason is None
-
-
-def test_simple_report_stop_can_ignore_only_high_surface_budget() -> None:
-    """Strong simple BIC may ignore high-surface ambiguity but not residuals."""
-
-    class _DummyFilter:
-        """Minimal filter without birth residual evidence."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-
-    class _DummyEstimator:
-        """Estimator with a confident one-source report model."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Populate report diagnostics without side effects."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a strong simple model-order diagnostic."""
-            return {
-                "Cs-137": {
-                    "selected_count": 1,
-                    "criterion_margin_to_simpler": 30.0,
-                    "condition_number": 1.0,
-                    "selected_max_response_correlation": 0.0,
-                }
-            }
-
-    high_surface_only = {
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 4.0,
-        },
-    }
-    residual_unresolved = {
-        "components": {
-            "residual": 4.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 4.0,
-        },
-    }
-
-    blocked = _report_model_order_simple_ready_for_stop(
-        _DummyEstimator(),
-        remaining_measurement_estimate=high_surface_only,
-        allow_high_surface_ambiguity=False,
-    )
-    allowed = _report_model_order_simple_ready_for_stop(
-        _DummyEstimator(),
-        remaining_measurement_estimate=high_surface_only,
-        allow_high_surface_ambiguity=True,
-    )
-    residual_blocked = _report_model_order_simple_ready_for_stop(
-        _DummyEstimator(),
-        remaining_measurement_estimate=residual_unresolved,
-        allow_high_surface_ambiguity=True,
-    )
-
-    assert blocked is False
-    assert allowed is True
-    assert residual_blocked is False
-
-
-def test_simple_report_stop_can_ignore_birth_residual_noise() -> None:
-    """Strong simple report BIC may override residual-birth structural noise."""
-
-    class _DummyFilter:
-        """Minimal filter with stale residual-birth evidence."""
-
-        last_birth_residual_gate_passed = True
-        last_birth_residual_support = 3
-
-    class _DummyEstimator:
-        """Estimator with a confident one-source report model."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Populate report diagnostics without side effects."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a strong simple model-order diagnostic."""
-            return {
-                "Cs-137": {
-                    "selected_count": 1,
-                    "criterion_margin_to_simpler": 30.0,
-                    "condition_number": 1.0,
-                    "selected_max_response_correlation": 0.0,
-                }
-            }
-
-    quiet_budget = {
-        "estimated_remaining_stations": 0,
-        "current_budget": 0.0,
-        "unresolved_factors": [],
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    blocked_by_birth = _report_model_order_simple_ready_for_stop(
-        _DummyEstimator(),
-        remaining_measurement_estimate=quiet_budget,
-        require_no_birth_residual=True,
-        birth_residual_min_support=2,
-    )
-    allowed_for_report = _report_model_order_simple_ready_for_stop(
-        _DummyEstimator(),
-        remaining_measurement_estimate=quiet_budget,
-        require_no_birth_residual=False,
-        birth_residual_min_support=2,
-    )
-
-    assert blocked_by_birth is False
-    assert allowed_for_report is True
-
-
-def test_adaptive_mission_stop_uses_simple_report_over_birth_noise() -> None:
-    """Simple report readiness should stop instead of soft-extending on birth noise."""
-
-    class _DummyFilter:
-        """Minimal filter with stale residual-birth evidence."""
-
-        last_birth_residual_gate_passed = True
-        last_birth_residual_support = 3
-        last_pseudo_source_fail_reasons: dict[str, int] = {
-            "needs_discriminative_views": 2,
-        }
-
-    class _DummyEstimator:
-        """Estimator with strong report BIC and non-converged runtime PF."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Populate report diagnostics without side effects."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a strong simple model-order diagnostic."""
-            return {
-                "Cs-137": {
-                    "selected_count": 1,
-                    "criterion_margin_to_simpler": 30.0,
-                    "condition_number": 1.0,
-                    "selected_max_response_correlation": 0.0,
-                }
-            }
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a non-converged global exploration state."""
-            return False
-
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(2, 1),
-        blocked_cells=(),
-    )
-    quiet_budget = {
-        "estimated_remaining_stations": 0,
-        "current_budget": 0.0,
-        "unresolved_factors": [],
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    reason = _adaptive_mission_stop_reason(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=[np.array([0.5, 0.5, 0.0], dtype=float)],
-        map_api=grid,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=0.5,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        require_quiet_birth_residual=True,
-        birth_residual_min_support=2,
-        remaining_measurement_estimate=quiet_budget,
-        require_remaining_measurement_ready=True,
-        allow_report_simple_stop=True,
-    )
-
-    assert reason == "report_simple_model_order"
-
-
-def test_adaptive_dss_program_length_shortens_only_when_budget_is_resolved() -> None:
-    """Adaptive shield programs should shorten only after report/budget readiness."""
-    cfg = DSSPPConfig(program_length=8)
-    quiet_budget = {
-        "estimated_remaining_stations": 0,
-        "current_budget": 0.0,
-        "unresolved_factors": [],
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    shortened, reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=True,
-        remaining_measurement_estimate=quiet_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-    )
-    residual, residual_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=True,
-        remaining_measurement_estimate={
-            **quiet_budget,
-            "components": {**quiet_budget["components"], "residual": 1.0},
-        },
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-    )
-
-    assert int(shortened.program_length) == 2
-    assert reason == "simple_report"
-    assert int(residual.program_length) == 16
-    assert residual_reason == "residual"
-
-    birth_noise, birth_noise_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=True,
-        report_simple_ready=True,
-        remaining_measurement_estimate=quiet_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-    )
-
-    assert int(birth_noise.program_length) == 2
-    assert birth_noise_reason == "simple_report"
-
-
-def test_sparse_cardinality_evidence_gap_unresolved_checks_nested_payload() -> None:
-    """Sparse cardinality gaps should mark only weak evidence as unresolved."""
-    unresolved = {
-        "Cs-137": {
-            "sparse_poisson_evidence": {
-                "available": True,
-                "model_order_ready": False,
-                "criterion_margin_to_runner_up": 2.0,
-            }
-        }
-    }
-    weak_gap = {
-        "Co-60": {
-            "available": True,
-            "model_order_ready": True,
-            "criterion_margin_to_runner_up": 4.0,
-            "criterion_margin_to_simpler": 12.0,
-        }
-    }
-    resolved = {
-        "Eu-154": {
-            "available": True,
-            "model_order_ready": True,
-            "criterion_margin_to_runner_up": 12.0,
-            "criterion_margin_to_simpler": 14.0,
-        }
-    }
-    missing_ready = {
-        "Cs-137": {
-            "available": True,
-            "criterion_margin_to_runner_up": 12.0,
-            "criterion_margin_to_simpler": 14.0,
-        }
-    }
-
-    assert sparse_cardinality_evidence_gap_unresolved(unresolved, gap_target=10.0)
-    assert sparse_cardinality_evidence_gap_unresolved(weak_gap, gap_target=10.0)
-    assert sparse_cardinality_evidence_gap_unresolved(missing_ready, gap_target=10.0)
-    assert not sparse_cardinality_evidence_gap_unresolved(resolved, gap_target=10.0)
-
-
-def test_report_model_order_ready_fallback_waits_for_diagnostics() -> None:
-    """Mission-stop fallback should not treat missing diagnostics as ready."""
-
-    class _MissingDiagnosticsEstimator:
-        """Estimator exposing no model-order diagnostics."""
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return no model-order diagnostics."""
-            return {}
-
-    class _ActiveMissingReadyEstimator:
-        """Estimator exposing active diagnostics with no ready flag."""
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return active diagnostics without an explicit readiness decision."""
-            return {"Cs-137": {"candidate_count": 3, "selected_count": 2}}
-
-    assert report_model_order_ready_for_stop(_MissingDiagnosticsEstimator()) is False
-    assert report_model_order_ready_for_stop(_ActiveMissingReadyEstimator()) is False
-
-
-def test_adaptive_dss_residual_extension_requires_cardinality_gap() -> None:
-    """Residual budgets alone should not trigger long programs under the new guard."""
-    cfg = DSSPPConfig(program_length=8)
-    residual_budget = {
-        "estimated_remaining_stations": 1,
-        "current_budget": 4.0,
-        "unresolved_factors": ["residual"],
-        "components": {
-            "residual": 1.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 0.0,
-        },
-    }
-
-    blocked, blocked_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=False,
-        remaining_measurement_estimate=residual_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-        residual_extension_requires_cardinality_evidence=True,
-        cardinality_evidence_unresolved=False,
-    )
-    extended, extended_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=False,
-        remaining_measurement_estimate=residual_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-        residual_extension_requires_cardinality_evidence=True,
-        cardinality_evidence_unresolved=True,
-    )
-
-    assert int(blocked.program_length) == 8
-    assert blocked_reason == "residual_without_cardinality_gap"
-    assert int(extended.program_length) == 16
-    assert extended_reason == "residual"
-
-
-def test_adaptive_dss_shortens_high_surface_budget_when_report_is_simple() -> None:
-    """High-surface ambiguity alone should not force full programs for simple reports."""
-    cfg = DSSPPConfig(program_length=8)
-    high_surface_budget = {
-        "estimated_remaining_stations": 1,
-        "current_budget": 4.0,
-        "unresolved_factors": ["high_surface_ambiguity"],
-        "components": {
-            "residual": 0.0,
-            "isotope_absence": 0.0,
-            "same_isotope_separation": 0.0,
-            "high_surface_ambiguity": 4.0,
-        },
-    }
-
-    blocked, blocked_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=True,
-        remaining_measurement_estimate=high_surface_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-        allow_high_surface_simple=False,
-    )
-    shortened, shortened_reason = _adapt_dss_program_length_for_budget(
-        cfg,
-        enabled=True,
-        simple_program_length=2,
-        residual_program_length=16,
-        residual_burst_active=False,
-        report_simple_ready=True,
-        remaining_measurement_estimate=high_surface_budget,
-        residual_budget_threshold=1.0e-9,
-        ambiguity_budget_threshold=1.0e-9,
-        allow_high_surface_simple=True,
-    )
-
-    assert int(blocked.program_length) == 8
-    assert blocked_reason == "ambiguity"
-    assert int(shortened.program_length) == 2
-    assert shortened_reason == "simple_report"
+    assert reason == "pf_cardinality_variance:Cs-137"
 
 
 def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
@@ -3052,10 +2131,6 @@ def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
             """Return a non-converged local rotation state."""
             return False
 
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this min-pose test."""
-            return True
-
     visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
 
     reason = _adaptive_mission_stop_reason(
@@ -3068,6 +2143,7 @@ def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
         coverage_fraction_threshold=1.0,
         ig_threshold=1e-3,
         planning_live_time_s=1.0,
+        require_pf_cardinality_ready=False,
     )
 
     assert reason is None
@@ -3082,6 +2158,7 @@ def test_adaptive_mission_pf_convergence_waits_for_min_poses() -> None:
         coverage_fraction_threshold=1.0,
         ig_threshold=1e-3,
         planning_live_time_s=1.0,
+        require_pf_cardinality_ready=False,
     )
 
     assert reason_after_min == "pf_converged_low_information_gain"
@@ -3117,10 +2194,6 @@ def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
             """Return a non-converged local rotation state."""
             return False
 
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this convergence-flag test."""
-            return True
-
     visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
     estimator = _DummyEstimator()
 
@@ -3154,496 +2227,6 @@ def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
     assert reason_after_min == "pf_filters_converged"
 
 
-def test_pf_convergence_rejects_report_cardinality_collapse() -> None:
-    """Mission convergence should reject a report that collapses PF cardinality."""
-
-    class _DummyConfig:
-        """Minimal convergence config for filter and estimator dummies."""
-
-        converge_enable = True
-        converge_cardinality_var_max = 0.05
-        report_model_order_require_posterior_match = True
-
-    class _DummyState:
-        """Minimal state with only an active source count."""
-
-        def __init__(self, num_sources: int) -> None:
-            """Store the active source count."""
-            self.num_sources = int(num_sources)
-
-    class _DummyParticle:
-        """Minimal particle wrapping a source-count state."""
-
-        def __init__(self, num_sources: int) -> None:
-            """Store the particle state."""
-            self.state = _DummyState(num_sources)
-
-    class _DummyFilter:
-        """Minimal converged filter whose posterior supports three sources."""
-
-        config = _DummyConfig()
-        is_converged = True
-        continuous_particles = [_DummyParticle(3), _DummyParticle(3)]
-        continuous_weights = np.array([0.5, 0.5], dtype=float)
-
-        def state_without_quarantined_sources(self, state: _DummyState) -> _DummyState:
-            """Return the state unchanged for this dummy."""
-            return state
-
-    class _DummyEstimator:
-        """Estimator with report model-order diagnostics collapsed to one source."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a collapsed one-source report."""
-            return {
-                "Cs-137": (
-                    np.zeros((1, 3), dtype=float),
-                    np.ones(1, dtype=float),
-                )
-            }
-
-        def report_model_order_ready(self) -> bool:
-            """Return ready to exercise the posterior-cardinality guard."""
-            return True
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return diagnostics indicating one selected source from three candidates."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 1,
-                    "model_order_ready": True,
-                }
-            }
-
-    assert _all_pf_filters_converged(_DummyEstimator()) is False  # type: ignore[arg-type]
-
-
-def test_pf_convergence_accepts_matching_report_cardinality() -> None:
-    """Mission convergence can stop when PF and report cardinality agree."""
-
-    class _DummyConfig:
-        """Minimal convergence config for filter and estimator dummies."""
-
-        converge_enable = True
-        converge_cardinality_var_max = 0.05
-        report_model_order_require_posterior_match = True
-
-    class _DummyState:
-        """Minimal state with only an active source count."""
-
-        num_sources = 2
-
-    class _DummyParticle:
-        """Minimal particle wrapping a source-count state."""
-
-        state = _DummyState()
-
-    class _DummyFilter:
-        """Minimal converged filter whose posterior supports two sources."""
-
-        config = _DummyConfig()
-        is_converged = True
-        continuous_particles = [_DummyParticle(), _DummyParticle()]
-        continuous_weights = np.array([0.5, 0.5], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator with report model-order diagnostics matching two sources."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a two-source report."""
-            return {
-                "Cs-137": (
-                    np.zeros((2, 3), dtype=float),
-                    np.ones(2, dtype=float),
-                )
-            }
-
-        def report_model_order_ready(self) -> bool:
-            """Return ready for this dummy."""
-            return True
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return diagnostics indicating two selected sources."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 2,
-                    "model_order_ready": True,
-                }
-            }
-
-    assert _all_pf_filters_converged(_DummyEstimator()) is True  # type: ignore[arg-type]
-
-
-def test_pf_convergence_rejects_report_count_above_posterior_cardinality() -> None:
-    """Mission convergence should reject report clusters unsupported by PF K-mass."""
-
-    class _DummyConfig:
-        """Minimal convergence config for filter and estimator dummies."""
-
-        converge_enable = True
-        converge_cardinality_var_max = 0.05
-        report_model_order_require_posterior_match = True
-
-    class _DummyState:
-        """Minimal state with only an active source count."""
-
-        num_sources = 1
-
-    class _DummyParticle:
-        """Minimal particle wrapping a source-count state."""
-
-        state = _DummyState()
-
-    class _DummyFilter:
-        """Minimal converged filter whose posterior supports one source."""
-
-        config = _DummyConfig()
-        is_converged = True
-        continuous_particles = [_DummyParticle(), _DummyParticle()]
-        continuous_weights = np.array([0.5, 0.5], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator whose report overstates posterior source cardinality."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a three-source report."""
-            return {
-                "Cs-137": (
-                    np.zeros((3, 3), dtype=float),
-                    np.ones(3, dtype=float),
-                )
-            }
-
-        def report_model_order_ready(self) -> bool:
-            """Return ready to exercise the posterior-cardinality guard."""
-            return True
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return diagnostics indicating three selected sources."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 3,
-                    "model_order_ready": True,
-                }
-            }
-
-    assert _all_pf_filters_converged(_DummyEstimator()) is False  # type: ignore[arg-type]
-
-
-def test_pf_convergence_can_trust_report_model_order_without_posterior_match() -> None:
-    """Mission convergence can use stable BIC report order as the cardinality source."""
-
-    class _DummyConfig:
-        """Minimal config that disables the report/PF cardinality equality guard."""
-
-        converge_enable = True
-        converge_cardinality_var_max = 0.05
-        report_model_order_require_posterior_match = False
-
-    class _DummyState:
-        """Minimal state with only an active source count."""
-
-        num_sources = 3
-
-    class _DummyParticle:
-        """Minimal particle wrapping a three-source state."""
-
-        state = _DummyState()
-
-    class _DummyFilter:
-        """Minimal converged filter whose posterior supports three sources."""
-
-        config = _DummyConfig()
-        is_converged = True
-        continuous_particles = [_DummyParticle()]
-        continuous_weights = np.array([1.0], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator whose BIC report selects fewer sources than PF K-mass."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return the BIC-selected two-source report."""
-            return {
-                "Cs-137": (
-                    np.zeros((2, 3), dtype=float),
-                    np.ones(2, dtype=float),
-                )
-            }
-
-        def report_model_order_ready(self) -> bool:
-            """Return a stable report-level model order."""
-            return True
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return diagnostics indicating a BIC-selected two-source report."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 2,
-                    "model_order_ready": True,
-                }
-            }
-
-    assert _all_pf_filters_converged(_DummyEstimator()) is True  # type: ignore[arg-type]
-
-
-def test_source_cardinality_dwell_rejects_unstable_posterior_when_report_collapses() -> (
-    None
-):
-    """Adaptive dwell should not stop when report clusters miss multisource K-mass."""
-
-    class _DummyConfig:
-        """Minimal PF config for dwell status checks."""
-
-        converge_cardinality_var_max = 0.05
-        birth_enable = True
-        max_sources = 3
-
-    class _StateOne:
-        """Single-source dummy state."""
-
-        num_sources = 1
-
-    class _StateThree:
-        """Three-source dummy state."""
-
-        num_sources = 3
-
-    class _ParticleOne:
-        """Particle wrapper for a single-source state."""
-
-        state = _StateOne()
-
-    class _ParticleThree:
-        """Particle wrapper for a three-source state."""
-
-        state = _StateThree()
-
-    class _DummyFilter:
-        """Filter whose posterior is still split across source counts."""
-
-        config = _DummyConfig()
-        continuous_particles = [_ParticleOne(), _ParticleThree()]
-        continuous_weights = np.array([0.5, 0.5], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator with a collapsed one-source report."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a collapsed one-source estimate."""
-            return {
-                "Cs-137": (
-                    np.zeros((1, 3), dtype=float),
-                    np.ones(1, dtype=float),
-                )
-            }
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a one-source report despite multisource posterior mass."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 1,
-                    "selected_count": 1,
-                    "model_order_ready": True,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=0.0,
-    )
-
-    assert ready is False
-    assert "posterior_cardinality_var" in reason
-
-
-def test_source_cardinality_dwell_allows_uncapped_max_sources() -> None:
-    """Adaptive dwell should treat max_sources=None as an uncapped PF."""
-
-    class _DummyConfig:
-        """Minimal uncapped PF config for dwell status checks."""
-
-        converge_cardinality_var_max = 0.05
-        birth_enable = True
-        max_sources = None
-
-    class _State:
-        """Two-source dummy state."""
-
-        num_sources = 2
-
-    class _Particle:
-        """Particle wrapper for a two-source state."""
-
-        state = _State()
-
-    class _DummyFilter:
-        """Filter whose posterior cardinality is stable."""
-
-        config = _DummyConfig()
-        continuous_particles = [_Particle()]
-        continuous_weights = np.array([1.0], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator with no report-visible source and uncapped birth enabled."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return an empty estimate to initialize report diagnostics."""
-            return {}
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a no-source report below the dwell candidate threshold."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 0,
-                    "selected_count": 0,
-                    "model_order_ready": True,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=0.0,
-    )
-
-    assert ready is True
-    assert reason == "model_order_ready"
-
-
-def test_source_cardinality_dwell_can_use_report_order_without_posterior_match() -> (
-    None
-):
-    """Adaptive dwell can ignore stable PF/report K mismatch when configured."""
-
-    class _DummyConfig:
-        """Minimal PF config with report-order cardinality as the stop source."""
-
-        converge_cardinality_var_max = 0.05
-        birth_enable = True
-        max_sources = None
-        report_model_order_require_posterior_match = False
-
-    class _State:
-        """Three-source dummy state."""
-
-        num_sources = 3
-
-    class _Particle:
-        """Particle wrapper for a three-source state."""
-
-        state = _State()
-
-    class _DummyFilter:
-        """Filter whose posterior cardinality disagrees with the report."""
-
-        config = _DummyConfig()
-        continuous_particles = [_Particle()]
-        continuous_weights = np.array([1.0], dtype=float)
-
-    class _DummyEstimator:
-        """Estimator with stable two-source report diagnostics."""
-
-        pf_config = _DummyConfig()
-        filters = {"Cs-137": _DummyFilter()}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Return a two-source report."""
-            return {
-                "Cs-137": (
-                    np.zeros((2, 3), dtype=float),
-                    np.ones(2, dtype=float),
-                )
-            }
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return a stable two-source model-order report."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 3,
-                    "selected_count": 2,
-                    "model_order_ready": True,
-                    "condition_number": 1.0,
-                    "criterion_margin_to_simpler": 10.0,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-    )
-
-    assert ready is True
-    assert reason == "model_order_ready"
-
-
-def test_source_cardinality_dwell_can_skip_estimate_refresh() -> None:
-    """Runtime dwell checks should be able to use cached model-order diagnostics."""
-
-    class _DummyConfig:
-        """Minimal PF config for cached report diagnostics."""
-
-        converge_cardinality_var_max = 0.05
-        report_model_order_require_posterior_match = False
-
-    class _DummyEstimator:
-        """Estimator whose heavy report refresh must not be called."""
-
-        pf_config = _DummyConfig()
-        filters: dict[str, object] = {}
-
-        def estimates(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-            """Fail if a cached-only dwell check refreshes final estimates."""
-            raise AssertionError("estimates refresh should be skipped")
-
-        def report_model_order_diagnostics(self) -> dict[str, dict[str, object]]:
-            """Return cached no-source report diagnostics."""
-            return {
-                "Cs-137": {
-                    "candidate_count": 0,
-                    "selected_count": 0,
-                    "model_order_ready": True,
-                }
-            }
-
-    ready, reason = _source_cardinality_dwell_status(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        min_candidate_count=2,
-        max_condition_number=100.0,
-        min_bic_margin=2.0,
-        refresh_estimates=False,
-    )
-
-    assert ready is True
-    assert reason == "model_order_ready"
-
-
 def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> None:
     """Coverage can stop a mission once residual birth evidence is quiet."""
 
@@ -3665,10 +2248,6 @@ def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> 
         def should_stop_shield_rotation(self, **kwargs: object) -> bool:
             """Return a non-converged local rotation state."""
             return False
-
-        def report_model_order_ready(self) -> bool:
-            """Return settled model-order status for this coverage-stop test."""
-            return True
 
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -3826,8 +2405,8 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     def _fake_estimates(
         self: RotatingShieldPFEstimator,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Return a non-empty estimate for each isotope."""
-        positions = np.array([[0.5, 0.5, 0.5]], dtype=float)
+        """Return a non-empty surface estimate for each isotope."""
+        positions = np.array([[0.5, 0.5, 0.0]], dtype=float)
         strengths = np.array([1.0], dtype=float)
         return {iso: (positions.copy(), strengths.copy()) for iso in ANALYSIS_ISOTOPES}
 
@@ -3961,7 +2540,6 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         measurement_log_output=str(tmp_path / "measurement-log"),
     )
     assert estimator is not None
-    assert estimator.pf_config.birth_window == 0
     assert (
         estimator.pf_config.observation_count_variance_includes_counting_noise is True
     )
@@ -4000,17 +2578,11 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         metrics["online_wall_clock_s"]
     )
     assert metrics["end_to_end_wall_clock_s"] >= metrics["online_wall_clock_s"]
-    assert metrics["final_point_reporting_pipeline_time_s"] >= 0.0
-    assert metrics["final_point_estimate_time_s"] >= 0.0
-    assert metrics["final_point_estimate_time_s"] == pytest.approx(
-        metrics["final_point_reporting_pipeline_time_s"]
-    )
-    assert metrics["final_mle_time_s"] >= metrics["final_point_estimate_time_s"]
+    assert metrics["final_posterior_projection_time_s"] >= 0.0
     assert metrics["gpu_memory"]["available"] is False
     evaluation = estimator.final_run_summary["evaluation_metrics"]
     assert "p95" in evaluation["accuracy"]["position_error"]
     assert "by_shield_pair" in evaluation["count_bias"]
-    assert "spectrum_bin_heldout_deviance" in evaluation["model_identifiability"]
     assert "consecutive_matched_cluster_shift_m" in evaluation["cluster_stability"]
     assert evaluation["operational"]["station_count"] == 2
     assert evaluation["operational"]["station_visit_count"] == 2
@@ -4019,6 +2591,7 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
         <= evaluation["operational"]["end_to_end_wall_clock_s"]
     )
     json.dumps(estimator.final_run_summary, allow_nan=False)
+    assert estimator.configured_isotope_order() == tuple(ANALYSIS_ISOTOPES)
     assert estimator.isotopes == list(ANALYSIS_ISOTOPES)
     for rec in estimator.measurements:
         assert set(rec.z_k) == set(ANALYSIS_ISOTOPES)
@@ -4032,276 +2605,6 @@ def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(
     positions, strengths = estimates.get("Cs-137", (np.zeros((0, 3)), np.zeros(0)))
     assert positions.size > 0
     assert strengths.size > 0
-
-
-def test_final_absent_filter_removes_unsupported_isotope() -> None:
-    """Final reporting should drop isotopes without count and PF support."""
-    measurements = [
-        MeasurementRecord(
-            z_k={"Cs-137": 120.0, "Co-60": 3.0},
-            pose_idx=0,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={"Cs-137": 120.0, "Co-60": 9.0},
-        ),
-        MeasurementRecord(
-            z_k={"Cs-137": 130.0, "Co-60": 2.0},
-            pose_idx=0,
-            orient_idx=1,
-            live_time_s=1.0,
-            fe_index=1,
-            pb_index=0,
-            z_variance_k={"Cs-137": 130.0, "Co-60": 9.0},
-        ),
-    ]
-    estimates = {
-        "Cs-137": (
-            np.array([[1.0, 2.0, 3.0]], dtype=float),
-            np.array([1000.0], dtype=float),
-        ),
-        "Co-60": (
-            np.array([[4.0, 5.0, 6.0]], dtype=float),
-            np.array([1000.0], dtype=float),
-        ),
-        "Eu-154": (
-            np.zeros((0, 3), dtype=float),
-            np.zeros(0, dtype=float),
-        ),
-    }
-
-    filtered, diagnostics = _filter_absent_final_estimates(
-        estimates,
-        measurements,
-        enabled=True,
-        count_threshold_abs=30.0,
-        min_support_measurements=2,
-        min_total_counts=60.0,
-        snr_threshold=3.0,
-        min_strength=500.0,
-    )
-
-    assert set(filtered) == {"Cs-137"}
-    assert diagnostics["Cs-137"]["kept"] is True
-    assert diagnostics["Co-60"]["reason"] == "insufficient_spectral_support"
-    assert diagnostics["Eu-154"]["reason"] == "no_final_pf_support"
-
-
-class _TinyCoverageMap:
-    """Small traversable map for online absent-isotope pruning tests."""
-
-    grid_shape = (4, 1)
-    cell_size = 1.0
-    origin = (0.0, 0.0)
-    traversable_cells = [(0, 0), (1, 0), (2, 0), (3, 0)]
-
-    @staticmethod
-    def cell_center(cell):
-        """Return the center of one map cell."""
-        return np.array([float(cell[0]) + 0.5, float(cell[1]) + 0.5])
-
-
-class _DummyOnlineAbsentEstimator:
-    """Minimal estimator stub for online absent-isotope pruning."""
-
-    def __init__(self) -> None:
-        """Create a two-isotope estimator with only Cs count support."""
-        self.isotopes = ["Cs-137", "Co-60"]
-        self.measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 120.0, "Co-60": 0.5},
-                pose_idx=i,
-                orient_idx=0,
-                live_time_s=1.0,
-                fe_index=0,
-                pb_index=0,
-                z_variance_k={"Cs-137": 120.0, "Co-60": 1.0},
-            )
-            for i in range(8)
-        ]
-        self.restricted: list[list[str]] = []
-
-    def restrict_isotopes(
-        self,
-        active_isotopes,
-        *,
-        allow_empty: bool = False,
-    ) -> None:
-        """Record and apply isotope restrictions."""
-        _ = allow_empty
-        self.restricted.append(list(active_isotopes))
-        self.isotopes = list(active_isotopes)
-
-
-def test_online_absent_pruning_waits_for_environment_coverage() -> None:
-    """Online pruning should not drop unsupported isotopes before coverage."""
-    estimator = _DummyOnlineAbsentEstimator()
-    removed = _prune_online_absent_isotopes(
-        estimator,
-        enabled=True,
-        detected_isotopes={"Cs-137"},
-        pruned_isotopes=set(),
-        visited_poses_xyz=[np.array([0.5, 0.5, 0.5])],
-        map_api=_TinyCoverageMap(),
-        min_poses=4,
-        coverage_radius_m=0.6,
-        coverage_fraction_threshold=0.75,
-        min_measurements=8,
-        count_threshold_abs=50.0,
-        min_support_measurements=2,
-        min_total_counts=100.0,
-        snr_threshold=3.0,
-        label="low_coverage",
-    )
-
-    assert removed == set()
-    assert estimator.isotopes == ["Cs-137", "Co-60"]
-    assert estimator.restricted == []
-
-
-def test_online_absent_pruning_support_guard_does_not_protect_all_active() -> None:
-    """Absent pruning should not treat every active isotope as newly supported."""
-    protected = _online_absent_pruning_supported_isotopes(
-        raw_detected={"Cs-137"},
-        last_candidates=set(),
-    )
-
-    assert protected == {"Cs-137"}
-    assert "Co-60" not in protected
-
-
-def test_online_absent_pruning_drops_only_after_covered_and_unsupported() -> None:
-    """Online pruning should remove absent isotopes after support and coverage gates."""
-    estimator = _DummyOnlineAbsentEstimator()
-    pruned: set[str] = set()
-    visited = [
-        np.array([0.5, 0.5, 0.5]),
-        np.array([1.5, 0.5, 0.5]),
-        np.array([2.5, 0.5, 0.5]),
-        np.array([3.5, 0.5, 0.5]),
-    ]
-
-    removed = _prune_online_absent_isotopes(
-        estimator,
-        enabled=True,
-        detected_isotopes={"Cs-137"},
-        pruned_isotopes=pruned,
-        visited_poses_xyz=visited,
-        map_api=_TinyCoverageMap(),
-        min_poses=4,
-        coverage_radius_m=0.6,
-        coverage_fraction_threshold=0.75,
-        min_measurements=8,
-        count_threshold_abs=50.0,
-        min_support_measurements=2,
-        min_total_counts=100.0,
-        snr_threshold=3.0,
-        label="covered",
-    )
-
-    assert removed == {"Co-60"}
-    assert pruned == {"Co-60"}
-    assert estimator.isotopes == ["Cs-137"]
-    assert estimator.restricted == [["Cs-137"]]
-
-
-def test_online_absent_pruning_drops_low_snr_cumulative_crosstalk() -> None:
-    """Cumulative low-SNR isotope leakage should not protect an absent filter."""
-
-    class _DummyLowSnrEstimator:
-        """Estimator with many low-SNR Eu leakage measurements."""
-
-        def __init__(self) -> None:
-            """Create many measurements whose Eu total count exceeds the count floor."""
-            self.isotopes = ["Cs-137", "Eu-154"]
-            self.measurements = [
-                MeasurementRecord(
-                    z_k={"Cs-137": 120.0, "Eu-154": 1.2},
-                    pose_idx=i,
-                    orient_idx=0,
-                    live_time_s=1.0,
-                    fe_index=0,
-                    pb_index=0,
-                    z_variance_k={"Cs-137": 120.0, "Eu-154": 1.0e6},
-                )
-                for i in range(120)
-            ]
-            self.restricted: list[list[str]] = []
-
-        def restrict_isotopes(
-            self,
-            active_isotopes,
-            *,
-            allow_empty: bool = False,
-        ) -> None:
-            """Record and apply isotope restrictions."""
-            _ = allow_empty
-            self.restricted.append(list(active_isotopes))
-            self.isotopes = list(active_isotopes)
-
-    estimator = _DummyLowSnrEstimator()
-    visited = [
-        np.array([0.5, 0.5, 0.5]),
-        np.array([1.5, 0.5, 0.5]),
-        np.array([2.5, 0.5, 0.5]),
-        np.array([3.5, 0.5, 0.5]),
-    ]
-
-    removed = _prune_online_absent_isotopes(
-        estimator,  # type: ignore[arg-type]
-        enabled=True,
-        detected_isotopes={"Cs-137"},
-        pruned_isotopes=set(),
-        visited_poses_xyz=visited,
-        map_api=_TinyCoverageMap(),
-        min_poses=4,
-        coverage_radius_m=0.6,
-        coverage_fraction_threshold=0.75,
-        min_measurements=8,
-        count_threshold_abs=50.0,
-        min_support_measurements=2,
-        min_total_counts=100.0,
-        snr_threshold=3.0,
-        label="low_snr_crosstalk",
-    )
-
-    assert removed == {"Eu-154"}
-    assert estimator.isotopes == ["Cs-137"]
-    assert estimator.restricted == [["Cs-137"]]
-
-
-def test_online_absent_pruning_keeps_newly_detected_isotope() -> None:
-    """Online pruning should protect isotopes with current spectral support."""
-    estimator = _DummyOnlineAbsentEstimator()
-    visited = [
-        np.array([0.5, 0.5, 0.5]),
-        np.array([1.5, 0.5, 0.5]),
-        np.array([2.5, 0.5, 0.5]),
-        np.array([3.5, 0.5, 0.5]),
-    ]
-
-    removed = _prune_online_absent_isotopes(
-        estimator,
-        enabled=True,
-        detected_isotopes={"Cs-137", "Co-60"},
-        pruned_isotopes=set(),
-        visited_poses_xyz=visited,
-        map_api=_TinyCoverageMap(),
-        min_poses=4,
-        coverage_radius_m=0.6,
-        coverage_fraction_threshold=0.75,
-        min_measurements=8,
-        count_threshold_abs=50.0,
-        min_support_measurements=2,
-        min_total_counts=100.0,
-        snr_threshold=3.0,
-        label="detected_guard",
-    )
-
-    assert removed == set()
-    assert estimator.isotopes == ["Cs-137", "Co-60"]
-    assert estimator.restricted == []
 
 
 def test_baseline_shield_program_preserves_adapted_dss_length() -> None:
@@ -4473,58 +2776,6 @@ def test_incident_gamma_runtime_uses_detector_response_folding() -> None:
     assert config.response_backscatter_fraction == pytest.approx(0.03)
     assert config.response_efficiency_model == "unit"
     assert config.apply_incident_gamma_detector_response is True
-
-
-def test_prune_missing_isotope_does_not_zero_fill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Missing isotope keys should not be treated as zero-count measurements."""
-    isotopes = ["Cs-137", "Co-60"]
-    pf_conf = RotatingShieldPFConfig(
-        num_particles=4, min_particles=4, max_particles=4, use_gpu=False
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=np.zeros((1, 3), dtype=float),
-        shield_normals=None,
-        mu_by_isotope=None,
-        pf_config=pf_conf,
-    )
-    estimator.poses = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])]
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={"Cs-137": 10.0},
-            pose_idx=0,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-        ),
-        MeasurementRecord(
-            z_k={"Cs-137": 12.0, "Co-60": 5.0},
-            pose_idx=1,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-        ),
-    ]
-
-    def _fake_estimates() -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Return a deterministic estimate for the pruning regression."""
-        positions = np.array([[0.5, 0.5, 0.5]], dtype=float)
-        strengths = np.array([100.0], dtype=float)
-        return {iso: (positions.copy(), strengths.copy()) for iso in isotopes}
-
-    monkeypatch.setattr(estimator, "estimates", _fake_estimates)
-    keep_masks = prune_spurious_sources_continuous(
-        estimator,
-        method="deltaLL",
-        params={"deltaLL_min": 1e9},
-        min_support=2,
-    )
-    assert keep_masks["Co-60"].size == 1
-    assert keep_masks["Co-60"].all()
 
 
 def test_adaptive_dwell_chunks_stop_at_ready_counts(
@@ -5805,350 +4056,11 @@ def test_room_wide_continuous_workspace_accepts_high_free_measurement_pose() -> 
     assert workspace.is_free((4.321, 11.234, 9.7))
 
 
-def test_surface_map_runtime_configuration_is_explicit_and_validated() -> None:
-    """Surface-map spacing and L1/TV weights should map to the public solver."""
-    runtime_config = {
-        "surface_map_spacing_m": [0.5, 1.0, 2.0],
-        "surface_map_l1_weight": 0.25,
-        "surface_map_tv_weight": 0.5,
-        "surface_map_nuisance_l1_weight": 0.1,
-        "surface_map_nuisance_l2_weight": 0.2,
-        "surface_map_max_iterations": 75,
-        "surface_map_max_spectrum_bins": 12,
-    }
-
-    spacing = realtime_demo_module._surface_map_spacing_from_runtime_config(
-        runtime_config
-    )
-    config = realtime_demo_module._surface_map_config_from_runtime_config(
-        runtime_config
-    )
-
-    assert spacing == pytest.approx((0.5, 1.0, 2.0))
-    assert config.l1_weight == pytest.approx(0.25)
-    assert config.tv_weight == pytest.approx(0.5)
-    assert config.nuisance_l1_weight == pytest.approx(0.1)
-    assert config.nuisance_l2_weight == pytest.approx(0.2)
-    assert config.max_iterations == 75
-    assert config.max_spectrum_bins == 12
-    with pytest.raises(ValueError, match="surface_map_spacing_m"):
-        realtime_demo_module._surface_map_spacing_from_runtime_config(
-            {"surface_map_spacing_m": [1.0, 0.0, 1.0]}
-        )
-
-
-def test_final_surface_map_is_opt_in() -> None:
-    """The memory-intensive full spectral map should remain an explicit action."""
-    payload = realtime_demo_module._fit_final_surface_map(
-        object(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
-        None,
-        {},
-        obstacle_height_m=1.0,
-    )
-
-    assert payload == {
-        "enabled": False,
-        "available": False,
-        "reason": "disabled",
-        "fit_time_s": None,
-        "solver_time_s": None,
-        "attempt_time_s": 0.0,
-    }
-
-
-def test_final_surface_map_checks_response_memory_before_fitting() -> None:
-    """The spectral response tensor should not be allocated beyond its cap."""
-
-    class _GuardedEstimator:
-        """Expose enough history to trigger the pre-allocation memory guard."""
-
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=tuple(np.ones(10, dtype=float)),
-            )
-        ]
-
-        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
-            """Fail if the guarded solver is called after exceeding the cap."""
-            raise AssertionError("surface-map solver should not be called")
-
-    payload = realtime_demo_module._fit_final_surface_map(
-        _GuardedEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 2.0,
-            "surface_map_max_response_elements": 1,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["available"] is False
-    assert payload["reason"] == "response_memory_budget_exceeded"
-    assert payload["fit_time_s"] is None
-    assert payload["solver_time_s"] is None
-    assert payload["attempt_time_s"] >= 0.0
-    assert payload["estimated_response_elements"] > 1
-    assert payload["estimated_peak_response_elements"] == (
-        payload["estimated_response_elements"]
-        * payload["response_peak_array_multiplier"]
-    )
-
-
-def test_final_surface_map_memory_guard_counts_pruned_configured_isotopes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The response guard should count all configured, not only active, isotopes."""
-
-    class _PrunedEstimator:
-        """Expose one active filter from a three-isotope configured analysis."""
-
-        all_isotopes = ["Cs-137", "Co-60", "Eu-154"]
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=(1.0,),
-            )
-        ]
-
-        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
-            """Fail if the all-isotope memory guard underestimates the tensor."""
-            raise AssertionError("surface-map solver should not be called")
-
-    def _fixed_patch_count(*_args: object, **_kwargs: object) -> int:
-        """Return a small deterministic preflight patch count."""
-        return 2
-
-    monkeypatch.setattr(
-        realtime_demo_module,
-        "estimate_surface_patch_count_upper_bound",
-        _fixed_patch_count,
-    )
-
-    payload = realtime_demo_module._fit_final_surface_map(
-        _PrunedEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 2.0,
-            "surface_map_max_response_elements": 10,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["reason"] == "response_memory_budget_exceeded"
-    assert payload["isotope_count_for_memory_guard"] == 3
-    assert payload["estimated_response_elements"] == 6
-    assert payload["estimated_peak_response_elements"] == 24
-
-
-def test_final_surface_map_memory_guard_uses_configured_spectrum_bin_cap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Preflight response sizing should match the surface solver's bin cap."""
-
-    class _CappedEstimator:
-        """Expose one ten-bin spectrum for a capped preflight estimate."""
-
-        all_isotopes = ["Cs-137"]
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=tuple(np.ones(10, dtype=float)),
-            )
-        ]
-
-        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
-            """Fail if the capped response guard does not stop the solver."""
-            raise AssertionError("surface-map solver should not be called")
-
-    def _fixed_patch_count(*_args: object, **_kwargs: object) -> int:
-        """Return a deterministic preflight patch count."""
-        return 2
-
-    monkeypatch.setattr(
-        realtime_demo_module,
-        "estimate_surface_patch_count_upper_bound",
-        _fixed_patch_count,
-    )
-
-    payload = realtime_demo_module._fit_final_surface_map(
-        _CappedEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 2.0,
-            "surface_map_max_spectrum_bins": 2,
-            "surface_map_max_response_elements": 1,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["reason"] == "response_memory_budget_exceeded"
-    assert payload["raw_maximum_spectrum_bin_count"] == 10
-    assert payload["maximum_spectrum_bin_count_for_memory_guard"] == 2
-    assert payload["estimated_response_elements"] == 4
-
-
-def test_final_surface_map_checks_patch_count_before_construction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An excessively fine surface grid should be rejected before allocation."""
-
-    class _GuardedEstimator:
-        """Expose spectral history for the pre-construction patch guard."""
-
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=(1.0,),
-            )
-        ]
-
-    def _fail_patch_build(*_args: object, **_kwargs: object) -> object:
-        """Fail if patch-array construction is reached after the count guard."""
-        raise AssertionError("surface patches should not be constructed")
-
-    monkeypatch.setattr(
-        realtime_demo_module,
-        "build_surface_patch_dictionary",
-        _fail_patch_build,
-    )
-    payload = realtime_demo_module._fit_final_surface_map(
-        _GuardedEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 0.1,
-            "surface_map_max_patch_count": 10,
-            "surface_map_max_response_elements": 1_000_000,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["available"] is False
-    assert payload["reason"] == "patch_memory_budget_exceeded"
-    assert payload["fit_time_s"] is None
-    assert payload["solver_time_s"] is None
-    assert payload["attempt_time_s"] >= 0.0
-    assert payload["estimated_patch_count_upper_bound"] > 10
-
-
-def test_final_surface_map_reports_memory_error_as_json_safe_unavailable() -> None:
-    """Late allocation failures should become serializable unavailable payloads."""
-
-    class _MemoryErrorEstimator:
-        """Raise the allocation error that can occur inside response construction."""
-
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=(1.0, 2.0),
-            )
-        ]
-
-        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
-            """Simulate a NumPy allocation failure after passing both guards."""
-            del args, kwargs
-            raise MemoryError
-
-    payload = realtime_demo_module._fit_final_surface_map(
-        _MemoryErrorEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=1.0, size_y=1.0, size_z=1.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 1.0,
-            "surface_map_max_patch_count": 100,
-            "surface_map_max_response_elements": 1_000,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["enabled"] is True
-    assert payload["available"] is False
-    assert payload["reason"] == "surface_map_memory_error"
-    assert payload["error"] == "memory_allocation_failed"
-    assert payload["fit_time_s"] is None
-    assert payload["solver_time_s"] is not None
-    assert payload["attempt_time_s"] >= payload["solver_time_s"]
-    assert json.loads(json.dumps(payload)) == payload
-
-
-def test_final_surface_map_reports_successful_fit_time() -> None:
-    """A completed all-history fit should expose finite wall-clock duration."""
-
-    class _TimedEstimator:
-        """Return a minimal successful surface-map payload."""
-
-        isotopes = ["Cs-137"]
-        measurements = [
-            MeasurementRecord(
-                z_k={"Cs-137": 1.0},
-                pose_idx=0,
-                orient_idx=0,
-                live_time_s=1.0,
-                spectrum_counts=(1.0,),
-            )
-        ]
-
-        def fit_surface_map(self, *args: object, **kwargs: object) -> object:
-            """Return the successful result timed by the runtime wrapper."""
-            del args, kwargs
-            return {"available": True, "reason": "ok"}
-
-    payload = realtime_demo_module._fit_final_surface_map(
-        _TimedEstimator(),  # type: ignore[arg-type]
-        EnvironmentConfig(size_x=1.0, size_y=1.0, size_z=1.0),
-        None,
-        {
-            "surface_map_reconstruction_enable": True,
-            "surface_map_spacing_m": 1.0,
-            "surface_map_max_patch_count": 100,
-            "surface_map_max_response_elements": 1_000,
-        },
-        obstacle_height_m=1.0,
-    )
-
-    assert payload["available"] is True
-    assert np.isfinite(payload["fit_time_s"])
-    assert payload["fit_time_s"] >= 0.0
-    assert payload["solver_time_s"] == pytest.approx(payload["fit_time_s"])
-    assert payload["attempt_time_s"] >= payload["solver_time_s"]
-
-
 def test_count_error_model_reports_three_distinct_layers() -> None:
     """Final diagnostics should not collapse bias and model mismatch into variance."""
     config = RotatingShieldPFConfig(
         measurement_scale_by_isotope={"Cs-137": 1.01},
         measurement_scale_by_isotope_and_pair={"Cs-137": {3: 0.99}},
-        sparse_poisson_spectral_nuisance_enable=True,
     )
 
     diagnostics = realtime_demo_module._count_error_model_diagnostics(

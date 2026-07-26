@@ -235,7 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--directive-schedule", required=True, type=Path)
     parser.add_argument(
         "--profile",
-        choices=("pf_strict", "pf_profiled"),
+        choices=("pf_strict",),
         default="pf_strict",
     )
     parser.add_argument("--seed", type=int, default=0)

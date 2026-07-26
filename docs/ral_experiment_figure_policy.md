@@ -85,5 +85,5 @@ same-isotope spatial ambiguity in one scene.
 
 The main result figure should include final PF particle support when the run
 summary contains it. The particle cloud must be visually secondary to truth and
-final report markers, but it is important evidence that the final report is
-supported by the posterior rather than being a disconnected rescue-only marker.
+final report markers, but it is important evidence that the reported point
+estimate is supported by the posterior.

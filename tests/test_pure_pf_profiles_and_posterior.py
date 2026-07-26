@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,13 +12,15 @@ import pytest
 from mission_control import resolve_mission_max_poses, resolve_mission_max_steps
 from measurement.model import EnvironmentConfig
 from measurement.source_surfaces import source_surface_kind
-from pf.estimator import RotatingShieldPFConfig
+from pf.estimator import MeasurementRecord, RotatingShieldPFConfig
 from pf.particle_filter import IsotopeParticle
 from pf.posterior import posterior_point_estimate_from_states
 from pf.profiles import (
+    EstimatorProfile,
     ProposalOrigin,
     apply_profile_to_config,
     enforce_pure_runtime_settings,
+    removed_estimator_config_keys,
     resolve_estimator_profile,
     resolve_structural_transition_provenance,
 )
@@ -27,104 +30,152 @@ from planning.dss_pp import extract_signature_modes
 from sim.runtime import load_runtime_config
 
 
-@pytest.mark.parametrize("profile", ["pf_strict", "pf_profiled"])
-def test_profiles_override_hostile_batch_booleans(profile: str) -> None:
-    """Legacy booleans cannot grant any all-history capability."""
-    hostile = {
-        "estimator_profile": profile,
-        "sparse_poisson_evidence_enable": True,
-        "sparse_poisson_joint_evidence_enable": True,
-        "report_mle_rescue_enable": True,
-        "runtime_report_rescue_enable": True,
-        "all_history_dictionary_proposal_enable": True,
-        "surface_map_reconstruction_enable": True,
-        "report_cluster_model_selection": True,
-        "report_strength_refit": True,
-        "report_surface_local_refine": True,
-        "joint_observation_update": True,
-        "delayed_resample_update": False,
-        "dss_pp": {
-            "include_runtime_rescue_modes": True,
-            "include_global_surface_rescue_modes": True,
-        },
-    }
-    resolved = enforce_pure_runtime_settings(hostile)
-    for key in (
-        "sparse_poisson_evidence_enable",
-        "sparse_poisson_joint_evidence_enable",
-        "report_mle_rescue_enable",
-        "runtime_report_rescue_enable",
+@pytest.mark.parametrize("profile", [None, "pf_strict", "strict", "pure_pf", "pf_only"])
+def test_only_strict_profile_is_supported(profile: str | None) -> None:
+    """Every supported alias must resolve to the single strict PF profile."""
+    resolved_profile, capabilities = resolve_estimator_profile(profile)
+
+    assert resolved_profile is EstimatorProfile.PF_STRICT
+    assert capabilities.sequential_updates_only is True
+    assert capabilities.posterior_reporting_only is True
+    assert capabilities.likelihood_consistent_structural_evidence is True
+
+
+@pytest.mark.parametrize("profile", ["pf_profiled", "profiled", "mle", "batch"])
+def test_removed_profiles_fail_fast(profile: str) -> None:
+    """Removed estimator variants must be rejected instead of downgraded."""
+    with pytest.raises(ValueError, match="only 'pf_strict' is available"):
+        resolve_estimator_profile(profile)
+    with pytest.raises(ValueError, match="only 'pf_strict' is available"):
+        enforce_pure_runtime_settings({}, profile=profile)
+
+
+@pytest.mark.parametrize(
+    ("payload", "removed_key"),
+    [
+        ({"report_mle_rescue_enable": False}, "report_mle_rescue_enable"),
+        ({"sparse_poisson_evidence_enable": False}, "sparse_poisson_evidence_enable"),
+        (
+            {"surface_map_reconstruction_enable": False},
+            "surface_map_reconstruction_enable",
+        ),
+        ({"conditional_strength_refit": False}, "conditional_strength_refit"),
+        ({"adaptive_strength_prior": False}, "adaptive_strength_prior"),
+        (
+            {"birth_residual_force_proposal_on_gate": False},
+            "birth_residual_force_proposal_on_gate",
+        ),
+        (
+            {"birth_existing_response_corr_max": 0.99},
+            "birth_existing_response_corr_max",
+        ),
+        (
+            {"birth_response_condition_max": 100.0},
+            "birth_response_condition_max",
+        ),
+        ({"death_require_low_strength": False}, "death_require_low_strength"),
+        ({"high_strength_split_enable": False}, "high_strength_split_enable"),
+        (
+            {"report_exclude_unverified_sources": False},
+            "report_exclude_unverified_sources",
+        ),
+        (
+            {"pseudo_source_quarantine_excludes_runtime": False},
+            "pseudo_source_quarantine_excludes_runtime",
+        ),
+        ({"support_window": 0}, "support_window"),
+        ({"birth_residual_always_try": False}, "birth_residual_always_try"),
+        ({"split_residual_always_try": False}, "split_residual_always_try"),
+        (
+            {"mission_stop_require_model_order_ready": False},
+            "mission_stop_require_model_order_ready",
+        ),
+        (
+            {"online_absent_isotope_pruning": False},
+            "online_absent_isotope_pruning",
+        ),
+        (
+            {"adaptive_cardinality_min_bic_margin": 0.0},
+            "adaptive_cardinality_min_bic_margin",
+        ),
+        ({"refit_after_moves": False}, "refit_after_moves"),
+        (
+            {"dss_pp": {"include_runtime_rescue_modes": False}},
+            "dss_pp.include_runtime_rescue_modes",
+        ),
+        (
+            {"dss_pp": {"lambda_cardinality_discrimination": 0.0}},
+            "dss_pp.lambda_cardinality_discrimination",
+        ),
+        (
+            {"dss_lambda_cardinality_discrimination": 0.0},
+            "dss_lambda_cardinality_discrimination",
+        ),
+        (
+            {
+                "remaining_measurement_estimate": {
+                    "report_residual_weight": 0.0,
+                }
+            },
+            "remaining_measurement_estimate.report_residual_weight",
+        ),
+        (
+            {"remaining_measurement_report_residual_weight": 0.0},
+            "remaining_measurement_report_residual_weight",
+        ),
+    ],
+)
+def test_removed_estimator_keys_fail_fast(
+    payload: dict[str, object],
+    removed_key: str,
+) -> None:
+    """Even false-valued removed keys must fail instead of becoming no-op flags."""
+    assert removed_estimator_config_keys(payload) == (removed_key,)
+    with pytest.raises(ValueError, match=removed_key.replace(".", r"\.")):
+        enforce_pure_runtime_settings(payload)
+
+
+def test_pf_config_physically_omits_removed_estimator_fields() -> None:
+    """The PF dataclass must not retain MLE, surface-map, or refit switches."""
+    config_fields = {field.name for field in fields(RotatingShieldPFConfig)}
+    removed_fields = {
         "all_history_dictionary_proposal_enable",
-        "surface_map_reconstruction_enable",
-        "report_cluster_model_selection",
+        "birth_existing_response_corr_max",
+        "birth_response_condition_max",
+        "conditional_strength_refit",
+        "conditional_strength_profile_before_likelihood",
+        "report_mle_rescue_enable",
         "report_strength_refit",
-        "report_surface_local_refine",
+        "runtime_report_rescue_enable",
+        "sparse_poisson_evidence_enable",
+        "surface_map_reconstruction_enable",
+        "pseudo_source_quarantine_excludes_runtime",
+    }
+
+    assert config_fields.isdisjoint(removed_fields)
+
+
+def test_strict_profile_requires_environment_surface_source_support() -> None:
+    """The declared pure-PF capability must reject a volume source prior."""
+    assert RotatingShieldPFConfig().source_position_prior == "surface"
+    with pytest.raises(
+        ValueError,
+        match="source_position_prior='surface'",
     ):
-        assert resolved[key] is False
-    assert resolved["dss_pp"]["include_runtime_rescue_modes"] is False
-    assert resolved["dss_pp"]["include_global_surface_rescue_modes"] is False
-    # Station-level joint/block-sequential PF updates are not batch estimators.
-    assert resolved["joint_observation_update"] is True
-    assert resolved["delayed_resample_update"] is False
+        apply_profile_to_config(
+            RotatingShieldPFConfig(source_position_prior="volume")
+        )
+    with pytest.raises(ValueError, match="source_surface_prior=true"):
+        enforce_pure_runtime_settings({"source_surface_prior": False})
+    with pytest.raises(
+        ValueError,
+        match="source_position_prior='surface'",
+    ):
+        enforce_pure_runtime_settings({"source_position_prior": "volume"})
 
 
-def test_only_profiled_variant_can_enable_conditional_strength_profile() -> None:
-    """The two profiles differ by exactly the declared online strength capability."""
-    strict = RotatingShieldPFConfig(
-        estimator_profile="pf_strict",
-        conditional_strength_refit=True,
-        conditional_strength_profile_before_likelihood=True,
-        sparse_poisson_evidence_enable=True,
-        report_mle_rescue_enable=True,
-    )
-    profiled = RotatingShieldPFConfig(
-        estimator_profile="pf_profiled",
-        conditional_strength_refit=True,
-        conditional_strength_profile_before_likelihood=True,
-        sparse_poisson_evidence_enable=True,
-        report_mle_rescue_enable=True,
-    )
-    strict_capabilities = apply_profile_to_config(strict)
-    profiled_capabilities = apply_profile_to_config(profiled)
-
-    assert strict.conditional_strength_refit is False
-    assert strict.conditional_strength_profile_before_likelihood is False
-    assert profiled.conditional_strength_refit is True
-    assert profiled.conditional_strength_profile_before_likelihood is True
-    assert strict.sparse_poisson_evidence_enable is False
-    assert profiled.sparse_poisson_evidence_enable is False
-    assert strict.report_mle_rescue_enable is False
-    assert profiled.report_mle_rescue_enable is False
-    differences = {
-        key
-        for key, value in strict_capabilities.to_dict().items()
-        if value != profiled_capabilities.to_dict()[key]
-    }
-    assert differences == {"conditional_strength_profile"}
-
-
-def test_runtime_profile_resolves_conditional_strength_fields() -> None:
-    """Resolved runtime mappings must agree with the selected PF capability."""
-    requested = {
-        "conditional_strength_refit": True,
-        "conditional_strength_profile_before_likelihood": True,
-        "conditional_strength_refit_reweight": True,
-        "refit_after_moves": True,
-    }
-    strict = enforce_pure_runtime_settings(
-        {**requested, "estimator_profile": "pf_strict"}
-    )
-    profiled = enforce_pure_runtime_settings(
-        {**requested, "estimator_profile": "pf_profiled"}
-    )
-
-    for field in requested:
-        assert strict[field] is False
-        assert profiled[field] is True
-
-
-def test_structural_provenance_distinguishes_fixed_k_from_heuristic_birth() -> None:
-    """Result metadata must not present matching pursuit as exact RJMCMC."""
+def test_structural_provenance_distinguishes_fixed_k_from_scored_birth() -> None:
+    """Structural provenance must identify likelihood-scored PF moves truthfully."""
     fixed_config = RotatingShieldPFConfig(
         estimator_profile="pf_strict",
         init_num_sources=(3, 3),
@@ -147,6 +198,7 @@ def test_structural_provenance_distinguishes_fixed_k_from_heuristic_birth() -> N
     assert fixed["structural_kernel_exact_rj"] is False
     assert fixed["reversible_jump_mcmc_used"] is False
     assert fixed["data_conditioned_structural_proposal"] is False
+    assert fixed["structural_evidence_uses_pf_likelihood"] is True
 
     birth_config = RotatingShieldPFConfig(
         estimator_profile="pf_strict",
@@ -160,9 +212,12 @@ def test_structural_provenance_distinguishes_fixed_k_from_heuristic_birth() -> N
     ).to_dict()
 
     assert birth["posterior_semantics"] == (
-        "approximate_sequential_particle_ensemble_with_heuristic_structural_moves"
+        "approximate_sequential_particle_ensemble_with_"
+        "likelihood_scored_structural_moves"
     )
-    assert birth["structural_kernel_family"] == ("residual_matching_pursuit_heuristic")
+    assert birth["structural_kernel_family"] == (
+        "likelihood_scored_residual_pf_structural_moves"
+    )
     assert birth["structural_moves_enabled"] is True
     assert birth["structural_kernel_target_preserving"] is False
     assert birth["structural_kernel_exact_rj"] is False
@@ -170,6 +225,7 @@ def test_structural_provenance_distinguishes_fixed_k_from_heuristic_birth() -> N
     assert birth["data_conditioned_structural_proposal"] is True
     assert birth["data_conditioned_strength_proposal"] is True
     assert birth["data_conditioned_strength_proposal_importance_corrected"] is False
+    assert birth["structural_evidence_uses_pf_likelihood"] is True
 
 
 def test_static_cardinality_mixture_without_moves_is_target_preserving() -> None:
@@ -194,42 +250,76 @@ def test_static_cardinality_mixture_without_moves_is_target_preserving() -> None
     assert provenance["structural_kernel_target_preserving"] is True
 
 
-def test_pure_estimator_applies_boundary_before_legacy_initialization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Hostile batch flags are disabled before the inherited shell sees config."""
-    from pf.estimator import RotatingShieldPFEstimator
-
-    original_init = RotatingShieldPFEstimator.__init__
-
-    def guarded_init(*args: object, **kwargs: object) -> None:
-        config = kwargs.get("pf_config")
-        assert isinstance(config, RotatingShieldPFConfig)
-        assert config.sparse_poisson_evidence_enable is False
-        assert config.report_mle_rescue_enable is False
-        assert config.runtime_report_rescue_enable is False
-        original_init(*args, **kwargs)
-
-    monkeypatch.setattr(RotatingShieldPFEstimator, "__init__", guarded_init)
-    hostile = RotatingShieldPFConfig(
-        estimator_profile="pf_strict",
-        sparse_poisson_evidence_enable=True,
-        report_mle_rescue_enable=True,
-        runtime_report_rescue_enable=True,
-    )
+def test_pure_estimator_initializes_the_single_strict_profile() -> None:
+    """PurePFEstimator must expose the positive strict-PF capability contract."""
     estimator = PurePFEstimator(
         isotopes=("Cs-137",),
         candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={"Cs-137": 0.0},
-        pf_config=hostile,
+        pf_config=RotatingShieldPFConfig(estimator_profile="pf_strict"),
         measurement_log_sha256="b" * 64,
     )
-    assert estimator.pf_config.sparse_poisson_evidence_enable is False
+
+    assert estimator.estimator_variant == "pf_strict"
+    assert estimator.profile_capabilities.posterior_reporting_only is True
+    assert estimator.profile_capabilities.sequential_updates_only is True
 
 
-def test_pure_estimator_rejects_inherited_batch_estimation_entry_points() -> None:
-    """Pure PF must fail closed when legacy position or strength MLE is requested."""
+def test_structural_history_preserves_runtime_spectrum_and_view_covariance() -> None:
+    """Structural evidence must receive the exact runtime likelihood payload."""
+    covariance = ((4.0, 1.5), (1.5, 9.0))
+    common = {
+        "z_k": {"Cs-137": 12.0},
+        "pose_idx": 0,
+        "orient_idx": 0,
+        "live_time_s": 1.0,
+        "z_variance_k": {"Cs-137": 4.0},
+        "spectrum_response_templates_by_isotope": {
+            "Cs-137": (0.25, 0.75)
+        },
+        "spectrum_background": (1.0, 2.0),
+        "station_sequence_id": 17,
+        "station_view_covariance_by_isotope": {"Cs-137": covariance},
+    }
+    records = [
+        MeasurementRecord(
+            **common,
+            fe_index=0,
+            pb_index=0,
+            spectrum_counts=(4.0, 8.0),
+            station_view_index=0,
+        ),
+        MeasurementRecord(
+            **{**common, "z_k": {"Cs-137": 20.0}, "orient_idx": 1},
+            fe_index=1,
+            pb_index=1,
+            spectrum_counts=(7.0, 13.0),
+            station_view_index=1,
+        ),
+    ]
+    estimator = object.__new__(PurePFEstimator)
+    estimator.measurements = records
+    estimator.poses = [np.asarray([1.0, 2.0, 0.5], dtype=float)]
+
+    data = estimator._measurement_data_for_iso("Cs-137", window=None)
+
+    assert data is not None
+    np.testing.assert_allclose(data.observation_count_covariance, covariance)
+    np.testing.assert_allclose(data.spectrum_counts, [[4.0, 8.0], [7.0, 13.0]])
+    np.testing.assert_allclose(
+        data.spectrum_response_template,
+        [[0.25, 0.75], [0.25, 0.75]],
+    )
+    np.testing.assert_allclose(data.spectrum_background, [[1.0, 2.0], [1.0, 2.0]])
+
+    final_row = estimator._measurement_data_for_iso("Cs-137", window=1)
+    assert final_row is not None
+    np.testing.assert_allclose(final_row.observation_count_covariance, [[9.0]])
+
+
+def test_removed_estimator_methods_are_physically_absent() -> None:
+    """Pure PF must not retain refusal stubs for deleted estimator families."""
     estimator = PurePFEstimator(
         isotopes=("Cs-137",),
         candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
@@ -238,17 +328,26 @@ def test_pure_estimator_rejects_inherited_batch_estimation_entry_points() -> Non
         measurement_log_sha256="b" * 64,
     )
 
-    for method_name in estimator.forbidden_batch_entry_points:
-        with pytest.raises(RuntimeError, match="PurePFEstimator boundary"):
-            getattr(estimator, method_name)()
-
-    assert estimator.batch_methods_invoked == list(
-        estimator.forbidden_batch_entry_points
+    removed_methods = (
+        "_refit_reported_strengths",
+        "_surface_stratified_rescue_indices",
+        "final_report_estimate",
+        "fit_surface_map",
+        "planning_surface_rescue_modes",
+        "refresh_sparse_poisson_evidence",
+        "report_model_order_diagnostics",
+        "runtime_report_rescue_modes",
+        "sparse_poisson_evidence_diagnostics",
     )
+    for method_name in removed_methods:
+        assert not hasattr(PurePFEstimator, method_name)
+        assert not hasattr(estimator, method_name)
+    assert not hasattr(estimator, "forbidden_batch_entry_points")
+    assert not hasattr(estimator, "batch_methods_invoked")
 
 
 def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
-    """Hostile report/surface modes cannot cross the pure planner boundary."""
+    """DSS modes and proposal origins must come only from the PF ensemble."""
     _profile, capabilities = resolve_estimator_profile("pf_strict")
     state = SimpleNamespace(
         num_sources=2,
@@ -258,26 +357,16 @@ def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
         verification_fail_streaks=np.asarray([0, 0]),
     )
 
-    def forbidden() -> object:
-        """Fail if a batch-derived planner source is requested."""
-        raise AssertionError("batch/report planner mode was requested")
-
     estimator = SimpleNamespace(
         isotopes=("Cs-137",),
         profile_capabilities=capabilities,
         planner_belief_sources=("pf_posterior", "pf_tentative"),
-        pf_config=SimpleNamespace(
-            pseudo_source_quarantine_excludes_runtime=False,
-        ),
+        pf_config=SimpleNamespace(),
         planning_particles=lambda **_kwargs: {"Cs-137": ([state], np.asarray([1.0]))},
-        runtime_report_rescue_modes=forbidden,
-        planning_surface_rescue_modes=forbidden,
     )
     modes = extract_signature_modes(
         estimator,
         mode_cluster_radius_m=0.1,
-        include_runtime_rescue_modes=True,
-        include_global_surface_rescue_modes=True,
     )
     assert len(modes["Cs-137"]) == 2
     assert estimator.planner_belief_sources == ("pf_posterior", "pf_tentative")
@@ -289,12 +378,12 @@ def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
         ProposalOrigin.PF_SPLIT,
     ):
         assert boundary.accepts_proposal_origin(origin)
-    for origin in (
-        ProposalOrigin.BATCH_SPARSE,
-        ProposalOrigin.REPORT_MLE,
-        ProposalOrigin.SURFACE_MAP,
-        ProposalOrigin.EXTERNAL_MLE,
-    ):
+    assert set(ProposalOrigin) == {
+        ProposalOrigin.PF_BIRTH,
+        ProposalOrigin.PF_RESIDUAL,
+        ProposalOrigin.PF_SPLIT,
+    }
+    for origin in ("batch_sparse", "report_mle", "surface_map", "external_mle"):
         assert not boundary.accepts_proposal_origin(origin)
 
 
@@ -302,21 +391,19 @@ def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
     "relative_path",
     [
         "configs/python/experiments/pf_strict_3d.json",
-        "configs/python/experiments/pf_profiled_3d.json",
         "configs/geant4/experiments/pf_strict_3d.json",
-        "configs/geant4/experiments/pf_profiled_3d.json",
     ],
 )
-def test_pure_profiles_keep_fixed_budget_and_continuous_3d_planning(
+def test_strict_profile_keeps_fixed_budget_and_continuous_3d_planning(
     relative_path: str,
 ) -> None:
-    """Purity profiles retain mission budget, collision, and 3-D planner settings."""
+    """Strict configs retain mission budget, collision, and 3-D planning."""
     root = Path(__file__).resolve().parents[1]
     resolved = enforce_pure_runtime_settings(load_runtime_config(root / relative_path))
     assert resolved["adaptive_cardinality_dwell_enable"] is False
     assert resolved["adaptive_mission_stop"] is False
     assert resolved["mission_stop_soft_extend_on_unresolved"] is False
-    assert resolved["final_absent_isotope_filter"] is False
+    assert "final_absent_isotope_filter" not in resolved
     assert resolved["measurement_budget_max_steps"] == 160
     assert resolved["mission_stop_max_poses"] == 20
     assert resolve_mission_max_steps(None, resolved) == 160
@@ -328,14 +415,13 @@ def test_pure_profiles_keep_fixed_budget_and_continuous_3d_planning(
     assert resolved["spectrum_count_method"] == "response_poisson"
     assert resolved["joint_observation_update"] is False
     assert resolved["delayed_resample_update"] is True
-    expected_variant = "profiled" if "profiled" in relative_path else "strict"
     expected_backend = "geant4" if "geant4" in relative_path else "python"
     assert resolved["measurement_log_output_dir"] == (
-        f"logs/pure_pf/{expected_backend}_pf_{expected_variant}_3d_measurement_log"
+        f"logs/pure_pf/{expected_backend}_pf_strict_3d_measurement_log"
     )
     dss = resolved["dss_pp"]
-    assert dss["include_runtime_rescue_modes"] is False
-    assert dss["include_global_surface_rescue_modes"] is False
+    assert "include_runtime_rescue_modes" not in dss
+    assert "include_global_surface_rescue_modes" not in dss
     assert dss["adaptive_program_length_enable"] is False
     # These inherited settings prove the nested section is fully specified,
     # not accidentally replaced by a three-key shallow override.
@@ -371,14 +457,15 @@ def test_standard_runtime_configs_declare_strict_pf_boundary(
         "report_surface_local_refine",
         "runtime_report_rescue_enable",
         "sparse_poisson_evidence_enable",
+        "source_strength_prior_mean",
         "surface_map_reconstruction_enable",
     )
     for field in forbidden:
-        assert payload.get(field, False) is False
+        assert field not in payload
     dss = payload.get("dss_pp", {})
     assert dss.get("adaptive_program_length_enable", False) is False
-    assert dss.get("include_runtime_rescue_modes", False) is False
-    assert dss.get("include_global_surface_rescue_modes", False) is False
+    assert "include_runtime_rescue_modes" not in dss
+    assert "include_global_surface_rescue_modes" not in dss
 
 
 @pytest.mark.parametrize(
@@ -407,23 +494,43 @@ def test_standard_runtime_configs_select_parallel_compute_paths(
     assert payload["parallel_isotope_updates"] is False
 
 
-def test_pure_final_report_ignores_legacy_best_so_far_selection(
+def test_final_estimates_are_projected_directly_from_pf_posterior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Compatibility report options must not replace the current PF posterior."""
+    """The historical array view must be a direct PF-posterior projection."""
     estimator = object.__new__(PurePFEstimator)
-    expected = {
-        "Cs-137": (
-            np.asarray([[1.0, 2.0, 3.0]], dtype=float),
-            np.asarray([25.0], dtype=float),
-        )
-    }
-    monkeypatch.setattr(estimator, "estimates", lambda: expected)
+    point_estimate = posterior_point_estimate_from_states(
+        [
+            SimpleNamespace(
+                num_sources=1,
+                positions=np.asarray([[1.0, 2.0, 3.0]], dtype=float),
+                strengths=np.asarray([25.0], dtype=float),
+                background=0.0,
+            )
+        ],
+        np.asarray([1.0], dtype=float),
+        max_cardinality=1,
+    )
+    monkeypatch.setattr(
+        estimator,
+        "posterior_point_estimate",
+        lambda: {"Cs-137": point_estimate},
+    )
 
-    actual = estimator.final_report_estimate(use_best_so_far=True)
+    actual = PurePFEstimator.estimates(estimator)
 
-    np.testing.assert_array_equal(actual["Cs-137"][0], expected["Cs-137"][0])
-    np.testing.assert_array_equal(actual["Cs-137"][1], expected["Cs-137"][1])
+    np.testing.assert_array_equal(
+        actual["Cs-137"][0],
+        np.asarray([[1.0, 2.0, 3.0]], dtype=float),
+    )
+    np.testing.assert_array_equal(
+        actual["Cs-137"][1],
+        np.asarray([25.0], dtype=float),
+    )
+    assert not hasattr(
+        estimator,
+        "final_report_estimate",
+    )
 
 
 def test_pure_posterior_projects_surface_particle_mean_to_surface() -> None:

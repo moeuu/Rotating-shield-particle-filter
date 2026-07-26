@@ -290,13 +290,7 @@ def _logged_effective_replay_config(
                 "Replay seed differs from the logged effective PF random seed."
             )
     allowed_compute_overrides = {"use_gpu", "gpu_device", "gpu_dtype"}
-    allowed_profile_overrides = {
-        "estimator_profile",
-        "conditional_strength_refit",
-        "conditional_strength_profile_before_likelihood",
-        "conditional_strength_refit_reweight",
-        "refit_after_moves",
-    }
+    allowed_profile_overrides = {"estimator_profile"}
     allowed_replay_overrides = allowed_compute_overrides | allowed_profile_overrides
     declared_pf_fields = {field.name for field in fields(RotatingShieldPFConfig)}
     for key, value in external_config.items():
@@ -613,7 +607,6 @@ def replay_records(
             if not station_pose and estimator.poses:
                 estimator.poses[-1] = pose.copy()
                 estimator.kernel_cache = None
-                estimator._invalidate_report_cache()
                 pose_index = len(estimator.poses) - 1
             else:
                 estimator.add_measurement_pose(pose, reset_filters=False)
@@ -758,7 +751,6 @@ def _write_replay_outputs(
             "records_processed": len(trace),
             "final_state_sha256": _sha256_bytes(final_state),
             "forward_model_compatibility": "local_manifest_exact_match",
-            "forbidden_batch_methods_invoked": list(estimator.batch_methods_invoked),
             "posterior_semantics": str(structural["posterior_semantics"]),
             "structural_kernel_family": str(structural["structural_kernel_family"]),
             "structural_kernel_target_preserving": bool(
@@ -829,7 +821,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument(
         "--profile",
-        choices=("pf_strict", "pf_profiled"),
+        choices=("pf_strict",),
         default="pf_strict",
     )
     parser.add_argument("--seed", type=int, default=0)

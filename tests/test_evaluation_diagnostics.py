@@ -1,4 +1,4 @@
-"""Tests for run-level count, model-order, stability, and GPU diagnostics."""
+"""Tests for run-level count, stability, and GPU diagnostics."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from evaluation_diagnostics import (
     start_gpu_memory_tracking,
     summarize_cluster_stability,
     summarize_count_bias,
-    summarize_model_diagnostics,
 )
 
 
@@ -96,145 +95,12 @@ def test_count_bias_rejects_invalid_counts_and_shield_indices() -> None:
         summarize_count_bias(**{**kwargs, "observed_counts": [-1.0]})
 
 
-def test_summarize_model_diagnostics_selects_heldout_deviance() -> None:
-    """Selected spectrum count should index held-out deviance explicitly."""
-    diagnostics = summarize_model_diagnostics(
-        {
-            "Cs-137": {
-                "selected_count": 1,
-                "criterion_margin_to_runner_up": 2.0,
-                "condition_number": 7.0,
-            }
-        },
-        {
-            "Cs-137": {
-                "selected_count": 1,
-                "bic_margin_to_runner_up": 3.5,
-                "condition_number": 5.0,
-                "measurement_count": 99,
-                "heldout_observation_count": 3,
-                "best_heldout_count": 1,
-                "heldout_deviance_by_count": [10.0, 3.0, 4.0],
-            },
-            "joint_multi_isotope": {
-                "available": True,
-                "selected_cardinality_key": "Cs-137:1",
-                "bic_margin_to_runner_up": 4.0,
-            },
-        },
-    )
-
-    isotope = diagnostics["by_isotope"]["Cs-137"]
-    assert isotope["bic_margin_to_runner_up"] == 3.5
-    assert isotope["response_condition_number"] == 5.0
-    assert isotope["selected_spectrum_bin_heldout_deviance"] == 3.0
-    assert isotope[
-        "selected_spectrum_bin_heldout_deviance_per_observation"
-    ] == 1.0
-    assert diagnostics["spectrum_bin_heldout_deviance"]["median"] == 3.0
-    assert diagnostics["spectrum_bin_heldout_deviance_per_observation"][
-        "median"
-    ] == 1.0
-    assert diagnostics["joint_multi_isotope"]["bic_margin_to_runner_up"] == 4.0
 
 
-def test_heldout_deviance_never_uses_training_measurement_count() -> None:
-    """Per-observation deviance requires an explicit actual holdout count."""
-    without_holdout_count = summarize_model_diagnostics(
-        {},
-        {
-            "Cs-137": {
-                "available": True,
-                "selected_count": 0,
-                "measurement_count": 100,
-                "n_observations": 100,
-                "heldout_deviance_by_count": [20.0],
-            }
-        },
-    )
-    with_holdout_count = summarize_model_diagnostics(
-        {},
-        {
-            "Cs-137": {
-                "available": True,
-                "selected_count": 0,
-                "measurement_count": 100,
-                "heldout_observation_count": 4,
-                "heldout_deviance_by_count": [20.0],
-            }
-        },
-    )
-
-    missing = without_holdout_count["by_isotope"]["Cs-137"]
-    assert missing["heldout_deviance_observation_count"] is None
-    assert missing["heldout_deviance_per_observation_available"] is False
-    assert missing["selected_spectrum_bin_heldout_deviance_per_observation"] is None
-    assert without_holdout_count[
-        "spectrum_bin_heldout_deviance_per_observation"
-    ]["count"] == 0
-    present = with_holdout_count["by_isotope"]["Cs-137"]
-    assert present["heldout_deviance_observation_count"] == 4
-    assert present["selected_spectrum_bin_heldout_deviance_per_observation"] == 5.0
 
 
-def test_model_diagnostics_availability_requires_an_evaluable_metric() -> None:
-    """Placeholder isotope rows must not make model diagnostics available."""
-    unavailable = summarize_model_diagnostics(
-        {"Cs-137": {"selected_count": 1}},
-        {"Co-60": {"available": False}},
-    )
-    joint = summarize_model_diagnostics(
-        {},
-        {"joint_multi_isotope": {"available": True}},
-    )
-
-    assert unavailable["available"] is False
-    assert unavailable["by_isotope"]["Cs-137"]["available"] is False
-    assert joint["available"] is True
 
 
-def test_unavailable_sparse_evidence_falls_back_and_sanitizes_deviance() -> None:
-    """Unavailable sparse payloads must not override valid report diagnostics."""
-    diagnostics = summarize_model_diagnostics(
-        {
-            "Cs-137": {
-                "selected_count": 2,
-                "criterion_margin_to_runner_up": 2.0,
-                "condition_number": 9.0,
-            },
-            "Co-60": {"selected_count": 1},
-            "Eu-154": {"selected_count": 1, "condition_number": 12.0},
-        },
-        {
-            "Cs-137": {
-                "available": False,
-                "selected_count": 0,
-                "bic_margin_to_runner_up": 99.0,
-                "condition_number": 1.0,
-                "heldout_deviance_by_count": [float("nan")],
-            },
-            "Co-60": {
-                "available": True,
-                "selected_count": 1,
-                "measurement_count": 2,
-                "heldout_deviance_by_count": [8.0, float("nan")],
-            },
-        },
-    )
-
-    cesium = diagnostics["by_isotope"]["Cs-137"]
-    assert cesium["sparse_evidence_available"] is False
-    assert cesium["selected_count"] == 2
-    assert cesium["bic_margin_to_runner_up"] == 2.0
-    assert cesium["response_condition_number"] == 9.0
-    cobalt = diagnostics["by_isotope"]["Co-60"]
-    assert cobalt["heldout_deviance_by_count"] == [8.0, None]
-    assert cobalt["selected_spectrum_bin_heldout_deviance"] is None
-    europium = diagnostics["by_isotope"]["Eu-154"]
-    assert europium["sparse_evidence_available"] is False
-    assert europium["selected_count"] == 1
-    assert europium["response_condition_number"] == 12.0
-    json.dumps(diagnostics, allow_nan=False)
 
 
 def test_summarize_cluster_stability_tracks_motion_and_count_stability() -> None:
@@ -250,7 +116,6 @@ def test_summarize_cluster_stability_tracks_motion_and_count_stability() -> None
     isotope = diagnostics["by_isotope"]["Cs-137"]
     assert isotope["final_window_count_stability_fraction"] == 1.0
     assert isotope["unmatched_cluster_event_count"] == 0
-    assert isotope["birth_death_event_count"] == 0
     shift = isotope["consecutive_matched_cluster_shift_m"]
     assert shift["count"] == 2
     assert shift["median"] == pytest.approx(0.1)
@@ -294,13 +159,7 @@ def test_cluster_stability_separates_final_window_and_same_count_replacement() -
     assert isotope["unmatched_cluster_disappearance_count"] == 1
     assert isotope["unmatched_cluster_event_count"] == 2
     assert isotope["same_cardinality_cluster_replacement_transition_count"] == 1
-    assert isotope["birth_event_count"] == 1
-    assert isotope["death_event_count"] == 1
-    assert isotope["birth_death_event_count"] == 2
-    assert isotope["same_count_birth_death_transition_count"] == 1
-    assert isotope["legacy_birth_death_key_semantics"] == (
-        "unmatched_reported_clusters_not_accepted_pf_transitions"
-    )
+    assert "birth_death_event_count" not in isotope
     assert isotope["all_history_consecutive_matched_cluster_shift_m"]["count"] == 2
     assert isotope["final_window_consecutive_matched_cluster_shift_m"]["count"] == 1
     final_strength = isotope[

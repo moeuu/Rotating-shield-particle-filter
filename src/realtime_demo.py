@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import matplotlib
 
@@ -26,10 +26,6 @@ from measurement.detector_geometry import (
     detector_active_radius_m,
 )
 from measurement.observation_model import build_runtime_observation_model
-
-if TYPE_CHECKING:
-    from pf.surface_map import SurfaceMapConfig
-
 
 def _has_display() -> bool:
     """Return True when a GUI display is likely available."""
@@ -228,7 +224,7 @@ def _build_effective_live_runtime_config(
             "spacing_xyz_m": json_safe(spacing),
             "margin_m": float(api_settings.get("candidate_grid_margin_m", 0.0)),
             "source_surface_prior": bool(
-                api_settings.get("source_surface_prior", False)
+                api_settings.get("source_surface_prior", True)
             ),
             "obstacle_height_m": float(api_settings.get("obstacle_height_m", 2.0)),
             "position_min_xyz_m": json_safe(lower),
@@ -523,10 +519,6 @@ from measurement.source_surfaces import (
     surface_observable_fractions,
     surface_response_observability_diagnostics,
 )
-from measurement.surface_patches import (
-    build_surface_patch_dictionary,
-    estimate_surface_patch_count_upper_bound,
-)
 from measurement.shielding import (
     generate_octant_orientations,
     generate_octant_rotation_matrices,
@@ -601,7 +593,6 @@ from evaluation_diagnostics import (
     start_gpu_memory_tracking,
     summarize_cluster_stability,
     summarize_count_bias,
-    summarize_model_diagnostics,
 )
 from evaluation_metrics import compute_metrics, print_metrics_report
 from piplup_notify import PiplupNotificationConfig, PiplupNotifier
@@ -610,15 +601,11 @@ from cui_runtime import (
     resolve_cui_split_view_enabled as _resolve_cui_split_view_enabled,
 )
 from mission_control import (
-    adapt_dss_program_length_for_budget as _adapt_dss_program_length_for_budget,
     has_birth_residual_evidence as _has_birth_residual_evidence,
     remaining_measurement_payload as _remaining_measurement_payload,
     remaining_measurement_ready_for_stop as _remaining_measurement_ready_for_stop,
-    report_model_order_ready_for_stop as _report_model_order_ready_for_stop,
-    report_model_order_simple_ready_for_stop as _report_model_order_simple_ready_for_stop,
     resolve_mission_max_poses as _resolve_mission_max_poses,
     resolve_mission_max_steps as _resolve_mission_max_steps,
-    sparse_cardinality_evidence_gap_unresolved as _sparse_gap_unresolved,
 )
 from runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
@@ -1129,21 +1116,14 @@ def _restore_live_controller_checkpoint(
 
 
 def _pure_pf_profile_active(estimator: object) -> bool:
-    """Return whether batch/report capabilities are forbidden for this estimator."""
+    """Return whether the estimator exposes the strict sequential PF contract."""
     capabilities = getattr(estimator, "profile_capabilities", None)
-    return capabilities is not None and not any(
-        bool(getattr(capabilities, field, False))
-        for field in (
-            "all_history_sparse_evidence",
-            "report_mle_rescue",
-            "surface_map_reconstruction",
-            "batch_model_order_selection",
-            "batch_strength_refit",
-            "batch_candidates_in_planner",
-            "batch_evidence_in_mission_stop",
-            "batch_evidence_in_adaptive_dwell",
-        )
+    profile = getattr(
+        getattr(estimator, "pf_config", None),
+        "estimator_profile",
+        "",
     )
+    return capabilities is not None and str(profile) == "pf_strict"
 
 
 def _pure_pf_primary_estimates(
@@ -1210,17 +1190,39 @@ def _validate_surface_constrained_estimates(
         )
 
 
+def _validate_surface_constrained_sources(
+    sources: Sequence[PointSource],
+    environment: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+    tolerance_m: float,
+) -> None:
+    """Reject simulation truth outside the strict PF position support."""
+    if not sources:
+        return
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    surface_kinds = source_surface_kinds(
+        positions,
+        environment,
+        obstacle_grid,
+        obstacle_height_m=obstacle_height_m,
+        tolerance_m=tolerance_m,
+    )
+    off_surface_count = int(np.count_nonzero(np.equal(surface_kinds, None)))
+    if off_surface_count:
+        raise ValueError(
+            "Surface-constrained PF simulation contains "
+            f"{off_surface_count}/{positions.shape[0]} off-surface true sources."
+        )
+
+
 _PURE_PF_SUMMARY_PROVENANCE_KEYS = (
     "schema_version",
     "estimator_family",
     "estimator_variant",
     "estimator_profile",
     "final_estimate_source",
-    "uses_all_history_batch_fit",
-    "uses_surface_map",
-    "uses_batch_model_order",
-    "batch_feedback_to_particles",
-    "batch_methods_invoked",
     "posterior_semantics",
     "structural_kernel_family",
     "structural_kernel_target_preserving",
@@ -1239,7 +1241,7 @@ _PURE_PF_SUMMARY_PROVENANCE_KEYS = (
 
 
 def _pure_pf_summary_provenance(estimator: object) -> dict[str, Any]:
-    """Embed mandatory pure-PF provenance in every legacy summary result."""
+    """Embed mandatory PF provenance in every runtime summary result."""
     if not _pure_pf_profile_active(estimator):
         return {}
     snapshot_getter = getattr(estimator, "posterior_snapshot", None)
@@ -1285,22 +1287,10 @@ IG_DIR = RESULTS_DIR / "IG"
 BLENDER_ENV_DIR = RESULTS_DIR / "blender_environments"
 SAVE_IG_GRIDS = False
 OBSTACLE_LAYOUT_DIR = ROOT / "obstacle_layouts"
-PRUNE_MIN_STRENGTH_ABS = 5.0
-PRUNE_MIN_STRENGTH_RATIO = 0.001
-PRUNE_TAU_MIX = 0.6
-PRUNE_METHOD = "legacy"
-PRUNE_DELTALL_MIN = 0.0
-FINAL_ESTIMATE_MIN_STRENGTH_ABS = 500.0
-FINAL_MERGE_DISTANCE_M = 1.5
-PRUNE_MIN_SUPPORT = 2
-PRUNE_MIN_OBS_COUNT = 0.0
-PRUNE_MIN_MEASUREMENTS = 10
 DETECT_MIN_PEAKS_BY_ISOTOPE = {"Eu-154": 2, "Co-60": 2}
 DETECT_REL_THRESH_BY_ISOTOPE = {"Co-60": 0.1}
 DETECT_CONSECUTIVE_BY_ISOTOPE = {"Cs-137": 3, "Co-60": 3, "Eu-154": 5}
 DETECT_MISS_AFTER_LOCK = 30
-FINAL_ABSENT_ISOTOPE_MIN_SUPPORT_MEASUREMENTS = 2
-FINAL_ABSENT_ISOTOPE_MIN_SNR = 3.0
 DEFAULT_SOURCE_CONFIG = ROOT / "source_layouts" / "demo_sources.json"
 DEFAULT_OBSTACLE_CONFIG = ROOT / DEFAULT_FIXED_OBSTACLE_CONFIG
 CANDIDATE_GRID_SPACING = (0.5, 0.5, 0.5)
@@ -1596,24 +1586,12 @@ def _final_estimate_source_status(
     estimates: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
 ) -> dict[str, list[dict[str, object]]]:
     """Return confirmed/tentative status metadata for final reported sources."""
-    diagnostics: dict[str, Any] = {}
-    if not _pure_pf_profile_active(estimator) and hasattr(
-        estimator, "report_model_order_diagnostics"
-    ):
-        try:
-            diagnostics = dict(estimator.report_model_order_diagnostics())
-        except (RuntimeError, ValueError, TypeError):
-            diagnostics = {}
     pf_config = getattr(estimator, "pf_config", None)
     match_radius = max(float(getattr(pf_config, "cluster_eps_m", 1.0)), 0.5)
     status_by_iso: dict[str, list[dict[str, object]]] = {}
     for isotope, estimate in sorted(estimates.items()):
         positions = np.asarray(estimate[0], dtype=float).reshape(-1, 3)
         strengths = np.asarray(estimate[1], dtype=float).reshape(-1)
-        stats = diagnostics.get(isotope, {})
-        report_ready = bool(
-            stats.get("model_order_ready", False) if isinstance(stats, dict) else False
-        )
         filt = estimator.filters.get(isotope)
         state_positions = np.zeros((0, 3), dtype=float)
         tentative = np.zeros(0, dtype=bool)
@@ -1674,15 +1652,12 @@ def _final_estimate_source_status(
                 source_support = float(
                     support[nearest_idx] if nearest_idx < support.size else 0.0
                 )
-            if not report_ready:
-                status = "tentative"
-                reason = "model_order_unresolved"
-            elif source_tentative or source_fail_streak > 0:
+            if source_tentative or source_fail_streak > 0:
                 status = "tentative"
                 reason = "verification_unconfirmed"
             else:
                 status = "confirmed"
-                reason = "report_model_order_ready"
+                reason = "pf_posterior"
             entries.append(
                 {
                     "estimate_index": int(idx),
@@ -1694,7 +1669,6 @@ def _final_estimate_source_status(
                         for value in np.asarray(pos, dtype=float).reshape(3)
                     ],
                     "strength": float(strengths[idx]) if idx < strengths.size else 0.0,
-                    "report_model_order_ready": bool(report_ready),
                     "nearest_state_slot": nearest_idx,
                     "nearest_state_distance_m": nearest_distance,
                     "metadata_match_radius_m": float(match_radius),
@@ -1735,13 +1709,12 @@ def _particle_surface_diagnostics(
     obstacle_height_m: float,
     tolerance_m: float = 1.0e-5,
 ) -> dict[str, dict[str, object]]:
-    """Return per-isotope surface diagnostics for final report-visible particles."""
+    """Return per-isotope surface diagnostics for the final PF particles."""
     diagnostics: dict[str, dict[str, object]] = {}
     for isotope, filt in estimator.filters.items():
         positions: list[NDArray[np.float64]] = []
         weights: list[NDArray[np.float64]] = []
-        raw_slots = 0
-        report_slots = 0
+        posterior_slots = 0
         particle_weights = np.asarray(
             getattr(filt, "continuous_weights", []),
             dtype=float,
@@ -1759,24 +1732,11 @@ def _particle_surface_diagnostics(
         for particle, weight in zip(particles, particle_weights):
             state = particle.state
             count = max(0, int(getattr(state, "num_sources", 0)))
-            raw_slots += count
+            posterior_slots += count
             if count <= 0:
                 continue
-            if hasattr(filt, "_report_source_mask"):
-                keep = filt._report_source_mask(state)  # noqa: SLF001
-            else:
-                keep = np.ones(count, dtype=bool)
-            keep = np.asarray(keep, dtype=bool).reshape(-1)[:count]
-            if keep.size != count:
-                padded = np.zeros(count, dtype=bool)
-                padded[: min(keep.size, count)] = keep[:count]
-                keep = padded
-            kept = int(np.count_nonzero(keep))
-            report_slots += kept
-            if kept <= 0:
-                continue
-            positions.append(np.asarray(state.positions[:count], dtype=float)[keep])
-            weights.append(np.full(kept, float(weight), dtype=float))
+            positions.append(np.asarray(state.positions[:count], dtype=float))
+            weights.append(np.full(count, float(weight), dtype=float))
         if positions:
             pos_arr = np.vstack(positions)
             weight_arr = np.concatenate(weights)
@@ -1811,9 +1771,7 @@ def _particle_surface_diagnostics(
         weighted["off_surface"] = float(np.sum(weight_arr[np.equal(kinds, None)]))
         diagnostics[isotope] = {
             "particles": int(len(particles)),
-            "raw_source_slots": int(raw_slots),
-            "report_visible_source_slots": int(report_slots),
-            "report_excluded_source_slots": int(raw_slots - report_slots),
+            "posterior_source_slots": int(posterior_slots),
             "surface_counts": counts,
             "weighted_surface_mass": weighted,
             "off_surface_count": int(counts.get("off_surface", 0)),
@@ -1853,18 +1811,7 @@ def _final_particle_cloud_payload(
             count = max(0, int(getattr(state, "num_sources", 0)))
             if count <= 0:
                 continue
-            if hasattr(filt, "_report_source_mask"):
-                keep = filt._report_source_mask(state)  # noqa: SLF001
-            else:
-                keep = np.ones(count, dtype=bool)
-            keep = np.asarray(keep, dtype=bool).reshape(-1)[:count]
-            if keep.size != count:
-                padded = np.zeros(count, dtype=bool)
-                padded[: min(keep.size, count)] = keep[:count]
-                keep = padded
-            if not np.any(keep):
-                continue
-            active_positions = np.asarray(state.positions[:count], dtype=float)[keep]
+            active_positions = np.asarray(state.positions[:count], dtype=float)
             positions.append(active_positions)
             weights.append(
                 np.full(active_positions.shape[0], float(weight), dtype=float)
@@ -1932,11 +1879,11 @@ def _compact_path_segments(
 
 
 def _build_demo_sources() -> list[PointSource]:
-    """Define a small set of synthetic sources inside the environment."""
+    """Define a small synthetic source set on known room surfaces."""
     return [
-        PointSource("Cs-137", position=(5.0, 10.0, 5.0), intensity_cps_1m=50000.0),
-        PointSource("Co-60", position=(2.0, 15.0, 7.0), intensity_cps_1m=20000.0),
-        PointSource("Eu-154", position=(7.0, 5.0, 3.0), intensity_cps_1m=30000.0),
+        PointSource("Cs-137", position=(5.0, 10.0, 0.0), intensity_cps_1m=50000.0),
+        PointSource("Co-60", position=(0.0, 15.0, 7.0), intensity_cps_1m=20000.0),
+        PointSource("Eu-154", position=(7.0, 5.0, 0.0), intensity_cps_1m=30000.0),
     ]
 
 
@@ -1990,7 +1937,7 @@ def _build_candidate_sources(
 
 def _source_surface_prior_enabled(runtime_config: dict[str, object]) -> bool:
     """Return True when PF source positions should use known surface support."""
-    raw = runtime_config.get("source_surface_prior", False)
+    raw = runtime_config.get("source_surface_prior", True)
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, (int, float)):
@@ -2209,44 +2156,32 @@ def _detect_isotopes_from_counts(
     return detected
 
 
-def _isotope_measurement_evidence(
-    measurements: Sequence[object],
+def _pf_posterior_background_counts(
+    estimator: RotatingShieldPFEstimator,
     isotope: str,
-    *,
-    count_threshold_abs: float,
-    snr_threshold: float,
-) -> dict[str, float | int]:
-    """Summarize count evidence for one isotope over the whole measurement list."""
-    total_counts = 0.0
-    total_variance = 0.0
-    max_counts = 0.0
-    support_measurements = 0
-    observed_measurements = 0
-    for record in measurements:
-        z_k = getattr(record, "z_k", {})
-        if isotope not in z_k:
-            continue
-        value = max(float(z_k.get(isotope, 0.0)), 0.0)
-        variance_by_isotope = getattr(record, "z_variance_k", None)
-        variance = value
-        if isinstance(variance_by_isotope, dict):
-            variance = float(variance_by_isotope.get(isotope, max(value, 1.0)))
-        sigma = float(np.sqrt(max(variance, 1.0)))
-        total_counts += value
-        total_variance += max(float(variance), 1.0)
-        max_counts = max(max_counts, value)
-        observed_measurements += 1
-        if value >= float(count_threshold_abs) or value / sigma >= float(snr_threshold):
-            support_measurements += 1
-    total_snr = total_counts / float(np.sqrt(max(total_variance, 1.0)))
-    return {
-        "total_counts": float(total_counts),
-        "total_variance": float(total_variance),
-        "total_snr": float(total_snr),
-        "max_counts": float(max_counts),
-        "support_measurements": int(support_measurements),
-        "observed_measurements": int(observed_measurements),
-    }
+    live_times_s: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return background counts from the current PF state without refitting."""
+    background_rate: float | None = None
+    filters = getattr(estimator, "filters", {})
+    filt = filters.get(str(isotope)) if isinstance(filters, dict) else None
+    if filt is not None and getattr(filt, "continuous_particles", None):
+        try:
+            background_rate = float(filt.best_particle().state.background)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            background_rate = None
+    if background_rate is None:
+        pf_config = getattr(estimator, "pf_config", None)
+        configured = getattr(pf_config, "background_level", 0.0)
+        if isinstance(configured, Mapping):
+            background_rate = float(configured.get(str(isotope), 0.0))
+        else:
+            background_rate = float(configured)
+    live_times = np.maximum(
+        np.asarray(live_times_s, dtype=float).reshape(-1),
+        0.0,
+    )
+    return live_times * max(float(background_rate), 0.0)
 
 
 def _final_isotope_count_residual_diagnostics(
@@ -2273,7 +2208,7 @@ def _final_isotope_count_residual_diagnostics(
             "missing_measurement_count": int(
                 len(estimator.measurements) - len(scored_records)
             ),
-            "fit_scope": "in_sample_final_reporting_fit",
+            "prediction_scope": "current_pf_posterior_projection",
         }
         if data is None or data.z_k.size == 0:
             estimate = estimates.get(isotope, (np.zeros((0, 3)), np.zeros(0)))
@@ -2300,7 +2235,8 @@ def _final_isotope_count_residual_diagnostics(
         source_count = min(pos_arr.shape[0], q_arr.size)
         pos_arr = pos_arr[:source_count]
         q_arr = np.maximum(q_arr[:source_count], 0.0)
-        background = estimator._background_counts_for_report_refit(
+        background = _pf_posterior_background_counts(
+            estimator,
             isotope,
             data.live_times,
         )
@@ -2388,7 +2324,8 @@ def _final_count_bias_diagnostics(
         source_count = min(pos_arr.shape[0], q_arr.size)
         pos_arr = pos_arr[:source_count]
         q_arr = q_arr[:source_count]
-        background = estimator._background_counts_for_report_refit(
+        background = _pf_posterior_background_counts(
+            estimator,
             isotope,
             data.live_times,
         )
@@ -2590,176 +2527,6 @@ def _remaining_measurement_trace_summary(
         "max_estimated_remaining_stations": int(max_remaining),
         "last_unresolved_factors": unresolved_values,
     }
-
-
-def _filter_absent_final_estimates(
-    estimates: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
-    measurements: Sequence[object],
-    *,
-    enabled: bool,
-    count_threshold_abs: float,
-    min_support_measurements: int,
-    min_total_counts: float,
-    snr_threshold: float,
-    min_strength: float,
-) -> tuple[
-    dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
-    dict[str, dict[str, float | int | bool | str]],
-]:
-    """
-    Remove isotopes that lack both count support and a credible final PF state.
-
-    This is a final reporting filter only. It does not remove isotope filters
-    during online updates, so temporarily shielded isotopes continue being
-    processed once they have been detected.
-    """
-    diagnostics: dict[str, dict[str, float | int | bool | str]] = {}
-    if not enabled:
-        return estimates, diagnostics
-    filtered: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-    min_support = max(1, int(min_support_measurements))
-    for iso, (positions, strengths) in estimates.items():
-        pos_arr = np.asarray(positions, dtype=float)
-        str_arr = np.asarray(strengths, dtype=float)
-        evidence = _isotope_measurement_evidence(
-            measurements,
-            iso,
-            count_threshold_abs=float(count_threshold_abs),
-            snr_threshold=float(snr_threshold),
-        )
-        source_count = int(pos_arr.shape[0]) if pos_arr.ndim == 2 else 0
-        max_strength = float(np.max(str_arr)) if str_arr.size else 0.0
-        count_supported = bool(
-            int(evidence["support_measurements"]) >= min_support
-            or float(evidence["total_counts"]) >= float(min_total_counts)
-        )
-        pf_supported = bool(source_count > 0 and max_strength >= float(min_strength))
-        keep = bool(count_supported and pf_supported)
-        reason = "kept"
-        if not pf_supported:
-            reason = "no_final_pf_support"
-        elif not count_supported:
-            reason = "insufficient_spectral_support"
-        diagnostics[iso] = {
-            **evidence,
-            "source_count": source_count,
-            "max_strength": max_strength,
-            "count_supported": count_supported,
-            "pf_supported": pf_supported,
-            "kept": keep,
-            "reason": reason,
-        }
-        if keep:
-            filtered[iso] = (pos_arr, str_arr)
-    return filtered, diagnostics
-
-
-def _prune_online_absent_isotopes(
-    estimator: RotatingShieldPFEstimator,
-    *,
-    enabled: bool,
-    detected_isotopes: set[str],
-    pruned_isotopes: set[str],
-    visited_poses_xyz: Sequence[NDArray[np.float64]],
-    map_api: object | None,
-    min_poses: int,
-    coverage_radius_m: float,
-    coverage_fraction_threshold: float,
-    min_measurements: int,
-    count_threshold_abs: float,
-    min_support_measurements: int,
-    min_total_counts: float,
-    snr_threshold: float,
-    label: str,
-) -> set[str]:
-    """
-    Remove isotope PFs that have no support after sufficient environment coverage.
-
-    This gate is intentionally conservative: it requires enough visited stations,
-    enough traversable-map coverage, and enough isotope-channel measurements
-    before dropping a filter. The decision uses only spectrum-derived evidence
-    and current robot coverage, not truth labels. A later spectral detection can
-    re-add the isotope through ``add_isotopes``.
-    """
-    if not bool(enabled):
-        return set()
-    active = [str(iso) for iso in getattr(estimator, "isotopes", ())]
-    if not active:
-        return set()
-    station_count = len(visited_poses_xyz)
-    min_station_count = max(1, int(min_poses))
-    if station_count < min_station_count:
-        return set()
-    coverage = _coverage_fraction_for_poses(
-        map_api,
-        visited_poses_xyz,
-        radius_m=float(coverage_radius_m),
-    )
-    coverage_threshold = float(coverage_fraction_threshold)
-    if coverage_threshold > 0.0 and coverage < coverage_threshold:
-        return set()
-    measurement_count = len(getattr(estimator, "measurements", ()))
-    min_meas = max(1, int(min_measurements))
-    if measurement_count < min_meas:
-        return set()
-    support_required = max(1, int(min_support_measurements))
-    to_prune: list[str] = []
-    diagnostics: dict[str, dict[str, float | int]] = {}
-    for isotope in active:
-        if isotope in detected_isotopes:
-            continue
-        evidence = _isotope_measurement_evidence(
-            estimator.measurements,
-            isotope,
-            count_threshold_abs=float(count_threshold_abs),
-            snr_threshold=float(snr_threshold),
-        )
-        diagnostics[isotope] = evidence
-        if int(evidence["observed_measurements"]) < min_meas:
-            continue
-        accumulated_signal_supported = float(evidence["total_counts"]) >= float(
-            min_total_counts
-        ) and float(evidence["total_snr"]) >= float(snr_threshold)
-        count_supported = bool(
-            int(evidence["support_measurements"]) >= support_required
-            or accumulated_signal_supported
-        )
-        if count_supported:
-            continue
-        to_prune.append(isotope)
-    if not to_prune:
-        return set()
-    prune_set = set(to_prune)
-    keep = [isotope for isotope in active if isotope not in prune_set]
-    estimator.restrict_isotopes(keep, allow_empty=True)
-    pruned_isotopes.update(prune_set)
-    print(
-        "Online absent-isotope pruning: "
-        f"label={label} removed={sorted(prune_set)} kept={keep} "
-        f"stations={station_count} measurements={measurement_count} "
-        f"coverage={coverage:.3f}/{coverage_threshold:.3f} "
-        f"count_threshold={float(count_threshold_abs):.3g} "
-        f"min_support={support_required} "
-        f"min_total={float(min_total_counts):.3g} "
-        f"evidence={_safe_json_dumps({iso: diagnostics[iso] for iso in to_prune})}"
-    )
-    return prune_set
-
-
-def _online_absent_pruning_supported_isotopes(
-    *,
-    raw_detected: set[str],
-    last_candidates: set[str],
-) -> set[str]:
-    """
-    Return isotopes that should be protected from absent-isotope pruning.
-
-    Existing active PF filters are intentionally not protected here. An isotope
-    becomes protected only through current spectral support or recent detection
-    candidates; otherwise the coverage/support gate in
-    ``_prune_online_absent_isotopes`` can inactivate it after enough evidence.
-    """
-    return set(raw_detected) | set(last_candidates)
 
 
 def _build_isotope_colors(isotopes: list[str]) -> dict[str, str]:
@@ -3149,8 +2916,6 @@ def _current_map_estimate_trace_frame(
             continue
         try:
             state = filt.best_particle().state
-            if hasattr(filt, "state_without_quarantined_sources"):
-                state = filt.state_without_quarantined_sources(state)
             source_count = max(0, int(getattr(state, "num_sources", 0)))
             positions = np.asarray(getattr(state, "positions"), dtype=float).reshape(
                 -1, 3
@@ -3160,16 +2925,11 @@ def _current_map_estimate_trace_frame(
             estimated_sources[isotope] = positions[:source_count].copy()
             estimated_strengths[isotope] = strengths[:source_count].copy()
             ages_raw = getattr(state, "ages", None)
-            low_q_raw = getattr(state, "low_q_streaks", None)
             support_raw = getattr(state, "support_scores", None)
             tentative_raw = getattr(state, "tentative_sources", None)
             fail_raw = getattr(state, "verification_fail_streaks", None)
             ages = np.asarray(
                 ages_raw if ages_raw is not None else np.zeros(0, dtype=int),
-                dtype=int,
-            ).reshape(-1)
-            low_q = np.asarray(
-                low_q_raw if low_q_raw is not None else np.zeros(0, dtype=int),
                 dtype=int,
             ).reshape(-1)
             support = np.asarray(
@@ -3189,7 +2949,6 @@ def _current_map_estimate_trace_frame(
                 metadata.append(
                     {
                         "age": int(ages[idx]) if idx < ages.size else None,
-                        "low_q_streak": int(low_q[idx]) if idx < low_q.size else None,
                         "support_score": (
                             float(support[idx]) if idx < support.size else None
                         ),
@@ -3300,7 +3059,6 @@ def _build_intermediate_estimate_trace_payload(
                     continue
                 for key in (
                     "age",
-                    "low_q_streak",
                     "support_score",
                     "tentative",
                     "verification_fail_streak",
@@ -3853,47 +3611,7 @@ def _log_pf_diagnostics(
         birth_gate_stations = int(stats.get("birth_residual_distinct_stations", 0))
         birth_gate_chi2 = float(stats.get("birth_residual_chi2", 0.0))
         birth_gate_p = float(stats.get("birth_residual_p_value", 1.0))
-        birth_refit_fraction = float(stats.get("birth_residual_refit_fraction", 1.0))
-        birth_refit_gate = bool(stats.get("birth_residual_refit_gate_passed", True))
         birth_layer = str(stats.get("birth_residual_layer", "none"))
-        birth_forced_attempts = int(stats.get("birth_forced_attempts", 0))
-        birth_forced_accepts = int(stats.get("birth_forced_accepts", 0))
-        birth_forced_mask_relaxations = int(
-            stats.get("birth_forced_mask_relaxations", 0)
-        )
-        birth_forced_no_candidate = int(stats.get("birth_forced_no_candidate", 0))
-        birth_forced_rejected = int(stats.get("birth_forced_rejected", 0))
-        birth_forced_best_delta = float(
-            stats.get("birth_forced_best_delta", float("-inf"))
-        )
-        birth_global_candidates = int(stats.get("birth_global_rescue_candidates", 0))
-        birth_global_attempts = int(stats.get("birth_global_rescue_attempts", 0))
-        birth_global_accepts = int(stats.get("birth_global_rescue_accepts", 0))
-        birth_global_rejected = int(stats.get("birth_global_rescue_rejected", 0))
-        birth_global_best_delta = float(
-            stats.get("birth_global_rescue_best_delta", float("-inf"))
-        )
-        global_quarantine_candidates = int(
-            stats.get("runtime_global_birth_quarantine_candidates", 0)
-        )
-        global_quarantine_sources = int(
-            stats.get("runtime_global_birth_quarantine_sources", 0)
-        )
-        global_quarantine_injected = int(
-            stats.get("runtime_global_birth_quarantine_injected", 0)
-        )
-        global_quarantine_weight = float(
-            stats.get("runtime_global_birth_quarantine_weight", 0.0)
-        )
-        runtime_rescue_candidates = int(
-            stats.get("runtime_report_rescue_candidates", 0)
-        )
-        runtime_rescue_sources = int(stats.get("runtime_report_rescue_sources", 0))
-        runtime_rescue_injected = int(stats.get("runtime_report_rescue_injected", 0))
-        runtime_rescue_weight = float(stats.get("runtime_report_rescue_weight", 0.0))
-        verification_queue_sources = int(
-            stats.get("candidate_verification_queue_sources", 0)
-        )
         birth_structural_eligible = int(stats.get("birth_structural_eligible", 0))
         pseudo_verified = int(stats.get("pseudo_source_verified", 0))
         pseudo_failed = int(stats.get("pseudo_source_failed", 0))
@@ -3961,29 +3679,7 @@ def _log_pf_diagnostics(
             f"birth_residual_distinct_stations={birth_gate_stations} "
             f"birth_residual_chi2={birth_gate_chi2:.2f} "
             f"birth_residual_p={birth_gate_p:.3g} "
-            f"birth_refit_gate={birth_refit_gate} "
-            f"birth_refit_fraction={birth_refit_fraction:.3f} "
             f"birth_layer={birth_layer} "
-            f"birth_forced_attempts={birth_forced_attempts} "
-            f"birth_forced_accepts={birth_forced_accepts} "
-            f"birth_forced_mask_relax={birth_forced_mask_relaxations} "
-            f"birth_forced_no_candidate={birth_forced_no_candidate} "
-            f"birth_forced_rejected={birth_forced_rejected} "
-            f"birth_forced_best_delta={_fmt_optional_float(birth_forced_best_delta)} "
-            f"birth_global_candidates={birth_global_candidates} "
-            f"birth_global_attempts={birth_global_attempts} "
-            f"birth_global_accepts={birth_global_accepts} "
-            f"birth_global_rejected={birth_global_rejected} "
-            f"birth_global_best_delta={_fmt_optional_float(birth_global_best_delta)} "
-            f"runtime_global_birth_quarantine_candidates={global_quarantine_candidates} "
-            f"runtime_global_birth_quarantine_sources={global_quarantine_sources} "
-            f"runtime_global_birth_quarantine_injected={global_quarantine_injected} "
-            f"runtime_global_birth_quarantine_weight={global_quarantine_weight:.3f} "
-            f"runtime_report_rescue_candidates={runtime_rescue_candidates} "
-            f"runtime_report_rescue_sources={runtime_rescue_sources} "
-            f"runtime_report_rescue_injected={runtime_rescue_injected} "
-            f"runtime_report_rescue_weight={runtime_rescue_weight:.3f} "
-            f"verification_queue_sources={verification_queue_sources} "
             f"birth_structural_eligible={birth_structural_eligible} "
             f"pseudo_verified={pseudo_verified} "
             f"pseudo_failed={pseudo_failed} "
@@ -4042,72 +3738,6 @@ def _log_pf_diagnostics(
             print(f"[step {step_index}] pf[{iso}] top_k={_fmt_top_k(top_entries)}")
 
 
-def _log_report_model_order_diagnostics(
-    estimator: RotatingShieldPFEstimator,
-    step_index: int,
-    *,
-    label: str,
-) -> None:
-    """Log report-level model-order selection diagnostics."""
-    if _pure_pf_profile_active(estimator):
-        return
-    if not hasattr(estimator, "report_model_order_diagnostics"):
-        return
-    diagnostics = estimator.report_model_order_diagnostics()
-    if not diagnostics:
-        print(f"[step {step_index}] report_model_order[{label}]: no diagnostics")
-        return
-    for iso, stats_raw in sorted(diagnostics.items()):
-        stats = dict(stats_raw)
-        candidate_count = int(stats.get("candidate_count", 0))
-        selected_count = int(stats.get("selected_count", 0))
-        method = str(stats.get("method", "unknown"))
-        ready = bool(stats.get("model_order_ready", False))
-        margin = stats.get("criterion_margin_to_simpler")
-        runner_margin = stats.get("criterion_margin_to_runner_up")
-        condition = stats.get("condition_number")
-        max_corr = stats.get("selected_max_response_correlation")
-        signal_total = stats.get("observed_signal_total_counts")
-        signal_snr = stats.get("observed_signal_snr")
-        residual_fraction = stats.get("selected_positive_residual_fraction")
-        zero_margin = stats.get("zero_source_ready_margin")
-        count_supported_zero = bool(stats.get("count_supported_zero_source", False))
-        evaluated = int(stats.get("evaluated_subsets", 0))
-        workers = int(stats.get("workers", 1))
-        eval_mode = str(stats.get("evaluation_mode", "unknown"))
-        selected_indices = stats.get("selected_indices", [])
-        best_by_k = stats.get("best_by_k", {})
-        best_by_k_chunks: list[str] = []
-        if isinstance(best_by_k, dict):
-            for k, entry_raw in sorted(
-                best_by_k.items(),
-                key=lambda item: (
-                    int(item[0]) if str(item[0]).lstrip("-").isdigit() else 10**9
-                ),
-            ):
-                entry = dict(entry_raw) if isinstance(entry_raw, dict) else {}
-                best_by_k_chunks.append(
-                    f"k{k}:crit={_fmt_optional_float(entry.get('criterion'))}"
-                    f",ll={_fmt_optional_float(entry.get('ll'))}"
-                    f",cond={_fmt_optional_float(entry.get('condition_number'))}"
-                )
-        print(
-            f"[step {step_index}] report_model_order[{iso}] label={label} "
-            f"method={method} ready={ready} candidates={candidate_count} "
-            f"selected={selected_count} selected_indices={selected_indices} "
-            f"margin_to_simpler={_fmt_optional_float(margin)} "
-            f"margin_to_runner_up={_fmt_optional_float(runner_margin)} "
-            f"condition={_fmt_optional_float(condition)} "
-            f"max_response_corr={_fmt_optional_float(max_corr, 3)} "
-            f"signal_total={_fmt_optional_float(signal_total, 3)} "
-            f"signal_snr={_fmt_optional_float(signal_snr, 3)} "
-            f"residual_frac={_fmt_optional_float(residual_fraction, 3)} "
-            f"zero_ready_margin={_fmt_optional_float(zero_margin, 3)} "
-            f"count_supported_zero={count_supported_zero} "
-            f"evaluated_subsets={evaluated} workers={workers} "
-            f"evaluation_mode={eval_mode} "
-            f"best_by_k=[{'; '.join(best_by_k_chunks)}]"
-        )
 
 
 def _log_surface_candidate_observability_diagnostics(
@@ -4517,12 +4147,9 @@ def _nearest_truth_diagnostic(
 
 
 def _active_state_for_diagnostics(filt: object) -> object | None:
-    """Return the current MAP state with quarantined sources removed when possible."""
+    """Return the current MAP state for PF diagnostics."""
     try:
-        state = filt.best_particle().state
-        if hasattr(filt, "state_without_quarantined_sources"):
-            state = filt.state_without_quarantined_sources(state)
-        return state
+        return filt.best_particle().state
     except (AttributeError, IndexError, RuntimeError, ValueError):
         return None
 
@@ -4903,8 +4530,6 @@ def _log_posterior_truth_mass_diagnostics(
             finite_nn_mass = 0.0
             for weight, particle in zip(weights, filt.continuous_particles):
                 state = particle.state
-                if hasattr(filt, "state_without_quarantined_sources"):
-                    state = filt.state_without_quarantined_sources(state)
                 positions, strengths, _ = _state_source_arrays(state)
                 if positions.size == 0:
                     no_source_mass += float(weight)
@@ -5124,15 +4749,7 @@ def _log_particle_cloud_diagnostics(
                 slot_positions.append(raw_positions[slot_idx])
                 slot_strengths.append(float(raw_strengths[slot_idx]))
                 slot_weights.append(source_weight)
-                active_mask = (
-                    filt._active_source_mask(state, include_quarantined=False)
-                    if hasattr(filt, "_active_source_mask")
-                    else np.ones(count, dtype=bool)
-                )
-                runtime_active = bool(
-                    slot_idx < active_mask.size and active_mask[slot_idx]
-                )
-                slot_runtime_weights.append(source_weight if runtime_active else 0.0)
+                slot_runtime_weights.append(source_weight)
                 ages = _metadata_value_array(state, "ages", count, fill=0, dtype=int)
                 tentative = _metadata_value_array(
                     state,
@@ -5324,18 +4941,12 @@ def _birth_support_detail_counts(
 def _birth_rejection_reason(
     *,
     support: bool,
-    corr: bool,
-    condition: bool,
     distance: bool,
     score_valid: bool,
 ) -> str:
     """Return the first failed birth-candidate diagnostic gate."""
     if not support:
         return "support_gate_failed"
-    if not corr:
-        return "response_correlation_gate_failed"
-    if not condition:
-        return "response_condition_gate_failed"
     if not distance:
         return "distance_gate_failed"
     if not score_valid:
@@ -5365,7 +4976,7 @@ def _log_birth_candidate_diagnostics(
     for isotope, filt in sorted(estimator.filters.items()):
         data = estimator._measurement_data_for_iso(
             isotope,
-            getattr(filt.config, "birth_window", None),
+            None,
         )
         if data is None or data.z_k.size == 0:
             print(f"[step {step_index}] birth_candidates[{isotope}]: no data")
@@ -5409,16 +5020,6 @@ def _log_birth_candidate_diagnostics(
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
         )
-        corr_mask = filt._birth_existing_response_correlation_mask(
-            candidate_counts=candidate_counts,
-            existing_response_counts=existing_unit,
-            observation_variances=data.observation_variances,
-        )
-        condition_mask = filt._birth_response_condition_mask(
-            candidate_counts=candidate_counts,
-            existing_response_counts=existing_unit,
-            observation_variances=data.observation_variances,
-        )
         distance_mask = np.ones(candidates_all.shape[0], dtype=bool)
         if positions.size:
             distances = np.linalg.norm(
@@ -5436,7 +5037,7 @@ def _log_birth_candidate_diagnostics(
         score_valid = (
             np.isfinite(scores) & np.isfinite(q_hat) & (scores > 0.0) & (q_hat > 0.0)
         )
-        keep = support_mask & corr_mask & condition_mask & distance_mask & score_valid
+        keep = support_mask & distance_mask & score_valid
         support_counts, view_counts, station_counts = _birth_support_detail_counts(
             filt,
             candidate_counts=candidate_counts,
@@ -5468,8 +5069,6 @@ def _log_birth_candidate_diagnostics(
             f"logged={order.size} residual_sum={residual_sum:.3f} "
             f"residual_max={float(np.max(residual)) if residual.size else 0.0:.3f} "
             f"support_pass={int(np.sum(support_mask))} "
-            f"corr_pass={int(np.sum(corr_mask))} "
-            f"condition_pass={int(np.sum(condition_mask))} "
             f"distance_pass={int(np.sum(distance_mask))} "
             f"score_valid={int(np.sum(score_valid))} "
             f"kept={int(np.sum(keep))} "
@@ -5481,8 +5080,6 @@ def _log_birth_candidate_diagnostics(
             pos = candidates_all[idx]
             reason = _birth_rejection_reason(
                 support=bool(support_mask[idx]),
-                corr=bool(corr_mask[idx]),
-                condition=bool(condition_mask[idx]),
                 distance=bool(distance_mask[idx]),
                 score_valid=bool(score_valid[idx]),
             )
@@ -5504,8 +5101,7 @@ def _log_birth_candidate_diagnostics(
                 f"support_count={int(support_counts[idx]) if idx < support_counts.size else 0} "
                 f"view_count={int(view_counts[idx]) if idx < view_counts.size else 0} "
                 f"station_count={int(station_counts[idx]) if idx < station_counts.size else 0} "
-                f"corr_pass={bool(corr_mask[idx])} max_corr={float(max_corr[idx]):.6g} "
-                f"condition_pass={bool(condition_mask[idx])} "
+                f"max_response_corr={float(max_corr[idx]):.6g} "
                 f"distance_pass={bool(distance_mask[idx])} "
                 f"nearest_truth={truth_diag.get('nearest_truth_index')} "
                 f"truth_d={_fmt_optional_float(truth_diag.get('nearest_truth_distance_m'))}m "
@@ -5810,23 +5406,6 @@ def _coerce_live_visualization(live: bool) -> bool:
     return True
 
 
-def _resolve_display_prune_refresh_interval(
-    runtime_config: dict[str, object],
-) -> int:
-    """Return the measurement interval for expensive display-only pruning."""
-    raw_value = runtime_config.get(
-        "display_pruned_estimates_every",
-        runtime_config.get("display_prune_refresh_every", 1),
-    )
-    try:
-        interval = int(raw_value)
-    except (TypeError, ValueError):
-        interval = 1
-    if interval <= 0:
-        return 0
-    return interval
-
-
 def _resolve_structural_trial_parallelism(
     runtime_config: Mapping[str, object],
 ) -> tuple[int, int]:
@@ -5840,21 +5419,6 @@ def _resolve_structural_trial_parallelism(
     except (TypeError, ValueError):
         min_trials = 8
     return max(1, workers), max(1, min_trials)
-
-
-def _should_refresh_display_pruned_estimates(
-    *,
-    step_index: int,
-    refresh_every: int,
-    cache_available: bool,
-    force_refresh: bool,
-) -> bool:
-    """Return whether display-only pruned estimates should be recomputed."""
-    if int(refresh_every) <= 0:
-        return False
-    if force_refresh or not cache_available:
-        return True
-    return int(step_index) % max(1, int(refresh_every)) == 0
 
 
 def _resolve_plot_save_interval(
@@ -6212,64 +5776,8 @@ def _build_measurement_workspace(
     return workspace, diagnostics
 
 
-def _surface_map_spacing_from_runtime_config(
-    runtime_config: Mapping[str, object],
-) -> tuple[float, float, float]:
-    """Return validated x/y/z patch spacing for final surface reconstruction."""
-    raw_spacing = runtime_config.get("surface_map_spacing_m", 1.0)
-    spacing = np.asarray(raw_spacing, dtype=float).reshape(-1)
-    if spacing.size == 1:
-        spacing = np.repeat(spacing, 3)
-    if spacing.shape != (3,) or np.any(~np.isfinite(spacing)) or np.any(spacing <= 0.0):
-        raise ValueError(
-            "surface_map_spacing_m must be a positive scalar or three-vector."
-        )
-    return tuple(float(value) for value in spacing)
 
 
-def _surface_map_config_from_runtime_config(
-    runtime_config: Mapping[str, object],
-) -> SurfaceMapConfig:
-    """Build the PF-independent L1+TV surface solver configuration."""
-    from pf.surface_map import SurfaceMapConfig
-
-    return SurfaceMapConfig(
-        l1_weight=max(0.0, float(runtime_config.get("surface_map_l1_weight", 0.0))),
-        tv_weight=max(0.0, float(runtime_config.get("surface_map_tv_weight", 0.0))),
-        nuisance_l1_weight=max(
-            0.0,
-            float(runtime_config.get("surface_map_nuisance_l1_weight", 0.0)),
-        ),
-        nuisance_l2_weight=max(
-            0.0,
-            float(runtime_config.get("surface_map_nuisance_l2_weight", 0.0)),
-        ),
-        max_iterations=max(
-            1,
-            int(runtime_config.get("surface_map_max_iterations", 4000)),
-        ),
-        tolerance=max(
-            0.0,
-            float(runtime_config.get("surface_map_tolerance", 1.0e-6)),
-        ),
-        objective_tolerance=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "surface_map_objective_tolerance",
-                    1.0e-7,
-                )
-            ),
-        ),
-        check_interval=max(
-            1,
-            int(runtime_config.get("surface_map_check_interval", 20)),
-        ),
-        max_spectrum_bins=max(
-            0,
-            int(runtime_config.get("surface_map_max_spectrum_bins", 0)),
-        ),
-    )
 
 
 def _count_error_model_diagnostics(
@@ -6315,202 +5823,11 @@ def _count_error_model_diagnostics(
             "spectrum_relative_sigma": pf_config.spectrum_count_rel_sigma,
             "spectrum_absolute_sigma": pf_config.spectrum_count_abs_sigma,
             "low_count_absolute_sigma": float(pf_config.low_count_abs_sigma),
-            "spectral_nuisance_enabled": bool(
-                pf_config.sparse_poisson_spectral_nuisance_enable
-            ),
             "obstacle_attenuation_active": bool(obstacle_attenuation_active),
         },
     }
 
 
-def _fit_final_surface_map(
-    estimator: RotatingShieldPFEstimator,
-    env: EnvironmentConfig,
-    obstacle_grid: ObstacleGrid | None,
-    runtime_config: Mapping[str, object],
-    *,
-    obstacle_height_m: float,
-) -> dict[str, object]:
-    """Run the optional final all-history surface reconstruction within a memory cap."""
-    enabled = bool(runtime_config.get("surface_map_reconstruction_enable", False))
-    if not enabled:
-        return {
-            "enabled": False,
-            "available": False,
-            "reason": "disabled",
-            "fit_time_s": None,
-            "solver_time_s": None,
-            "attempt_time_s": 0.0,
-        }
-    attempt_started_at = time.perf_counter()
-    solver_started_at: float | None = None
-    configured_isotopes = tuple(
-        str(isotope)
-        for isotope in getattr(
-            estimator,
-            "all_isotopes",
-            getattr(estimator, "isotopes", ()),
-        )
-    )
-    memory_guard_isotope_count = max(1, len(configured_isotopes))
-
-    def _timing_payload(*, solver_completed: bool = False) -> dict[str, float | None]:
-        """Return elapsed wrapper and solver times for every exit path."""
-        now = time.perf_counter()
-        solver_elapsed = (
-            None
-            if solver_started_at is None
-            else max(0.0, float(now - solver_started_at))
-        )
-        return {
-            "attempt_time_s": max(0.0, float(now - attempt_started_at)),
-            "solver_time_s": solver_elapsed,
-            "fit_time_s": solver_elapsed if solver_completed else None,
-        }
-
-    try:
-        spacing = _surface_map_spacing_from_runtime_config(runtime_config)
-        solver_config = _surface_map_config_from_runtime_config(runtime_config)
-        spectral_records = [
-            record
-            for record in estimator.measurements
-            if record.spectrum_counts is not None
-        ]
-        if not spectral_records:
-            return {
-                "enabled": True,
-                "available": False,
-                "reason": "no_spectral_history",
-                "spacing_m": [float(value) for value in spacing],
-                **_timing_payload(),
-            }
-        raw_maximum_bin_count = max(
-            (len(record.spectrum_counts) for record in spectral_records),
-            default=0,
-        )
-        maximum_bin_count_config = int(solver_config.max_spectrum_bins)
-        if maximum_bin_count_config <= 0:
-            maximum_bin_count = int(raw_maximum_bin_count)
-        else:
-            maximum_bin_count = min(
-                int(raw_maximum_bin_count),
-                int(maximum_bin_count_config),
-            )
-        estimated_patch_count = estimate_surface_patch_count_upper_bound(
-            env,
-            obstacle_grid,
-            spacing,
-            obstacle_height_m=float(obstacle_height_m),
-        )
-        max_patch_count = max(
-            0,
-            int(runtime_config.get("surface_map_max_patch_count", 100_000)),
-        )
-        if max_patch_count and estimated_patch_count > max_patch_count:
-            return {
-                "enabled": True,
-                "available": False,
-                "reason": "patch_memory_budget_exceeded",
-                "estimated_patch_count_upper_bound": int(estimated_patch_count),
-                "max_patch_count": int(max_patch_count),
-                "spacing_m": [float(value) for value in spacing],
-                **_timing_payload(),
-            }
-        response_elements = (
-            len(spectral_records)
-            * int(maximum_bin_count)
-            * int(estimated_patch_count)
-            * memory_guard_isotope_count
-        )
-        # Cover the response tensor, density-scaled matrix, validation temporaries,
-        # and one full-array allocation margin during construction or optimization.
-        peak_array_multiplier = 4
-        peak_response_elements = response_elements * peak_array_multiplier
-        max_response_elements = max(
-            0,
-            int(
-                runtime_config.get(
-                    "surface_map_max_response_elements",
-                    50_000_000,
-                )
-            ),
-        )
-        if max_response_elements and peak_response_elements > max_response_elements:
-            return {
-                "enabled": True,
-                "available": False,
-                "reason": "response_memory_budget_exceeded",
-                "estimated_patch_count_upper_bound": int(estimated_patch_count),
-                "estimated_response_elements": int(response_elements),
-                "estimated_response_bytes_float64": int(response_elements * 8),
-                "estimated_peak_response_elements": int(peak_response_elements),
-                "estimated_peak_response_bytes_float64": int(
-                    peak_response_elements * 8
-                ),
-                "response_peak_array_multiplier": int(peak_array_multiplier),
-                "max_response_elements": int(max_response_elements),
-                "raw_maximum_spectrum_bin_count": int(raw_maximum_bin_count),
-                "maximum_spectrum_bin_count_for_memory_guard": int(maximum_bin_count),
-                "spacing_m": [float(value) for value in spacing],
-                "isotope_count_for_memory_guard": int(memory_guard_isotope_count),
-                **_timing_payload(),
-            }
-        patches = build_surface_patch_dictionary(
-            env,
-            obstacle_grid,
-            spacing,
-            obstacle_height_m=float(obstacle_height_m),
-        )
-        response_elements = (
-            len(spectral_records)
-            * int(maximum_bin_count)
-            * int(patches.patch_count)
-            * memory_guard_isotope_count
-        )
-        peak_response_elements = response_elements * peak_array_multiplier
-        solver_started_at = time.perf_counter()
-        payload = dict(
-            estimator.fit_surface_map(
-                patches,
-                config=solver_config,
-            )
-        )
-        payload.update(
-            {
-                "enabled": True,
-                "estimated_response_elements": int(response_elements),
-                "estimated_response_bytes_float64": int(response_elements * 8),
-                "estimated_peak_response_elements": int(peak_response_elements),
-                "estimated_peak_response_bytes_float64": int(
-                    peak_response_elements * 8
-                ),
-                "response_peak_array_multiplier": int(peak_array_multiplier),
-                "max_response_elements": int(max_response_elements),
-                "max_patch_count": int(max_patch_count),
-                "raw_maximum_spectrum_bin_count": int(raw_maximum_bin_count),
-                "maximum_spectrum_bin_count_for_memory_guard": int(maximum_bin_count),
-                "isotope_count_for_memory_guard": int(memory_guard_isotope_count),
-                "spacing_m": [float(value) for value in spacing],
-                **_timing_payload(solver_completed=True),
-            }
-        )
-        return payload
-    except MemoryError:
-        return {
-            "enabled": True,
-            "available": False,
-            "reason": "surface_map_memory_error",
-            "error": "memory_allocation_failed",
-            **_timing_payload(),
-        }
-    except (RuntimeError, TypeError, ValueError) as exc:
-        return {
-            "enabled": True,
-            "available": False,
-            "reason": "surface_map_error",
-            "error": str(exc),
-            **_timing_payload(),
-        }
 
 
 def _compute_ig_grid(
@@ -7420,12 +6737,6 @@ def _restore_remaining_measurement_history(
             + float(config.verification_weight)
             * components.get("pseudo_source_verification", 0.0)
             + float(config.residual_weight) * components.get("residual", 0.0)
-            + float(config.report_response_correlation_weight)
-            * components.get("report_response_correlation", 0.0)
-            + float(config.report_residual_weight)
-            * components.get("report_residual", 0.0)
-            + float(config.strength_absorption_weight)
-            * components.get("strength_absorption", 0.0)
             + float(config.high_surface_ambiguity_weight)
             * components.get("high_surface_ambiguity", 0.0)
             + components.get("isotope_absence", 0.0)
@@ -7864,68 +7175,30 @@ def _adaptive_mission_stop_reason(
     require_pf_convergence_for_coverage: bool = False,
     require_no_unresolved_discriminative_failures: bool = True,
     unresolved_discriminative_failure_min_count: int = 1,
-    require_model_order_ready: bool = True,
+    require_pf_cardinality_ready: bool = True,
     remaining_measurement_estimate: Mapping[str, Any] | None = None,
     require_remaining_measurement_ready: bool = True,
-    allow_report_simple_stop: bool = True,
-    report_simple_max_sources_per_isotope: int = 1,
-    report_simple_min_bic_margin: float = 10.0,
-    report_simple_max_condition_number: float = 100.0,
-    report_simple_max_response_correlation: float = 0.98,
-    report_simple_residual_budget_threshold: float = 1.0e-9,
-    report_simple_ambiguity_budget_threshold: float = 1.0e-9,
-    report_simple_allow_high_surface_ambiguity: bool = False,
 ) -> str | None:
     """Return an adaptive mission-stop reason when exploration is sufficiently complete."""
     if len(visited_poses_xyz) < max(1, int(min_poses)):
-        return None
-    pure_pf = _pure_pf_profile_active(estimator)
-    report_simple_ready = (
-        not pure_pf
-        and bool(allow_report_simple_stop)
-        and (
-            _report_model_order_simple_ready_for_stop(
-                estimator,
-                remaining_measurement_estimate=remaining_measurement_estimate,
-                max_sources_per_isotope=int(report_simple_max_sources_per_isotope),
-                min_bic_margin=float(report_simple_min_bic_margin),
-                max_condition_number=float(report_simple_max_condition_number),
-                max_response_correlation=float(report_simple_max_response_correlation),
-                residual_budget_threshold=float(
-                    report_simple_residual_budget_threshold
-                ),
-                ambiguity_budget_threshold=float(
-                    report_simple_ambiguity_budget_threshold
-                ),
-                allow_high_surface_ambiguity=bool(
-                    report_simple_allow_high_surface_ambiguity
-                ),
-                require_no_birth_residual=False,
-                birth_residual_min_support=int(birth_residual_min_support),
-                refresh_estimates=False,
-            )
-        )
-    )
-    report_ready = pure_pf or _report_model_order_ready_for_stop(
-        estimator, refresh_estimates=False
-    )
-    if bool(require_model_order_ready) and not (report_ready or report_simple_ready):
         return None
     if bool(require_no_unresolved_discriminative_failures) and (
         _has_unresolved_discriminative_pseudo_failures(
             estimator,
             min_count=int(unresolved_discriminative_failure_min_count),
         )
-        and not report_simple_ready
     ):
+        return None
+    cardinality_ready, _cardinality_reason = _source_cardinality_dwell_status(
+        estimator,
+        refresh_estimates=False,
+    )
+    if bool(require_pf_cardinality_ready) and not cardinality_ready:
         return None
     if bool(require_remaining_measurement_ready) and not (
         _remaining_measurement_ready_for_stop(remaining_measurement_estimate)
-        or report_simple_ready
     ):
         return None
-    if report_simple_ready:
-        return "report_simple_model_order"
     if _all_pf_filters_converged(estimator, refresh_estimates=False):
         if bool(require_quiet_birth_residual) and _has_birth_residual_evidence(
             estimator,
@@ -7949,10 +7222,6 @@ def _adaptive_mission_stop_reason(
             min_support=int(birth_residual_min_support),
         ):
             return None
-        if not pure_pf and not _report_model_order_ready_for_stop(
-            estimator, refresh_estimates=False
-        ):
-            return None
         if bool(
             require_pf_convergence_for_coverage
         ) and not estimator.should_stop_exploration(
@@ -7971,7 +7240,7 @@ def _adaptive_mission_stop_reason(
 
 
 def _posterior_cardinality_summary(filt: object) -> tuple[float, float]:
-    """Return posterior mean and variance of non-quarantined source count."""
+    """Return posterior mean and variance of physical PF source count."""
     particles = list(getattr(filt, "continuous_particles", []) or [])
     if not particles:
         return 0.0, 0.0
@@ -7989,8 +7258,6 @@ def _posterior_cardinality_summary(filt: object) -> tuple[float, float]:
         if state is None:
             counts.append(0.0)
             continue
-        if hasattr(filt, "state_without_quarantined_sources"):
-            state = filt.state_without_quarantined_sources(state)
         counts.append(float(max(0, int(getattr(state, "num_sources", 0)))))
     counts_arr = np.asarray(counts, dtype=float)
     mean = float(np.sum(weights * counts_arr))
@@ -7998,38 +7265,6 @@ def _posterior_cardinality_summary(filt: object) -> tuple[float, float]:
     return mean, variance
 
 
-def _report_model_order_matches_posterior(estimator: object) -> bool:
-    """Return True when report-level source count agrees with PF cardinality."""
-    if _pure_pf_profile_active(estimator):
-        return True
-    pf_config = getattr(estimator, "pf_config", None)
-    if not bool(getattr(pf_config, "report_model_order_require_posterior_match", True)):
-        return True
-    if not hasattr(estimator, "report_model_order_diagnostics"):
-        return True
-    diagnostics = estimator.report_model_order_diagnostics()
-    if not diagnostics:
-        return True
-    filters = getattr(estimator, "filters", {})
-    tolerance = 0.25
-    for isotope, stats in diagnostics.items():
-        filt = filters.get(isotope) if isinstance(filters, dict) else None
-        if filt is None:
-            continue
-        candidate_count = int(stats.get("candidate_count", 0))
-        selected_count = int(stats.get("selected_count", 0))
-        if max(candidate_count, selected_count) <= 1:
-            continue
-        mean_count, variance = _posterior_cardinality_summary(filt)
-        var_limit = max(
-            float(getattr(pf_config, "converge_cardinality_var_max", 0.05)),
-            0.0,
-        )
-        if variance > var_limit + 1.0e-9:
-            return False
-        if abs(mean_count - float(selected_count)) > tolerance:
-            return False
-    return True
 
 
 def _all_pf_filters_converged(
@@ -8038,6 +7273,7 @@ def _all_pf_filters_converged(
     refresh_estimates: bool = True,
 ) -> bool:
     """Return True when every enabled isotope PF reports convergence."""
+    del refresh_estimates
     pf_config = getattr(estimator, "pf_config", None)
     if not bool(getattr(pf_config, "converge_enable", False)):
         return False
@@ -8050,59 +7286,20 @@ def _all_pf_filters_converged(
             return False
         if not bool(getattr(filt, "is_converged", False)):
             return False
-    if not _pure_pf_profile_active(
-        estimator
-    ) and not _report_model_order_ready_for_stop(
-        estimator, refresh_estimates=bool(refresh_estimates)
-    ):
-        return False
-    if not _report_model_order_matches_posterior(estimator):
-        return False
     return True
 
 
 def _source_cardinality_dwell_status(
     estimator: RotatingShieldPFEstimator,
     *,
-    min_candidate_count: int,
-    max_condition_number: float,
-    min_bic_margin: float,
     refresh_estimates: bool = True,
 ) -> tuple[bool, str]:
-    """
-    Return whether isotope-count readiness is enough for source-cardinality dwell.
-
-    Multi-source cases need more than isotope-level counts: the fixed-position
-    report model should have a stable model order and a reasonably conditioned
-    response matrix before adaptive dwell is allowed to stop at its minimum.
-    """
-    if _pure_pf_profile_active(estimator):
-        filters = getattr(estimator, "filters", {})
-        if not isinstance(filters, dict) or not filters:
-            return False, "no_pf_posterior"
-        variance_limit = max(
-            float(
-                getattr(
-                    getattr(estimator, "pf_config", None),
-                    "converge_cardinality_var_max",
-                    0.05,
-                )
-            ),
-            0.0,
-        )
-        pending = [
-            str(isotope)
-            for isotope, filt in sorted(filters.items())
-            if _posterior_cardinality_summary(filt)[1] > variance_limit + 1.0e-9
-        ]
-        if pending:
-            return False, f"pf_cardinality_variance:{','.join(pending)}"
-        return True, "pf_cardinality_ready"
+    """Return whether PF structural evidence supports ending adaptive dwell."""
     if bool(refresh_estimates):
         try:
             estimator.estimates()
         except RuntimeError:
-            return False, "model_order_unavailable"
+            return False, "pf_posterior_unavailable"
     unresolved_getter = getattr(estimator, "unresolved_structural_evidence", None)
     if callable(unresolved_getter):
         try:
@@ -8112,106 +7309,24 @@ def _source_cardinality_dwell_status(
         if isinstance(unresolved, dict) and unresolved:
             labels = ",".join(str(key) for key in sorted(unresolved))
             return False, f"unresolved_structural:{labels}"
-    diagnostics_getter = getattr(estimator, "report_model_order_diagnostics", None)
-    if not callable(diagnostics_getter):
-        return False, "no_model_order_diagnostics"
-    try:
-        diagnostics = diagnostics_getter()
-    except (RuntimeError, ValueError, TypeError):
-        return False, "model_order_unavailable"
-    if not diagnostics:
-        return False, "no_model_order_diagnostics"
-    min_count = max(2, int(min_candidate_count))
-    max_condition = max(float(max_condition_number), 0.0)
-    min_margin = max(float(min_bic_margin), 0.0)
-    pending: list[str] = []
     filters = getattr(estimator, "filters", {})
+    if not isinstance(filters, dict) or not filters:
+        return False, "no_pf_posterior"
     pf_config = getattr(estimator, "pf_config", None)
-    require_posterior_match = bool(
-        getattr(pf_config, "report_model_order_require_posterior_match", True)
-    )
-    posterior_tolerance = 0.25
-    var_limit = max(
+    variance_limit = max(
         float(getattr(pf_config, "converge_cardinality_var_max", 0.05)),
         0.0,
     )
-    for isotope, stats in sorted(diagnostics.items()):
-        candidate_count = int(stats.get("candidate_count", 0))
-        selected_count = int(stats.get("selected_count", 0))
-        has_count_evidence = _report_stats_have_count_evidence(stats, pf_config)
-        active_count = (
-            max(candidate_count, selected_count)
-            if selected_count > 0 or has_count_evidence
-            else 0
-        )
-        filt = filters.get(isotope) if isinstance(filters, dict) else None
-        if active_count >= min_count:
-            if not bool(stats.get("model_order_ready", False)):
-                pending.append(f"{isotope}:model_order")
-                continue
-            condition = float(stats.get("condition_number", 1.0))
-            if max_condition > 0.0 and condition > max_condition:
-                pending.append(f"{isotope}:condition={condition:.3g}")
-                continue
-            margin = float(stats.get("criterion_margin_to_simpler", float("inf")))
-            if selected_count > 1 and np.isfinite(margin) and margin < min_margin:
-                pending.append(f"{isotope}:bic_margin={margin:.3g}")
-                continue
-        if filt is not None and require_posterior_match and active_count > 0:
-            mean_count, variance = _posterior_cardinality_summary(filt)
-            if variance > var_limit + 1.0e-9:
-                pending.append(f"{isotope}:posterior_cardinality_var={variance:.3g}")
-                continue
-            if (
-                selected_count > 0
-                and abs(mean_count - float(selected_count)) > posterior_tolerance
-            ):
-                pending.append(
-                    f"{isotope}:posterior_cardinality={mean_count:.3g}!={selected_count}"
-                )
-                continue
-            filt_config = getattr(filt, "config", pf_config)
-            max_sources = getattr(filt_config, "max_sources", None)
-            if (
-                bool(getattr(filt_config, "birth_enable", False))
-                and max_sources is not None
-                and int(max_sources) > 1
-                and active_count < min_count
-                and mean_count > 1.0 + posterior_tolerance
-            ):
-                pending.append(
-                    f"{isotope}:posterior_multisource_without_report={mean_count:.3g}"
-                )
+    pending = [
+        str(isotope)
+        for isotope, filt in sorted(filters.items())
+        if _posterior_cardinality_summary(filt)[1] > variance_limit + 1.0e-9
+    ]
     if pending:
-        return False, ",".join(pending)
-    return True, "model_order_ready"
+        return False, f"pf_cardinality_variance:{','.join(pending)}"
+    return True, "pf_cardinality_ready"
 
 
-def _report_stats_have_count_evidence(
-    stats: Mapping[str, Any],
-    pf_config: Any,
-) -> bool:
-    """Return True when report diagnostics contain count-supported evidence."""
-    if bool(stats.get("count_supported_zero_source", False)):
-        return True
-    total_counts = float(stats.get("observed_signal_total_counts", 0.0))
-    max_count = float(stats.get("observed_signal_max_count", 0.0))
-    signal_snr = float(stats.get("observed_signal_snr", 0.0))
-    total_floor = max(
-        float(getattr(pf_config, "structural_update_min_counts", 25.0)),
-        0.0,
-    )
-    max_floor = max(
-        float(getattr(pf_config, "conditional_strength_refit_min_count", 5.0)),
-        0.0,
-    )
-    snr_floor = max(float(getattr(pf_config, "structural_update_min_snr", 2.0)), 0.0)
-    count_floor_met = total_counts >= total_floor or max_count >= max_floor
-    if snr_floor <= 0.0:
-        return bool(count_floor_met)
-    if total_floor <= 0.0 and max_floor <= 0.0:
-        return bool(signal_snr >= snr_floor)
-    return bool(count_floor_met and signal_snr >= snr_floor)
 
 
 def _has_unresolved_discriminative_pseudo_failures(
@@ -8240,77 +7355,40 @@ def _has_unresolved_discriminative_pseudo_failures(
     return False
 
 
-def _final_model_order_status(estimator: object) -> dict[str, Any]:
-    """Return compact model-order and pseudo-source diagnostics for JSON output."""
-    if _pure_pf_profile_active(estimator):
-        getter = getattr(estimator, "posterior_cardinality_distribution", None)
-        distributions = dict(getter()) if callable(getter) else {}
-        cardinality: dict[str, dict[str, Any]] = {}
-        for isotope, distribution_raw in sorted(distributions.items()):
-            distribution = {
-                int(key): max(float(value), 0.0)
-                for key, value in dict(distribution_raw).items()
-            }
-            total = float(sum(distribution.values()))
-            if total > 0.0:
-                distribution = {
-                    key: value / total for key, value in distribution.items()
-                }
-            counts = np.asarray(list(distribution), dtype=float)
-            probabilities = np.asarray(list(distribution.values()), dtype=float)
-            mean = float(np.sum(counts * probabilities)) if counts.size else 0.0
-            variance = (
-                float(np.sum(probabilities * (counts - mean) ** 2))
-                if counts.size
-                else 0.0
-            )
-            positive = probabilities[probabilities > 0.0]
-            entropy = float(-np.sum(positive * np.log(positive)))
-            cardinality[str(isotope)] = {
-                "distribution": {
-                    str(key): float(value)
-                    for key, value in sorted(distribution.items())
-                },
-                "mean": mean,
-                "variance": variance,
-                "entropy_nats": entropy,
-            }
-        return {
-            "source": "pf_posterior",
-            "uses_batch_model_order": False,
-            "pf_cardinality": cardinality,
+def _final_pf_cardinality_status(estimator: object) -> dict[str, Any]:
+    """Return PF cardinality and unresolved structural evidence for JSON output."""
+    getter = getattr(estimator, "posterior_cardinality_distribution", None)
+    distributions = dict(getter()) if callable(getter) else {}
+    cardinality: dict[str, dict[str, Any]] = {}
+    for isotope, distribution_raw in sorted(distributions.items()):
+        distribution = {
+            int(key): max(float(value), 0.0)
+            for key, value in dict(distribution_raw).items()
         }
-    if hasattr(estimator, "estimates"):
-        try:
-            estimator.estimates()
-        except RuntimeError:
-            pass
-    diagnostics = {}
-    if hasattr(estimator, "report_model_order_diagnostics"):
-        diagnostics = dict(estimator.report_model_order_diagnostics())
-    ready_values = [
-        bool(stats.get("model_order_ready", False))
-        for stats in diagnostics.values()
-        if isinstance(stats, dict)
-    ]
-    condition_values = [
-        float(stats.get("condition_number", 0.0))
-        for stats in diagnostics.values()
-        if isinstance(stats, dict)
-        and np.isfinite(float(stats.get("condition_number", 0.0)))
-    ]
-    margin_values = [
-        float(stats.get("criterion_margin_to_simpler", float("inf")))
-        for stats in diagnostics.values()
-        if isinstance(stats, dict)
-        and np.isfinite(float(stats.get("criterion_margin_to_simpler", float("inf"))))
-    ]
-    response_corr_values = [
-        float(stats.get("selected_max_response_correlation", 0.0))
-        for stats in diagnostics.values()
-        if isinstance(stats, dict)
-        and np.isfinite(float(stats.get("selected_max_response_correlation", 0.0)))
-    ]
+        total = float(sum(distribution.values()))
+        if total > 0.0:
+            distribution = {
+                key: value / total for key, value in distribution.items()
+            }
+        counts = np.asarray(list(distribution), dtype=float)
+        probabilities = np.asarray(list(distribution.values()), dtype=float)
+        mean = float(np.sum(counts * probabilities)) if counts.size else 0.0
+        variance = (
+            float(np.sum(probabilities * (counts - mean) ** 2))
+            if counts.size
+            else 0.0
+        )
+        positive = probabilities[probabilities > 0.0]
+        entropy = float(-np.sum(positive * np.log(positive)))
+        cardinality[str(isotope)] = {
+            "distribution": {
+                str(key): float(value)
+                for key, value in sorted(distribution.items())
+            },
+            "mean": mean,
+            "variance": variance,
+            "entropy_nats": entropy,
+        }
     pseudo_by_isotope: dict[str, dict[str, Any]] = {}
     unresolved_reason_totals: dict[str, int] = {}
     unresolved_structural_evidence: dict[str, Any] = {}
@@ -8344,19 +7422,10 @@ def _final_model_order_status(estimator: object) -> dict[str, Any]:
                 ),
                 "fail_reasons": reason_payload,
             }
-    raw_ready = bool(all(ready_values)) if ready_values else False
     return {
-        "all_model_order_ready": bool(raw_ready and not unresolved_structural_evidence),
-        "all_model_order_ready_before_structural_gates": raw_ready,
-        "max_condition_number": (
-            float(max(condition_values)) if condition_values else None
-        ),
-        "min_bic_margin_to_simpler": (
-            float(min(margin_values)) if margin_values else None
-        ),
-        "max_response_correlation": (
-            float(max(response_corr_values)) if response_corr_values else None
-        ),
+        "source": "pf_posterior",
+        "all_structural_evidence_resolved": not unresolved_structural_evidence,
+        "pf_cardinality": cardinality,
         "unresolved_pseudo_source_reasons": unresolved_reason_totals,
         "unresolved_structural_evidence": unresolved_structural_evidence,
         "pseudo_source_verification": pseudo_by_isotope,
@@ -8826,27 +7895,6 @@ def _filter_count_covariance(
     return filtered
 
 
-def _count_covariance_has_offdiag(
-    covariance: Mapping[str, Mapping[str, float]] | None,
-) -> bool:
-    """Return True when a covariance payload contains cross-isotope covariance."""
-    if covariance is None:
-        return False
-    for row_iso, row_payload in covariance.items():
-        if not isinstance(row_payload, Mapping):
-            continue
-        row_key = str(row_iso)
-        for col_iso, value in row_payload.items():
-            if str(col_iso) == row_key:
-                continue
-            try:
-                if abs(float(value)) > 0.0:
-                    return True
-            except (TypeError, ValueError):
-                continue
-    return False
-
-
 def _metadata_count_covariance(
     metadata: Mapping[str, object],
     isotope_set: set[str] | None = None,
@@ -8860,6 +7908,57 @@ def _metadata_count_covariance(
     allowed = isotope_set if isotope_set is not None else {str(key) for key in payload}
     covariance = _filter_count_covariance(payload, allowed)
     return covariance
+
+
+def _complete_count_covariance(
+    variances: Mapping[str, float],
+    covariance: Mapping[str, Mapping[str, float]] | None,
+    isotopes: Sequence[str],
+) -> dict[str, dict[str, float]]:
+    """Return the symmetric covariance used identically by live PF and replay."""
+    isotope_order = [str(isotope) for isotope in isotopes]
+    matrix = np.diag(
+        [float(variances.get(isotope, 1.0)) for isotope in isotope_order]
+    ).astype(np.float64)
+    if isinstance(covariance, Mapping):
+        for row_index, row_isotope in enumerate(isotope_order):
+            row_payload = covariance.get(row_isotope, {})
+            if not isinstance(row_payload, Mapping):
+                continue
+            if row_isotope in row_payload:
+                value = float(row_payload[row_isotope])
+                if np.isfinite(value):
+                    matrix[row_index, row_index] = value
+        for row_index, row_isotope in enumerate(isotope_order):
+            row_payload = covariance.get(row_isotope, {})
+            if not isinstance(row_payload, Mapping):
+                row_payload = {}
+            for column_index in range(row_index + 1, len(isotope_order)):
+                column_isotope = isotope_order[column_index]
+                column_payload = covariance.get(column_isotope, {})
+                if not isinstance(column_payload, Mapping):
+                    column_payload = {}
+                pair_values = []
+                for payload, key in (
+                    (row_payload, column_isotope),
+                    (column_payload, row_isotope),
+                ):
+                    if key not in payload:
+                        continue
+                    value = float(payload[key])
+                    if np.isfinite(value):
+                        pair_values.append(value)
+                if pair_values:
+                    symmetric_value = float(np.mean(pair_values))
+                    matrix[row_index, column_index] = symmetric_value
+                    matrix[column_index, row_index] = symmetric_value
+    return {
+        row_isotope: {
+            column_isotope: float(matrix[row_index, column_index])
+            for column_index, column_isotope in enumerate(isotope_order)
+        }
+        for row_index, row_isotope in enumerate(isotope_order)
+    }
 
 
 def _store_count_covariance_metadata(
@@ -9214,9 +8313,9 @@ def _merge_adaptive_observation_chunks(
             _metadata_float(observation.metadata, key) for observation in observations
         ]
         finite_values = [value for value in values if value is not None]
-        sparse_counter = str(key).startswith("source_equivalent_counts_")
+        optional_counter = str(key).startswith("source_equivalent_counts_")
         if len(finite_values) == len(observations) or (
-            sparse_counter and finite_values
+            optional_counter and finite_values
         ):
             metadata[key] = float(sum(finite_values))
         elif key in metadata:
@@ -9762,10 +8861,6 @@ def run_live_pf(
     adaptive_ready_min_counts: float = 100.0,
     adaptive_ready_min_isotopes: int = 1,
     adaptive_ready_min_snr: float = 0.0,
-    adaptive_strength_prior: bool = True,
-    adaptive_strength_prior_steps: int = 3,
-    adaptive_strength_prior_min_counts: float = 3.0,
-    adaptive_strength_prior_log_sigma: float = 0.7,
     pose_min_observation_counts: float | None = None,
     pose_min_observation_penalty_scale: float = 1.0,
     pose_min_observation_aggregate: str = "max",
@@ -9836,13 +8931,9 @@ def run_live_pf(
         adaptive_ready_min_counts: Minimum count estimate per detected isotope.
         adaptive_ready_min_isotopes: Required number of detected isotopes for readiness.
         adaptive_ready_min_snr: Optional minimum count-estimate SNR for dwell readiness.
-        adaptive_strength_prior: Rescale early PF strengths from observed counts.
-        adaptive_strength_prior_steps: Number of first measurements used for strength rescaling.
-        adaptive_strength_prior_min_counts: Count floor for zero/weak observations.
-        adaptive_strength_prior_log_sigma: Proposal spread around count-matched strengths.
         pose_min_observation_counts: Minimum posterior-predicted counts per isotope
             used as a soft pose-selection constraint; None uses runtime config
-            or adaptive_strength_prior_min_counts.
+            or the configured observation-SNR floor.
         pose_min_observation_penalty_scale: Relative weight of the pose
             observability soft constraint.
         pose_min_observation_aggregate: Orientation aggregation for pose
@@ -9922,18 +9013,6 @@ def run_live_pf(
         float(
             runtime_config.get("adaptive_cardinality_min_live_s", adaptive_min_dwell_s)
         ),
-    )
-    adaptive_cardinality_min_candidate_count = max(
-        2,
-        int(runtime_config.get("adaptive_cardinality_min_candidate_count", 2)),
-    )
-    adaptive_cardinality_condition_max = max(
-        0.0,
-        float(runtime_config.get("adaptive_cardinality_condition_max", 0.0)),
-    )
-    adaptive_cardinality_min_bic_margin = max(
-        0.0,
-        float(runtime_config.get("adaptive_cardinality_min_bic_margin", 0.0)),
     )
     effective_robot_radius_m = _resolve_measurement_clearance_radius_m(
         runtime_config,
@@ -10364,9 +9443,6 @@ def run_live_pf(
         if cui_split_max_particles_raw is None
         else int(cui_split_max_particles_raw)
     )
-    display_prune_refresh_every = _resolve_display_prune_refresh_interval(
-        runtime_config,
-    )
     spectrum_plot_save_every = _resolve_plot_save_interval(
         runtime_config,
         "spectrum_plot_save_every",
@@ -10457,9 +9533,20 @@ def run_live_pf(
     pf_obstacle_attenuation_enabled = _pf_obstacle_attenuation_enabled(runtime_config)
     pf_obstacle_grid = _pf_obstacle_grid_for_runtime(obstacle_grid, runtime_config)
 
-    # Candidate sources: dense grid inside environment (used by birth proposals).
+    # Candidate sources: known environment surfaces used by birth proposals.
     spacing = candidate_grid_spacing or CANDIDATE_GRID_SPACING
     source_surface_prior = _source_surface_prior_enabled(runtime_config)
+    if source_surface_prior:
+        _validate_surface_constrained_sources(
+            sources,
+            env,
+            obstacle_grid,
+            obstacle_height_m=float(runtime_config.get("obstacle_height_m", 2.0)),
+            tolerance_m=max(
+                0.0,
+                float(runtime_config.get("posterior_surface_tolerance_m", 1.0e-5)),
+            ),
+        )
     source_position_min, source_position_max = _resolve_source_position_bounds(
         env,
         runtime_config,
@@ -10526,7 +9613,7 @@ def run_live_pf(
     active_isotopes: set[str] = set()
     last_candidates: set[str] = set()
     pf_detected_isotopes_only = bool(
-        runtime_config.get("pf_detected_isotopes_only", True)
+        runtime_config.get("pf_detected_isotopes_only", False)
     )
     pf_detection_activation_only = bool(
         runtime_config.get("pf_detected_isotope_activation_only", False)
@@ -10863,10 +9950,6 @@ def run_live_pf(
             0.0,
             float(_dss_value("correlation_reduction_weight", 0.0)),
         ),
-        lambda_cardinality_discrimination=max(
-            0.0,
-            float(_dss_value("cardinality_discrimination_weight", 0.0)),
-        ),
         lambda_isotope_balance=max(
             0.0,
             float(_dss_value("isotope_balance_weight", 0.0)),
@@ -11094,30 +10177,12 @@ def run_live_pf(
             0.0,
             float(_dss_value("remaining_route_frontier_weight", 0.5)),
         ),
-        cardinality_evidence_gap_target=max(
-            1.0e-12,
-            float(_dss_value("cardinality_evidence_gap_target", 10.0)),
-        ),
         same_isotope_direct_separation_guard=bool(
             _dss_value("same_isotope_direct_separation_guard", True)
         ),
         same_isotope_direct_separation_epsilon=max(
             0.0,
             float(_dss_value("same_isotope_direct_separation_epsilon", 1.0e-9)),
-        ),
-        include_runtime_rescue_modes=bool(
-            _dss_value("include_runtime_rescue_modes", True)
-        ),
-        runtime_rescue_mode_weight=max(
-            0.0,
-            float(_dss_value("runtime_rescue_mode_weight", 0.5)),
-        ),
-        include_global_surface_rescue_modes=bool(
-            _dss_value("include_global_surface_rescue_modes", True)
-        ),
-        global_surface_rescue_mode_weight=max(
-            0.0,
-            float(_dss_value("global_surface_rescue_mode_weight", 0.75)),
         ),
         recovery_isotope_mode_weight_multiplier=max(
             1.0,
@@ -11260,51 +10325,6 @@ def run_live_pf(
             0.0,
             float(_remaining_value("residual_weight", 1.0)),
         ),
-        report_response_correlation_weight=max(
-            0.0,
-            float(_remaining_value("report_response_correlation_weight", 1.0)),
-        ),
-        report_residual_weight=max(
-            0.0,
-            float(_remaining_value("report_residual_weight", 1.0)),
-        ),
-        strength_absorption_weight=max(
-            0.0,
-            float(_remaining_value("strength_absorption_weight", 0.5)),
-        ),
-        report_response_correlation_threshold=float(
-            np.clip(
-                float(
-                    _remaining_value(
-                        "report_response_correlation_threshold",
-                        0.9,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        report_positive_residual_fraction_threshold=max(
-            0.0,
-            float(
-                _remaining_value(
-                    "report_positive_residual_fraction_threshold",
-                    0.02,
-                )
-            ),
-        ),
-        report_strength_concentration_threshold=float(
-            np.clip(
-                float(
-                    _remaining_value(
-                        "report_strength_concentration_threshold",
-                        0.75,
-                    )
-                ),
-                1.0e-12,
-                1.0,
-            )
-        ),
         high_surface_ambiguity_weight=max(
             0.0,
             float(_remaining_value("high_surface_ambiguity_weight", 1.0)),
@@ -11324,10 +10344,6 @@ def run_live_pf(
                     _remaining_value("pairwise_separation_threshold", 9.0),
                 )
             ),
-        ),
-        high_surface_absorption_q_multiple=max(
-            1.0,
-            float(_remaining_value("high_surface_absorption_q_multiple", 2.0)),
         ),
         dss_information_gain_weight=max(
             0.0,
@@ -11353,10 +10369,6 @@ def run_live_pf(
         unresolved_absent_budget_weight=max(
             0.0,
             float(_remaining_value("unresolved_absent_budget_weight", 1.0)),
-        ),
-        residual_surface_gain_candidate_limit=max(
-            0,
-            int(_remaining_value("residual_surface_gain_candidate_limit", 2048)),
         ),
     )
     likelihood_runtime = runtime_config.get("pf_count_likelihood", {})
@@ -11571,8 +10583,8 @@ def run_live_pf(
             True,
         )
     )
-    mission_stop_require_model_order_ready = bool(
-        runtime_config.get("mission_stop_require_model_order_ready", True)
+    mission_stop_require_pf_cardinality_ready = bool(
+        runtime_config.get("mission_stop_require_pf_cardinality_ready", True)
     )
     mission_stop_require_remaining_measurement_ready = bool(
         runtime_config.get("mission_stop_require_remaining_measurement_ready", True)
@@ -11584,9 +10596,9 @@ def run_live_pf(
         0,
         int(runtime_config.get("mission_stop_soft_extension_poses", 4)),
     )
-    mission_stop_soft_extension_require_report_progress = bool(
+    mission_stop_soft_extension_require_progress = bool(
         runtime_config.get(
-            "mission_stop_soft_extension_require_report_progress",
+            "mission_stop_soft_extension_require_progress",
             True,
         )
     )
@@ -11601,61 +10613,6 @@ def run_live_pf(
                 ),
             )
         ),
-    )
-    mission_stop_report_simple_enable = bool(
-        runtime_config.get("mission_stop_report_simple_enable", True)
-    )
-    mission_stop_report_simple_max_sources_per_isotope = max(
-        0,
-        int(
-            runtime_config.get("mission_stop_report_simple_max_sources_per_isotope", 1)
-        ),
-    )
-    mission_stop_report_simple_min_bic_margin = max(
-        0.0,
-        float(runtime_config.get("mission_stop_report_simple_min_bic_margin", 10.0)),
-    )
-    mission_stop_report_simple_max_condition_number = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "mission_stop_report_simple_max_condition_number",
-                runtime_config.get("report_model_order_condition_max", 100.0),
-            )
-        ),
-    )
-    mission_stop_report_simple_max_response_correlation = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "mission_stop_report_simple_max_response_correlation",
-                runtime_config.get("report_model_order_response_corr_max", 0.98),
-            )
-        ),
-    )
-    mission_stop_report_simple_residual_budget_threshold = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "mission_stop_report_simple_residual_budget_threshold",
-                1.0e-9,
-            )
-        ),
-    )
-    mission_stop_report_simple_ambiguity_budget_threshold = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "mission_stop_report_simple_ambiguity_budget_threshold",
-                1.0e-9,
-            )
-        ),
-    )
-    mission_stop_report_simple_allow_high_surface_ambiguity = bool(
-        runtime_config.get(
-            "mission_stop_report_simple_allow_high_surface_ambiguity",
-            False,
-        )
     )
     simulation_runtime = create_simulation_runtime(
         sim_backend,
@@ -11761,16 +10718,6 @@ def run_live_pf(
         init_strength_min,
         init_strength_max,
     ) = _resolve_pf_initial_strength_prior(runtime_config)
-    death_strength_threshold = max(
-        _runtime_float(
-            runtime_config,
-            "death_strength_threshold_cps_1m",
-            init_strength_min
-            if init_strength_prior in {"uniform", "log_uniform"}
-            else 0.0,
-        ),
-        0.0,
-    )
     parallel_isotope_workers_raw = runtime_config.get(
         "parallel_isotope_workers",
         python_worker_count_resolved,
@@ -11850,18 +10797,6 @@ def run_live_pf(
         min_strength=5.0,
         p_birth=0.05,
         p_kill=0.1,
-        death_strength_threshold=death_strength_threshold,
-        death_require_low_strength=bool(
-            runtime_config.get("death_require_low_strength", False)
-        ),
-        # Zero means all causal history up to the current update.  Source
-        # removal requires multi-station evidence, so the one-record fallback
-        # cannot be a valid standard-runtime default.
-        support_window=max(0, int(runtime_config.get("support_window", 0))),
-        # Non-positive values deliberately retain all causal measurements for
-        # residual birth.  This must be wired explicitly because the library
-        # dataclass keeps the legacy finite-window default for API callers.
-        birth_window=max(0, int(runtime_config.get("birth_window", 0))),
         short_time_s=planning_live_time,
         max_dwell_time_s=10000.0,
         position_min=source_position_min,
@@ -11976,18 +10911,6 @@ def run_live_pf(
             0,
             int(runtime_config.get("mode_preserving_min_particles_per_cardinality", 2)),
         ),
-        mode_preserving_report_cardinality_strata=bool(
-            runtime_config.get("mode_preserving_report_cardinality_strata", True)
-        ),
-        mode_preserving_report_cardinality_extra_particles=max(
-            0,
-            int(
-                runtime_config.get(
-                    "mode_preserving_report_cardinality_extra_particles",
-                    0,
-                )
-            ),
-        ),
         mode_preserving_dynamic_cardinality_allocation=bool(
             runtime_config.get(
                 "mode_preserving_dynamic_cardinality_allocation",
@@ -12049,10 +10972,6 @@ def run_live_pf(
             0.0,
             float(runtime_config.get("deferred_resample_roughening_scale", 0.15)),
         ),
-        adaptive_strength_prior=bool(adaptive_strength_prior),
-        adaptive_strength_prior_steps=int(adaptive_strength_prior_steps),
-        adaptive_strength_prior_min_counts=float(adaptive_strength_prior_min_counts),
-        adaptive_strength_prior_log_sigma=float(adaptive_strength_prior_log_sigma),
         pose_min_observation_counts=pose_min_observation_counts_resolved,
         pose_min_observation_penalty_scale=pose_min_observation_penalty_scale,
         pose_min_observation_aggregate=pose_min_observation_aggregate,
@@ -12060,9 +10979,6 @@ def run_live_pf(
         pose_min_observation_quantile=pose_min_observation_quantile,
         split_prob=max(0.0, float(runtime_config.get("split_prob", 0.05))),
         split_residual_guided=bool(runtime_config.get("split_residual_guided", True)),
-        split_residual_always_try=bool(
-            runtime_config.get("split_residual_always_try", False)
-        ),
         split_complexity_penalty=max(
             0.0,
             float(runtime_config.get("split_complexity_penalty", 0.0)),
@@ -12093,29 +11009,6 @@ def run_live_pf(
         structural_proposal_topk_particles=structural_proposal_topk_particles,
         structural_trial_workers=structural_trial_workers,
         structural_trial_parallel_min_trials=structural_trial_parallel_min_trials,
-        structural_update_min_counts=float(
-            runtime_config.get("structural_update_min_counts", 0.0)
-        ),
-        structural_update_min_snr=max(
-            0.0,
-            _runtime_float(runtime_config, "structural_update_min_snr", 0.0),
-        ),
-        structural_update_count_min_snr=max(
-            0.0,
-            _runtime_float(
-                runtime_config,
-                "structural_update_count_min_snr",
-                0.0,
-            ),
-        ),
-        structural_update_max_rel_sigma=max(
-            0.0,
-            _runtime_float(
-                runtime_config,
-                "structural_update_max_rel_sigma",
-                0.0,
-            ),
-        ),
         birth_delta_ll_threshold=float(
             runtime_config.get("birth_delta_ll_threshold", 0.0)
         ),
@@ -12158,22 +11051,8 @@ def run_live_pf(
         birth_candidate_support_fraction=float(
             runtime_config.get("birth_candidate_support_fraction", 0.05)
         ),
-        birth_refit_residual_gate=bool(
-            runtime_config.get("birth_refit_residual_gate", True)
-        ),
-        birth_refit_residual_min_fraction=max(
-            0.0,
-            float(runtime_config.get("birth_refit_residual_min_fraction", 0.5)),
-        ),
         birth_use_shield_coded_residual=bool(
             runtime_config.get("birth_use_shield_coded_residual", True)
-        ),
-        birth_existing_response_corr_max=float(
-            runtime_config.get("birth_existing_response_corr_max", 1.0)
-        ),
-        birth_response_condition_max=max(
-            0.0,
-            float(runtime_config.get("birth_response_condition_max", 0.0)),
         ),
         birth_count_distance_prior_weight=max(
             0.0,
@@ -12190,9 +11069,6 @@ def run_live_pf(
         birth_count_distance_strength_sigma=max(
             1.0e-12,
             float(runtime_config.get("birth_count_distance_strength_sigma", 2.0)),
-        ),
-        birth_residual_always_try=bool(
-            runtime_config.get("birth_residual_always_try", True)
         ),
         birth_residual_expand_structural_particles=bool(
             runtime_config.get("birth_residual_expand_structural_particles", True)
@@ -12213,30 +11089,6 @@ def run_live_pf(
                     )
                 ),
             )
-        ),
-        birth_residual_acceptance_complexity_scale=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "birth_residual_acceptance_complexity_scale",
-                        0.0,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        birth_residual_force_proposal_on_gate=bool(
-            runtime_config.get("birth_residual_force_proposal_on_gate", True)
-        ),
-        birth_residual_forced_min_delta_ll=float(
-            runtime_config.get("birth_residual_forced_min_delta_ll", -50.0)
-        ),
-        birth_residual_force_relax_candidate_masks=bool(
-            runtime_config.get("birth_residual_force_relax_candidate_masks", True)
-        ),
-        birth_residual_suppress_death=bool(
-            runtime_config.get("birth_residual_suppress_death", True)
         ),
         birth_matching_pursuit_max_new_sources=max(
             1,
@@ -12280,101 +11132,6 @@ def run_live_pf(
             )
         ),
         birth_jitter_topk_candidates=birth_jitter_topk_candidates,
-        birth_global_rescue_enable=bool(
-            runtime_config.get("birth_global_rescue_enable", False)
-        ),
-        birth_global_rescue_max_candidates=max(
-            0,
-            int(runtime_config.get("birth_global_rescue_max_candidates", 8)),
-        ),
-        birth_global_rescue_min_residual_fraction=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "birth_global_rescue_min_residual_fraction",
-                    0.005,
-                )
-            ),
-        ),
-        birth_global_rescue_dedup_radius_m=max(
-            0.0,
-            float(runtime_config.get("birth_global_rescue_dedup_radius_m", 0.5)),
-        ),
-        birth_global_rescue_force_proposal_on_gate=bool(
-            runtime_config.get("birth_global_rescue_force_proposal_on_gate", False)
-        ),
-        birth_global_rescue_forced_min_delta_ll=float(
-            runtime_config.get("birth_global_rescue_forced_min_delta_ll", 0.0)
-        ),
-        birth_global_rescue_min_support=(
-            None
-            if runtime_config.get("birth_global_rescue_min_support") is None
-            else max(1, int(runtime_config.get("birth_global_rescue_min_support")))
-        ),
-        birth_global_rescue_min_distinct_poses=(
-            None
-            if runtime_config.get("birth_global_rescue_min_distinct_poses") is None
-            else max(
-                1,
-                int(runtime_config.get("birth_global_rescue_min_distinct_poses")),
-            )
-        ),
-        birth_global_rescue_min_distinct_stations=(
-            None
-            if runtime_config.get("birth_global_rescue_min_distinct_stations") is None
-            else max(
-                1,
-                int(runtime_config.get("birth_global_rescue_min_distinct_stations")),
-            )
-        ),
-        birth_global_rescue_candidate_memory_enable=bool(
-            runtime_config.get("birth_global_rescue_candidate_memory_enable", False)
-        ),
-        birth_global_rescue_candidate_memory_decay=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "birth_global_rescue_candidate_memory_decay",
-                        0.85,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        birth_global_rescue_candidate_memory_max_candidates=max(
-            0,
-            int(
-                runtime_config.get(
-                    "birth_global_rescue_candidate_memory_max_candidates",
-                    0,
-                )
-            ),
-        ),
-        birth_global_rescue_candidate_memory_min_retained=max(
-            0,
-            int(
-                runtime_config.get(
-                    "birth_global_rescue_candidate_memory_min_retained",
-                    0,
-                )
-            ),
-        ),
-        high_strength_split_enable=bool(
-            runtime_config.get("high_strength_split_enable", True)
-        ),
-        high_strength_split_q_multiple=max(
-            1.0,
-            float(runtime_config.get("high_strength_split_q_multiple", 2.0)),
-        ),
-        high_strength_split_offset_m=max(
-            1.0e-6,
-            float(runtime_config.get("high_strength_split_offset_m", 1.5)),
-        ),
-        high_strength_split_candidate_count=max(
-            1,
-            int(runtime_config.get("high_strength_split_candidate_count", 12)),
-        ),
         residual_decomposition_enable=bool(
             runtime_config.get("residual_decomposition_enable", True)
         ),
@@ -12421,12 +11178,6 @@ def run_live_pf(
         pseudo_source_quarantine_on_suppress=bool(
             runtime_config.get("pseudo_source_quarantine_on_suppress", True)
         ),
-        pseudo_source_quarantine_excludes_runtime=bool(
-            runtime_config.get("pseudo_source_quarantine_excludes_runtime", False)
-        ),
-        report_exclude_unverified_sources=bool(
-            runtime_config.get("report_exclude_unverified_sources", False)
-        ),
         source_prune_min_distinct_stations=max(
             1,
             int(runtime_config.get("source_prune_min_distinct_stations", 2)),
@@ -12442,809 +11193,12 @@ def run_live_pf(
         source_prune_delta_ll_threshold=float(
             runtime_config.get("source_prune_delta_ll_threshold", 0.0)
         ),
-        source_prune_refit_after_remove=bool(
-            runtime_config.get("source_prune_refit_after_remove", True)
-        ),
         source_prune_bic_penalty_params=max(
             0,
             int(runtime_config.get("source_prune_bic_penalty_params", 4)),
         ),
-        weak_source_prune_min_expected_count=max(
-            0.0,
-            float(runtime_config.get("weak_source_prune_min_expected_count", 3.0)),
-        ),
-        weak_source_prune_min_fraction=max(
-            0.0,
-            float(runtime_config.get("weak_source_prune_min_fraction", 0.001)),
-        ),
-        weak_source_prune_min_age=max(
-            0,
-            int(runtime_config.get("weak_source_prune_min_age", 0)),
-        ),
-        weak_source_prune_require_observable=bool(
-            runtime_config.get("weak_source_prune_require_observable", True)
-        ),
-        weak_source_prune_min_observable_measurements=max(
-            1,
-            int(
-                runtime_config.get(
-                    "weak_source_prune_min_observable_measurements",
-                    1,
-                )
-            ),
-        ),
-        weak_source_prune_observable_count=max(
-            0.0,
-            float(runtime_config.get("weak_source_prune_observable_count", 0.0)),
-        ),
-        weak_source_prune_observable_fraction=max(
-            0.0,
-            float(runtime_config.get("weak_source_prune_observable_fraction", 0.0)),
-        ),
-        weak_source_prune_visibility_reference_strength=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "weak_source_prune_visibility_reference_strength",
-                    0.0,
-                )
-            ),
-        ),
-        conditional_strength_refit=bool(
-            runtime_config.get("conditional_strength_refit", True)
-        ),
-        conditional_strength_profile_before_likelihood=bool(
-            runtime_config.get(
-                "conditional_strength_profile_before_likelihood",
-                False,
-            )
-        ),
-        conditional_strength_refit_window=max(
-            0,
-            int(runtime_config.get("conditional_strength_refit_window", 10)),
-        ),
-        conditional_strength_refit_iters=max(
-            1,
-            int(runtime_config.get("conditional_strength_refit_iters", 3)),
-        ),
-        conditional_strength_refit_reweight=bool(
-            runtime_config.get("conditional_strength_refit_reweight", False)
-        ),
-        conditional_strength_refit_cardinality_neutral_reweight=bool(
-            runtime_config.get(
-                "conditional_strength_refit_cardinality_neutral_reweight",
-                True,
-            )
-        ),
-        conditional_strength_refit_reweight_clip=max(
-            0.0,
-            float(runtime_config.get("conditional_strength_refit_reweight_clip", 50.0)),
-        ),
-        conditional_strength_refit_min_count=max(
-            0.0,
-            float(runtime_config.get("conditional_strength_refit_min_count", 5.0)),
-        ),
-        conditional_strength_refit_min_snr=max(
-            0.0,
-            float(runtime_config.get("conditional_strength_refit_min_snr", 1.0)),
-        ),
-        conditional_strength_refit_prior_weight=max(
-            0.0,
-            float(runtime_config.get("conditional_strength_refit_prior_weight", 0.0)),
-        ),
-        conditional_strength_refit_prior_rel_sigma=max(
-            1.0e-6,
-            float(
-                runtime_config.get("conditional_strength_refit_prior_rel_sigma", 2.0)
-            ),
-        ),
-        source_strength_prior_mean=max(
-            0.0,
-            float(runtime_config.get("source_strength_prior_mean", 0.0)),
-        ),
-        source_strength_prior_weight=max(
-            0.0,
-            float(runtime_config.get("source_strength_prior_weight", 0.0)),
-        ),
-        source_strength_prior_rel_sigma=max(
-            1.0e-6,
-            float(runtime_config.get("source_strength_prior_rel_sigma", 1.0)),
-        ),
-        source_strength_absorption_penalty_weight=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "source_strength_absorption_penalty_weight",
-                    0.0,
-                )
-            ),
-        ),
-        source_strength_absorption_q_multiple=max(
-            1.0,
-            float(
-                runtime_config.get(
-                    "source_strength_absorption_q_multiple",
-                    4.0,
-                )
-            ),
-        ),
-        source_strength_observation_overshoot_penalty_weight=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "source_strength_observation_overshoot_penalty_weight",
-                    0.0,
-                )
-            ),
-        ),
-        source_strength_observation_overshoot_sigma=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "source_strength_observation_overshoot_sigma",
-                    5.0,
-                )
-            ),
-        ),
-        source_strength_observation_overshoot_quantile=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "source_strength_observation_overshoot_quantile",
-                        0.05,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        source_strength_observation_overshoot_min_visible_fraction=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "source_strength_observation_overshoot_min_visible_fraction",
-                    0.05,
-                )
-            ),
-        ),
-        source_strength_observation_overshoot_min_visible_measurements=max(
-            1,
-            int(
-                runtime_config.get(
-                    "source_strength_observation_overshoot_min_visible_measurements",
-                    3,
-                )
-            ),
-        ),
         birth_stage_single_station_as_quarantine=bool(
             runtime_config.get("birth_stage_single_station_as_quarantine", True)
-        ),
-        report_strength_refit=bool(runtime_config.get("report_strength_refit", False)),
-        report_strength_refit_iters=max(
-            1,
-            int(runtime_config.get("report_strength_refit_iters", 64)),
-        ),
-        report_strength_refit_eps=max(
-            1.0e-15,
-            float(runtime_config.get("report_strength_refit_eps", 1.0e-9)),
-        ),
-        report_strength_refit_use_all_measurements=bool(
-            runtime_config.get("report_strength_refit_use_all_measurements", True)
-        ),
-        report_strength_refit_preserve_cardinality=bool(
-            runtime_config.get("report_strength_refit_preserve_cardinality", False)
-        ),
-        report_strength_refit_prior_weight=max(
-            0.0,
-            float(runtime_config.get("report_strength_refit_prior_weight", 0.0)),
-        ),
-        report_strength_refit_prior_rel_sigma=max(
-            1.0e-6,
-            float(runtime_config.get("report_strength_refit_prior_rel_sigma", 2.0)),
-        ),
-        report_strength_absorption_penalty_weight=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_strength_absorption_penalty_weight",
-                    0.0,
-                )
-            ),
-        ),
-        report_strength_absorption_q_multiple=max(
-            1.0,
-            float(
-                runtime_config.get(
-                    "report_strength_absorption_q_multiple",
-                    4.0,
-                )
-            ),
-        ),
-        report_strength_observation_overshoot_penalty_weight=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_strength_observation_overshoot_penalty_weight",
-                    0.0,
-                )
-            ),
-        ),
-        report_strength_observation_overshoot_sigma=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_strength_observation_overshoot_sigma",
-                    5.0,
-                )
-            ),
-        ),
-        report_strength_observation_overshoot_quantile=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "report_strength_observation_overshoot_quantile",
-                        0.05,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        report_strength_observation_overshoot_min_visible_fraction=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_strength_observation_overshoot_min_visible_fraction",
-                    0.05,
-                )
-            ),
-        ),
-        report_strength_observation_overshoot_min_visible_measurements=max(
-            1,
-            int(
-                runtime_config.get(
-                    "report_strength_observation_overshoot_min_visible_measurements",
-                    3,
-                )
-            ),
-        ),
-        report_best_so_far_enable=bool(
-            runtime_config.get("report_best_so_far_enable", True)
-        ),
-        report_best_so_far_min_score_improvement=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_best_so_far_min_score_improvement",
-                    1.0e-9,
-                )
-            ),
-        ),
-        report_best_so_far_final_min_measurement_fraction=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "report_best_so_far_final_min_measurement_fraction",
-                        0.8,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        report_best_so_far_final_require_resolved=bool(
-            runtime_config.get("report_best_so_far_final_require_resolved", True)
-        ),
-        report_model_order_underfit_gate=bool(
-            runtime_config.get("report_model_order_underfit_gate", True)
-        ),
-        report_model_order_underfit_min_residual_fraction=float(
-            runtime_config.get(
-                "report_model_order_underfit_min_residual_fraction",
-                -1.0,
-            )
-        ),
-        report_model_order_underfit_min_positive_chi2=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_model_order_underfit_min_positive_chi2",
-                    0.0,
-                )
-            ),
-        ),
-        report_surface_local_refine=bool(
-            runtime_config.get("report_surface_local_refine", False)
-        ),
-        report_surface_local_refine_radius_m=max(
-            0.0,
-            float(runtime_config.get("report_surface_local_refine_radius_m", 0.5)),
-        ),
-        report_surface_local_refine_grid_steps=max(
-            0,
-            int(runtime_config.get("report_surface_local_refine_grid_steps", 1)),
-        ),
-        report_surface_local_refine_max_candidates_per_source=max(
-            1,
-            int(
-                runtime_config.get(
-                    "report_surface_local_refine_max_candidates_per_source",
-                    27,
-                )
-            ),
-        ),
-        report_surface_local_refine_max_sources=max(
-            0,
-            int(runtime_config.get("report_surface_local_refine_max_sources", 0)),
-        ),
-        report_surface_local_refine_min_ll_gain=max(
-            0.0,
-            float(runtime_config.get("report_surface_local_refine_min_ll_gain", 0.0)),
-        ),
-        report_mle_rescue_enable=bool(
-            runtime_config.get("report_mle_rescue_enable", False)
-        ),
-        report_mle_rescue_max_candidates=max(
-            1,
-            int(runtime_config.get("report_mle_rescue_max_candidates", 12)),
-        ),
-        report_mle_rescue_max_posterior_candidates=max(
-            0,
-            int(runtime_config.get("report_mle_rescue_max_posterior_candidates", 8)),
-        ),
-        report_mle_rescue_max_residual_candidates=max(
-            0,
-            int(runtime_config.get("report_mle_rescue_max_residual_candidates", 8)),
-        ),
-        report_mle_rescue_dedup_radius_m=max(
-            0.0,
-            float(runtime_config.get("report_mle_rescue_dedup_radius_m", 0.5)),
-        ),
-        report_mle_rescue_min_residual_fraction=max(
-            0.0,
-            float(runtime_config.get("report_mle_rescue_min_residual_fraction", 0.01)),
-        ),
-        report_mle_rescue_visibility_weight=float(
-            np.clip(
-                float(runtime_config.get("report_mle_rescue_visibility_weight", 0.0)),
-                0.0,
-                1.0,
-            )
-        ),
-        report_mle_rescue_min_visible_measurements=max(
-            1,
-            int(runtime_config.get("report_mle_rescue_min_visible_measurements", 1)),
-        ),
-        report_mle_rescue_visible_count=max(
-            0.0,
-            float(runtime_config.get("report_mle_rescue_visible_count", 0.0)),
-        ),
-        report_mle_rescue_visibility_reference_strength=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_mle_rescue_visibility_reference_strength",
-                    0.0,
-                )
-            ),
-        ),
-        runtime_report_rescue_enable=bool(
-            runtime_config.get("runtime_report_rescue_enable", False)
-        ),
-        runtime_report_rescue_particle_fraction=float(
-            np.clip(
-                float(
-                    runtime_config.get("runtime_report_rescue_particle_fraction", 0.15)
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        runtime_report_rescue_min_particles_per_source=max(
-            1,
-            int(
-                runtime_config.get("runtime_report_rescue_min_particles_per_source", 4)
-            ),
-        ),
-        runtime_report_rescue_weight=float(
-            np.clip(
-                float(runtime_config.get("runtime_report_rescue_weight", 0.10)),
-                0.0,
-                0.5,
-            )
-        ),
-        runtime_report_rescue_jitter_sigma_m=max(
-            0.0,
-            float(runtime_config.get("runtime_report_rescue_jitter_sigma_m", 0.10)),
-        ),
-        runtime_report_rescue_quarantine_enable=bool(
-            runtime_config.get("runtime_report_rescue_quarantine_enable", True)
-        ),
-        runtime_report_rescue_quarantine_weight=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "runtime_report_rescue_quarantine_weight",
-                        0.02,
-                    )
-                ),
-                0.0,
-                0.5,
-            )
-        ),
-        runtime_report_rescue_candidate_weight=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "runtime_report_rescue_candidate_weight",
-                        0.06,
-                    )
-                ),
-                0.0,
-                0.5,
-            )
-        ),
-        runtime_report_rescue_memory_enable=bool(
-            runtime_config.get("runtime_report_rescue_memory_enable", True)
-        ),
-        runtime_report_rescue_memory_decay=float(
-            np.clip(
-                float(runtime_config.get("runtime_report_rescue_memory_decay", 0.90)),
-                0.0,
-                1.0,
-            )
-        ),
-        runtime_report_rescue_memory_max_sources=max(
-            0,
-            int(runtime_config.get("runtime_report_rescue_memory_max_sources", 0)),
-        ),
-        runtime_report_rescue_verification_queue_only=bool(
-            runtime_config.get(
-                "runtime_report_rescue_verification_queue_only",
-                False,
-            )
-        ),
-        all_history_dictionary_proposal_enable=bool(
-            runtime_config.get("all_history_dictionary_proposal_enable", False)
-        ),
-        all_history_dictionary_proposal_weight=float(
-            np.clip(
-                float(
-                    runtime_config.get("all_history_dictionary_proposal_weight", 0.04)
-                ),
-                0.0,
-                0.5,
-            )
-        ),
-        all_history_dictionary_proposal_max_candidates=max(
-            0,
-            int(
-                runtime_config.get("all_history_dictionary_proposal_max_candidates", 0)
-            ),
-        ),
-        candidate_verification_queue_enable=bool(
-            runtime_config.get("candidate_verification_queue_enable", False)
-        ),
-        candidate_verification_queue_weight=float(
-            np.clip(
-                float(runtime_config.get("candidate_verification_queue_weight", 0.05)),
-                0.0,
-                0.5,
-            )
-        ),
-        candidate_verification_queue_decay=float(
-            np.clip(
-                float(runtime_config.get("candidate_verification_queue_decay", 0.85)),
-                0.0,
-                1.0,
-            )
-        ),
-        candidate_verification_queue_max_sources=max(
-            0,
-            int(runtime_config.get("candidate_verification_queue_max_sources", 0)),
-        ),
-        candidate_verification_independent_evidence_enable=bool(
-            runtime_config.get(
-                "candidate_verification_independent_evidence_enable",
-                False,
-            )
-        ),
-        candidate_verification_require_independent_xy=bool(
-            runtime_config.get(
-                "candidate_verification_require_independent_xy",
-                True,
-            )
-        ),
-        candidate_verification_min_xy_separation_m=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "candidate_verification_min_xy_separation_m",
-                    0.5,
-                )
-            ),
-        ),
-        candidate_verification_require_distinct_height=bool(
-            runtime_config.get(
-                "candidate_verification_require_distinct_height",
-                True,
-            )
-        ),
-        candidate_verification_min_height_separation_m=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "candidate_verification_min_height_separation_m",
-                    0.5,
-                )
-            ),
-        ),
-        candidate_verification_require_distinct_shield_program=bool(
-            runtime_config.get(
-                "candidate_verification_require_distinct_shield_program",
-                True,
-            )
-        ),
-        candidate_verification_min_deviance_improvement=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "candidate_verification_min_deviance_improvement",
-                    4.0,
-                )
-            ),
-        ),
-        candidate_verification_min_positive_checks=max(
-            1,
-            int(
-                runtime_config.get(
-                    "candidate_verification_min_positive_checks",
-                    1,
-                )
-            ),
-        ),
-        candidate_verification_reject_after_negatives=max(
-            1,
-            int(
-                runtime_config.get(
-                    "candidate_verification_reject_after_negatives",
-                    2,
-                )
-            ),
-        ),
-        candidate_verification_negative_deviance_threshold=float(
-            runtime_config.get(
-                "candidate_verification_negative_deviance_threshold",
-                0.0,
-            )
-        ),
-        candidate_verification_profile_l2=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "candidate_verification_profile_l2",
-                    1.0e-6,
-                )
-            ),
-        ),
-        candidate_verification_profile_max_iters=max(
-            1,
-            int(
-                runtime_config.get(
-                    "candidate_verification_profile_max_iters",
-                    32,
-                )
-            ),
-        ),
-        report_mle_rescue_surface_quota_enable=bool(
-            runtime_config.get("report_mle_rescue_surface_quota_enable", True)
-        ),
-        report_mle_rescue_surface_quota_min_score_fraction=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_mle_rescue_surface_quota_min_score_fraction",
-                    0.0,
-                )
-            ),
-        ),
-        report_mle_rescue_surface_quota_per_stratum=max(
-            1,
-            int(runtime_config.get("report_mle_rescue_surface_quota_per_stratum", 1)),
-        ),
-        report_mle_rescue_spatial_quota_enable=bool(
-            runtime_config.get("report_mle_rescue_spatial_quota_enable", True)
-        ),
-        report_mle_rescue_spatial_quota_tile_m=max(
-            1.0e-6,
-            float(runtime_config.get("report_mle_rescue_spatial_quota_tile_m", 2.5)),
-        ),
-        report_mle_rescue_spatial_quota_per_tile=max(
-            1,
-            int(runtime_config.get("report_mle_rescue_spatial_quota_per_tile", 1)),
-        ),
-        report_cluster_model_selection=bool(
-            runtime_config.get("report_cluster_model_selection", True)
-        ),
-        report_cluster_bic_penalty_params=max(
-            0,
-            int(runtime_config.get("report_cluster_bic_penalty_params", 4)),
-        ),
-        report_cluster_delta_ll_threshold=float(
-            runtime_config.get("report_cluster_delta_ll_threshold", 0.0)
-        ),
-        report_cluster_model_selection_max_candidates=max(
-            1,
-            int(
-                runtime_config.get("report_cluster_model_selection_max_candidates", 12)
-            ),
-        ),
-        report_model_order_require_posterior_match=bool(
-            runtime_config.get("report_model_order_require_posterior_match", True)
-        ),
-        report_model_order_prune_particles=bool(
-            runtime_config.get("report_model_order_prune_particles", False)
-        ),
-        report_model_order_particle_prune_radius_m=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_model_order_particle_prune_radius_m",
-                    0.0,
-                )
-            ),
-        ),
-        report_model_order_min_bic_margin=max(
-            0.0,
-            float(runtime_config.get("report_model_order_min_bic_margin", 0.0)),
-        ),
-        report_model_order_zero_source_min_bic_margin=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "report_model_order_zero_source_min_bic_margin",
-                    10.0,
-                )
-            ),
-        ),
-        report_model_order_condition_max=max(
-            0.0,
-            float(runtime_config.get("report_model_order_condition_max", 0.0)),
-        ),
-        report_model_order_corr_penalty_weight=max(
-            0.0,
-            float(runtime_config.get("report_model_order_corr_penalty_weight", 0.0)),
-        ),
-        report_model_order_corr_penalty_threshold=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "report_model_order_corr_penalty_threshold",
-                        0.98,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        report_model_order_corr_penalty_power=max(
-            1.0e-6,
-            float(runtime_config.get("report_model_order_corr_penalty_power", 1.0)),
-        ),
-        report_model_order_subset_corr_prune_threshold=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "report_model_order_subset_corr_prune_threshold",
-                        0.0,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        report_model_order_workers=max(
-            1,
-            int(runtime_config.get("report_model_order_workers", 1)),
-        ),
-        report_model_order_parallel_min_subsets=max(
-            1,
-            int(runtime_config.get("report_model_order_parallel_min_subsets", 128)),
-        ),
-        sparse_poisson_evidence_enable=bool(
-            runtime_config.get("sparse_poisson_evidence_enable", False)
-        ),
-        sparse_poisson_evidence_authoritative=bool(
-            runtime_config.get("sparse_poisson_evidence_authoritative", False)
-        ),
-        sparse_poisson_evidence_candidate_limit=max(
-            0,
-            int(runtime_config.get("sparse_poisson_evidence_candidate_limit", 2048)),
-        ),
-        sparse_poisson_evidence_refit_iters=max(
-            1,
-            int(runtime_config.get("sparse_poisson_evidence_refit_iters", 64)),
-        ),
-        sparse_poisson_evidence_holdout_stride=max(
-            0,
-            int(runtime_config.get("sparse_poisson_evidence_holdout_stride", 4)),
-        ),
-        sparse_poisson_evidence_parameter_count_per_source=max(
-            0,
-            int(
-                runtime_config.get(
-                    "sparse_poisson_evidence_parameter_count_per_source",
-                    4,
-                )
-            ),
-        ),
-        sparse_poisson_evidence_min_bic_margin=max(
-            0.0,
-            float(runtime_config.get("sparse_poisson_evidence_min_bic_margin", 2.0)),
-        ),
-        sparse_poisson_evidence_min_distinct_stations=max(
-            1,
-            int(
-                runtime_config.get(
-                    "sparse_poisson_evidence_min_distinct_stations",
-                    runtime_config.get("birth_min_distinct_stations", 1),
-                )
-            ),
-        ),
-        sparse_poisson_evidence_corr_prune_threshold=float(
-            np.clip(
-                float(
-                    runtime_config.get(
-                        "sparse_poisson_evidence_corr_prune_threshold",
-                        0.995,
-                    )
-                ),
-                0.0,
-                1.0,
-            )
-        ),
-        sparse_poisson_evidence_max_response_correlation=max(
-            0.0,
-            float(
-                runtime_config.get(
-                    "sparse_poisson_evidence_max_response_correlation",
-                    0.98,
-                )
-            ),
-        ),
-        sparse_poisson_evidence_condition_max=max(
-            0.0,
-            float(runtime_config.get("sparse_poisson_evidence_condition_max", 100.0)),
-        ),
-        sparse_poisson_spectral_evidence_enable=bool(
-            runtime_config.get("sparse_poisson_spectral_evidence_enable", True)
-        ),
-        sparse_poisson_spectral_evidence_primary=bool(
-            runtime_config.get("sparse_poisson_spectral_evidence_primary", True)
-        ),
-        sparse_poisson_spectral_nuisance_enable=bool(
-            runtime_config.get("sparse_poisson_spectral_nuisance_enable", True)
-        ),
-        sparse_poisson_joint_evidence_enable=bool(
-            runtime_config.get("sparse_poisson_joint_evidence_enable", True)
-        ),
-        sparse_poisson_offgrid_refine_enable=bool(
-            runtime_config.get("sparse_poisson_offgrid_refine_enable", True)
-        ),
-        sparse_poisson_offgrid_refine_radius_m=max(
-            0.0,
-            float(runtime_config.get("sparse_poisson_offgrid_refine_radius_m", 0.75)),
-        ),
-        sparse_poisson_offgrid_refine_max_iter=max(
-            1,
-            int(runtime_config.get("sparse_poisson_offgrid_refine_max_iter", 64)),
-        ),
-        sparse_poisson_offgrid_refine_min_ll_gain=max(
-            0.0,
-            float(runtime_config.get("sparse_poisson_offgrid_refine_min_ll_gain", 0.0)),
-        ),
-        report_pre_finalize_guard=bool(
-            runtime_config.get("report_pre_finalize_guard", True)
         ),
         history_estimate_interval=max(
             0,
@@ -13427,123 +11381,6 @@ def run_live_pf(
     estimate_mode = "mmse"
     estimate_min_strength = 100.0
     estimate_min_existence_prob = None
-    final_estimate_min_strength = max(
-        estimate_min_strength,
-        FINAL_ESTIMATE_MIN_STRENGTH_ABS,
-    )
-    final_absent_filter_enabled = bool(
-        runtime_config.get("final_absent_isotope_filter", True)
-    )
-    final_absent_count_threshold_abs = max(
-        0.0,
-        float(
-            runtime_config.get("final_absent_count_threshold_abs", detect_threshold_abs)
-        ),
-    )
-    final_absent_min_support_measurements = max(
-        1,
-        int(
-            runtime_config.get(
-                "final_absent_min_support_measurements",
-                FINAL_ABSENT_ISOTOPE_MIN_SUPPORT_MEASUREMENTS,
-            )
-        ),
-    )
-    final_absent_min_total_counts = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "final_absent_min_total_counts",
-                final_absent_count_threshold_abs
-                * float(final_absent_min_support_measurements),
-            )
-        ),
-    )
-    final_absent_min_snr = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "final_absent_min_snr",
-                FINAL_ABSENT_ISOTOPE_MIN_SNR,
-            )
-        ),
-    )
-    final_absent_min_strength = max(
-        0.0,
-        float(
-            runtime_config.get("final_absent_min_strength", final_estimate_min_strength)
-        ),
-    )
-    online_absent_pruning_enabled = bool(
-        runtime_config.get("online_absent_isotope_pruning", True)
-    )
-    online_absent_min_poses = max(
-        1,
-        int(runtime_config.get("online_absent_min_poses", 8)),
-    )
-    online_absent_coverage_radius_m = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "online_absent_coverage_radius_m",
-                mission_stop_coverage_radius_m,
-            )
-        ),
-    )
-    online_absent_coverage_fraction = float(
-        np.clip(
-            float(runtime_config.get("online_absent_coverage_fraction", 0.75)),
-            0.0,
-            1.0,
-        )
-    )
-    online_absent_min_measurements = max(
-        1,
-        int(
-            runtime_config.get(
-                "online_absent_min_measurements",
-                max(8, final_absent_min_support_measurements),
-            )
-        ),
-    )
-    online_absent_count_threshold_abs = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "online_absent_count_threshold_abs",
-                final_absent_count_threshold_abs,
-            )
-        ),
-    )
-    online_absent_min_support_measurements = max(
-        1,
-        int(
-            runtime_config.get(
-                "online_absent_min_support_measurements",
-                final_absent_min_support_measurements,
-            )
-        ),
-    )
-    online_absent_min_total_counts = max(
-        0.0,
-        float(
-            runtime_config.get(
-                "online_absent_min_total_counts",
-                final_absent_min_total_counts,
-            )
-        ),
-    )
-    online_absent_min_snr = max(
-        0.0,
-        float(runtime_config.get("online_absent_min_snr", final_absent_min_snr)),
-    )
-    prune_min_obs_count = PRUNE_MIN_OBS_COUNT
-    if background_by_isotope:
-        background_level = float(np.median(list(background_by_isotope.values())))
-        prune_live_time = float(adaptive_min_dwell_s) if adaptive_dwell else live_time
-        prune_min_obs_count = max(
-            prune_min_obs_count, background_level * prune_live_time
-        )
     pf_detector_radius_m = detector_geometry.count_radius_m
     pf_detector_aperture_radius_m = detector_geometry.aperture_radius_m
     pf_detector_aperture_samples = detector_geometry.aperture_samples
@@ -13697,170 +11534,15 @@ def run_live_pf(
         grid_pos = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1)
         return grid_pos.reshape(-1, 3)
 
-    def _apply_display_thresholds(
-        positions: NDArray[np.float64],
-        strengths: NDArray[np.float64],
-        min_strength: float | None,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Filter estimates using the same min-strength cutoff as the display."""
-        if min_strength is None or strengths.size == 0:
-            return positions, strengths
-        mask = strengths >= float(min_strength)
-        return positions[mask], strengths[mask]
-
-    def _merge_close_estimates(
-        positions: NDArray[np.float64],
-        strengths: NDArray[np.float64],
-        max_distance: float,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """
-        Merge nearby estimates by summing strengths and weighted-average positions.
-
-        The merge uses a greedy agglomeration sorted by strength, combining any
-        points within max_distance into a single estimate.
-        """
-        if positions.size == 0 or strengths.size == 0:
-            return positions, strengths
-        if max_distance <= 0.0:
-            return positions, strengths
-        order = np.argsort(strengths)[::-1]
-        merged_pos: list[NDArray[np.float64]] = []
-        merged_strengths: list[float] = []
-        for idx in order:
-            pos = positions[int(idx)]
-            strength = float(strengths[int(idx)])
-            merged = False
-            for j, center in enumerate(merged_pos):
-                if float(np.linalg.norm(pos - center)) <= max_distance:
-                    total = merged_strengths[j] + strength
-                    if total > 0.0:
-                        merged_pos[j] = (
-                            center * merged_strengths[j] + pos * strength
-                        ) / total
-                    merged_strengths[j] = total
-                    merged = True
-                    break
-            if not merged:
-                merged_pos.append(pos.copy())
-                merged_strengths.append(strength)
-        pos_out = np.vstack(merged_pos) if merged_pos else np.zeros((0, 3), dtype=float)
-        str_out = (
-            np.asarray(merged_strengths, dtype=float)
-            if merged_strengths
-            else np.zeros(0, dtype=float)
-        )
-        return pos_out, str_out
-
-    def _build_final_estimates(
+    def _build_pf_posterior_estimates(
         estimator_final: RotatingShieldPFEstimator,
         isotope_list: list[str],
-        min_strength: float | None,
-        min_obs_count: float,
-        use_pruning: bool = True,
     ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """
-        Build final estimates using LLR pruning with a legacy fallback per isotope.
-
-        If LLR pruning removes all sources for an isotope, fall back to legacy
-        pruning. If that is also empty but raw estimates exist, keep the strongest
-        raw estimate to avoid empty outputs. Model-order/refit already deduplicates
-        report candidates, so final close-merge is reserved for legacy fallbacks
-        and must not collapse BIC-selected multi-source reports.
-        """
-        pure_estimates = _pure_pf_primary_estimates(estimator_final, isotope_list)
-        if pure_estimates is not None:
-            return pure_estimates
-        if not use_pruning:
-            raw_estimates = estimator_final.estimates()
-            final_estimates: dict[
-                str, tuple[NDArray[np.float64], NDArray[np.float64]]
-            ] = {}
-            for iso in isotope_list:
-                pos, strg = raw_estimates.get(
-                    iso, (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float))
-                )
-                pos_arr = np.asarray(pos, dtype=float)
-                str_arr = np.asarray(strg, dtype=float)
-                final_estimates[iso] = (pos_arr, str_arr)
-            return final_estimates
-        llr_pruned = estimator_final.pruned_estimates(
-            method="deltall",
-            params={"deltaLL_min": PRUNE_DELTALL_MIN},
-            tau_mix=PRUNE_TAU_MIX,
-            min_support=PRUNE_MIN_SUPPORT,
-            min_obs_count=min_obs_count,
-            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-        )
-        legacy_pruned = estimator_final.pruned_estimates(
-            method="legacy",
-            params=None,
-            tau_mix=PRUNE_TAU_MIX,
-            min_support=PRUNE_MIN_SUPPORT,
-            min_obs_count=min_obs_count,
-            min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-            min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-        )
-        raw_estimates = estimator_final.estimates()
-        final_estimates: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-        for iso in isotope_list:
-            used_legacy_fallback = False
-            pos, strg = llr_pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-            pos, strg = _apply_display_thresholds(pos, strg, min_strength)
-            if pos.size == 0:
-                pos, strg = legacy_pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-                pos, strg = _apply_display_thresholds(pos, strg, min_strength)
-                used_legacy_fallback = bool(pos.size)
-            raw_pos, raw_strg = raw_estimates.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-            raw_pos, raw_strg = _apply_display_thresholds(
-                np.asarray(raw_pos, dtype=float),
-                np.asarray(raw_strg, dtype=float),
-                min_strength,
-            )
-            filt = estimator_final.filters.get(iso)
-            unresolved_birth_residual = bool(
-                filt is not None
-                and getattr(filt, "last_birth_residual_gate_passed", False)
-                and int(getattr(filt, "last_birth_residual_support", 0))
-                >= PRUNE_MIN_SUPPORT
-            )
-            if (
-                unresolved_birth_residual
-                and raw_pos.shape[0] > np.asarray(pos).shape[0]
-            ):
-                pos, strg = raw_pos, raw_strg
-                used_legacy_fallback = False
-            if pos.size == 0:
-                if raw_strg.size:
-                    best_idx = int(np.argmax(raw_strg))
-                    pos = raw_pos[[best_idx]]
-                    strg = np.array([raw_strg[best_idx]], dtype=float)
-                    used_legacy_fallback = False
-            if used_legacy_fallback:
-                pos, strg = _merge_close_estimates(pos, strg, FINAL_MERGE_DISTANCE_M)
-            pos, strg = _apply_display_thresholds(pos, strg, min_strength)
-            final_estimates[iso] = (pos, strg)
-        return final_estimates
-
-    def _apply_final_absent_filter(
-        estimates_in: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
-    ) -> tuple[
-        dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
-        dict[str, dict[str, float | int | bool | str]],
-    ]:
-        """Apply the configured final absent-isotope filter to estimates."""
-        if _pure_pf_profile_active(estimator):
-            return estimates_in, {}
-        return _filter_absent_final_estimates(
-            estimates_in,
-            estimator.measurements,
-            enabled=final_absent_filter_enabled,
-            count_threshold_abs=final_absent_count_threshold_abs,
-            min_support_measurements=final_absent_min_support_measurements,
-            min_total_counts=final_absent_min_total_counts,
-            snr_threshold=final_absent_min_snr,
-            min_strength=final_absent_min_strength,
-        )
+        """Project the current sequential PF posterior without a batch report stage."""
+        estimates = _pure_pf_primary_estimates(estimator_final, isotope_list)
+        if estimates is None:
+            raise RuntimeError("The realtime estimator must use the strict PF profile.")
+        return estimates
 
     def _serialize_estimate_stage(
         estimates_in: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]],
@@ -14015,11 +11697,10 @@ def run_live_pf(
                 **writer_arguments,
             )
         else:
-            if pf_detected_isotopes_only or online_absent_pruning_enabled:
+            if pf_detected_isotopes_only:
                 raise RuntimeError(
                     "Exact station-boundary resume currently requires "
-                    "pf_detected_isotopes_only=false and "
-                    "online_absent_isotope_pruning=false."
+                    "pf_detected_isotopes_only=false."
                 )
             assert compatibility is not None
             measurement_log_writer = MeasurementLogStreamWriter.resume_from_stage(
@@ -14185,10 +11866,6 @@ def run_live_pf(
         else float(resume_controller_state.elapsed_s)
     )
     last_frame: PFFrame | None = None
-    pruned_display_cache: (
-        dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] | None
-    ) = None
-    pruned_display_force_refresh = True
     step_counter = (
         0
         if resume_controller_state is None
@@ -14275,13 +11952,11 @@ def run_live_pf(
     )
     total_ig_wall_s = 0.0
     total_pf_wall_s = 0.0
-    total_prune_wall_s = 0.0
     total_viz_wall_s = 0.0
     total_path_planning_wall_s = 0.0
     ig_wall_samples_s: list[float] = []
     pf_wall_samples_s: list[float] = []
     path_planning_wall_samples_s: list[float] = []
-    online_absent_pruned_isotopes: set[str] = set()
     if resume_controller_state is not None:
         assert measurement_log_writer is not None
         resumed_stations = _records_by_station(measurement_log_writer.records)
@@ -14329,57 +12004,6 @@ def run_live_pf(
         str(pf_conf.gpu_device) if gpu_runtime_enabled else None
     )
     run_wall_start = time.perf_counter()
-
-    def _reactivate_online_absent_isotopes(raw_detected: set[str]) -> None:
-        """Re-enable previously pruned isotope PFs once spectral support returns."""
-        guard = set(raw_detected) | set(active_isotopes) | set(last_candidates)
-        to_reactivate = guard & online_absent_pruned_isotopes
-        if not to_reactivate:
-            return
-        ordered = [iso for iso in isotopes if iso in to_reactivate]
-        estimator.add_isotopes(ordered)
-        active_isotopes.update(to_reactivate)
-        detected_isotopes.update(to_reactivate)
-        online_absent_pruned_isotopes.difference_update(to_reactivate)
-        print(
-            "Online absent-isotope reactivation: "
-            f"reactivated={ordered} support={sorted(guard)}"
-        )
-
-    def _maybe_prune_online_absent_isotopes(
-        *,
-        label: str,
-        pose_for_coverage: NDArray[np.float64],
-        raw_detected: set[str],
-    ) -> set[str]:
-        """Conservatively inactivate unsupported isotope PFs after map coverage."""
-        visited_for_prune = list(visited_poses)
-        visited_for_prune.append(np.asarray(pose_for_coverage, dtype=float).copy())
-        protected = _online_absent_pruning_supported_isotopes(
-            raw_detected=set(raw_detected),
-            last_candidates=set(last_candidates),
-        )
-        removed = _prune_online_absent_isotopes(
-            estimator,
-            enabled=online_absent_pruning_enabled,
-            detected_isotopes=protected,
-            pruned_isotopes=online_absent_pruned_isotopes,
-            visited_poses_xyz=visited_for_prune,
-            map_api=planning_map,
-            min_poses=online_absent_min_poses,
-            coverage_radius_m=online_absent_coverage_radius_m,
-            coverage_fraction_threshold=online_absent_coverage_fraction,
-            min_measurements=online_absent_min_measurements,
-            count_threshold_abs=online_absent_count_threshold_abs,
-            min_support_measurements=online_absent_min_support_measurements,
-            min_total_counts=online_absent_min_total_counts,
-            snr_threshold=online_absent_min_snr,
-            label=label,
-        )
-        if removed:
-            active_isotopes.difference_update(removed)
-            detected_isotopes.difference_update(removed)
-        return removed
 
     def _select_one_step_pose_for_planning(
         *,
@@ -14429,45 +12053,12 @@ def run_live_pf(
             return remaining_measurement_estimates[-1]
         return None
 
-    def _report_simple_ready_for_planning(
-        estimate: Mapping[str, Any] | object | None,
-    ) -> bool:
-        """Return whether the current report BIC is simple enough for short programs."""
-        if estimate is None:
-            return False
-        return bool(mission_stop_report_simple_enable) and (
-            _report_model_order_simple_ready_for_stop(
-                estimator,
-                remaining_measurement_estimate=estimate,
-                max_sources_per_isotope=(
-                    mission_stop_report_simple_max_sources_per_isotope
-                ),
-                min_bic_margin=mission_stop_report_simple_min_bic_margin,
-                max_condition_number=(mission_stop_report_simple_max_condition_number),
-                max_response_correlation=(
-                    mission_stop_report_simple_max_response_correlation
-                ),
-                residual_budget_threshold=(
-                    mission_stop_report_simple_residual_budget_threshold
-                ),
-                ambiguity_budget_threshold=(
-                    mission_stop_report_simple_ambiguity_budget_threshold
-                ),
-                allow_high_surface_ambiguity=(
-                    mission_stop_report_simple_allow_high_surface_ambiguity
-                ),
-                require_no_birth_residual=False,
-                birth_residual_min_support=mission_stop_birth_residual_min_support,
-                refresh_estimates=False,
-            )
-        )
-
-    def _recovery_isotopes_from_remaining(
+    def _pf_priority_isotopes_from_remaining(
         estimate: Mapping[str, Any] | object | None,
         *,
         max_isotopes: int = 2,
     ) -> tuple[str, ...]:
-        """Return isotopes whose remaining-budget details should drive recovery views."""
+        """Return isotopes prioritized by PF posterior uncertainty and residuals."""
         payload = _remaining_measurement_payload(estimate)
         details = payload.get("isotope_details", {})
         if not isinstance(details, Mapping):
@@ -14485,66 +12076,65 @@ def run_live_pf(
                 except (TypeError, ValueError):
                     return 0.0
 
-            score = 0.0
-            score += 4.0 * _detail_float("report_residual_budget")
-            score += 3.0 * _detail_float("report_response_correlation_budget")
-            score += 3.0 * _detail_float("strength_absorption_budget")
-            score += min(_detail_float("residual_chi2") / 100.0, 10.0)
+            score = _detail_float("cardinality_entropy")
+            score += min(
+                _detail_float("posterior_predictive_positive_chi2") / 100.0,
+                10.0,
+            )
             score += float(int(_detail_float("unresolved_pair_count") > 0.0))
             score += float(
                 int(_detail_float("high_surface_unresolved_pair_count") > 0.0)
             )
+            score += _detail_float("verification_budget")
             score += _detail_float("unresolved_absent_budget")
             if score > 0.0:
                 ranked.append((float(score), str(isotope)))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return tuple(isotope for _score, isotope in ranked[: max(0, int(max_isotopes))])
 
-    def _planner_mode_from_remaining(
+    def _pf_planner_mode_from_remaining(
         estimate: Mapping[str, Any] | object | None,
     ) -> tuple[str, dict[str, float]]:
-        """Return the explicit DSS-PP planner mode from unresolved diagnostics."""
+        """Return a planner mode from PF posterior budget components."""
         payload = _remaining_measurement_payload(estimate)
-        details = payload.get("isotope_details", {})
+        components = payload.get("components", {})
         totals = {
             "residual": 0.0,
             "absent": 0.0,
             "verification": 0.0,
             "pairwise": 0.0,
-            "correlation": 0.0,
             "high_surface": 0.0,
+            "cardinality": 0.0,
+            "uncertainty": 0.0,
         }
-        if isinstance(details, Mapping):
-            for detail_raw in details.values():
-                if not isinstance(detail_raw, Mapping):
-                    continue
-                detail = dict(detail_raw)
+        if isinstance(components, Mapping):
 
-                def _val(key: str) -> float:
-                    """Read a finite detail value."""
-                    try:
-                        value = float(detail.get(key, 0.0))
-                    except (TypeError, ValueError):
-                        return 0.0
-                    return value if np.isfinite(value) else 0.0
+            def _component(key: str) -> float:
+                """Read a finite PF posterior budget component."""
+                try:
+                    value = float(components.get(key, 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+                return value if np.isfinite(value) else 0.0
 
-                totals["residual"] += _val("report_residual_budget")
-                totals["absent"] += _val("unresolved_absent_budget")
-                totals["verification"] += _val("verification_budget")
-                totals["pairwise"] += _val("unresolved_pair_count")
-                totals["correlation"] += _val("report_response_correlation_budget")
-                totals["high_surface"] += _val("high_surface_unresolved_pair_count")
+            totals["residual"] = _component("residual")
+            totals["absent"] = _component("isotope_absence")
+            totals["verification"] = _component("pseudo_source_verification")
+            totals["pairwise"] = _component("same_isotope_separation")
+            totals["high_surface"] = _component("high_surface_ambiguity")
+            totals["cardinality"] = _component("cardinality")
+            totals["uncertainty"] = _component("uncertainty")
         if totals["absent"] > 0.0 or totals["residual"] >= max(
             1.0,
-            totals["pairwise"] + totals["verification"],
+            totals["pairwise"] + totals["verification"] + totals["cardinality"],
         ):
             return "global_recovery", totals
         if totals["verification"] > 0.0:
             return "verification", totals
         if (
             totals["pairwise"] > 0.0
-            or totals["correlation"] > 0.0
             or totals["high_surface"] > 0.0
+            or totals["cardinality"] > 0.0
         ):
             return "local_disambiguation", totals
         return "balanced", totals
@@ -14556,54 +12146,70 @@ def run_live_pf(
         remaining_estimate: Mapping[str, Any] | object | None,
         label: str,
     ) -> DSSPPConfig:
-        """Return the DSS-PP config with adaptive shield-program length applied."""
-        if _pure_pf_profile_active(estimator):
+        """Adapt DSS-PP using only PF posterior-predictive budget evidence."""
+        if not bool(dss_adaptive_program_length_enabled):
             return config
-        sparse_diagnostics: Mapping[str, Any] = {}
-        sparse_getter = getattr(estimator, "sparse_poisson_evidence_diagnostics", None)
-        if callable(sparse_getter):
+        if config.forced_program_pair_ids is not None:
+            return config
+        payload = _remaining_measurement_payload(remaining_estimate)
+        components = payload.get("components", {})
+        component_values = dict(components) if isinstance(components, Mapping) else {}
+
+        def _budget(key: str) -> float:
+            """Return a finite PF remaining-budget component."""
             try:
-                sparse_payload = sparse_getter()
-            except (RuntimeError, ValueError, TypeError):
-                sparse_payload = {}
-            if isinstance(sparse_payload, Mapping):
-                sparse_diagnostics = sparse_payload
-        if not sparse_diagnostics and hasattr(
-            estimator, "report_model_order_diagnostics"
+                value = float(component_values.get(key, 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+            return value if np.isfinite(value) else 0.0
+
+        cardinality_ready, _cardinality_reason = _source_cardinality_dwell_status(
+            estimator,
+            refresh_estimates=False,
+        )
+        residual_unresolved = bool(
+            _budget("residual") > dss_adaptive_residual_budget_threshold
+            or _budget("isotope_absence") > dss_adaptive_residual_budget_threshold
+            or bool(residual_burst_active)
+        )
+        ambiguity_unresolved = bool(
+            _budget("same_isotope_separation")
+            > dss_adaptive_ambiguity_budget_threshold
+            or _budget("pseudo_source_verification")
+            > dss_adaptive_ambiguity_budget_threshold
+            or _budget("high_surface_ambiguity")
+            > dss_adaptive_ambiguity_budget_threshold
+            or _budget("cardinality") > dss_adaptive_ambiguity_budget_threshold
+        )
+        require_cardinality_gap = bool(
+            dss_residual_extension_requires_cardinality_evidence
+        )
+        base_length = max(1, int(config.program_length))
+        residual_length = max(
+            base_length,
+            int(dss_residual_program_length_resolved),
+        )
+        simple_length = max(
+            1,
+            min(base_length, int(dss_adaptive_simple_program_length)),
+        )
+        adapted = config
+        reason = "full"
+        if residual_unresolved and (
+            not require_cardinality_gap or not cardinality_ready
         ):
-            try:
-                report_payload = estimator.report_model_order_diagnostics()
-            except (RuntimeError, ValueError, TypeError):
-                report_payload = {}
-            if isinstance(report_payload, Mapping):
-                sparse_diagnostics = report_payload
-        cardinality_evidence_unresolved = _sparse_gap_unresolved(
-            sparse_diagnostics,
-            gap_target=float(config.cardinality_evidence_gap_target),
-        )
-        adapted, reason = _adapt_dss_program_length_for_budget(
-            config,
-            enabled=dss_adaptive_program_length_enabled,
-            simple_program_length=dss_adaptive_simple_program_length,
-            residual_program_length=dss_residual_program_length_resolved,
-            residual_burst_active=bool(residual_burst_active),
-            report_simple_ready=_report_simple_ready_for_planning(remaining_estimate),
-            remaining_measurement_estimate=remaining_estimate,
-            residual_budget_threshold=dss_adaptive_residual_budget_threshold,
-            ambiguity_budget_threshold=dss_adaptive_ambiguity_budget_threshold,
-            allow_high_surface_simple=(
-                mission_stop_report_simple_allow_high_surface_ambiguity
-            ),
-            residual_extension_requires_cardinality_evidence=(
-                dss_residual_extension_requires_cardinality_evidence
-            ),
-            cardinality_evidence_unresolved=cardinality_evidence_unresolved,
-        )
-        if bool(dss_adaptive_program_length_enabled) and reason not in {
-            "disabled",
-            "forced_program",
-            "full",
-        }:
+            adapted = replace(config, program_length=residual_length)
+            reason = "pf_residual"
+        elif ambiguity_unresolved:
+            reason = "pf_ambiguity"
+        elif (
+            _remaining_measurement_ready_for_stop(payload)
+            and cardinality_ready
+            and simple_length < base_length
+        ):
+            adapted = replace(config, program_length=simple_length)
+            reason = "pf_ready"
+        if reason != "full":
             print(
                 "DSS-PP adaptive shield program length: "
                 f"context={label} reason={reason} "
@@ -14611,39 +12217,26 @@ def run_live_pf(
                 f"base={int(config.program_length)} "
                 f"residual={int(dss_residual_program_length_resolved)}"
             )
-        recovery_isotopes = _recovery_isotopes_from_remaining(remaining_estimate)
-        if recovery_isotopes:
-            boosted_runtime = max(float(adapted.runtime_rescue_mode_weight), 1.0)
-            boosted_global = max(float(adapted.global_surface_rescue_mode_weight), 1.0)
+        priority_isotopes = _pf_priority_isotopes_from_remaining(remaining_estimate)
+        if priority_isotopes:
             adapted = replace(
                 adapted,
-                recovery_isotopes=recovery_isotopes,
-                runtime_rescue_mode_weight=boosted_runtime,
-                global_surface_rescue_mode_weight=boosted_global,
+                recovery_isotopes=priority_isotopes,
             )
             print(
-                "DSS-PP isotope recovery mode: "
-                f"context={label} isotopes={list(recovery_isotopes)} "
-                f"runtime_rescue_w={boosted_runtime:.2f} "
-                f"global_rescue_w={boosted_global:.2f}"
+                "DSS-PP PF-priority isotopes: "
+                f"context={label} isotopes={list(priority_isotopes)}"
             )
         if bool(adapted.explicit_mode_switch):
-            planner_mode, mode_scores = _planner_mode_from_remaining(remaining_estimate)
+            planner_mode, mode_scores = _pf_planner_mode_from_remaining(
+                remaining_estimate
+            )
             if planner_mode == "global_recovery":
                 adapted = replace(
                     adapted,
                     planner_mode=planner_mode,
                     lambda_frontier=max(float(adapted.lambda_frontier), 2.0),
                     lambda_coverage=max(float(adapted.lambda_coverage), 2.0),
-                    include_global_surface_rescue_modes=True,
-                    global_surface_rescue_mode_weight=max(
-                        float(adapted.global_surface_rescue_mode_weight),
-                        1.5,
-                    ),
-                    runtime_rescue_mode_weight=max(
-                        float(adapted.runtime_rescue_mode_weight),
-                        1.0,
-                    ),
                 )
             elif planner_mode == "local_disambiguation":
                 adapted = replace(
@@ -14671,11 +12264,6 @@ def run_live_pf(
                 adapted = replace(
                     adapted,
                     planner_mode=planner_mode,
-                    include_runtime_rescue_modes=True,
-                    runtime_rescue_mode_weight=max(
-                        float(adapted.runtime_rescue_mode_weight),
-                        1.75,
-                    ),
                     lambda_correlation_reduction=max(
                         float(adapted.lambda_correlation_reduction),
                         6.0,
@@ -14693,9 +12281,7 @@ def run_live_pf(
                 f"scores={_safe_json_dumps(mode_scores)} "
                 f"signature_w={float(adapted.lambda_signature):.2f} "
                 f"temporal_w={float(adapted.lambda_temporal_separation):.2f} "
-                f"condition_w={float(adapted.lambda_station_condition):.2f} "
-                f"global_rescue_w={float(adapted.global_surface_rescue_mode_weight):.2f} "
-                f"runtime_rescue_w={float(adapted.runtime_rescue_mode_weight):.2f}"
+                f"condition_w={float(adapted.lambda_station_condition):.2f}"
             )
         return adapted
 
@@ -14783,24 +12369,11 @@ def run_live_pf(
         f"cardinality_min_s={float(adaptive_cardinality_min_live_s):.1f}"
     )
     print(
-        "Strength prior adaptation: "
-        f"enabled={bool(pf_conf.adaptive_strength_prior)} "
-        f"steps={int(pf_conf.adaptive_strength_prior_steps)} "
-        f"min_counts={float(pf_conf.adaptive_strength_prior_min_counts):.3f} "
-        f"log_sigma={float(pf_conf.adaptive_strength_prior_log_sigma):.3f}"
-    )
-    display_prune_refresh_label = (
-        "station/final only"
-        if int(display_prune_refresh_every) <= 0
-        else f"{int(display_prune_refresh_every)} measurement(s)"
-    )
-    print(
-        "Display pruning: "
-        f"refresh_every={display_prune_refresh_label}; "
+        "Output rendering: "
         f"spectrum_plot_save_every={int(spectrum_plot_save_every)}; "
         f"pf_plot_save_every={int(pf_plot_save_every)}; "
         f"headless_visualizer_defer={bool(runtime_config.get('headless_visualizer_defer', True))}; "
-        "final estimates remain fully recomputed"
+        "estimates use the current PF posterior projection"
     )
     print(
         "Pose observability constraint: "
@@ -14838,10 +12411,6 @@ def run_live_pf(
         "station_cond_coherence_w="
         f"{float(dss_config.station_condition_coherence_weight):.3f} "
         f"corr_reduction_w={float(dss_config.lambda_correlation_reduction):.3f} "
-        "cardinality_discrimination_w="
-        f"{float(dss_config.lambda_cardinality_discrimination):.3f} "
-        "cardinality_gap_target="
-        f"{float(dss_config.cardinality_evidence_gap_target):.3f} "
         f"isotope_balance_w={float(dss_config.lambda_isotope_balance):.3f} "
         f"env_sig_w={float(dss_config.lambda_environment_signature):.3f} "
         f"occ_boundary_w={float(dss_config.lambda_occlusion_boundary):.3f} "
@@ -14866,8 +12435,6 @@ def run_live_pf(
         f"{bool(dss_config.same_isotope_direct_separation_guard)} "
         "same_iso_direct_eps="
         f"{float(dss_config.same_isotope_direct_separation_epsilon):.3g} "
-        f"runtime_rescue_modes={bool(dss_config.include_runtime_rescue_modes)} "
-        f"runtime_rescue_mode_w={float(dss_config.runtime_rescue_mode_weight):.2f} "
         f"high_surface_pair_boost={float(dss_config.high_surface_pair_boost):.2f} "
         "high_surface_cross_stratum_boost="
         f"{float(dss_config.high_surface_cross_stratum_boost):.2f} "
@@ -14914,141 +12481,9 @@ def run_live_pf(
         f"{float(pf_conf.shield_view_ratio_likelihood_concentration):.1f}"
     )
     print(
-        "PF cardinality birth gate: "
-        f"p_value={float(pf_conf.birth_residual_gate_p_value):.3g} "
-        f"min_support={int(pf_conf.birth_residual_min_support)} "
-        f"min_distinct_poses={int(pf_conf.birth_min_distinct_poses)} "
-        f"min_distinct_stations={int(pf_conf.birth_min_distinct_stations)} "
-        f"source_detector_exclusion_m={float(pf_conf.source_detector_exclusion_m):.3f} "
-        f"support_sigma={float(pf_conf.birth_residual_support_sigma):.2f} "
-        f"candidate_support_fraction={float(pf_conf.birth_candidate_support_fraction):.2f} "
-        f"refit_gate={bool(pf_conf.birth_refit_residual_gate)} "
-        f"refit_min_fraction={float(pf_conf.birth_refit_residual_min_fraction):.2f} "
-        f"shield_coded={bool(pf_conf.birth_use_shield_coded_residual)} "
-        f"existing_corr_max={float(pf_conf.birth_existing_response_corr_max):.3f} "
-        f"count_distance_w={float(pf_conf.birth_count_distance_prior_weight):.2f} "
-        f"count_distance_strength_w={float(pf_conf.birth_count_distance_strength_weight):.2f} "
-        f"always_try={bool(pf_conf.birth_residual_always_try)} "
-        f"expand_particles={bool(pf_conf.birth_residual_expand_structural_particles)} "
-        f"expanded_topk={pf_conf.birth_residual_expanded_structural_topk_particles} "
-        f"residual_complexity_scale={float(pf_conf.birth_residual_acceptance_complexity_scale):.2f} "
-        f"force_proposal={bool(pf_conf.birth_residual_force_proposal_on_gate)} "
-        f"forced_min_delta_ll={float(pf_conf.birth_residual_forced_min_delta_ll):.1f} "
-        f"force_relax_masks={bool(pf_conf.birth_residual_force_relax_candidate_masks)} "
-        f"suppress_death={bool(pf_conf.birth_residual_suppress_death)} "
-        f"mp_max_new={int(pf_conf.birth_matching_pursuit_max_new_sources)} "
-        f"mp_topk={int(pf_conf.birth_matching_pursuit_topk_candidates)} "
-        f"jitter_topk={pf_conf.birth_jitter_topk_candidates} "
-        f"global_rescue={bool(pf_conf.birth_global_rescue_enable)} "
-        f"global_rescue_max={int(pf_conf.birth_global_rescue_max_candidates)} "
-        f"global_rescue_min_frac={float(pf_conf.birth_global_rescue_min_residual_fraction):.3f} "
-        f"global_rescue_dedup={float(pf_conf.birth_global_rescue_dedup_radius_m):.2f} "
-        f"global_rescue_min_support={pf_conf.birth_global_rescue_min_support} "
-        f"global_rescue_min_distinct_poses={pf_conf.birth_global_rescue_min_distinct_poses} "
-        "global_rescue_min_distinct_stations="
-        f"{pf_conf.birth_global_rescue_min_distinct_stations} "
-        f"high_strength_split={bool(pf_conf.high_strength_split_enable)} "
-        f"high_strength_split_qx={float(pf_conf.high_strength_split_q_multiple):.2f} "
-        f"runtime_report_rescue={bool(pf_conf.runtime_report_rescue_enable)} "
-        f"runtime_report_rescue_fraction={float(pf_conf.runtime_report_rescue_particle_fraction):.2f} "
-        f"runtime_report_rescue_min_per_source={int(pf_conf.runtime_report_rescue_min_particles_per_source)} "
-        f"runtime_report_rescue_weight={float(pf_conf.runtime_report_rescue_weight):.2f} "
-        f"runtime_report_rescue_jitter={float(pf_conf.runtime_report_rescue_jitter_sigma_m):.2f} "
-        f"runtime_report_rescue_quarantine={bool(pf_conf.runtime_report_rescue_quarantine_enable)} "
-        f"runtime_report_rescue_quarantine_weight={float(pf_conf.runtime_report_rescue_quarantine_weight):.3f} "
-        f"runtime_report_rescue_candidate_weight={float(pf_conf.runtime_report_rescue_candidate_weight):.3f} "
-        f"runtime_report_rescue_memory={bool(pf_conf.runtime_report_rescue_memory_enable)} "
-        f"runtime_report_rescue_memory_decay={float(pf_conf.runtime_report_rescue_memory_decay):.2f} "
-        f"runtime_report_rescue_memory_max={int(pf_conf.runtime_report_rescue_memory_max_sources)} "
-        "runtime_report_rescue_queue_only="
-        f"{bool(pf_conf.runtime_report_rescue_verification_queue_only)} "
-        f"sparse_poisson={bool(pf_conf.sparse_poisson_evidence_enable)} "
-        f"sparse_poisson_authority={bool(pf_conf.sparse_poisson_evidence_authoritative)} "
-        f"sparse_poisson_candidate_limit={int(pf_conf.sparse_poisson_evidence_candidate_limit)} "
-        f"spectral_evidence={bool(pf_conf.sparse_poisson_spectral_evidence_enable)} "
-        f"spectral_primary={bool(pf_conf.sparse_poisson_spectral_evidence_primary)} "
-        f"spectral_nuisance={bool(pf_conf.sparse_poisson_spectral_nuisance_enable)} "
-        f"joint_evidence={bool(pf_conf.sparse_poisson_joint_evidence_enable)} "
-        f"offgrid_refine={bool(pf_conf.sparse_poisson_offgrid_refine_enable)} "
-        f"offgrid_radius={float(pf_conf.sparse_poisson_offgrid_refine_radius_m):.2f} "
-        f"all_history_dictionary={bool(pf_conf.all_history_dictionary_proposal_enable)} "
-        f"all_history_dictionary_weight={float(pf_conf.all_history_dictionary_proposal_weight):.3f} "
-        f"verification_queue={bool(pf_conf.candidate_verification_queue_enable)} "
-        f"verification_queue_weight={float(pf_conf.candidate_verification_queue_weight):.3f} "
-        f"max_per_update={pf_conf.birth_max_per_update} "
-        f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
-        f"residual_layers={bool(pf_conf.residual_decomposition_enable)} "
-        f"peak_suppression={bool(pf_conf.peak_suppression_enable)} "
-        f"pseudo_verify={bool(pf_conf.pseudo_source_verification_enable)} "
-        f"pseudo_grace={int(pf_conf.pseudo_source_fail_grace_stations)}"
-    )
-    print(
-        "PF conditional strength refit: "
-        f"enabled={bool(pf_conf.conditional_strength_refit)} "
-        f"window={int(pf_conf.conditional_strength_refit_window)} "
-        f"iters={int(pf_conf.conditional_strength_refit_iters)} "
-        f"reweight={bool(pf_conf.conditional_strength_refit_reweight)} "
-        f"cardinality_neutral={bool(pf_conf.conditional_strength_refit_cardinality_neutral_reweight)} "
-        f"reweight_clip={float(pf_conf.conditional_strength_refit_reweight_clip):.3f} "
-        f"min_count={float(pf_conf.conditional_strength_refit_min_count):.3f} "
-        f"min_snr={float(pf_conf.conditional_strength_refit_min_snr):.3f} "
-        f"prior_weight={float(pf_conf.conditional_strength_refit_prior_weight):.3f} "
-        f"prior_rel_sigma={float(pf_conf.conditional_strength_refit_prior_rel_sigma):.3f} "
-        f"abs_q_prior_mean={float(pf_conf.source_strength_prior_mean):.3f} "
-        f"abs_q_prior_weight={float(pf_conf.source_strength_prior_weight):.3f} "
-        f"abs_q_prior_rel_sigma={float(pf_conf.source_strength_prior_rel_sigma):.3f} "
-        f"report_refit={bool(pf_conf.report_strength_refit)} "
-        f"report_refit_iters={int(pf_conf.report_strength_refit_iters)} "
-        f"report_refit_all_measurements={bool(pf_conf.report_strength_refit_use_all_measurements)} "
-        f"weak_prune_min_counts={float(pf_conf.weak_source_prune_min_expected_count):.3f} "
-        f"weak_prune_min_fraction={float(pf_conf.weak_source_prune_min_fraction):.4f} "
-        f"weak_prune_min_age={int(pf_conf.weak_source_prune_min_age)} "
-        f"weak_prune_require_observable={bool(pf_conf.weak_source_prune_require_observable)} "
-        f"weak_prune_min_observable={int(pf_conf.weak_source_prune_min_observable_measurements)} "
-        f"report_preserve_cardinality={bool(pf_conf.report_strength_refit_preserve_cardinality)} "
-        f"report_prior_weight={float(pf_conf.report_strength_refit_prior_weight):.3f} "
-        f"report_prior_rel_sigma={float(pf_conf.report_strength_refit_prior_rel_sigma):.3f} "
-        f"report_absorption_weight={float(pf_conf.report_strength_absorption_penalty_weight):.3f} "
-        f"report_absorption_q_multiple={float(pf_conf.report_strength_absorption_q_multiple):.3f} "
-        "obs_overshoot_w="
-        f"{float(pf_conf.source_strength_observation_overshoot_penalty_weight):.3f} "
-        "report_obs_overshoot_w="
-        f"{float(pf_conf.report_strength_observation_overshoot_penalty_weight):.3f} "
-        f"report_surface_refine={bool(pf_conf.report_surface_local_refine)} "
-        "report_surface_refine_radius="
-        f"{float(pf_conf.report_surface_local_refine_radius_m):.2f}m "
-        "report_surface_refine_candidates="
-        f"{int(pf_conf.report_surface_local_refine_max_candidates_per_source)} "
-        f"report_require_posterior_match={bool(pf_conf.report_model_order_require_posterior_match)} "
-        f"report_prune_particles={bool(pf_conf.report_model_order_prune_particles)} "
-        f"report_exclude_unverified={bool(pf_conf.report_exclude_unverified_sources)} "
-        f"report_mle_rescue={bool(pf_conf.report_mle_rescue_enable)} "
-        f"report_rescue_visibility_weight={float(pf_conf.report_mle_rescue_visibility_weight):.3f} "
-        f"report_rescue_min_visible={int(pf_conf.report_mle_rescue_min_visible_measurements)} "
-        f"report_rescue_surface_quota={bool(pf_conf.report_mle_rescue_surface_quota_enable)} "
-        "report_rescue_surface_quota_min_frac="
-        f"{float(pf_conf.report_mle_rescue_surface_quota_min_score_fraction):.3f} "
-        f"report_rescue_quota_per_stratum={int(pf_conf.report_mle_rescue_surface_quota_per_stratum)} "
-        "report_zero_source_min_bic_margin="
-        f"{float(pf_conf.report_model_order_zero_source_min_bic_margin):.3f} "
-        f"report_rescue_spatial_quota={bool(pf_conf.report_mle_rescue_spatial_quota_enable)} "
-        f"report_rescue_spatial_tile={float(pf_conf.report_mle_rescue_spatial_quota_tile_m):.2f}m"
-    )
-    print(
         "PF shield-program update: "
         f"delayed_resample={bool(delayed_resample_update)} "
         f"legacy_joint={bool(joint_observation_update)}"
-    )
-    print(
-        "Online absent-isotope pruning: "
-        f"enabled={bool(online_absent_pruning_enabled)} "
-        f"min_poses={int(online_absent_min_poses)} "
-        f"coverage={float(online_absent_coverage_fraction):.3f} "
-        f"radius_m={float(online_absent_coverage_radius_m):.2f} "
-        f"min_measurements={int(online_absent_min_measurements)} "
-        f"min_support={int(online_absent_min_support_measurements)} "
-        f"min_total_counts={float(online_absent_min_total_counts):.3g} "
-        f"min_snr={float(online_absent_min_snr):.3g}"
     )
     print(
         "Shield posture selector: "
@@ -15109,28 +12544,6 @@ def run_live_pf(
         f"max_sources={pf_conf.max_sources}"
     )
     print(
-        "Birth moves: "
-        f"enabled={birth_enabled} "
-        f"p_birth={pf_conf.p_birth:.3f} p_kill={pf_conf.p_kill:.3f} "
-        f"split_prob={pf_conf.split_prob:.3f} merge_prob={pf_conf.merge_prob:.3f} "
-        f"split_residual_guided={bool(pf_conf.split_residual_guided)} "
-        f"split_residual_always_try={bool(pf_conf.split_residual_always_try)} "
-        f"birth_ll_threshold={float(pf_conf.birth_delta_ll_threshold):.3f} "
-        f"birth_complexity={float(pf_conf.birth_complexity_penalty):.3f} "
-        f"birth_bic_params={int(pf_conf.birth_bic_penalty_params)} "
-        f"split_complexity={float(pf_conf.split_complexity_penalty):.3f} "
-        f"split_candidates={int(pf_conf.split_residual_candidate_count)} "
-        f"high_strength_split={bool(pf_conf.high_strength_split_enable)} "
-        f"high_strength_qx={float(pf_conf.high_strength_split_q_multiple):.2f} "
-        f"merge_corr_min={float(pf_conf.merge_response_corr_min):.3f} "
-        f"merge_pairs={int(pf_conf.merge_search_topk_pairs)} "
-        "birth_orthogonalize="
-        f"{bool(pf_conf.birth_orthogonalize_residual_candidates)} "
-        "birth_orthogonal_corr_max="
-        f"{float(pf_conf.birth_orthogonal_candidate_corr_max):.3f} "
-        f"max_sources={pf_conf.max_sources}"
-    )
-    print(
         "Tempering settings: "
         f"max_resamples_per_observation={pf_conf.max_resamples_per_observation} "
         f"disable_regularize_on_temper_resample={pf_conf.disable_regularize_on_temper_resample} "
@@ -15147,30 +12560,6 @@ def run_live_pf(
         f"k={pf_conf.roughening_k:.3f} "
         f"min_sigma_pos={pf_conf.min_sigma_pos:.3f} "
         f"max_sigma_pos={pf_conf.max_sigma_pos:.3f}"
-    )
-    print(
-        "Mode-preserving resampling: "
-        f"enabled={bool(pf_conf.mode_preserving_resample)} "
-        f"max_modes={int(pf_conf.mode_preserving_max_modes)} "
-        f"per_mode={int(pf_conf.mode_preserving_particles_per_mode)} "
-        f"radius_m={float(pf_conf.mode_preserving_radius_m):.2f} "
-        f"min_weight_fraction={float(pf_conf.mode_preserving_min_weight_fraction):.3g} "
-        f"cardinality_strata={bool(pf_conf.mode_preserving_cardinality_strata)} "
-        "min_particles_per_cardinality="
-        f"{int(pf_conf.mode_preserving_min_particles_per_cardinality)} "
-        "report_cardinality_strata="
-        f"{bool(pf_conf.mode_preserving_report_cardinality_strata)} "
-        "report_cardinality_extra="
-        f"{int(pf_conf.mode_preserving_report_cardinality_extra_particles)} "
-        "dynamic_cardinality_allocation="
-        f"{bool(pf_conf.mode_preserving_dynamic_cardinality_allocation)} "
-        "dynamic_cardinality_extra="
-        f"{int(pf_conf.mode_preserving_dynamic_cardinality_extra_particles)} "
-        "dynamic_spatial_allocation="
-        f"{bool(pf_conf.mode_preserving_dynamic_spatial_allocation)} "
-        "dynamic_spatial_extra="
-        f"{int(pf_conf.mode_preserving_dynamic_spatial_extra_particles)} "
-        f"surface_rejuvenation={bool(pf_conf.surface_rejuvenation_enable)}"
     )
     print(
         "Planning rollout settings: "
@@ -15222,18 +12611,12 @@ def run_live_pf(
         f"birth_residual_min_support={mission_stop_birth_residual_min_support} "
         "require_no_unresolved_discriminative_failures="
         f"{mission_stop_require_no_unresolved_discriminative_failures} "
-        f"require_model_order_ready={mission_stop_require_model_order_ready} "
+        "require_pf_cardinality_ready="
+        f"{mission_stop_require_pf_cardinality_ready} "
         "require_remaining_measurement_ready="
         f"{mission_stop_require_remaining_measurement_ready} "
         "unresolved_fail_min_count="
-        f"{mission_stop_unresolved_discriminative_fail_min_count} "
-        f"report_simple_stop={mission_stop_report_simple_enable} "
-        "report_simple_margin="
-        f"{mission_stop_report_simple_min_bic_margin:.2f} "
-        "report_simple_max_sources_per_iso="
-        f"{mission_stop_report_simple_max_sources_per_isotope} "
-        "report_simple_allow_high_surface="
-        f"{mission_stop_report_simple_allow_high_surface_ambiguity}"
+        f"{mission_stop_unresolved_discriminative_fail_min_count}"
     )
     has_environment_obstacles = _has_environment_obstacles(obstacle_grid)
     reset_usd_path = (
@@ -15411,21 +12794,8 @@ def run_live_pf(
                 adaptive_cardinality_dwell_enable
             ),
             "adaptive_cardinality_min_live_s": float(adaptive_cardinality_min_live_s),
-            "adaptive_cardinality_min_candidate_count": int(
-                adaptive_cardinality_min_candidate_count
-            ),
-            "adaptive_cardinality_condition_max": float(
-                adaptive_cardinality_condition_max
-            ),
-            "adaptive_cardinality_min_bic_margin": float(
-                adaptive_cardinality_min_bic_margin
-            ),
             "delayed_resample_update": bool(delayed_resample_update),
             "joint_observation_update": bool(joint_observation_update),
-            "online_absent_isotope_pruning": bool(online_absent_pruning_enabled),
-            "online_absent_min_poses": int(online_absent_min_poses),
-            "online_absent_coverage_fraction": float(online_absent_coverage_fraction),
-            "online_absent_min_measurements": int(online_absent_min_measurements),
             "strict_planned_shield_program": bool(strict_planned_shield_program),
             "baseline_shield_policy": baseline_shield_policy,
             "baseline_path_policy": baseline_path_policy,
@@ -15591,7 +12961,6 @@ def run_live_pf(
                 if resume_station_boundary and resume_controller_state is not None
                 else []
             )
-            pose_raw_detected_isotopes: set[str] = set()
             deferred_update_records = 0
             executed_signature_vectors: list[NDArray[np.float64]] = []
             if delayed_resample_update:
@@ -15901,11 +13270,6 @@ def run_live_pf(
                     cardinality_ready, cardinality_reason = (
                         _source_cardinality_dwell_status(
                             estimator,
-                            min_candidate_count=(
-                                adaptive_cardinality_min_candidate_count
-                            ),
-                            max_condition_number=(adaptive_cardinality_condition_max),
-                            min_bic_margin=adaptive_cardinality_min_bic_margin,
                             refresh_estimates=False,
                         )
                     )
@@ -15961,7 +13325,6 @@ def run_live_pf(
                 executed_pair_ids_this_pose.append(int(fe_idx * num_orients + pb_idx))
                 pending_motion_distance_m = 0.0
                 pending_motion_time_s = 0.0
-                pose_raw_detected_isotopes.update(set(detected))
                 step_path_segment = pending_path_segment
                 pending_path_segment = None
                 total_motion_distance_m += step_motion_distance_m
@@ -16081,11 +13444,10 @@ def run_live_pf(
                             f"{sorted(active_isotopes)} "
                             "(PF/planning gating disabled by config)."
                         )
-                _reactivate_online_absent_isotopes(raw_detected_isotopes)
                 pf_isotopes = list(estimator.isotopes)
                 # The scientific baseline is a response_poisson count-domain PF.
-                # Raw bins remain in MeasurementLog for standalone MLE/ablations
-                # and must never enter the online PF likelihood a second time.
+                # Raw bins remain in MeasurementLog for audit and replay and must
+                # never enter the online PF likelihood a second time.
                 spectrum_payload = None
                 z_k_full = {iso: float(z_detected.get(iso, 0.0)) for iso in pf_isotopes}
                 z_variance_full = {
@@ -16110,12 +13472,15 @@ def run_live_pf(
                     )
                     for iso in isotopes
                 }
-                z_covariance_full = _metadata_count_covariance(
+                metadata_count_covariance = _metadata_count_covariance(
                     observation.metadata,
-                    {str(isotope) for isotope in pf_isotopes},
+                    {str(isotope) for isotope in isotopes},
                 )
-                if not _count_covariance_has_offdiag(z_covariance_full):
-                    z_covariance_full = None
+                z_covariance_full = _complete_count_covariance(
+                    history_z_variance,
+                    metadata_count_covariance,
+                    isotopes,
+                )
                 z_counts = z_k_full
                 z_k = z_k_full
                 if str(observation.metadata.get("backend", "")).lower() == "geant4":
@@ -16177,7 +13542,6 @@ def run_live_pf(
                     # update so the log and replay use bit-identical geometry.
                     estimator.poses[current_pose_idx] = pose_for_pf.copy()
                     estimator.kernel_cache = None
-                    estimator._invalidate_report_cache()
                     pose = pose_for_pf.copy()
                     current_pose = pose_for_pf.copy()
                 elif not np.array_equal(
@@ -16203,24 +13567,16 @@ def run_live_pf(
                 )
                 last_measurement_for_diagnostics = meas
                 if measurement_log_writer is not None:
-                    log_covariance_payload = _metadata_count_covariance(
-                        observation.metadata,
-                        {str(isotope) for isotope in isotopes},
+                    log_covariance = np.asarray(
+                        [
+                            [
+                                z_covariance_full[row_isotope][column_isotope]
+                                for column_isotope in isotopes
+                            ]
+                            for row_isotope in isotopes
+                        ],
+                        dtype=np.float64,
                     )
-                    log_covariance = np.diag(
-                        [float(history_z_variance[isotope]) for isotope in isotopes]
-                    ).astype(np.float64)
-                    if isinstance(log_covariance_payload, Mapping):
-                        for row_index, row_isotope in enumerate(isotopes):
-                            row_payload = log_covariance_payload.get(row_isotope, {})
-                            if not isinstance(row_payload, Mapping):
-                                continue
-                            for column_index, column_isotope in enumerate(isotopes):
-                                if column_isotope in row_payload:
-                                    log_covariance[row_index, column_index] = float(
-                                        row_payload[column_isotope]
-                                    )
-                    log_covariance = 0.5 * (log_covariance + log_covariance.T)
                     measurement_log_writer.append_before_update(
                         MeasurementLogRecord(
                             step_id=int(step_counter),
@@ -16274,24 +13630,20 @@ def run_live_pf(
                         float(actual_live_time_s),
                         dict(history_z_variance),
                     )
-                    if z_covariance_full is not None:
-                        joint_record = (
-                            *joint_record,
-                            {
-                                row_iso: dict(row_payload)
-                                for row_iso, row_payload in z_covariance_full.items()
-                            },
-                        )
+                    joint_record = (
+                        *joint_record,
+                        {
+                            row_iso: dict(row_payload)
+                            for row_iso, row_payload in z_covariance_full.items()
+                        },
+                    )
                     if spectrum_payload is not None:
-                        if z_covariance_full is None:
-                            joint_record = (*joint_record, None, spectrum_payload)
-                        else:
-                            joint_record = (*joint_record, spectrum_payload)
+                        joint_record = (*joint_record, spectrum_payload)
                     joint_update_records.append(joint_record)
                 else:
-                    update_kwargs: dict[str, object] = {}
-                    if z_covariance_full is not None:
-                        update_kwargs["z_covariance_k"] = z_covariance_full
+                    update_kwargs: dict[str, object] = {
+                        "z_covariance_k": z_covariance_full,
+                    }
                     if spectrum_payload is not None and _callable_accepts_keyword(
                         estimator.update_pair,
                         "spectrum_payload",
@@ -16308,55 +13660,12 @@ def run_live_pf(
                     )
                     if delayed_resample_update:
                         deferred_update_records += 1
-                if (
-                    not joint_observation_update
-                    and estimator.last_strength_prior_diagnostics
-                ):
-                    for iso, stats in sorted(
-                        estimator.last_strength_prior_diagnostics.items()
-                    ):
-                        print(
-                            f"[step {step_counter}] strength_prior[{iso}] "
-                            f"z={stats['observed_counts']:.2f} "
-                            f"target={stats['target_counts']:.2f} "
-                            f"median_before={stats['before_median_strength']:.2f} "
-                            f"median_after={stats['after_median_strength']:.2f} "
-                            f"particles={int(stats['particles_changed'])}"
-                        )
                 pf_elapsed = time.perf_counter() - pf_start
                 if not joint_observation_update:
                     total_pf_wall_s += pf_elapsed
                     pf_wall_samples_s.append(float(pf_elapsed))
-                    _maybe_prune_online_absent_isotopes(
-                        label=f"step_{step_counter}",
-                        pose_for_coverage=pose_for_pf,
-                        raw_detected=raw_detected_isotopes,
-                    )
                 measurement_live_times_s.append(float(actual_live_time_s))
                 elapsed += actual_live_time_s
-                refresh_pruned_display = _should_refresh_display_pruned_estimates(
-                    step_index=step_counter,
-                    refresh_every=display_prune_refresh_every,
-                    cache_available=pruned_display_cache is not None,
-                    force_refresh=pruned_display_force_refresh,
-                )
-                if refresh_pruned_display:
-                    prune_start = time.perf_counter()
-                    pruned_display_cache = estimator.pruned_estimates(
-                        method=PRUNE_METHOD,
-                        params={"deltaLL_min": PRUNE_DELTALL_MIN},
-                        tau_mix=PRUNE_TAU_MIX,
-                        min_support=PRUNE_MIN_SUPPORT,
-                        min_obs_count=prune_min_obs_count,
-                        min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                        min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-                    )
-                    prune_elapsed = time.perf_counter() - prune_start
-                    total_prune_wall_s += prune_elapsed
-                    pruned_display_force_refresh = False
-                else:
-                    prune_elapsed = 0.0
-                pruned = pruned_display_cache
                 viz_elapsed = 0.0
                 viz_start = time.perf_counter()
                 frame = build_frame_from_pf(
@@ -16367,7 +13676,6 @@ def run_live_pf(
                     estimate_mode=estimate_mode,
                     min_est_strength=estimate_min_strength,
                     min_existence_prob=estimate_min_existence_prob,
-                    estimated_override=pruned,
                 )
                 if step_path_segment is not None:
                     waypoints_payload = step_path_segment.get("waypoints_xyz")
@@ -16396,20 +13704,6 @@ def run_live_pf(
                     frame.spectrum_components_by_isotope = spectrum_components_payload
                 viz_elapsed += time.perf_counter() - viz_start
                 viz_start = time.perf_counter()
-                if (
-                    pruned is not None
-                    and hasattr(frame, "estimated_sources")
-                    and hasattr(frame, "estimated_strengths")
-                ):
-                    frame.estimated_sources = {}
-                    frame.estimated_strengths = {}
-                    for iso in isotopes:
-                        pos, strg = pruned.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-                        pos, strg = _apply_display_thresholds(
-                            pos, strg, estimate_min_strength
-                        )
-                        frame.estimated_sources[iso] = pos
-                        frame.estimated_strengths[iso] = strg
                 viz.update(frame)
                 if cui_split_viz is not None:
                     cui_split_viz.update(frame)
@@ -16494,12 +13788,11 @@ def run_live_pf(
                         log_enabled=estimate_trace_log_enabled,
                         log_every=estimate_trace_log_every,
                         max_log_records=estimate_trace_max_log_records,
-                        estimate_source="current_map",
+                        estimate_source="current_pf_posterior",
                     )
                 print(
                     f"[timing step {step_counter}] ig={ig_elapsed:.3f}s pf={pf_elapsed:.3f}s "
-                    f"display_prune={prune_elapsed:.3f}s viz={viz_elapsed:.3f}s "
-                    f"prune_refreshed={refresh_pruned_display} "
+                    f"viz={viz_elapsed:.3f}s "
                     f"travel={step_motion_time_s:.1f}s "
                     f"shield={step_rotation_time_s:.1f}s "
                     f"live={actual_live_time_s:.1f}s"
@@ -16581,11 +13874,6 @@ def run_live_pf(
                         f"per_measurement={per_measurement_pf:.3f}s"
                     )
                     finalize_step_index = max(step_counter - 1, 0)
-                    _maybe_prune_online_absent_isotopes(
-                        label=f"pose_{current_pose_idx}_finalize",
-                        pose_for_coverage=pose,
-                        raw_detected=pose_raw_detected_isotopes,
-                    )
                     _log_pf_diagnostics(estimator, finalize_step_index)
                     _log_precision_degradation_diagnostics(
                         estimator,
@@ -16612,11 +13900,6 @@ def run_live_pf(
                         full_spectrum_response_diagnostics_enabled=(
                             precision_diagnostic_full_spectrum_response_enable
                         ),
-                    )
-                    _log_report_model_order_diagnostics(
-                        estimator,
-                        finalize_step_index,
-                        label=f"pose_{current_pose_idx}_finalize",
                     )
                     _log_surface_candidate_observability_diagnostics(
                         estimator,
@@ -16647,27 +13930,14 @@ def run_live_pf(
                             log_enabled=estimate_trace_log_enabled,
                             log_every=estimate_trace_log_every,
                             max_log_records=estimate_trace_max_log_records,
-                            estimate_source="post_finalize_map",
+                            estimate_source="post_finalize_pf_posterior",
                         )
-                    pruned_display_force_refresh = True
             elif joint_observation_update and joint_update_records:
                 pf_start = time.perf_counter()
                 estimator.update_pair_sequence(
                     joint_update_records,
                     pose_idx=current_pose_idx,
                 )
-                if estimator.last_strength_prior_diagnostics:
-                    for iso, stats in sorted(
-                        estimator.last_strength_prior_diagnostics.items()
-                    ):
-                        print(
-                            f"[pose {current_pose_idx}] strength_prior[{iso}] "
-                            f"z={stats['observed_counts']:.2f} "
-                            f"target={stats['target_counts']:.2f} "
-                            f"median_before={stats['before_median_strength']:.2f} "
-                            f"median_after={stats['after_median_strength']:.2f} "
-                            f"particles={int(stats['particles_changed'])}"
-                        )
                 pf_elapsed = time.perf_counter() - pf_start
                 total_pf_wall_s += pf_elapsed
                 per_measurement_pf = pf_elapsed / max(len(joint_update_records), 1)
@@ -16701,25 +13971,7 @@ def run_live_pf(
                             for key, value in sorted(pair_stage_wall.items())
                         )
                     )
-                sparse_stage_wall = getattr(
-                    estimator,
-                    "last_sparse_poisson_refresh_stage_wall_s",
-                    {},
-                )
-                if isinstance(sparse_stage_wall, dict) and sparse_stage_wall:
-                    print(
-                        f"[pose {current_pose_idx}] sparse_evidence_refresh_stages "
-                        + " ".join(
-                            f"{key}={float(value):.3f}s"
-                            for key, value in sorted(sparse_stage_wall.items())
-                        )
-                    )
                 joint_step_index = max(step_counter - 1, 0)
-                _maybe_prune_online_absent_isotopes(
-                    label=f"pose_{current_pose_idx}_joint_update",
-                    pose_for_coverage=pose,
-                    raw_detected=pose_raw_detected_isotopes,
-                )
                 _log_pf_diagnostics(estimator, joint_step_index)
                 _log_precision_degradation_diagnostics(
                     estimator,
@@ -16744,11 +13996,6 @@ def run_live_pf(
                     full_spectrum_response_diagnostics_enabled=(
                         precision_diagnostic_full_spectrum_response_enable
                     ),
-                )
-                _log_report_model_order_diagnostics(
-                    estimator,
-                    joint_step_index,
-                    label=f"pose_{current_pose_idx}_joint_update",
                 )
                 _log_surface_candidate_observability_diagnostics(
                     estimator,
@@ -16778,9 +14025,8 @@ def run_live_pf(
                         log_enabled=estimate_trace_log_enabled,
                         log_every=estimate_trace_log_every,
                         max_log_records=estimate_trace_max_log_records,
-                        estimate_source="post_joint_update_map",
+                        estimate_source="post_joint_update_pf_posterior",
                     )
-                pruned_display_force_refresh = True
             if (
                 save_outputs
                 and not resume_station_boundary
@@ -16809,54 +14055,22 @@ def run_live_pf(
                     )
                     else None
                 )
-                report_simple_ready_for_low_ig = (
-                    not _pure_pf_profile_active(estimator)
-                    and bool(mission_stop_report_simple_enable)
-                    and _report_model_order_simple_ready_for_stop(
+                cardinality_ready, cardinality_reason = (
+                    _source_cardinality_dwell_status(
                         estimator,
-                        remaining_measurement_estimate=remaining_stop_estimate,
-                        max_sources_per_isotope=(
-                            mission_stop_report_simple_max_sources_per_isotope
-                        ),
-                        min_bic_margin=mission_stop_report_simple_min_bic_margin,
-                        max_condition_number=(
-                            mission_stop_report_simple_max_condition_number
-                        ),
-                        max_response_correlation=(
-                            mission_stop_report_simple_max_response_correlation
-                        ),
-                        residual_budget_threshold=(
-                            mission_stop_report_simple_residual_budget_threshold
-                        ),
-                        ambiguity_budget_threshold=(
-                            mission_stop_report_simple_ambiguity_budget_threshold
-                        ),
-                        allow_high_surface_ambiguity=(
-                            mission_stop_report_simple_allow_high_surface_ambiguity
-                        ),
-                        require_no_birth_residual=False,
-                        birth_residual_min_support=(
-                            mission_stop_birth_residual_min_support
-                        ),
                         refresh_estimates=False,
                     )
                 )
                 if (
                     (
-                        not bool(mission_stop_require_model_order_ready)
-                        or _pure_pf_profile_active(estimator)
-                        or _report_model_order_ready_for_stop(
-                            estimator,
-                            refresh_estimates=False,
-                        )
-                        or report_simple_ready_for_low_ig
+                        not bool(mission_stop_require_pf_cardinality_ready)
+                        or cardinality_ready
                     )
                     and (
                         not bool(mission_stop_require_remaining_measurement_ready)
                         or _remaining_measurement_ready_for_stop(
                             remaining_stop_estimate
                         )
-                        or report_simple_ready_for_low_ig
                     )
                     and estimator.should_stop_exploration(
                         ig_threshold=ig_threshold_current,
@@ -16865,7 +14079,9 @@ def run_live_pf(
                 ):
                     print(
                         "Converged; stopping exploration "
-                        f"(max IG {last_max_ig:.6g} < threshold {ig_threshold_current:.6g})."
+                        f"(max IG {last_max_ig:.6g} < threshold "
+                        f"{ig_threshold_current:.6g}; "
+                        f"cardinality={cardinality_reason})."
                     )
                     break
             visited_poses.append(pose.copy())
@@ -16900,33 +14116,13 @@ def run_live_pf(
                     unresolved_discriminative_failure_min_count=(
                         mission_stop_unresolved_discriminative_fail_min_count
                     ),
-                    require_model_order_ready=mission_stop_require_model_order_ready,
+                    require_pf_cardinality_ready=(
+                        mission_stop_require_pf_cardinality_ready
+                    ),
                     remaining_measurement_estimate=remaining_stop_estimate,
                     require_remaining_measurement_ready=(
                         bool(mission_stop_require_remaining_measurement_ready)
                         and bool(remaining_measurement_config.enabled)
-                    ),
-                    allow_report_simple_stop=mission_stop_report_simple_enable,
-                    report_simple_max_sources_per_isotope=(
-                        mission_stop_report_simple_max_sources_per_isotope
-                    ),
-                    report_simple_min_bic_margin=(
-                        mission_stop_report_simple_min_bic_margin
-                    ),
-                    report_simple_max_condition_number=(
-                        mission_stop_report_simple_max_condition_number
-                    ),
-                    report_simple_max_response_correlation=(
-                        mission_stop_report_simple_max_response_correlation
-                    ),
-                    report_simple_residual_budget_threshold=(
-                        mission_stop_report_simple_residual_budget_threshold
-                    ),
-                    report_simple_ambiguity_budget_threshold=(
-                        mission_stop_report_simple_ambiguity_budget_threshold
-                    ),
-                    report_simple_allow_high_surface_ambiguity=(
-                        mission_stop_report_simple_allow_high_surface_ambiguity
                     ),
                 )
                 if stop_reason is not None:
@@ -16944,80 +14140,33 @@ def run_live_pf(
                 remaining_unresolved = not _remaining_measurement_ready_for_stop(
                     remaining_stop_estimate
                 )
-                report_simple_ready_at_cap = (
-                    not _pure_pf_profile_active(estimator)
-                    and bool(mission_stop_report_simple_enable)
-                    and _report_model_order_simple_ready_for_stop(
+                pf_cardinality_ready, pf_cardinality_reason = (
+                    _source_cardinality_dwell_status(
                         estimator,
-                        remaining_measurement_estimate=remaining_stop_estimate,
-                        max_sources_per_isotope=(
-                            mission_stop_report_simple_max_sources_per_isotope
-                        ),
-                        min_bic_margin=mission_stop_report_simple_min_bic_margin,
-                        max_condition_number=(
-                            mission_stop_report_simple_max_condition_number
-                        ),
-                        max_response_correlation=(
-                            mission_stop_report_simple_max_response_correlation
-                        ),
-                        residual_budget_threshold=(
-                            mission_stop_report_simple_residual_budget_threshold
-                        ),
-                        ambiguity_budget_threshold=(
-                            mission_stop_report_simple_ambiguity_budget_threshold
-                        ),
-                        allow_high_surface_ambiguity=(
-                            mission_stop_report_simple_allow_high_surface_ambiguity
-                        ),
-                        require_no_birth_residual=False,
-                        birth_residual_min_support=(
-                            mission_stop_birth_residual_min_support
-                        ),
                         refresh_estimates=False,
                     )
                 )
-                model_order_unresolved = (
-                    False
-                    if _pure_pf_profile_active(estimator)
-                    else not (
-                        _report_model_order_ready_for_stop(
-                            estimator,
-                            refresh_estimates=False,
-                        )
-                        or (report_simple_ready_at_cap and not remaining_unresolved)
-                    )
-                )
+                pf_cardinality_unresolved = not pf_cardinality_ready
                 can_extend = (
-                    not _pure_pf_profile_active(estimator)
-                    and bool(mission_stop_soft_extend_on_unresolved)
+                    bool(mission_stop_soft_extend_on_unresolved)
                     and soft_pose_extension_used
                     < int(mission_stop_soft_extension_poses)
-                    and (remaining_unresolved or model_order_unresolved)
+                    and (remaining_unresolved or pf_cardinality_unresolved)
                 )
-                report_progress = {}
                 remaining_progress = {}
-                if can_extend and mission_stop_soft_extension_require_report_progress:
-                    progress_getter = getattr(
-                        estimator, "report_snapshot_progress", None
-                    )
-                    if callable(progress_getter):
-                        try:
-                            report_progress = dict(progress_getter())
-                        except (RuntimeError, ValueError, TypeError):
-                            report_progress = {}
+                if (
+                    can_extend
+                    and mission_stop_soft_extension_require_progress
+                    and not pf_cardinality_unresolved
+                ):
                     remaining_progress = _remaining_measurement_progress(
                         remaining_measurement_estimates
                     )
-                    can_extend = bool(
-                        report_progress.get("has_progress", False)
-                        or remaining_progress.get("has_progress", False)
-                    )
+                    can_extend = bool(remaining_progress.get("has_progress", False))
                     if not can_extend:
                         print(
-                            "Soft extension denied because report diagnostics did "
-                            "not improve and full-history remaining residual "
-                            "budget did not improve: "
-                            f"report_progress={report_progress} "
+                            "Soft extension denied because the PF posterior "
+                            "remaining-measurement budget did not improve: "
                             f"remaining_progress={remaining_progress}"
                         )
                 if can_extend:
@@ -17041,44 +14190,49 @@ def run_live_pf(
                         soft_pose_extension_used += int(extension)
                         max_poses += int(extension)
                         print(
-                            "Soft-extending max poses for unresolved model order: "
+                            "Soft-extending max poses for unresolved PF structure: "
                             f"extension={int(extension)} "
                             f"new_max_poses={int(max_poses)} "
                             f"remaining_unresolved={bool(remaining_unresolved)} "
-                            f"model_order_unresolved={bool(model_order_unresolved)} "
-                            f"report_progress={report_progress} "
+                            "pf_cardinality_unresolved="
+                            f"{bool(pf_cardinality_unresolved)} "
+                            f"pf_cardinality_reason={pf_cardinality_reason} "
                             f"remaining_progress={remaining_progress}"
                         )
                     else:
                         max_pose_stop_unresolved = bool(
-                            remaining_unresolved or model_order_unresolved
+                            remaining_unresolved or pf_cardinality_unresolved
                         )
                         max_pose_stop_diagnostics = {
                             "max_poses": int(max_poses),
                             "remaining_unresolved": bool(remaining_unresolved),
-                            "model_order_unresolved": bool(model_order_unresolved),
+                            "pf_cardinality_unresolved": bool(
+                                pf_cardinality_unresolved
+                            ),
+                            "pf_cardinality_reason": pf_cardinality_reason,
                             "soft_pose_extension_used": int(soft_pose_extension_used),
                             "soft_pose_extension_limit": int(
                                 mission_stop_soft_extension_poses
                             ),
-                            "soft_extension_report_progress": report_progress,
                             "soft_extension_remaining_progress": remaining_progress,
                         }
                         print(f"Reached max poses ({max_poses}); stopping exploration.")
                         break
                 else:
                     max_pose_stop_unresolved = bool(
-                        remaining_unresolved or model_order_unresolved
+                        remaining_unresolved or pf_cardinality_unresolved
                     )
                     max_pose_stop_diagnostics = {
                         "max_poses": int(max_poses),
                         "remaining_unresolved": bool(remaining_unresolved),
-                        "model_order_unresolved": bool(model_order_unresolved),
+                        "pf_cardinality_unresolved": bool(
+                            pf_cardinality_unresolved
+                        ),
+                        "pf_cardinality_reason": pf_cardinality_reason,
                         "soft_pose_extension_used": int(soft_pose_extension_used),
                         "soft_pose_extension_limit": int(
                             mission_stop_soft_extension_poses
                         ),
-                        "soft_extension_report_progress": report_progress,
                         "soft_extension_remaining_progress": remaining_progress,
                     }
                     print(f"Reached max poses ({max_poses}); stopping exploration.")
@@ -17535,8 +14689,6 @@ def run_live_pf(
                     f"remaining_route_penalty={float(dss_result.sequence[0].remaining_route_penalty):.6g} "
                     f"remaining_route_gain={float(dss_result.sequence[0].remaining_route_gain):.6g} "
                     f"planner_mode={dss_result.diagnostics.get('planner_mode', 'balanced')} "
-                    "runtime_rescue_modes="
-                    f"{dss_result.diagnostics.get('runtime_rescue_mode_counts', {})} "
                     f"workers={int(dss_result.diagnostics.get('program_eval_workers', 1))} "
                     f"compute={dss_elapsed:.3f}s"
                 )
@@ -17777,14 +14929,13 @@ def run_live_pf(
     # Save final snapshots
     result_paths: dict[str, str] = {}
     summary_out_path: Path | None = None
-    final_absent_diagnostics: dict[str, dict[str, float | int | bool | str]] = {}
     final_estimates_for_run: (
         dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] | None
     ) = None
     final_estimate_stages_for_run: (
         dict[str, dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]] | None
     ) = None
-    final_point_reporting_pipeline_time_s = 0.0
+    final_posterior_projection_time_s = 0.0
     if save_outputs:
         pf_out_path = RESULTS_DIR / f"result_pf{output_suffix}.png"
         spectrum_out_path = RESULTS_DIR / f"result_spectrum{output_suffix}.png"
@@ -17817,85 +14968,17 @@ def run_live_pf(
                 }
             )
         pf_out_path.parent.mkdir(parents=True, exist_ok=True)
-        final_point_reporting_started_at = time.perf_counter()
-        raw_estimates = None
-        best_so_far_stage = None
-        best_so_far_selected = False
-        final_report_getter = getattr(estimator, "final_report_estimate", None)
-        if not _pure_pf_profile_active(estimator) and callable(final_report_getter):
-            try:
-                best_so_far_stage = final_report_getter(use_best_so_far=True)
-                selection = getattr(estimator, "_last_final_report_selection", {})
-                best_so_far_selected = (
-                    isinstance(selection, Mapping)
-                    and selection.get("selected") == "best_so_far"
-                )
-            except (RuntimeError, ValueError, TypeError):
-                best_so_far_stage = None
-                best_so_far_selected = False
+        posterior_projection_started_at = time.perf_counter()
         if last_frame is not None:
             last_frame.step_index = max(0, int(step_counter) - 1)
             last_frame.time = float(elapsed)
-            final_estimates = _build_final_estimates(
+            final_estimates = _build_pf_posterior_estimates(
                 estimator,
                 isotopes,
-                final_estimate_min_strength,
-                prune_min_obs_count,
-                use_pruning=True,
-            )
-            raw_stage = _build_final_estimates(
-                estimator,
-                isotopes,
-                final_estimate_min_strength,
-                prune_min_obs_count,
-                use_pruning=False,
             )
             final_estimate_stages_for_run = {
-                "raw_estimates": raw_stage,
-                "llr_pruned_estimates": estimator.pruned_estimates(
-                    method="deltall",
-                    params={"deltaLL_min": PRUNE_DELTALL_MIN},
-                    tau_mix=PRUNE_TAU_MIX,
-                    min_support=PRUNE_MIN_SUPPORT,
-                    min_obs_count=prune_min_obs_count,
-                    min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                    min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-                ),
-                "legacy_pruned_estimates": estimator.pruned_estimates(
-                    method="legacy",
-                    params=None,
-                    tau_mix=PRUNE_TAU_MIX,
-                    min_support=PRUNE_MIN_SUPPORT,
-                    min_obs_count=prune_min_obs_count,
-                    min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                    min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-                ),
-                "final_estimates_before_absent_filter": final_estimates,
+                "pf_posterior_projection": final_estimates,
             }
-            if best_so_far_stage is not None:
-                normalized_best_stage = {}
-                for iso in isotopes:
-                    pos, strg = best_so_far_stage.get(
-                        iso,
-                        (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
-                    )
-                    pos, strg = _apply_display_thresholds(
-                        np.asarray(pos, dtype=float),
-                        np.asarray(strg, dtype=float),
-                        final_estimate_min_strength,
-                    )
-                    normalized_best_stage[iso] = (pos, strg)
-                final_estimate_stages_for_run["best_so_far_report_estimates"] = (
-                    normalized_best_stage
-                )
-                if best_so_far_selected:
-                    final_estimates = normalized_best_stage
-                    final_estimate_stages_for_run[
-                        "final_estimates_before_absent_filter"
-                    ] = final_estimates
-            final_estimates, final_absent_diagnostics = _apply_final_absent_filter(
-                final_estimates,
-            )
             _validate_surface_constrained_estimates(
                 final_estimates,
                 env,
@@ -17912,16 +14995,9 @@ def run_live_pf(
                 ),
                 surface_prior_active=bool(source_surface_prior),
             )
-            final_estimate_stages_for_run["final_estimates"] = final_estimates
             final_estimates_for_run = final_estimates
-            raw_estimates = raw_stage
-            raw_estimates = {
-                iso: raw_estimates[iso]
-                for iso in final_estimates
-                if iso in raw_estimates
-            }
-        final_point_reporting_pipeline_time_s += float(
-            time.perf_counter() - final_point_reporting_started_at
+        final_posterior_projection_time_s += float(
+            time.perf_counter() - posterior_projection_started_at
         )
         if last_frame is not None:
             last_frame.estimated_sources = {
@@ -17936,18 +15012,6 @@ def run_live_pf(
         viz.save_final(pf_out_path.as_posix())
         if last_frame is not None:
             viz.save_estimates_only(estimates_out_path.as_posix())
-        if last_frame is not None and raw_estimates is not None:
-            last_frame.estimated_sources = {
-                iso: pos for iso, (pos, _) in raw_estimates.items()
-            }
-            last_frame.estimated_strengths = {
-                iso: strg for iso, (_, strg) in raw_estimates.items()
-            }
-            viz.update(last_frame)
-            if estimator.poses:
-                pf_step = len(estimator.poses)
-                estimates_step_path = PF_DIR / f"estimates_step_{pf_step:03d}.png"
-                viz.save_estimates_only(estimates_step_path.as_posix())
         if representative_spectrum is not None:
             highlight = set(representative_candidates)
             title = "Representative measurement spectrum"
@@ -18009,7 +15073,6 @@ def run_live_pf(
     total_compute_time_s = float(
         total_ig_wall_s
         + total_pf_wall_s
-        + total_prune_wall_s
         + total_viz_wall_s
         + total_path_planning_wall_s
     )
@@ -18098,8 +15161,8 @@ def run_live_pf(
         "dss_same_isotope_direct_separation_epsilon": float(
             dss_config.same_isotope_direct_separation_epsilon
         ),
-        "mission_stop_require_model_order_ready": bool(
-            mission_stop_require_model_order_ready
+        "mission_stop_require_pf_cardinality_ready": bool(
+            mission_stop_require_pf_cardinality_ready
         ),
         "mission_stop_require_remaining_measurement_ready": bool(
             mission_stop_require_remaining_measurement_ready
@@ -18120,8 +15183,6 @@ def run_live_pf(
         "path_planning_compute_time_s": float(total_path_planning_wall_s),
         "mean_path_planning_time_s": mean_path_planning_wall_s,
         "max_path_planning_time_s": max_path_planning_wall_s,
-        "display_prune_time_s": float(total_prune_wall_s),
-        "prune_time_s": float(total_prune_wall_s),
         "viz_time_s": float(total_viz_wall_s),
         "resumed_from_station_boundary": bool(
             resume_controller_state is not None
@@ -18140,8 +15201,7 @@ def run_live_pf(
         "operational_timing_definitions": {
             "online_wall_clock_s": (
                 "Wall time from online-loop initialization through simulator close; "
-                "final reporting, plotting, surface reconstruction, and evaluation "
-                "are excluded."
+                "posterior projection, plotting, and evaluation are excluded."
             ),
             "end_to_end_wall_clock_s": (
                 "Wall time from online-loop initialization through final evaluation "
@@ -18149,34 +15209,11 @@ def run_live_pf(
                 "are excluded."
             ),
             "wall_clock_runtime_s": ("Compatibility alias of online_wall_clock_s."),
-            "final_point_reporting_pipeline_time_s": (
-                "Final point-estimate selection, pruning, refit, and absent-isotope "
-                "reporting time; visualization and file output are excluded."
-            ),
-            "surface_map_solver_time_s": (
-                "Time spent inside the final surface-map solver when attempted."
-            ),
-            "surface_map_attempt_time_s": (
-                "Total surface-map wrapper time including preflight and failed or "
-                "memory-guarded attempts."
-            ),
-            "final_point_estimate_time_s": (
-                "Compatibility alias of final_point_reporting_pipeline_time_s."
-            ),
-            "final_surface_map_mle_time_s": (
-                "Compatibility completed-fit time; equal to surface_map_solver_time_s "
-                "only when the solver completes without an error."
-            ),
-            "final_mle_time_s": (
-                "Compatibility aggregate of final point reporting and successful "
-                "surface solver time."
+            "final_posterior_projection_time_s": (
+                "Time to project final source estimates from the current sequential "
+                "PF posterior; visualization and file output are excluded."
             ),
         },
-        "final_absent_isotope_filter": bool(final_absent_filter_enabled),
-        "online_absent_isotope_pruning": bool(online_absent_pruning_enabled),
-        "online_absent_pruned_isotopes": sorted(online_absent_pruned_isotopes),
-        "online_absent_min_poses": int(online_absent_min_poses),
-        "online_absent_coverage_fraction": float(online_absent_coverage_fraction),
     }
     setattr(estimator, "mission_metrics", mission_metrics)
     if save_outputs:
@@ -18243,81 +15280,14 @@ def run_live_pf(
                 ),
             }
         )
-    late_final_estimation_start = (
+    late_posterior_projection_start = (
         time.perf_counter() if final_estimates_for_run is None else None
     )
     if final_estimates_for_run is None:
-        best_so_far_stage = None
-        best_so_far_selected = False
-        final_report_getter = getattr(estimator, "final_report_estimate", None)
-        if not _pure_pf_profile_active(estimator) and callable(final_report_getter):
-            try:
-                best_so_far_stage = final_report_getter(use_best_so_far=True)
-                selection = getattr(estimator, "_last_final_report_selection", {})
-                best_so_far_selected = (
-                    isinstance(selection, Mapping)
-                    and selection.get("selected") == "best_so_far"
-                )
-            except (RuntimeError, ValueError, TypeError):
-                best_so_far_stage = None
-                best_so_far_selected = False
-        estimates = _build_final_estimates(
-            estimator,
-            isotopes,
-            final_estimate_min_strength,
-            prune_min_obs_count,
-            use_pruning=True,
-        )
+        estimates = _build_pf_posterior_estimates(estimator, isotopes)
         final_estimate_stages = {
-            "raw_estimates": _build_final_estimates(
-                estimator,
-                isotopes,
-                final_estimate_min_strength,
-                prune_min_obs_count,
-                use_pruning=False,
-            ),
-            "llr_pruned_estimates": estimator.pruned_estimates(
-                method="deltall",
-                params={"deltaLL_min": PRUNE_DELTALL_MIN},
-                tau_mix=PRUNE_TAU_MIX,
-                min_support=PRUNE_MIN_SUPPORT,
-                min_obs_count=prune_min_obs_count,
-                min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-            ),
-            "legacy_pruned_estimates": estimator.pruned_estimates(
-                method="legacy",
-                params=None,
-                tau_mix=PRUNE_TAU_MIX,
-                min_support=PRUNE_MIN_SUPPORT,
-                min_obs_count=prune_min_obs_count,
-                min_strength_abs=PRUNE_MIN_STRENGTH_ABS,
-                min_strength_ratio=PRUNE_MIN_STRENGTH_RATIO,
-            ),
-            "final_estimates_before_absent_filter": estimates,
+            "pf_posterior_projection": estimates,
         }
-        if best_so_far_stage is not None:
-            normalized_best_stage = {}
-            for iso in isotopes:
-                pos, strg = best_so_far_stage.get(
-                    iso,
-                    (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
-                )
-                pos, strg = _apply_display_thresholds(
-                    np.asarray(pos, dtype=float),
-                    np.asarray(strg, dtype=float),
-                    final_estimate_min_strength,
-                )
-                normalized_best_stage[iso] = (pos, strg)
-            final_estimate_stages["best_so_far_report_estimates"] = (
-                normalized_best_stage
-            )
-            if best_so_far_selected:
-                estimates = normalized_best_stage
-                final_estimate_stages["final_estimates_before_absent_filter"] = (
-                    estimates
-                )
-        estimates, final_absent_diagnostics = _apply_final_absent_filter(estimates)
         _validate_surface_constrained_estimates(
             estimates,
             env,
@@ -18334,26 +15304,14 @@ def run_live_pf(
             ),
             surface_prior_active=bool(source_surface_prior),
         )
-        final_estimate_stages["final_estimates"] = estimates
     else:
         estimates = final_estimates_for_run
         final_estimate_stages = final_estimate_stages_for_run or {
-            "final_estimates": estimates,
+            "pf_posterior_projection": estimates,
         }
-    if late_final_estimation_start is not None:
-        final_point_reporting_pipeline_time_s += float(
-            time.perf_counter() - late_final_estimation_start
-        )
-    removed_final_isotopes = [
-        iso
-        for iso, stats in sorted(final_absent_diagnostics.items())
-        if not bool(stats.get("kept", False))
-    ]
-    if removed_final_isotopes:
-        print(
-            "Final absent-isotope filter removed: "
-            f"{removed_final_isotopes} "
-            "(based on full measurement-count support and final PF support)."
+    if late_posterior_projection_start is not None:
+        final_posterior_projection_time_s += float(
+            time.perf_counter() - late_posterior_projection_start
         )
     est_by_iso: dict[str, list[dict[str, Any]]] = {}
     for iso, estimate in estimates.items():
@@ -18395,16 +15353,13 @@ def run_live_pf(
         ),
         surface_tolerance_m=posterior_surface_tolerance_m,
     )
-    uncertainty_reference_consistent = not bool(best_so_far_selected)
     for isotope_diagnostics in estimated_source_uncertainty.values():
         for diagnostic in isotope_diagnostics:
             diagnostic["posterior_reference"] = "current_final_pf_particle_cloud"
             diagnostic["reported_estimate_reference"] = (
-                "best_so_far_snapshot"
-                if best_so_far_selected
-                else "current_final_report"
+                "current_pf_posterior_projection"
             )
-            diagnostic["reference_consistent"] = bool(uncertainty_reference_consistent)
+            diagnostic["reference_consistent"] = True
     final_source_status = _final_estimate_source_status(estimator, estimates)
     confirmed_est_by_iso = _filter_serialized_sources_by_status(
         est_by_iso,
@@ -18457,60 +15412,12 @@ def run_live_pf(
             runtime_config.get("final_surface_observability_candidates", 1024)
         ),
     )
-    final_surface_map = _fit_final_surface_map(
-        estimator,
-        env,
-        obstacle_grid,
-        runtime_config,
-        obstacle_height_m=surface_obstacle_height_m,
-    )
-    surface_map_solver_time_raw = final_surface_map.get("solver_time_s")
-    surface_map_solver_time_s = (
-        float(surface_map_solver_time_raw)
-        if surface_map_solver_time_raw is not None
-        and np.isfinite(float(surface_map_solver_time_raw))
-        else None
-    )
-    surface_map_completed_fit_time_raw = final_surface_map.get("fit_time_s")
-    surface_map_completed_fit_time_s = (
-        float(surface_map_completed_fit_time_raw)
-        if surface_map_completed_fit_time_raw is not None
-        and np.isfinite(float(surface_map_completed_fit_time_raw))
-        else None
-    )
-    surface_map_attempt_time_raw = final_surface_map.get("attempt_time_s")
-    surface_map_attempt_time_s = (
-        float(surface_map_attempt_time_raw)
-        if surface_map_attempt_time_raw is not None
-        and np.isfinite(float(surface_map_attempt_time_raw))
-        else None
-    )
-    final_estimation_total_time_s = float(
-        final_point_reporting_pipeline_time_s
-        + (
-            0.0
-            if surface_map_completed_fit_time_s is None
-            else surface_map_completed_fit_time_s
-        )
-    )
-    final_estimation_attempt_total_time_s = float(
-        final_point_reporting_pipeline_time_s
-        + (0.0 if surface_map_attempt_time_s is None else surface_map_attempt_time_s)
-    )
     gpu_memory_metrics = finish_gpu_memory_tracking(gpu_memory_baseline)
     mission_metrics.update(
         {
-            "final_point_reporting_pipeline_time_s": float(
-                final_point_reporting_pipeline_time_s
+            "final_posterior_projection_time_s": float(
+                final_posterior_projection_time_s
             ),
-            "surface_map_solver_time_s": surface_map_solver_time_s,
-            "surface_map_attempt_time_s": surface_map_attempt_time_s,
-            "final_reporting_and_surface_attempt_time_s": (
-                final_estimation_attempt_total_time_s
-            ),
-            "final_point_estimate_time_s": float(final_point_reporting_pipeline_time_s),
-            "final_surface_map_mle_time_s": surface_map_completed_fit_time_s,
-            "final_mle_time_s": final_estimation_total_time_s,
             "gpu_memory": gpu_memory_metrics,
         }
     )
@@ -18579,42 +15486,7 @@ def run_live_pf(
     remaining_trace_summary = _remaining_measurement_trace_summary(
         remaining_measurement_estimates
     )
-    pure_pf_profile = _pure_pf_profile_active(estimator)
-    final_model_order_status = _final_model_order_status(estimator)
-    best_report_summary = {}
-    if not pure_pf_profile and hasattr(estimator, "best_report_summary"):
-        try:
-            best_report_summary = dict(estimator.best_report_summary())
-        except (RuntimeError, ValueError, TypeError):
-            best_report_summary = {}
-    final_sparse_poisson_evidence = {}
-    sparse_evidence_getter = getattr(
-        estimator,
-        "sparse_poisson_evidence_diagnostics",
-        None,
-    )
-    if not pure_pf_profile and callable(sparse_evidence_getter):
-        try:
-            final_sparse_poisson_evidence = dict(sparse_evidence_getter())
-        except (RuntimeError, ValueError, TypeError):
-            final_sparse_poisson_evidence = {}
-    report_model_order_diagnostics = (
-        {} if pure_pf_profile else dict(estimator.report_model_order_diagnostics())
-    )
-    model_evaluation_diagnostics = summarize_model_diagnostics(
-        report_model_order_diagnostics, final_sparse_poisson_evidence
-    )
-    final_candidate_verification = {}
-    verification_getter = getattr(
-        estimator,
-        "candidate_verification_diagnostics",
-        None,
-    )
-    if not pure_pf_profile and callable(verification_getter):
-        try:
-            final_candidate_verification = dict(verification_getter())
-        except (RuntimeError, ValueError, TypeError):
-            final_candidate_verification = {}
+    final_pf_cardinality_status = _final_pf_cardinality_status(estimator)
     final_payload = {
         **_pure_pf_summary_provenance(estimator),
         "measurements_completed": int(step_counter),
@@ -18631,7 +15503,7 @@ def run_live_pf(
             "schema_version": 1,
             "accuracy": metrics.get("global", {}),
             "count_bias": count_bias_diagnostics,
-            "model_identifiability": model_evaluation_diagnostics,
+            "pf_structural_evidence": final_pf_cardinality_status,
             "cluster_stability": cluster_stability,
             "operational": {
                 "mean_pf_update_time_s": mission_metrics.get("mean_pf_update_time_s"),
@@ -18641,22 +15513,9 @@ def run_live_pf(
                 ),
                 "p95_pf_update_time_s": mission_metrics.get("p95_pf_update_time_s"),
                 "max_pf_update_time_s": mission_metrics.get("max_pf_update_time_s"),
-                "final_point_reporting_pipeline_time_s": mission_metrics.get(
-                    "final_point_reporting_pipeline_time_s"
+                "final_posterior_projection_time_s": mission_metrics.get(
+                    "final_posterior_projection_time_s"
                 ),
-                "surface_map_solver_time_s": mission_metrics.get(
-                    "surface_map_solver_time_s"
-                ),
-                "surface_map_attempt_time_s": mission_metrics.get(
-                    "surface_map_attempt_time_s"
-                ),
-                "final_point_estimate_time_s": mission_metrics.get(
-                    "final_point_estimate_time_s"
-                ),
-                "final_surface_map_mle_time_s": mission_metrics.get(
-                    "final_surface_map_mle_time_s"
-                ),
-                "final_mle_time_s": mission_metrics.get("final_mle_time_s"),
                 "gpu_memory": mission_metrics.get("gpu_memory"),
                 "mission_time_s": mission_metrics.get("total_mission_time_s"),
                 "online_wall_clock_s": mission_metrics.get("online_wall_clock_s"),
@@ -18692,12 +15551,8 @@ def run_live_pf(
         "estimated_source_uncertainty": estimated_source_uncertainty,
         "estimated_source_uncertainty_reference": {
             "posterior_reference": "current_final_pf_particle_cloud",
-            "reported_estimate_reference": (
-                "best_so_far_snapshot"
-                if best_so_far_selected
-                else "current_final_report"
-            ),
-            "reference_consistent": bool(uncertainty_reference_consistent),
+            "reported_estimate_reference": "current_pf_posterior_projection",
+            "reference_consistent": True,
         },
         "estimated_sources_confirmed": confirmed_est_by_iso,
         "estimated_sources_tentative": tentative_est_by_iso,
@@ -18716,22 +15571,16 @@ def run_live_pf(
         "pf_obstacle_diagnostics": pf_obstacle_diagnostics,
         "count_error_model": count_error_model,
         "surface_candidate_observability_diagnostics": final_surface_observability,
-        "surface_map_reconstruction": final_surface_map,
         "isotope_count_residual_diagnostics": final_isotope_count_diagnostics,
         "final_estimate_diagnostics": {
             "stages": {
                 stage: _serialize_estimate_stage(stage_estimates)
                 for stage, stage_estimates in final_estimate_stages.items()
             },
-            "report_model_order": report_model_order_diagnostics,
-            "sparse_poisson_evidence": final_sparse_poisson_evidence,
-            "candidate_verification": final_candidate_verification,
-            "model_order_status": final_model_order_status,
-            "best_report": best_report_summary,
+            "pf_cardinality_status": final_pf_cardinality_status,
         },
         "ground_truth_sources": gt_by_iso,
         "last_counts": last_counts,
-        "final_absent_isotope_diagnostics": final_absent_diagnostics,
         "output_paths": result_paths,
         "backend": sim_backend,
         "sim_config_path": sim_config_path,

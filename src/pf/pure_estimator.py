@@ -1,15 +1,15 @@
-"""Expose the clean sequential PF estimator used by scientific runtimes."""
+"""Expose the sequential particle-filter estimator used by scientific runtimes."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, NoReturn, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 from pf.estimator import (
     RotatingShieldPFConfig,
-    RotatingShieldPFEstimator as _LegacyEstimatorShell,
+    RotatingShieldPFEstimator as _PFEstimatorCore,
 )
 from pf.posterior import (
     PFPointEstimate,
@@ -27,34 +27,17 @@ from pf.provenance import canonical_json_bytes, repository_commit, sha256_json
 
 
 class PurePFBoundaryError(RuntimeError):
-    """Signal an attempt to call a batch estimator through the pure PF API."""
+    """Signal a violation of the sequential PF result contract."""
 
 
-class PurePFEstimator(_LegacyEstimatorShell):
-    """Run only causal PF updates while preserving the established PF kernels.
-
-    The inherited shell supplies the high-fidelity observation kernel, batched
-    likelihood, resampling, structural moves, and continuous 3-D planner APIs.
-    Every all-history/batch hook is overridden here so it cannot participate in
-    state updates, planning, mission control, or reporting.
-    """
+class PurePFEstimator(_PFEstimatorCore):
+    """Run causal PF updates and report only the resulting PF posterior."""
 
     planner_belief_sources: tuple[str, ...] = ("pf_posterior", "pf_tentative")
     allowed_proposal_origins: tuple[ProposalOrigin, ...] = (
         ProposalOrigin.PF_BIRTH,
         ProposalOrigin.PF_RESIDUAL,
         ProposalOrigin.PF_SPLIT,
-    )
-    forbidden_batch_entry_points: tuple[str, ...] = (
-        "_solve_report_strengths",
-        "_solve_report_strengths_batch",
-        "_augment_report_candidates_with_mle_rescue",
-        "_select_report_clusters_by_model_order",
-        "_refine_report_surface_positions",
-        "_refit_reported_strengths",
-        "_all_history_dictionary_candidates",
-        "_runtime_report_rescue_estimate",
-        "fit_surface_map",
     )
 
     def __init__(
@@ -67,7 +50,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
         random_seed: int = 0,
         **kwargs: Any,
     ) -> None:
-        """Initialize the clean PF and its immutable purity provenance."""
+        """Initialize the PF and its immutable result provenance."""
         positional_args = list(args)
         if "pf_config" in kwargs:
             pure_config = kwargs["pf_config"]
@@ -86,7 +69,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
         super().__init__(*positional_args, **kwargs)
         if apply_profile_to_config(self.pf_config) != capabilities:
             raise PurePFBoundaryError(
-                "Pure PF capabilities changed during legacy-shell initialization."
+                "PF capabilities changed during estimator initialization."
             )
         self.profile_capabilities = capabilities
         self.measurement_log_schema_version = int(measurement_log_schema_version)
@@ -107,7 +90,6 @@ class PurePFEstimator(_LegacyEstimatorShell):
         self.repository_commit = repository_commit()
         self.measurement_log_sha256 = str(measurement_log_sha256)
         self.random_seed = int(random_seed)
-        self.batch_methods_invoked: list[str] = []
 
     @property
     def estimator_variant(self) -> str:
@@ -115,14 +97,14 @@ class PurePFEstimator(_LegacyEstimatorShell):
         return str(self.pf_config.estimator_profile)
 
     def structural_transition_diagnostics(self) -> dict[str, bool | str]:
-        """Return truthful target-preservation provenance for structural moves."""
+        """Return target-preservation provenance for structural moves."""
         return resolve_structural_transition_provenance(
             self.pf_config,
             capabilities=self.profile_capabilities,
         ).to_dict()
 
     def accepts_proposal_origin(self, origin: ProposalOrigin | str) -> bool:
-        """Return whether a proposal origin is allowed to alter this PF."""
+        """Return whether a proposal origin may alter this PF."""
         try:
             resolved = (
                 origin if isinstance(origin, ProposalOrigin) else ProposalOrigin(origin)
@@ -130,170 +112,6 @@ class PurePFEstimator(_LegacyEstimatorShell):
         except ValueError:
             return False
         return resolved in self.allowed_proposal_origins
-
-    def _reject_batch_estimation(self, method_name: str) -> NoReturn:
-        """Record and reject an inherited all-history batch-estimation call."""
-        self.batch_methods_invoked.append(str(method_name))
-        raise PurePFBoundaryError(
-            f"{method_name} is outside the PurePFEstimator boundary."
-        )
-
-    def _solve_report_strengths(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject the inherited all-history report-strength optimizer."""
-        del args, kwargs
-        self._reject_batch_estimation("_solve_report_strengths")
-
-    def _solve_report_strengths_batch(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject the inherited batched all-history strength optimizer."""
-        del args, kwargs
-        self._reject_batch_estimation("_solve_report_strengths_batch")
-
-    def _augment_report_candidates_with_mle_rescue(
-        self, *args: Any, **kwargs: Any
-    ) -> NoReturn:
-        """Reject inherited report-MLE position candidate augmentation."""
-        del args, kwargs
-        self._reject_batch_estimation("_augment_report_candidates_with_mle_rescue")
-
-    def _select_report_clusters_by_model_order(
-        self, *args: Any, **kwargs: Any
-    ) -> NoReturn:
-        """Reject inherited batch model-order selection for final reports."""
-        del args, kwargs
-        self._reject_batch_estimation("_select_report_clusters_by_model_order")
-
-    def _refine_report_surface_positions(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject inherited all-history surface-position refinement."""
-        del args, kwargs
-        self._reject_batch_estimation("_refine_report_surface_positions")
-
-    def _refit_reported_strengths(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject inherited final-report position and strength refitting."""
-        del args, kwargs
-        self._reject_batch_estimation("_refit_reported_strengths")
-
-    def _all_history_dictionary_candidates(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject inherited all-history dictionary proposals."""
-        del args, kwargs
-        self._reject_batch_estimation("_all_history_dictionary_candidates")
-
-    def _runtime_report_rescue_estimate(self, *args: Any, **kwargs: Any) -> NoReturn:
-        """Reject inherited runtime report-MLE rescue estimation."""
-        del args, kwargs
-        self._reject_batch_estimation("_runtime_report_rescue_estimate")
-
-    def refresh_sparse_poisson_evidence(self) -> Dict[str, Dict[str, Any]]:
-        """Return no evidence because all-history sparse fits are outside pure PF."""
-        self._last_sparse_poisson_evidence_diagnostics = {}
-        self._last_joint_sparse_poisson_evidence_diagnostics = {}
-        self.last_sparse_poisson_refresh_wall_s = 0.0
-        self.last_sparse_poisson_refresh_stage_wall_s = {}
-        return {}
-
-    def sparse_poisson_evidence_diagnostics(self) -> Dict[str, Dict[str, Any]]:
-        """Return an empty mapping without invoking a sparse estimator."""
-        return {}
-
-    def _complete_spectrum_payload_with_configured_responses(
-        self,
-        payload: Mapping[str, object] | None,
-    ) -> dict[str, object] | None:
-        """Reject direct spectrum-bin likelihoods at the pure count-PF boundary."""
-        if payload is not None:
-            raise PurePFBoundaryError(
-                "Pure PF profiles accept response_poisson isotope counts only; "
-                "raw spectrum bins are reserved for standalone MLE/ablations."
-            )
-        return None
-
-    def report_model_order_diagnostics(self) -> Dict[str, Dict[str, Any]]:
-        """Return no batch model-order diagnostics in a pure PF."""
-        return {}
-
-    def report_model_order_ready(self) -> bool:
-        """Return false because readiness is not defined by a batch model order."""
-        return False
-
-    def runtime_report_rescue_modes(
-        self,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64], float]]:
-        """Return no report/MLE rescue modes to the planner."""
-        return {}
-
-    def planning_surface_rescue_modes(
-        self,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64], float]]:
-        """Return no surface-map modes to the planner."""
-        self._last_planning_surface_rescue_mode_counts = {}
-        return {}
-
-    def _sync_sparse_evidence_cardinality_protection(
-        self,
-        isotope: str,
-        filt: Any,
-    ) -> tuple[bool, int]:
-        """Disable sparse-evidence cardinality protection for pure PF updates."""
-        del isotope, filt
-        return False, 0
-
-    def _runtime_global_birth_rescue_candidates(
-        self,
-        isotope: str,
-        filt: Any,
-        data: Any,
-    ) -> NDArray[np.float64]:
-        """Return no all-history/global rescue candidates."""
-        del isotope, filt, data
-        return np.zeros((0, 3), dtype=float)
-
-    def _inject_runtime_report_rescue(self, isotope: str, filt: Any) -> None:
-        """Reject report-derived particle injection by construction."""
-        del isotope, filt
-
-    def _run_isotope_structural_update(
-        self,
-        task: tuple[str, Any, Any, Any, Any],
-    ) -> None:
-        """Run causal PF refit/moves without batch candidates or feedback."""
-        _isotope, filt, refit_data, support_data, birth_data = task
-        if self.profile_capabilities.conditional_strength_profile and bool(
-            self.pf_config.conditional_strength_refit
-        ):
-            filt.refit_strengths_for_particles(
-                refit_data,
-                iters=self.pf_config.conditional_strength_refit_iters,
-                eps=self.pf_config.refit_eps,
-                suppress_prune_after_refit=bool(
-                    self.pf_config.birth_residual_suppress_death
-                ),
-            )
-        filt.apply_birth_death(
-            support_data=support_data,
-            birth_data=birth_data,
-            candidate_positions=self.candidate_sources,
-            global_birth_candidates=np.zeros((0, 3), dtype=float),
-            global_birth_candidate_counts=None,
-            allow_structural_birth_proposals=True,
-        )
-
-    def record_report_snapshot(
-        self,
-        *,
-        label: str,
-        allow_heavy_estimate: bool = True,
-    ) -> None:
-        """Avoid the historical mixed best-report cache in pure PF variants."""
-        del label, allow_heavy_estimate
-
-    def final_report_estimate(
-        self,
-        *,
-        total_measurements: int | None = None,
-        use_best_so_far: bool = False,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return the current PF posterior projection as the final report."""
-        del total_measurements, use_best_so_far
-        return self.estimates()
 
     def posterior_cardinality_distribution(self) -> dict[str, dict[int, float]]:
         """Return source-count posterior mass for every active isotope."""
@@ -308,7 +126,7 @@ class PurePFEstimator(_LegacyEstimatorShell):
         return result
 
     def posterior_point_estimate(self) -> dict[str, PFPointEstimate]:
-        """Return deterministic PF-only point estimates and uncertainty."""
+        """Return deterministic PF point estimates and uncertainty."""
         result: dict[str, PFPointEstimate] = {}
         for isotope, filt in self.filters.items():
             states = [particle.state for particle in filt.continuous_particles]
@@ -328,13 +146,13 @@ class PurePFEstimator(_LegacyEstimatorShell):
         }
 
     def posterior_snapshot(self) -> PFPosteriorSnapshot:
-        """Return a schema-v1 PF posterior result with purity provenance."""
+        """Return a schema-v1 PF posterior result with reproducibility metadata."""
         log_digest = str(self.measurement_log_sha256).strip().lower()
         if len(log_digest) != 64 or any(
             character not in "0123456789abcdef" for character in log_digest
         ):
             raise PurePFBoundaryError(
-                "A publishable pure-PF posterior requires a finalized "
+                "A publishable PF posterior requires a finalized "
                 "MeasurementLog SHA-256 digest."
             )
         return PFPosteriorSnapshot(
@@ -349,16 +167,15 @@ class PurePFEstimator(_LegacyEstimatorShell):
             random_seed=self.random_seed,
             profile_capability_map=self.profile_capabilities.to_dict(),
             record_count=len(self.measurements),
-            structural_transition_provenance=(self.structural_transition_diagnostics()),
+            structural_transition_provenance=(
+                self.structural_transition_diagnostics()
+            ),
         )
 
     def estimates(
         self,
-        *,
-        use_pre_finalize_guard: bool = True,
     ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Project the PF posterior report into the historical array API."""
-        del use_pre_finalize_guard
+        """Project the PF posterior into the historical array result format."""
         result: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
         for isotope, point_estimate in self.posterior_point_estimate().items():
             if not point_estimate.modes:
@@ -382,34 +199,11 @@ class PurePFEstimator(_LegacyEstimatorShell):
     def estimate_all(
         self,
     ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return the PF posterior projection for visualization compatibility."""
+        """Return the PF posterior projection for visualization."""
         return self.estimates()
 
-    def pruned_estimates(
-        self,
-        method: str = "none",
-        params: Mapping[str, float] | None = None,
-        **kwargs: Any,
-    ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Apply display-only strength thresholding without likelihood refits."""
-        del method, kwargs
-        threshold = max(0.0, float((params or {}).get("min_strength_abs", 0.0)))
-        result: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-        for isotope, (positions, strengths) in self.estimates().items():
-            keep = np.asarray(strengths, dtype=float) >= threshold
-            result[isotope] = (
-                np.asarray(positions, dtype=float)[keep].copy(),
-                np.asarray(strengths, dtype=float)[keep].copy(),
-            )
-        return result
-
-    def fit_surface_map(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Reject surface-map reconstruction at the pure PF boundary."""
-        del args, kwargs
-        self._reject_batch_estimation("fit_surface_map")
-
     def serialized_state(self) -> bytes:
-        """Return a canonical byte representation for causality/determinism tests."""
+        """Return canonical bytes for causality and determinism tests."""
         isotope_payload: dict[str, Any] = {}
         for isotope, filt in sorted(self.filters.items()):
             particles: list[dict[str, Any]] = []
@@ -423,10 +217,11 @@ class PurePFEstimator(_LegacyEstimatorShell):
                         "strengths": np.asarray(state.strengths, dtype=float),
                         "background": float(state.background),
                         "ages": state.ages,
-                        "low_q_streaks": state.low_q_streaks,
                         "support_scores": state.support_scores,
                         "tentative_sources": state.tentative_sources,
-                        "verification_fail_streaks": state.verification_fail_streaks,
+                        "verification_fail_streaks": (
+                            state.verification_fail_streaks
+                        ),
                     }
                 )
             isotope_payload[str(isotope)] = particles
@@ -439,6 +234,17 @@ class PurePFEstimator(_LegacyEstimatorShell):
                 "live_time_s": float(measurement.live_time_s),
                 "z_variance_k": measurement.z_variance_k,
                 "z_covariance_k": measurement.z_covariance_k,
+                "station_sequence_id": measurement.station_sequence_id,
+                "station_view_index": measurement.station_view_index,
+                "runtime_likelihood_route_by_isotope": (
+                    measurement.runtime_likelihood_route_by_isotope
+                ),
+                "runtime_spectrum_variance_used_by_isotope": (
+                    measurement.runtime_spectrum_variance_used_by_isotope
+                ),
+                "station_view_covariance_by_isotope": (
+                    measurement.station_view_covariance_by_isotope
+                ),
             }
             for measurement in self.measurements
         ]
@@ -461,7 +267,6 @@ class PurePFEstimator(_LegacyEstimatorShell):
         )
 
 
-# The scientific/default class name is kept explicit for downstream adapters.
 RotatingShieldPurePFEstimator = PurePFEstimator
 RotatingShieldPFEstimator = PurePFEstimator
 

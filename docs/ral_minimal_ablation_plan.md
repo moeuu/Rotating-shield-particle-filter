@@ -57,10 +57,10 @@ measurement log is available:
 - `no_residual_birth`
 - `no_verification`
 
-These replay ablations isolate source-cardinality birth and final
-verification/refit-after-remove logic without paying for additional Geant4
-closed-loop transport. Do not include them in the default full-simulation run
-script unless the user explicitly accepts the extra runtime.
+These replay ablations isolate source-cardinality birth and causal
+tentative-source verification without paying for additional Geant4 closed-loop
+transport. Do not include them in the default full-simulation run script unless
+the user explicitly accepts the extra runtime.
 
 ## Generated Files
 

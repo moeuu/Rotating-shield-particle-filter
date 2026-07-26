@@ -98,22 +98,15 @@ def _feature_variants(candidate_isotopes: tuple[str, ...]) -> tuple[AblationVari
             },
         ),
         AblationVariant(
-            name="no_recovery_verification_modes",
+            name="no_verification_pressure",
             description=(
-                "Disable DSS-PP runtime rescue/global recovery modes and remaining "
-                "verification pressure while keeping estimator verification enabled."
+                "Disable only remaining-measurement verification pressure while "
+                "keeping causal estimator verification enabled."
             ),
             overrides={
                 **all_on_overrides,
-                "dss_pp": {
-                    "include_runtime_rescue_modes": False,
-                    "include_global_surface_rescue_modes": False,
-                    "runtime_rescue_mode_weight": 0.0,
-                    "global_surface_rescue_mode_weight": 0.0,
-                },
                 "remaining_measurement_estimate": {
                     "verification_weight": 0.0,
-                    "report_response_correlation_weight": 0.0,
                 },
             },
         ),

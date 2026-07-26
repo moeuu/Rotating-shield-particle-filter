@@ -156,7 +156,7 @@ def replay_config() -> dict[str, object]:
         "use_gpu": False,
         "replay_candidate_sources_xyz": [
             [0.25, 0.25, 0.0],
-            [1.0, 1.0, 0.75],
+            [1.0, 1.0, 0.0],
             [1.75, 1.75, 1.5],
         ],
     }

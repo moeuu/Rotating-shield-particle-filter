@@ -8,12 +8,10 @@ from measurement.kernels import ShieldParams
 from pf.likelihood import expected_counts_per_source
 from pf.estimator import (
     MeasurementRecord,
-    ReportSnapshot,
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator,
 )
 from pf.particle_filter import (
-    BirthResidualLayer,
     IsotopeParticleFilter,
     IsotopeParticle,
     MeasurementData,
@@ -59,6 +57,1066 @@ def _build_filter(
     return estimator.filters["Cs-137"]
 
 
+@pytest.mark.parametrize("likelihood_model", ["gaussian", "student_t"])
+def test_structural_count_likelihood_matches_runtime_sequence(
+    likelihood_model: str,
+) -> None:
+    """Batched structural evidence should equal the runtime count likelihood."""
+    import torch
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        count_likelihood_model=likelihood_model,
+        count_likelihood_df=6.0,
+        transport_model_rel_sigma=0.08,
+        transport_model_abs_sigma=1.5,
+        spectrum_count_rel_sigma=0.12,
+        spectrum_count_abs_sigma=0.7,
+        low_count_abs_sigma=0.5,
+        low_count_transition_counts=25.0,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=0.4,
+        shield_contrast_likelihood_enable=True,
+        shield_contrast_likelihood_weight=0.3,
+        shield_contrast_min_count=1.0,
+        shield_view_ratio_likelihood_enable=True,
+        shield_view_ratio_likelihood_weight=0.2,
+        shield_view_ratio_likelihood_min_total_count=1.0,
+        use_gpu=False,
+    )
+    detector_positions = np.array(
+        [
+            [0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.5],
+            [0.0, 0.0, 0.5],
+            [2.0, 1.0, 0.5],
+            [2.0, 1.0, 0.5],
+            [2.0, 1.0, 0.5],
+        ],
+        dtype=float,
+    )
+    covariance = np.zeros((6, 6), dtype=float)
+    covariance[:3, :3] = np.array(
+        [[0.0, 0.20, 0.10], [0.20, 0.0, 0.15], [0.10, 0.15, 0.0]],
+        dtype=float,
+    )
+    covariance[3:, 3:] = np.array(
+        [[0.0, 0.12, 0.08], [0.12, 0.0, 0.11], [0.08, 0.11, 0.0]],
+        dtype=float,
+    )
+    data = MeasurementData(
+        z_k=np.array([72.0, 48.0, 31.0, 26.0, 39.0, 57.0], dtype=float),
+        observation_variances=np.array(
+            [4.0, 5.0, 3.5, 2.5, 4.5, 6.0],
+            dtype=float,
+        ),
+        detector_positions=detector_positions,
+        fe_indices=np.array([0, 1, 2, 0, 1, 2], dtype=int),
+        pb_indices=np.array([2, 1, 0, 2, 1, 0], dtype=int),
+        live_times=np.ones(6, dtype=float),
+        station_sequence_ids=np.array([0, 0, 0, 1, 1, 1], dtype=int),
+        observation_count_covariance=covariance,
+    )
+    lambda_kp = np.array(
+        [
+            [68.0, 75.0, 58.0, 83.0],
+            [51.0, 44.0, 55.0, 39.0],
+            [28.0, 35.0, 24.0, 42.0],
+            [29.0, 22.0, 34.0, 18.0],
+            [36.0, 43.0, 31.0, 49.0],
+            [61.0, 52.0, 67.0, 46.0],
+        ],
+        dtype=float,
+    )
+
+    structural = filt._structural_count_log_likelihood_matrix_np(
+        data,
+        lambda_kp,
+    )
+    runtime = torch.zeros(lambda_kp.shape[1], dtype=torch.float64)
+    for rows in (np.arange(3), np.arange(3, 6)):
+        station_covariance = covariance[np.ix_(rows, rows)]
+        runtime += filt._log_likelihood_sequence_gpu(
+            torch.as_tensor(lambda_kp[rows], dtype=torch.float64),
+            data.z_k[rows],
+            data.observation_variances[rows],
+            observation_count_covariance=station_covariance,
+        )
+    scalar = np.asarray(
+        [
+            filt._structural_count_log_likelihood_np(data, lambda_kp[:, idx])
+            for idx in range(lambda_kp.shape[1])
+        ],
+        dtype=float,
+    )
+
+    assert np.allclose(structural, runtime.numpy(), rtol=1.0e-11, atol=1.0e-10)
+    assert np.allclose(structural, scalar, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_structural_per_row_blocks_match_runtime_likelihood_product() -> None:
+    """Independent runtime rows must remain independent at one detector pose."""
+    import torch
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="student_t",
+        count_likelihood_df=6.0,
+        spectrum_count_rel_sigma=0.2,
+        spectrum_count_abs_sigma=0.8,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=0.75,
+        shield_contrast_likelihood_enable=True,
+        shield_contrast_likelihood_weight=0.4,
+        shield_contrast_min_count=1.0,
+        shield_view_ratio_likelihood_enable=True,
+        shield_view_ratio_likelihood_weight=0.3,
+        shield_view_ratio_likelihood_min_total_count=1.0,
+        use_gpu=False,
+    )
+    data = MeasurementData(
+        z_k=np.array([44.0, 19.0, 67.0], dtype=float),
+        observation_variances=np.array([3.0, 2.0, 4.0], dtype=float),
+        detector_positions=np.repeat(
+            np.array([[1.0, 2.0, 0.5]], dtype=float),
+            3,
+            axis=0,
+        ),
+        fe_indices=np.array([0, 1, 2], dtype=int),
+        pb_indices=np.array([2, 1, 0], dtype=int),
+        live_times=np.ones(3, dtype=float),
+        station_sequence_ids=np.arange(3, dtype=int),
+    )
+    lambda_kp = np.array(
+        [[41.0, 52.0], [22.0, 16.0], [62.0, 73.0]],
+        dtype=float,
+    )
+
+    structural = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    runtime = torch.zeros(lambda_kp.shape[1], dtype=torch.float64)
+    lambda_t = torch.as_tensor(lambda_kp, dtype=torch.float64)
+    for row_index in range(int(data.z_k.size)):
+        rows = slice(row_index, row_index + 1)
+        runtime += filt._log_likelihood_sequence_gpu(
+            lambda_t[rows],
+            data.z_k[rows],
+            data.observation_variances[rows],
+        )
+
+    assert np.allclose(structural, runtime.numpy(), rtol=1.0e-11, atol=1.0e-10)
+
+
+def test_same_xyz_revisited_station_sequences_are_not_merged() -> None:
+    """Explicit sequence IDs must separate revisits to identical coordinates."""
+    import torch
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="gaussian",
+        spectrum_count_rel_sigma=0.25,
+        spectrum_count_abs_sigma=1.0,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=0.8,
+        shield_contrast_likelihood_enable=True,
+        shield_contrast_likelihood_weight=0.5,
+        shield_contrast_min_count=1.0,
+        shield_view_ratio_likelihood_enable=True,
+        shield_view_ratio_likelihood_weight=0.4,
+        shield_view_ratio_likelihood_min_total_count=1.0,
+        use_gpu=False,
+    )
+    covariance = np.zeros((4, 4), dtype=float)
+    covariance[:2, :2] = np.array([[0.0, 0.6], [0.6, 0.0]], dtype=float)
+    covariance[2:, 2:] = np.array([[0.0, 0.3], [0.3, 0.0]], dtype=float)
+    data = MeasurementData(
+        z_k=np.array([58.0, 23.0, 31.0, 71.0], dtype=float),
+        observation_variances=np.array([4.0, 2.0, 3.0, 5.0], dtype=float),
+        detector_positions=np.repeat(
+            np.array([[1.5, 1.5, 0.5]], dtype=float),
+            4,
+            axis=0,
+        ),
+        fe_indices=np.array([0, 1, 2, 3], dtype=int),
+        pb_indices=np.array([3, 2, 1, 0], dtype=int),
+        live_times=np.ones(4, dtype=float),
+        station_sequence_ids=np.array([10, 10, 11, 11], dtype=int),
+        observation_count_covariance=covariance,
+    )
+    lambda_kp = np.array(
+        [[54.0, 63.0], [26.0, 19.0], [35.0, 27.0], [66.0, 78.0]],
+        dtype=float,
+    )
+
+    structural = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    lambda_t = torch.as_tensor(lambda_kp, dtype=torch.float64)
+    runtime_separate = torch.zeros(lambda_kp.shape[1], dtype=torch.float64)
+    for rows in (np.arange(2), np.arange(2, 4)):
+        runtime_separate += filt._log_likelihood_sequence_gpu(
+            lambda_t[rows],
+            data.z_k[rows],
+            data.observation_variances[rows],
+            observation_count_covariance=covariance[np.ix_(rows, rows)],
+        )
+    runtime_merged = filt._log_likelihood_sequence_gpu(
+        lambda_t,
+        data.z_k,
+        data.observation_variances,
+        observation_count_covariance=covariance,
+    )
+
+    assert np.allclose(
+        structural,
+        runtime_separate.numpy(),
+        rtol=1.0e-11,
+        atol=1.0e-10,
+    )
+    assert not np.allclose(structural, runtime_merged.numpy())
+
+
+def test_structural_mixed_station_covariance_routes_match_runtime() -> None:
+    """Only station blocks that used covariance may take that runtime branch."""
+    import torch
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="gaussian",
+        station_view_covariance_enable=False,
+        shield_contrast_likelihood_enable=False,
+        shield_view_ratio_likelihood_enable=False,
+        use_gpu=False,
+    )
+    covariance = np.zeros((4, 4), dtype=float)
+    covariance[:2, :2] = np.array(
+        [[0.0, 4.0], [4.0, 0.0]],
+        dtype=float,
+    )
+    data = MeasurementData(
+        z_k=np.array([18.0, 27.0, 31.0, 14.0], dtype=float),
+        observation_variances=np.array([3.0, 4.0, 5.0, 2.0], dtype=float),
+        detector_positions=np.array(
+            [
+                [0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1, 0, 1], dtype=int),
+        pb_indices=np.array([1, 0, 1, 0], dtype=int),
+        live_times=np.ones(4, dtype=float),
+        station_sequence_ids=np.array([0, 0, 1, 1], dtype=int),
+        runtime_likelihood_routes=np.array(
+            ["count_covariance", "count_covariance", "count", "count"],
+            dtype=str,
+        ),
+        observation_count_covariance=covariance,
+    )
+    lambda_kp = np.array(
+        [[20.0, 16.0], [25.0, 30.0], [29.0, 35.0], [16.0, 12.0]],
+        dtype=float,
+    )
+
+    structural = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    runtime = filt._log_likelihood_sequence_gpu(
+        torch.as_tensor(lambda_kp[:2], dtype=torch.float64),
+        data.z_k[:2],
+        data.observation_variances[:2],
+        observation_count_covariance=covariance[:2, :2],
+    )
+    runtime += filt._log_likelihood_sequence_gpu(
+        torch.as_tensor(lambda_kp[2:], dtype=torch.float64),
+        data.z_k[2:],
+        data.observation_variances[2:],
+    )
+
+    np.testing.assert_allclose(
+        structural,
+        runtime.numpy(),
+        rtol=1.0e-11,
+        atol=1.0e-10,
+    )
+
+
+def test_structural_covariance_regularization_is_independent_per_station() -> None:
+    """One invalid station covariance must not force fallback in another."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="gaussian",
+        station_view_covariance_enable=False,
+        shield_contrast_likelihood_enable=False,
+        shield_view_ratio_likelihood_enable=False,
+        use_gpu=False,
+    )
+    covariance = np.zeros((4, 4), dtype=float)
+    covariance[:2, :2] = np.array(
+        [[0.0, 10.0], [10.0, 0.0]],
+        dtype=float,
+    )
+    covariance[2:, 2:] = np.array(
+        [[0.0, 1000.0], [1000.0, 0.0]],
+        dtype=float,
+    )
+    data = MeasurementData(
+        z_k=np.array([10.0, 12.0, 9.0, 11.0], dtype=float),
+        observation_variances=np.ones(4, dtype=float),
+        detector_positions=np.array(
+            [
+                [0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1, 0, 1], dtype=int),
+        pb_indices=np.array([1, 0, 1, 0], dtype=int),
+        live_times=np.ones(4, dtype=float),
+        station_sequence_ids=np.array([0, 0, 1, 1], dtype=int),
+        runtime_likelihood_routes=np.asarray(
+            ["count_covariance"] * 4,
+            dtype=str,
+        ),
+        observation_count_covariance=covariance,
+    )
+    lambda_kp = np.array(
+        [[10.0, 14.0], [12.0, 8.0], [9.0, 13.0], [11.0, 7.0]],
+        dtype=float,
+    )
+
+    combined = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    separate = np.zeros(lambda_kp.shape[1], dtype=float)
+    for block_id in (0, 1):
+        mask = data.station_sequence_ids == block_id
+        separate += filt._structural_count_log_likelihood_matrix_np(
+            filt._measurement_rows(data, mask),
+            lambda_kp[mask],
+        )
+
+    np.testing.assert_allclose(combined, separate, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_measurement_history_records_runtime_likelihood_block_ids() -> None:
+    """Joint rows should share an ID while per-row and delayed rows do not."""
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        min_particles=1,
+        max_particles=1,
+        max_sources=1,
+        init_num_sources=(1, 1),
+        birth_enable=False,
+        resample_threshold=0.0,
+        use_tempering=False,
+        use_gpu=False,
+        parallel_isotope_updates=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.5},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    estimator.update_pair_sequence(
+        (
+            ({"Cs-137": 10.0}, 0, 1, 1.0, {"Cs-137": 2.0}),
+            ({"Cs-137": 12.0}, 1, 0, 1.0, {"Cs-137": 2.5}),
+        ),
+        pose_idx=0,
+    )
+    estimator.update_pair(
+        {"Cs-137": 9.0},
+        pose_idx=0,
+        fe_index=2,
+        pb_index=3,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 2.0},
+    )
+    estimator.begin_deferred_pose_update()
+    estimator.update_pair(
+        {"Cs-137": 8.0},
+        pose_idx=0,
+        fe_index=3,
+        pb_index=2,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 2.0},
+    )
+    estimator.update_pair(
+        {"Cs-137": 7.0},
+        pose_idx=0,
+        fe_index=4,
+        pb_index=1,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 2.0},
+    )
+    assert estimator.finalize_deferred_pose_update() == 2
+    estimator.update_pair(
+        {"Cs-137": 6.0},
+        pose_idx=0,
+        fe_index=5,
+        pb_index=0,
+        live_time_s=1.0,
+    )
+
+    record_ids = [
+        int(record.station_sequence_id)
+        for record in estimator.measurements
+        if record.station_sequence_id is not None
+    ]
+    data = estimator._measurement_data_for_iso("Cs-137", None)
+
+    assert record_ids == [0, 0, 2, 3, 4, 5]
+    assert data is not None
+    assert data.station_sequence_ids is not None
+    assert data.station_sequence_ids.tolist() == record_ids
+    assert estimator.measurements[-1].z_variance_k == {"Cs-137": 0.0}
+    assert data.observation_variances[-1] == pytest.approx(0.0)
+
+
+def test_mixed_runtime_likelihood_history_matches_runtime_updates() -> None:
+    """Structural replay must preserve mixed direct-spectrum and count routes."""
+    import torch
+
+    config = RotatingShieldPFConfig(
+        num_particles=1,
+        min_particles=1,
+        max_particles=1,
+        max_sources=1,
+        init_num_sources=(1, 1),
+        birth_enable=False,
+        resample_threshold=0.0,
+        use_tempering=False,
+        count_likelihood_model="student_t",
+        count_likelihood_df=6.0,
+        spectrum_count_rel_sigma=0.05,
+        spectrum_count_abs_sigma=0.2,
+        direct_spectrum_likelihood_enable=True,
+        use_gpu=False,
+        parallel_isotope_updates=False,
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
+        mu_by_isotope={"Cs-137": 0.5},
+        pf_config=config,
+        shield_params=ShieldParams(),
+    )
+    estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    template = (0.2, 0.5, 0.3)
+    direct_with_variance = {
+        "spectrum_counts": (8.0, 21.0, 13.0),
+        "spectrum_variance": (1.5, 2.5, 3.5),
+        "spectrum_background": (0.5, 0.5, 0.5),
+        "spectrum_response_templates_by_isotope": {"Cs-137": template},
+    }
+    direct_without_variance = {
+        "spectrum_counts": (11.0, 17.0, 10.0),
+        "spectrum_background": (0.25, 0.25, 0.25),
+        "spectrum_response_templates_by_isotope": {"Cs-137": template},
+    }
+    estimator.update_pair(
+        {"Cs-137": 40.5},
+        pose_idx=0,
+        fe_index=0,
+        pb_index=1,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 4.0},
+        spectrum_payload=direct_with_variance,
+    )
+    estimator.update_pair(
+        {"Cs-137": 31.0},
+        pose_idx=0,
+        fe_index=1,
+        pb_index=0,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 3.0},
+    )
+    estimator.update_pair(
+        {"Cs-137": 37.25},
+        pose_idx=0,
+        fe_index=2,
+        pb_index=3,
+        live_time_s=1.0,
+        z_variance_k={"Cs-137": 5.0},
+        spectrum_payload=direct_without_variance,
+    )
+    data = estimator._measurement_data_for_iso("Cs-137", None)
+    assert data is not None
+    assert data.runtime_likelihood_routes is not None
+    assert data.runtime_likelihood_routes.tolist() == [
+        "direct_spectrum",
+        "count",
+        "direct_spectrum",
+    ]
+    assert data.spectrum_variance is not None
+    assert data.spectrum_variance_present is not None
+    assert data.spectrum_variance_present.tolist() == [True, False, False]
+    np.testing.assert_allclose(
+        data.spectrum_variance,
+        np.array(
+            [
+                [1.5, 2.5, 3.5],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+    )
+
+    filt = estimator.filters["Cs-137"]
+    lambda_kp = np.array(
+        [[39.0, 45.0], [29.0, 35.0], [36.0, 42.0]],
+        dtype=float,
+    )
+    structural = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    lambda_t = torch.as_tensor(lambda_kp, dtype=torch.float64)
+    runtime = torch.zeros(lambda_kp.shape[1], dtype=torch.float64)
+    for row_index in (0, 2):
+        rows = slice(row_index, row_index + 1)
+        row_variance = (
+            data.spectrum_variance[rows]
+            if bool(data.spectrum_variance_present[row_index])
+            else None
+        )
+        runtime += filt._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+            lambda_t[rows],
+            data.spectrum_counts[rows],
+            data.spectrum_response_template[rows],
+            data.spectrum_background[rows],
+            row_variance,
+        )
+    count_rows = slice(1, 2)
+    runtime += filt._log_likelihood_sequence_gpu(
+        lambda_t[count_rows],
+        data.z_k[count_rows],
+        data.observation_variances[count_rows],
+    )
+
+    assert np.allclose(structural, runtime.numpy(), rtol=1.0e-11, atol=1.0e-10)
+
+
+def test_joint_spectrum_route_retains_present_row_variance() -> None:
+    """A missing row variance must mean zero, not erase other joint variances."""
+    import torch
+
+    payloads = (
+        {
+            "spectrum_counts": np.array([3.0, 5.0], dtype=float),
+            "spectrum_response_template": np.array([0.4, 0.6], dtype=float),
+            "spectrum_background": np.array([0.1, 0.2], dtype=float),
+            "spectrum_variance": np.array([1.0, 2.0], dtype=float),
+        },
+        {
+            "spectrum_counts": np.array([4.0, 6.0], dtype=float),
+            "spectrum_response_template": np.array([0.3, 0.7], dtype=float),
+            "spectrum_background": np.array([0.2, 0.1], dtype=float),
+        },
+    )
+
+    stacked = RotatingShieldPFEstimator._stack_pf_spectrum_sequence_payloads(
+        payloads
+    )
+
+    assert stacked is not None
+    assert "spectrum_variance" in stacked
+    np.testing.assert_allclose(
+        stacked["spectrum_variance"],
+        np.array([[1.0, 2.0], [0.0, 0.0]], dtype=float),
+    )
+    assert (
+        RotatingShieldPFEstimator._stack_pf_spectrum_sequence_payloads(
+            (payloads[0], None)
+        )
+        is None
+    )
+    records = (
+        MeasurementRecord(
+            z_k={"Cs-137": 8.0},
+            pose_idx=0,
+            orient_idx=0,
+            live_time_s=1.0,
+            station_sequence_id=4,
+            station_view_index=0,
+            runtime_likelihood_route_by_isotope={
+                "Cs-137": "direct_spectrum"
+            },
+        ),
+        MeasurementRecord(
+            z_k={"Cs-137": 10.0},
+            pose_idx=0,
+            orient_idx=1,
+            live_time_s=1.0,
+            station_sequence_id=4,
+            station_view_index=1,
+            runtime_likelihood_route_by_isotope={
+                "Cs-137": "direct_spectrum"
+            },
+        ),
+    )
+    routes = np.asarray(["direct_spectrum"] * 2, dtype=str)
+    variance_present = (
+        RotatingShieldPFEstimator._runtime_spectrum_variance_usage_for_records(
+            "Cs-137",
+            records,
+            payloads,
+            routes,
+        )
+    )
+    assert variance_present.tolist() == [True, True]
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="poisson",
+        direct_spectrum_likelihood_enable=True,
+        use_gpu=False,
+    )
+    assert stacked is not None
+    data = MeasurementData(
+        z_k=np.array([8.0, 10.0], dtype=float),
+        observation_variances=np.zeros(2, dtype=float),
+        detector_positions=np.repeat(
+            np.array([[0.5, 0.0, 0.0]], dtype=float),
+            2,
+            axis=0,
+        ),
+        fe_indices=np.array([0, 1], dtype=int),
+        pb_indices=np.array([1, 0], dtype=int),
+        live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.array([4, 4], dtype=int),
+        runtime_likelihood_routes=routes,
+        spectrum_counts=stacked["spectrum_counts"],
+        spectrum_response_template=stacked["spectrum_response_template"],
+        spectrum_background=stacked["spectrum_background"],
+        spectrum_variance=stacked["spectrum_variance"],
+        spectrum_variance_present=variance_present,
+    )
+    lambda_kp = np.array([[7.0, 9.0], [11.0, 8.0]], dtype=float)
+    structural = filt._structural_count_log_likelihood_matrix_np(data, lambda_kp)
+    runtime = filt._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+        torch.as_tensor(lambda_kp, dtype=torch.float64),
+        stacked["spectrum_counts"],
+        stacked["spectrum_response_template"],
+        stacked["spectrum_background"],
+        stacked["spectrum_variance"],
+    )
+
+    np.testing.assert_allclose(
+        structural,
+        runtime.numpy(),
+        rtol=1.0e-11,
+        atol=1.0e-10,
+    )
+
+
+@pytest.mark.parametrize("likelihood_model", ["poisson", "student_t"])
+def test_structural_direct_spectrum_likelihood_matches_runtime(
+    likelihood_model: str,
+) -> None:
+    """Direct-spectrum structural evidence should equal the runtime GPU path."""
+    import torch
+
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        count_likelihood_model=likelihood_model,
+        count_likelihood_df=7.0,
+        spectrum_count_rel_sigma=0.06,
+        spectrum_count_abs_sigma=0.4,
+        direct_spectrum_likelihood_enable=True,
+        spectrum_likelihood_bin_chunk=2,
+        shield_contrast_likelihood_enable=True,
+        shield_contrast_likelihood_weight=0.25,
+        shield_contrast_min_count=1.0,
+        shield_view_ratio_likelihood_enable=True,
+        shield_view_ratio_likelihood_weight=0.15,
+        shield_view_ratio_likelihood_min_total_count=1.0,
+        use_gpu=False,
+    )
+    lambda_kp = np.array(
+        [
+            [42.0, 55.0, 31.0],
+            [28.0, 19.0, 37.0],
+            [61.0, 48.0, 70.0],
+            [35.0, 44.0, 26.0],
+        ],
+        dtype=float,
+    )
+    template = np.array(
+        [
+            [0.15, 0.25, 0.35, 0.25],
+            [0.20, 0.30, 0.25, 0.25],
+            [0.10, 0.20, 0.40, 0.30],
+            [0.25, 0.20, 0.30, 0.25],
+        ],
+        dtype=float,
+    )
+    background = np.array(
+        [
+            [0.5, 0.2, 0.4, 0.3],
+            [0.4, 0.3, 0.2, 0.5],
+            [0.6, 0.2, 0.5, 0.4],
+            [0.3, 0.4, 0.2, 0.6],
+        ],
+        dtype=float,
+    )
+    observed = np.array(
+        [
+            [7.0, 11.0, 16.0, 10.0],
+            [6.0, 8.0, 7.0, 8.0],
+            [7.0, 13.0, 25.0, 18.0],
+            [9.0, 7.0, 11.0, 9.0],
+        ],
+        dtype=float,
+    )
+    spectrum_variance = (
+        None
+        if likelihood_model == "poisson"
+        else np.full(observed.shape, 0.75, dtype=float)
+    )
+    data = MeasurementData(
+        z_k=np.sum(observed - background, axis=1),
+        observation_variances=np.array([3.0, 2.0, 4.0, 2.5], dtype=float),
+        detector_positions=np.array(
+            [
+                [0.0, 0.0, 0.5],
+                [0.0, 0.0, 0.5],
+                [2.0, 1.0, 0.5],
+                [2.0, 1.0, 0.5],
+            ],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1, 0, 1], dtype=int),
+        pb_indices=np.array([1, 0, 1, 0], dtype=int),
+        live_times=np.ones(4, dtype=float),
+        station_sequence_ids=np.array([0, 0, 1, 1], dtype=int),
+        spectrum_counts=observed,
+        spectrum_response_template=template,
+        spectrum_background=background,
+        spectrum_variance=spectrum_variance,
+    )
+
+    structural = filt._structural_count_log_likelihood_matrix_np(
+        data,
+        lambda_kp,
+    )
+    lambda_t = torch.as_tensor(lambda_kp, dtype=torch.float64)
+    runtime = filt._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
+        lambda_t,
+        observed,
+        template,
+        background,
+        spectrum_variance,
+    )
+    for rows in (np.arange(2), np.arange(2, 4)):
+        runtime += filt._shield_shape_sequence_log_likelihood_gpu(
+            lambda_t[rows],
+            data.z_k[rows],
+            data.observation_variances[rows],
+        )
+
+    assert np.allclose(structural, runtime.numpy(), rtol=1.0e-11, atol=1.0e-10)
+
+
+def test_batched_structural_removal_matches_scalar_with_covariance() -> None:
+    """Batched leave-one-out evidence should match the scalar structural oracle."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        count_likelihood_model="student_t",
+        count_likelihood_df=5.0,
+        transport_model_rel_sigma=0.1,
+        spectrum_count_rel_sigma=0.15,
+        station_view_covariance_enable=True,
+        station_view_correlated_spectrum_fraction=0.5,
+        use_gpu=False,
+    )
+    covariance = np.array(
+        [
+            [0.0, 0.25, 0.0, 0.0],
+            [0.25, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.15],
+            [0.0, 0.0, 0.15, 0.0],
+        ],
+        dtype=float,
+    )
+    data = MeasurementData(
+        z_k=np.array([40.0, 24.0, 52.0, 31.0], dtype=float),
+        observation_variances=np.array([3.0, 2.0, 4.0, 2.5], dtype=float),
+        detector_positions=np.array(
+            [
+                [0.0, 0.0, 0.5],
+                [0.0, 0.0, 0.5],
+                [2.0, 1.0, 0.5],
+                [2.0, 1.0, 0.5],
+            ],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1, 0, 1], dtype=int),
+        pb_indices=np.array([1, 0, 1, 0], dtype=int),
+        live_times=np.ones(4, dtype=float),
+        station_sequence_ids=np.array([0, 0, 1, 1], dtype=int),
+        observation_count_covariance=covariance,
+    )
+    lambda_total = np.array(
+        [
+            [38.0, 43.0, 35.0],
+            [26.0, 21.0, 29.0],
+            [49.0, 57.0, 45.0],
+            [33.0, 28.0, 37.0],
+        ],
+        dtype=float,
+    )
+    component_fractions = np.array(
+        [[0.18, 0.11], [0.22, 0.08], [0.15, 0.13], [0.20, 0.09]],
+        dtype=float,
+    )
+    lambda_components = lambda_total[:, :, None] * component_fractions[:, None, :]
+
+    batched = filt._delta_log_likelihood_remove_group(
+        data,
+        lambda_total,
+        lambda_components,
+    )
+    scalar = np.vstack(
+        [
+            filt._structural_delta_log_likelihood_remove(
+                data,
+                lambda_total[:, particle_idx],
+                lambda_components[:, particle_idx, :],
+            )
+            for particle_idx in range(lambda_total.shape[1])
+        ]
+    )
+    batched_prune = filt._source_prune_allowed_mask_group(
+        data,
+        lambda_components,
+        lambda_total,
+        delta_ll=batched,
+    )
+    scalar_prune = np.vstack(
+        [
+            filt._source_prune_allowed_mask(
+                IsotopeState(
+                    num_sources=2,
+                    positions=np.zeros((2, 3), dtype=float),
+                    strengths=np.ones(2, dtype=float),
+                    background=0.0,
+                ),
+                data,
+                lambda_m=lambda_components[:, particle_idx, :],
+                lambda_total=lambda_total[:, particle_idx],
+                delta_ll=scalar[particle_idx],
+            )
+            for particle_idx in range(lambda_total.shape[1])
+        ]
+    )
+
+    assert np.allclose(batched, scalar, rtol=1.0e-12, atol=1.0e-12)
+    assert np.array_equal(batched_prune, scalar_prune)
+
+
+def test_birth_residual_support_uses_effective_pf_covariance() -> None:
+    """A large PF model variance should prevent unsupported residual births."""
+    data = MeasurementData(
+        z_k=np.array([100.0, 100.0], dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=np.array(
+            [[0.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
+            dtype=float,
+        ),
+        fe_indices=np.zeros(2, dtype=int),
+        pb_indices=np.zeros(2, dtype=int),
+        live_times=np.ones(2, dtype=float),
+    )
+    residual = np.array([10.0, 10.0], dtype=float)
+    narrow = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        count_likelihood_model="student_t",
+        transport_model_rel_sigma=0.0,
+        birth_residual_min_support=2,
+        birth_min_distinct_poses=2,
+        birth_min_distinct_stations=2,
+        birth_residual_support_sigma=1.0,
+        birth_residual_gate_p_value=1.0,
+        use_gpu=False,
+    )
+    broad = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        count_likelihood_model="student_t",
+        transport_model_rel_sigma=1.0,
+        birth_residual_min_support=2,
+        birth_min_distinct_poses=2,
+        birth_min_distinct_stations=2,
+        birth_residual_support_sigma=1.0,
+        birth_residual_gate_p_value=1.0,
+        use_gpu=False,
+    )
+
+    assert narrow._birth_residual_gate_allows(residual, data)
+    assert narrow.last_birth_residual_support == 2
+    assert not broad._birth_residual_gate_allows(residual, data)
+    assert broad.last_birth_residual_support == 0
+
+
+def test_birth_residual_support_uses_offdiagonal_covariance_evidence() -> None:
+    """Strong covariance contrast evidence must survive marginal-variance gating."""
+    filt = _build_filter(
+        p_birth=1.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        count_likelihood_model="gaussian",
+        birth_residual_min_support=1,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        birth_residual_support_sigma=1.0,
+        birth_residual_gate_p_value=0.05,
+        birth_candidate_support_fraction=0.0,
+        use_gpu=False,
+    )
+    common_kwargs = {
+        "z_k": np.array([5.0, 0.0], dtype=float),
+        "observation_variances": np.array([100.0, 100.0], dtype=float),
+        "detector_positions": np.repeat(
+            np.array([[0.5, 0.0, 0.0]], dtype=float),
+            2,
+            axis=0,
+        ),
+        "fe_indices": np.array([0, 1], dtype=int),
+        "pb_indices": np.array([1, 0], dtype=int),
+        "live_times": np.ones(2, dtype=float),
+        "station_sequence_ids": np.array([0, 0], dtype=int),
+        "runtime_likelihood_routes": np.array(
+            ["count_covariance", "count_covariance"],
+            dtype=str,
+        ),
+    }
+    diagonal = MeasurementData(
+        **common_kwargs,
+        observation_count_covariance=np.zeros((2, 2), dtype=float),
+    )
+    correlated = MeasurementData(
+        **common_kwargs,
+        observation_count_covariance=np.array(
+            [[0.0, 99.0], [99.0, 0.0]],
+            dtype=float,
+        ),
+    )
+    residual = np.array([5.0, 0.0], dtype=float)
+    candidate_counts = np.array([[1.0], [0.25]], dtype=float)
+
+    diagonal_support, *_ = filt._birth_residual_support_evidence(
+        residual,
+        diagonal,
+    )
+    correlated_support, *_ = filt._birth_residual_support_evidence(
+        residual,
+        correlated,
+    )
+
+    assert diagonal_support.tolist() == [False, False]
+    assert correlated_support.tolist() == [True, False]
+    assert not filt._birth_residual_gate_allows(residual, diagonal)
+    assert filt._birth_residual_gate_allows(residual, correlated)
+    assert not filt._birth_candidate_support_mask(
+        data=diagonal,
+        candidate_counts=candidate_counts,
+        residual_mix=residual,
+    )[0]
+    assert filt._birth_candidate_support_mask(
+        data=correlated,
+        candidate_counts=candidate_counts,
+        residual_mix=residual,
+    )[0]
+
+
+def test_removed_fit_rescue_and_forced_gate_apis_are_physically_absent() -> None:
+    """Legacy fit, rescue, and forced-gate APIs should not remain as dead knobs."""
+    field_names = set(PFConfig.__dataclass_fields__)
+    exact_removed_fields = {
+        "birth_window",
+        "birth_residual_always_try",
+        "split_residual_always_try",
+        "death_low_q_streak",
+        "death_strength_threshold",
+        "death_require_low_strength",
+        "death_delta_ll_threshold",
+        "support_window",
+        "report_exclude_unverified_sources",
+        "mode_preserving_report_cardinality_strata",
+        "mode_preserving_report_cardinality_extra_particles",
+        "source_strength_prior_mean",
+    }
+    forbidden_field_fragments = (
+        "refit",
+        "global_rescue",
+        "runtime_report_rescue",
+        "force_proposal",
+        "forced_min_delta",
+        "suppress_death",
+        "weak_source_prune",
+        "structural_update_min",
+        "strength_absorption",
+        "observation_overshoot",
+    )
+    assert field_names.isdisjoint(exact_removed_fields)
+    assert not any(
+        fragment in field_name
+        for field_name in field_names
+        for fragment in forbidden_field_fragments
+    )
+
+    removed_methods = {
+        "apply_birth_death",
+        "apply_report_model_order_cluster_prune",
+        "inject_runtime_report_rescue_particles",
+        "refit_strengths_for_particles",
+        "sync_particles_to_evidence_sources",
+        "_birth_residual_survives_strength_refit",
+        "_data_driven_visibility_strengths_from_unit_response",
+        "_prune_floor_sources_by_expected_counts",
+        "_solve_trial_strengths_from_unit_counts",
+        "_structural_evidence_data",
+    }
+    assert not any(
+        hasattr(IsotopeParticleFilter, method_name) for method_name in removed_methods
+    )
+    assert hasattr(IsotopeParticleFilter, "apply_structural_moves")
+
+
 def test_birth_adds_source_when_particle_empty() -> None:
     """Birth move should inject a new source when a particle has none."""
     np.random.seed(0)
@@ -89,9 +1147,8 @@ def test_birth_adds_source_when_particle_empty() -> None:
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
     assert all(p.state.num_sources > 0 for p in filt.continuous_particles)
@@ -185,8 +1242,6 @@ def test_peak_suppressed_residual_birth_reveals_noncollinear_weak_source() -> No
         birth_residual_support_sigma=0.1,
         birth_residual_gate_p_value=1.0,
         birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
-        birth_existing_response_corr_max=0.95,
         residual_decomposition_enable=True,
         peak_suppression_enable=True,
         residual_decomposition_max_layers=2,
@@ -247,215 +1302,25 @@ def test_peak_suppressed_residual_birth_reveals_noncollinear_weak_source() -> No
     )
 
     assert proposal is not None
-    _, _, _, candidates, _ = proposal
+    _, _, _, candidates, candidate_counts = proposal
     assert filt.last_birth_residual_layer.startswith("strong_suppressed")
-    assert np.allclose(candidates[0], weak_pos[0])
-
-
-def test_structural_updates_filter_low_count_rows(monkeypatch) -> None:
-    """Structure-changing moves should ignore low-count rows, not PF weight updates."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        structural_update_min_counts=100.0,
+    assert np.any(
+        np.linalg.norm(candidates - weak_pos[0][None, :], axis=1) < 1.0e-9
     )
-    filt.continuous_particles[0].state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
+    accepted = filt._apply_matching_pursuit_births_to_state(
+        filt.continuous_particles[0].state,
+        data,
+        candidates,
+        max_new_sources=1,
+        candidate_unit_counts=candidate_counts,
     )
-    data = MeasurementData(
-        z_k=np.array([4.0, 150.0, 6.0], dtype=float),
-        observation_variances=np.array([4.0, 150.0, 6.0], dtype=float),
-        detector_positions=np.array(
-            [[0.5, 0.0, 0.0], [1.0, 0.0, 0.0], [1.5, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
+    final_state = filt.continuous_particles[0].state
+    assert accepted == 1
+    assert final_state.num_sources == 2
+    assert (
+        np.min(np.linalg.norm(final_state.positions - weak_pos, axis=1))
+        < 1.0e-9
     )
-    seen_counts: list[np.ndarray] = []
-
-    def _proposal(
-        birth_data: MeasurementData | None,
-        candidate_positions: np.ndarray | None,
-    ) -> None:
-        """Record the rows passed to the residual birth proposal."""
-        assert birth_data is not None
-        seen_counts.append(np.asarray(birth_data.z_k, dtype=float).copy())
-        return None
-
-    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert len(seen_counts) == 1
-    assert np.allclose(seen_counts[0], np.array([150.0], dtype=float))
-
-
-def test_structural_count_gate_requires_configured_snr(monkeypatch) -> None:
-    """High-count uncertain rows should not drive structure-changing moves."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        structural_update_min_counts=100.0,
-        structural_update_min_snr=0.0,
-        structural_update_count_min_snr=3.0,
-    )
-    filt.continuous_particles[0].state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
-    )
-    data = MeasurementData(
-        z_k=np.array([1000.0, 150.0], dtype=float),
-        observation_variances=np.array([1.0e6, 100.0], dtype=float),
-        detector_positions=np.array(
-            [[0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-    seen_counts: list[np.ndarray] = []
-
-    def _proposal(
-        birth_data: MeasurementData | None,
-        candidate_positions: np.ndarray | None,
-    ) -> None:
-        """Record the structural rows that survive the reliability gate."""
-        assert birth_data is not None
-        seen_counts.append(np.asarray(birth_data.z_k, dtype=float).copy())
-        return None
-
-    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert len(seen_counts) == 1
-    assert np.allclose(seen_counts[0], np.array([150.0], dtype=float))
-
-
-def test_structural_updates_skip_when_only_low_count_rows(monkeypatch) -> None:
-    """Birth proposals should not run when all structural evidence rows are weak."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        structural_update_min_counts=100.0,
-        structural_update_min_snr=20.0,
-    )
-    data = MeasurementData(
-        z_k=np.array([4.0, 6.0], dtype=float),
-        observation_variances=np.array([4.0, 6.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-    called = False
-
-    def _proposal(
-        birth_data: MeasurementData | None,
-        candidate_positions: np.ndarray | None,
-    ) -> None:
-        """Fail the test if low-count-only data reaches birth proposal."""
-        nonlocal called
-        called = True
-        return None
-
-    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert not called
-    assert not filt.last_birth_residual_gate_passed
-
-
-def test_birth_response_condition_rejects_indistinguishable_candidate() -> None:
-    """Same-isotope birth candidates should pass only when response columns differ."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        birth_response_condition_max=10.0,
-    )
-    existing = np.array([[1.0], [2.0], [3.0]], dtype=float)
-    candidates = np.array(
-        [
-            [2.0, 0.0],
-            [4.0, 1.0],
-            [6.0, 0.0],
-        ],
-        dtype=float,
-    )
-
-    keep = filt._birth_response_condition_mask(
-        candidate_counts=candidates,
-        existing_response_counts=existing,
-        observation_variances=np.ones(3, dtype=float),
-    )
-
-    assert keep.tolist() == [False, True]
-
-
-def test_birth_response_condition_is_incremental_with_bad_existing_matrix() -> None:
-    """Ill-conditioned existing sources alone should not reject independent births."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=4,
-        num_particles=1,
-        birth_response_condition_max=10.0,
-    )
-    existing = np.array(
-        [
-            [1.0, 1.01],
-            [2.0, 2.02],
-            [3.0, 3.03],
-            [4.0, 4.04],
-        ],
-        dtype=float,
-    )
-    candidates = np.array(
-        [
-            [1.0, 0.0],
-            [2.0, 1.0],
-            [3.0, 0.0],
-            [4.0, 0.0],
-        ],
-        dtype=float,
-    )
-
-    keep = filt._birth_response_condition_mask(
-        candidate_counts=candidates,
-        existing_response_counts=existing,
-        observation_variances=np.ones(4, dtype=float),
-    )
-
-    assert keep.tolist() == [False, True]
 
 
 def test_birth_residual_layers_include_leave_one_cluster_out() -> None:
@@ -548,13 +1413,12 @@ def test_matching_pursuit_birth_can_add_multiple_sources() -> None:
         birth_residual_support_sigma=0.1,
         birth_residual_gate_p_value=1.0,
         birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
         birth_matching_pursuit_max_new_sources=2,
         birth_matching_pursuit_topk_candidates=3,
         birth_min_sep_m=0.4,
         birth_bic_penalty_params=0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
+        birth_q_min=1.0,
+        birth_q_max=130.0,
     )
     state = IsotopeState(
         num_sources=0,
@@ -646,7 +1510,6 @@ def test_pseudo_source_verification_prunes_unsupported_tentative_source() -> Non
         strengths=np.array([200.0, 200.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.zeros(2, dtype=int),
@@ -728,7 +1591,6 @@ def test_pseudo_source_verification_requires_multiple_stations_to_prune() -> Non
         strengths=np.array([200.0, 200.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.zeros(2, dtype=int),
@@ -789,7 +1651,6 @@ def test_pseudo_source_quarantine_does_not_require_prune_allowed() -> None:
         strengths=np.array([200.0, 200.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.array([10.0, 7.5], dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.zeros(2, dtype=int),
@@ -855,7 +1716,6 @@ def test_pseudo_source_correlation_failure_requests_more_views() -> None:
         strengths=np.array([200.0, 200.0], dtype=float),
         background=0.0,
         ages=np.array([5, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.zeros(2, dtype=int),
@@ -882,33 +1742,6 @@ def test_pseudo_source_correlation_failure_requests_more_views() -> None:
     assert filt.last_pseudo_source_quarantined == 0
     assert filt.last_pseudo_source_pruned == 0
     assert filt.last_pseudo_source_fail_reasons["needs_discriminative_views"] == 1
-
-
-def test_source_prune_mask_protects_collinear_tentative_sources() -> None:
-    """Refit pruning should not delete tentative sources in collinear windows."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        pseudo_source_corr_max=0.995,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([200.0, 100.0], dtype=float),
-        background=0.0,
-        ages=np.array([5, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.array([False, True], dtype=bool),
-        verification_fail_streaks=np.zeros(2, dtype=int),
-    )
-    lambda_m = np.array([[10.0, 5.0], [20.0, 10.0], [30.0, 15.0]], dtype=float)
-
-    allowed = filt._tentative_response_separation_prune_mask(state, lambda_m)
-
-    assert allowed.tolist() == [True, False]
 
 
 def test_pseudo_source_verification_uses_cached_prune_allowed() -> None:
@@ -949,7 +1782,6 @@ def test_pseudo_source_verification_uses_cached_prune_allowed() -> None:
         strengths=np.array([200.0, 200.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.zeros(2, dtype=int),
@@ -963,11 +1795,10 @@ def test_pseudo_source_verification_uses_cached_prune_allowed() -> None:
         live_times=np.ones(3, dtype=float),
     )
     lambda_m, lambda_total = filt._lambda_components(state, data)
-    delta_ll = filt._delta_log_likelihood_remove(
-        data.z_k,
+    delta_ll = filt._structural_delta_log_likelihood_remove(
+        data,
         lambda_total,
         lambda_m,
-        observation_count_variance=data.observation_variances,
     )
 
     def fail_uncached_prune(*_args: object, **_kwargs: object) -> np.ndarray:
@@ -988,120 +1819,6 @@ def test_pseudo_source_verification_uses_cached_prune_allowed() -> None:
 
     assert changed
     assert filt.last_pseudo_source_quarantined == 1
-
-
-def test_refit_after_remove_prune_allows_redundant_source_removal() -> None:
-    """Refit-after-remove pruning should catch collinear redundant components."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-        source_prune_refit_after_remove=True,
-        source_prune_bic_penalty_params=4,
-    )
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    source_pos = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=source_pos,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )[:, 0]
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.vstack([source_pos, source_pos]),
-        strengths=np.array([50.0, 50.0], dtype=float),
-        background=0.0,
-        ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-    )
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    allowed = filt._source_prune_allowed_mask(state, data)
-
-    assert np.all(allowed)
-
-
-def test_batched_refit_uses_batched_refit_after_remove_prune() -> None:
-    """Equal-cardinality refit should not fall back to scalar prune refits."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=2,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-        source_prune_refit_after_remove=True,
-    )
-    positions = np.array(
-        [
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            [[0.1, 0.0, 0.0], [1.1, 0.0, 0.0]],
-        ],
-        dtype=float,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=positions[idx].copy(),
-                strengths=np.array([50.0, 50.0], dtype=float),
-                background=0.0,
-                ages=np.array([3, 3], dtype=int),
-                low_q_streaks=np.zeros(2, dtype=int),
-                support_scores=np.zeros(2, dtype=float),
-            ),
-            log_weight=float(np.log(0.5)),
-        )
-        for idx in range(2)
-    ]
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    data = MeasurementData(
-        z_k=np.array([120.0, 80.0, 45.0], dtype=float),
-        observation_variances=np.array([120.0, 80.0, 45.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    def fail_scalar_refit(*_args: object, **_kwargs: object) -> np.ndarray:
-        """Fail if the old per-particle refit-after-remove path is used."""
-        raise AssertionError("scalar refit-after-remove prune was called")
-
-    filt._source_prune_refit_after_remove_mask = fail_scalar_refit
-
-    filt._refit_fixed_source_count_particles_batched(
-        data,
-        particle_indices=[0, 1],
-        source_count=2,
-        iters=1,
-        eps=1.0e-12,
-    )
-
-    assert all(p.state.num_sources >= 1 for p in filt.continuous_particles)
 
 
 def test_group_unit_response_matches_legacy_and_deduplicates_geometry(
@@ -1166,9 +1883,8 @@ def test_group_unit_response_matches_legacy_and_deduplicates_geometry(
             data.pb_indices,
         ),
     ).reshape(2, 3, 2)
-    legacy_total = (
-        data.live_times[:, None] * backgrounds[None, :]
-        + np.sum(legacy_components, axis=2)
+    legacy_total = data.live_times[:, None] * backgrounds[None, :] + np.sum(
+        legacy_components, axis=2
     )
 
     source_counts: list[int] = []
@@ -1186,266 +1902,15 @@ def test_group_unit_response_matches_legacy_and_deduplicates_geometry(
         count_sources,
     )
 
-    actual_components, actual_total = (
-        filt._lambda_components_for_particle_group(
-            data,
-            particle_indices=[0, 1, 2],
-            source_count=2,
-        )
+    actual_components, actual_total = filt._lambda_components_for_particle_group(
+        data,
+        particle_indices=[0, 1, 2],
+        source_count=2,
     )
 
     assert np.array_equal(actual_components, legacy_components)
     assert np.array_equal(actual_total, legacy_total)
     assert source_counts == [3]
-
-
-def test_refit_after_remove_vectorized_matches_loop_oracle() -> None:
-    """Vectorized refit-after-remove masks should match source-loop masks."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=4,
-        num_particles=3,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-        source_prune_refit_after_remove=True,
-        conditional_strength_refit_prior_weight=0.0,
-    )
-    base_positions = np.array(
-        [[0.0, 0.0, 0.0], [0.7, 0.1, 0.0], [2.0, 0.2, 0.0]],
-        dtype=float,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=3,
-                positions=base_positions + np.array([0.05 * idx, 0.0, 0.0]),
-                strengths=np.array([80.0, 45.0 + idx, 25.0], dtype=float),
-                background=0.0,
-                ages=np.array([4, 4, 4], dtype=int),
-                low_q_streaks=np.zeros(3, dtype=int),
-                support_scores=np.ones(3, dtype=float),
-            ),
-            log_weight=float(np.log(1.0 / 3.0)),
-        )
-        for idx in range(3)
-    ]
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0], [3.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    true_counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=base_positions,
-        strengths=np.array([80.0, 45.0, 25.0], dtype=float),
-        live_times=np.ones(4, dtype=float),
-        fe_indices=np.zeros(4, dtype=int),
-        pb_indices=np.zeros(4, dtype=int),
-        source_scale=1.0,
-    ).sum(axis=1)
-    data = MeasurementData(
-        z_k=true_counts,
-        observation_variances=np.maximum(true_counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(4, dtype=int),
-        pb_indices=np.zeros(4, dtype=int),
-        live_times=np.ones(4, dtype=float),
-    )
-    k_tensor, background_counts, strengths = (
-        filt._unit_kernel_tensor_for_particle_group(
-            data,
-            particle_indices=[0, 1, 2],
-            source_count=3,
-        )
-    )
-    q_min = max(float(filt.config.min_strength), 0.0)
-    q_max = float(filt.config.birth_q_max)
-    full_strengths, full_lambda = filt._solve_strengths_for_kernel_tensor_batched(
-        data,
-        k_tensor=k_tensor,
-        background_counts=background_counts,
-        prior_mean=strengths,
-        iters=2,
-        eps=1.0e-12,
-        q_min=q_min,
-        q_max=q_max,
-    )
-
-    loop_mask = filt._source_prune_refit_after_remove_mask_loop(
-        data,
-        k_tensor=k_tensor,
-        background_counts=background_counts,
-        full_strengths=full_strengths,
-        full_lambda_total=full_lambda,
-        iters=2,
-        eps=1.0e-12,
-        q_min=q_min,
-        q_max=q_max,
-    )
-    vectorized_mask = filt._source_prune_refit_after_remove_mask_batched(
-        data,
-        k_tensor=k_tensor,
-        background_counts=background_counts,
-        full_strengths=full_strengths,
-        full_lambda_total=full_lambda,
-        iters=2,
-        eps=1.0e-12,
-        q_min=q_min,
-        q_max=q_max,
-    )
-
-    assert np.array_equal(vectorized_mask, loop_mask)
-
-
-def test_apply_birth_death_reuses_batched_refit_prune_cache(monkeypatch) -> None:
-    """Structural updates should not scalar-refit prune masks twice."""
-    filt = _build_filter(
-        p_birth=0.0,
-        p_kill=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=2,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-        source_prune_refit_after_remove=True,
-        death_require_low_strength=False,
-        death_low_q_streak=99,
-        pseudo_source_verification_enable=False,
-        split_residual_guided=False,
-        split_prob=0.0,
-        merge_prob=0.0,
-        refit_after_moves=False,
-    )
-    positions = np.array(
-        [
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            [[0.1, 0.0, 0.0], [1.1, 0.0, 0.0]],
-        ],
-        dtype=float,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=positions[idx].copy(),
-                strengths=np.array([50.0, 50.0], dtype=float),
-                background=0.0,
-                ages=np.array([3, 3], dtype=int),
-                low_q_streaks=np.zeros(2, dtype=int),
-                support_scores=np.zeros(2, dtype=float),
-            ),
-            log_weight=float(np.log(0.5)),
-        )
-        for idx in range(2)
-    ]
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    data = MeasurementData(
-        z_k=np.array([120.0, 80.0, 45.0], dtype=float),
-        observation_variances=np.array([120.0, 80.0, 45.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    def fail_scalar_refit(*_args: object, **_kwargs: object) -> np.ndarray:
-        """Fail if apply_birth_death uses the scalar prune-refit path."""
-        raise AssertionError("scalar refit-after-remove prune was called")
-
-    filt._source_prune_refit_after_remove_mask = fail_scalar_refit
-    geometry_calls = 0
-    original = filt.continuous_kernel.kernel_values_selected_pairs_for_detectors
-
-    def count_geometry(*args: object, **kwargs: object) -> NDArray[np.float64]:
-        """Count structural geometry evaluations for the equal-cardinality group."""
-        nonlocal geometry_calls
-        geometry_calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        filt.continuous_kernel,
-        "kernel_values_selected_pairs_for_detectors",
-        count_geometry,
-    )
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=None,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert all(p.state.num_sources >= 1 for p in filt.continuous_particles)
-    assert geometry_calls == 1
-
-
-def test_apply_birth_death_skips_refit_prune_without_candidates() -> None:
-    """Structural updates should not refit-after-remove when no prune can occur."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=2,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-        source_prune_refit_after_remove=True,
-        death_low_q_streak=99,
-        pseudo_source_verification_enable=True,
-    )
-    positions = np.array(
-        [
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            [[0.1, 0.0, 0.0], [1.1, 0.0, 0.0]],
-        ],
-        dtype=float,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=positions[idx].copy(),
-                strengths=np.array([50.0, 50.0], dtype=float),
-                background=0.0,
-                ages=np.array([3, 3], dtype=int),
-                low_q_streaks=np.zeros(2, dtype=int),
-                support_scores=np.full(2, 100.0, dtype=float),
-                tentative_sources=np.zeros(2, dtype=bool),
-                verification_fail_streaks=np.zeros(2, dtype=int),
-            ),
-            log_weight=float(np.log(0.5)),
-        )
-        for idx in range(2)
-    ]
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    data = MeasurementData(
-        z_k=np.array([120.0, 80.0, 45.0], dtype=float),
-        observation_variances=np.array([120.0, 80.0, 45.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    def fail_batched_refit(*_args: object, **_kwargs: object) -> np.ndarray:
-        """Fail if prune-refit work runs without any prune candidates."""
-        raise AssertionError("unnecessary refit-after-remove prune was called")
-
-    filt._source_prune_refit_after_remove_mask_batched = fail_batched_refit
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=None,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert all(p.state.num_sources == 2 for p in filt.continuous_particles)
 
 
 def test_matching_pursuit_birth_uses_cached_candidate_counts(monkeypatch) -> None:
@@ -1468,7 +1933,6 @@ def test_matching_pursuit_birth_uses_cached_candidate_counts(monkeypatch) -> Non
         strengths=np.array([10.0], dtype=float),
         background=0.0,
         ages=np.array([3], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
         support_scores=np.zeros(1, dtype=float),
     )
     data = MeasurementData(
@@ -1503,7 +1967,6 @@ def test_matching_pursuit_birth_uses_cached_candidate_counts(monkeypatch) -> Non
         data,
         candidates,
         max_new_sources=2,
-        residual_gate_forced=True,
         candidate_unit_counts=candidate_counts,
     )
 
@@ -1531,7 +1994,6 @@ def test_birth_existing_unit_response_counts_batched_match_scalar_oracle() -> No
                 strengths=np.array([10.0, 5.0], dtype=float),
                 background=0.0,
                 ages=np.array([3, 1], dtype=int),
-                low_q_streaks=np.zeros(2, dtype=int),
                 support_scores=np.zeros(2, dtype=float),
                 tentative_sources=np.array([False, True], dtype=bool),
                 verification_fail_streaks=np.array([0, 1], dtype=int),
@@ -1545,7 +2007,6 @@ def test_birth_existing_unit_response_counts_batched_match_scalar_oracle() -> No
                 strengths=np.array([6.0], dtype=float),
                 background=0.0,
                 ages=np.array([2], dtype=int),
-                low_q_streaks=np.zeros(1, dtype=int),
                 support_scores=np.zeros(1, dtype=float),
             ),
             log_weight=np.log(0.35),
@@ -1585,414 +2046,6 @@ def test_birth_existing_unit_response_counts_batched_match_scalar_oracle() -> No
 
     assert np.allclose(batched, scalar)
     assert batched.shape == (3, 3)
-
-
-def test_birth_proposal_reuses_raw_refit_gate(monkeypatch) -> None:
-    """Raw residual refit gate should not be recomputed for the same layer."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        birth_refit_residual_gate=True,
-        birth_residual_min_support=1,
-        birth_min_distinct_poses=1,
-        birth_min_distinct_stations=1,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([1.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    data = MeasurementData(
-        z_k=np.array([10.0, 12.0], dtype=float),
-        observation_variances=np.array([10.0, 12.0], dtype=float),
-        detector_positions=np.array(
-            [[0.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    monkeypatch.setattr(
-        filt,
-        "_compute_birth_residual_layers",
-        lambda **_kwargs: [
-            BirthResidualLayer(
-                name="raw",
-                residual=np.array([5.0, 4.0], dtype=float),
-            )
-        ],
-    )
-    calls = {"gate": 0, "refit": 0}
-
-    def count_residual_gate(*_args: object, **_kwargs: object) -> bool:
-        """Record residual-gate calls while preserving a passing result."""
-        calls["gate"] += 1
-        return True
-
-    monkeypatch.setattr(filt, "_birth_residual_gate_allows", count_residual_gate)
-
-    def count_refit_gate(**_kwargs: object) -> bool:
-        """Record refit-gate calls while preserving a passing result."""
-        calls["refit"] += 1
-        return True
-
-    monkeypatch.setattr(
-        filt,
-        "_birth_residual_survives_strength_refit",
-        count_refit_gate,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_candidate_support_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_existing_response_correlation_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_response_condition_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_residual_candidate_scores",
-        lambda *, candidate_counts, **_kwargs: (
-            np.ones(np.asarray(candidate_counts).shape[1], dtype=float),
-            np.ones(np.asarray(candidate_counts).shape[1], dtype=float),
-        ),
-    )
-
-    result = filt._compute_birth_proposal(
-        data,
-        np.array([[5.0, 0.0, 0.0], [6.0, 0.0, 0.0]], dtype=float),
-    )
-
-    assert result is not None
-    assert calls == {"gate": 1, "refit": 1}
-
-
-def test_birth_proposal_falls_back_to_suppressed_layer_when_raw_refit_fails(
-    monkeypatch,
-) -> None:
-    """A failed raw refit gate should not suppress shield-coded residual layers."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        birth_refit_residual_gate=True,
-        birth_residual_min_support=1,
-        birth_min_distinct_poses=1,
-        birth_min_distinct_stations=1,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([1.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    data = MeasurementData(
-        z_k=np.array([10.0, 12.0], dtype=float),
-        observation_variances=np.array([10.0, 12.0], dtype=float),
-        detector_positions=np.array(
-            [[0.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    monkeypatch.setattr(
-        filt,
-        "_compute_birth_residual_layers",
-        lambda **_kwargs: [
-            BirthResidualLayer(name="raw", residual=np.array([5.0, 4.0], dtype=float)),
-            BirthResidualLayer(
-                name="strong_suppressed_0",
-                residual=np.array([4.0, 3.0], dtype=float),
-            ),
-        ],
-    )
-    monkeypatch.setattr(
-        filt, "_birth_residual_gate_allows", lambda *_args, **_kwargs: True
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_residual_survives_strength_refit",
-        lambda **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_candidate_support_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_existing_response_correlation_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_response_condition_mask",
-        lambda *, candidate_counts, **_kwargs: np.ones(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_residual_candidate_scores",
-        lambda *, candidate_counts, **_kwargs: (
-            np.ones(np.asarray(candidate_counts).shape[1], dtype=float),
-            np.ones(np.asarray(candidate_counts).shape[1], dtype=float),
-        ),
-    )
-
-    result = filt._compute_birth_proposal(
-        data,
-        np.array([[5.0, 0.0, 0.0], [6.0, 0.0, 0.0]], dtype=float),
-    )
-
-    assert result is not None
-    assert filt.last_birth_residual_refit_gate_passed is True
-    assert filt.last_birth_residual_layer == "strong_suppressed_0"
-
-
-def test_matching_pursuit_cached_refit_matches_scalar_path() -> None:
-    """Cached matching-pursuit trial refits should match scalar refits."""
-    common_kwargs = dict(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=0.1,
-        birth_residual_gate_p_value=1.0,
-        birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
-        birth_matching_pursuit_max_new_sources=2,
-        birth_matching_pursuit_topk_candidates=3,
-        birth_min_sep_m=0.4,
-        birth_bic_penalty_params=0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    fast = _build_filter(**common_kwargs, birth_residual_suppress_death=True)
-    scalar = _build_filter(**common_kwargs, birth_residual_suppress_death=False)
-    true_positions = np.array(
-        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    true_strengths = np.array([120.0, 90.0], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=fast.continuous_kernel,
-        isotope=fast.isotope,
-        detector_positions=detector_positions,
-        sources=true_positions,
-        strengths=true_strengths,
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    counts = np.sum(expected, axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    candidate_counts = expected_counts_per_source(
-        kernel=fast.continuous_kernel,
-        isotope=fast.isotope,
-        detector_positions=detector_positions,
-        sources=true_positions,
-        strengths=np.ones(2, dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    fast_state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
-    )
-    scalar_state = fast_state.copy()
-
-    accepted_fast = fast._apply_matching_pursuit_births_to_state(
-        fast_state,
-        data,
-        true_positions,
-        max_new_sources=2,
-        residual_gate_forced=True,
-        candidate_unit_counts=candidate_counts,
-    )
-    accepted_scalar = scalar._apply_matching_pursuit_births_to_state(
-        scalar_state,
-        data,
-        true_positions,
-        max_new_sources=2,
-        residual_gate_forced=True,
-        candidate_unit_counts=candidate_counts,
-    )
-
-    assert accepted_fast == accepted_scalar == 2
-    assert np.allclose(fast_state.positions, scalar_state.positions)
-    assert np.allclose(fast_state.strengths, scalar_state.strengths)
-
-
-def test_matching_pursuit_batched_trial_matches_scalar_oracle() -> None:
-    """Batched matching-pursuit candidate trials should match scalar solves."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        birth_residual_suppress_death=True,
-        birth_matching_pursuit_topk_candidates=3,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([50.0], dtype=float),
-        background=0.0,
-    )
-    candidates = np.array(
-        [[2.0, 0.0, 0.0], [3.0, 0.5, 0.0], [4.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=np.vstack([state.positions, candidates[[1]]]),
-        strengths=np.array([50.0, 70.0], dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    ).sum(axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    unit_existing = filt._unit_response_counts_for_state(state, data)
-    unit_all = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=candidates,
-        strengths=np.ones(candidates.shape[0], dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    q_hat = np.array([20.0, 70.0, 30.0], dtype=float)
-    ranked = np.array([0, 1, 2], dtype=int)
-    base_lambda = unit_existing @ state.strengths[: state.num_sources]
-    base_ll = filt._trial_log_likelihood_from_lambda(data, base_lambda)
-
-    batched_trial, batched_delta = (
-        filt._best_cached_matching_pursuit_birth_trial_batched(
-            state,
-            data,
-            candidates=candidates,
-            ranked_candidate_indices=ranked,
-            q_hat=q_hat,
-            unit_counts_existing=unit_existing,
-            unit_counts_all=unit_all,
-            source_strengths=state.strengths[: state.num_sources],
-            base_ll=base_ll,
-        )
-    )
-    scalar_trial = None
-    scalar_delta = -np.inf
-    for cand_idx in ranked:
-        trial_counts = np.column_stack([unit_existing, unit_all[:, int(cand_idx)]])
-        trial_prior = np.concatenate(
-            [state.strengths[: state.num_sources], [q_hat[int(cand_idx)]]]
-        )
-        trial_strengths, _lambda_total, ll_after = (
-            filt._solve_trial_strengths_from_unit_counts(
-                data,
-                trial_counts,
-                trial_prior,
-                state.background,
-                iters=filt.config.refit_iters,
-                eps=filt.config.refit_eps,
-            )
-        )
-        delta = float(ll_after - base_ll)
-        if delta > scalar_delta:
-            scalar_delta = delta
-            scalar_trial = state.copy()
-            scalar_trial.positions = np.vstack(
-                [
-                    scalar_trial.positions[: scalar_trial.num_sources],
-                    candidates[int(cand_idx)],
-                ]
-            )
-            scalar_trial.strengths = trial_strengths
-            scalar_trial.num_sources = int(scalar_trial.positions.shape[0])
-
-    assert batched_trial is not None
-    assert scalar_trial is not None
-    assert np.isclose(batched_delta, scalar_delta)
-    assert np.allclose(batched_trial.positions, scalar_trial.positions)
-    assert np.allclose(batched_trial.strengths, scalar_trial.strengths)
 
 
 def test_orthogonalized_residual_candidates_skip_existing_response_copy() -> None:
@@ -2037,9 +2090,6 @@ def test_merge_trial_batched_matches_scalar_oracle() -> None:
         merge_distance_max=5.0,
         merge_response_corr_min=0.0,
         merge_search_topk_pairs=6,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-        conditional_strength_refit_prior_weight=0.0,
     )
     state = IsotopeState(
         num_sources=3,
@@ -2050,7 +2100,6 @@ def test_merge_trial_batched_matches_scalar_oracle() -> None:
         strengths=np.array([80.0, 70.0, 35.0], dtype=float),
         background=0.0,
         ages=np.array([4, 3, 5], dtype=int),
-        low_q_streaks=np.zeros(3, dtype=int),
         support_scores=np.array([3.0, 2.0, 1.0], dtype=float),
         tentative_sources=np.array([False, True, False], dtype=bool),
         verification_fail_streaks=np.array([0, 1, 0], dtype=int),
@@ -2098,138 +2147,35 @@ def test_merge_trial_batched_matches_scalar_oracle() -> None:
     )
 
 
-def test_residual_split_cached_batched_matches_scalar_oracle(monkeypatch) -> None:
-    """Cached residual split trials should be batched without changing the result."""
+def test_merge_trial_projects_weighted_position_to_surface_prior() -> None:
+    """Merging sources on different walls must not create an interior source."""
     filt = _build_filter(
         p_birth=0.0,
-        p_kill=0.0,
         min_strength=0.01,
         max_sources=3,
         num_particles=1,
-        split_residual_guided=True,
-        split_residual_candidate_count=4,
-        birth_min_sep_m=0.4,
-        min_age_to_split=0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-        conditional_strength_refit_prior_weight=0.0,
+        source_position_prior="surface",
     )
     state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([90.0], dtype=float),
+        num_sources=2,
+        positions=np.array(
+            [[0.0, 5.0, 5.0], [5.0, 0.0, 5.0]],
+            dtype=float,
+        ),
+        strengths=np.array([1.0, 1.0], dtype=float),
         background=0.0,
-        ages=np.array([3], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
-        support_scores=np.zeros(1, dtype=float),
-        tentative_sources=np.array([False], dtype=bool),
-        verification_fail_streaks=np.zeros(1, dtype=int),
     )
-    candidates = np.array(
-        [[1.8, 0.0, 0.0], [2.2, 0.2, 0.0], [3.5, 0.0, 0.0]],
-        dtype=float,
-    )
-    true_positions = np.array([[0.0, 0.0, 0.0], [2.2, 0.2, 0.0]], dtype=float)
-    true_strengths = np.array([80.0, 110.0], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [3.5, 1.0, 0.0]],
-        dtype=float,
-    )
-    counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=true_positions,
-        strengths=true_strengths,
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    ).sum(axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    candidate_counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=candidates,
-        strengths=np.ones(candidates.shape[0], dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    existing_counts = filt._unit_response_counts_for_state(state, data)
+    interior_average = np.mean(state.positions, axis=0)
 
-    def fail_existing_response(
-        *_args: object,
-        **_kwargs: object,
-    ) -> NDArray[np.float64]:
-        """Fail if the split path recomputes an already cached response."""
-        raise AssertionError("existing unit response was recomputed")
+    trial = filt._make_merge_trial_state(state, 0, 1)
+    merged = trial.positions[-1]
 
-    monkeypatch.setattr(
-        filt,
-        "_unit_response_counts_for_state",
-        fail_existing_response,
+    assert trial.num_sources == 1
+    assert not np.allclose(merged, interior_average)
+    assert np.any(
+        np.isclose(merged, np.asarray(filt.config.position_min, dtype=float))
+        | np.isclose(merged, np.asarray(filt.config.position_max, dtype=float))
     )
-
-    batched_trial, batched_delta = filt._best_residual_guided_split_trial(
-        state.copy(),
-        data,
-        candidates,
-        None,
-        suppress_prune_after_refit=True,
-        candidate_unit_counts=candidate_counts,
-        cached_existing_unit_counts=existing_counts,
-    )
-
-    base_lambda = existing_counts @ state.strengths[: state.num_sources]
-    base_ll = filt._trial_log_likelihood_from_lambda(data, base_lambda)
-    cand_strengths = filt._candidate_initial_strengths(
-        candidate_count=candidates.shape[0],
-        candidate_kernel_sums=None,
-        residual_sum=float(np.sum(np.maximum(data.z_k, 0.0))),
-    )
-    scalar_trial = None
-    scalar_delta = -np.inf
-    for cand_idx in range(candidates.shape[0]):
-        trial_counts = np.column_stack([existing_counts, candidate_counts[:, cand_idx]])
-        q_new = max(float(cand_strengths[cand_idx]), float(filt.config.min_strength))
-        keep_strength = max(
-            float(state.strengths[0]) - q_new,
-            float(filt.config.min_strength),
-        )
-        trial_prior = np.array([keep_strength, q_new], dtype=float)
-        trial_strengths, _lambda_total, ll_after = (
-            filt._solve_trial_strengths_from_unit_counts(
-                data,
-                trial_counts,
-                trial_prior,
-                state.background,
-                iters=filt.config.refit_iters,
-                eps=filt.config.refit_eps,
-            )
-        )
-        delta = float(ll_after - base_ll)
-        if delta > scalar_delta:
-            scalar_delta = delta
-            scalar_trial = state.copy()
-            scalar_trial.positions = np.vstack([state.positions, candidates[cand_idx]])
-            scalar_trial.strengths = trial_strengths
-            scalar_trial.num_sources = 2
-
-    assert batched_trial is not None
-    assert scalar_trial is not None
-    assert np.isclose(batched_delta, scalar_delta)
-    assert np.allclose(batched_trial.positions, scalar_trial.positions)
-    assert np.allclose(batched_trial.strengths, scalar_trial.strengths)
 
 
 def test_merge_trial_evaluation_can_be_chunked_without_drift() -> None:
@@ -2242,9 +2188,6 @@ def test_merge_trial_evaluation_can_be_chunked_without_drift() -> None:
         merge_distance_max=5.0,
         merge_response_corr_min=0.0,
         merge_search_topk_pairs=6,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-        conditional_strength_refit_prior_weight=0.0,
     )
     states = [
         IsotopeState(
@@ -2256,7 +2199,6 @@ def test_merge_trial_evaluation_can_be_chunked_without_drift() -> None:
             strengths=np.array([90.0, 80.0, 30.0], dtype=float),
             background=0.0,
             ages=np.array([4, 3, 5], dtype=int),
-            low_q_streaks=np.zeros(3, dtype=int),
             support_scores=np.ones(3, dtype=float),
             tentative_sources=np.array([False, True, False], dtype=bool),
             verification_fail_streaks=np.zeros(3, dtype=int),
@@ -2270,7 +2212,6 @@ def test_merge_trial_evaluation_can_be_chunked_without_drift() -> None:
             strengths=np.array([40.0, 60.0, 55.0], dtype=float),
             background=0.0,
             ages=np.array([5, 4, 3], dtype=int),
-            low_q_streaks=np.zeros(3, dtype=int),
             support_scores=np.ones(3, dtype=float),
             tentative_sources=np.zeros(3, dtype=bool),
             verification_fail_streaks=np.zeros(3, dtype=int),
@@ -2281,7 +2222,6 @@ def test_merge_trial_evaluation_can_be_chunked_without_drift() -> None:
             strengths=np.array([35.0, 33.0], dtype=float),
             background=0.0,
             ages=np.array([3, 3], dtype=int),
-            low_q_streaks=np.zeros(2, dtype=int),
             support_scores=np.ones(2, dtype=float),
             tentative_sources=np.zeros(2, dtype=bool),
             verification_fail_streaks=np.zeros(2, dtype=int),
@@ -2360,9 +2300,6 @@ def test_cached_split_trial_evaluation_can_be_chunked_without_drift() -> None:
         split_residual_candidate_count=4,
         birth_min_sep_m=0.4,
         min_age_to_split=0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-        conditional_strength_refit_prior_weight=0.0,
     )
     states = [
         IsotopeState(
@@ -2371,7 +2308,6 @@ def test_cached_split_trial_evaluation_can_be_chunked_without_drift() -> None:
             strengths=np.array([90.0], dtype=float),
             background=0.0,
             ages=np.array([3], dtype=int),
-            low_q_streaks=np.zeros(1, dtype=int),
             support_scores=np.zeros(1, dtype=float),
             tentative_sources=np.array([False], dtype=bool),
             verification_fail_streaks=np.zeros(1, dtype=int),
@@ -2382,7 +2318,6 @@ def test_cached_split_trial_evaluation_can_be_chunked_without_drift() -> None:
             strengths=np.array([100.0], dtype=float),
             background=0.0,
             ages=np.array([4], dtype=int),
-            low_q_streaks=np.zeros(1, dtype=int),
             support_scores=np.zeros(1, dtype=float),
             tentative_sources=np.array([False], dtype=bool),
             verification_fail_streaks=np.zeros(1, dtype=int),
@@ -2436,7 +2371,6 @@ def test_cached_split_trial_evaluation_can_be_chunked_without_drift() -> None:
             data,
             candidates,
             None,
-            suppress_prune_after_refit=True,
             candidate_unit_counts=candidate_counts,
         )
 
@@ -2574,163 +2508,8 @@ def test_birth_residual_layers_batched_match_scalar_oracle() -> None:
         assert np.allclose(batched.residual, scalar.residual)
 
 
-def test_residual_split_cached_refit_matches_scalar_path() -> None:
-    """Cached residual split trial refits should match scalar trial refits."""
-    common_kwargs = dict(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        split_residual_guided=True,
-        split_residual_candidate_count=1,
-        split_strength_min=1.0,
-        min_age_to_split=1,
-        birth_min_sep_m=0.4,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    fast = _build_filter(**common_kwargs, birth_residual_suppress_death=True)
-    scalar = _build_filter(**common_kwargs, birth_residual_suppress_death=False)
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([210.0], dtype=float),
-        background=0.0,
-        ages=np.array([3], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
-        support_scores=np.zeros(1, dtype=float),
-    )
-    true_positions = np.array(
-        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    true_strengths = np.array([120.0, 90.0], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=fast.continuous_kernel,
-        isotope=fast.isotope,
-        detector_positions=detector_positions,
-        sources=true_positions,
-        strengths=true_strengths,
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    candidates = np.array([[2.0, 0.0, 0.0]], dtype=float)
-    candidate_counts = expected_counts_per_source(
-        kernel=fast.continuous_kernel,
-        isotope=fast.isotope,
-        detector_positions=detector_positions,
-        sources=candidates,
-        strengths=np.ones(1, dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-
-    fast_trial, fast_delta = fast._best_residual_guided_split_trial(
-        state.copy(),
-        data,
-        candidates,
-        np.array([90.0], dtype=float),
-        suppress_prune_after_refit=True,
-        candidate_unit_counts=candidate_counts,
-    )
-    scalar_trial, scalar_delta = scalar._best_residual_guided_split_trial(
-        state.copy(),
-        data,
-        candidates,
-        np.array([90.0], dtype=float),
-        suppress_prune_after_refit=False,
-    )
-
-    assert fast_trial is not None
-    assert scalar_trial is not None
-    assert np.isclose(fast_delta, scalar_delta)
-    assert np.allclose(fast_trial.positions, scalar_trial.positions)
-    assert np.allclose(fast_trial.strengths, scalar_trial.strengths)
-
-
-def test_clustered_output_excludes_quarantined_sources() -> None:
-    """Quarantined tentative sources should not appear in reported clusters."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        cluster_min_samples=1,
-        use_clustered_output=True,
-        pseudo_source_quarantine_excludes_runtime=True,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0, 50.0], dtype=float),
-        background=0.0,
-        ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.array([False, True], dtype=bool),
-        verification_fail_streaks=np.array([0, 2], dtype=int),
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-
-    positions, strengths = filt.estimate_clustered()
-
-    assert positions.shape == (1, 3)
-    assert strengths.shape == (1,)
-    assert np.allclose(positions[0], np.array([0.0, 0.0, 0.0]))
-
-
-def test_report_excludes_unverified_sources_without_runtime_exclusion() -> None:
-    """Report estimates should be able to hide tentative sources only in output."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        cluster_min_samples=1,
-        use_clustered_output=True,
-        pseudo_source_quarantine_excludes_runtime=False,
-        report_exclude_unverified_sources=True,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0, 50.0], dtype=float),
-        background=0.0,
-        ages=np.array([3, 0], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.array([False, True], dtype=bool),
-        verification_fail_streaks=np.array([0, 0], dtype=int),
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-
-    runtime_state = filt.state_without_quarantined_sources(state)
-    positions, strengths = filt.estimate_clustered()
-
-    assert runtime_state.num_sources == 2
-    assert positions.shape == (1, 3)
-    assert strengths.shape == (1,)
-    assert np.allclose(positions[0], np.array([0.0, 0.0, 0.0]))
-
-
-def test_soft_quarantine_remains_visible_to_runtime_by_default() -> None:
-    """Soft-quarantined sources should remain available to runtime PF operations."""
+def test_soft_quarantine_is_diagnostic_only() -> None:
+    """Verification quarantine metadata must not suppress a physical PF source."""
     filt = _build_filter(
         p_birth=0.0,
         min_strength=0.01,
@@ -2745,7 +2524,6 @@ def test_soft_quarantine_remains_visible_to_runtime_by_default() -> None:
         strengths=np.array([100.0, 50.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.array([0, 2], dtype=int),
@@ -2756,10 +2534,7 @@ def test_soft_quarantine_remains_visible_to_runtime_by_default() -> None:
 
     assert positions.shape == (2, 3)
     assert strengths.shape == (2,)
-    assert filt._active_source_mask(state, include_quarantined=False).tolist() == [
-        True,
-        True,
-    ]
+    assert filt._active_source_mask(state).tolist() == [True, True]
 
 
 def test_birth_response_counts_include_quarantined_sources() -> None:
@@ -2769,7 +2544,6 @@ def test_birth_response_counts_include_quarantined_sources() -> None:
         min_strength=0.01,
         max_sources=2,
         num_particles=1,
-        pseudo_source_quarantine_excludes_runtime=True,
     )
     state = IsotopeState(
         num_sources=2,
@@ -2777,7 +2551,6 @@ def test_birth_response_counts_include_quarantined_sources() -> None:
         strengths=np.array([100.0, 50.0], dtype=float),
         background=0.0,
         ages=np.array([3, 3], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
         support_scores=np.zeros(2, dtype=float),
         tentative_sources=np.array([False, True], dtype=bool),
         verification_fail_streaks=np.array([0, 2], dtype=int),
@@ -2808,7 +2581,6 @@ def test_planning_particles_include_quarantined_sources() -> None:
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=2,
-        pseudo_source_quarantine_excludes_runtime=True,
         planning_particles=1,
     )
     estimator = RotatingShieldPFEstimator(
@@ -2830,7 +2602,6 @@ def test_planning_particles_include_quarantined_sources() -> None:
                 strengths=np.array([100.0, 50.0], dtype=float),
                 background=0.0,
                 ages=np.array([3, 3], dtype=int),
-                low_q_streaks=np.zeros(2, dtype=int),
                 support_scores=np.zeros(2, dtype=float),
                 tentative_sources=np.array([False, True], dtype=bool),
                 verification_fail_streaks=np.array([0, 2], dtype=int),
@@ -3134,7 +2905,6 @@ def test_convergence_does_not_skip_unverified_multisource_state() -> None:
     state.positions = np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=float)
     state.strengths = np.array([100.0, 50.0], dtype=float)
     state.ages = np.array([10, 1], dtype=int)
-    state.low_q_streaks = np.zeros(2, dtype=int)
     state.support_scores = np.zeros(2, dtype=float)
     state.tentative_sources = np.array([False, True], dtype=bool)
     state.verification_fail_streaks = np.zeros(2, dtype=int)
@@ -3215,117 +2985,6 @@ def test_convergence_requires_compact_supported_clusters() -> None:
     assert filt._cluster_convergence_supported()
 
 
-def test_pre_finalize_guard_preserves_reported_cardinality() -> None:
-    """Reported estimates should prefer pre-finalize modes after collapse."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        birth_enable=True,
-        report_pre_finalize_guard=True,
-        report_strength_refit=False,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.zeros((1, 3), dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    guard_pos = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
-    guard_q = np.array([100.0, 50.0], dtype=float)
-    estimator._pre_finalize_guard_estimates[isotope] = (guard_pos, guard_q)
-
-    positions, strengths = estimator._guarded_report_estimate(
-        isotope,
-        np.array([[0.0, 0.0, 0.0]], dtype=float),
-        np.array([150.0], dtype=float),
-        use_pre_finalize_guard=True,
-    )
-
-    assert positions.shape == (2, 3)
-    assert strengths.shape == (2,)
-
-
-def test_residual_birth_always_try_avoids_stochastic_miss(monkeypatch) -> None:
-    """Residual-gated birth should not be skipped by the proposal probability."""
-    filt = _build_filter(
-        p_birth=0.01,
-        p_kill=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        birth_residual_always_try=True,
-        birth_matching_pursuit_max_new_sources=2,
-        birth_matching_pursuit_topk_candidates=3,
-        birth_num_local_jitter=0,
-        birth_min_sep_m=0.4,
-        birth_detector_min_sep_m=0.0,
-        birth_residual_min_support=1,
-        birth_min_distinct_poses=1,
-        birth_min_distinct_stations=1,
-        birth_residual_support_sigma=0.1,
-        birth_residual_gate_p_value=1.0,
-        birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
-        split_prob=0.0,
-        merge_prob=0.0,
-        conditional_strength_refit_prior_weight=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-                ages=np.array([3], dtype=int),
-                low_q_streaks=np.zeros(1, dtype=int),
-                support_scores=np.zeros(1, dtype=float),
-            ),
-            log_weight=0.0,
-        )
-    ]
-    true_positions = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float)
-    true_strengths = np.array([100.0, 120.0], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [1.0, 3.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=true_positions,
-        strengths=true_strengths,
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    monkeypatch.setattr(np.random, "rand", lambda *args: 0.99)
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
-        candidate_positions=true_positions,
-    )
-
-    state = filt.continuous_particles[0].state
-    assert filt.last_birth_count > 0
-    assert state.num_sources == 2
-
-
 def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) -> None:
     """Residual-gated birth should not be limited to collapsed top-weight particles."""
     filt = _build_filter(
@@ -3336,9 +2995,7 @@ def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) ->
         num_particles=2,
         structural_proposal_topk_particles=1,
         birth_residual_expand_structural_particles=True,
-        birth_residual_always_try=True,
         birth_matching_pursuit_max_new_sources=2,
-        refit_after_moves=False,
     )
     filt.continuous_particles = [
         IsotopeParticle(
@@ -3375,7 +3032,6 @@ def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) ->
     ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         """Return a residual-gated proposal independent of top-k particles."""
         filt.last_birth_residual_gate_passed = True
-        filt.last_birth_residual_refit_gate_passed = True
         return (
             np.array([1.0], dtype=float),
             np.array([1.0], dtype=float),
@@ -3389,18 +3045,15 @@ def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) ->
         candidate_positions: np.ndarray,
         *,
         max_new_sources: int,
-        residual_gate_forced: bool = False,
         candidate_unit_counts: np.ndarray | None = None,
     ) -> int:
         """Accept a birth only for the non-top empty particle."""
-        assert residual_gate_forced
         assert candidate_unit_counts is None
         if st.num_sources > 0:
             return 0
         st.positions = np.array([[2.0, 0.0, 0.0]], dtype=float)
         st.strengths = np.array([100.0], dtype=float)
         st.ages = np.array([0], dtype=int)
-        st.low_q_streaks = np.array([0], dtype=int)
         st.support_scores = np.array([0.0], dtype=float)
         st.num_sources = 1
         return 1
@@ -3417,9 +3070,8 @@ def test_residual_birth_expands_beyond_topk_structural_particles(monkeypatch) ->
         lambda data, **kwargs: None,
     )
 
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
+    filt.apply_structural_moves(
+        evidence_data=data,
         candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
     )
 
@@ -3441,11 +3093,9 @@ def test_residual_birth_expansion_is_capped_and_cardinality_diverse(
         structural_proposal_topk_particles=1,
         birth_residual_expand_structural_particles=True,
         birth_residual_expanded_structural_topk_particles=2,
-        birth_residual_always_try=True,
         split_prob=0.0,
         split_residual_guided=False,
         merge_prob=0.0,
-        refit_after_moves=False,
     )
     filt.continuous_particles = []
     weights = np.array([0.90, 0.05, 0.03, 0.01, 0.01], dtype=float)
@@ -3482,7 +3132,6 @@ def test_residual_birth_expansion_is_capped_and_cardinality_diverse(
     ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         """Return a residual-gated proposal for structural expansion."""
         filt.last_birth_residual_gate_passed = True
-        filt.last_birth_residual_refit_gate_passed = True
         return (
             np.array([1.0], dtype=float),
             np.array([1.0], dtype=float),
@@ -3498,11 +3147,9 @@ def test_residual_birth_expansion_is_capped_and_cardinality_diverse(
         candidate_positions: np.ndarray,
         *,
         max_new_sources: int,
-        residual_gate_forced: bool = False,
         candidate_unit_counts: np.ndarray | None = None,
     ) -> int:
         """Record particles that receive exact structural birth evaluation."""
-        assert residual_gate_forced
         assert candidate_unit_counts is None
         attempted.append(int(st.background))
         return 0
@@ -3514,346 +3161,30 @@ def test_residual_birth_expansion_is_capped_and_cardinality_diverse(
         _matching_pursuit,
     )
 
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
+    filt.apply_structural_moves(
+        evidence_data=data,
         candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
     )
 
     assert set(attempted) == {0, 1}
 
 
-def test_residual_birth_gate_suppresses_same_update_death(monkeypatch) -> None:
-    """Residual birth evidence should delay death in the same structural update."""
-    filt = _build_filter(
-        p_birth=1.0,
-        p_kill=1.0,
-        min_strength=5.0,
-        max_sources=1,
-        num_particles=1,
-        death_low_q_streak=1,
-        death_delta_ll_threshold=1.0e9,
-        support_ema_alpha=1.0,
-        birth_residual_always_try=True,
-        birth_residual_suppress_death=True,
-        refit_after_moves=False,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([1.0], dtype=float),
-                background=0.0,
-                ages=np.array([5], dtype=int),
-                low_q_streaks=np.array([1], dtype=int),
-                support_scores=np.array([-1.0], dtype=float),
-            ),
-            log_weight=0.0,
-        )
-    ]
-    data = MeasurementData(
-        z_k=np.array([50.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-
-    def _proposal(
-        birth_data: MeasurementData | None,
-        candidate_positions: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-        """Return a gate-passing proposal so death is delayed."""
-        filt.last_birth_residual_gate_passed = True
-        filt.last_birth_residual_refit_gate_passed = True
-        return (
-            np.array([1.0], dtype=float),
-            np.array([1.0], dtype=float),
-            50.0,
-            np.array([[2.0, 0.0, 0.0]], dtype=float),
-        )
-
-    monkeypatch.setattr(filt, "_compute_birth_proposal", _proposal)
-
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
-        candidate_positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
-    )
-
-    assert filt.last_kill_count == 0
-    assert filt.continuous_particles[0].state.num_sources == 1
-
-
-def test_residual_gate_suppresses_refit_floor_prune() -> None:
-    """Residual-gated structural moves should delay weak-source refit pruning."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=3,
-        num_particles=1,
-        weak_source_prune_min_expected_count=3.0,
-        weak_source_prune_min_fraction=0.0,
-        weak_source_prune_min_age=1,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 0.0]], dtype=float),
-        strengths=np.array([5.0, 5.0], dtype=float),
-        background=0.0,
-        ages=np.array([5, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-    )
-    data = MeasurementData(
-        z_k=np.array([100.0], dtype=float),
-        observation_variances=np.array([100.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-
-    filt._prune_floor_sources_after_refit(
-        state,
-        data,
-        suppress_prune=True,
-    )
-
-    assert filt.last_kill_count == 0
-    assert state.num_sources == 2
-
-
-def test_residual_gate_scales_birth_complexity_penalty() -> None:
-    """Residual-gated matching pursuit should avoid double complexity charging."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=0.1,
-        birth_candidate_support_fraction=0.0,
-        birth_complexity_penalty=1.0e12,
-        birth_residual_acceptance_complexity_scale=0.0,
-        birth_min_sep_m=0.4,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
-    )
-    true_position = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=true_position,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(2, dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        source_scale=1.0,
-    )
-    counts = np.sum(expected, axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    accepted = filt._apply_matching_pursuit_births_to_state(
-        state,
-        data,
-        true_position,
-        max_new_sources=1,
-        residual_gate_forced=True,
-    )
-
-    assert accepted == 1
-    assert state.num_sources == 1
-
-
-def test_residual_forced_birth_relaxes_empty_candidate_masks(monkeypatch) -> None:
-    """Forced residual birth should not be blocked solely by proposal masks."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        birth_residual_force_proposal_on_gate=True,
-        birth_residual_force_relax_candidate_masks=True,
-        birth_residual_forced_min_delta_ll=-50.0,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=0.1,
-        birth_candidate_support_fraction=0.0,
-        birth_matching_pursuit_topk_candidates=1,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_candidate_support_mask",
-        lambda *, candidate_counts, **_kwargs: np.zeros(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_existing_response_correlation_mask",
-        lambda *, candidate_counts, **_kwargs: np.zeros(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_response_condition_mask",
-        lambda *, candidate_counts, **_kwargs: np.zeros(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
-    )
-    source = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=source,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(2, dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        source_scale=1.0,
-    )
-    counts = np.sum(expected, axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    accepted = filt._apply_matching_pursuit_births_to_state(
-        state,
-        data,
-        source,
-        max_new_sources=1,
-        residual_gate_forced=True,
-    )
-
-    assert accepted == 1
-    assert state.num_sources == 1
-    assert filt.last_birth_forced_mask_relaxations == 1
-    assert filt.last_birth_forced_accepts == 1
-
-
-def test_non_forced_birth_keeps_candidate_masks_strict(monkeypatch) -> None:
-    """Non-forced matching pursuit should keep proposal masks as hard filters."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        birth_residual_force_relax_candidate_masks=True,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=0.1,
-        birth_candidate_support_fraction=0.0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_birth_candidate_support_mask",
-        lambda *, candidate_counts, **_kwargs: np.zeros(
-            np.asarray(candidate_counts).shape[1],
-            dtype=bool,
-        ),
-    )
-    state = IsotopeState(
-        num_sources=0,
-        positions=np.zeros((0, 3), dtype=float),
-        strengths=np.zeros(0, dtype=float),
-        background=0.0,
-    )
-    source = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    detector_positions = np.array([[0.0, 1.0, 0.0]], dtype=float)
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=source,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(1, dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        source_scale=1.0,
-    )
-    counts = np.sum(expected, axis=1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-
-    accepted = filt._apply_matching_pursuit_births_to_state(
-        state,
-        data,
-        source,
-        max_new_sources=1,
-        residual_gate_forced=False,
-    )
-
-    assert accepted == 0
-    assert state.num_sources == 0
-
-
-def test_birth_bic_penalty_survives_residual_gate_scaling() -> None:
-    """Residual-forced births should still pay a BIC model-order penalty."""
+def test_birth_complexity_penalty_includes_bic() -> None:
+    """Every birth should pay the configured and BIC model-order penalties."""
     filt = _build_filter(
         p_birth=1.0,
         min_strength=0.01,
         max_sources=2,
         num_particles=1,
         birth_complexity_penalty=1.0e12,
-        birth_residual_acceptance_complexity_scale=0.0,
         birth_bic_penalty_params=4,
     )
 
     penalty = filt._birth_complexity_penalty(
-        residual_gate_forced=True,
         measurement_count=16,
     )
 
-    assert penalty == np.log(16.0) * 2.0
+    assert penalty == pytest.approx(1.0e12 + np.log(16.0) * 2.0)
 
 
 def test_resampling_can_protect_distinct_low_weight_source_modes() -> None:
@@ -4219,11 +3550,9 @@ def test_pseudo_verification_marks_unchanged_likelihood_and_keeps_rng_schedule(
         max_sources=1,
         num_particles=1,
         pseudo_source_verification_enable=True,
-        death_low_q_streak=99,
         split_residual_guided=False,
         split_prob=0.0,
         merge_prob=0.0,
-        refit_after_moves=False,
     )
     state = IsotopeState(
         num_sources=1,
@@ -4231,7 +3560,6 @@ def test_pseudo_verification_marks_unchanged_likelihood_and_keeps_rng_schedule(
         strengths=np.array([40.0], dtype=float),
         background=0.1,
         ages=np.array([3], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
         support_scores=np.zeros(1, dtype=float),
         tentative_sources=np.ones(1, dtype=bool),
         verification_fail_streaks=np.zeros(1, dtype=int),
@@ -4286,9 +3614,8 @@ def test_pseudo_verification_marks_unchanged_likelihood_and_keeps_rng_schedule(
     expected_resample_draw = float(np.random.rand())
     np.random.seed(123)
 
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=None,
+    filt.apply_structural_moves(
+        evidence_data=data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -4299,6 +3626,99 @@ def test_pseudo_verification_marks_unchanged_likelihood_and_keeps_rng_schedule(
     assert refresh_kwargs[0]["moved_indices"] == {0}
     assert refresh_kwargs[0]["likelihood_unchanged_indices"] == {0}
     assert resample_draws == [expected_resample_draw]
+
+
+def test_failed_birth_keeps_prior_move_weight_refresh(monkeypatch) -> None:
+    """A rejected birth must not discard bookkeeping for an earlier PF move."""
+    filt = _build_filter(
+        p_birth=1.0,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=1,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        birth_matching_pursuit_max_new_sources=1,
+        split_residual_guided=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+    )
+    state = IsotopeState(
+        num_sources=1,
+        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([40.0], dtype=float),
+        background=0.1,
+        ages=np.array([3], dtype=int),
+        support_scores=np.zeros(1, dtype=float),
+        tentative_sources=np.ones(1, dtype=bool),
+        verification_fail_streaks=np.zeros(1, dtype=int),
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+    data = MeasurementData(
+        z_k=np.array([10.0], dtype=float),
+        observation_variances=np.array([11.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+        station_sequence_ids=np.array([0], dtype=int),
+        runtime_likelihood_routes=np.array(["count"], dtype=str),
+    )
+    refresh_kwargs: list[dict[str, object]] = []
+
+    def verify_metadata_only(
+        target: IsotopeState,
+        _data: MeasurementData,
+        **_kwargs: object,
+    ) -> bool:
+        """Mark the existing source verified before the rejected birth."""
+        target.tentative_sources[0] = False
+        return True
+
+    def rejected_birth_proposal(
+        _data: MeasurementData,
+        _candidates: NDArray[np.float64] | None,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        float,
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return a zero-response candidate that cannot produce a birth."""
+        return (
+            np.array([1.0], dtype=float),
+            np.array([0.0], dtype=float),
+            1.0,
+            np.array([[2.0, 0.0, 0.0]], dtype=float),
+            np.zeros((1, 1), dtype=float),
+        )
+
+    def record_refresh(
+        _data: MeasurementData | None,
+        **kwargs: object,
+    ) -> None:
+        """Record reweighting after the failed birth attempt."""
+        refresh_kwargs.append(kwargs)
+
+    monkeypatch.setattr(
+        filt,
+        "_verify_pseudo_sources_for_state",
+        verify_metadata_only,
+    )
+    monkeypatch.setattr(filt, "_compute_birth_proposal", rejected_birth_proposal)
+    monkeypatch.setattr(filt, "refresh_weights_from_measurements", record_refresh)
+    monkeypatch.setattr(
+        filt,
+        "_maybe_resample_after_structural_update",
+        lambda: False,
+    )
+
+    filt.apply_structural_moves(data, candidate_positions=filt.kernel.sources)
+
+    assert state.num_sources == 1
+    assert not bool(state.tentative_sources[0])
+    assert refresh_kwargs[0]["moved_indices"] == {0}
 
 
 def test_structural_update_resamples_after_weight_collapse() -> None:
@@ -4331,246 +3751,6 @@ def test_structural_update_resamples_after_weight_collapse() -> None:
     assert np.allclose(filt.continuous_weights, np.full(filt.N, 1.0 / filt.N))
 
 
-def test_reported_strength_refit_uses_all_measurements() -> None:
-    """Reported strengths should be refit from counts after position clustering."""
-    np.random.seed(10)
-    isotope = "Cs-137"
-    sources = np.array([[0.0, 0.0, 0.0], [3.0, 1.0, 0.0]], dtype=float)
-    detector_positions = [
-        np.array([1.0, 3.0, 0.0], dtype=float),
-        np.array([4.0, 0.0, 0.0], dtype=float),
-        np.array([2.0, -2.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_iters=128,
-        init_num_sources=(1, 1),
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    true_strengths = np.array([120.0, 45.0], dtype=float)
-    data_design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=sources,
-        strengths=np.ones(2, dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = data_design @ true_strengths
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-    filt = estimator.filters[isotope]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=sources.copy(),
-                strengths=np.array([10.0, 10.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-
-    positions, strengths = estimator.estimates()[isotope]
-
-    order = np.argsort(positions[:, 0])
-    assert np.allclose(positions[order], sources, atol=1.0e-6)
-    assert np.allclose(strengths[order], true_strengths, rtol=1.0e-3, atol=1.0e-3)
-
-
-def test_report_mle_rescue_adds_residual_surface_candidate() -> None:
-    """Report MLE rescue should let residual-supported surface candidates enter BIC."""
-    isotope = "Cs-137"
-    candidates = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]],
-        dtype=float,
-    )
-    detector_positions = [
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([4.0, 1.0, 0.0], dtype=float),
-        np.array([2.0, 3.0, 0.0], dtype=float),
-        np.array([5.0, 3.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        birth_enable=True,
-        report_strength_refit=True,
-        report_strength_refit_iters=128,
-        report_strength_refit_prior_weight=0.0,
-        report_mle_rescue_enable=True,
-        report_mle_rescue_max_candidates=3,
-        report_mle_rescue_max_posterior_candidates=0,
-        report_mle_rescue_max_residual_candidates=2,
-        report_mle_rescue_min_residual_fraction=0.0,
-        report_cluster_model_selection=True,
-        report_cluster_model_selection_max_candidates=3,
-        report_cluster_bic_penalty_params=0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=candidates,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    true_sources = candidates[:2]
-    true_strengths = np.array([120.0, 90.0], dtype=float)
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=true_sources,
-        strengths=np.ones(2, dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = design @ true_strengths
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        candidates[:1],
-        np.array([210.0], dtype=float),
-    )
-
-    assert positions.shape[0] == 2
-    assert strengths.shape == (2,)
-    assert np.min(np.linalg.norm(positions - candidates[1][None, :], axis=1)) < 1e-6
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert diagnostics["mle_rescue_enabled"] is True
-    rescued_candidates = int(diagnostics.get("mle_rescue_global_candidates", 0)) + int(
-        diagnostics.get("mle_rescue_residual_candidates", 0)
-    )
-    assert rescued_candidates >= 1
-    assert diagnostics["selected_count"] == 2
-
-
-def test_report_surface_local_refine_improves_nearby_surface_candidate() -> None:
-    """Report-local surface refinement should move a candidate to a better surface point."""
-    isotope = "Cs-137"
-    initial = np.array([[1.25, 2.0, 4.0]], dtype=float)
-    truth = np.array([[2.0, 2.0, 4.0]], dtype=float)
-    detector_positions = [
-        np.array([2.0, 2.0, 0.0], dtype=float),
-        np.array([0.0, 2.0, 0.0], dtype=float),
-        np.array([4.0, 2.0, 0.0], dtype=float),
-        np.array([2.0, 0.0, 0.0], dtype=float),
-        np.array([2.0, 4.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=1,
-        birth_enable=True,
-        report_strength_refit=True,
-        report_strength_refit_iters=64,
-        report_surface_local_refine=True,
-        report_surface_local_refine_radius_m=0.75,
-        report_surface_local_refine_grid_steps=1,
-        report_surface_local_refine_max_candidates_per_source=27,
-        report_cluster_model_selection=True,
-        report_cluster_bic_penalty_params=0,
-        source_position_prior="surface",
-        position_min=(0.0, 0.0, 0.0),
-        position_max=(4.0, 4.0, 4.0),
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=initial,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=truth,
-        strengths=np.ones(1, dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = design[:, 0] * 120.0
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        initial,
-        np.array([100.0], dtype=float),
-    )
-
-    assert positions.shape == (1, 3)
-    assert np.linalg.norm(positions[0] - truth[0]) < np.linalg.norm(
-        initial[0] - truth[0]
-    )
-    assert strengths[0] > 0.0
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert diagnostics["surface_local_refine_accept_count"] >= 1
-
-
 def test_grid_initialization_repeats_strength_samples_per_cell() -> None:
     """Deterministic grid initialization should support repeated strength samples."""
     filt = _build_filter(
@@ -4585,9 +3765,10 @@ def test_grid_initialization_repeats_strength_samples_per_cell() -> None:
         position_max=(2.0, 1.0, 1.0),
     )
     positions = np.vstack([p.state.positions[0] for p in filt.continuous_particles])
+    grid_positions = filt._initial_grid_positions()
 
-    assert len(filt.continuous_particles) == 6
-    assert np.unique(positions, axis=0).shape[0] == 2
+    assert len(filt.continuous_particles) == 3 * len(grid_positions)
+    assert np.unique(positions, axis=0).shape[0] == len(grid_positions)
 
 
 def test_grid_initialization_respects_source_count_prior() -> None:
@@ -4606,7 +3787,7 @@ def test_grid_initialization_respects_source_count_prior() -> None:
     )
     counts = [particle.state.num_sources for particle in filt.continuous_particles]
 
-    assert len(filt.continuous_particles) == 8
+    assert len(filt.continuous_particles) == 4 * len(filt._initial_grid_positions())
     assert set(counts) == {0, 1, 2, 3}
 
 
@@ -4644,7 +3825,7 @@ def test_grid_source_counts_use_vectorized_runtime_path(
     monkeypatch.setattr(filt, "_initial_source_count_for_particle", fail_scalar_path)
     filt._init_continuous_particles()
 
-    assert len(filt.continuous_particles) == 8
+    assert len(filt.continuous_particles) == 4 * len(filt._initial_grid_positions())
     assert {particle.state.num_sources for particle in filt.continuous_particles} == {
         0,
         1,
@@ -4823,9 +4004,8 @@ def test_birth_excludes_candidates_near_detector_poses() -> None:
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
     for particle in filt.continuous_particles:
@@ -4833,188 +4013,19 @@ def test_birth_excludes_candidates_near_detector_poses() -> None:
         assert np.allclose(particle.state.positions[0], np.array([2.0, 0.0, 0.0]))
 
 
-def test_death_removes_weak_sources() -> None:
-    """Sources below the minimum strength threshold should be removed."""
-    np.random.seed(1)
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.5,
-        max_sources=2,
-        num_particles=2,
-        death_low_q_streak=1,
-        death_delta_ll_threshold=0.0,
-        support_ema_alpha=1.0,
-        p_kill=1.0,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
-                strengths=np.array([0.1, 0.2], dtype=float),
-                background=0.1,
-            ),
-            log_weight=float(np.log(0.5)),
-        )
-        for _ in range(filt.N)
-    ]
-    support_data = MeasurementData(
-        z_k=np.array([0.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([7], dtype=int),
-        pb_indices=np.array([7], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    filt.apply_birth_death(
-        support_data=support_data, birth_data=None, candidate_positions=None
-    )
-    assert all(p.state.num_sources == 0 for p in filt.continuous_particles)
-
-
-def test_death_uses_declared_source_strength_support_threshold() -> None:
-    """Evidence-poor sources below the physical prior support should be removable."""
-    np.random.seed(1)
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        death_strength_threshold=300000.0,
-        max_sources=2,
-        num_particles=1,
-        death_low_q_streak=1,
-        death_delta_ll_threshold=0.0,
-        support_ema_alpha=1.0,
-        p_kill=1.0,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
-                strengths=np.array([100000.0, 200000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    support_data = MeasurementData(
-        z_k=np.array([0.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([7], dtype=int),
-        pb_indices=np.array([7], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-
-    filt.apply_birth_death(
-        support_data=support_data,
-        birth_data=None,
-        candidate_positions=None,
-    )
-
-    assert filt.last_kill_count == 2
-    assert filt.continuous_particles[0].state.num_sources == 0
-
-
-def test_evidence_driven_death_waits_for_multistation_support() -> None:
-    """Unsupported sources should die by evidence, not an unrelated cps floor."""
-    np.random.seed(2)
-    filt = _build_filter(
-        p_birth=0.0,
-        p_kill=1.0,
-        min_strength=5.0,
-        death_strength_threshold=300000.0,
-        death_require_low_strength=False,
-        death_low_q_streak=2,
-        death_delta_ll_threshold=0.0,
-        support_ema_alpha=1.0,
-        source_prune_min_distinct_stations=2,
-        source_prune_min_distinct_views=2,
-        num_particles=1,
-        max_sources=1,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([1000000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    one_station = MeasurementData(
-        z_k=np.zeros(1, dtype=float),
-        observation_variances=np.ones(1, dtype=float),
-        detector_positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    two_stations = MeasurementData(
-        z_k=np.zeros(2, dtype=float),
-        observation_variances=np.ones(2, dtype=float),
-        detector_positions=np.array(
-            [[1.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.array([0, 1], dtype=int),
-        pb_indices=np.array([0, 1], dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    filt.apply_birth_death(
-        support_data=one_station,
-        birth_data=None,
-        candidate_positions=None,
-    )
-    assert filt.last_kill_count == 0
-    assert filt.continuous_particles[0].state.low_q_streaks[0] == 0
-
-    filt.apply_birth_death(
-        support_data=two_stations,
-        birth_data=None,
-        candidate_positions=None,
-    )
-    assert filt.last_kill_count == 0
-    assert filt.continuous_particles[0].state.low_q_streaks[0] == 1
-
-    filt.apply_birth_death(
-        support_data=two_stations,
-        birth_data=None,
-        candidate_positions=None,
-    )
-    assert filt.last_kill_count == 1
-    assert filt.continuous_particles[0].state.num_sources == 0
-
-
-def test_evidence_death_prunes_neutral_source_without_strength_refit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Half-BIC evidence should prune a neutral source after station history."""
+def test_evidence_death_prunes_neutral_source_and_keeps_supported_source() -> None:
+    """The exact PF likelihood plus BIC should remove only a neutral source."""
     np.random.seed(23)
     filt = _build_filter(
         p_birth=0.0,
         p_kill=1.0,
         min_strength=5.0,
-        death_require_low_strength=False,
-        death_low_q_streak=2,
-        source_prune_refit_after_remove=False,
         source_prune_bic_penalty_params=4,
         source_prune_delta_ll_threshold=0.0,
         source_prune_min_distinct_stations=2,
         source_prune_min_distinct_views=2,
         pseudo_source_verification_enable=False,
-        conditional_strength_refit=False,
-        refit_after_moves=False,
         split_prob=0.0,
-        split_residual_always_try=False,
-        high_strength_split_enable=False,
         merge_prob=0.0,
         num_particles=1,
         max_sources=2,
@@ -5051,81 +4062,129 @@ def test_evidence_death_prunes_neutral_source_without_strength_refit(
         live_times=np.ones(2, dtype=float),
     )
 
-    def _fail_refit(*args: object, **kwargs: object) -> None:
-        """Fail if strict non-refit evidence death invokes a refit path."""
-        raise AssertionError("evidence-only death must not invoke strength refit")
-
-    monkeypatch.setattr(
-        filt,
-        "_source_prune_refit_after_remove_mask",
-        _fail_refit,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_source_prune_refit_after_remove_mask_batched",
-        _fail_refit,
-    )
-    monkeypatch.setattr(filt, "_refit_strengths_for_particle", _fail_refit)
-    monkeypatch.setattr(filt, "_refit_particle_indices_batched", _fail_refit)
-
-    filt.apply_birth_death(
-        support_data=support_data,
-        birth_data=None,
-        candidate_positions=None,
-    )
-    first_state = filt.continuous_particles[0].state
-    assert filt.last_kill_count == 0
-    assert first_state.low_q_streaks.tolist() == [0, 1]
-
-    filt.apply_birth_death(
-        support_data=support_data,
-        birth_data=None,
+    filt.apply_structural_moves(
+        evidence_data=support_data,
         candidate_positions=None,
     )
     final_state = filt.continuous_particles[0].state
     assert filt.last_kill_count == 1
     assert final_state.num_sources == 1
     assert final_state.strengths.tolist() == [pytest.approx(1.0e6)]
-    assert final_state.low_q_streaks.tolist() == [0]
+
+    filt.apply_structural_moves(
+        evidence_data=support_data,
+        candidate_positions=None,
+    )
+    assert filt.last_kill_count == 1
+    assert filt.continuous_particles[0].state.num_sources == 1
 
 
-def test_source_detector_exclusion_removes_detector_collapsed_source() -> None:
-    """Structural updates should reject sources inside measured detector poses."""
+def test_supported_source_inside_detector_exclusion_is_not_forced_dead() -> None:
+    """A physical-prior violation must survive when full-history evidence supports it."""
+    filt = _build_filter(
+        p_birth=0.0,
+        p_kill=1.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        source_detector_exclusion_m=0.25,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=2,
+        pseudo_source_verification_enable=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+    )
+    state = IsotopeState(
+        num_sources=1,
+        positions=np.array([[0.51, 0.0, 0.0]], dtype=float),
+        strengths=np.array([100.0], dtype=float),
+        background=0.0,
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+    detector_positions = np.array(
+        [[0.5, 0.0, 0.0], [1.5, 0.5, 0.0]],
+        dtype=float,
+    )
+    template = MeasurementData(
+        z_k=np.zeros(2, dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=detector_positions,
+        fe_indices=np.array([7, 6], dtype=int),
+        pb_indices=np.array([7, 6], dtype=int),
+        live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.array([0, 1], dtype=int),
+    )
+    _, expected = filt._lambda_components(state, template)
+    support_data = MeasurementData(
+        z_k=expected,
+        observation_variances=np.maximum(expected, 1.0),
+        detector_positions=detector_positions,
+        fe_indices=template.fe_indices,
+        pb_indices=template.pb_indices,
+        live_times=template.live_times,
+        station_sequence_ids=template.station_sequence_ids,
+    )
+
+    filt.apply_structural_moves(evidence_data=support_data, candidate_positions=None)
+
+    final_state = filt.continuous_particles[0].state
+    assert filt.last_kill_count == 0
+    assert final_state.num_sources == 1
+    assert np.allclose(final_state.positions[0], np.array([0.51, 0.0, 0.0]))
+
+
+def test_unsupported_source_inside_detector_exclusion_is_evidence_pruned() -> None:
+    """A physical-prior violation may be prioritized only after prune evidence."""
     np.random.seed(11)
     filt = _build_filter(
         p_birth=0.0,
+        p_kill=1.0,
         min_strength=0.01,
-        max_sources=2,
+        max_sources=1,
         num_particles=1,
         source_detector_exclusion_m=0.25,
+        source_prune_min_distinct_stations=2,
+        source_prune_min_distinct_views=2,
+        pseudo_source_verification_enable=False,
+        split_prob=0.0,
+        merge_prob=0.0,
     )
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=2,
-                positions=np.array([[0.51, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([10.0, 10.0], dtype=float),
+                num_sources=1,
+                positions=np.array([[0.51, 0.0, 0.0]], dtype=float),
+                strengths=np.array([100.0], dtype=float),
                 background=0.0,
             ),
             log_weight=0.0,
         )
     ]
-    support_data = MeasurementData(
-        z_k=np.array([10.0], dtype=float),
-        observation_variances=np.array([10.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([7], dtype=int),
-        pb_indices=np.array([7], dtype=int),
-        live_times=np.array([1.0], dtype=float),
+    evidence_data = MeasurementData(
+        z_k=np.zeros(2, dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=np.array(
+            [[0.5, 0.0, 0.0], [1.5, 0.5, 0.0]],
+            dtype=float,
+        ),
+        fe_indices=np.array([7, 6], dtype=int),
+        pb_indices=np.array([7, 6], dtype=int),
+        live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.array([0, 1], dtype=int),
     )
 
-    filt.apply_birth_death(
-        support_data=support_data, birth_data=support_data, candidate_positions=None
+    filt.apply_structural_moves(
+        evidence_data=evidence_data,
+        candidate_positions=None,
     )
 
-    state = filt.continuous_particles[0].state
-    assert state.num_sources == 1
-    assert np.allclose(state.positions[0], np.array([2.0, 0.0, 0.0]))
+    assert filt.last_kill_count == 1
+    assert filt.continuous_particles[0].state.num_sources == 0
+    assert any(
+        event["reason"]
+        == "leave_one_out_evidence_physical_prior_violation"
+        for event in filt.last_source_event_diagnostics
+    )
 
 
 def test_estimate_returns_all_sources() -> None:
@@ -5165,8 +4224,6 @@ def test_weak_source_survives_with_support() -> None:
         min_strength=0.1,
         max_sources=2,
         num_particles=1,
-        death_low_q_streak=2,
-        death_delta_ll_threshold=0.0,
         support_ema_alpha=1.0,
         p_kill=1.0,
     )
@@ -5208,220 +4265,16 @@ def test_weak_source_survives_with_support() -> None:
         live_times=np.array([live_time], dtype=float),
     )
     for _ in range(3):
-        filt.apply_birth_death(
-            support_data=support_data, birth_data=None, candidate_positions=None
+        filt.apply_structural_moves(
+            evidence_data=support_data, candidate_positions=None
         )
     assert filt.continuous_particles[0].state.num_sources == 2
 
 
-def test_weak_source_prune_respects_min_age() -> None:
-    """Weak-source pruning should not delete newly proposed components immediately."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=3,
-        num_particles=1,
-        weak_source_prune_min_expected_count=3.0,
-        weak_source_prune_min_fraction=0.0,
-        weak_source_prune_min_age=2,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([5.0, 5.0], dtype=float),
-        background=0.0,
-        ages=np.array([0, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-    )
-
-    filt._prune_floor_sources_by_expected_counts(
-        state,
-        np.array([0.0, 0.0], dtype=float),
-    )
-
-    assert state.num_sources == 1
-    assert np.allclose(state.positions[0], [0.0, 0.0, 0.0])
-
-
-def test_weak_source_prune_preserves_occluded_floor_sources() -> None:
-    """Weak-source pruning should require observable views before deletion."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=3,
-        num_particles=1,
-        weak_source_prune_min_expected_count=3.0,
-        weak_source_prune_min_fraction=0.0,
-        weak_source_prune_min_age=1,
-        weak_source_prune_require_observable=True,
-        weak_source_prune_min_observable_measurements=1,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([5.0, 5.0], dtype=float),
-        background=0.0,
-        ages=np.array([5, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-    )
-
-    filt._prune_floor_sources_by_expected_counts(
-        state,
-        np.array([0.0, 0.0], dtype=float),
-        observable_view_counts=np.array([0, 2], dtype=np.int64),
-    )
-
-    assert state.num_sources == 1
-    assert np.allclose(state.positions[0], [0.0, 0.0, 0.0])
-    assert filt.last_weak_source_prune_occlusion_protected == 1
-
-
-def test_batched_weak_prune_observability_matches_serial_counts() -> None:
-    """Batched weak-prune visibility counts should match per-particle counts."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=3,
-        num_particles=1,
-        weak_source_prune_min_expected_count=3.0,
-        weak_source_prune_min_fraction=0.0,
-        source_strength_prior_mean=10.0,
-    )
-    unit_counts = np.array(
-        [
-            [[0.1, 0.4], [1.0, 0.0]],
-            [[0.2, 0.0], [0.1, 0.5]],
-            [[0.0, 0.5], [0.1, 0.5]],
-        ],
-        dtype=float,
-    )
-
-    batched = filt._weak_source_observable_counts_from_unit_response(unit_counts)
-    serial = np.vstack(
-        [
-            filt._weak_source_observable_counts_from_unit_response(unit_counts[:, i, :])
-            for i in range(unit_counts.shape[1])
-        ]
-    )
-
-    assert np.array_equal(batched, serial)
-
-
-def test_batched_weak_prune_observability_uses_observed_signal() -> None:
-    """Weak-prune visibility should use observation-supported strength when no fixed reference is configured."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=3,
-        num_particles=1,
-        weak_source_prune_min_expected_count=3.0,
-        weak_source_prune_min_fraction=0.0,
-        source_strength_prior_mean=0.0,
-        weak_source_prune_visibility_reference_strength=0.0,
-    )
-    unit_counts = np.array(
-        [
-            [[0.1, 0.0], [0.0, 0.2]],
-            [[0.2, 0.0], [0.0, 0.1]],
-            [[0.1, 0.0], [0.0, 0.1]],
-        ],
-        dtype=float,
-    )
-    signal_counts = np.array(
-        [
-            [100.0, 60.0],
-            [120.0, 50.0],
-            [80.0, 40.0],
-        ],
-        dtype=float,
-    )
-    variances = np.maximum(signal_counts, 1.0)
-
-    batched = filt._weak_source_observable_counts_from_unit_response(
-        unit_counts,
-        signal_counts=signal_counts,
-        observation_variances=variances,
-    )
-    serial = np.vstack(
-        [
-            filt._weak_source_observable_counts_from_unit_response(
-                unit_counts[:, i, :],
-                signal_counts=signal_counts[:, i],
-                observation_variances=variances[:, i],
-            )
-            for i in range(unit_counts.shape[1])
-        ]
-    )
-
-    assert np.array_equal(batched, serial)
-    assert batched.tolist() == [[3, 0], [0, 3]]
-
-
-def test_batched_refit_respects_suppressed_weak_source_prune() -> None:
-    """Batched strength refit should defer weak-source deletion when requested."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=2,
-        num_particles=1,
-        weak_source_prune_min_expected_count=10.0,
-        weak_source_prune_min_fraction=0.0,
-        weak_source_prune_min_age=0,
-        source_prune_refit_after_remove=False,
-        source_prune_delta_ll_threshold=1.0,
-        source_prune_min_distinct_stations=1,
-        source_prune_min_distinct_views=1,
-    )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0, 5.0], dtype=float),
-        background=0.0,
-        ages=np.array([5, 5], dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-    detector_positions = np.array(
-        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=state.positions[:1],
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(2, dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(counts, axis=1),
-        observation_variances=np.maximum(np.sum(counts, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    filt._refit_particle_indices_batched(
-        data,
-        [0],
-        iters=3,
-        eps=1.0e-12,
-        suppress_prune_after_refit=True,
-    )
-
-    assert filt.continuous_particles[0].state.num_sources == 2
-    assert filt.last_kill_count == 0
-
-
-def test_birth_disabled_skips_moves() -> None:
-    """Birth mode disabled should skip birth/kill/split/merge moves."""
+def test_birth_disabled_skips_all_structural_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixed-cardinality mode should return before structural trial work."""
     np.random.seed(3)
     filt = _build_filter(
         p_birth=1.0,
@@ -5445,14 +4298,6 @@ def test_birth_disabled_skips_moves() -> None:
         )
         for _ in range(filt.N)
     ]
-    support_data = MeasurementData(
-        z_k=np.array([0.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([7], dtype=int),
-        pb_indices=np.array([7], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
     birth_data = MeasurementData(
         z_k=np.array([5.0], dtype=float),
         observation_variances=np.array([5.0], dtype=float),
@@ -5461,14 +4306,124 @@ def test_birth_disabled_skips_moves() -> None:
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=support_data,
-        birth_data=birth_data,
+    particle_count_before = len(filt.continuous_particles)
+    positions_before = [
+        particle.state.positions.copy() for particle in filt.continuous_particles
+    ]
+    strengths_before = [
+        particle.state.strengths.copy() for particle in filt.continuous_particles
+    ]
+    ages_before = [
+        None if particle.state.ages is None else particle.state.ages.copy()
+        for particle in filt.continuous_particles
+    ]
+    weights_before = [
+        float(particle.log_weight) for particle in filt.continuous_particles
+    ]
+
+    def unexpected_structural_work(*_args: object, **_kwargs: object) -> None:
+        """Fail if fixed-cardinality mode enters any structural helper."""
+        raise AssertionError("structural helper called with birth_enable=False")
+
+    for helper_name in (
+        "_compute_birth_proposal",
+        "_particle_indices_by_source_count",
+        "_trial_log_likelihood",
+        "_verify_pseudo_sources_for_state",
+        "align_continuous_labels",
+    ):
+        monkeypatch.setattr(filt, helper_name, unexpected_structural_work)
+
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
-    assert all(p.state.num_sources == 1 for p in filt.continuous_particles)
+    assert len(filt.continuous_particles) == particle_count_before
+    for idx, particle in enumerate(filt.continuous_particles):
+        assert particle.state.num_sources == 1
+        assert np.array_equal(particle.state.positions, positions_before[idx])
+        assert np.array_equal(particle.state.strengths, strengths_before[idx])
+        if ages_before[idx] is None:
+            assert particle.state.ages is None
+        else:
+            assert np.array_equal(particle.state.ages, ages_before[idx])
+        assert particle.log_weight == weights_before[idx]
     assert filt.last_birth_count == 0
     assert filt.last_kill_count == 0
+    assert filt.last_structural_timing_s["structural_moves_gated"] == 1.0
+
+
+def test_standard_structural_cache_uses_grouped_prune_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The standard equal-cardinality path must not call scalar prune kernels."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=2,
+        birth_enable=True,
+        p_kill=0.0,
+        split_prob=0.0,
+        merge_prob=0.0,
+        pseudo_source_verification_enable=False,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        source_prune_min_distinct_views=1,
+        source_prune_min_distinct_stations=1,
+        source_detector_exclusion_m=0.25,
+        use_gpu=False,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[1.0 + offset, 0.0, 0.0]], dtype=float),
+                strengths=np.array([10.0 + offset], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.5)),
+        )
+        for offset in (0.0, 0.5)
+    ]
+    data = MeasurementData(
+        z_k=np.array([12.0, 8.0], dtype=float),
+        observation_variances=np.array([2.0, 2.0], dtype=float),
+        detector_positions=np.array(
+            [[0.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
+            dtype=float,
+        ),
+        fe_indices=np.array([0, 1], dtype=int),
+        pb_indices=np.array([1, 0], dtype=int),
+        live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.array([0, 1], dtype=int),
+    )
+
+    def unexpected_scalar_path(*_args: object, **_kwargs: object) -> None:
+        """Fail if the standard grouped cache enters a scalar evidence helper."""
+        raise AssertionError("scalar structural evidence helper was called")
+
+    monkeypatch.setattr(
+        filt,
+        "_source_prune_allowed_mask",
+        unexpected_scalar_path,
+    )
+    monkeypatch.setattr(
+        filt,
+        "_source_detector_exclusion_mask",
+        unexpected_scalar_path,
+    )
+
+    filt.apply_structural_moves(
+        evidence_data=data,
+        candidate_positions=None,
+    )
+
+    assert len(filt.continuous_particles) == 2
+    assert all(
+        particle.state.num_sources == 1
+        for particle in filt.continuous_particles
+    )
 
 
 def test_birth_enabled_adds_sources() -> None:
@@ -5480,7 +4435,6 @@ def test_birth_enabled_adds_sources() -> None:
         max_sources=3,
         num_particles=3,
         birth_enable=True,
-        birth_refit_residual_gate=False,
         birth_min_sep_m=0.0,
         birth_residual_min_support=1,
     )
@@ -5504,9 +4458,8 @@ def test_birth_enabled_adds_sources() -> None:
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
     assert any(p.state.num_sources > 1 for p in filt.continuous_particles)
@@ -5547,9 +4500,8 @@ def test_birth_max_per_update_caps_structural_growth() -> None:
         live_times=np.array([1.0], dtype=float),
     )
 
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -5566,7 +4518,6 @@ def test_birth_proposal_skipped_when_all_particles_at_max_sources(monkeypatch) -
         max_sources=1,
         num_particles=4,
         birth_enable=True,
-        birth_residual_always_try=True,
     )
     filt.continuous_particles = [
         IsotopeParticle(
@@ -5594,9 +4545,8 @@ def test_birth_proposal_skipped_when_all_particles_at_max_sources(monkeypatch) -
 
     monkeypatch.setattr(filt, "_compute_birth_proposal", fail_if_called)
 
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -5613,6 +4563,7 @@ def test_birth_gate_blocks_statistically_explained_residual() -> None:
         max_sources=2,
         num_particles=3,
         birth_enable=True,
+        count_likelihood_model="student_t",
         birth_min_sep_m=0.0,
         birth_residual_min_support=1,
         birth_residual_gate_p_value=0.05,
@@ -5637,9 +4588,8 @@ def test_birth_gate_blocks_statistically_explained_residual() -> None:
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
     assert all(p.state.num_sources == 0 for p in filt.continuous_particles)
@@ -5678,9 +4628,8 @@ def test_birth_gate_requires_multiple_supported_measurements_by_default() -> Non
         pb_indices=np.array([7], dtype=int),
         live_times=np.array([1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=birth_data,
+    filt.apply_structural_moves(
+        evidence_data=birth_data,
         candidate_positions=filt.kernel.sources,
     )
     assert all(p.state.num_sources == 0 for p in filt.continuous_particles)
@@ -5727,9 +4676,8 @@ def test_birth_gate_requires_residual_support_from_distinct_poses() -> None:
         live_times=np.array([1.0, 1.0], dtype=float),
     )
 
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=same_pose_data,
+    filt.apply_structural_moves(
+        evidence_data=same_pose_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -5749,9 +4697,8 @@ def test_birth_gate_requires_residual_support_from_distinct_poses() -> None:
         pb_indices=np.array([0, 0], dtype=int),
         live_times=np.array([1.0, 1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=distinct_pose_data,
+    filt.apply_structural_moves(
+        evidence_data=distinct_pose_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -5798,1945 +4745,13 @@ def test_birth_gate_counts_distinct_shield_views() -> None:
         live_times=np.array([1.0, 1.0], dtype=float),
     )
 
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=shield_view_data,
+    filt.apply_structural_moves(
+        evidence_data=shield_view_data,
         candidate_positions=filt.kernel.sources,
     )
 
     assert filt.last_birth_residual_distinct_poses == 2
     assert filt.last_birth_count > 0
-
-
-def test_global_rescue_can_use_single_station_tentative_birth() -> None:
-    """Global rescue can relax station support without weakening ordinary birth."""
-    detector_positions = np.array(
-        [[0.5, 1.0, 0.0], [0.5, 1.0, 0.0], [0.5, 1.0, 0.0]],
-        dtype=float,
-    )
-    fe_indices = np.array([0, 1, 2], dtype=int)
-    pb_indices = np.array([0, 1, 2], dtype=int)
-
-    ordinary = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        birth_enable=True,
-        p_kill=0.0,
-        birth_min_sep_m=0.0,
-        birth_detector_min_sep_m=0.0,
-        birth_num_local_jitter=0,
-        birth_residual_min_support=2,
-        birth_min_distinct_poses=2,
-        birth_min_distinct_stations=2,
-    )
-    counts = expected_counts_per_source(
-        kernel=ordinary.continuous_kernel,
-        isotope=ordinary.isotope,
-        detector_positions=detector_positions,
-        sources=ordinary.kernel.sources[:1],
-        strengths=np.array([120.0], dtype=float),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-    ).reshape(-1)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-    )
-    ordinary.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3)),
-                strengths=np.zeros(0),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-
-    ordinary.apply_birth_death(
-        support_data=None,
-        birth_data=data,
-        candidate_positions=ordinary.kernel.sources,
-    )
-
-    assert ordinary.last_birth_residual_distinct_stations == 1
-    assert ordinary.last_birth_count == 0
-    assert ordinary.continuous_particles[0].state.num_sources == 0
-
-    rescue = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        birth_enable=True,
-        p_kill=0.0,
-        birth_min_sep_m=0.0,
-        birth_detector_min_sep_m=0.0,
-        birth_num_local_jitter=0,
-        birth_residual_min_support=2,
-        birth_min_distinct_poses=2,
-        birth_min_distinct_stations=2,
-        birth_global_rescue_enable=True,
-        birth_global_rescue_min_support=2,
-        birth_global_rescue_min_distinct_poses=2,
-        birth_global_rescue_min_distinct_stations=1,
-        birth_global_rescue_force_proposal_on_gate=True,
-        birth_global_rescue_forced_min_delta_ll=-1.0e9,
-        birth_matching_pursuit_max_new_sources=1,
-        birth_matching_pursuit_topk_candidates=1,
-        birth_candidate_support_fraction=0.0,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-        pseudo_source_verification_enable=False,
-    )
-    rescue.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3)),
-                strengths=np.zeros(0),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-
-    rescue.apply_birth_death(
-        support_data=None,
-        birth_data=data,
-        candidate_positions=np.zeros((0, 3), dtype=float),
-        global_birth_candidates=rescue.kernel.sources[:1],
-    )
-
-    assert rescue.last_birth_residual_distinct_stations == 1
-    assert rescue.last_birth_global_rescue_attempts > 0
-    assert rescue.last_birth_global_rescue_accepts > 0
-    assert rescue.last_birth_count > 0
-    assert rescue.continuous_particles[0].state.num_sources == 1
-
-
-def test_runtime_global_rescue_birth_uses_surface_candidates(monkeypatch) -> None:
-    """Runtime global rescue should recover candidates outside the posterior."""
-    np.random.seed(11)
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=1,
-        birth_enable=True,
-        p_kill=0.0,
-        birth_min_sep_m=0.2,
-        birth_detector_min_sep_m=0.0,
-        birth_global_rescue_enable=True,
-        birth_global_rescue_force_proposal_on_gate=True,
-        birth_global_rescue_forced_min_delta_ll=-1.0e9,
-        birth_matching_pursuit_max_new_sources=2,
-        birth_matching_pursuit_topk_candidates=2,
-        birth_delta_ll_threshold=0.0,
-        birth_complexity_penalty=0.0,
-        birth_bic_penalty_params=0,
-        pseudo_source_verification_enable=False,
-        report_exclude_unverified_sources=False,
-        weak_source_prune_min_expected_count=0.0,
-        weak_source_prune_min_fraction=0.0,
-    )
-    truth_sources = np.array(
-        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [
-            [0.5, 1.0, 0.0],
-            [1.5, 1.0, 0.0],
-            [0.5, -1.0, 0.0],
-            [1.5, -1.0, 0.0],
-        ],
-        dtype=float,
-    )
-    design = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=truth_sources,
-        strengths=np.ones(2, dtype=float),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-    )
-    counts = design @ np.array([120.0, 90.0], dtype=float)
-    data = MeasurementData(
-        z_k=counts,
-        observation_variances=np.maximum(counts, 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([250.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    seen_candidate_counts: list[NDArray[np.float64] | None] = []
-    original_matching_pursuit = filt._apply_matching_pursuit_births_to_state
-
-    def _spy_matching_pursuit(*args: object, **kwargs: object) -> int:
-        """Record whether global rescue receives precomputed candidate counts."""
-        if bool(kwargs.get("global_rescue", False)):
-            candidate_counts = kwargs.get("candidate_unit_counts")
-            if candidate_counts is None:
-                seen_candidate_counts.append(None)
-            else:
-                seen_candidate_counts.append(np.asarray(candidate_counts, dtype=float))
-        return original_matching_pursuit(*args, **kwargs)
-
-    monkeypatch.setattr(
-        filt,
-        "_apply_matching_pursuit_births_to_state",
-        _spy_matching_pursuit,
-    )
-
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=data,
-        candidate_positions=np.zeros((0, 3), dtype=float),
-        global_birth_candidates=truth_sources,
-    )
-
-    assert filt.last_birth_global_rescue_candidates == 2
-    assert seen_candidate_counts
-    assert all(item is not None for item in seen_candidate_counts)
-    assert seen_candidate_counts[0].shape == (data.z_k.size, truth_sources.shape[0])
-    assert filt.last_birth_global_rescue_attempts > 0
-    assert filt.last_birth_global_rescue_accepts > 0
-    assert filt.last_birth_count > 0
-    assert filt.continuous_particles[0].state.num_sources >= 2
-
-
-def test_structural_update_passes_precomputed_global_rescue_counts() -> None:
-    """Estimator structural updates should pass cached global candidate counts."""
-    config = RotatingShieldPFConfig(conditional_strength_refit=False)
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.pf_config = config
-    estimator.candidate_sources = np.zeros((0, 3), dtype=float)
-    candidates = np.array(
-        [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]],
-        dtype=float,
-    )
-    candidate_counts = np.array([[0.2, 0.5]], dtype=float)
-    calls: dict[str, object] = {}
-
-    def fake_runtime_candidates(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-    ) -> NDArray[np.float64]:
-        """Return deterministic global birth candidates."""
-        calls["candidate_request"] = (isotope, filt, data)
-        return candidates
-
-    def fake_candidate_counts(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-        candidate_positions: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Return deterministic precomputed candidate counts."""
-        calls["count_request"] = (isotope, filt, data)
-        np.testing.assert_allclose(candidate_positions, candidates)
-        return candidate_positions, candidate_counts
-
-    def fake_runtime_injection(isotope: str, filt: object) -> int:
-        """Record that runtime report rescue remains chained after birth/death."""
-        calls["injection"] = (isotope, filt)
-        return 0
-
-    def fake_global_quarantine(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-        candidate_positions: NDArray[np.float64],
-        candidate_unit_counts: NDArray[np.float64] | None,
-    ) -> int:
-        """Record quarantined global residual candidates."""
-        calls["global_quarantine"] = (
-            isotope,
-            filt,
-            data,
-            np.asarray(candidate_positions, dtype=float).copy(),
-            candidate_unit_counts,
-        )
-        return 0
-
-    class FakeFilter:
-        """Minimal filter object that records structural update inputs."""
-
-        def apply_birth_death(self, **kwargs: object) -> None:
-            """Record the birth/death keyword arguments."""
-            calls["birth_kwargs"] = kwargs
-
-    data = MeasurementData(
-        z_k=np.array([1.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    filt = FakeFilter()
-    estimator._runtime_global_birth_rescue_candidates = fake_runtime_candidates
-    estimator._global_birth_candidate_counts_for_update = fake_candidate_counts
-    estimator._inject_runtime_report_rescue = fake_runtime_injection
-    estimator._inject_runtime_global_birth_quarantine = fake_global_quarantine
-
-    estimator._run_isotope_structural_update(("Cs-137", filt, None, data, data))
-
-    birth_kwargs = calls["birth_kwargs"]
-    np.testing.assert_allclose(birth_kwargs["global_birth_candidates"], candidates)
-    assert birth_kwargs["global_birth_candidate_counts"] is candidate_counts
-    quarantine = calls["global_quarantine"]
-    assert quarantine[:3] == ("Cs-137", filt, data)
-    np.testing.assert_allclose(quarantine[3], candidates)
-    assert quarantine[4] is candidate_counts
-    assert calls["injection"] == ("Cs-137", filt)
-
-
-def test_structural_update_gates_birth_proposals_when_sparse_evidence_ready() -> None:
-    """Authoritative sparse evidence should disable PF-side birth proposals."""
-    config = RotatingShieldPFConfig(
-        conditional_strength_refit=False,
-        sparse_poisson_evidence_authoritative=True,
-    )
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.pf_config = config
-    estimator.candidate_sources = np.zeros((0, 3), dtype=float)
-    estimator._last_sparse_poisson_evidence_diagnostics = {
-        "Cs-137": {
-            "available": True,
-            "model_order_ready": True,
-            "selected_count": 2,
-        }
-    }
-    calls: dict[str, object] = {}
-
-    def forbidden_runtime_candidates(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-    ) -> NDArray[np.float64]:
-        """Fail if proposal candidates are requested despite ready evidence."""
-        _ = (isotope, filt, data)
-        raise AssertionError("global birth candidates should be gated")
-
-    def fake_runtime_injection(isotope: str, filt: object) -> int:
-        """Record that report rescue remains chained after structural gating."""
-        calls["injection"] = (isotope, filt)
-        return 0
-
-    class FakeFilter:
-        """Minimal filter that records evidence-gated structural updates."""
-
-        last_structural_timing_s: dict[str, float]
-
-        def __init__(self) -> None:
-            """Initialize recorded structural timing."""
-            self.last_structural_timing_s = {}
-
-        def set_external_protected_cardinalities(self, values: set[int]) -> None:
-            """Record externally protected evidence cardinalities."""
-            calls["protected"] = set(values)
-
-        def apply_birth_death(self, **kwargs: object) -> None:
-            """Record the gated birth/death keyword arguments."""
-            calls["birth_kwargs"] = kwargs
-
-    data = MeasurementData(
-        z_k=np.array([1.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    filt = FakeFilter()
-    estimator._runtime_global_birth_rescue_candidates = forbidden_runtime_candidates
-    estimator._inject_runtime_report_rescue = fake_runtime_injection
-
-    estimator._run_isotope_structural_update(("Cs-137", filt, None, data, data))
-
-    assert calls["protected"] == {2}
-    birth_kwargs = calls["birth_kwargs"]
-    assert birth_kwargs["allow_structural_birth_proposals"] is False
-    assert np.asarray(birth_kwargs["global_birth_candidates"]).shape == (0, 3)
-    assert birth_kwargs["global_birth_candidate_counts"] is None
-    assert calls["injection"] == ("Cs-137", filt)
-    assert filt.last_structural_timing_s["sparse_evidence_cardinality_ready"] == 1.0
-    assert filt.last_structural_timing_s["sparse_evidence_selected_count"] == 2.0
-
-
-def test_structural_update_syncs_particles_when_sparse_evidence_ready() -> None:
-    """Ready sparse evidence should skip structural moves and sync PF particles."""
-    config = RotatingShieldPFConfig(
-        conditional_strength_refit=True,
-        sparse_poisson_evidence_authoritative=True,
-    )
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.pf_config = config
-    estimator.candidate_sources = np.zeros((0, 3), dtype=float)
-    estimator._last_sparse_poisson_evidence_diagnostics = {
-        "Cs-137": {
-            "available": True,
-            "model_order_ready": True,
-            "selected_count": 1,
-            "selected_positions": [[1.0, 2.0, 3.0]],
-            "selected_strengths": [42.0],
-        }
-    }
-    calls: dict[str, object] = {}
-
-    class SyncFilter:
-        """Minimal filter that records sparse-evidence particle sync."""
-
-        last_structural_timing_s: dict[str, float]
-
-        def __init__(self) -> None:
-            """Initialize recorded structural timing."""
-            self.last_structural_timing_s = {}
-
-        def set_external_protected_cardinalities(self, values: set[int]) -> None:
-            """Record externally protected evidence cardinalities."""
-            calls["protected"] = set(values)
-
-        def sync_particles_to_evidence_sources(
-            self,
-            positions: NDArray[np.float64],
-            strengths: NDArray[np.float64],
-            data: MeasurementData | None = None,
-        ) -> int:
-            """Record evidence-selected source slots."""
-            calls["sync"] = (
-                np.asarray(positions, dtype=float).copy(),
-                np.asarray(strengths, dtype=float).copy(),
-                data,
-            )
-            self.last_structural_timing_s = {"sparse_evidence_particle_sync": 1.0}
-            return 3
-
-        def refit_strengths_for_particles(self, *args: object, **kwargs: object) -> None:
-            """Fail if a separate refit is attempted before evidence sync."""
-            _ = (args, kwargs)
-            raise AssertionError("conditional refit should be skipped after sync")
-
-        def apply_birth_death(self, **kwargs: object) -> None:
-            """Fail if structural moves are attempted after evidence sync."""
-            _ = kwargs
-            raise AssertionError("birth/death should be skipped after evidence sync")
-
-    def forbidden_runtime_candidates(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-    ) -> NDArray[np.float64]:
-        """Fail if proposal candidates are requested despite ready evidence."""
-        _ = (isotope, filt, data)
-        raise AssertionError("global birth candidates should be gated")
-
-    def forbidden_runtime_injection(isotope: str, filt: object) -> int:
-        """Fail if report rescue runs after authoritative evidence sync."""
-        _ = (isotope, filt)
-        raise AssertionError("report rescue should be skipped after evidence sync")
-
-    data = MeasurementData(
-        z_k=np.array([1.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    filt = SyncFilter()
-    estimator._runtime_global_birth_rescue_candidates = forbidden_runtime_candidates
-    estimator._inject_runtime_report_rescue = forbidden_runtime_injection
-
-    estimator._run_isotope_structural_update(("Cs-137", filt, data, data, data))
-
-    assert calls["protected"] == {1}
-    synced_positions, synced_strengths, synced_data = calls["sync"]
-    np.testing.assert_allclose(synced_positions, np.array([[1.0, 2.0, 3.0]]))
-    np.testing.assert_allclose(synced_strengths, np.array([42.0]))
-    assert synced_data is data
-    assert filt.last_structural_timing_s["sparse_evidence_cardinality_ready"] == 1.0
-    assert filt.last_structural_timing_s["birth_proposals_gated"] == 1.0
-    assert (
-        filt.last_structural_timing_s["structural_moves_skipped_by_sparse_evidence"]
-        == 1.0
-    )
-
-
-def test_filter_sync_particles_to_evidence_sources_replaces_source_slots() -> None:
-    """Evidence sync should replace PF source slots with confirmed sources."""
-    filt = IsotopeParticleFilter(
-        isotope="Cs-137",
-        kernel=None,
-        config=PFConfig(num_particles=2, use_gpu=False),
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([10.0, 20.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-
-    changed = filt.sync_particles_to_evidence_sources(
-        np.array([[1.0, 2.0, 3.0]], dtype=float),
-        np.array([42.0], dtype=float),
-    )
-
-    assert changed == 2
-    for particle in filt.continuous_particles:
-        state = particle.state
-        assert state.num_sources == 1
-        np.testing.assert_allclose(state.positions, np.array([[1.0, 2.0, 3.0]]))
-        np.testing.assert_allclose(state.strengths, np.array([42.0]))
-        assert state.tentative_sources is not None
-        assert not bool(state.tentative_sources[0])
-        assert state.verification_fail_streaks is not None
-        assert int(state.verification_fail_streaks[0]) == 0
-    assert filt.last_structural_timing_s["sparse_evidence_particle_sync"] == 1.0
-
-
-def test_structural_update_quarantines_rejected_global_rescue_candidates() -> None:
-    """Accepted global births should not discard other residual candidates."""
-    config = RotatingShieldPFConfig(conditional_strength_refit=False)
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.pf_config = config
-    estimator.candidate_sources = np.zeros((0, 3), dtype=float)
-    candidates = np.array(
-        [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    candidate_counts = np.ones((1, 2), dtype=float)
-    calls: dict[str, object] = {}
-
-    def fake_runtime_candidates(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-    ) -> NDArray[np.float64]:
-        """Return deterministic global birth candidates."""
-        return candidates
-
-    def fake_candidate_counts(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-        candidate_positions: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Return deterministic candidate response counts."""
-        return candidate_positions, candidate_counts
-
-    def fake_global_quarantine(
-        isotope: str,
-        filt: object,
-        data: MeasurementData | None,
-        candidate_positions: NDArray[np.float64],
-        candidate_unit_counts: NDArray[np.float64] | None,
-    ) -> int:
-        """Record global quarantine when some candidates remain unresolved."""
-        calls["global_quarantine"] = np.asarray(candidate_positions, dtype=float).copy()
-        return 1
-
-    def fake_runtime_injection(isotope: str, filt: object) -> int:
-        """Keep report rescue chained after quarantine."""
-        calls["runtime_report_rescue"] = True
-        return 0
-
-    class FakeFilter:
-        """Minimal filter that simulates one accepted and one rejected rescue."""
-
-        last_birth_global_rescue_accepts = 1
-        last_birth_global_rescue_rejected = 1
-        last_birth_residual_support = 1
-        last_birth_residual_gate_passed = False
-
-        def apply_birth_death(self, **kwargs: object) -> None:
-            """Keep the configured rescue diagnostics after birth/death."""
-            calls["birth_kwargs"] = kwargs
-
-    data = MeasurementData(
-        z_k=np.array([1.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    filt = FakeFilter()
-    estimator._runtime_global_birth_rescue_candidates = fake_runtime_candidates
-    estimator._global_birth_candidate_counts_for_update = fake_candidate_counts
-    estimator._inject_runtime_global_birth_quarantine = fake_global_quarantine
-    estimator._inject_runtime_report_rescue = fake_runtime_injection
-
-    estimator._run_isotope_structural_update(("Cs-137", filt, None, data, data))
-
-    np.testing.assert_allclose(calls["global_quarantine"], candidates)
-    assert calls["runtime_report_rescue"] is True
-
-
-def test_runtime_report_rescue_injects_multisource_particles() -> None:
-    """Report-rescue models should re-enter the runtime particle population."""
-    np.random.seed(12)
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=4,
-        num_particles=8,
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[float(idx % 4), 0.0, 0.0]], dtype=float),
-                strengths=np.array([50.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=float(np.log(1.0 / 8.0)),
-        )
-        for idx in range(8)
-    ]
-    rescue_positions = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 4.0]],
-        dtype=float,
-    )
-    rescue_strengths = np.array([100.0, 80.0, 60.0], dtype=float)
-
-    injected = filt.inject_runtime_report_rescue_particles(
-        rescue_positions,
-        rescue_strengths,
-        particle_fraction=0.25,
-        min_particles_per_source=2,
-        total_weight=0.2,
-        jitter_sigma_m=0.0,
-    )
-    weights = filt.continuous_weights
-    rescued = np.array(
-        [particle.state.num_sources == 3 for particle in filt.continuous_particles],
-        dtype=bool,
-    )
-
-    assert injected == 6
-    assert int(np.count_nonzero(rescued)) == 6
-    assert float(np.sum(weights[rescued])) == pytest.approx(0.2)
-    assert filt.last_runtime_report_rescue_sources == 3
-    assert filt.last_runtime_report_rescue_injected == 6
-
-
-def test_runtime_report_rescue_quarantine_injects_single_candidates() -> None:
-    """Quarantined rescue candidates should not become one max-cardinality model."""
-    np.random.seed(13)
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=5,
-        num_particles=10,
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-        strength_log_sigma=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[float(idx % 4), 0.0, 0.0]], dtype=float),
-                strengths=np.array([50.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=float(np.log(1.0 / 10.0)),
-        )
-        for idx in range(10)
-    ]
-    rescue_positions = np.array(
-        [
-            [0.0, 4.0, 0.0],
-            [4.0, 0.0, 0.0],
-            [0.0, 4.0, 4.0],
-            [4.0, 4.0, 4.0],
-        ],
-        dtype=float,
-    )
-    rescue_strengths = np.array([100.0, 90.0, 80.0, 70.0], dtype=float)
-
-    injected = filt.inject_runtime_report_rescue_particles(
-        rescue_positions,
-        rescue_strengths,
-        particle_fraction=0.4,
-        min_particles_per_source=1,
-        total_weight=0.02,
-        jitter_sigma_m=0.0,
-        combine_sources=False,
-    )
-    source_counts = np.array(
-        [particle.state.num_sources for particle in filt.continuous_particles],
-        dtype=int,
-    )
-
-    assert injected == 4
-    assert int(np.count_nonzero(source_counts == 4)) == 0
-    assert int(np.count_nonzero(source_counts <= 2)) == 10
-    assert filt.last_runtime_report_rescue_sources == 4
-    assert filt.last_runtime_report_rescue_injected == 4
-
-
-def test_runtime_report_rescue_quarantine_does_not_prior_cap_strengths() -> None:
-    """Quarantined rescue injection should not impose a fixed prior-rate cap."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=6,
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-        runtime_report_rescue_weight=0.20,
-        source_strength_prior_mean=100.0,
-        source_strength_absorption_penalty_weight=0.0,
-        source_strength_absorption_q_multiple=2.0,
-        strength_log_sigma=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=float(np.log(1.0 / 6.0)),
-        )
-        for _ in range(6)
-    ]
-
-    injected = filt.inject_runtime_report_rescue_particles(
-        np.array([[0.0, 0.0, 0.0]], dtype=float),
-        np.array([1000.0], dtype=float),
-        particle_fraction=0.5,
-        min_particles_per_source=1,
-        total_weight=0.02,
-        jitter_sigma_m=0.0,
-    )
-    rescued_strengths = [
-        float(particle.state.strengths[0])
-        for particle in filt.continuous_particles
-        if particle.state.num_sources == 1
-    ]
-
-    assert injected == 3
-    assert rescued_strengths
-    assert min(rescued_strengths) == pytest.approx(1000.0)
-
-
-def test_runtime_report_rescue_bic_candidate_gets_intermediate_weight() -> None:
-    """BIC-selected report modes should be preserved more strongly than quarantine."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            runtime_report_rescue_enable=True,
-            runtime_report_rescue_quarantine_enable=True,
-            runtime_report_rescue_quarantine_weight=0.02,
-            runtime_report_rescue_candidate_weight=0.06,
-            runtime_report_rescue_weight=0.10,
-            report_model_order_min_bic_margin=2.0,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-    )
-    estimator._last_report_model_order_diagnostics[isotope] = {
-        "candidate_count": 4,
-        "selected_count": 2,
-        "method": "exhaustive_bic",
-        "model_order_ready": False,
-        "criterion_margin_to_runner_up": 4.0,
-        "criterion_margin_to_simpler": 4.0,
-    }
-
-    weight = estimator._runtime_report_rescue_injection_weight(isotope, 2)
-
-    assert weight == pytest.approx(0.06)
-    assert estimator._runtime_report_rescue_injection_fraction(0.02) == pytest.approx(
-        0.03
-    )
-    assert estimator._runtime_report_rescue_injection_fraction(0.10) == pytest.approx(
-        0.15
-    )
-
-
-def test_runtime_observation_overshoot_guard_uses_observed_counts() -> None:
-    """Runtime overshoot guard should shrink only source responses above data."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        source_strength_observation_overshoot_penalty_weight=3.0,
-        source_strength_observation_overshoot_sigma=0.0,
-        source_strength_observation_overshoot_quantile=0.0,
-        source_strength_observation_overshoot_min_visible_fraction=0.0,
-        source_strength_observation_overshoot_min_visible_measurements=1,
-    )
-    data_low = MeasurementData(
-        z_k=np.array([10.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    data_high = MeasurementData(
-        z_k=np.array([1000.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    strengths = np.array([[100.0]], dtype=float)
-    kernel = np.ones((1, 1, 1), dtype=float)
-    background = np.zeros((1, 1), dtype=float)
-
-    low_guarded = filt._apply_runtime_observation_overshoot_guard(
-        strengths,
-        kernel,
-        data_low,
-        background,
-        eps=1.0e-12,
-    )
-    high_guarded = filt._apply_runtime_observation_overshoot_guard(
-        strengths,
-        kernel,
-        data_high,
-        background,
-        eps=1.0e-12,
-    )
-
-    assert low_guarded[0, 0] == pytest.approx(10.0 + (100.0 - 10.0) / 4.0)
-    assert high_guarded[0, 0] == pytest.approx(100.0)
-
-
-def test_runtime_report_rescue_memory_keeps_missing_modes() -> None:
-    """Runtime rescue memory should retain modes that vanish in one station."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        runtime_report_rescue_enable=True,
-        runtime_report_rescue_memory_enable=True,
-        runtime_report_rescue_memory_decay=0.5,
-        runtime_report_rescue_memory_max_sources=2,
-        report_mle_rescue_dedup_radius_m=0.25,
-        min_strength=1.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    first_pos = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    first_q = np.array([30.0], dtype=float)
-
-    merged_pos, merged_q = estimator._merge_runtime_report_rescue_memory(
-        isotope,
-        first_pos,
-        first_q,
-    )
-    replay_pos, replay_q = estimator._merge_runtime_report_rescue_memory(
-        isotope,
-        np.zeros((0, 3), dtype=float),
-        np.zeros(0, dtype=float),
-    )
-
-    assert np.allclose(merged_pos, first_pos)
-    assert np.allclose(merged_q, first_q)
-    assert np.allclose(replay_pos, first_pos)
-    assert np.allclose(replay_q, first_q)
-
-
-def test_global_birth_candidate_memory_keeps_single_station_candidates() -> None:
-    """Global residual candidate memory should carry unaccepted candidates."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        birth_global_rescue_enable=True,
-        birth_global_rescue_candidate_memory_enable=True,
-        birth_global_rescue_candidate_memory_decay=0.5,
-        birth_global_rescue_candidate_memory_max_candidates=2,
-        birth_global_rescue_dedup_radius_m=0.25,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    first_pos = np.array([[1.0, 0.0, 0.0]], dtype=float)
-
-    merged = estimator._merge_global_birth_candidate_memory(isotope, first_pos)
-    replay = estimator._merge_global_birth_candidate_memory(
-        isotope,
-        np.zeros((0, 3), dtype=float),
-    )
-
-    assert np.allclose(merged, first_pos)
-    assert np.allclose(replay, first_pos)
-
-
-def test_global_birth_candidate_memory_reserves_old_candidates() -> None:
-    """Memory should keep residual candidates even when new candidates rank higher."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        birth_global_rescue_enable=True,
-        birth_global_rescue_candidate_memory_enable=True,
-        birth_global_rescue_candidate_memory_decay=0.01,
-        birth_global_rescue_candidate_memory_max_candidates=2,
-        birth_global_rescue_candidate_memory_min_retained=1,
-        birth_global_rescue_dedup_radius_m=0.25,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    old_pos = np.array([[9.0, 0.0, 0.0]], dtype=float)
-    new_pos = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
-
-    estimator._merge_global_birth_candidate_memory(isotope, old_pos)
-    merged = estimator._merge_global_birth_candidate_memory(isotope, new_pos)
-
-    assert merged.shape == (2, 3)
-    assert np.min(np.linalg.norm(merged - old_pos[0], axis=1)) == pytest.approx(0.0)
-
-
-def test_global_birth_candidates_are_quarantined_into_particles() -> None:
-    """Unaccepted global residual candidates should re-enter PF at low weight."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        birth_global_rescue_enable=True,
-        runtime_report_rescue_quarantine_enable=True,
-        runtime_report_rescue_quarantine_weight=0.02,
-        runtime_report_rescue_weight=0.10,
-        runtime_report_rescue_particle_fraction=0.15,
-        runtime_report_rescue_min_particles_per_source=1,
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=10,
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-        runtime_report_rescue_weight=0.10,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=float(np.log(1.0 / 10.0)),
-        )
-        for _ in range(10)
-    ]
-    data = MeasurementData(
-        z_k=np.array([120.0], dtype=float),
-        observation_variances=np.array([4.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    candidates = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    candidate_counts = np.array([[1.0]], dtype=float)
-
-    injected = estimator._inject_runtime_global_birth_quarantine(
-        isotope,
-        filt,
-        data,
-        candidates,
-        candidate_counts,
-    )
-    weights = filt.continuous_weights
-    rescued = np.array(
-        [particle.state.num_sources == 1 for particle in filt.continuous_particles],
-        dtype=bool,
-    )
-    stats = estimator._runtime_global_birth_quarantine_stats[isotope]
-
-    assert injected == 1
-    assert int(np.count_nonzero(rescued)) == 1
-    assert float(np.sum(weights[rescued])) == pytest.approx(0.02)
-    assert stats["sources"] == 1
-    assert stats["injected"] == 1
-    assert stats["weight"] == pytest.approx(0.02)
-
-
-def test_best_report_snapshot_prefers_ready_low_residual_report() -> None:
-    """Best-so-far report selection should prefer ready lower-residual models."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(use_gpu=False),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    worse = ReportSnapshot(
-        label="worse",
-        measurement_count=10,
-        estimates={},
-        diagnostics={},
-        unresolved={isotope: {"residual": True}},
-        score_tuple=(
-            1.0,
-            1.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.8,
-            10.0,
-            0.9,
-            1.0,
-            3.0,
-        ),
-        components={"residual_fraction_sum": 0.8},
-    )
-    better = ReportSnapshot(
-        label="better",
-        measurement_count=15,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.2,
-            2.0,
-            0.5,
-            1.0,
-            3.0,
-        ),
-        components={"residual_fraction_sum": 0.2},
-    )
-
-    assert estimator._report_snapshot_is_better(better, worse)
-    assert not estimator._report_snapshot_is_better(worse, better)
-
-
-def test_best_report_snapshot_rejects_overlarge_rescue_snapshot() -> None:
-    """Low residual must not make an overlarge rescue set the best report."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(use_gpu=False, max_sources=5),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.filters[isotope] = estimator._build_filter(
-        isotope,
-        estimator._build_pf_config(),
-    )
-    reference = ReportSnapshot(
-        label="current_small_model",
-        measurement_count=200,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.9,
-            20.0,
-            0.8,
-            1.0,
-            9.0,
-        ),
-        components={"source_excess_count": 0.0, "residual_fraction_sum": 0.9},
-    )
-    overlarge = ReportSnapshot(
-        label="raw_rescue_candidates",
-        measurement_count=130,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(
-            0.0,
-            0.0,
-            9.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.1,
-            1.0,
-            0.2,
-            1.0,
-            42.0,
-        ),
-        components={"source_excess_count": 9.0, "residual_fraction_sum": 0.1},
-    )
-
-    assert not estimator._report_snapshot_is_better(overlarge, reference)
-    assert estimator._report_snapshot_is_better(reference, overlarge)
-
-
-def test_best_report_snapshot_rejects_too_early_final_candidate() -> None:
-    """Final report must not replace full-run evidence with an early snapshot."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            use_gpu=False,
-            report_best_so_far_final_min_measurement_fraction=0.8,
-            report_best_so_far_final_require_resolved=True,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    early_best = ReportSnapshot(
-        label="measurement_16",
-        measurement_count=16,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(0.0,) * 12,
-        components={
-            "unready_count": 0.0,
-            "unresolved_count": 0.0,
-            "source_excess_count": 0.0,
-            "model_count_mismatch": 0.0,
-            "underfit_count": 0.0,
-        },
-    )
-    final_snapshot = ReportSnapshot(
-        label="final",
-        measurement_count=352,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(1.0,) * 12,
-        components={
-            "unready_count": 0.0,
-            "unresolved_count": 0.0,
-            "source_excess_count": 0.0,
-            "model_count_mismatch": 0.0,
-            "underfit_count": 0.0,
-        },
-    )
-
-    eligible, reason = estimator._report_snapshot_final_eligible(
-        early_best,
-        final_snapshot,
-    )
-
-    assert estimator._report_snapshot_is_better(early_best, final_snapshot)
-    assert not eligible
-    assert reason.startswith("insufficient_measurement_fraction")
-
-
-def test_best_report_snapshot_rejects_unresolved_final_candidate() -> None:
-    """Final report should not roll back to an unresolved snapshot."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            use_gpu=False,
-            report_best_so_far_final_min_measurement_fraction=0.8,
-            report_best_so_far_final_require_resolved=True,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    unresolved_best = ReportSnapshot(
-        label="measurement_340",
-        measurement_count=340,
-        estimates={},
-        diagnostics={},
-        unresolved={isotope: {"residual": True}},
-        score_tuple=(0.0,) * 12,
-        components={
-            "unready_count": 0.0,
-            "unresolved_count": 1.0,
-            "source_excess_count": 0.0,
-            "model_count_mismatch": 0.0,
-            "underfit_count": 0.0,
-        },
-    )
-    final_snapshot = ReportSnapshot(
-        label="final",
-        measurement_count=352,
-        estimates={},
-        diagnostics={},
-        unresolved={},
-        score_tuple=(1.0,) * 12,
-        components={
-            "unready_count": 0.0,
-            "unresolved_count": 0.0,
-            "source_excess_count": 0.0,
-            "model_count_mismatch": 0.0,
-            "underfit_count": 0.0,
-        },
-    )
-
-    eligible, reason = estimator._report_snapshot_final_eligible(
-        unresolved_best,
-        final_snapshot,
-    )
-
-    assert not eligible
-    assert reason.startswith("unresolved_count_nonzero")
-
-
-def test_runtime_best_report_modes_skip_stale_snapshot() -> None:
-    """Online report rescue should not reuse stale best-so-far source modes."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            use_gpu=False,
-            report_best_so_far_final_min_measurement_fraction=0.8,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: 1.0},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-        )
-        for idx in range(100)
-    ]
-    estimator._best_report_snapshot = ReportSnapshot(
-        label="measurement_10",
-        measurement_count=10,
-        estimates={
-            isotope: (
-                np.array([[1.0, 2.0, 3.0]], dtype=float),
-                np.array([100.0], dtype=float),
-            )
-        },
-        diagnostics={},
-        unresolved={},
-        score_tuple=(0.0,) * 12,
-        components={},
-    )
-
-    positions, strengths = estimator._best_report_modes_for_isotope(isotope)
-
-    assert positions.shape == (0, 3)
-    assert strengths.shape == (0,)
-
-
-def test_report_underfit_evidence_blocks_model_order_ready() -> None:
-    """Large full-history positive residual should keep report order unresolved."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            use_gpu=False,
-            report_mle_rescue_min_residual_fraction=0.005,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.filters[isotope] = estimator._build_filter(
-        isotope,
-        estimator._build_pf_config(),
-    )
-    estimator._last_report_model_order_diagnostics[isotope] = {
-        "candidate_count": 1,
-        "selected_count": 1,
-        "model_order_ready": True,
-        "selected_positive_residual_fraction": 0.25,
-        "selected_positive_residual_chi2": 100.0,
-    }
-
-    unresolved = estimator.unresolved_structural_evidence()
-
-    assert isotope in unresolved
-    assert unresolved[isotope]["report_underfit"]["reason"] == (
-        "selected_model_positive_residual"
-    )
-    assert estimator.report_model_order_ready() is False
-
-
-def test_report_model_order_ready_waits_for_generated_diagnostics() -> None:
-    """Estimator-level readiness should not treat missing diagnostics as stable."""
-
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator._last_report_model_order_diagnostics = {}
-
-    assert estimator.report_model_order_ready() is False
-
-    estimator._last_report_model_order_diagnostics = {
-        "Cs-137": {"candidate_count": 2, "selected_count": 2}
-    }
-
-    assert estimator.report_model_order_ready() is False
-
-
-def test_report_snapshot_components_count_missing_ready_as_unready() -> None:
-    """Best-report snapshot scoring should penalize missing readiness evidence."""
-
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.all_isotopes = ["Cs-137"]
-    estimator.pf_config = RotatingShieldPFConfig(use_gpu=False)
-
-    components = estimator._report_snapshot_components(
-        {"Cs-137": (np.zeros((1, 3), dtype=float), np.ones(1, dtype=float))},
-        {"Cs-137": {"selected_count": 1}},
-        {},
-    )
-
-    assert components["unready_count"] == pytest.approx(1.0)
-
-
-def test_lightweight_report_snapshot_caps_runtime_rescue_modes() -> None:
-    """Report snapshots should not store raw oversized runtime rescue sets."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(use_gpu=False, max_sources=5),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.filters[isotope] = estimator._build_filter(
-        isotope,
-        estimator._build_pf_config(),
-    )
-    positions = np.array([[float(idx), 0.0, 0.0] for idx in range(8)], dtype=float)
-    strengths = np.arange(1, 9, dtype=float)
-    estimator._runtime_report_rescue_modes[isotope] = (positions, strengths, 0.1)
-    estimator._last_report_model_order_diagnostics[isotope] = {
-        "selected_count": 3,
-    }
-
-    estimates = estimator._lightweight_report_snapshot_estimates()
-    out_pos, out_q = estimates[isotope]
-
-    assert out_pos.shape == (3, 3)
-    assert out_q.tolist() == [8.0, 7.0, 6.0]
-
-
-def test_report_strength_absorption_guard_is_one_sided() -> None:
-    """Report strength absorption guard should only shrink high outliers."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        source_strength_prior_mean=100.0,
-        report_strength_absorption_penalty_weight=3.0,
-        report_strength_absorption_q_multiple=2.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-
-    guarded = estimator._apply_report_strength_absorption_guard(
-        np.array([50.0, 500.0], dtype=float)
-    )
-
-    assert guarded[0] == pytest.approx(50.0)
-    assert guarded[1] == pytest.approx((500.0 + 3.0 * 200.0) / 4.0)
-
-
-def test_report_observation_overshoot_guard_uses_observed_counts() -> None:
-    """Report overshoot guard should be data-driven, not fixed to a prior strength."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=1,
-            report_strength_observation_overshoot_penalty_weight=3.0,
-            report_strength_observation_overshoot_sigma=0.0,
-            report_strength_observation_overshoot_quantile=0.0,
-            report_strength_observation_overshoot_min_visible_fraction=0.0,
-            report_strength_observation_overshoot_min_visible_measurements=1,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    kwargs = {
-        "design": np.ones((1, 1), dtype=float),
-        "background": np.zeros(1, dtype=float),
-        "observation_variances": np.ones(1, dtype=float),
-        "eps": 1.0e-12,
-    }
-
-    low_guarded = estimator._apply_report_observation_overshoot_guard(
-        np.array([100.0], dtype=float),
-        z_obs=np.array([10.0], dtype=float),
-        **kwargs,
-    )
-    high_guarded = estimator._apply_report_observation_overshoot_guard(
-        np.array([100.0], dtype=float),
-        z_obs=np.array([1000.0], dtype=float),
-        **kwargs,
-    )
-
-    assert low_guarded[0] == pytest.approx(10.0 + (100.0 - 10.0) / 4.0)
-    assert high_guarded[0] == pytest.approx(100.0)
-
-
-def test_visibility_adjusted_rescue_scores_require_visible_support() -> None:
-    """Rescue scoring should reject candidates with no visible measurements."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        source_strength_prior_mean=100.0,
-        report_mle_rescue_visibility_weight=0.5,
-        report_mle_rescue_min_visible_measurements=1,
-        report_mle_rescue_visible_count=10.0,
-        report_mle_rescue_visibility_reference_strength=100.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    candidate_counts = np.array(
-        [
-            [0.2, 0.0],
-            [0.1, 0.0],
-        ],
-        dtype=float,
-    )
-    base_scores = np.array([1.0, 10.0], dtype=float)
-
-    adjusted, valid, stats = estimator._visibility_adjusted_rescue_scores(
-        candidate_counts=candidate_counts,
-        residual=np.array([5.0, 3.0], dtype=float),
-        weights=np.ones(2, dtype=float),
-        base_scores=base_scores,
-        eps=1.0e-12,
-    )
-
-    assert valid.tolist() == [True, False]
-    assert adjusted[0] > 0.0
-    assert stats["rescue_visibility_valid_candidates"] == 1
-
-
-def test_visibility_adjusted_rescue_scores_use_observed_residual_strength() -> None:
-    """Rescue visibility should be data-driven when no fixed reference strength is configured."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        source_strength_prior_mean=0.0,
-        report_mle_rescue_visibility_weight=0.5,
-        report_mle_rescue_min_visible_measurements=1,
-        report_mle_rescue_visible_count=10.0,
-        report_mle_rescue_visibility_reference_strength=0.0,
-        weak_source_prune_visibility_reference_strength=0.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    candidate_counts = np.array(
-        [
-            [0.2, 0.0],
-            [0.1, 0.0],
-        ],
-        dtype=float,
-    )
-
-    adjusted, valid, stats = estimator._visibility_adjusted_rescue_scores(
-        candidate_counts=candidate_counts,
-        residual=np.array([100.0, 80.0], dtype=float),
-        weights=np.ones(2, dtype=float),
-        base_scores=np.array([1.0, 10.0], dtype=float),
-        eps=1.0e-12,
-    )
-
-    assert valid.tolist() == [True, False]
-    assert adjusted[0] > 1.0
-    assert stats["rescue_visibility_reference_mode"] == "data_driven_qhat"
-    assert stats["rescue_visibility_reference_strength"] == pytest.approx(0.0)
-    assert stats["rescue_visibility_qhat_median"] > 0.0
-
-
-def test_surface_rescue_spatial_quota_keeps_separate_ceiling_tiles() -> None:
-    """MLE rescue should reserve candidates across ceiling spatial tiles."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        position_max=(4.0, 4.0, 4.0),
-        report_mle_rescue_surface_quota_enable=True,
-        report_mle_rescue_surface_quota_per_stratum=1,
-        report_mle_rescue_spatial_quota_enable=True,
-        report_mle_rescue_spatial_quota_tile_m=2.0,
-        report_mle_rescue_spatial_quota_per_tile=1,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.zeros((0, 3), dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    pool = np.array(
-        [
-            [0.2, 0.2, 4.0],
-            [0.6, 0.4, 4.0],
-            [3.2, 0.2, 4.0],
-        ],
-        dtype=float,
-    )
-    scores = np.array([100.0, 90.0, 10.0], dtype=float)
-    valid = np.ones(3, dtype=bool)
-    strata = estimator._surface_rescue_strata(pool)
-    spatial_keys = estimator._surface_spatial_rescue_keys(pool, strata)
-
-    selected = estimator._surface_stratified_rescue_indices(
-        pool,
-        scores,
-        valid,
-        max_candidates=2,
-    )
-    selected_cached = estimator._surface_stratified_rescue_indices(
-        pool,
-        scores,
-        valid,
-        max_candidates=2,
-        strata=strata,
-        spatial_keys=spatial_keys,
-    )
-    next_direct = estimator._next_surface_stratified_rescue_index(
-        pool,
-        scores,
-        valid,
-        [0],
-    )
-    next_cached = estimator._next_surface_stratified_rescue_index(
-        pool,
-        scores,
-        valid,
-        [0],
-        strata=strata,
-        spatial_keys=spatial_keys,
-    )
-
-    assert selected.tolist() == [0, 2]
-    assert selected_cached.tolist() == selected.tolist()
-    assert next_cached == next_direct == 2
-
-
-def test_surface_rescue_spatial_quota_keeps_separate_wall_tiles() -> None:
-    """Runtime rescue should not spend all wall candidates in one spatial tile."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        position_max=(6.0, 6.0, 6.0),
-        report_mle_rescue_surface_quota_enable=True,
-        report_mle_rescue_surface_quota_per_stratum=1,
-        report_mle_rescue_surface_quota_min_score_fraction=0.05,
-        report_mle_rescue_spatial_quota_enable=True,
-        report_mle_rescue_spatial_quota_tile_m=2.0,
-        report_mle_rescue_spatial_quota_per_tile=1,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.zeros((0, 3), dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    pool = np.array(
-        [
-            [0.0, 1.0, 1.0],
-            [0.0, 1.2, 1.1],
-            [0.0, 4.2, 1.0],
-        ],
-        dtype=float,
-    )
-    scores = np.array([100.0, 90.0, 10.0], dtype=float)
-    valid = np.ones(3, dtype=bool)
-    strata = estimator._surface_rescue_strata(pool)
-    spatial_keys = estimator._surface_spatial_rescue_keys(pool, strata)
-
-    selected = estimator._surface_stratified_rescue_indices(
-        pool,
-        scores,
-        valid,
-        max_candidates=2,
-        strata=strata,
-        spatial_keys=spatial_keys,
-    )
-    next_index = estimator._next_surface_stratified_rescue_index(
-        pool,
-        scores,
-        valid,
-        [0],
-        strata=strata,
-        spatial_keys=spatial_keys,
-    )
-
-    assert selected.tolist() == [0, 2]
-    assert next_index == 2
-    assert spatial_keys[0] != spatial_keys[2]
-    assert str(spatial_keys[0]).startswith("wall:")
-
-
-def test_runtime_high_strength_split_candidates_are_surface_projected() -> None:
-    """Over-strong runtime modes should create nearby split rescue candidates."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-        source_strength_prior_mean=100.0,
-        high_strength_split_enable=True,
-        high_strength_split_q_multiple=2.0,
-        high_strength_split_offset_m=1.0,
-        high_strength_split_candidate_count=4,
-        birth_global_rescue_max_candidates=8,
-        birth_global_rescue_dedup_radius_m=0.1,
-        birth_min_sep_m=0.5,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.zeros((0, 3), dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    estimator._ensure_kernel_cache()
-    filt = estimator.filters[isotope]
-
-    candidates = estimator._runtime_high_strength_split_candidates(
-        filt,
-        np.array([[2.0, 2.0, 4.0]], dtype=float),
-        np.array([250.0], dtype=float),
-    )
-    low_candidates = estimator._runtime_high_strength_split_candidates(
-        filt,
-        np.array([[2.0, 2.0, 4.0]], dtype=float),
-        np.array([150.0], dtype=float),
-    )
-
-    assert candidates.shape[0] > 0
-    assert np.allclose(candidates[:, 2], 4.0)
-    distances = np.linalg.norm(candidates - np.array([[2.0, 2.0, 4.0]]), axis=1)
-    assert np.min(distances) >= 0.25
-    assert low_candidates.shape[0] == 0
-
-
-def test_runtime_high_strength_split_uses_observation_overshoot_without_prior() -> None:
-    """High-strength splitting should use data overshoot when fixed q prior is off."""
-    isotope = "Cs-137"
-    config = RotatingShieldPFConfig(
-        source_position_prior="surface",
-        position_max=(4.0, 4.0, 4.0),
-        source_strength_prior_mean=0.0,
-        source_strength_prior_weight=0.0,
-        high_strength_split_enable=True,
-        high_strength_split_offset_m=1.0,
-        high_strength_split_candidate_count=4,
-        source_strength_observation_overshoot_penalty_weight=3.0,
-        source_strength_observation_overshoot_sigma=0.0,
-        source_strength_observation_overshoot_quantile=0.0,
-        source_strength_observation_overshoot_min_visible_fraction=0.0,
-        source_strength_observation_overshoot_min_visible_measurements=1,
-        birth_global_rescue_max_candidates=8,
-        birth_global_rescue_dedup_radius_m=0.1,
-        birth_min_sep_m=0.5,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.zeros((0, 3), dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    estimator._ensure_kernel_cache()
-    filt = estimator.filters[isotope]
-    source_pos = np.array([[2.0, 2.0, 4.0]], dtype=float)
-    strength = np.array([250.0], dtype=float)
-    data_low = MeasurementData(
-        z_k=np.array([0.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[2.0, 2.0, 0.5]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    data_high = MeasurementData(
-        z_k=np.array([1.0e9], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[2.0, 2.0, 0.5]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-
-    no_data = estimator._runtime_high_strength_split_candidates(
-        filt,
-        source_pos,
-        strength,
-    )
-    overshoot = estimator._runtime_high_strength_split_candidates(
-        filt,
-        source_pos,
-        strength,
-        data=data_low,
-    )
-    supported = estimator._runtime_high_strength_split_candidates(
-        filt,
-        source_pos,
-        strength,
-        data=data_high,
-    )
-
-    assert no_data.shape[0] == 0
-    assert overshoot.shape[0] > 0
-    assert supported.shape[0] == 0
-
-
-def test_count_supported_zero_source_report_is_unresolved() -> None:
-    """Zero-source BIC reports with signal support should block model-order readiness."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=1,
-            structural_update_min_counts=10.0,
-            conditional_strength_refit_min_count=10.0,
-            structural_update_min_snr=1.0,
-            report_model_order_zero_source_min_bic_margin=10.0,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0], dtype=float))
-    estimator._ensure_kernel_cache()
-    estimator._last_report_model_order_diagnostics[isotope] = {
-        "candidate_count": 2,
-        "selected_count": 0,
-        "model_order_ready": False,
-        "count_supported_zero_source": True,
-        "observed_signal_total_counts": 100.0,
-        "observed_signal_max_count": 100.0,
-        "observed_signal_snr": 5.0,
-        "criterion_margin_to_runner_up": 2.0,
-        "zero_source_ready_margin": 10.0,
-    }
-
-    unresolved = estimator.unresolved_structural_evidence()
-
-    assert estimator.report_model_order_ready() is False
-    assert unresolved[isotope]["report_underfit"]["reason"] == (
-        "count_supported_zero_source"
-    )
-
-
-def test_runtime_report_rescue_falls_back_for_absent_count_supported_isotope(
-    monkeypatch,
-) -> None:
-    """Count-supported zero-source isotopes should get quarantined surface modes."""
-    isotope = "Cs-137"
-    candidate_sources = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [[1.0, 1.0, 0.0], [5.0, 1.0, 0.0], [1.0, 5.0, 0.0]],
-        dtype=float,
-    )
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        report_strength_refit=True,
-        report_mle_rescue_enable=True,
-        report_mle_rescue_max_candidates=2,
-        report_mle_rescue_max_residual_candidates=2,
-        report_mle_rescue_min_residual_fraction=0.0,
-        runtime_report_rescue_enable=True,
-        runtime_report_rescue_quarantine_enable=True,
-        structural_update_min_counts=1.0,
-        structural_update_min_snr=0.0,
-        conditional_strength_refit_min_count=1.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=candidate_sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    filt = estimator.filters[isotope]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    design = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=isotope,
-        detector_positions=detector_positions,
-        sources=candidate_sources[1:2],
-        strengths=np.ones(1, dtype=float),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-    )
-    counts = np.asarray(design[:, 0] * 200.0, dtype=float)
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=int(idx),
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    monkeypatch.setattr(
-        estimator,
-        "_refit_reported_strengths",
-        lambda *_args, **_kwargs: (
-            np.zeros((0, 3), dtype=float),
-            np.zeros(0, dtype=float),
-        ),
-    )
-
-    rescued_pos, rescued_q = estimator._runtime_report_rescue_estimate(isotope, filt)
-
-    assert rescued_pos.shape[0] > 0
-    assert rescued_q.shape == (rescued_pos.shape[0],)
-    assert np.all(rescued_q > 0.0)
 
 
 def test_surface_candidate_observability_diagnostics_are_truth_independent() -> None:
@@ -7782,125 +4797,6 @@ def test_surface_candidate_observability_diagnostics_are_truth_independent() -> 
     assert "max_abs_correlation" in stats
 
 
-def test_absolute_strength_prior_limits_single_source_absorption() -> None:
-    """Absolute q prior should pull fixed-geometry refits away from huge rates."""
-    weak_prior = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit_prior_weight=0.0,
-    )
-    strong_prior = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit_prior_weight=0.0,
-        source_strength_prior_mean=100.0,
-        source_strength_prior_weight=100.0,
-        source_strength_prior_rel_sigma=0.1,
-    )
-    data = MeasurementData(
-        z_k=np.array([1000.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
-        detector_positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    k_tensor = np.ones((1, 1, 1), dtype=float)
-    background = np.zeros((1, 1), dtype=float)
-    prior = np.array([[1000.0]], dtype=float)
-
-    no_prior_q, _ = weak_prior._solve_strengths_for_kernel_tensor_batched(
-        data,
-        k_tensor=k_tensor,
-        background_counts=background,
-        prior_mean=prior,
-        iters=2,
-        eps=1.0e-12,
-        q_min=0.0,
-        q_max=10000.0,
-    )
-    prior_q, _ = strong_prior._solve_strengths_for_kernel_tensor_batched(
-        data,
-        k_tensor=k_tensor,
-        background_counts=background,
-        prior_mean=prior,
-        iters=2,
-        eps=1.0e-12,
-        q_min=0.0,
-        q_max=10000.0,
-    )
-
-    assert no_prior_q[0, 0] == pytest.approx(1000.0)
-    assert prior_q[0, 0] < no_prior_q[0, 0]
-    assert abs(prior_q[0, 0] - 100.0) < abs(no_prior_q[0, 0] - 100.0)
-
-
-def test_report_absolute_strength_prior_limits_report_refit() -> None:
-    """Report refits should use the same absolute source-rate prior."""
-    isotope = "Cs-137"
-    candidates = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    base = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=candidates,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=1,
-            report_strength_refit=True,
-            report_strength_refit_prior_weight=0.0,
-            report_strength_refit_iters=2,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(),
-    )
-    regularized = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=candidates,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=1,
-            report_strength_refit=True,
-            report_strength_refit_prior_weight=0.0,
-            report_strength_refit_iters=2,
-            source_strength_prior_mean=100.0,
-            source_strength_prior_weight=100.0,
-            source_strength_prior_rel_sigma=0.1,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(),
-    )
-    kwargs = {
-        "design": np.array([[1.0]], dtype=float),
-        "z_obs": np.array([1000.0], dtype=float),
-        "background": np.array([0.0], dtype=float),
-        "observation_variances": np.array([1.0], dtype=float),
-        "initial_strengths": np.array([1000.0], dtype=float),
-        "eps": 1.0e-12,
-        "q_max": 10000.0,
-    }
-
-    no_prior_q = base._solve_report_strengths(**kwargs)
-    prior_q = regularized._solve_report_strengths(**kwargs)
-    prior_batch_q = regularized._solve_report_strengths_batch(
-        design_batch=kwargs["design"][None, :, :],
-        z_obs=kwargs["z_obs"],
-        background=kwargs["background"],
-        observation_variances=kwargs["observation_variances"],
-        initial_strengths=kwargs["initial_strengths"][None, :],
-        eps=kwargs["eps"],
-        q_max=kwargs["q_max"],
-    )
-
-    assert no_prior_q[0] == pytest.approx(1000.0)
-    assert prior_q[0] < no_prior_q[0]
-    assert prior_batch_q[0, 0] == pytest.approx(prior_q[0])
-
-
 def test_birth_gate_can_require_distinct_robot_stations() -> None:
     """Residual birth can require support from more than one robot station."""
     np.random.seed(10)
@@ -7941,9 +4837,8 @@ def test_birth_gate_can_require_distinct_robot_stations() -> None:
         live_times=np.array([1.0, 1.0], dtype=float),
     )
 
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=one_station_data,
+    filt.apply_structural_moves(
+        evidence_data=one_station_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -7962,9 +4857,8 @@ def test_birth_gate_can_require_distinct_robot_stations() -> None:
         pb_indices=np.array([0, 0], dtype=int),
         live_times=np.array([1.0, 1.0], dtype=float),
     )
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=two_station_data,
+    filt.apply_structural_moves(
+        evidence_data=two_station_data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -7972,295 +4866,64 @@ def test_birth_gate_can_require_distinct_robot_stations() -> None:
     assert filt.last_birth_count > 0
 
 
-def test_structural_refresh_uses_birth_observation_block() -> None:
-    """Moved particles should be judged by the station birth block when present."""
-    np.random.seed(11)
+def test_birth_readiness_does_not_gate_evidence_death(monkeypatch) -> None:
+    """A birth-only station gate must not suppress leave-one-out death."""
     filt = _build_filter(
-        p_birth=1.0,
+        p_birth=0.0,
+        p_kill=1.0,
         min_strength=0.01,
         max_sources=2,
-        num_particles=3,
-        birth_enable=True,
-        birth_min_sep_m=0.0,
-        birth_detector_min_sep_m=0.0,
-        birth_num_local_jitter=0,
-        birth_residual_min_support=1,
-        birth_min_distinct_poses=1,
+        num_particles=1,
+        birth_min_distinct_poses=2,
+        birth_min_distinct_stations=2,
+        source_prune_min_distinct_views=1,
+        source_prune_min_distinct_stations=1,
+        pseudo_source_verification_enable=False,
+        split_prob=0.0,
+        merge_prob=0.0,
     )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3)),
-                strengths=np.zeros(0),
-                background=0.0,
-            ),
-            log_weight=float(np.log(1.0 / filt.N)),
-        )
-        for _ in range(filt.N)
-    ]
-    support_data = MeasurementData(
+    state = IsotopeState(
+        num_sources=1,
+        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([40.0], dtype=float),
+        background=0.1,
+        ages=np.array([3], dtype=int),
+        support_scores=np.zeros(1, dtype=float),
+        tentative_sources=np.zeros(1, dtype=bool),
+        verification_fail_streaks=np.zeros(1, dtype=int),
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+    data = MeasurementData(
         z_k=np.array([1.0], dtype=float),
-        observation_variances=np.array([1.0], dtype=float),
+        observation_variances=np.array([2.0], dtype=float),
         detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
         fe_indices=np.array([0], dtype=int),
         pb_indices=np.array([0], dtype=int),
         live_times=np.array([1.0], dtype=float),
-    )
-    birth_data = MeasurementData(
-        z_k=np.array([100.0], dtype=float),
-        observation_variances=np.array([100.0], dtype=float),
-        detector_positions=np.array([[1.5, 0.0, 0.0]], dtype=float),
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times=np.array([1.0], dtype=float),
-    )
-    seen: list[MeasurementData] = []
-
-    def _record_refresh(data: MeasurementData | None, **kwargs: object) -> None:
-        """Record which data block was used for post-move weight refresh."""
-        if data is not None:
-            seen.append(data)
-
-    filt.refresh_weights_from_measurements = _record_refresh  # type: ignore[method-assign]
-
-    filt.apply_birth_death(
-        support_data=support_data,
-        birth_data=birth_data,
-        candidate_positions=filt.kernel.sources,
+        station_sequence_ids=np.array([0], dtype=int),
+        runtime_likelihood_routes=np.array(["count"], dtype=str),
     )
 
-    assert seen and seen[-1] is birth_data
+    def allow_group_prune(
+        _data: MeasurementData,
+        lambda_m: NDArray[np.float64],
+        _lambda_total: NDArray[np.float64],
+        **_kwargs: object,
+    ) -> NDArray[np.bool_]:
+        """Allow the exact death path for every particle and source slot."""
+        return np.ones(lambda_m.shape[1:], dtype=bool)
 
-
-def test_conditional_strength_refit_matches_counts_for_fixed_position() -> None:
-    """Strength refit should recover source rate when position is fixed."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit=True,
-    )
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([10.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(state=state, log_weight=0.0),
-    ]
-    detector_positions = np.array(
-        [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    true_strength = np.array([100.0], dtype=float)
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=state.positions,
-        strengths=true_strength,
-        live_times=np.ones(2, dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
+    monkeypatch.setattr(
+        filt,
+        "_source_prune_allowed_mask_group",
+        allow_group_prune,
     )
 
-    filt.refit_strengths_for_particles(data, iters=5)
+    filt.apply_structural_moves(data, candidate_positions=filt.kernel.sources)
 
-    assert np.isclose(filt.continuous_particles[0].state.strengths[0], 100.0, rtol=1e-3)
-
-
-def test_conditional_strength_refit_ignores_censored_low_signal_data() -> None:
-    """Low-signal upper-limit observations should not collapse source rates."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit=True,
-        conditional_strength_refit_min_count=5.0,
-        conditional_strength_refit_min_snr=1.0,
-    )
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-    data = MeasurementData(
-        z_k=np.array([0.0, 3.0], dtype=float),
-        observation_variances=np.array([10000.0, 10000.0], dtype=float),
-        detector_positions=np.array(
-            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    filt.refit_strengths_for_particles(data, iters=5)
-
-    assert filt.continuous_particles[0].state.strengths[0] == 100.0
-
-
-def test_conditional_strength_refit_prior_limits_overfit() -> None:
-    """Strength MAP refit should not ignore the particle strength prior."""
-    unregularized = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit=True,
-        conditional_strength_refit_prior_weight=0.0,
-    )
-    regularized = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit=True,
-        conditional_strength_refit_prior_weight=10.0,
-        conditional_strength_refit_prior_rel_sigma=0.5,
-    )
-    detector_positions = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    data = MeasurementData(
-        z_k=np.array([1000.0], dtype=float),
-        observation_variances=np.array([1000.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-    for filt in (unregularized, regularized):
-        state = IsotopeState(
-            num_sources=1,
-            positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([100.0], dtype=float),
-            background=0.0,
-        )
-        filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-        filt.refit_strengths_for_particles(data, iters=5)
-
-    q_unregularized = unregularized.continuous_particles[0].state.strengths[0]
-    q_regularized = regularized.continuous_particles[0].state.strengths[0]
-
-    assert q_unregularized > 900.0
-    assert q_regularized < q_unregularized
-    assert q_regularized > 100.0
-
-
-def test_conditional_strength_refit_does_not_anchor_numeric_floor() -> None:
-    """Numerical strength floors should not become physical source priors."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=5.0,
-        max_sources=1,
-        num_particles=1,
-        conditional_strength_refit=True,
-        conditional_strength_refit_prior_weight=100.0,
-        conditional_strength_refit_prior_rel_sigma=0.5,
-    )
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([5.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-    detector_positions = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=state.positions,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(1, dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-
-    filt.refit_strengths_for_particles(data, iters=5)
-
-    assert filt.continuous_particles[0].state.strengths[0] > 90.0
-
-
-def test_conditional_strength_refit_batches_multi_source_particles() -> None:
-    """Batched refit should recover fixed-position strengths for multi-source particles."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=2,
-        conditional_strength_refit=True,
-    )
-    states = [
-        IsotopeState(
-            num_sources=2,
-            positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([10.0, 10.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=2,
-            positions=np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([20.0, 20.0], dtype=float),
-            background=0.0,
-        ),
-    ]
-    filt.continuous_particles = [
-        IsotopeParticle(state=state, log_weight=np.log(0.5)) for state in states
-    ]
-    detector_positions = np.array(
-        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0], [1.0, 3.0, 0.0]],
-        dtype=float,
-    )
-    true_strengths = np.array([120.0, 240.0], dtype=float)
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=states[0].positions,
-        strengths=true_strengths,
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    filt.refit_strengths_for_particles(data, iters=8)
-
-    for particle in filt.continuous_particles:
-        assert np.allclose(particle.state.strengths, true_strengths, rtol=1e-2)
+    assert filt.last_birth_residual_distinct_stations == 1
+    assert filt.last_kill_count == 1
+    assert state.num_sources == 0
 
 
 def test_refresh_weights_batches_mixed_source_cardinality() -> None:
@@ -8418,237 +5081,6 @@ def test_refresh_weights_reuses_cached_lambda_totals(monkeypatch) -> None:
     assert np.allclose(actual_logw, expected_logw)
 
 
-def test_conditional_strength_refit_reweights_by_profile_likelihood() -> None:
-    """Strength refit should update weights when fixed positions fit differently."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=2,
-        conditional_strength_refit=True,
-        conditional_strength_refit_reweight=True,
-        conditional_strength_refit_reweight_clip=100.0,
-    )
-    true_state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([10.0], dtype=float),
-        background=0.0,
-    )
-    wrong_state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[3.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([10.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(state=true_state, log_weight=np.log(0.5)),
-        IsotopeParticle(state=wrong_state, log_weight=np.log(0.5)),
-    ]
-    detector_positions = np.array(
-        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=true_state.positions,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(3, dtype=float),
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.ones(3, dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-
-    filt.refit_strengths_for_particles(data, iters=5)
-
-    weights = filt.continuous_weights
-    assert weights[0] > weights[1]
-
-
-def test_conditional_strength_refit_resamples_after_reweight_collapse(
-    monkeypatch,
-) -> None:
-    """Profile-likelihood refit should not leave a degenerate station posterior."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=4,
-        conditional_strength_refit=True,
-        conditional_strength_refit_reweight=True,
-        conditional_strength_refit_reweight_clip=100.0,
-        deferred_resample_roughening_scale=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[float(idx), 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=float(-np.log(4.0)),
-        )
-        for idx in range(4)
-    ]
-    data = MeasurementData(
-        z_k=np.array([100.0], dtype=float),
-        observation_variances=np.array([100.0], dtype=float),
-        detector_positions=np.array([[0.0, 1.0, 0.0]], dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-
-    def _collapse_weights(
-        *_args: object,
-        particle_indices: list[int],
-        **_kwargs: object,
-    ) -> np.ndarray:
-        """Return deterministic corrections that collapse ESS."""
-        corrections = np.full(len(particle_indices), -50.0, dtype=float)
-        first = particle_indices.index(0)
-        corrections[first] = 0.0
-        return corrections
-
-    monkeypatch.setattr(
-        filt,
-        "_refit_fixed_source_count_particles_batched",
-        _collapse_weights,
-    )
-
-    filt.refit_strengths_for_particles(data, iters=1)
-
-    assert filt.last_resample_ess
-    assert np.allclose(filt.continuous_weights, np.full(4, 0.25))
-
-
-def test_conditional_strength_refit_reweight_preserves_cardinality_mass() -> None:
-    """Strength-refit reweighting should not act as a model-order selector."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=4,
-        conditional_strength_refit_cardinality_neutral_reweight=True,
-    )
-    states = [
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([100.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([100.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=3,
-            positions=np.array(
-                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-                dtype=float,
-            ),
-            strengths=np.array([100.0, 100.0, 100.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=3,
-            positions=np.array(
-                [[0.5, 0.0, 0.0], [1.5, 0.0, 0.0], [2.5, 0.0, 0.0]],
-                dtype=float,
-            ),
-            strengths=np.array([100.0, 100.0, 100.0], dtype=float),
-            background=0.0,
-        ),
-    ]
-    filt.continuous_particles = [
-        IsotopeParticle(state=state, log_weight=float(-np.log(4.0))) for state in states
-    ]
-    corrections = np.array([20.0, 10.0, 0.0, -5.0], dtype=float)
-
-    adjusted = filt._cardinality_neutral_refit_corrections(corrections)
-    logw = np.array([particle.log_weight for particle in filt.continuous_particles])
-    counts = np.array(
-        [particle.state.num_sources for particle in filt.continuous_particles]
-    )
-
-    for source_count in (1, 3):
-        mask = counts == source_count
-        old_mass = np.sum(np.exp(logw[mask]))
-        new_mass = np.sum(np.exp(logw[mask] + adjusted[mask]))
-        assert np.isclose(new_mass, old_mass)
-
-
-def test_conditional_strength_refit_reweight_includes_strength_prior() -> None:
-    """Profile-likelihood reweighting should penalize implausible strength jumps."""
-    filt = _build_filter(
-        p_birth=0.0,
-        min_strength=0.01,
-        max_sources=1,
-        num_particles=2,
-        conditional_strength_refit=True,
-        conditional_strength_refit_reweight=True,
-        conditional_strength_refit_reweight_clip=1.0e9,
-        conditional_strength_refit_prior_weight=100.0,
-        conditional_strength_refit_prior_rel_sigma=0.5,
-    )
-    near_prior = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0], dtype=float),
-        background=0.0,
-    )
-    far_prior = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([10.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(state=near_prior, log_weight=np.log(0.999)),
-        IsotopeParticle(state=far_prior, log_weight=np.log(0.001)),
-    ]
-    detector_positions = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=near_prior.positions,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(1, dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.maximum(np.sum(expected, axis=1), 1.0),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-        live_times=np.ones(1, dtype=float),
-    )
-
-    filt.refit_strengths_for_particles(data, iters=5)
-
-    weights = filt.continuous_weights
-    assert weights[0] > 0.95
-    assert weights[0] > weights[1]
-
-
 def test_clustered_estimate_uses_robust_strength_summary() -> None:
     """Clustered output should not be dominated by rare high-strength tails."""
     filt = _build_filter(
@@ -8709,160 +5141,6 @@ def test_clustered_estimate_conditions_strength_on_active_sources() -> None:
     assert q_est[0] > 10000.0
 
 
-def test_birth_is_blocked_when_strength_refit_explains_residual() -> None:
-    """Residual birth should not fire when existing fixed sources absorb counts."""
-    np.random.seed(3)
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=2,
-        num_particles=1,
-        birth_num_local_jitter=0,
-        birth_detector_min_sep_m=0.0,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=1.0,
-        birth_residual_gate_p_value=0.05,
-        birth_refit_residual_gate=True,
-        birth_refit_residual_min_fraction=0.5,
-        split_prob=0.0,
-        merge_prob=0.0,
-    )
-    state = IsotopeState(
-        num_sources=1,
-        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([5.0], dtype=float),
-        background=0.0,
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-    detector_positions = np.array(
-        [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    expected = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=filt.isotope,
-        detector_positions=detector_positions,
-        sources=state.positions,
-        strengths=np.array([100.0], dtype=float),
-        live_times=np.ones(2, dtype=float),
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        source_scale=1.0,
-    )
-    data = MeasurementData(
-        z_k=np.sum(expected, axis=1),
-        observation_variances=np.ones(2, dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(2, dtype=int),
-        pb_indices=np.zeros(2, dtype=int),
-        live_times=np.ones(2, dtype=float),
-    )
-
-    filt.apply_birth_death(
-        support_data=None,
-        birth_data=data,
-        candidate_positions=filt.kernel.sources,
-    )
-
-    assert filt.last_birth_count == 0
-    assert filt.continuous_particles[0].state.num_sources == 1
-
-
-def test_birth_refit_residual_gate_batched_matches_scalar_oracle() -> None:
-    """Batched residual-refit gate should match the scalar particle loop."""
-    filt = _build_filter(
-        p_birth=1.0,
-        min_strength=0.01,
-        max_sources=3,
-        num_particles=3,
-        birth_refit_residual_gate=True,
-        birth_residual_min_support=1,
-        birth_residual_support_sigma=0.25,
-        birth_residual_gate_p_value=1.0,
-        birth_refit_residual_min_fraction=0.1,
-        refit_iters=4,
-    )
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([10.0], dtype=float),
-                background=0.2,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=np.array(
-                    [[0.0, 0.0, 0.0], [2.0, 0.5, 0.0]],
-                    dtype=float,
-                ),
-                strengths=np.array([8.0, 4.0], dtype=float),
-                background=0.1,
-            ),
-            log_weight=np.log(0.3),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.5,
-            ),
-            log_weight=np.log(0.2),
-        ),
-    ]
-    detector_positions = np.array(
-        [
-            [0.5, 0.0, 0.0],
-            [1.5, 0.5, 0.0],
-            [3.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
-    data = MeasurementData(
-        z_k=np.array([80.0, 35.0, 20.0], dtype=float),
-        observation_variances=np.array([80.0, 35.0, 20.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(3, dtype=int),
-        pb_indices=np.zeros(3, dtype=int),
-        live_times=np.ones(3, dtype=float),
-    )
-    particle_indices = np.array([0, 1, 2], dtype=int)
-    particle_weights = np.array([5.0, 3.0, 2.0], dtype=float)
-
-    scalar = filt._birth_residual_survives_strength_refit_scalar(
-        data=data,
-        particle_indices=particle_indices,
-        particle_weights=particle_weights,
-        residual_sum_before=100.0,
-    )
-    scalar_fraction = filt.last_birth_residual_refit_fraction
-    scalar_support = filt.last_birth_residual_support
-    scalar_distinct = filt.last_birth_residual_distinct_poses
-    scalar_stations = filt.last_birth_residual_distinct_stations
-
-    batched = filt._birth_residual_survives_strength_refit_batched(
-        data=data,
-        particle_indices=particle_indices,
-        particle_weights=particle_weights,
-        residual_sum_before=100.0,
-    )
-
-    assert batched is scalar
-    assert np.isclose(
-        filt.last_birth_residual_refit_fraction,
-        scalar_fraction,
-        rtol=1.0e-10,
-        atol=1.0e-10,
-    )
-    assert filt.last_birth_residual_support == scalar_support
-    assert filt.last_birth_residual_distinct_poses == scalar_distinct
-    assert filt.last_birth_residual_distinct_stations == scalar_stations
-
-
 def test_residual_guided_split_separates_same_isotope_sources() -> None:
     """Residual-guided split should add a same-isotope source only when LL improves."""
     np.random.seed(4)
@@ -8886,9 +5164,7 @@ def test_residual_guided_split_separates_same_isotope_sources() -> None:
         birth_residual_support_sigma=0.1,
         birth_residual_gate_p_value=1.0,
         birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
         merge_prob=0.0,
-        conditional_strength_refit_prior_weight=0.0,
     )
     initial_state = IsotopeState(
         num_sources=1,
@@ -8896,7 +5172,6 @@ def test_residual_guided_split_separates_same_isotope_sources() -> None:
         strengths=np.array([100.0], dtype=float),
         background=0.0,
         ages=np.array([3], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
         support_scores=np.zeros(1, dtype=float),
     )
     filt.continuous_particles = [IsotopeParticle(state=initial_state, log_weight=0.0)]
@@ -8927,9 +5202,8 @@ def test_residual_guided_split_separates_same_isotope_sources() -> None:
         live_times=np.ones(3, dtype=float),
     )
 
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
+    filt.apply_structural_moves(
+        evidence_data=data,
         candidate_positions=filt.kernel.sources,
     )
 
@@ -8950,9 +5224,8 @@ def test_residual_split_ranks_candidates_by_residual_support() -> None:
         min_strength=0.01,
         max_sources=2,
         num_particles=1,
-        split_prob=0.0,
         split_residual_guided=True,
-        split_residual_always_try=True,
+        split_prob=1.0,
         split_residual_candidate_count=1,
         split_delta_ll_threshold=0.0,
         min_age_to_split=0,
@@ -8965,9 +5238,7 @@ def test_residual_split_ranks_candidates_by_residual_support() -> None:
         birth_residual_support_sigma=0.1,
         birth_residual_gate_p_value=1.0,
         birth_candidate_support_fraction=0.0,
-        birth_refit_residual_gate=False,
         merge_prob=0.0,
-        conditional_strength_refit_prior_weight=0.0,
     )
     initial_state = IsotopeState(
         num_sources=1,
@@ -8975,7 +5246,6 @@ def test_residual_split_ranks_candidates_by_residual_support() -> None:
         strengths=np.array([90.0], dtype=float),
         background=0.0,
         ages=np.array([2], dtype=int),
-        low_q_streaks=np.zeros(1, dtype=int),
         support_scores=np.zeros(1, dtype=float),
     )
     filt.continuous_particles = [IsotopeParticle(state=initial_state, log_weight=0.0)]
@@ -9016,9 +5286,8 @@ def test_residual_split_ranks_candidates_by_residual_support() -> None:
     _, _, _, ranked_candidates, _ = proposal
     assert np.allclose(ranked_candidates[0], true_positions[1])
 
-    filt.apply_birth_death(
-        support_data=data,
-        birth_data=data,
+    filt.apply_structural_moves(
+        evidence_data=data,
         candidate_positions=candidate_positions,
     )
 
@@ -9030,1084 +5299,61 @@ def test_residual_split_ranks_candidates_by_residual_support() -> None:
     )
 
 
-def test_report_strength_refit_prunes_unsupported_component() -> None:
-    """Reported Poisson strength refit should remove zero-supported components."""
-    np.random.seed(5)
-    isotope = "Cs-137"
-    reported_positions = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
-    detector_positions = [
-        np.array([0.0, 1.0, 0.0], dtype=float),
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([0.0, 2.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_iters=128,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    true_strength = np.array([90.0], dtype=float)
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=reported_positions[:1],
-        strengths=true_strength,
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = np.sum(design, axis=1)
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        reported_positions,
-        np.array([40.0, 40.0], dtype=float),
-    )
-
-    assert positions.shape == (1, 3)
-    assert strengths.shape == (1,)
-    assert np.allclose(positions[0], reported_positions[0], atol=1.0e-6)
-    assert np.isclose(strengths[0], true_strength[0], rtol=1.0e-2)
-
-
-def test_report_strength_refit_can_preserve_posterior_cardinality() -> None:
-    """Reported strength refit can keep PF clusters when regression is collinear."""
-    isotope = "Cs-137"
-    reported_positions = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
-    detector_positions = [
-        np.array([0.0, 1.0, 0.0], dtype=float),
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([0.0, 2.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_preserve_cardinality=True,
-        report_cluster_model_selection=False,
-        report_strength_refit_iters=128,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=reported_positions[:1],
-        strengths=np.array([90.0], dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = np.sum(design, axis=1)
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        reported_positions,
-        np.array([40.0, 40.0], dtype=float),
-    )
-
-    assert positions.shape == (2, 3)
-    assert strengths.shape == (2,)
-
-
-def test_report_strength_refit_prior_regularizes_large_strength() -> None:
-    """Report-level strength refit should support MAP regularization."""
-    isotope = "Cs-137"
-    source = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=source,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=1,
-            report_strength_refit_iters=64,
-            report_strength_refit_prior_weight=0.0,
-            report_strength_refit_prior_rel_sigma=0.1,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    design = np.ones((2, 1), dtype=float)
-    z_obs = np.full(2, 1000.0, dtype=float)
-    background = np.zeros(2, dtype=float)
-    variances = np.ones(2, dtype=float)
-    initial = np.array([100.0], dtype=float)
-
-    q_unregularized = estimator._solve_report_strengths(
-        design=design,
-        z_obs=z_obs,
-        background=background,
-        observation_variances=variances,
-        initial_strengths=initial,
-        eps=1.0e-9,
-        q_max=0.0,
-    )
-    estimator.pf_config.report_strength_refit_prior_weight = 1000.0
-    q_regularized = estimator._solve_report_strengths(
-        design=design,
-        z_obs=z_obs,
-        background=background,
-        observation_variances=variances,
-        initial_strengths=initial,
-        eps=1.0e-9,
-        q_max=0.0,
-    )
-
-    assert q_unregularized[0] > 900.0
-    assert 100.0 <= q_regularized[0] < q_unregularized[0] * 0.5
-
-
-def test_report_strength_refit_rejects_mismatched_variance_vector() -> None:
-    """Report strength refit should not resize observation variances silently."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(num_particles=1, use_gpu=False),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-
-    with pytest.raises(ValueError, match="observation_variances"):
-        estimator._solve_report_strengths(
-            design=np.ones((3, 1), dtype=float),
-            z_obs=np.full(3, 10.0, dtype=float),
-            background=np.zeros(3, dtype=float),
-            observation_variances=np.ones(2, dtype=float),
-            initial_strengths=np.ones(1, dtype=float),
-            eps=1.0e-9,
-            q_max=0.0,
-        )
-
-
-def test_report_strength_refit_rejects_mismatched_initial_strengths() -> None:
-    """Report strength refit should require one initial strength per source."""
-    isotope = "Cs-137"
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(num_particles=1, use_gpu=False),
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-
-    with pytest.raises(ValueError, match="initial_strengths"):
-        estimator._solve_report_strengths(
-            design=np.ones((3, 2), dtype=float),
-            z_obs=np.full(3, 10.0, dtype=float),
-            background=np.zeros(3, dtype=float),
-            observation_variances=np.ones(3, dtype=float),
-            initial_strengths=np.ones(1, dtype=float),
-            eps=1.0e-9,
-            q_max=0.0,
-        )
-
-
-def test_report_model_order_cluster_prune_updates_particle_source_slots() -> None:
-    """BIC-dropped report clusters should be removable from PF source slots."""
+def test_birth_proposal_projects_and_deduplicates_surface_candidates() -> None:
+    """Strict surface-PF candidates must be projected before response scoring."""
     filt = _build_filter(
-        p_birth=0.0,
+        p_birth=1.0,
+        p_kill=0.0,
         min_strength=0.01,
-        max_sources=2,
+        max_sources=1,
         num_particles=1,
-        birth_enable=True,
+        source_position_prior="surface",
+        position_min=(0.0, 0.0, 0.0),
+        position_max=(4.0, 4.0, 4.0),
+        birth_num_local_jitter=0,
+        birth_detector_min_sep_m=0.0,
+        birth_min_sep_m=0.0,
+        birth_residual_min_support=1,
+        birth_min_distinct_poses=1,
+        birth_min_distinct_stations=1,
+        birth_residual_support_sigma=0.0,
+        birth_residual_gate_p_value=1.0,
+        birth_candidate_support_fraction=0.0,
+        split_prob=0.0,
+        merge_prob=0.0,
         use_gpu=False,
     )
-    state = IsotopeState(
-        num_sources=2,
-        positions=np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=float),
-        strengths=np.array([100.0, 50.0], dtype=float),
-        background=0.0,
-        ages=np.ones(2, dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.zeros(2, dtype=bool),
-        verification_fail_streaks=np.zeros(2, dtype=int),
-    )
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-
-    removed = filt.apply_report_model_order_cluster_prune(
-        np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=float),
-        np.array([True, False], dtype=bool),
-        radius_m=0.5,
-    )
-
-    assert removed == 1
-    assert state.num_sources == 1
-    assert np.allclose(state.positions[0], np.array([0.0, 0.0, 0.0]))
-
-
-def test_report_model_order_prune_particles_applies_after_bic_selection() -> None:
-    """Estimator report refit should optionally push BIC drops back into PF state."""
-    isotope = "Cs-137"
-    reported_positions = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
-    detector_positions = [
-        np.array([0.0, 1.0, 0.0], dtype=float),
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([0.0, 2.0, 0.0], dtype=float),
-        np.array([2.0, 2.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_preserve_cardinality=False,
-        report_cluster_model_selection=True,
-        report_strength_refit_iters=128,
-        report_cluster_bic_penalty_params=8,
-        report_model_order_prune_particles=True,
-        report_model_order_particle_prune_radius_m=0.5,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=reported_positions[:1],
-        strengths=np.array([90.0], dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = np.sum(design, axis=1)
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-    state = IsotopeState(
-        num_sources=2,
-        positions=reported_positions.copy(),
-        strengths=np.array([40.0, 40.0], dtype=float),
-        background=0.0,
-        ages=np.ones(2, dtype=int),
-        low_q_streaks=np.zeros(2, dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.zeros(2, dtype=bool),
-        verification_fail_streaks=np.zeros(2, dtype=int),
-    )
-    filt = estimator.filters[isotope]
-    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        reported_positions,
-        np.array([40.0, 40.0], dtype=float),
-    )
-
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert positions.shape == (1, 3)
-    assert strengths.shape == (1,)
-    assert state.num_sources == 1
-    assert int(diagnostics["particle_pruned_source_slots"]) == 1
-
-
-def test_report_strength_refit_preserve_overrides_bic_collapse() -> None:
-    """Cardinality preservation should keep supported PF clusters after BIC scoring."""
-    isotope = "Cs-137"
-    reported_positions = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=float)
-    detector_positions = [
-        np.array([0.0, 1.0, 0.0], dtype=float),
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([0.0, 2.0, 0.0], dtype=float),
-        np.array([2.0, 2.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_preserve_cardinality=True,
-        report_cluster_model_selection=True,
-        report_strength_refit_iters=128,
-        report_cluster_bic_penalty_params=8,
-        report_model_order_min_bic_margin=0.0,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=reported_positions[:1],
-        strengths=np.array([90.0], dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = np.sum(design, axis=1)
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        reported_positions,
-        np.array([40.0, 40.0], dtype=float),
-    )
-
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert int(diagnostics["model_selected_count"]) < 2
-    assert int(diagnostics["selected_count"]) == 2
-    assert diagnostics["model_order_ready"] is False
-    assert diagnostics["model_order_overridden"] is True
-    assert positions.shape == (2, 3)
-    assert strengths.shape == (2,)
-
-
-def test_pruned_estimates_respect_preserved_report_cardinality(monkeypatch) -> None:
-    """Non-destructive output pruning must not undo preserved model order."""
-    isotope = "Cs-137"
-    reported_positions = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.0, 4.0, 0.0]],
-        dtype=float,
-    )
-    reported_strengths = np.array([1000.0, 80.0, 60.0], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        birth_enable=True,
-        report_strength_refit=False,
-        report_strength_refit_preserve_cardinality=True,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-
-    def fake_estimates() -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return a three-source estimate with preserved model-order diagnostics."""
-        estimator._last_report_model_order_diagnostics[isotope] = {
-            "candidate_count": 3,
-            "selected_count": 3,
-            "selected_indices": [0, 1, 2],
-            "preserve_cardinality": True,
-        }
-        return {isotope: (reported_positions, reported_strengths)}
-
-    def fake_prune(*_args: object, **_kwargs: object) -> dict[str, NDArray[np.bool_]]:
-        """Return an over-aggressive keep mask to exercise the guard."""
-        return {isotope: np.array([True, False, False], dtype=bool)}
-
-    monkeypatch.setattr(estimator, "estimates", fake_estimates)
-    monkeypatch.setattr(
-        "pf.mixing.prune_spurious_sources_continuous",
-        fake_prune,
-    )
-
-    pruned_positions, pruned_strengths = estimator.pruned_estimates()[isotope]
-
-    assert pruned_positions.shape == (3, 3)
-    assert pruned_strengths.shape == (3,)
-
-
-def test_pruned_estimates_reuses_same_report_snapshot(monkeypatch) -> None:
-    """Report pruning must not mix keep masks from a later estimate revision."""
-    isotope = "Cs-137"
-    reported_positions = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.0, 4.0, 0.0]],
-        dtype=float,
-    )
-    reported_strengths = np.array([1000.0, 80.0, 60.0], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        birth_enable=True,
-        report_strength_refit=False,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=reported_positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: 1.0},
-            pose_idx=0,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: 1.0},
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
         )
     ]
-    calls = {"estimates": 0, "prune_positions": 0}
-
-    def fake_estimates() -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return one report snapshot and fail if pruning asks for another."""
-        calls["estimates"] += 1
-        if calls["estimates"] > 1:
-            raise AssertionError("pruned_estimates recomputed report estimates")
-        return {isotope: (reported_positions, reported_strengths)}
-
-    def fake_prune(
-        *,
-        z_k: NDArray[np.float64],
-        live_times: NDArray[np.float64],
-        positions: NDArray[np.float64],
-        strengths: NDArray[np.float64],
-        background: float | NDArray[np.float64],
-        forward_model: object,
-        method: str,
-        params: dict[str, float] | None,
-    ) -> NDArray[np.bool_]:
-        """Return a keep mask sized to the snapshot supplied by pruned_estimates."""
-        del z_k, live_times, strengths, background, forward_model, method, params
-        calls["prune_positions"] = int(positions.shape[0])
-        return np.array([True, False, True], dtype=bool)
-
-    monkeypatch.setattr(estimator, "estimates", fake_estimates)
-    monkeypatch.setattr("pf.mixing.prune_spurious_sources", fake_prune)
-
-    pruned_positions, pruned_strengths = estimator.pruned_estimates()[isotope]
-
-    assert calls["estimates"] == 1
-    assert calls["prune_positions"] == 3
-    assert pruned_positions.shape == (2, 3)
-    assert pruned_strengths.shape == (2,)
-
-
-def test_report_model_order_selection_keeps_supported_three_sources() -> None:
-    """Report-level BIC selection should keep any supported source count."""
-    isotope = "Cs-137"
-    sources = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.5, 3.5, 0.0]],
-        dtype=float,
-    )
-    detector_positions = [
-        np.array([0.5, 1.0, 0.0], dtype=float),
-        np.array([1.5, 1.0, 0.0], dtype=float),
-        np.array([3.5, 1.0, 0.0], dtype=float),
-        np.array([5.0, 1.5, 0.0], dtype=float),
-        np.array([1.0, 4.5, 0.0], dtype=float),
-        np.array([3.0, 4.0, 0.0], dtype=float),
-    ]
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_iters=128,
-        report_cluster_model_selection=True,
-        report_cluster_model_selection_max_candidates=12,
-        report_cluster_bic_penalty_params=4,
-        report_model_order_min_bic_margin=0.0,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    true_strengths = np.array([1200.0, 850.0, 650.0], dtype=float)
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=np.vstack(detector_positions),
-        sources=sources,
-        strengths=np.ones(3, dtype=float),
-        live_times=np.ones(len(detector_positions), dtype=float),
-        fe_indices=np.zeros(len(detector_positions), dtype=int),
-        pb_indices=np.zeros(len(detector_positions), dtype=int),
-    )
-    counts = design @ true_strengths
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        sources,
-        np.array([500.0, 500.0, 500.0], dtype=float),
-    )
-
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    order = np.argsort(positions[:, 0])
-    assert positions.shape == (3, 3)
-    assert diagnostics["selected_count"] == 3
-    assert set(diagnostics["best_by_k"]) >= {"0", "1", "2", "3"}
-    assert np.allclose(
-        positions[order], sources[np.argsort(sources[:, 0])], atol=1.0e-6
-    )
-    assert np.all(strengths > 0.0)
-
-
-def test_report_model_order_respects_configured_max_sources() -> None:
-    """Report-level BIC selection should not exceed the PF source-count cap."""
-    isotope = "Cs-137"
-    sources = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.5, 3.5, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [
-            [0.5, 1.0, 0.0],
-            [1.5, 1.0, 0.0],
-            [3.5, 1.0, 0.0],
-            [5.0, 1.5, 0.0],
-            [1.0, 4.5, 0.0],
-            [3.0, 4.0, 0.0],
-        ],
-        dtype=float,
-    )
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_iters=64,
-        report_cluster_model_selection=True,
-        report_cluster_model_selection_max_candidates=12,
-        report_cluster_bic_penalty_params=4,
-        report_model_order_min_bic_margin=0.0,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    true_strengths = np.array([1200.0, 850.0, 650.0], dtype=float)
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=detector_positions,
-        sources=sources,
-        strengths=np.ones(3, dtype=float),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
-        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-    )
-    counts = design @ true_strengths
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: float(count)},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(float(count), 1.0)},
-        )
-        for idx, count in enumerate(counts)
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        sources,
-        np.array([500.0, 500.0, 500.0], dtype=float),
-    )
-
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert positions.shape[0] <= 2
-    assert strengths.shape[0] <= 2
-    assert diagnostics["selected_count"] <= 2
-    assert diagnostics["max_model_sources"] == 2
-    assert "3" not in diagnostics["best_by_k"]
-
-
-def test_report_model_order_prunes_highly_correlated_subsets() -> None:
-    """Report-level BIC should not evaluate unresolved high-correlation splits."""
-    isotope = "Cs-137"
-    sources = np.array(
-        [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array([[2.5, 1.0, 0.0]], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        use_clustered_output=True,
-        cluster_min_samples=1,
-        report_strength_refit=True,
-        report_strength_refit_iters=32,
-        report_cluster_model_selection=True,
-        report_cluster_model_selection_max_candidates=12,
-        report_cluster_bic_penalty_params=4,
-        report_model_order_min_bic_margin=0.0,
-        report_model_order_subset_corr_prune_threshold=0.99,
-        init_num_sources=(1, 1),
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    estimator.add_measurement_pose(detector_positions[0])
-    estimator._ensure_kernel_cache()
-    design = expected_counts_per_source(
-        kernel=estimator.filters[isotope].continuous_kernel,
-        isotope=isotope,
-        detector_positions=detector_positions,
-        sources=sources,
-        strengths=np.ones(2, dtype=float),
-        live_times=np.ones(1, dtype=float),
-        fe_indices=np.zeros(1, dtype=int),
-        pb_indices=np.zeros(1, dtype=int),
-    )
-    count = float((design @ np.array([800.0, 600.0], dtype=float)).item())
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: count},
-            pose_idx=0,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: max(count, 1.0)},
-        )
-    ]
-
-    positions, strengths = estimator._refit_reported_strengths(
-        isotope,
-        sources,
-        np.array([500.0, 500.0], dtype=float),
-    )
-
-    diagnostics = estimator.report_model_order_diagnostics()[isotope]
-    assert diagnostics["subset_correlation_pruned_subsets"] == 1
-    assert diagnostics["subset_correlation_prune_threshold"] == pytest.approx(0.99)
-    assert "2" not in diagnostics["best_by_k"]
-    assert diagnostics["selected_count"] <= 1
-    assert positions.shape[0] <= 1
-    assert strengths.shape[0] <= 1
-
-
-def test_report_model_order_parallel_matches_serial_selection() -> None:
-    """Parallel report-level subset scoring should match the serial oracle."""
-    isotope = "Cs-137"
-    sources = np.array(
-        [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [1.5, 3.5, 0.0]],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [
-            [0.5, 1.0, 0.0],
-            [1.5, 1.0, 0.0],
-            [3.5, 1.0, 0.0],
-            [5.0, 1.5, 0.0],
-            [1.0, 4.5, 0.0],
-            [3.0, 4.0, 0.0],
-        ],
-        dtype=float,
-    )
-    true_strengths = np.array([1200.0, 850.0, 650.0], dtype=float)
-    results: list[
-        tuple[
-            NDArray[np.float64],
-            NDArray[np.float64],
-            dict[str, object],
-        ]
-    ] = []
-    for workers in (1, 4):
-        config = RotatingShieldPFConfig(
-            num_particles=1,
-            max_sources=3,
-            birth_enable=True,
-            use_clustered_output=True,
-            cluster_min_samples=1,
-            report_strength_refit=True,
-            report_strength_refit_iters=64,
-            report_cluster_model_selection=True,
-            report_cluster_model_selection_max_candidates=12,
-            report_cluster_bic_penalty_params=4,
-            report_model_order_min_bic_margin=0.0,
-            report_model_order_workers=workers,
-            report_model_order_parallel_min_subsets=1,
-            init_num_sources=(1, 1),
-            min_strength=0.01,
-            use_gpu=False,
-        )
-        estimator = RotatingShieldPFEstimator(
-            isotopes=[isotope],
-            candidate_sources=sources,
-            shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-            mu_by_isotope={isotope: 0.0},
-            pf_config=config,
-            shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-        )
-        for pose in detector_positions:
-            estimator.add_measurement_pose(pose)
-        estimator._ensure_kernel_cache()
-        design = expected_counts_per_source(
-            kernel=estimator.filters[isotope].continuous_kernel,
-            isotope=isotope,
-            detector_positions=detector_positions,
-            sources=sources,
-            strengths=np.ones(3, dtype=float),
-            live_times=np.ones(detector_positions.shape[0], dtype=float),
-            fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-            pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        )
-        counts = design @ true_strengths
-        estimator.measurements = [
-            MeasurementRecord(
-                z_k={isotope: float(count)},
-                pose_idx=idx,
-                orient_idx=0,
-                live_time_s=1.0,
-                fe_index=0,
-                pb_index=0,
-                z_variance_k={isotope: max(float(count), 1.0)},
-            )
-            for idx, count in enumerate(counts)
-        ]
-        positions, strengths = estimator._refit_reported_strengths(
-            isotope,
-            sources,
-            np.array([500.0, 500.0, 500.0], dtype=float),
-        )
-        diagnostics = estimator.report_model_order_diagnostics()[isotope]
-        results.append((positions, strengths, diagnostics))
-
-    serial_positions, serial_strengths, serial_diagnostics = results[0]
-    parallel_positions, parallel_strengths, parallel_diagnostics = results[1]
-    assert parallel_diagnostics["workers"] == 4
-    assert serial_diagnostics["evaluation_mode"] == "serial"
-    assert parallel_diagnostics["evaluation_mode"] == "batched_numpy"
-    assert (
-        serial_diagnostics["selected_indices"]
-        == parallel_diagnostics["selected_indices"]
-    )
-    assert (
-        serial_diagnostics["selected_count"] == parallel_diagnostics["selected_count"]
-    )
-    assert np.allclose(serial_positions, parallel_positions, atol=1.0e-9)
-    assert np.allclose(serial_strengths, parallel_strengths, rtol=1.0e-9, atol=1.0e-9)
-
-
-def test_report_condition_numbers_batch_matches_scalar() -> None:
-    """Batched report-design condition numbers should match the scalar oracle."""
-    rng = np.random.default_rng(1234)
-    designs = rng.uniform(0.0, 1.0, size=(6, 7, 3))
-    designs[1, :, 2] = 0.0
-    designs[2, :, :] = 0.0
-    designs[3, :, 0] = 0.0
-    eps = 1.0e-9
-
-    scalar = np.asarray(
-        [
-            RotatingShieldPFEstimator._report_design_condition_number(
-                design,
-                eps=eps,
-            )
-            for design in designs
-        ],
-        dtype=float,
-    )
-    batched = RotatingShieldPFEstimator._report_design_condition_numbers_batch(
-        designs,
-        eps=eps,
-    )
-
-    assert np.allclose(batched, scalar, rtol=1.0e-10, atol=1.0e-10)
-    single_source = rng.uniform(0.0, 1.0, size=(4, 7, 1))
-    assert np.allclose(
-        RotatingShieldPFEstimator._report_design_condition_numbers_batch(
-            single_source,
-            eps=eps,
-        ),
-        np.ones(4, dtype=float),
-    )
-
-
-def test_residual_surface_candidate_grid_cache_matches_filtered_oracle() -> None:
-    """Full-grid cached residual rescue scoring should match filtered scoring."""
-    isotope = "Cs-137"
-    sources = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-            [5.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
-    detector_positions = np.array(
-        [
-            [0.5, 1.0, 0.0],
-            [2.5, 1.0, 0.0],
-            [4.5, 1.0, 0.0],
-        ],
-        dtype=float,
-    )
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=3,
-        report_mle_rescue_surface_quota_enable=False,
-        report_mle_rescue_visibility_weight=0.0,
-        report_mle_rescue_min_visible_measurements=1,
-        report_mle_rescue_visible_count=0.0,
-        report_mle_rescue_dedup_radius_m=0.75,
-        candidate_response_cache_max_entries=8,
-        min_strength=0.01,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=sources,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    filt = estimator.filters[isotope]
     data = MeasurementData(
-        z_k=np.array([100.0, 180.0, 120.0], dtype=float),
-        observation_variances=np.array([100.0, 180.0, 120.0], dtype=float),
-        detector_positions=detector_positions,
-        fe_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        pb_indices=np.zeros(detector_positions.shape[0], dtype=int),
-        live_times=np.ones(detector_positions.shape[0], dtype=float),
+        z_k=np.array([40.0], dtype=float),
+        observation_variances=np.array([2.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.5, 0.5]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+        station_sequence_ids=np.array([0], dtype=int),
+        runtime_likelihood_routes=np.array(["count"], dtype=str),
     )
-    residual = np.array([30.0, 120.0, 60.0], dtype=float)
-    background = np.zeros(data.z_k.size, dtype=float)
-    existing_positions = np.array([[0.0, 0.0, 0.0]], dtype=float)
-
-    positions, strengths, _stats = estimator._rank_residual_surface_candidates(
-        isotope,
-        filt,
-        data,
-        residual=residual,
-        existing_positions=existing_positions,
-        background=background,
-        eps=1.0e-9,
-        max_candidates=2,
-        min_residual_fraction=0.0,
-        dedup_radius_m=0.75,
+    off_surface = np.array(
+        [[2.0, 2.0, 2.0], [2.0, 2.0, 2.0]],
+        dtype=float,
     )
+    projected = filt._project_positions_to_source_prior(off_surface[:1])
+    assert not np.allclose(projected, off_surface[:1])
 
-    keep = (
-        np.linalg.norm(
-            sources - existing_positions[0][None, :],
-            axis=1,
-        )
-        > 0.75
-    )
-    oracle_pool = sources[keep]
-    oracle_counts = expected_counts_per_source(
-        kernel=filt.continuous_kernel,
-        isotope=isotope,
-        detector_positions=data.detector_positions,
-        sources=oracle_pool,
-        strengths=np.ones(oracle_pool.shape[0], dtype=float),
-        live_times=data.live_times,
-        fe_indices=data.fe_indices,
-        pb_indices=data.pb_indices,
-    )
-    weights = 1.0 / data.observation_variances
-    numerator = (weights * residual) @ oracle_counts
-    denominator = weights @ (oracle_counts * oracle_counts)
-    oracle_strengths = numerator / np.maximum(denominator, 1.0e-9)
-    scores = numerator * np.maximum(oracle_strengths, 0.0)
-    order = np.argsort(scores)[::-1][:2]
+    proposal = filt._compute_birth_proposal(data, off_surface)
 
-    assert np.allclose(positions, oracle_pool[order])
-    assert np.allclose(strengths, oracle_strengths[order])
-    assert estimator._candidate_response_cache
-
-
-def test_report_strength_refit_returns_empty_without_signal_support() -> None:
-    """Reported source estimates should require signal-bearing observations."""
-    isotope = "Co-60"
-    positions = np.array([[2.0, 2.0, 0.0], [4.0, 4.0, 0.0]], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=2,
-        birth_enable=True,
-        report_strength_refit=True,
-        conditional_strength_refit_min_count=5.0,
-        conditional_strength_refit_min_snr=1.0,
-        use_gpu=False,
-    )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=[isotope],
-        candidate_sources=positions,
-        shield_normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
-        mu_by_isotope={isotope: 0.0},
-        pf_config=config,
-        shield_params=ShieldParams(thickness_pb_cm=0.0, thickness_fe_cm=0.0),
-    )
-    detector_positions = [
-        np.array([1.0, 1.0, 0.0], dtype=float),
-        np.array([3.0, 1.0, 0.0], dtype=float),
-    ]
-    for pose in detector_positions:
-        estimator.add_measurement_pose(pose)
-    estimator._ensure_kernel_cache()
-    estimator.measurements = [
-        MeasurementRecord(
-            z_k={isotope: 0.0},
-            pose_idx=idx,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-            z_variance_k={isotope: 10000.0},
-        )
-        for idx in range(len(detector_positions))
-    ]
-
-    refit_positions, refit_strengths = estimator._refit_reported_strengths(
-        isotope,
-        positions,
-        np.array([1000.0, 1000.0], dtype=float),
-    )
-
-    assert refit_positions.shape == (0, 3)
-    assert refit_strengths.shape == (0,)
+    assert proposal is not None
+    _, _, _, proposed_positions, _ = proposal
+    assert proposed_positions.shape == (1, 3)
+    np.testing.assert_allclose(proposed_positions, projected)

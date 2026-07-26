@@ -1,8 +1,8 @@
 # External relocation boundary
 
 `python -m pf.hybrid_replay` is an opt-in, estimator-neutral boundary for a
-hybrid controller.  It does not change `pf.replay`, `PurePFEstimator`, or the
-scientific meaning of `pf_strict`/`pf_profiled`.
+hybrid controller. It does not change `pf.replay`, `PurePFEstimator`, or the
+scientific meaning of the single `pf_strict` profile.
 
 The separate [hybrid DSS-PP recommendation boundary](hybrid_planning_boundary.md)
 can causally replay these directives and expose eligible external modes to the
@@ -43,6 +43,12 @@ closed when a surface-projected position prior, shield contrast likelihood,
 shield-view-ratio likelihood, or correlated station-view likelihood is active.
 Projecting a Gaussian onto a union of surfaces would not have the density used
 by the MH correction, so it is never done silently.
+
+The only supported scientific profile, `pf_strict`, now requires the
+environment-surface position prior. Consequently, a non-empty v1 relocation
+schedule is intentionally unavailable in the production pure-PF runtime. The
+volume kernel remains isolated for boundary-level tests; an empty schedule is
+still a byte-for-byte no-op.
 
 ## Causal binding
 
@@ -131,7 +137,7 @@ a resumable PF checkpoint.
 - Fixed-cardinality relocation cannot discover a source when every particle
   has zero slots for that isotope.
 - It is not reversible-jump birth/death and must not be described as such.
-- Candidate corroboration, quarantine, pruning, conflict planning, and final
-  batch reporting remain controller responsibilities.
+- Candidate corroboration, quarantine, pruning, and conflict planning remain
+  controller responsibilities.
 - Later observations are processed once by the ordinary PF update.  They are
   not reweighted through the external snapshot.

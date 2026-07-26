@@ -22,8 +22,8 @@ The command performs the following operations:
 3. Create an in-memory `MeasurementLog` prefix ending at that station.
 4. Remove later relocation directives before parsing or applying the causal
    directive schedule.
-5. Replay `pf_strict` or `pf_profiled` plus the existing target-preserving
-   fixed-cardinality relocation directives through the cutoff.
+5. Replay `pf_strict` plus the existing target-preserving fixed-cardinality
+   relocation directives through the cutoff.
 6. Wrap the replayed estimator in a read-only planning view.
 7. Add only `pending` and `verified` external modes as DSS-PP hypotheses.
    `quarantined` modes are recorded as excluded and never reach DSS-PP.
@@ -75,8 +75,7 @@ canonical JSON helper.
 
 The DSS-PP request must explicitly set `augment_candidates` to `false`.
 Otherwise DSS-PP could create poses that are absent from the attested set.
-Legacy runtime-rescue and surface-rescue planner inputs must also remain
-disabled.
+The planner receives no posterior-external runtime or surface rescue modes.
 
 ## Request shape
 
@@ -104,9 +103,7 @@ disabled.
     "reachability_filtered": true
   },
   "dsspp_config": {
-    "augment_candidates": false,
-    "include_runtime_rescue_modes": false,
-    "include_global_surface_rescue_modes": false
+    "augment_candidates": false
   },
   "external_modes": [
     {

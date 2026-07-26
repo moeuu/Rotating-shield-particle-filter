@@ -17,14 +17,13 @@ localization from shield-sensitive strength estimation.
    `response_poisson_shield_systematic_anchor_pair_ids`. Anchor pairs use
    `response_poisson_shield_systematic_anchor_rel_sigma`; other shielded pairs
    use `response_poisson_shield_systematic_rel_sigma`.
-4. DSS-PP already evaluates temporal separation with normalized and whitened
-   program signatures. The new variance floor makes the downstream strength
-   fit less sensitive to shield-pose spectral bias without removing those
-   normalized temporal signatures from localization and source-count selection.
-5. Final report strength refit continues to use the full-spectrum
-   `response_poisson` count-ingestion standard. Shield-dependent mismatch is
-   propagated through measurement variances instead of replacing Geant4
-   transport or switching to a lower-fidelity count extractor.
+4. DSS-PP evaluates temporal separation with normalized and whitened program
+   signatures. The variance floor makes PF strength-state likelihoods less
+   sensitive to shield-pose spectral bias without removing those temporal
+   signatures from localization and source-count inference.
+5. Shield-dependent mismatch is propagated through the same
+   `response_poisson` covariance used by the sequential PF. No report-time
+   strength optimization or lower-fidelity count extractor is used.
 
 ## Runtime Metadata
 

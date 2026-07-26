@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import nnls
 from scipy.special import logsumexp
 from scipy.spatial import cKDTree
 
@@ -51,7 +49,6 @@ class KempFilterConfig:
     p_birth: float = 0.04
     p_death: float = 0.03
     p_move: float = 0.25
-    refit_final_strengths: bool = True
     estimate_min_grid_probability: float = 0.02
     estimate_merge_radius_m: float = 0.75
     use_gpu: bool = False
@@ -361,36 +358,6 @@ class KempLogDDPF:
             self.strengths[best, active],
         )
 
-    def refit_strengths(
-        self,
-        source_indices: Sequence[int],
-    ) -> NDArray[np.float64]:
-        """Refit source strengths for fixed positions using NNLS counts."""
-        indices = np.asarray(tuple(int(index) for index in source_indices), dtype=np.int64)
-        if indices.size == 0 or not self.measurements:
-            return np.zeros(0, dtype=float)
-        design = np.zeros((len(self.measurements), indices.size), dtype=float)
-        target = np.zeros(len(self.measurements), dtype=float)
-        for row, measurement in enumerate(self.measurements):
-            theta = self.kernel.kernel_vector(
-                self.isotope,
-                measurement.detector_pos,
-                measurement.fe_index,
-                measurement.pb_index,
-            )
-            design[row, :] = float(measurement.live_time_s) * theta[indices]
-            target[row] = max(
-                float(measurement.counts)
-                - float(measurement.live_time_s) * max(float(self.config.background_cps), 0.0),
-                0.0,
-            )
-        strengths, _ = nnls(design, target)
-        return np.clip(
-            strengths,
-            float(self.config.min_strength_cps_1m),
-            float(self.config.max_strength_cps_1m),
-        )
-
     def posterior_grid_summary(
         self,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -447,7 +414,5 @@ class KempLogDDPF:
         indices = self._posterior_source_indices()
         _, strength_mass = self.posterior_grid_summary()
         strengths = np.asarray(strength_mass[indices], dtype=float)
-        if bool(self.config.refit_final_strengths) and indices.size > 0:
-            strengths = self.refit_strengths(indices)
         positions = self.kernel.positions_for_indices(indices)
         return positions, strengths, indices

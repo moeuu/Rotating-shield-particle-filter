@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import json
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +20,7 @@ from pf.external_relocation import (
     scalar_count_log_targets_for_relocations,
 )
 from pf.hybrid_replay import replay_with_external_relocations
-from pf.profiles import ProposalOrigin, enforce_pure_runtime_settings
+from pf.profiles import enforce_pure_runtime_settings
 from pf.provenance import sha256_json
 from pf.replay import (
     build_replay_estimator,
@@ -174,17 +173,10 @@ def _shared_contract_prefix_log() -> MeasurementLog:
 
 
 def test_covered_record_digest_matches_shared_cross_repo_fixture() -> None:
-    """The PF prefix digest must equal the orchestrator/MLE fixture constant."""
+    """The PF prefix digest must equal the shared orchestrator fixture."""
     assert covered_records_sha256(_shared_contract_prefix_log(), 3) == (
         "f57c5e5cc83689dfed4b12310e3b63d27e3e95d0c5d53e0904763879f7430efb"
     )
-
-
-def test_strict_estimator_still_refuses_external_mle_origin(tmp_path: Path) -> None:
-    """The opt-in wrapper must not widen the PurePFEstimator boundary."""
-    _log, _config, estimator = _fixture_context(tmp_path)
-    assert estimator.accepts_proposal_origin(ProposalOrigin.EXTERNAL_MLE) is False
-
 
 def test_empty_schedule_preserves_standard_replay_outputs_byte_for_byte(
     tmp_path: Path,
@@ -225,30 +217,26 @@ def test_empty_schedule_preserves_standard_replay_outputs_byte_for_byte(
         ).read_bytes()
 
 
-def test_duplicate_directive_id_is_idempotent_and_deterministic(tmp_path: Path) -> None:
-    """An identical repeated directive ID is applied once with one RNG stream."""
+def test_nonempty_directive_fails_closed_for_strict_surface_prior(
+    tmp_path: Path,
+) -> None:
+    """The only supported profile must reject the volume-only relocation kernel."""
     log, config, estimator = _fixture_context(tmp_path)
     directive = _native_directive(log, estimator)
     single = {"schema_version": 1, "directives": [directive]}
     duplicate = {"schema_version": 1, "directives": [directive, directive]}
-    first, _trace_a, first_schedule, _pred_a = replay_with_external_relocations(
-        log.path,  # type: ignore[attr-defined]
-        config,
-        single,
-        seed=37,
-        relocation_seed=101,
-    )
-    second, _trace_b, second_schedule, _pred_b = replay_with_external_relocations(
-        log.path,  # type: ignore[attr-defined]
-        config,
-        duplicate,
-        seed=37,
-        relocation_seed=101,
-    )
-    assert first.serialized_state() == second.serialized_state()
-    assert len(first_schedule.receipts) == len(second_schedule.receipts) == 1
-    assert first_schedule.receipts == second_schedule.receipts
-    assert first_schedule.applied_directive_ids == ("directive-test-001",)
+    for schedule in (single, duplicate):
+        with pytest.raises(
+            ExternalRelocationError,
+            match="invalid for a surface prior",
+        ):
+            replay_with_external_relocations(
+                log.path,  # type: ignore[attr-defined]
+                config,
+                schedule,
+                seed=37,
+                relocation_seed=101,
+            )
 
 
 def test_future_directive_remains_pending_and_cannot_change_prefix(
@@ -306,29 +294,22 @@ def test_unseen_log_suffix_does_not_change_cutoff_state_or_relocation_rng(
         short_directive["covered_records_sha256"]
         == long_directive["covered_records_sha256"]
     )
-    short_estimator, short_trace, _schedule_a, short_predictions = (
-        replay_with_external_relocations(
-            short_log.path,
-            config,
-            {"schema_version": 1, "directives": [short_directive]},
-            seed=37,
-            relocation_seed=101,
-            stop_after=2,
-        )
-    )
-    long_estimator, long_trace, _schedule_b, long_predictions = (
-        replay_with_external_relocations(
-            long_log.path,
-            config,
-            {"schema_version": 1, "directives": [long_directive]},
-            seed=37,
-            relocation_seed=101,
-            stop_after=2,
-        )
-    )
-    assert short_estimator.serialized_state() == long_estimator.serialized_state()
-    assert short_trace[-1]["state_sha256"] == long_trace[-1]["state_sha256"]
-    assert short_predictions == long_predictions
+    for replay_log, directive in (
+        (short_log, short_directive),
+        (long_log, long_directive),
+    ):
+        with pytest.raises(
+            ExternalRelocationError,
+            match="invalid for a surface prior",
+        ):
+            replay_with_external_relocations(
+                replay_log.path,
+                config,
+                {"schema_version": 1, "directives": [directive]},
+                seed=37,
+                relocation_seed=101,
+                stop_after=2,
+            )
 
 
 def test_directive_rejects_future_coverage_and_non_boundary_cutoff(
@@ -477,10 +458,10 @@ def test_candidate_outcomes_report_all_particle_results_without_representative()
     ]
 
 
-def test_orchestrator_directive_translates_without_strength_mutation(
+def test_orchestrator_directive_translates_then_surface_kernel_fails_closed(
     tmp_path: Path,
 ) -> None:
-    """PFDirective v1 maps its candidate to the position-only internal kernel."""
+    """PFDirective parsing remains strength-free before the surface guard."""
     log, _config, estimator = _fixture_context(tmp_path)
     payload = {
         "schema_version": 1,
@@ -515,7 +496,6 @@ def test_orchestrator_directive_translates_without_strength_mutation(
             }
         ],
         "safety_policy": {
-            "direct_mle_objective_reweight": False,
             "hard_prune_authorized": False,
             "future_only_corroboration": True,
             "once_only_application": True,
@@ -531,64 +511,19 @@ def test_orchestrator_directive_translates_without_strength_mutation(
     assert candidate.proposal_id == "proposal-cs-001"
     assert not hasattr(candidate, "strength_cps_1m")
 
-    pure = build_replay_estimator(log, replay_config(), profile="pf_strict", seed=37)
-    replay_records(log, pure, stop_after=2)
-    hybrid, _trace, schedule, _predictions = replay_with_external_relocations(
-        log.path,
-        replay_config(),
-        {"schema_version": 1, "directives": [payload]},
-        seed=37,
-        relocation_seed=103,
-        stop_after=2,
-        output_dir=tmp_path / "orchestrator-hybrid-output",
-    )
-    pure_filter = pure.filters["Cs-137"]
-    hybrid_filter = hybrid.filters["Cs-137"]
-    np.testing.assert_array_equal(
-        [particle.log_weight for particle in hybrid_filter.continuous_particles],
-        [particle.log_weight for particle in pure_filter.continuous_particles],
-    )
-    for pure_particle, hybrid_particle in zip(
-        pure_filter.continuous_particles,
-        hybrid_filter.continuous_particles,
+    with pytest.raises(
+        ExternalRelocationError,
+        match="invalid for a surface prior",
     ):
-        np.testing.assert_array_equal(
-            np.sort(hybrid_particle.state.strengths),
-            np.sort(pure_particle.state.strengths),
+        replay_with_external_relocations(
+            log.path,
+            replay_config(),
+            {"schema_version": 1, "directives": [payload]},
+            seed=37,
+            relocation_seed=103,
+            stop_after=2,
+            output_dir=tmp_path / "orchestrator-hybrid-output",
         )
-        assert hybrid_particle.state.num_sources == pure_particle.state.num_sources
-        assert hybrid_particle.state.background == pure_particle.state.background
-    assert len(schedule.receipts) == 1
-    contract = schedule.receipts[0]["contract_receipt"]
-    assert contract["directive_sha256"] == sha256_json(payload)
-    assert contract["safety_evidence"] == {
-        "direct_mle_objective_reweight_performed": False,
-        "hard_prune_performed": False,
-        "target_preserving_mh_performed": True,
-        "reweighted_observation_step_ids": [],
-        "next_observation_min_step": 2,
-    }
-    eligible_count = schedule.receipts[0]["isotopes"][0]["eligible_particle_count"]
-    assert contract["candidate_outcomes"] == [
-        {
-            "proposal_id": "proposal-cs-001",
-            "outcome": "not_applied",
-            "mh_attempt_count": 0,
-            "mh_accepted_count": 0,
-            "mh_rejected_count": 0,
-            "not_sampled_count": eligible_count,
-            "eligible_particle_count": eligible_count,
-            "mh_log_acceptance_ratio": None,
-            "mh_log_uniform_draw": None,
-        }
-    ]
-    receipt_files = tuple(
-        (tmp_path / "orchestrator-hybrid-output" / "pf_directive_receipts").glob(
-            "*.json"
-        )
-    )
-    assert len(receipt_files) == 1
-    assert json.loads(receipt_files[0].read_text(encoding="utf-8")) == contract
 
 
 def test_external_boundary_has_no_estimator_package_import() -> None:

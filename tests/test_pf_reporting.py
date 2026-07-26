@@ -16,7 +16,7 @@ from pf.posterior_uncertainty import (
     SURFACE_KINDS,
     posterior_mode_uncertainty_batched,
 )
-from pf.reporting import dedupe_report_candidates, measurement_vector
+from pf.reporting import measurement_vector
 from pf.state import IsotopeState
 
 
@@ -115,153 +115,15 @@ def _scalar_mode_oracle(
 
 
 def test_measurement_vector_broadcasts_scalar() -> None:
-    """Scalar report inputs should broadcast to the requested measurement count."""
+    """Scalar inputs should broadcast to the requested measurement count."""
     vec = measurement_vector(2.5, 3, "background", min_value=0.0)
     assert np.allclose(vec, [2.5, 2.5, 2.5])
 
 
 def test_measurement_vector_rejects_wrong_length() -> None:
-    """Vector report inputs must match the requested measurement count."""
+    """Vector inputs must match the requested measurement count."""
     with pytest.raises(ValueError, match="one value per measurement"):
         measurement_vector(np.asarray([1.0, 2.0]), 3, "z", allow_scalar=False)
-
-
-def test_report_guard_projects_every_origin_to_surface_prior() -> None:
-    """Raw and guarded report positions should obey the configured state space."""
-    environment = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=("Cs-137",),
-        candidate_sources=np.array([[0.0, 1.0, 1.0]], dtype=float),
-        shield_normals=None,
-        mu_by_isotope={"Cs-137": {"fe": 0.01, "pb": 0.02}},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=3,
-            use_gpu=False,
-            position_min=(0.0, 0.0, 0.0),
-            position_max=(2.0, 2.0, 2.0),
-            source_position_prior="surface",
-        ),
-    )
-    estimator.add_measurement_pose(np.array([1.0, 1.0, 1.0], dtype=float))
-    estimator._ensure_kernel_cache()
-    off_surface = np.array([[0.5, 0.5, 0.5]], dtype=float)
-    raw_positions, _ = estimator._guarded_report_estimate(
-        "Cs-137",
-        off_surface,
-        np.array([1.0]),
-        use_pre_finalize_guard=False,
-    )
-    estimator._pre_finalize_guard_estimates["Cs-137"] = (
-        np.array([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]], dtype=float),
-        np.array([1.0, 2.0]),
-    )
-    guarded_positions, _ = estimator._guarded_report_estimate(
-        "Cs-137",
-        raw_positions,
-        np.array([1.0]),
-        use_pre_finalize_guard=True,
-    )
-
-    for position in np.vstack([raw_positions, guarded_positions]):
-        assert source_surface_kind(position, environment) is not None
-
-
-def test_dedupe_report_candidates_keeps_strong_order() -> None:
-    """Report candidate de-duplication should preserve deterministic input order."""
-    positions = np.asarray(
-        [
-            [0.0, 0.0, 0.0],
-            [0.1, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
-    strengths = np.asarray([5.0, 9.0, 3.0], dtype=float)
-
-    out_pos, out_q = dedupe_report_candidates(
-        positions,
-        strengths,
-        radius_m=0.5,
-        max_candidates=5,
-    )
-
-    assert out_pos.shape == (2, 3)
-    assert np.allclose(out_pos, [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
-    assert np.allclose(out_q, [5.0, 3.0])
-
-
-def test_report_design_correlation_penalty_flags_collinear_sources() -> None:
-    """Correlation penalty should activate only above the physical threshold."""
-    collinear = np.asarray(
-        [
-            [1.0, 2.0],
-            [2.0, 4.0],
-            [3.0, 6.0],
-        ],
-        dtype=float,
-    )
-    separated = np.asarray(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [0.0, 0.0],
-        ],
-        dtype=float,
-    )
-
-    assert (
-        RotatingShieldPFEstimator._report_design_correlation_penalty(
-            collinear,
-            threshold=0.98,
-            weight=24.0,
-            power=1.0,
-            eps=1.0e-12,
-        )
-        > 0.0
-    )
-    assert (
-        RotatingShieldPFEstimator._report_design_correlation_penalty(
-            separated,
-            threshold=0.98,
-            weight=24.0,
-            power=1.0,
-            eps=1.0e-12,
-        )
-        == 0.0
-    )
-
-
-def test_report_design_correlation_penalty_batch_matches_scalar() -> None:
-    """Batched correlation penalties should match the scalar implementation."""
-    designs = np.asarray(
-        [
-            [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]],
-            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
-        ],
-        dtype=float,
-    )
-    batch = RotatingShieldPFEstimator._report_design_correlation_penalties_batch(
-        designs,
-        threshold=0.98,
-        weight=24.0,
-        power=1.0,
-        eps=1.0e-12,
-    )
-    scalar = np.asarray(
-        [
-            RotatingShieldPFEstimator._report_design_correlation_penalty(
-                design,
-                threshold=0.98,
-                weight=24.0,
-                power=1.0,
-                eps=1.0e-12,
-            )
-            for design in designs
-        ],
-        dtype=float,
-    )
-
-    assert np.allclose(batch, scalar)
 
 
 def test_posterior_mode_uncertainty_batch_matches_scalar_oracle() -> None:

@@ -20,7 +20,6 @@ class IsotopeState:
     background: float
     covariances: NDArray[np.float64] | None = None  # optional (r_h,4,4) across (x,y,z,q)
     ages: NDArray[np.int64] | None = None
-    low_q_streaks: NDArray[np.int64] | None = None
     support_scores: NDArray[np.float64] | None = None
     tentative_sources: NDArray[np.bool_] | None = None
     verification_fail_streaks: NDArray[np.int64] | None = None
@@ -34,7 +33,6 @@ class IsotopeState:
             background=float(self.background),
             covariances=None if self.covariances is None else self.covariances.copy(),
             ages=None if self.ages is None else self.ages.copy(),
-            low_q_streaks=None if self.low_q_streaks is None else self.low_q_streaks.copy(),
             support_scores=None if self.support_scores is None else self.support_scores.copy(),
             tentative_sources=(
                 None if self.tentative_sources is None else self.tentative_sources.copy()

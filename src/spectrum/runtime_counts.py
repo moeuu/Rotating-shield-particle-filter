@@ -404,7 +404,7 @@ class RuntimeCountExtractor:
         Rotating-shield postures are valuable temporal codes for localization,
         but their spectra are more sensitive to geometry and scattering mismatch
         than weakly shielded anchor views. This floor keeps those postures in
-        the PF likelihood while preventing them from dominating strength refits.
+        the PF likelihood without letting biased postures dominate the update.
         """
         config = getattr(self.decomposer, "config", None)
         if config is None or not bool(

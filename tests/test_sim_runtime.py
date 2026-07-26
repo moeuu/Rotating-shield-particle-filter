@@ -3842,6 +3842,7 @@ def test_run_live_pf_uses_simulation_runtime(
         pb_index: int,
         live_time_s: float,
         z_variance_k: dict[str, float] | None = None,
+        z_covariance_k: dict[str, dict[str, float]] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
         self.measurements.append(
@@ -3853,6 +3854,7 @@ def test_run_live_pf_uses_simulation_runtime(
                 fe_index=fe_index,
                 pb_index=pb_index,
                 z_variance_k=z_variance_k,
+                z_covariance_k=z_covariance_k,
             )
         )
 
@@ -4082,6 +4084,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         pb_index: int,
         live_time_s: float,
         z_variance_k: dict[str, float] | None = None,
+        z_covariance_k: dict[str, dict[str, float]] | None = None,
     ) -> None:
         """Append a lightweight measurement record without GPU updates."""
         self.measurements.append(
@@ -4093,6 +4096,7 @@ def test_run_live_pf_random_environment_uses_blender_usd(
                 fe_index=fe_index,
                 pb_index=pb_index,
                 z_variance_k=z_variance_k,
+                z_covariance_k=z_covariance_k,
             )
         )
 

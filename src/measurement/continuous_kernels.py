@@ -973,6 +973,167 @@ def obstacle_path_lengths_between_points_by_box_cm_torch(
     return 100.0 * length_m
 
 
+def _finite_sphere_geometric_term_numpy(
+    distance: NDArray[np.float64],
+    *,
+    detector_radius_m: float,
+    point_distance_floor_m: float = 1.0e-6,
+) -> NDArray[np.float64]:
+    """Return finite-sphere detector-cps@1m scaling for NumPy distances."""
+    distances = np.asarray(distance, dtype=float)
+    radius = max(float(detector_radius_m), 0.0)
+    if radius <= 0.0:
+        safe_distance = np.maximum(distances, float(point_distance_floor_m))
+        return 1.0 / (safe_distance**2)
+    effective_distance = np.maximum(distances, radius)
+    ratio = np.clip(radius / np.maximum(effective_distance, 1.0e-12), 0.0, 1.0)
+    fraction = 0.5 * (1.0 - np.sqrt(np.clip(1.0 - ratio * ratio, 0.0, None)))
+    reference = max(1.0, radius)
+    reference_ratio = min(radius / reference, 1.0)
+    reference_fraction = max(
+        0.5
+        * (
+            1.0
+            - float(
+                np.sqrt(max(1.0 - reference_ratio * reference_ratio, 0.0))
+            )
+        ),
+        1.0e-12,
+    )
+    return fraction / reference_fraction
+
+
+def _segment_rotated_octant_shell_path_length_cm_numpy(
+    source_pos: NDArray[np.float64],
+    target_pos: NDArray[np.float64],
+    center_pos: NDArray[np.float64],
+    rotations: NDArray[np.float64],
+    inner_radius_cm: float,
+    outer_radius_cm: float,
+    tol: float = 1.0e-12,
+) -> NDArray[np.float64]:
+    """Return exact rotated-octant shell lengths for matched NumPy ray rows."""
+    sources = np.asarray(source_pos, dtype=float)
+    targets = np.asarray(target_pos, dtype=float)
+    centers = np.asarray(center_pos, dtype=float)
+    rotation_arr = np.asarray(rotations, dtype=float)
+    if sources.ndim != 3 or sources.shape[-1] != 3:
+        raise ValueError("source_pos must be shaped (N, R, 3).")
+    if targets.shape != sources.shape:
+        raise ValueError("target_pos must match source_pos.")
+    if centers.shape != (sources.shape[0], 1, 3):
+        raise ValueError("center_pos must be shaped (N, 1, 3).")
+    if rotation_arr.shape != (sources.shape[0], 3, 3):
+        raise ValueError("rotations must be shaped (N, 3, 3).")
+
+    source_local = np.einsum(
+        "nri,nij->nrj",
+        sources - centers,
+        rotation_arr,
+        optimize=True,
+    )
+    target_local = np.einsum(
+        "nri,nij->nrj",
+        targets - centers,
+        rotation_arr,
+        optimize=True,
+    )
+    delta = target_local - source_local
+    segment_length = np.linalg.norm(delta, axis=-1)
+    inner_m = max(0.0, float(inner_radius_cm) / 100.0)
+    outer_m = max(inner_m, float(outer_radius_cm) / 100.0)
+    if outer_m <= inner_m:
+        return np.zeros_like(segment_length)
+
+    a = np.sum(delta * delta, axis=-1)
+    b = 2.0 * np.sum(source_local * delta, axis=-1)
+    breakpoints = [
+        np.zeros_like(segment_length),
+        np.ones_like(segment_length),
+    ]
+    denominator = np.maximum(2.0 * a, float(tol))
+    for radius in (inner_m, outer_m):
+        c = np.sum(source_local * source_local, axis=-1) - radius * radius
+        discriminant = b * b - 4.0 * a * c
+        valid = discriminant >= 0.0
+        root = np.sqrt(np.clip(discriminant, 0.0, None))
+        for sign in (-1.0, 1.0):
+            value = (-b + sign * root) / denominator
+            value = np.where(valid, value, 0.0)
+            breakpoints.append(np.clip(value, 0.0, 1.0))
+    for axis in range(3):
+        axis_delta = delta[..., axis]
+        valid = np.abs(axis_delta) > float(tol)
+        safe_delta = np.where(valid, axis_delta, 1.0)
+        value = -source_local[..., axis] / safe_delta
+        breakpoints.append(np.clip(np.where(valid, value, 0.0), 0.0, 1.0))
+
+    ordered = np.sort(np.stack(breakpoints, axis=-1), axis=-1)
+    left = ordered[..., :-1]
+    right = ordered[..., 1:]
+    width = np.maximum(right - left, 0.0)
+    midpoint = 0.5 * (left + right)
+    points = (
+        source_local[..., None, :]
+        + midpoint[..., None] * delta[..., None, :]
+    )
+    radius_sq = np.sum(points * points, axis=-1)
+    inside_shell = (
+        (radius_sq >= inner_m * inner_m - float(tol))
+        & (radius_sq <= outer_m * outer_m + float(tol))
+    )
+    inside_octant = np.all(points >= -float(tol), axis=-1)
+    length_m = (
+        np.sum(np.where(inside_shell & inside_octant, width, 0.0), axis=-1)
+        * segment_length
+    )
+    return np.where(
+        segment_length > float(tol),
+        100.0 * length_m,
+        np.zeros_like(length_m),
+    )
+
+
+def _obstacle_path_lengths_between_points_by_box_cm_numpy(
+    source_pos: NDArray[np.float64],
+    target_pos: NDArray[np.float64],
+    obstacle_boxes_m: NDArray[np.float64],
+    tol: float = 1.0e-12,
+) -> NDArray[np.float64]:
+    """Return per-box segment lengths for batched matched NumPy ray rows."""
+    sources = np.asarray(source_pos, dtype=float)
+    targets = np.asarray(target_pos, dtype=float)
+    boxes = np.asarray(obstacle_boxes_m, dtype=float)
+    if sources.shape != targets.shape or sources.shape[-1] != 3:
+        raise ValueError("source_pos and target_pos must match with last dimension 3.")
+    if boxes.size == 0:
+        return np.zeros((*sources.shape[:-1], 0), dtype=float)
+    if boxes.ndim != 2 or boxes.shape[1] != 6:
+        raise ValueError("obstacle_boxes_m must be shaped (N, 6).")
+
+    point = sources[..., None, :]
+    direction = (targets - sources)[..., None, :]
+    distance = np.linalg.norm(targets - sources, axis=-1)
+    lower = boxes[:, :3]
+    upper = boxes[:, 3:]
+    parallel = np.abs(direction) <= float(tol)
+    inside = (point >= lower) & (point <= upper)
+    safe_direction = np.where(parallel, 1.0, direction)
+    t0 = (lower - point) / safe_direction
+    t1 = (upper - point) / safe_direction
+    axis_min = np.minimum(t0, t1)
+    axis_max = np.maximum(t0, t1)
+    axis_min = np.where(parallel & inside, -np.inf, axis_min)
+    axis_max = np.where(parallel & inside, np.inf, axis_max)
+    axis_min = np.where(parallel & ~inside, np.inf, axis_min)
+    axis_max = np.where(parallel & ~inside, -np.inf, axis_max)
+    t_enter = np.maximum(np.max(axis_min, axis=-1), 0.0)
+    t_exit = np.minimum(np.min(axis_max, axis=-1), 1.0)
+    span = np.where(t_exit > t_enter, t_exit - t_enter, 0.0)
+    span = np.where(np.isfinite(span), span, 0.0)
+    return 100.0 * span * distance[..., None]
+
+
 def _torch_available() -> bool:
     """Return True if torch is available and CUDA is usable."""
     return bool(_TORCH_AVAILABLE and torch is not None and torch.cuda.is_available())
@@ -1055,6 +1216,11 @@ class ContinuousKernel:
         init=False,
         repr=False,
     )
+    _numpy_octant_rotations_cache: NDArray[np.float64] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Validate obstacle attenuation settings."""
@@ -1114,6 +1280,52 @@ class ContinuousKernel:
         rotation = torch.as_tensor(rotation_np, device=device, dtype=dtype)
         self._torch_octant_rotation_cache[key] = rotation
         return rotation
+
+    def _rotated_octant_rotations_numpy(self) -> NDArray[np.float64]:
+        """Return cached rotations for every fixed physical shield octant."""
+        if self._numpy_octant_rotations_cache is None:
+            # This one-time fixed-size geometry setup is not a runtime
+            # detector/source/orientation evaluation loop.
+            self._numpy_octant_rotations_cache = np.stack(
+                [
+                    rotation_matrix_between_vectors(
+                        LOCAL_POSITIVE_OCTANT_CENTER,
+                        -np.asarray(normal, dtype=float),
+                    )
+                    for normal in np.asarray(self.orientations, dtype=float)
+                ],
+                axis=0,
+            )
+        return self._numpy_octant_rotations_cache
+
+    def _adaptive_numpy_chunk_size(
+        self,
+        requested: int,
+        *,
+        isotope: str,
+    ) -> int:
+        """Return a bounded NumPy row chunk for batched kernel evaluation."""
+        source_samples = (
+            max(int(self.source_extent_samples), 1)
+            if float(self.source_extent_radius_m or 0.0) > 0.0
+            else 1
+        )
+        aperture_samples = (
+            max(int(self.detector_aperture_samples), 1)
+            if float(self.detector_aperture_radius_m or 0.0) > 0.0
+            else 1
+        )
+        ray_count = source_samples * aperture_samples
+        obstacle_count = int(self.obstacle_boxes_m().shape[0])
+        line_count = max(1, len(self._line_mu_values(isotope)))
+        # The exact octant intersection holds coordinates, breakpoints and
+        # masks concurrently; obstacle and line axes add their own work arrays.
+        working_elements_per_row = ray_count * (
+            48 + 12 * obstacle_count + 8 * line_count
+        )
+        element_budget = 8_000_000
+        safe_chunk = max(1, element_budget // max(working_elements_per_row, 1))
+        return max(1, min(int(requested), int(safe_chunk)))
 
     def _adaptive_torch_chunk_size(
         self,
@@ -1596,6 +1808,184 @@ class ContinuousKernel:
         log_scale = torch.clamp(log_scale, min=float(min_log), max=float(max_log))
         return torch.exp(log_scale)
 
+    def _transport_response_factor_numpy(
+        self,
+        isotope: str,
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        shield_tau_feature: NDArray[np.float64],
+        obstacle_tau_feature: NDArray[np.float64],
+        fe_tau_feature: NDArray[np.float64] | None = None,
+        pb_tau_feature: NDArray[np.float64] | None = None,
+        distance_feature: NDArray[np.float64] | None = None,
+        distance_shield_feature: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return source-local response factors for batched NumPy kernel math."""
+        shield_feature = np.asarray(shield_tau_feature, dtype=float)
+        payload = self._transport_response_payload(isotope)
+        if not payload:
+            return np.ones_like(shield_feature)
+
+        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+        pair_ids = fe_arr * int(len(self.orientations)) + pb_arr
+        base_scale = max(float(payload.get("scale", 1.0)), 1.0e-12)
+        pair_log_lookup = np.full(
+            int(len(self.orientations)) ** 2,
+            np.log(base_scale),
+            dtype=float,
+        )
+        pair_scales = payload.get("scale_by_pair", {})
+        if isinstance(pair_scales, dict):
+            # Parsing the fixed 64-entry calibration table is configuration
+            # work; detector/source evaluation below remains fully batched.
+            for raw_pair_id, raw_scale in pair_scales.items():
+                try:
+                    pair_id = int(raw_pair_id)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= pair_id < pair_log_lookup.size:
+                    pair_log_lookup[pair_id] = np.log(
+                        max(float(raw_scale), 1.0e-12)
+                    )
+        pair_logs = pair_log_lookup[pair_ids]
+        while pair_logs.ndim < shield_feature.ndim:
+            pair_logs = pair_logs[..., None]
+
+        coeffs, min_log, max_log = self._transport_response_coefficients(isotope)
+        (
+            shield_cap,
+            obstacle_cap,
+            fe_cap,
+            pb_cap,
+            distance_shield_cap,
+            distance_fe_cap,
+            distance_pb_cap,
+            distance_obstacle_cap,
+        ) = self._transport_response_feature_caps(isotope)
+        shield_raw = np.maximum(shield_feature, 0.0)
+        shield = (
+            np.minimum(shield_raw, float(shield_cap))
+            if shield_cap is not None
+            else shield_raw
+        )
+        obstacle_raw = np.maximum(
+            np.asarray(obstacle_tau_feature, dtype=float),
+            0.0,
+        )
+        obstacle = (
+            np.minimum(obstacle_raw, float(obstacle_cap))
+            if obstacle_cap is not None
+            else obstacle_raw
+        )
+        fe_raw = (
+            np.zeros_like(shield)
+            if fe_tau_feature is None
+            else np.maximum(np.asarray(fe_tau_feature, dtype=float), 0.0)
+        )
+        fe_feature = (
+            np.minimum(fe_raw, float(fe_cap)) if fe_cap is not None else fe_raw
+        )
+        pb_raw = (
+            np.zeros_like(shield)
+            if pb_tau_feature is None
+            else np.maximum(np.asarray(pb_tau_feature, dtype=float), 0.0)
+        )
+        pb_feature = (
+            np.minimum(pb_raw, float(pb_cap)) if pb_cap is not None else pb_raw
+        )
+        distance = (
+            np.zeros_like(shield)
+            if distance_feature is None
+            else np.maximum(np.asarray(distance_feature, dtype=float), 0.0)
+        )
+        while distance.ndim < shield.ndim:
+            distance = distance[..., None]
+        distance_shield = (
+            distance * shield_raw
+            if distance_shield_feature is None
+            else np.maximum(
+                np.asarray(distance_shield_feature, dtype=float),
+                0.0,
+            )
+        )
+        while distance_shield.ndim < shield.ndim:
+            distance_shield = distance_shield[..., None]
+        if distance_shield_cap is not None:
+            distance_shield = np.minimum(
+                distance_shield,
+                float(distance_shield_cap),
+            )
+        distance_fe = distance * fe_raw
+        if distance_fe_cap is not None:
+            distance_fe = np.minimum(distance_fe, float(distance_fe_cap))
+        distance_pb = distance * pb_raw
+        if distance_pb_cap is not None:
+            distance_pb = np.minimum(distance_pb, float(distance_pb_cap))
+        distance_obstacle = distance * obstacle_raw
+        if distance_obstacle_cap is not None:
+            distance_obstacle = np.minimum(
+                distance_obstacle,
+                float(distance_obstacle_cap),
+            )
+
+        log_scale = pair_logs
+        log_scale = log_scale + float(coeffs.get("shield", 0.0)) * shield
+        log_scale = log_scale + float(coeffs.get("obstacle", 0.0)) * obstacle
+        log_scale = (
+            log_scale
+            + float(coeffs.get("shield_squared", 0.0)) * shield * shield
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("obstacle_squared", 0.0))
+            * obstacle
+            * obstacle
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("shield_obstacle", 0.0)) * shield * obstacle
+        )
+        log_scale = log_scale + float(coeffs.get("fe", 0.0)) * fe_feature
+        log_scale = log_scale + float(coeffs.get("pb", 0.0)) * pb_feature
+        log_scale = (
+            log_scale
+            + float(coeffs.get("fe_squared", 0.0)) * fe_feature * fe_feature
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("pb_squared", 0.0)) * pb_feature * pb_feature
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("fe_pb", 0.0)) * fe_feature * pb_feature
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("fe_obstacle", 0.0)) * fe_feature * obstacle
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("pb_obstacle", 0.0)) * pb_feature * obstacle
+        )
+        log_scale = log_scale + float(coeffs.get("distance", 0.0)) * distance
+        log_scale = (
+            log_scale
+            + float(coeffs.get("distance_shield", 0.0)) * distance_shield
+        )
+        log_scale = (
+            log_scale + float(coeffs.get("distance_fe", 0.0)) * distance_fe
+        )
+        log_scale = (
+            log_scale + float(coeffs.get("distance_pb", 0.0)) * distance_pb
+        )
+        log_scale = (
+            log_scale
+            + float(coeffs.get("distance_obstacle", 0.0))
+            * distance_obstacle
+        )
+        return np.exp(np.clip(log_scale, float(min_log), float(max_log)))
+
     def obstacle_boxes_m(self) -> NDArray[np.float64]:
         """Return cached obstacle boxes in meters as (x0, y0, z0, x1, y1, z1)."""
         if self.obstacle_grid is None:
@@ -1850,6 +2240,32 @@ class ContinuousKernel:
             1.0 - float(np.exp(-max(tau_obstacle, 0.0)))
         )
         return max(1.0, float(factor))
+
+    def _buildup_factor_numpy(
+        self,
+        tau_fe: NDArray[np.float64],
+        tau_pb: NDArray[np.float64],
+        tau_obstacle: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return broad-beam build-up factors for batched NumPy optical depths."""
+        fe_arr = np.asarray(tau_fe, dtype=float)
+        pb_arr = np.asarray(tau_pb, dtype=float)
+        obstacle_arr = np.asarray(tau_obstacle, dtype=float)
+        factor = np.ones(np.broadcast_shapes(
+            fe_arr.shape,
+            pb_arr.shape,
+            obstacle_arr.shape,
+        ), dtype=float)
+        factor = factor + self.shield_params.buildup_fe_coeff * (
+            1.0 - np.exp(-np.maximum(fe_arr, 0.0))
+        )
+        factor = factor + self.shield_params.buildup_pb_coeff * (
+            1.0 - np.exp(-np.maximum(pb_arr, 0.0))
+        )
+        factor = factor + self.obstacle_buildup_coeff * (
+            1.0 - np.exp(-np.maximum(obstacle_arr, 0.0))
+        )
+        return np.maximum(factor, 1.0)
 
     def _buildup_factor_torch(
         self,
@@ -2395,6 +2811,204 @@ class ContinuousKernel:
         )
         return l_fe, l_pb
 
+    @staticmethod
+    def _perpendicular_bases_numpy(
+        sources: NDArray[np.float64],
+        detectors: NDArray[np.float64],
+        *,
+        tol: float,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return matched ray axes, distances and stable perpendicular bases."""
+        source_arr = np.asarray(sources, dtype=float)
+        detector_arr = np.asarray(detectors, dtype=float)
+        direction = detector_arr - source_arr
+        distance = np.linalg.norm(direction, axis=-1)
+        safe_distance = np.maximum(distance, float(tol))
+        axis = direction / safe_distance[..., None]
+        helper_z = np.zeros_like(axis)
+        helper_z[..., 2] = 1.0
+        helper_y = np.zeros_like(axis)
+        helper_y[..., 1] = 1.0
+        helper = np.where(
+            (np.abs(axis[..., 2]) > 0.9)[..., None],
+            helper_y,
+            helper_z,
+        )
+        basis_u = np.cross(axis, helper)
+        basis_norm = np.linalg.norm(basis_u, axis=-1)
+        basis_u = basis_u / np.maximum(basis_norm, float(tol))[..., None]
+        basis_v = np.cross(axis, basis_u)
+        return axis, distance, basis_u, basis_v
+
+    def _source_extent_points_numpy(
+        self,
+        sources: NDArray[np.float64],
+        detectors: NDArray[np.float64],
+        *,
+        tol: float,
+    ) -> NDArray[np.float64]:
+        """Return deterministic source-extent points for matched NumPy rows."""
+        source_arr = np.asarray(sources, dtype=float)
+        detector_arr = np.asarray(detectors, dtype=float)
+        radius = float(self.source_extent_radius_m or 0.0)
+        count = max(int(self.source_extent_samples), 1)
+        if radius <= 0.0 or count <= 1:
+            return source_arr[:, None, :]
+        _, distance, basis_u, basis_v = self._perpendicular_bases_numpy(
+            source_arr,
+            detector_arr,
+            tol=tol,
+        )
+        indices = np.arange(count, dtype=float)
+        fractions = np.zeros(count, dtype=float)
+        fractions[1:] = (indices[1:] - 0.5) / float(count - 1)
+        radii = radius * np.sqrt(np.clip(fractions, 0.0, 1.0))
+        angles = indices * float(np.pi * (3.0 - np.sqrt(5.0)))
+        offsets = radii[None, :, None] * (
+            np.cos(angles)[None, :, None] * basis_u[:, None, :]
+            + np.sin(angles)[None, :, None] * basis_v[:, None, :]
+        )
+        points = source_arr[:, None, :] + offsets
+        degenerate = distance <= float(tol)
+        if np.any(degenerate):
+            points = np.where(
+                degenerate[:, None, None],
+                source_arr[:, None, :],
+                points,
+            )
+        return points
+
+    def _detector_aperture_targets_numpy(
+        self,
+        sources: NDArray[np.float64],
+        detectors: NDArray[np.float64],
+        *,
+        tol: float,
+    ) -> NDArray[np.float64]:
+        """Return deterministic detector-aperture targets for matched NumPy rows."""
+        source_arr = np.asarray(sources, dtype=float)
+        detector_arr = np.asarray(detectors, dtype=float)
+        aperture_radius = float(self.detector_aperture_radius_m or 0.0)
+        sample_count = max(int(self.detector_aperture_samples), 1)
+        if aperture_radius <= 0.0 or sample_count <= 1:
+            return detector_arr[:, None, :]
+        axis, distance, basis_u, basis_v = self._perpendicular_bases_numpy(
+            source_arr,
+            detector_arr,
+            tol=tol,
+        )
+        indices = np.arange(sample_count, dtype=float)
+        golden_angle = float(np.pi * (3.0 - np.sqrt(5.0)))
+        angles = golden_angle * indices
+        angular_basis = (
+            np.cos(angles)[None, :, None] * basis_u[:, None, :]
+            + np.sin(angles)[None, :, None] * basis_v[:, None, :]
+        )
+        if self.detector_aperture_sampling == "solid_angle_cone":
+            safe_distance = np.maximum(distance, float(tol))
+            sin_theta_max = np.clip(
+                aperture_radius / safe_distance,
+                0.0,
+                1.0,
+            )
+            cos_theta_max = np.sqrt(
+                np.clip(1.0 - sin_theta_max * sin_theta_max, 0.0, None)
+            )
+            fractions = (indices + 0.5) / float(sample_count)
+            cos_theta = 1.0 - fractions[None, :] * (
+                1.0 - cos_theta_max[:, None]
+            )
+            sin_theta = np.sqrt(
+                np.clip(1.0 - cos_theta * cos_theta, 0.0, None)
+            )
+            direction = (
+                cos_theta[..., None] * axis[:, None, :]
+                + sin_theta[..., None] * angular_basis
+            )
+            radial_sq = (distance[:, None] * sin_theta) ** 2
+            chord = np.sqrt(
+                np.clip(aperture_radius * aperture_radius - radial_sq, 0.0, None)
+            )
+            path_length = distance[:, None] * cos_theta - chord
+            targets = (
+                source_arr[:, None, :]
+                + path_length[..., None] * direction
+            )
+            inside = distance <= aperture_radius
+            if np.any(inside):
+                targets = np.where(
+                    inside[:, None, None],
+                    detector_arr[:, None, :],
+                    targets,
+                )
+            return targets
+
+        fractions = np.clip(
+            (indices - 0.5) / float(sample_count - 1),
+            0.0,
+            1.0,
+        )
+        radii = np.sqrt(fractions)
+        radii[0] = 0.0
+        max_radius = np.minimum(aperture_radius, 0.95 * distance)
+        offsets = (
+            max_radius[:, None, None]
+            * radii[None, :, None]
+            * angular_basis
+        )
+        targets = detector_arr[:, None, :] + offsets
+        degenerate = distance <= float(tol)
+        if np.any(degenerate):
+            targets = np.where(
+                degenerate[:, None, None],
+                detector_arr[:, None, :],
+                targets,
+            )
+        return targets
+
+    def _ray_sample_points_numpy(
+        self,
+        sources: NDArray[np.float64],
+        detectors: NDArray[np.float64],
+        *,
+        tol: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], int]:
+        """Return flattened source/target rays for matched NumPy kernel rows."""
+        source_arr = np.asarray(sources, dtype=float)
+        detector_arr = np.asarray(detectors, dtype=float)
+        source_points = self._source_extent_points_numpy(
+            source_arr,
+            detector_arr,
+            tol=tol,
+        )
+        row_count, source_sample_count, _ = source_points.shape
+        flat_sources = source_points.reshape(-1, 3)
+        flat_detectors = np.broadcast_to(
+            detector_arr[:, None, :],
+            (row_count, source_sample_count, 3),
+        ).reshape(-1, 3)
+        flat_targets = self._detector_aperture_targets_numpy(
+            flat_sources,
+            flat_detectors,
+            tol=tol,
+        )
+        aperture_sample_count = int(flat_targets.shape[1])
+        sample_count = int(source_sample_count) * aperture_sample_count
+        sampled_sources = np.broadcast_to(
+            flat_sources[:, None, :],
+            flat_targets.shape,
+        )
+        return (
+            sampled_sources.reshape(row_count, sample_count, 3),
+            flat_targets.reshape(row_count, sample_count, 3),
+            sample_count,
+        )
+
     def _detector_aperture_targets_torch(
         self,
         sources: "torch.Tensor",
@@ -2672,6 +3286,10 @@ class ContinuousKernel:
         sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
         sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
         dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
+        response_distance = torch.linalg.norm(
+            sampled_sources - detector_t.view(1, 1, 3),
+            dim=-1,
+        )
 
         detector_to_source_unit = -dir_unit
         blocked_fe = self._rotated_octant_blocked_mask_torch(
@@ -2835,8 +3453,8 @@ class ContinuousKernel:
                 obstacle_tau_feature,
                 fe_tau_feature,
                 pb_tau_feature,
-                distance_feature=dist.unsqueeze(-1),
-                distance_shield_feature=dist.unsqueeze(-1) * shield_tau_feature,
+                distance_feature=response_distance,
+                distance_shield_feature=response_distance * shield_tau_feature,
                 device=device,
                 dtype=dtype,
             )
@@ -2860,8 +3478,8 @@ class ContinuousKernel:
                 tau_obstacle,
                 tau_fe,
                 tau_pb,
-                distance_feature=dist.unsqueeze(-1),
-                distance_shield_feature=dist.unsqueeze(-1) * (tau_fe + tau_pb),
+                distance_feature=response_distance,
+                distance_shield_feature=response_distance * (tau_fe + tau_pb),
                 device=device,
                 dtype=dtype,
             )
@@ -2924,6 +3542,10 @@ class ContinuousKernel:
         sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
         dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
         detector_to_source_unit = -dir_unit
+        response_distance = torch.linalg.norm(
+            sampled_sources - detector_t.view(1, 1, 3),
+            dim=-1,
+        )
 
         unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
         path_lengths: dict[int, tuple["torch.Tensor", "torch.Tensor"]] = {}
@@ -3088,8 +3710,10 @@ class ContinuousKernel:
                 obstacle_tau_feature,
                 fe_tau_feature,
                 pb_tau_feature,
-                distance_feature=dist.view(1, -1, 1),
-                distance_shield_feature=dist.view(1, -1, 1) * shield_tau_feature,
+                distance_feature=response_distance.unsqueeze(0),
+                distance_shield_feature=(
+                    response_distance.unsqueeze(0) * shield_tau_feature
+                ),
                 device=device,
                 dtype=dtype,
             )
@@ -3115,8 +3739,10 @@ class ContinuousKernel:
                 tau_obstacle,
                 tau_fe,
                 tau_pb,
-                distance_feature=dist.view(1, -1, 1),
-                distance_shield_feature=dist.view(1, -1, 1) * (tau_fe + tau_pb),
+                distance_feature=response_distance.unsqueeze(0),
+                distance_shield_feature=(
+                    response_distance.unsqueeze(0) * (tau_fe + tau_pb)
+                ),
                 device=device,
                 dtype=dtype,
             )
@@ -3321,6 +3947,10 @@ class ContinuousKernel:
             sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
             dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
             detector_to_source_unit = -dir_unit
+            response_distance = torch.linalg.norm(
+                sampled_sources - detectors_t.unsqueeze(-2),
+                dim=-1,
+            )
 
             l_fe_by_orient: list[torch.Tensor] = []
             l_pb_by_orient: list[torch.Tensor] = []
@@ -3486,8 +4116,10 @@ class ContinuousKernel:
                     obstacle_tau_feature,
                     fe_tau_feature,
                     pb_tau_feature,
-                    distance_feature=dist.view(1, -1, 1),
-                    distance_shield_feature=dist.view(1, -1, 1) * shield_tau_feature,
+                    distance_feature=response_distance.unsqueeze(0),
+                    distance_shield_feature=(
+                        response_distance.unsqueeze(0) * shield_tau_feature
+                    ),
                     device=device,
                     dtype=dtype,
                 )
@@ -3513,8 +4145,10 @@ class ContinuousKernel:
                     tau_obstacle,
                     tau_fe,
                     tau_pb,
-                    distance_feature=dist.view(1, -1, 1),
-                    distance_shield_feature=dist.view(1, -1, 1) * (tau_fe + tau_pb),
+                    distance_feature=response_distance.unsqueeze(0),
+                    distance_shield_feature=(
+                        response_distance.unsqueeze(0) * (tau_fe + tau_pb)
+                    ),
                     device=device,
                     dtype=dtype,
                 )
@@ -3526,6 +4160,324 @@ class ContinuousKernel:
             att = torch.mean(att, dim=-1)
             values = geom.unsqueeze(0) * att
         return values.transpose(0, 1).detach().cpu().numpy().astype(float, copy=False)
+
+    def _kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        tol: float = 1.0e-12,
+    ) -> NDArray[np.float64]:
+        """Return selected-pair kernels for matched rows via batched NumPy."""
+        detectors = np.asarray(detector_positions, dtype=float)
+        source_arr = np.asarray(sources, dtype=float)
+        if detectors.ndim != 2 or detectors.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (N, 3).")
+        if source_arr.ndim != 2 or source_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if detectors.shape[0] != source_arr.shape[0]:
+            raise ValueError(
+                "detector_positions and sources must have the same row count."
+            )
+        row_count = int(source_arr.shape[0])
+        if row_count == 0:
+            return np.zeros(0, dtype=float)
+        num_orients = int(len(self.orientations))
+        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+        if fe_arr.size != row_count or pb_arr.size != row_count:
+            raise ValueError(
+                "Fe/Pb index arrays must match the detector-source row count."
+            )
+        if (
+            np.any(fe_arr < -num_orients)
+            or np.any(fe_arr >= num_orients)
+            or np.any(pb_arr < -num_orients)
+            or np.any(pb_arr >= num_orients)
+        ):
+            raise IndexError("Fe/Pb orientation index is out of bounds.")
+        fe_arr = fe_arr % num_orients
+        pb_arr = pb_arr % num_orients
+
+        center_direction = detectors - source_arr
+        center_distance = np.linalg.norm(center_direction, axis=1)
+        geom = _finite_sphere_geometric_term_numpy(
+            center_distance,
+            detector_radius_m=self.detector_radius_m,
+        )
+        sampled_sources, targets, _ = self._ray_sample_points_numpy(
+            source_arr,
+            detectors,
+            tol=tol,
+        )
+        sampled_direction = targets - sampled_sources
+        sampled_distance = np.linalg.norm(sampled_direction, axis=-1)
+        safe_sampled_distance = np.maximum(sampled_distance, float(tol))
+        direction_unit = sampled_direction / safe_sampled_distance[..., None]
+        response_distance = np.linalg.norm(
+            sampled_sources - detectors[:, None, :],
+            axis=-1,
+        )
+        rotations = self._rotated_octant_rotations_numpy()
+        fe_rotations = rotations[fe_arr]
+        pb_rotations = rotations[pb_arr]
+
+        if (
+            self.shield_params.shield_geometry_model
+            == SHIELD_GEOMETRY_SPHERICAL_OCTANT
+            and not self.shield_params.use_angle_attenuation
+        ):
+            centers = detectors[:, None, :]
+            l_fe = _segment_rotated_octant_shell_path_length_cm_numpy(
+                sampled_sources,
+                targets,
+                centers,
+                fe_rotations,
+                self.shield_params.inner_radius_fe_cm,
+                (
+                    self.shield_params.inner_radius_fe_cm
+                    + self.shield_params.thickness_fe_cm
+                ),
+                tol=tol,
+            )
+            l_pb = _segment_rotated_octant_shell_path_length_cm_numpy(
+                sampled_sources,
+                targets,
+                centers,
+                pb_rotations,
+                self.shield_params.inner_radius_pb_cm,
+                (
+                    self.shield_params.inner_radius_pb_cm
+                    + self.shield_params.thickness_pb_cm
+                ),
+                tol=tol,
+            )
+        else:
+            detector_to_source_unit = -direction_unit
+            local_fe = np.einsum(
+                "nri,nij->nrj",
+                detector_to_source_unit,
+                fe_rotations,
+                optimize=True,
+            )
+            local_pb = np.einsum(
+                "nri,nij->nrj",
+                detector_to_source_unit,
+                pb_rotations,
+                optimize=True,
+            )
+            nonzero_ray = sampled_distance > float(tol)
+            blocked_fe = nonzero_ray & np.all(local_fe >= -float(tol), axis=-1)
+            blocked_pb = nonzero_ray & np.all(local_pb >= -float(tol), axis=-1)
+            normal_fe = np.asarray(self.orientations, dtype=float)[fe_arr]
+            normal_pb = np.asarray(self.orientations, dtype=float)[pb_arr]
+            cos_fe = np.clip(
+                np.sum(direction_unit * normal_fe[:, None, :], axis=-1),
+                0.0,
+                1.0,
+            )
+            cos_pb = np.clip(
+                np.sum(direction_unit * normal_pb[:, None, :], axis=-1),
+                0.0,
+                1.0,
+            )
+            if self.shield_params.use_angle_attenuation:
+                l_fe = np.where(
+                    blocked_fe & (cos_fe > float(tol)),
+                    self.shield_params.thickness_fe_cm
+                    / np.maximum(cos_fe, float(tol)),
+                    0.0,
+                )
+                l_pb = np.where(
+                    blocked_pb & (cos_pb > float(tol)),
+                    self.shield_params.thickness_pb_cm
+                    / np.maximum(cos_pb, float(tol)),
+                    0.0,
+                )
+            else:
+                l_fe = np.where(
+                    blocked_fe,
+                    self.shield_params.thickness_fe_cm,
+                    0.0,
+                )
+                l_pb = np.where(
+                    blocked_pb,
+                    self.shield_params.thickness_pb_cm,
+                    0.0,
+                )
+
+        mu_fe, mu_pb = self._mu_values(isotope=isotope)
+        tau_fe = float(mu_fe) * l_fe
+        tau_pb = float(mu_pb) * l_pb
+        obstacle_path_cm = None
+        tau_obstacle = np.zeros_like(tau_fe)
+        boxes = self.obstacle_boxes_m()
+        if boxes.size:
+            obstacle_path_cm = (
+                _obstacle_path_lengths_between_points_by_box_cm_numpy(
+                    sampled_sources,
+                    targets,
+                    boxes,
+                    tol=tol,
+                )
+            )
+            obstacle_mu = self.obstacle_mu_values_cm_inv(isotope)
+            tau_obstacle = np.sum(
+                obstacle_path_cm * obstacle_mu.reshape(1, 1, -1),
+                axis=-1,
+            )
+
+        line_entries = self._line_mu_values(isotope)
+        if line_entries:
+            line_values = np.asarray(line_entries, dtype=float)
+            weights = line_values[:, 0]
+            line_mu_fe = line_values[:, 1]
+            line_mu_pb = line_values[:, 2]
+            line_tau_fe = l_fe[..., None] * line_mu_fe.reshape(1, 1, -1)
+            line_tau_pb = l_pb[..., None] * line_mu_pb.reshape(1, 1, -1)
+            line_tau_obstacle = tau_obstacle[..., None]
+            if obstacle_path_cm is not None:
+                obstacle_line_mu = self.obstacle_line_mu_values_cm_inv(isotope)
+                if obstacle_line_mu.shape == (
+                    len(line_entries),
+                    obstacle_path_cm.shape[-1],
+                ):
+                    line_tau_obstacle = np.einsum(
+                        "nrb,lb->nrl",
+                        obstacle_path_cm,
+                        obstacle_line_mu,
+                        optimize=True,
+                    )
+            line_total_tau = (
+                line_tau_fe + line_tau_pb + line_tau_obstacle
+            )
+            line_buildup = self._buildup_factor_numpy(
+                line_tau_fe,
+                line_tau_pb,
+                line_tau_obstacle,
+            )
+            weight_view = weights.reshape(1, 1, -1)
+            shield_tau_feature = np.sum(
+                (line_tau_fe + line_tau_pb) * weight_view,
+                axis=-1,
+            )
+            fe_tau_feature = np.sum(
+                line_tau_fe * weight_view,
+                axis=-1,
+            )
+            pb_tau_feature = np.sum(
+                line_tau_pb * weight_view,
+                axis=-1,
+            )
+            obstacle_tau_feature = np.sum(
+                line_tau_obstacle * weight_view,
+                axis=-1,
+            )
+            response_factor = self._transport_response_factor_numpy(
+                isotope,
+                fe_arr,
+                pb_arr,
+                shield_tau_feature,
+                obstacle_tau_feature,
+                fe_tau_feature,
+                pb_tau_feature,
+                distance_feature=response_distance,
+                distance_shield_feature=(
+                    response_distance * shield_tau_feature
+                ),
+            )
+            base_attenuation = np.sum(
+                np.exp(-line_total_tau) * line_buildup * weight_view,
+                axis=-1,
+            )
+        else:
+            total_tau = tau_fe + tau_pb + tau_obstacle
+            buildup = self._buildup_factor_numpy(
+                tau_fe,
+                tau_pb,
+                tau_obstacle,
+            )
+            shield_tau_feature = tau_fe + tau_pb
+            response_factor = self._transport_response_factor_numpy(
+                isotope,
+                fe_arr,
+                pb_arr,
+                shield_tau_feature,
+                tau_obstacle,
+                tau_fe,
+                tau_pb,
+                distance_feature=response_distance,
+                distance_shield_feature=(
+                    response_distance * shield_tau_feature
+                ),
+            )
+            base_attenuation = np.exp(-total_tau) * buildup
+
+        attenuation = np.clip(base_attenuation, 0.0, 1.0)
+        if self._transport_response_payload(isotope):
+            attenuation = np.maximum(attenuation * response_factor, 0.0)
+        mean_attenuation = np.mean(attenuation, axis=-1)
+        return (geom * mean_attenuation).astype(float, copy=False)
+
+    def _kernel_values_all_pairs_for_detectors_numpy(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        *,
+        chunk_size: int,
+    ) -> NDArray[np.float64]:
+        """Return detector-by-pair-by-source kernels via batched NumPy rows."""
+        detectors = np.asarray(detector_positions, dtype=float)
+        source_arr = np.asarray(sources, dtype=float)
+        if detectors.ndim != 2 or detectors.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (P, 3).")
+        if source_arr.ndim != 2 or source_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (S, 3).")
+        detector_count = int(detectors.shape[0])
+        source_count = int(source_arr.shape[0])
+        orientation_count = int(len(self.orientations))
+        pair_count = orientation_count * orientation_count
+        if detector_count == 0 or source_count == 0:
+            return np.zeros(
+                (detector_count, pair_count, source_count),
+                dtype=float,
+            )
+        pair_fe = np.repeat(
+            np.arange(orientation_count, dtype=np.int64),
+            orientation_count,
+        )
+        pair_pb = np.tile(
+            np.arange(orientation_count, dtype=np.int64),
+            orientation_count,
+        )
+        rows_per_detector = pair_count * source_count
+        total_rows = detector_count * rows_per_detector
+        chunk = self._adaptive_numpy_chunk_size(
+            chunk_size,
+            isotope=isotope,
+        )
+        parts: list[NDArray[np.float64]] = []
+        for start in range(0, total_rows, chunk):
+            stop = min(start + chunk, total_rows)
+            flat_rows = np.arange(start, stop, dtype=np.int64)
+            detector_indices = flat_rows // rows_per_detector
+            local_rows = flat_rows % rows_per_detector
+            pair_indices = local_rows // source_count
+            source_indices = local_rows % source_count
+            parts.append(
+                self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors[detector_indices],
+                    sources=source_arr[source_indices],
+                    fe_indices=pair_fe[pair_indices],
+                    pb_indices=pair_pb[pair_indices],
+                )
+            )
+        flat_values = np.concatenate(parts) if parts else np.zeros(0, dtype=float)
+        return flat_values.reshape(detector_count, pair_count, source_count)
 
     def _kernel_values_selected_pairs_for_detector_source_torch_chunk(
         self,
@@ -3595,6 +4547,10 @@ class ContinuousKernel:
             sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
             dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
             detector_to_source_unit = -dir_unit
+            response_distance = torch.linalg.norm(
+                sampled_sources - detectors_t.unsqueeze(-2),
+                dim=-1,
+            )
 
             l_fe_by_orient: list[torch.Tensor] = []
             l_pb_by_orient: list[torch.Tensor] = []
@@ -3755,8 +4711,8 @@ class ContinuousKernel:
                     obstacle_tau_feature,
                     fe_tau_feature,
                     pb_tau_feature,
-                    distance_feature=dist.view(-1, 1),
-                    distance_shield_feature=dist.view(-1, 1) * shield_tau_feature,
+                    distance_feature=response_distance,
+                    distance_shield_feature=response_distance * shield_tau_feature,
                     device=device,
                     dtype=dtype,
                 )
@@ -3782,8 +4738,8 @@ class ContinuousKernel:
                     tau_obstacle,
                     tau_fe,
                     tau_pb,
-                    distance_feature=dist.view(-1, 1),
-                    distance_shield_feature=dist.view(-1, 1) * (tau_fe + tau_pb),
+                    distance_feature=response_distance,
+                    distance_shield_feature=response_distance * (tau_fe + tau_pb),
                     device=device,
                     dtype=dtype,
                 )
@@ -3812,19 +4768,15 @@ class ContinuousKernel:
         if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
             raise ValueError("sources must be shaped (N, 3).")
         if not self.use_gpu:
-            rows = [
-                self.kernel_values_pair(
-                    isotope=isotope,
-                    detector_pos=detector_pos,
-                    sources=sources_arr,
-                    fe_index=fe_index,
-                    pb_index=pb_index,
-                    chunk_size=chunk_size,
-                )
-                for fe_index in range(num_orients)
-                for pb_index in range(num_orients)
-            ]
-            return np.vstack(rows).astype(float, copy=False)
+            detector = np.asarray(detector_pos, dtype=float)
+            if detector.shape != (3,):
+                raise ValueError("detector_pos must be shaped (3,).")
+            return self._kernel_values_all_pairs_for_detectors_numpy(
+                isotope,
+                detector.reshape(1, 3),
+                sources_arr,
+                chunk_size=chunk_size,
+            )[0]
         self._gpu_enabled()
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
@@ -3870,31 +4822,21 @@ class ContinuousKernel:
         sources_arr = np.asarray(sources, dtype=float)
         num_orients = int(len(self.orientations))
         num_pairs = num_orients * num_orients
-        if detectors_arr.size == 0 or sources_arr.size == 0:
-            if detectors_arr.size == 0:
-                pose_count = 0
-            else:
-                pose_count = int(detectors_arr.reshape(-1, 3).shape[0])
-            return np.zeros((pose_count, num_pairs, 0), dtype=float)
         if detectors_arr.ndim != 2 or detectors_arr.shape[1] != 3:
             raise ValueError("detector_positions must be shaped (P, 3).")
         if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
             raise ValueError("sources must be shaped (S, 3).")
         pose_count = int(detectors_arr.shape[0])
         source_count = int(sources_arr.shape[0])
+        if pose_count == 0 or source_count == 0:
+            return np.zeros((pose_count, num_pairs, source_count), dtype=float)
         if not self.use_gpu:
-            return np.stack(
-                [
-                    self.kernel_values_all_pairs(
-                        isotope=isotope,
-                        detector_pos=detector,
-                        sources=sources_arr,
-                        chunk_size=chunk_size,
-                    )
-                    for detector in detectors_arr
-                ],
-                axis=0,
-            ).astype(float, copy=False)
+            return self._kernel_values_all_pairs_for_detectors_numpy(
+                isotope,
+                detectors_arr,
+                sources_arr,
+                chunk_size=chunk_size,
+            )
         self._gpu_enabled()
         detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
         sources_flat = np.tile(sources_arr, (pose_count, 1))
@@ -3960,18 +4902,28 @@ class ContinuousKernel:
         if pose_count == 0 or source_count == 0:
             return np.zeros((pose_count, source_count), dtype=float)
         if not self.use_gpu:
-            return np.vstack(
-                [
-                    self.kernel_values_pair(
-                        isotope=isotope,
-                        detector_pos=detector,
-                        sources=sources_arr,
-                        fe_index=int(fe_idx),
-                        pb_index=int(pb_idx),
-                    )
-                    for detector, fe_idx, pb_idx in zip(detectors_arr, fe_arr, pb_arr)
-                ]
-            ).astype(float, copy=False)
+            detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
+            sources_flat = np.tile(sources_arr, (pose_count, 1))
+            fe_flat = np.repeat(fe_arr, source_count)
+            pb_flat = np.repeat(pb_arr, source_count)
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            parts = [
+                self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors_flat[start:stop],
+                    sources=sources_flat[start:stop],
+                    fe_indices=fe_flat[start:stop],
+                    pb_indices=pb_flat[start:stop],
+                )
+                for start in range(0, sources_flat.shape[0], chunk)
+                for stop in [min(start + chunk, sources_flat.shape[0])]
+            ]
+            if not parts:
+                return np.zeros((pose_count, source_count), dtype=float)
+            return np.concatenate(parts).reshape(pose_count, source_count)
         self._gpu_enabled()
         detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
         sources_flat = np.tile(sources_arr, (pose_count, 1))
@@ -4011,6 +4963,34 @@ class ContinuousKernel:
             return np.zeros((pose_count, source_count), dtype=float)
         return np.concatenate(parts).reshape(pose_count, source_count)
 
+    def _kernel_values_pair_scalar_oracle(
+        self,
+        isotope: str,
+        detector_pos: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_index: int,
+        pb_index: int,
+    ) -> NDArray[np.float64]:
+        """Return the scalar CPU kernel oracle for tests and explicit debugging."""
+        sources_arr = np.asarray(sources, dtype=float)
+        if sources_arr.size == 0:
+            return np.zeros(0, dtype=float)
+        if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        return np.asarray(
+            [
+                self.kernel_value_pair(
+                    isotope=isotope,
+                    detector_pos=detector_pos,
+                    source_pos=source,
+                    fe_index=fe_index,
+                    pb_index=pb_index,
+                )
+                for source in sources_arr
+            ],
+            dtype=float,
+        )
+
     def kernel_values_pair(
         self,
         isotope: str,
@@ -4027,19 +5007,28 @@ class ContinuousKernel:
         if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
             raise ValueError("sources must be shaped (N, 3).")
         if not self.use_gpu:
-            return np.asarray(
-                [
-                    self.kernel_value_pair(
-                        isotope=isotope,
-                        detector_pos=detector_pos,
-                        source_pos=source,
-                        fe_index=fe_index,
-                        pb_index=pb_index,
-                    )
-                    for source in sources_arr
-                ],
-                dtype=float,
+            detector = np.asarray(detector_pos, dtype=float)
+            if detector.shape != (3,):
+                raise ValueError("detector_pos must be shaped (3,).")
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
             )
+            parts = [
+                self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    isotope=isotope,
+                    detector_positions=np.broadcast_to(
+                        detector,
+                        (stop - start, 3),
+                    ),
+                    sources=sources_arr[start:stop],
+                    fe_indices=np.full(stop - start, int(fe_index), dtype=int),
+                    pb_indices=np.full(stop - start, int(pb_index), dtype=int),
+                )
+                for start in range(0, sources_arr.shape[0], chunk)
+                for stop in [min(start + chunk, sources_arr.shape[0])]
+            ]
+            return np.concatenate(parts) if parts else np.zeros(0, dtype=float)
         self._gpu_enabled()
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
@@ -4425,20 +5414,20 @@ class ContinuousKernel:
         Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
         """
         if not self.use_gpu:
-            rate = float(background)
             sources_arr = np.asarray(sources, dtype=float)
             strengths_arr = np.asarray(strengths, dtype=float)
             if sources_arr.size == 0:
-                return rate
-            for source_pos, strength in zip(sources_arr, strengths_arr):
-                rate += float(strength) * self.kernel_value_pair(
-                    isotope=isotope,
-                    detector_pos=detector_pos,
-                    source_pos=source_pos,
-                    fe_index=fe_index,
-                    pb_index=pb_index,
-                )
-            return float(rate)
+                return float(background)
+            if strengths_arr.shape != (sources_arr.shape[0],):
+                raise ValueError("strengths must contain one value per source.")
+            kernel_values = self.kernel_values_pair(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources=sources_arr,
+                fe_index=fe_index,
+                pb_index=pb_index,
+            )
+            return float(background) + float(np.dot(strengths_arr, kernel_values))
         self._gpu_enabled()
         return self._expected_rate_pair_torch(
             isotope=isotope,

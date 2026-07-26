@@ -273,7 +273,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "no_verification" in by_variant
     assert "no_obstacle_signature" in by_variant
     assert "no_pf_obstacle_attenuation" in by_variant
-    assert "volume_source_prior" in by_variant
+    assert "volume_source_prior" not in by_variant
     fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
     proposed_config = json.loads(by_variant["proposed"].config_path.read_text())
     round_robin = json.loads(by_variant["round_robin_shield"].config_path.read_text())
@@ -287,7 +287,42 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         proposed_config["precision_diagnostic_full_spectrum_response_enable"] is False
     )
     assert proposed_config["surface_observability_diagnostic_candidates"] == 0
-    assert proposed_config["sparse_poisson_evidence_min_distinct_stations"] == 2
+    assert proposed_config["source_surface_prior"] is True
+    removed_prefixes = (
+        "adaptive_strength_prior",
+        "all_history_dictionary",
+        "birth_global_rescue",
+        "birth_refit_residual",
+        "candidate_verification",
+        "conditional_strength",
+        "final_absent_",
+        "high_strength_split",
+        "mode_preserving_report_cardinality",
+        "online_absent_",
+        "report_best_so_far",
+        "report_cluster",
+        "report_mle_rescue",
+        "report_model_order",
+        "report_strength",
+        "report_surface_local_refine",
+        "runtime_report_rescue",
+        "source_strength_absorption",
+        "source_strength_observation_overshoot",
+        "source_strength_prior",
+        "sparse_poisson",
+        "surface_map",
+    )
+    for entry in entries:
+        generated = json.loads(entry.config_path.read_text())
+        assert generated["source_surface_prior"] is True
+        assert not any(key.startswith(removed_prefixes) for key in generated)
+        assert "birth_residual_suppress_death" not in generated
+        assert "birth_residual_force_proposal_on_gate" not in generated
+        assert "birth_residual_force_relax_candidate_masks" not in generated
+        assert "birth_residual_forced_min_delta_ll" not in generated
+        assert "birth_residual_acceptance_complexity_scale" not in generated
+        assert "refit_after_moves" not in generated
+        assert "source_prune_refit_after_remove" not in generated
     assert proposed_config["height_partner_reuse_shield_program"] is False
     assert round_robin["orientation_k"] == proposed_config["orientation_k"]
     assert (
@@ -333,17 +368,9 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert pf_obstacle_off["pf_obstacle_attenuation"] is False
     assert pf_obstacle_off["author_obstacle_prims"] is True
     assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
-    volume_prior = json.loads(by_variant["volume_source_prior"].config_path.read_text())
-    assert volume_prior["source_surface_prior"] is False
     no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
     assert no_birth["birth_max_per_update"] == 0
     assert no_birth.get("pf_max_sources") is None
-    assert no_birth["birth_residual_always_try"] is False
-    assert no_birth["birth_global_rescue_enable"] is False
-    assert no_birth["report_mle_rescue_enable"] is False
-    assert no_birth["runtime_report_rescue_enable"] is False
-    assert no_birth["runtime_report_rescue_candidate_weight"] == 0.0
-    assert no_birth["runtime_report_rescue_memory_enable"] is False
     passive_no_shield = json.loads(
         by_variant["baseline_passive_no_shield"].config_path.read_text()
     )
@@ -390,8 +417,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert eig_only["dss_pp"]["same_isotope_direct_separation_guard"] is False
     no_verification = json.loads(by_variant["no_verification"].config_path.read_text())
     assert no_verification["pseudo_source_verification_enable"] is False
-    assert no_verification["source_prune_refit_after_remove"] is False
-    assert no_verification["report_strength_refit_preserve_cardinality"] is True
     single_view = json.loads(
         by_variant["baseline_passive_fixed_shield_single_view"].config_path.read_text()
     )
@@ -494,7 +519,7 @@ def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None
         "feature_all_on",
         "no_dynamic_particle_allocation",
         "no_condition_planning",
-        "no_recovery_verification_modes",
+        "no_verification_pressure",
         "no_orthogonal_birth",
     }
     all_on_config = json.loads(Path(manifest["feature_all_on"][3]).read_text())
@@ -504,8 +529,8 @@ def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None
     no_condition_config = json.loads(
         Path(manifest["no_condition_planning"][3]).read_text()
     )
-    no_recovery_config = json.loads(
-        Path(manifest["no_recovery_verification_modes"][3]).read_text()
+    no_verification_pressure_config = json.loads(
+        Path(manifest["no_verification_pressure"][3]).read_text()
     )
     no_orthogonal_config = json.loads(
         Path(manifest["no_orthogonal_birth"][3]).read_text()
@@ -516,16 +541,21 @@ def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None
     assert all_on_config["candidate_isotopes"] == ["Cs-137"]
     assert no_dynamic_config["candidate_isotopes"] == ["Cs-137"]
     assert no_condition_config["candidate_isotopes"] == ["Cs-137"]
-    assert no_recovery_config["candidate_isotopes"] == ["Cs-137"]
+    assert no_verification_pressure_config["candidate_isotopes"] == ["Cs-137"]
     assert no_orthogonal_config["candidate_isotopes"] == ["Cs-137"]
     assert all_on_config["birth_orthogonalize_residual_candidates"] is True
     assert all_on_config["mode_preserving_dynamic_cardinality_allocation"] is True
     assert no_dynamic_config["mode_preserving_dynamic_cardinality_allocation"] is False
     assert no_condition_config["dss_pp"]["station_condition_weight"] == 0.0
     assert no_condition_config["dss_pp"]["elevation_condition_weight"] == 0.0
-    assert no_recovery_config["dss_pp"]["include_runtime_rescue_modes"] is False
     assert (
-        no_recovery_config["remaining_measurement_estimate"]["verification_weight"]
+        "include_runtime_rescue_modes"
+        not in no_verification_pressure_config["dss_pp"]
+    )
+    assert (
+        no_verification_pressure_config["remaining_measurement_estimate"][
+            "verification_weight"
+        ]
         == 0.0
     )
     assert no_orthogonal_config["birth_orthogonalize_residual_candidates"] is False

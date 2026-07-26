@@ -358,13 +358,22 @@ def _orchestrator_directive_from_mapping(
         raise ExternalRelocationError(
             "PFDirective must apply at cutoff and corroborate strictly afterward."
         )
-    if not isinstance(safety, Mapping) or any(
+    safety_fields = {
+        "hard_prune_authorized",
+        "future_only_corroboration",
+        "once_only_application",
+        "requires_target_preserving_mh",
+    }
+    if (
+        not isinstance(safety, Mapping)
+        or {str(key) for key in safety} != safety_fields
+        or any(
         (
-            safety.get("direct_mle_objective_reweight") is not False,
             safety.get("hard_prune_authorized") is not False,
             safety.get("future_only_corroboration") is not True,
             safety.get("once_only_application") is not True,
             safety.get("requires_target_preserving_mh") is not True,
+        )
         )
     ):
         raise ExternalRelocationError(
@@ -1224,7 +1233,6 @@ class ExternalRelocationSchedule:
                 "pf_state_sha256_after": state_after,
                 "candidate_outcomes": candidate_outcomes,
                 "safety_evidence": {
-                    "direct_mle_objective_reweight_performed": False,
                     "hard_prune_performed": False,
                     "target_preserving_mh_performed": True,
                     "reweighted_observation_step_ids": [],
@@ -1269,8 +1277,6 @@ class ExternalRelocationSchedule:
                 }
             )
             self._applied_ids.add(directive.directive_id)
-            if accepted_count:
-                estimator._invalidate_report_cache()
 
     @property
     def applied_directive_ids(self) -> tuple[str, ...]:

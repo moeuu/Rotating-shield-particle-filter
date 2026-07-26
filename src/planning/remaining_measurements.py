@@ -40,16 +40,9 @@ class RemainingMeasurementConfig:
     separation_weight: float = 1.5
     verification_weight: float = 1.0
     residual_weight: float = 1.0
-    report_response_correlation_weight: float = 1.0
-    report_residual_weight: float = 1.0
-    strength_absorption_weight: float = 0.5
-    report_response_correlation_threshold: float = 0.9
-    report_positive_residual_fraction_threshold: float = 0.02
-    report_strength_concentration_threshold: float = 0.75
     high_surface_ambiguity_weight: float = 1.0
     high_surface_z_fraction: float = 0.75
     high_surface_pairwise_separation_threshold: float = 9.0
-    high_surface_absorption_q_multiple: float = 2.0
     dss_information_gain_weight: float = 1.0
     dss_count_utility_weight: float = 0.25
     range_scale: float = 1.35
@@ -57,7 +50,6 @@ class RemainingMeasurementConfig:
     unresolved_absent_min_max_counts: float = 5.0
     unresolved_absent_min_snr: float = 2.0
     unresolved_absent_budget_weight: float = 1.0
-    residual_surface_gain_candidate_limit: int = 2048
 
 
 @dataclass(frozen=True)
@@ -99,6 +91,15 @@ class _PairwiseSignatureStats:
     weighted_increment: float
 
 
+@dataclass(frozen=True)
+class _PosteriorPredictiveResidualStats:
+    """Store likelihood-matched residual diagnostics from the PF posterior."""
+
+    deviance: float
+    positive_chi2: float
+    mean_counts: float
+
+
 def _json_safe(value: Any) -> Any:
     """Return a JSON-safe copy with nonfinite floats converted to null."""
     if isinstance(value, dict):
@@ -135,7 +136,6 @@ def _remaining_state_cache_key(
     )
     return (
         int(len(getattr(estimator, "measurements", []))),
-        int(getattr(estimator, "_report_cache_revision", 0)),
         config_items,
     )
 
@@ -163,7 +163,6 @@ def _store_remaining_state_payload(
         str,
         list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
     ],
-    residual_surface_gain: float,
 ) -> None:
     """Store state diagnostics for the next post-DSS remaining-budget call."""
     setattr(
@@ -174,7 +173,6 @@ def _store_remaining_state_payload(
             "components": components,
             "isotope_details": isotope_details,
             "mode_arrays": mode_arrays,
-            "residual_surface_gain": float(residual_surface_gain),
         },
     )
 
@@ -316,6 +314,129 @@ def _mode_response_matrix(
     )
 
 
+def _posterior_predictive_residual_stats(
+    estimator: RotatingShieldPFEstimator,
+    isotope: str,
+    data: object,
+    weights: NDArray[np.float64],
+    *,
+    variance_floor: float,
+) -> _PosteriorPredictiveResidualStats:
+    """Return PF-posterior residual diagnostics under the runtime likelihood.
+
+    All detector poses, shield pairs, PF particles, and source slots are
+    evaluated through the estimator's batched production response path.  The
+    deviance uses the filter's structural likelihood, including its configured
+    same-station covariance, instead of fitting an additional surface source.
+    """
+    filt = estimator.filters[isotope]
+    particles = filt.continuous_particles
+    norm_weights = _normalise_weights(np.asarray(weights, dtype=float))
+    if not particles or norm_weights.size != len(particles):
+        return _PosteriorPredictiveResidualStats(0.0, 0.0, 0.0)
+
+    detector_positions = np.asarray(
+        getattr(data, "detector_positions"),
+        dtype=float,
+    ).reshape(-1, 3)
+    observations = np.asarray(getattr(data, "z_k"), dtype=float).reshape(-1)
+    if detector_positions.shape[0] == 0 or observations.size == 0:
+        return _PosteriorPredictiveResidualStats(0.0, 0.0, 0.0)
+    if detector_positions.shape[0] != observations.size:
+        raise ValueError("Posterior-predictive detector rows must match observations.")
+
+    unique_positions, inverse_positions = np.unique(
+        detector_positions,
+        axis=0,
+        return_inverse=True,
+    )
+    states = [particle.state for particle in particles]
+    unit_live_counts = estimator.expected_counts_all_pairs_for_states_at_detectors(
+        isotope=isotope,
+        detector_positions=unique_positions,
+        live_time_s=1.0,
+        states=states,
+    )
+    num_orientations = max(1, int(estimator.num_orientations))
+    fe_indices = np.asarray(getattr(data, "fe_indices"), dtype=int).reshape(-1)
+    pb_indices = np.asarray(getattr(data, "pb_indices"), dtype=int).reshape(-1)
+    live_times = np.asarray(getattr(data, "live_times"), dtype=float).reshape(-1)
+    if not (fe_indices.size == pb_indices.size == live_times.size == observations.size):
+        raise ValueError("Posterior-predictive measurement vectors must align.")
+    pair_ids = fe_indices * num_orientations + pb_indices
+    pair_count = num_orientations * num_orientations
+    if np.any(pair_ids < 0) or np.any(pair_ids >= pair_count):
+        raise ValueError("Measurement shield-pair index is out of range.")
+    lambda_kp = np.maximum(
+        unit_live_counts[inverse_positions, pair_ids, :]
+        * np.maximum(live_times, 0.0)[:, None],
+        1.0e-12,
+    )
+    if lambda_kp.shape != (observations.size, len(particles)):
+        raise RuntimeError("Batched PF posterior counts returned an unexpected shape.")
+
+    log_likelihoods = filt._structural_count_log_likelihood_matrix_np(
+        data,
+        lambda_kp,
+    )
+    finite = np.isfinite(log_likelihoods) & (norm_weights > 0.0)
+    if not np.any(finite):
+        return _PosteriorPredictiveResidualStats(0.0, 0.0, 0.0)
+    finite_ll = np.asarray(log_likelihoods[finite], dtype=float)
+    finite_weights = _normalise_weights(norm_weights[finite])
+    max_ll = float(np.max(finite_ll))
+    log_predictive = max_ll + float(
+        np.log(
+            np.sum(
+                finite_weights * np.exp(finite_ll - max_ll),
+            )
+        )
+    )
+    saturated_lambda = np.maximum(observations, 1.0e-12)[:, None]
+    saturated_log_likelihood = float(
+        filt._structural_count_log_likelihood_matrix_np(
+            data,
+            saturated_lambda,
+        )[0]
+    )
+    deviance = max(
+        2.0 * (saturated_log_likelihood - log_predictive),
+        0.0,
+    )
+
+    posterior_mean = np.asarray(lambda_kp @ norm_weights, dtype=float)
+    centered = lambda_kp - posterior_mean[:, None]
+    posterior_variance = np.asarray(
+        (centered * centered) @ norm_weights,
+        dtype=float,
+    )
+    observation_variances = np.asarray(
+        getattr(data, "observation_variances"),
+        dtype=float,
+    ).reshape(-1)
+    likelihood_variance = np.asarray(
+        filt._structural_effective_variance_np(
+            observations,
+            posterior_mean[:, None],
+            observation_variances,
+        )[:, 0],
+        dtype=float,
+    )
+    predictive_variance = np.maximum(
+        likelihood_variance + posterior_variance,
+        max(float(variance_floor), 1.0e-12),
+    )
+    positive_residual = np.maximum(observations - posterior_mean, 0.0)
+    positive_chi2 = float(
+        np.sum((positive_residual * positive_residual) / predictive_variance)
+    )
+    return _PosteriorPredictiveResidualStats(
+        deviance=float(deviance),
+        positive_chi2=float(max(positive_chi2, 0.0)),
+        mean_counts=float(np.sum(posterior_mean)),
+    )
+
+
 def _high_surface_mode_mask(
     estimator: RotatingShieldPFEstimator,
     positions: NDArray[np.float64],
@@ -372,9 +493,6 @@ def _state_budget_components(
         "same_isotope_separation": 0.0,
         "pseudo_source_verification": 0.0,
         "residual": 0.0,
-        "report_response_correlation": 0.0,
-        "report_residual": 0.0,
-        "strength_absorption": 0.0,
         "isotope_absence": 0.0,
         "high_surface_ambiguity": 0.0,
     }
@@ -390,14 +508,6 @@ def _state_budget_components(
         _timer_add(
             timings, "state_absent_evidence_s", time.perf_counter() - evidence_start
         )
-    report_start = time.perf_counter()
-    try:
-        report_diagnostics = estimator.report_model_order_diagnostics()
-    except (RuntimeError, ValueError, TypeError):
-        report_diagnostics = {}
-    _timer_add(
-        timings, "state_report_diagnostics_s", time.perf_counter() - report_start
-    )
     isotope_details: dict[str, dict[str, float | int]] = {}
     mode_arrays: dict[
         str,
@@ -422,66 +532,10 @@ def _state_budget_components(
         count_supported, total_counts, max_count, signal_snr = (
             _measurement_data_count_evidence(data, config)
         )
-        report_stats = (
-            report_diagnostics.get(str(isotope), {})
-            if isinstance(report_diagnostics, dict)
-            else {}
-        )
-        report_selected_count = (
-            int(report_stats.get("selected_count", 0))
-            if isinstance(report_stats, dict)
-            else 0
-        )
-        report_candidate_count = (
-            int(report_stats.get("candidate_count", 0))
-            if isinstance(report_stats, dict)
-            else 0
-        )
-        report_count_supported_zero = (
-            bool(report_stats.get("count_supported_zero_source", False))
-            if isinstance(report_stats, dict)
-            else False
-        )
-        report_model_order_unready = (
-            not bool(report_stats.get("model_order_ready", False))
-            and (
-                report_candidate_count > 0
-                or report_selected_count > 0
-                or report_count_supported_zero
-            )
-            if isinstance(report_stats, dict)
-            else False
-        )
-        report_max_response_corr = (
-            float(report_stats.get("selected_max_response_correlation", 0.0))
-            if isinstance(report_stats, dict)
-            else 0.0
-        )
-        report_positive_residual_fraction = (
-            float(report_stats.get("selected_positive_residual_fraction", 0.0))
-            if isinstance(report_stats, dict)
-            else 0.0
-        )
-        report_positive_residual_chi2 = (
-            float(report_stats.get("selected_positive_residual_chi2", 0.0))
-            if isinstance(report_stats, dict)
-            else 0.0
-        )
-        report_strengths = (
-            np.maximum(
-                np.asarray(
-                    report_stats.get("selected_strengths", []), dtype=float
-                ).reshape(-1),
-                0.0,
-            )
-            if isinstance(report_stats, dict)
-            else np.zeros(0, dtype=float)
-        )
+        source_probability = float(np.sum(weights[source_counts > 0]))
         active_evidence = bool(
             count_supported
-            or report_selected_count > 0
-            or report_count_supported_zero
-            or report_model_order_unready
+            or source_probability > 1.0e-9
             or str(isotope) in unresolved_absent
         )
         strength_totals = [
@@ -536,10 +590,6 @@ def _state_budget_components(
             max(int(getattr(filt, "last_pseudo_source_quarantine_active", 0)), 0)
         )
         separation_budget = 0.0
-        report_corr_budget = 0.0
-        report_residual_budget = 0.0
-        strength_absorption_budget = 0.0
-        report_strength_concentration = 0.0
         min_separation = float("inf")
         unresolved_pairs = 0
         high_surface_budget = 0.0
@@ -547,6 +597,9 @@ def _state_budget_components(
         high_surface_min_separation = float("inf")
         high_surface_unresolved_pairs = 0
         residual_budget = 0.0
+        residual_deviance = 0.0
+        residual_positive_chi2 = 0.0
+        posterior_predictive_mean_counts = 0.0
         absent_payload = unresolved_absent.get(str(isotope), {})
         absence_budget = float(absent_payload.get("budget", 0.0))
         if not active_evidence:
@@ -555,6 +608,7 @@ def _state_budget_components(
                 "mode_count": int(len(modes)),
                 "map_source_count": int(map_count),
                 "active_evidence": 0,
+                "posterior_source_probability": float(source_probability),
                 "observed_signal_total_counts": float(total_counts),
                 "observed_signal_max_count": float(max_count),
                 "observed_signal_snr": float(signal_snr),
@@ -571,16 +625,9 @@ def _state_budget_components(
                 "high_surface_min_pairwise_separation": 0.0,
                 "high_surface_unresolved_pair_count": 0,
                 "high_surface_ambiguity_budget": 0.0,
-                "residual_chi2": 0.0,
-                "report_max_response_correlation": float(report_max_response_corr),
-                "report_response_correlation_budget": 0.0,
-                "report_positive_residual_fraction": float(
-                    report_positive_residual_fraction
-                ),
-                "report_positive_residual_chi2": float(report_positive_residual_chi2),
-                "report_residual_budget": 0.0,
-                "report_strength_concentration": 0.0,
-                "strength_absorption_budget": 0.0,
+                "posterior_predictive_deviance": 0.0,
+                "posterior_predictive_positive_chi2": 0.0,
+                "posterior_predictive_mean_counts": 0.0,
                 "unresolved_absent_budget": 0.0,
                 "unresolved_absent_total_counts": float(
                     absent_payload.get("total_counts", 0.0)
@@ -631,76 +678,25 @@ def _state_budget_components(
                 high_surface_budget += float(high_stats.deficit)
                 high_surface_min_separation = high_stats.min_separation
                 high_surface_unresolved_pairs = high_stats.unresolved_pairs
-            prior_mean = max(
-                float(
-                    getattr(
-                        getattr(estimator, "pf_config", None),
-                        "source_strength_prior_mean",
-                        0.0,
-                    )
-                ),
-                0.0,
+        if data is not None and data.z_k.size:
+            residual_start = time.perf_counter()
+            residual_stats = _posterior_predictive_residual_stats(
+                estimator,
+                isotope,
+                data,
+                weights,
+                variance_floor=variance_floor,
             )
-            if prior_mean > 0.0 and np.any(high_mask):
-                high_strengths = mode_strengths[high_mask]
-                absorption_threshold = prior_mean * max(
-                    float(config.high_surface_absorption_q_multiple),
-                    1.0,
-                )
-                high_surface_budget += float(
-                    np.sum(
-                        np.maximum(
-                            high_strengths / max(absorption_threshold, 1.0e-12) - 1.0,
-                            0.0,
-                        )
-                    )
-                )
-            background_rate = (
-                float(filt.best_particle().state.background)
-                if filt.continuous_particles
-                else 0.0
+            _timer_add(
+                timings,
+                f"state_posterior_predictive_{isotope}_s",
+                time.perf_counter() - residual_start,
             )
-            prediction = background_rate * data.live_times + np.sum(response, axis=1)
-            residual = np.maximum(np.asarray(data.z_k, dtype=float) - prediction, 0.0)
-            residual_chi2 = float(np.sum((residual * residual) / variance))
-            residual_budget = max(residual_chi2 / residual_threshold - 1.0, 0.0)
-        else:
-            residual_chi2 = 0.0
-        if report_selected_count > 1:
-            corr_threshold = float(
-                np.clip(config.report_response_correlation_threshold, 0.0, 1.0)
-            )
-            if corr_threshold < 1.0:
-                report_corr_budget = max(
-                    (report_max_response_corr - corr_threshold)
-                    / max(1.0 - corr_threshold, 1.0e-12),
-                    0.0,
-                )
-        residual_fraction_threshold = max(
-            float(config.report_positive_residual_fraction_threshold),
-            0.0,
-        )
-        if residual_fraction_threshold > 0.0:
-            report_residual_budget = max(
-                report_positive_residual_fraction / residual_fraction_threshold - 1.0,
-                0.0,
-            )
-        if report_strengths.size:
-            total_report_strength = float(np.sum(report_strengths))
-            if total_report_strength > 1.0e-12:
-                report_strength_concentration = float(
-                    np.max(report_strengths) / total_report_strength
-                )
-        concentration_threshold = float(
-            np.clip(config.report_strength_concentration_threshold, 1.0e-12, 1.0)
-        )
-        if (
-            report_selected_count > 1
-            and report_strength_concentration > concentration_threshold
-            and (report_residual_budget > 0.0 or report_corr_budget > 0.0)
-        ):
-            strength_absorption_budget = max(
-                report_strength_concentration / concentration_threshold - 1.0,
+            residual_deviance = float(residual_stats.deviance)
+            residual_positive_chi2 = float(residual_stats.positive_chi2)
+            posterior_predictive_mean_counts = float(residual_stats.mean_counts)
+            residual_budget = max(
+                residual_deviance / residual_threshold - 1.0,
                 0.0,
             )
         components["uncertainty"] += spread_budget + strength_budget
@@ -708,9 +704,6 @@ def _state_budget_components(
         components["same_isotope_separation"] += separation_budget
         components["pseudo_source_verification"] += verification_budget
         components["residual"] += residual_budget
-        components["report_response_correlation"] += report_corr_budget
-        components["report_residual"] += report_residual_budget
-        components["strength_absorption"] += strength_absorption_budget
         components["isotope_absence"] += float(
             config.unresolved_absent_budget_weight
         ) * max(absence_budget, 0.0)
@@ -719,6 +712,7 @@ def _state_budget_components(
             "mode_count": int(len(modes)),
             "map_source_count": int(map_count),
             "active_evidence": int(active_evidence),
+            "posterior_source_probability": float(source_probability),
             "observed_signal_total_counts": float(total_counts),
             "observed_signal_max_count": float(max_count),
             "observed_signal_snr": float(signal_snr),
@@ -741,16 +735,9 @@ def _state_budget_components(
             ),
             "high_surface_unresolved_pair_count": int(high_surface_unresolved_pairs),
             "high_surface_ambiguity_budget": float(high_surface_budget),
-            "residual_chi2": float(residual_chi2),
-            "report_max_response_correlation": float(report_max_response_corr),
-            "report_response_correlation_budget": float(report_corr_budget),
-            "report_positive_residual_fraction": float(
-                report_positive_residual_fraction
-            ),
-            "report_positive_residual_chi2": float(report_positive_residual_chi2),
-            "report_residual_budget": float(report_residual_budget),
-            "report_strength_concentration": float(report_strength_concentration),
-            "strength_absorption_budget": float(strength_absorption_budget),
+            "posterior_predictive_deviance": float(residual_deviance),
+            "posterior_predictive_positive_chi2": float(residual_positive_chi2),
+            "posterior_predictive_mean_counts": float(posterior_predictive_mean_counts),
             "unresolved_absent_budget": float(max(absence_budget, 0.0)),
             "unresolved_absent_total_counts": float(
                 absent_payload.get("total_counts", 0.0)
@@ -847,7 +834,6 @@ def _prediction_gain_components(
     dss_node: DSSPPNode | None,
     dss_diagnostics: dict[str, float | int | str] | None,
     *,
-    residual_surface_gain: float | None = None,
     timings: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], int]:
     """Return predicted one-station ambiguity reduction components."""
@@ -861,7 +847,6 @@ def _prediction_gain_components(
         "same_isotope_separation": 0.0,
         "pseudo_source_verification": 0.0,
         "residual": 0.0,
-        "residual_surface": 0.0,
         "dss_information": 0.0,
         "high_surface_ambiguity": 0.0,
     }
@@ -938,159 +923,9 @@ def _prediction_gain_components(
             if key in dss_diagnostics:
                 gains["dss_information"] += max(float(dss_diagnostics[key]), 0.0)
                 break
-    if residual_surface_gain is None:
-        residual_surface_gain = _residual_surface_gain_estimate(
-            estimator,
-            mode_arrays,
-            config,
-            timings=timings,
-        )
-    else:
-        _timer_add(timings, "residual_surface_cache_hit", 1.0)
-    gains["residual_surface"] = residual_surface_gain
-    gains["residual"] += residual_surface_gain
     gains["pseudo_source_verification"] += float(program_length)
     _timer_add(timings, "prediction_total_s", time.perf_counter() - start)
     return gains, program_length
-
-
-def _residual_surface_gain_estimate(
-    estimator: RotatingShieldPFEstimator,
-    mode_arrays: dict[
-        str,
-        list[tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]],
-    ],
-    config: RemainingMeasurementConfig,
-    timings: dict[str, float] | None = None,
-) -> float:
-    """
-    Return a batched estimate of residual reduction available from one surface source.
-
-    The residual budget can be very large after PF posterior collapse.  DSS count
-    utility is a station-local score and is often too small to scale that budget,
-    so this diagnostic computes the best single fixed-surface source that could
-    reduce the current positive residual over the accumulated measurements.  It
-    uses the same PF response model and a batched weighted least-squares strength
-    fit over known source-surface candidates; no transport shortcut is introduced.
-    """
-    start = time.perf_counter()
-    pool_all = np.asarray(
-        getattr(estimator, "candidate_sources", np.zeros((0, 3))),
-        dtype=float,
-    )
-    if pool_all.size == 0:
-        return 0.0
-    pool_all = pool_all.reshape(-1, 3)
-    limit = int(config.residual_surface_gain_candidate_limit)
-    if limit > 0 and pool_all.shape[0] > limit:
-        sample_indices = np.linspace(
-            0,
-            pool_all.shape[0] - 1,
-            max(1, limit),
-            dtype=np.int64,
-        )
-        pool = pool_all[sample_indices]
-    else:
-        sample_indices = np.arange(pool_all.shape[0], dtype=np.int64)
-        pool = pool_all
-    if pool.size == 0:
-        return 0.0
-    threshold = max(float(config.residual_chi2_threshold), 1.0e-12)
-    variance_floor = max(float(config.count_variance_floor), 1.0e-12)
-    eps = max(float(config.gain_epsilon), 1.0e-12)
-    total_gain = 0.0
-    for isotope, filt in estimator.filters.items():
-        iso_start = time.perf_counter()
-        data = estimator._measurement_data_for_iso(isotope, window=None)
-        if data is None or data.z_k.size == 0:
-            continue
-        variances = np.maximum(
-            np.asarray(data.observation_variances, dtype=float).reshape(-1),
-            variance_floor,
-        )
-        if variances.size != data.z_k.size:
-            continue
-        background_rate = (
-            float(filt.best_particle().state.background)
-            if getattr(filt, "continuous_particles", None)
-            else 0.0
-        )
-        prediction = background_rate * np.asarray(data.live_times, dtype=float)
-        arrays = mode_arrays.get(isotope, [])
-        if arrays:
-            mode_positions, mode_strengths, _mode_weights = arrays[0]
-            response = _mode_response_matrix(
-                estimator,
-                isotope,
-                data.detector_positions,
-                data.fe_indices,
-                data.pb_indices,
-                data.live_times,
-                mode_positions,
-                mode_strengths,
-            )
-            prediction = prediction + np.sum(response, axis=1)
-        residual = np.maximum(
-            np.asarray(data.z_k, dtype=float).reshape(-1) - prediction,
-            0.0,
-        )
-        current_chi2 = float(np.sum((residual * residual) / variances))
-        if current_chi2 <= threshold:
-            continue
-        cached_grid_getter = getattr(estimator, "_cached_candidate_grid_counts", None)
-        if callable(cached_grid_getter):
-            candidate_counts = cached_grid_getter(
-                filt=filt,
-                isotope=isotope,
-                data=data,
-            )[:, sample_indices]
-            _timer_add(timings, "residual_surface_candidate_cache_path", 1.0)
-        else:
-            candidate_counts = expected_counts_per_source(
-                kernel=filt.continuous_kernel,
-                isotope=isotope,
-                detector_positions=data.detector_positions,
-                sources=pool,
-                strengths=np.ones(pool.shape[0], dtype=float),
-                live_times=data.live_times,
-                fe_indices=data.fe_indices,
-                pb_indices=data.pb_indices,
-                source_scale=estimator.response_scales_for_measurements(
-                    isotope,
-                    data.fe_indices,
-                    data.pb_indices,
-                ),
-            )
-        counts = np.maximum(np.asarray(candidate_counts, dtype=float), 0.0)
-        if counts.ndim != 2 or counts.shape != (data.z_k.size, pool.shape[0]):
-            continue
-        weights = 1.0 / np.maximum(variances, eps)
-        numerator = np.sum(weights[:, None] * residual[:, None] * counts, axis=0)
-        denominator = np.sum(weights[:, None] * counts * counts, axis=0)
-        q_hat = np.divide(
-            numerator,
-            np.maximum(denominator, eps),
-            out=np.zeros_like(numerator),
-            where=denominator > eps,
-        )
-        valid = np.isfinite(q_hat) & (q_hat > 0.0)
-        if not np.any(valid):
-            continue
-        trial_residual = np.maximum(
-            residual[:, None] - counts[:, valid] * q_hat[valid][None, :],
-            0.0,
-        )
-        trial_chi2 = np.sum(weights[:, None] * trial_residual * trial_residual, axis=0)
-        reduction = np.maximum(current_chi2 - trial_chi2, 0.0)
-        if reduction.size:
-            total_gain += float(np.max(reduction)) / threshold
-        _timer_add(
-            timings,
-            f"residual_surface_{isotope}_s",
-            time.perf_counter() - iso_start,
-        )
-    _timer_add(timings, "residual_surface_total_s", time.perf_counter() - start)
-    return float(max(total_gain, 0.0))
 
 
 def _empirical_eta(
@@ -1149,25 +984,15 @@ def estimate_remaining_measurement_budget(
     timings: dict[str, float] = {}
     cache_key = _remaining_state_cache_key(estimator, cfg)
     cached_state = _cached_remaining_state_payload(estimator, cache_key)
-    cached_residual_surface_gain: float | None = None
     if cached_state is not None:
         timings["state_cache_hit"] = 1.0
         components = dict(cached_state.get("components", {}))
         isotope_details = dict(cached_state.get("isotope_details", {}))
         mode_arrays = dict(cached_state.get("mode_arrays", {}))
-        cached_residual_surface_gain = float(
-            cached_state.get("residual_surface_gain", 0.0)
-        )
     else:
         timings["state_cache_hit"] = 0.0
         components, isotope_details, mode_arrays = _state_budget_components(
             estimator,
-            cfg,
-            timings=timings,
-        )
-        cached_residual_surface_gain = _residual_surface_gain_estimate(
-            estimator,
-            mode_arrays,
             cfg,
             timings=timings,
         )
@@ -1178,7 +1003,6 @@ def estimate_remaining_measurement_budget(
                 components=components,
                 isotope_details=isotope_details,
                 mode_arrays=mode_arrays,
-                residual_surface_gain=cached_residual_surface_gain,
             )
     gains, program_length = _prediction_gain_components(
         estimator,
@@ -1189,7 +1013,6 @@ def estimate_remaining_measurement_budget(
         cfg,
         dss_node,
         dss_diagnostics,
-        residual_surface_gain=cached_residual_surface_gain,
         timings=timings,
     )
     weighted_budget = (
@@ -1198,10 +1021,6 @@ def estimate_remaining_measurement_budget(
         + float(cfg.separation_weight) * components["same_isotope_separation"]
         + float(cfg.verification_weight) * components["pseudo_source_verification"]
         + float(cfg.residual_weight) * components["residual"]
-        + float(cfg.report_response_correlation_weight)
-        * components["report_response_correlation"]
-        + float(cfg.report_residual_weight) * components["report_residual"]
-        + float(cfg.strength_absorption_weight) * components["strength_absorption"]
         + float(cfg.high_surface_ambiguity_weight)
         * components["high_surface_ambiguity"]
         + components["isotope_absence"]

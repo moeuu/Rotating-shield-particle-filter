@@ -14,6 +14,7 @@ import numpy as np
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import build_obstacle_grid
 from measurement.source_surfaces import generate_surface_sources
+from pf.profiles import reject_removed_estimator_config
 from runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_MEASUREMENT_TIME_S,
@@ -325,37 +326,20 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "birth_max_per_update": 0,
             "split_prob": 0.0,
             "split_residual_guided": False,
-            "split_residual_always_try": False,
             "birth_use_shield_coded_residual": False,
-            "birth_residual_always_try": False,
             "birth_residual_expand_structural_particles": False,
-            "birth_residual_force_proposal_on_gate": False,
-            "birth_residual_suppress_death": False,
-            "birth_global_rescue_enable": False,
             "residual_decomposition_enable": False,
             "peak_suppression_enable": False,
-            "report_mle_rescue_enable": False,
-            "report_mle_rescue_max_residual_candidates": 0,
-            "runtime_report_rescue_enable": False,
-            "runtime_report_rescue_particle_fraction": 0.0,
-            "runtime_report_rescue_weight": 0.0,
-            "runtime_report_rescue_quarantine_enable": False,
-            "runtime_report_rescue_quarantine_weight": 0.0,
-            "runtime_report_rescue_candidate_weight": 0.0,
-            "runtime_report_rescue_memory_enable": False,
-            "runtime_report_rescue_memory_max_sources": 0,
         },
     ),
     AblationVariant(
         name="no_verification",
         description=(
-            "Disable tentative-source verification and refit-after-remove "
-            "report pruning for logged estimator-side replay ablations."
+            "Disable causal tentative-source verification for a logged "
+            "estimator-side replay ablation."
         ),
         overrides={
             "pseudo_source_verification_enable": False,
-            "source_prune_refit_after_remove": False,
-            "report_strength_refit_preserve_cardinality": True,
         },
     ),
     AblationVariant(
@@ -376,14 +360,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "known-obstacle attenuation from the PF observation kernel."
         ),
         overrides={"pf_obstacle_attenuation": False},
-    ),
-    AblationVariant(
-        name="volume_source_prior",
-        description=(
-            "Use legacy full-volume PF source-position support instead of "
-            "known room, floor, ceiling, and obstacle surfaces."
-        ),
-        overrides={"source_surface_prior": False},
     ),
 )
 
@@ -667,6 +643,11 @@ def _variant_config(
     """Return the runtime config for one ablation variant."""
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
+    reject_removed_estimator_config(config)
+    if config.get("estimator_profile") != "pf_strict":
+        raise ValueError("RA-L ablations require estimator_profile='pf_strict'.")
+    if config.get("source_surface_prior") is not True:
+        raise ValueError("RA-L ablations require source_surface_prior=true.")
     transport_history_mode = _validate_ral_transport_sampling(config)
     thread_count = int(config.get("thread_count", 1))
     if thread_count <= 1:

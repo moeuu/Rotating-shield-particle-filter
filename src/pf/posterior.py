@@ -124,7 +124,6 @@ class PFPosteriorSnapshot:
             "config_sha256": str(self.config_hash),
             "random_seed": int(self.random_seed),
             "planner_belief_sources": list(self.planner_belief_sources),
-            "batch_feedback_applied": False,
             "posterior_semantics": str(structural["posterior_semantics"]),
             "structural_transition_provenance": dict(structural),
         }
@@ -134,12 +133,6 @@ class PFPosteriorSnapshot:
             "estimator_variant": str(self.estimator_variant),
             "estimator_profile": str(self.estimator_variant),
             "final_estimate_source": "pf_posterior",
-            "uses_all_history_batch_fit": False,
-            "uses_surface_map": False,
-            "uses_batch_model_order": False,
-            "batch_feedback_to_particles": False,
-            "batch_feedback_applied": False,
-            "batch_methods_invoked": [],
             "posterior_semantics": str(structural["posterior_semantics"]),
             "structural_kernel_family": str(structural["structural_kernel_family"]),
             "structural_kernel_target_preserving": bool(

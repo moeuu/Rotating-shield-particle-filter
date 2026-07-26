@@ -1,5 +1,7 @@
 {
   "backend": "isaacsim",
+  "estimator_profile": "pf_strict",
+  "source_surface_prior": true,
   "host": "127.0.0.1",
   "port": 5555,
   "timeout_s": 90.0,

@@ -59,13 +59,6 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
             "2",
             "--adaptive-ready-min-snr",
             "1.5",
-            "--no-adaptive-strength-prior",
-            "--adaptive-strength-prior-steps",
-            "5",
-            "--adaptive-strength-prior-min-counts",
-            "4.5",
-            "--adaptive-strength-prior-log-sigma",
-            "0.25",
             "--pose-min-observation-counts",
             "6.5",
             "--pose-min-observation-penalty-scale",
@@ -105,10 +98,6 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
     assert captured["adaptive_ready_min_counts"] == 250.0
     assert captured["adaptive_ready_min_isotopes"] == 2
     assert captured["adaptive_ready_min_snr"] == 1.5
-    assert captured["adaptive_strength_prior"] is False
-    assert captured["adaptive_strength_prior_steps"] == 5
-    assert captured["adaptive_strength_prior_min_counts"] == 4.5
-    assert captured["adaptive_strength_prior_log_sigma"] == 0.25
     assert captured["pose_min_observation_counts"] == 6.5
     assert captured["pose_min_observation_penalty_scale"] == 1.7
     assert captured["pose_min_observation_aggregate"] == "mean"

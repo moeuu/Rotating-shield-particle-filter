@@ -223,7 +223,7 @@ def test_complete_covariance_routes_weighted_spectrum_to_count_likelihood(
         spectrum_variance=np.asarray([[500.0, 500.0]], dtype=float),
     )
 
-    assert filt.last_spectrum_likelihood_route == "count_covariance"
+    assert filt.last_spectrum_likelihood_route == "count"
     assert filt.continuous_weights[0] > filt.continuous_weights[1]
 
 

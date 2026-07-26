@@ -200,6 +200,8 @@ def test_kemp_filter_updates_toward_synthetic_source() -> None:
     positions, _, _ = filt.estimate_sources()
     assert positions.shape[0] == 1
     assert float(np.linalg.norm(positions[0] - kernel.source_grid[true_idx])) <= 1.5
+    assert not hasattr(filt, "refit_strengths")
+    assert not hasattr(config, "refit_final_strengths")
 
 
 def test_kemp_gpu_particle_rates_runs_when_cuda_available() -> None:

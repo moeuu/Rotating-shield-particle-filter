@@ -611,31 +611,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--no-adaptive-strength-prior",
-        dest="adaptive_strength_prior",
-        action="store_false",
-        default=True,
-        help="Disable count-conditioned PF strength prior adaptation.",
-    )
-    parser.add_argument(
-        "--adaptive-strength-prior-steps",
-        type=int,
-        default=3,
-        help="Number of initial measurements used to adapt PF strength particles.",
-    )
-    parser.add_argument(
-        "--adaptive-strength-prior-min-counts",
-        type=float,
-        default=3.0,
-        help="Poisson count floor used by strength adaptation for weak observations.",
-    )
-    parser.add_argument(
-        "--adaptive-strength-prior-log-sigma",
-        type=float,
-        default=0.7,
-        help="Log-space proposal spread around count-matched PF strengths.",
-    )
-    parser.add_argument(
         "--pose-min-observation-counts",
         type=float,
         default=None,
@@ -932,10 +907,6 @@ def main() -> None:
         adaptive_ready_min_counts=args.adaptive_ready_min_counts,
         adaptive_ready_min_isotopes=args.adaptive_ready_min_isotopes,
         adaptive_ready_min_snr=args.adaptive_ready_min_snr,
-        adaptive_strength_prior=args.adaptive_strength_prior,
-        adaptive_strength_prior_steps=args.adaptive_strength_prior_steps,
-        adaptive_strength_prior_min_counts=args.adaptive_strength_prior_min_counts,
-        adaptive_strength_prior_log_sigma=args.adaptive_strength_prior_log_sigma,
         pose_min_observation_counts=args.pose_min_observation_counts,
         pose_min_observation_penalty_scale=args.pose_min_observation_penalty_scale,
         pose_min_observation_aggregate=args.pose_min_observation_aggregate,

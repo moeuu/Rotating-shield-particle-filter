@@ -39,56 +39,6 @@ def test_systematic_resample_count_falls_back_to_uniform() -> None:
     assert set(idx.tolist()).issubset({0, 1, 2})
 
 
-def test_report_cardinality_hint_adds_resampling_quota() -> None:
-    """Report-selected cardinality should receive extra mode-preserving quota."""
-    config = PFConfig(
-        num_particles=6,
-        mode_preserving_resample=True,
-        mode_preserving_max_modes=4,
-        mode_preserving_particles_per_mode=1,
-        mode_preserving_cardinality_strata=True,
-        mode_preserving_min_particles_per_cardinality=1,
-        mode_preserving_report_cardinality_strata=True,
-        mode_preserving_report_cardinality_extra_particles=2,
-    )
-    filt = IsotopeParticleFilter("Cs-137", kernel=None, config=config)
-    particles = []
-    for idx, count in enumerate((1, 1, 1, 2, 2, 2)):
-        positions = np.column_stack(
-            [
-                np.linspace(float(idx), float(idx) + count - 1, count),
-                np.zeros(count),
-                np.zeros(count),
-            ]
-        )
-        particles.append(
-            IsotopeParticle(
-                state=IsotopeState(
-                    num_sources=count,
-                    positions=positions,
-                    strengths=np.full(count, 100.0, dtype=float),
-                    background=0.0,
-                ),
-                log_weight=float(-np.log(6.0)),
-            )
-        )
-    filt.continuous_particles = particles
-    filt.set_external_protected_cardinalities({2})
-
-    protected = filt._source_mode_preserving_indices(  # noqa: SLF001
-        np.full(6, 1.0 / 6.0, dtype=float)
-    )
-
-    details = {
-        int(entry["num_sources"]): entry
-        for entry in filt.last_mode_preserving_selected_cardinalities
-    }
-    assert protected.size > 0
-    assert details[2]["externally_protected"] is True
-    assert details[2]["target_protected_count"] == 3
-    assert int(details[2]["protected_count"]) >= 1
-
-
 def test_dynamic_cardinality_allocation_adds_entropy_quota() -> None:
     """High cardinality entropy should add dynamic fixed-budget protection."""
     config = PFConfig(
@@ -98,7 +48,6 @@ def test_dynamic_cardinality_allocation_adds_entropy_quota() -> None:
         mode_preserving_particles_per_mode=1,
         mode_preserving_cardinality_strata=True,
         mode_preserving_min_particles_per_cardinality=1,
-        mode_preserving_report_cardinality_strata=False,
         mode_preserving_dynamic_cardinality_allocation=True,
         mode_preserving_dynamic_cardinality_extra_particles=2,
         mode_preserving_dynamic_cardinality_min_mass=0.1,

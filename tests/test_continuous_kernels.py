@@ -1155,6 +1155,23 @@ def test_kernel_values_all_pairs_for_detectors_matches_cpu_pairs() -> None:
         )
 
 
+def test_kernel_values_all_pairs_preserves_source_axis_for_empty_detectors() -> None:
+    """An empty detector batch should retain the declared source-axis length."""
+    kernel = ContinuousKernel(use_gpu=False)
+    sources = np.array(
+        [[1.0, 0.0, 0.0], [2.0, 1.0, 0.5]],
+        dtype=float,
+    )
+
+    values = kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        np.empty((0, 3), dtype=float),
+        sources,
+    )
+
+    assert values.shape == (0, len(kernel.orientations) ** 2, sources.shape[0])
+
+
 def test_kernel_values_selected_pairs_for_detectors_matches_cpu_pairs() -> None:
     """Batched selected-pair detector evaluation should match scalar CPU calls."""
     from measurement.shielding import HVL_TVL_TABLE_MM, mu_by_isotope_from_tvl_mm
@@ -1207,6 +1224,371 @@ def test_kernel_values_selected_pairs_for_detectors_matches_cpu_pairs() -> None:
             rel=1.0e-12,
             abs=1.0e-12,
         )
+
+
+@pytest.mark.parametrize(
+    "shield_params",
+    [
+        ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=2.0,
+            thickness_pb_cm=1.0,
+            buildup_fe_coeff=0.2,
+            buildup_pb_coeff=0.1,
+        ),
+        ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=2.0,
+            thickness_pb_cm=1.0,
+            buildup_fe_coeff=0.2,
+            buildup_pb_coeff=0.1,
+            shield_geometry_model="nominal_tvl",
+            use_angle_attenuation=True,
+        ),
+    ],
+    ids=["spherical-octant", "angle-dependent"],
+)
+def test_cpu_batched_selected_pairs_matches_scalar_oracle_with_full_physics(
+    shield_params: ShieldParams,
+) -> None:
+    """NumPy batching should preserve every CPU attenuation component."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((0, 0), (1, 1)),
+    ).with_transport_model(
+        boxes_m=(
+            (0.2, 0.2, 0.0, 0.8, 0.8, 2.0),
+            (1.1, 1.1, 0.0, 1.7, 1.7, 2.0),
+        ),
+        mu_by_isotope={"TestIso": (0.01, 0.02)},
+        line_mu_by_isotope={"TestIso": ((0.01, 0.02), (0.025, 0.04))},
+    )
+    line_mu = {
+        "TestIso": (
+            {"weight": 0.4, "fe": 0.05, "pb": 0.08},
+            {"weight": 0.6, "fe": 0.09, "pb": 0.12},
+        )
+    }
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {
+            "TestIso": {
+                "scale": 1.1,
+                "scale_by_pair": {"7": 1.2, "26": 0.9},
+                "tau_coefficients": {
+                    "shield": 0.03,
+                    "obstacle": -0.02,
+                    "shield_obstacle": 0.01,
+                    "fe": 0.015,
+                    "pb": -0.01,
+                    "distance": 0.005,
+                    "distance_shield": 0.002,
+                },
+                "min_log_scale": -2.0,
+                "max_log_scale": 2.0,
+            }
+        },
+    }
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=shield_params,
+        obstacle_grid=grid,
+        detector_radius_m=0.04,
+        detector_aperture_radius_m=0.03,
+        detector_aperture_samples=9,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
+        line_mu_by_isotope=line_mu,
+        transport_response_model=transport_model,
+        use_gpu=False,
+    )
+    detectors = np.array(
+        [[0.0, 0.0, 1.0], [2.0, 2.0, 1.0]],
+        dtype=float,
+    )
+    sources = np.array(
+        [[1.0, 1.0, 1.0], [-1.0, 0.2, 0.7], [2.5, 0.3, 1.2]],
+        dtype=float,
+    )
+    fe_indices = np.array([0, 3], dtype=int)
+    pb_indices = np.array([7, 2], dtype=int)
+
+    batched = kernel.kernel_values_selected_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        chunk_size=2,
+    )
+    scalar = np.vstack(
+        [
+            kernel._kernel_values_pair_scalar_oracle(
+                "TestIso",
+                detector,
+                sources,
+                int(fe_index),
+                int(pb_index),
+            )
+            for detector, fe_index, pb_index in zip(
+                detectors,
+                fe_indices,
+                pb_indices,
+            )
+        ]
+    )
+    all_pairs_batched = kernel.kernel_values_all_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        chunk_size=7,
+    )
+    all_pairs_scalar = np.stack(
+        [
+            np.vstack(
+                [
+                    kernel._kernel_values_pair_scalar_oracle(
+                        "TestIso",
+                        detector,
+                        sources,
+                        fe_index,
+                        pb_index,
+                    )
+                    for fe_index in range(len(kernel.orientations))
+                    for pb_index in range(len(kernel.orientations))
+                ]
+            )
+            for detector in detectors
+        ],
+        axis=0,
+    )
+
+    assert batched == pytest.approx(scalar, rel=5.0e-13, abs=5.0e-13)
+    assert all_pairs_batched == pytest.approx(
+        all_pairs_scalar,
+        rel=5.0e-13,
+        abs=5.0e-13,
+    )
+
+
+def test_torch_transport_response_uses_sampled_source_extent_distance() -> None:
+    """Torch kernels should match NumPy distance features for source-extent rays."""
+    torch = pytest.importorskip("torch")
+    isotope = "TestIso"
+    transport_model = {
+        "enabled": True,
+        "by_isotope": {
+            isotope: {
+                "scale": 1.0,
+                "scale_by_pair": {"7": 1.15, "26": 0.85},
+                "tau_coefficients": {"distance": 0.7},
+                "min_log_scale": -10.0,
+                "max_log_scale": 10.0,
+            }
+        },
+    }
+    kernel = ContinuousKernel(
+        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        detector_radius_m=0.038,
+        detector_aperture_radius_m=0.03,
+        detector_aperture_samples=5,
+        source_extent_radius_m=0.5,
+        source_extent_samples=5,
+        transport_response_model=transport_model,
+        use_gpu=True,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+    )
+    detectors = np.array(
+        [[0.0, 0.0, 0.0], [0.5, -0.25, 0.1]],
+        dtype=float,
+    )
+    matched_sources = np.array(
+        [[2.0, 0.0, 0.0], [-1.0, 1.5, 0.3]],
+        dtype=float,
+    )
+    fe_indices = np.array([0, 3], dtype=np.int64)
+    pb_indices = np.array([7, 2], dtype=np.int64)
+
+    numpy_selected = (
+        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+            isotope,
+            detectors,
+            matched_sources,
+            fe_indices,
+            pb_indices,
+        )
+    )
+    torch_selected = (
+        kernel._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+            isotope,
+            detectors,
+            matched_sources,
+            fe_indices,
+            pb_indices,
+            tol=1.0e-12,
+        )
+    )
+
+    pair_count = len(kernel.orientations) ** 2
+    pair_ids = np.arange(pair_count, dtype=np.int64)
+    pair_fe = pair_ids // len(kernel.orientations)
+    pair_pb = pair_ids % len(kernel.orientations)
+    numpy_all = (
+        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+            isotope,
+            np.repeat(detectors, pair_count, axis=0),
+            np.repeat(matched_sources, pair_count, axis=0),
+            np.tile(pair_fe, detectors.shape[0]),
+            np.tile(pair_pb, detectors.shape[0]),
+        ).reshape(detectors.shape[0], pair_count)
+    )
+    torch_all = kernel._kernel_values_all_pairs_for_detector_source_torch_chunk(
+        isotope,
+        detectors,
+        matched_sources,
+        tol=1.0e-12,
+    )
+
+    common_detector_sources = np.array(
+        [[2.0, 0.0, 0.0], [-1.0, 1.5, 0.3]],
+        dtype=float,
+    )
+    tensor_fe = np.array([0, 3], dtype=np.int64)
+    tensor_pb = np.array([7, 2], dtype=np.int64)
+    numpy_tensor = np.vstack(
+        [
+            kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                isotope,
+                np.broadcast_to(detectors[0], common_detector_sources.shape),
+                common_detector_sources,
+                np.full(common_detector_sources.shape[0], fe_index, dtype=np.int64),
+                np.full(common_detector_sources.shape[0], pb_index, dtype=np.int64),
+            )
+            for fe_index, pb_index in zip(tensor_fe, tensor_pb)
+        ]
+    )
+    torch_tensor = (
+        kernel._kernel_values_selected_pairs_torch_tensor(
+            isotope,
+            detectors[0],
+            torch.as_tensor(common_detector_sources, dtype=torch.float64),
+            tensor_fe,
+            tensor_pb,
+            tol=1.0e-12,
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    strengths = np.array([2.0, 3.0], dtype=float)
+    background = 0.25
+    numpy_rate = float(background + numpy_tensor[0] @ strengths)
+    torch_rate = kernel._expected_rate_pair_torch(
+        isotope,
+        detectors[0],
+        common_detector_sources,
+        strengths,
+        int(tensor_fe[0]),
+        int(tensor_pb[0]),
+        background,
+        tol=1.0e-12,
+    )
+
+    np.testing.assert_allclose(torch_selected, numpy_selected, rtol=1.0e-12)
+    np.testing.assert_allclose(torch_all, numpy_all, rtol=1.0e-12)
+    np.testing.assert_allclose(torch_tensor, numpy_tensor, rtol=1.0e-12)
+    assert torch_rate == pytest.approx(numpy_rate, rel=1.0e-12)
+
+
+def test_standard_cpu_kernel_paths_select_numpy_batching(monkeypatch) -> None:
+    """Standard CPU multi-source APIs should not invoke the scalar primitive."""
+    kernel = ContinuousKernel(
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=3,
+    )
+    detectors = np.array(
+        [[0.1, -0.2, 0.8], [1.2, 0.4, 1.1]],
+        dtype=float,
+    )
+    sources = np.array(
+        [[1.0, 0.2, 0.8], [-0.5, 1.4, 1.0], [2.0, -1.0, 0.7]],
+        dtype=float,
+    )
+    original_batch = (
+        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk
+    )
+    batch_calls = 0
+
+    def _tracked_batch(*args, **kwargs):
+        """Count standard-path calls into the batched NumPy implementation."""
+        nonlocal batch_calls
+        batch_calls += 1
+        return original_batch(*args, **kwargs)
+
+    def _forbid_scalar(*args, **kwargs):
+        """Fail if a standard multi-source path selects the scalar primitive."""
+        raise AssertionError("standard CPU path selected scalar kernel_value_pair")
+
+    monkeypatch.setattr(
+        kernel,
+        "_kernel_values_selected_pairs_for_detector_source_numpy_chunk",
+        _tracked_batch,
+    )
+    monkeypatch.setattr(kernel, "kernel_value_pair", _forbid_scalar)
+
+    pair_values = kernel.kernel_values_pair(
+        "Cs-137",
+        detectors[0],
+        sources,
+        0,
+        7,
+        chunk_size=2,
+    )
+    selected_values = kernel.kernel_values_selected_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        np.array([0, 3], dtype=int),
+        np.array([7, 2], dtype=int),
+        chunk_size=2,
+    )
+    all_pairs = kernel.kernel_values_all_pairs(
+        "Cs-137",
+        detectors[0],
+        sources,
+        chunk_size=2,
+    )
+    all_detector_pairs = kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        chunk_size=2,
+    )
+
+    assert pair_values.shape == (sources.shape[0],)
+    assert selected_values.shape == (detectors.shape[0], sources.shape[0])
+    assert all_pairs.shape == (
+        len(kernel.orientations) ** 2,
+        sources.shape[0],
+    )
+    assert all_detector_pairs.shape == (
+        detectors.shape[0],
+        len(kernel.orientations) ** 2,
+        sources.shape[0],
+    )
+    assert np.all(np.isfinite(pair_values))
+    assert np.all(np.isfinite(selected_values))
+    assert np.all(np.isfinite(all_pairs))
+    assert np.all(np.isfinite(all_detector_pairs))
+    assert batch_calls >= 4
 
 
 def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() -> None:
