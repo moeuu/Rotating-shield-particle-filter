@@ -1104,6 +1104,101 @@ def test_batched_refit_uses_batched_refit_after_remove_prune() -> None:
     assert all(p.state.num_sources >= 1 for p in filt.continuous_particles)
 
 
+def test_group_unit_response_matches_legacy_and_deduplicates_geometry(
+    monkeypatch,
+) -> None:
+    """Unit-response reuse should preserve counts and evaluate unique positions once."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=2,
+        num_particles=3,
+        use_gpu=False,
+    )
+    positions = [
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+        np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=float),
+    ]
+    strengths = [
+        np.array([20.0, 30.0], dtype=float),
+        np.array([40.0, 50.0], dtype=float),
+        np.array([60.0, 70.0], dtype=float),
+    ]
+    backgrounds = np.array([0.1, 0.2, 0.3], dtype=float)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=2,
+                positions=positions[idx].copy(),
+                strengths=strengths[idx].copy(),
+                background=float(backgrounds[idx]),
+            ),
+            log_weight=float(np.log(1.0 / 3.0)),
+        )
+        for idx in range(3)
+    ]
+    detector_positions = np.array(
+        [[0.0, 1.0, 0.0], [2.0, 1.0, 0.0]],
+        dtype=float,
+    )
+    data = MeasurementData(
+        z_k=np.array([10.0, 12.0], dtype=float),
+        observation_variances=np.array([11.0, 13.0], dtype=float),
+        detector_positions=detector_positions,
+        fe_indices=np.zeros(2, dtype=int),
+        pb_indices=np.zeros(2, dtype=int),
+        live_times=np.array([1.0, 2.0], dtype=float),
+    )
+    flat_positions = np.vstack(positions)
+    flat_strengths = np.concatenate(strengths)
+    legacy_components = expected_counts_per_source(
+        kernel=filt.continuous_kernel,
+        isotope=filt.isotope,
+        detector_positions=data.detector_positions,
+        sources=flat_positions,
+        strengths=flat_strengths,
+        live_times=data.live_times,
+        fe_indices=data.fe_indices,
+        pb_indices=data.pb_indices,
+        source_scale=filt._measurement_source_scale_vector(
+            data.fe_indices,
+            data.pb_indices,
+        ),
+    ).reshape(2, 3, 2)
+    legacy_total = (
+        data.live_times[:, None] * backgrounds[None, :]
+        + np.sum(legacy_components, axis=2)
+    )
+
+    source_counts: list[int] = []
+    original = filt.continuous_kernel.kernel_values_selected_pairs_for_detectors
+
+    def count_sources(*args: object, **kwargs: object) -> NDArray[np.float64]:
+        """Record the number of geometry columns evaluated by the kernel."""
+        sources_arg = np.asarray(kwargs["sources"], dtype=float)
+        source_counts.append(int(sources_arg.shape[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt.continuous_kernel,
+        "kernel_values_selected_pairs_for_detectors",
+        count_sources,
+    )
+
+    actual_components, actual_total = (
+        filt._lambda_components_for_particle_group(
+            data,
+            particle_indices=[0, 1, 2],
+            source_count=2,
+        )
+    )
+
+    assert np.array_equal(actual_components, legacy_components)
+    assert np.array_equal(actual_total, legacy_total)
+    assert source_counts == [3]
+
+
 def test_refit_after_remove_vectorized_matches_loop_oracle() -> None:
     """Vectorized refit-after-remove masks should match source-loop masks."""
     filt = _build_filter(
@@ -1204,17 +1299,24 @@ def test_refit_after_remove_vectorized_matches_loop_oracle() -> None:
     assert np.array_equal(vectorized_mask, loop_mask)
 
 
-def test_apply_birth_death_reuses_batched_refit_prune_cache() -> None:
+def test_apply_birth_death_reuses_batched_refit_prune_cache(monkeypatch) -> None:
     """Structural updates should not scalar-refit prune masks twice."""
     filt = _build_filter(
         p_birth=0.0,
+        p_kill=0.0,
         min_strength=0.01,
         max_sources=3,
         num_particles=2,
         source_prune_min_distinct_stations=1,
         source_prune_min_distinct_views=1,
         source_prune_refit_after_remove=True,
+        death_require_low_strength=False,
         death_low_q_streak=99,
+        pseudo_source_verification_enable=False,
+        split_residual_guided=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+        refit_after_moves=False,
     )
     positions = np.array(
         [
@@ -1256,6 +1358,20 @@ def test_apply_birth_death_reuses_batched_refit_prune_cache() -> None:
         raise AssertionError("scalar refit-after-remove prune was called")
 
     filt._source_prune_refit_after_remove_mask = fail_scalar_refit
+    geometry_calls = 0
+    original = filt.continuous_kernel.kernel_values_selected_pairs_for_detectors
+
+    def count_geometry(*args: object, **kwargs: object) -> NDArray[np.float64]:
+        """Count structural geometry evaluations for the equal-cardinality group."""
+        nonlocal geometry_calls
+        geometry_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        filt.continuous_kernel,
+        "kernel_values_selected_pairs_for_detectors",
+        count_geometry,
+    )
 
     filt.apply_birth_death(
         support_data=data,
@@ -1264,6 +1380,7 @@ def test_apply_birth_death_reuses_batched_refit_prune_cache() -> None:
     )
 
     assert all(p.state.num_sources >= 1 for p in filt.continuous_particles)
+    assert geometry_calls == 1
 
 
 def test_apply_birth_death_skips_refit_prune_without_candidates() -> None:
@@ -1981,7 +2098,7 @@ def test_merge_trial_batched_matches_scalar_oracle() -> None:
     )
 
 
-def test_residual_split_cached_batched_matches_scalar_oracle() -> None:
+def test_residual_split_cached_batched_matches_scalar_oracle(monkeypatch) -> None:
     """Cached residual split trials should be batched without changing the result."""
     filt = _build_filter(
         p_birth=0.0,
@@ -2048,6 +2165,20 @@ def test_residual_split_cached_batched_matches_scalar_oracle() -> None:
         pb_indices=np.zeros(3, dtype=int),
         source_scale=1.0,
     )
+    existing_counts = filt._unit_response_counts_for_state(state, data)
+
+    def fail_existing_response(
+        *_args: object,
+        **_kwargs: object,
+    ) -> NDArray[np.float64]:
+        """Fail if the split path recomputes an already cached response."""
+        raise AssertionError("existing unit response was recomputed")
+
+    monkeypatch.setattr(
+        filt,
+        "_unit_response_counts_for_state",
+        fail_existing_response,
+    )
 
     batched_trial, batched_delta = filt._best_residual_guided_split_trial(
         state.copy(),
@@ -2056,9 +2187,9 @@ def test_residual_split_cached_batched_matches_scalar_oracle() -> None:
         None,
         suppress_prune_after_refit=True,
         candidate_unit_counts=candidate_counts,
+        cached_existing_unit_counts=existing_counts,
     )
 
-    existing_counts = filt._unit_response_counts_for_state(state, data)
     base_lambda = existing_counts @ state.strengths[: state.num_sources]
     base_ll = filt._trial_log_likelihood_from_lambda(data, base_lambda)
     cand_strengths = filt._candidate_initial_strengths(
@@ -3996,6 +4127,178 @@ def test_structural_weight_refresh_preserves_prior_history(monkeypatch) -> None:
 
     weights = filt.continuous_weights
     assert np.allclose(weights, np.array([0.9, 0.1], dtype=float))
+
+
+def test_structural_weight_refresh_reuses_metadata_only_likelihood(
+    monkeypatch,
+) -> None:
+    """Metadata-only moves should preserve weights without a kernel recomputation."""
+    filt = _build_filter(
+        p_birth=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=2,
+    )
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[float(idx), 0.0, 0.0]], dtype=float),
+                strengths=np.array([20.0 + idx], dtype=float),
+                background=0.1,
+            ),
+            log_weight=float(np.log(weight)),
+        )
+        for idx, weight in enumerate((0.8, 0.2))
+    ]
+    data = MeasurementData(
+        z_k=np.array([10.0], dtype=float),
+        observation_variances=np.array([11.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+
+    def fail_window_likelihood(
+        *_args: object,
+        **_kwargs: object,
+    ) -> NDArray[np.float64]:
+        """Fail if unchanged particles are sent through the response model."""
+        raise AssertionError("metadata-only likelihood was recomputed")
+
+    log_weights_before = np.asarray(
+        [particle.log_weight for particle in filt.continuous_particles],
+        dtype=float,
+    )
+    reference_likelihoods = {0: -3.0, 1: -4.0}
+    monkeypatch.setattr(
+        filt,
+        "_window_log_likelihoods_for_indices",
+        lambda _data, _indices: np.array([-3.0, -4.0], dtype=float),
+    )
+    filt.refresh_weights_from_measurements(
+        data,
+        reference_log_likelihood_by_index=reference_likelihoods,
+        moved_indices={0, 1},
+    )
+    reference_log_weights = np.asarray(
+        [particle.log_weight for particle in filt.continuous_particles],
+        dtype=float,
+    )
+    for particle, log_weight in zip(filt.continuous_particles, log_weights_before):
+        particle.log_weight = float(log_weight)
+    monkeypatch.setattr(
+        filt,
+        "_window_log_likelihoods_for_indices",
+        fail_window_likelihood,
+    )
+
+    filt.refresh_weights_from_measurements(
+        data,
+        reference_log_likelihood_by_index=reference_likelihoods,
+        moved_indices={0, 1},
+        likelihood_unchanged_indices={0, 1},
+    )
+
+    log_weights_after = np.asarray(
+        [particle.log_weight for particle in filt.continuous_particles],
+        dtype=float,
+    )
+    assert np.array_equal(log_weights_after, reference_log_weights)
+
+
+def test_pseudo_verification_marks_unchanged_likelihood_and_keeps_rng_schedule(
+    monkeypatch,
+) -> None:
+    """Verification-only metadata changes should reuse likelihoods before resampling."""
+    filt = _build_filter(
+        p_birth=0.0,
+        p_kill=0.0,
+        min_strength=0.01,
+        max_sources=1,
+        num_particles=1,
+        pseudo_source_verification_enable=True,
+        death_low_q_streak=99,
+        split_residual_guided=False,
+        split_prob=0.0,
+        merge_prob=0.0,
+        refit_after_moves=False,
+    )
+    state = IsotopeState(
+        num_sources=1,
+        positions=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        strengths=np.array([40.0], dtype=float),
+        background=0.1,
+        ages=np.array([3], dtype=int),
+        low_q_streaks=np.zeros(1, dtype=int),
+        support_scores=np.zeros(1, dtype=float),
+        tentative_sources=np.ones(1, dtype=bool),
+        verification_fail_streaks=np.zeros(1, dtype=int),
+    )
+    filt.continuous_particles = [IsotopeParticle(state=state, log_weight=0.0)]
+    data = MeasurementData(
+        z_k=np.array([10.0], dtype=float),
+        observation_variances=np.array([11.0], dtype=float),
+        detector_positions=np.array([[0.5, 0.0, 0.0]], dtype=float),
+        fe_indices=np.array([0], dtype=int),
+        pb_indices=np.array([0], dtype=int),
+        live_times=np.array([1.0], dtype=float),
+    )
+    positions_before = state.positions.copy()
+    strengths_before = state.strengths.copy()
+    refresh_kwargs: list[dict[str, object]] = []
+    resample_draws: list[float] = []
+
+    def verify_metadata_only(
+        target: IsotopeState,
+        _data: MeasurementData,
+        **_kwargs: object,
+    ) -> bool:
+        """Mark a tentative source verified without changing its response."""
+        target.tentative_sources[0] = False
+        return True
+
+    def record_refresh(
+        _data: MeasurementData | None,
+        **kwargs: object,
+    ) -> None:
+        """Record the cache classification passed to structural reweighting."""
+        refresh_kwargs.append(kwargs)
+
+    def record_resample() -> bool:
+        """Record the next random draw while preserving the resample call."""
+        resample_draws.append(float(np.random.rand()))
+        return False
+
+    monkeypatch.setattr(
+        filt,
+        "_verify_pseudo_sources_for_state",
+        verify_metadata_only,
+    )
+    monkeypatch.setattr(filt, "refresh_weights_from_measurements", record_refresh)
+    monkeypatch.setattr(
+        filt,
+        "_maybe_resample_after_structural_update",
+        record_resample,
+    )
+    np.random.seed(123)
+    expected_resample_draw = float(np.random.rand())
+    np.random.seed(123)
+
+    filt.apply_birth_death(
+        support_data=data,
+        birth_data=None,
+        candidate_positions=filt.kernel.sources,
+    )
+
+    assert np.array_equal(state.positions, positions_before)
+    assert np.array_equal(state.strengths, strengths_before)
+    assert not bool(state.tentative_sources[0])
+    assert refresh_kwargs
+    assert refresh_kwargs[0]["moved_indices"] == {0}
+    assert refresh_kwargs[0]["likelihood_unchanged_indices"] == {0}
+    assert resample_draws == [expected_resample_draw]
 
 
 def test_structural_update_resamples_after_weight_collapse() -> None:

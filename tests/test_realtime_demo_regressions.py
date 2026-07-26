@@ -1303,6 +1303,42 @@ def test_diagnostic_detail_limit_uses_zero_as_no_details() -> None:
     assert _diagnostic_detail_order(order, -1).tolist() == [4, 2, 0, 1, 3]
 
 
+def test_source_event_diagnostics_bound_details_and_summarize_all(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Source-event logs should retain complete counts without dumping particles."""
+    events = [
+        {
+            "event": "pseudo_source_verified",
+            "reason": "supported",
+            "position": [float(index), 0.0, 0.0],
+        }
+        for index in range(3)
+    ]
+    estimator = SimpleNamespace(
+        filters={
+            "Cs-137": SimpleNamespace(last_source_event_diagnostics=events),
+        }
+    )
+
+    realtime_demo_module._log_source_event_diagnostics(
+        estimator,
+        {"Cs-137": np.zeros((0, 3), dtype=float)},
+        {"Cs-137": np.zeros(0, dtype=float)},
+        step_index=9,
+        event_log_limit=1,
+    )
+
+    output = capsys.readouterr().out
+    assert "source_event_summary[Cs-137] total=3 logged=1 omitted=2" in output
+    assert 'event_counts={"pseudo_source_verified": 3}' in output
+    assert 'reason_counts={"supported": 3}' in output
+    assert "raw_sha256=" in output
+    assert output.count("source_event[Cs-137]") == 1
+    assert "event_idx=0" in output
+    assert "event_idx=1" not in output
+
+
 def test_pf_timing_formatter_keeps_counters_unitless() -> None:
     """PF timing logs should not print diagnostic counters as seconds."""
     assert _format_pf_timing_item("total", 1.25) == "total=1.250s"
@@ -1447,6 +1483,54 @@ def test_precision_diagnostics_use_compact_spectrum_log_by_default(
     )
 
     assert calls == ["compact", "full"]
+
+
+def test_precision_diagnostics_route_source_event_log_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime diagnostics should route the configured source-event detail cap."""
+    routed_limits: list[int] = []
+
+    def noop(*args: object, **kwargs: object) -> None:
+        """Replace unrelated diagnostic callbacks during this routing test."""
+        _ = (args, kwargs)
+
+    def record_source_events(*args: object, **kwargs: object) -> None:
+        """Record the detail cap passed to source-event diagnostics."""
+        _ = args
+        routed_limits.append(int(kwargs["event_log_limit"]))
+
+    for name in (
+        "_log_spectrum_response_poisson_diagnostics",
+        "_log_current_map_prediction_residuals",
+        "_log_truth_observability_diagnostics",
+        "_log_posterior_truth_mass_diagnostics",
+        "_log_particle_cloud_diagnostics",
+        "_log_birth_candidate_diagnostics",
+    ):
+        monkeypatch.setattr(realtime_demo_module, name, noop)
+    monkeypatch.setattr(
+        realtime_demo_module,
+        "_log_source_event_diagnostics",
+        record_source_events,
+    )
+
+    _log_precision_degradation_diagnostics(
+        object(),
+        object(),
+        None,
+        {},
+        {},
+        EnvironmentConfig(),
+        None,
+        obstacle_height_m=2.0,
+        step_index=0,
+        candidate_log_limit=0,
+        particle_log_limit=0,
+        source_event_log_limit=7,
+    )
+
+    assert routed_limits == [7]
 
 
 def test_surface_observability_diagnostics_skip_zero_candidates() -> None:

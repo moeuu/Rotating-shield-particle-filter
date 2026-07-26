@@ -1464,8 +1464,9 @@ def test_continuous_kernel_cuda_matches_cpu_with_obstacles_and_aperture() -> Non
             assert gpu_counts == pytest.approx(cpu_counts, rel=1e-10, abs=1e-10)
 
 
-def test_gpu_chunk_size_accounts_for_obstacle_aperture_expansion() -> None:
-    """GPU batching should shrink when obstacle-aperture tensors get large."""
+def test_torch_chunk_cpu_fallback_accounts_for_obstacle_aperture_expansion() -> None:
+    """CPU fallback batching should retain the conservative fixed budget."""
+    torch = pytest.importorskip("torch")
     blocked = tuple((idx, 0) for idx in range(494))
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -1480,7 +1481,12 @@ def test_gpu_chunk_size_accounts_for_obstacle_aperture_expansion() -> None:
         gpu_dtype="float64",
     )
 
-    chunk = kernel._adaptive_torch_chunk_size(8192)
+    chunk = kernel._adaptive_torch_chunk_size(
+        8192,
+        isotope="Cs-137",
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
 
     assert chunk == 66
     assert chunk < 8192

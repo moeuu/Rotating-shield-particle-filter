@@ -770,6 +770,31 @@ class IsotopeParticleFilter:
             live_times=np.asarray(data.live_times, dtype=float)[row_mask],
         )
 
+    @staticmethod
+    def _same_measurement_block(
+        first: MeasurementData | None,
+        second: MeasurementData | None,
+    ) -> bool:
+        """Return whether two bundles contain exactly the same response rows."""
+        if first is second:
+            return first is not None
+        if first is None or second is None:
+            return False
+        return bool(
+            np.array_equal(first.z_k, second.z_k)
+            and np.array_equal(
+                first.observation_variances,
+                second.observation_variances,
+            )
+            and np.array_equal(
+                first.detector_positions,
+                second.detector_positions,
+            )
+            and np.array_equal(first.fe_indices, second.fe_indices)
+            and np.array_equal(first.pb_indices, second.pb_indices)
+            and np.array_equal(first.live_times, second.live_times)
+        )
+
     def _structural_evidence_data(
         self,
         data: MeasurementData | None,
@@ -5852,82 +5877,14 @@ class IsotopeParticleFilter:
                 np.zeros((num_meas, particle_count, count), dtype=float),
                 np.zeros((num_meas, particle_count), dtype=float),
             )
-        backgrounds = np.asarray(
-            [
-                float(self.continuous_particles[idx].state.background)
-                for idx in particle_indices
-            ],
-            dtype=float,
-        )
-        background_counts = data.live_times[:, None] * backgrounds[None, :]
-        if count <= 0:
-            return np.zeros(
-                (num_meas, particle_count, 0), dtype=float
-            ), background_counts
-        sources = np.vstack(
-            [
-                np.asarray(
-                    self.continuous_particles[idx].state.positions[:count],
-                    dtype=float,
-                )
-                for idx in particle_indices
-            ]
-        )
-        strengths = np.concatenate(
-            [
-                np.asarray(
-                    self.continuous_particles[idx].state.strengths[:count],
-                    dtype=float,
-                )
-                for idx in particle_indices
-            ]
-        )
-        source_rows = sources.reshape(particle_count, count, 3)
-        strength_rows = strengths.reshape(particle_count, count)
-        if (
-            particle_count > 1
-            and np.array_equal(source_rows, source_rows[:1])
-            and np.array_equal(strength_rows, strength_rows[:1])
-        ):
-            lambda_one = expected_counts_per_source(
-                kernel=self.continuous_kernel,
-                isotope=self.isotope,
-                detector_positions=data.detector_positions,
-                sources=source_rows[0],
-                strengths=strength_rows[0],
-                live_times=data.live_times,
-                fe_indices=data.fe_indices,
-                pb_indices=data.pb_indices,
-                source_scale=self._measurement_source_scale_vector(
-                    data.fe_indices,
-                    data.pb_indices,
-                ),
+        k_tensor, background_counts, strengths = (
+            self._unit_kernel_tensor_for_particle_group(
+                data,
+                particle_indices,
+                count,
             )
-            lambda_m = np.broadcast_to(
-                np.asarray(lambda_one, dtype=float)[:, None, :],
-                (num_meas, particle_count, count),
-            ).copy()
-            lambda_total = background_counts + np.sum(lambda_m, axis=2)
-            return lambda_m, lambda_total
-        lambda_flat = expected_counts_per_source(
-            kernel=self.continuous_kernel,
-            isotope=self.isotope,
-            detector_positions=data.detector_positions,
-            sources=sources,
-            strengths=strengths,
-            live_times=data.live_times,
-            fe_indices=data.fe_indices,
-            pb_indices=data.pb_indices,
-            source_scale=self._measurement_source_scale_vector(
-                data.fe_indices,
-                data.pb_indices,
-            ),
         )
-        lambda_m = np.asarray(lambda_flat, dtype=float).reshape(
-            num_meas,
-            particle_count,
-            count,
-        )
+        lambda_m = k_tensor * strengths[None, :, :]
         lambda_total = background_counts + np.sum(lambda_m, axis=2)
         return lambda_m, lambda_total
 
@@ -5982,12 +5939,19 @@ class IsotopeParticleFilter:
                 for idx in particle_indices
             ]
         )
-        unit_strengths = np.ones(sources.shape[0], dtype=float)
-        k_flat = expected_counts_per_source(
+        unique_sources, inverse = np.unique(
+            sources,
+            axis=0,
+            return_inverse=True,
+        )
+        has_duplicate_sources = unique_sources.shape[0] < sources.shape[0]
+        evaluate_sources = unique_sources if has_duplicate_sources else sources
+        unit_strengths = np.ones(evaluate_sources.shape[0], dtype=float)
+        k_evaluated = expected_counts_per_source(
             kernel=self.continuous_kernel,
             isotope=self.isotope,
             detector_positions=data.detector_positions,
-            sources=sources,
+            sources=evaluate_sources,
             strengths=unit_strengths,
             live_times=data.live_times,
             fe_indices=data.fe_indices,
@@ -5997,6 +5961,10 @@ class IsotopeParticleFilter:
                 data.pb_indices,
             ),
         )
+        if has_duplicate_sources:
+            k_flat = np.asarray(k_evaluated, dtype=float)[:, inverse]
+        else:
+            k_flat = np.asarray(k_evaluated, dtype=float)
         k_tensor = np.asarray(k_flat, dtype=float).reshape(
             num_meas,
             particle_count,
@@ -9460,6 +9428,7 @@ class IsotopeParticleFilter:
         *,
         suppress_prune_after_refit: bool = False,
         candidate_unit_counts: NDArray[np.float64] | None = None,
+        cached_existing_unit_counts: NDArray[np.float64] | None = None,
     ) -> tuple[IsotopeState | None, float]:
         """
         Return the best residual-guided split trial and its likelihood gain.
@@ -9499,7 +9468,22 @@ class IsotopeParticleFilter:
         existing_unit_counts: NDArray[np.float64] | None = None
         candidate_counts_arr: NDArray[np.float64] | None = None
         if use_cached_trial_counts:
-            existing_unit_counts = self._unit_response_counts_for_state(st, data)
+            cached_existing_counts = (
+                None
+                if cached_existing_unit_counts is None
+                else np.asarray(cached_existing_unit_counts, dtype=float)
+            )
+            expected_existing_shape = (
+                int(data.z_k.size),
+                int(st.num_sources),
+            )
+            if (
+                cached_existing_counts is None
+                or cached_existing_counts.shape != expected_existing_shape
+            ):
+                existing_unit_counts = self._unit_response_counts_for_state(st, data)
+            else:
+                existing_unit_counts = cached_existing_counts
             candidate_counts_arr = np.asarray(candidate_unit_counts, dtype=float)
             expected_shape = (int(data.z_k.size), int(candidates.shape[0]))
             if candidate_counts_arr.shape != expected_shape:
@@ -11014,6 +10998,7 @@ class IsotopeParticleFilter:
         lambda_total_by_index: dict[int, NDArray[np.float64]] | None = None,
         reference_log_likelihood_by_index: dict[int, float] | None = None,
         moved_indices: set[int] | None = None,
+        likelihood_unchanged_indices: set[int] | None = None,
     ) -> None:
         """
         Recompute particle weights from a measurement block after structural moves.
@@ -11035,6 +11020,11 @@ class IsotopeParticleFilter:
         posterior evidence already accumulated before the structural move. It
         is not a forward/reverse proposal-density, prior, or Jacobian correction,
         so it does not turn the structural heuristic into an exact RJ move.
+
+        ``likelihood_unchanged_indices`` identifies moved particles whose
+        response-defining state is exactly unchanged (for example, a tentative
+        source becoming verified). Their old likelihood is reused exactly while
+        retaining the same normalization and resampling schedule.
         """
         if data is None or data.z_k.size == 0 or not self.continuous_particles:
             return
@@ -11043,6 +11033,7 @@ class IsotopeParticleFilter:
                 data,
                 reference_log_likelihood_by_index=reference_log_likelihood_by_index,
                 moved_indices=moved_indices,
+                likelihood_unchanged_indices=likelihood_unchanged_indices,
             )
             return
         log_likelihoods = np.full(len(self.continuous_particles), -np.inf, dtype=float)
@@ -11108,6 +11099,7 @@ class IsotopeParticleFilter:
         *,
         reference_log_likelihood_by_index: dict[int, float],
         moved_indices: set[int],
+        likelihood_unchanged_indices: set[int] | None = None,
     ) -> None:
         """Apply station-window likelihood-ratio corrections to moved particles."""
         if data.z_k.size == 0 or not moved_indices:
@@ -11119,10 +11111,29 @@ class IsotopeParticleFilter:
         ]
         if not valid_indices:
             return
-        new_ll = self._window_log_likelihoods_for_indices(data, valid_indices)
-        for particle_idx, ll_new in zip(valid_indices, new_ll):
+        unchanged = {
+            int(idx)
+            for idx in (likelihood_unchanged_indices or set())
+            if int(idx) in moved_indices
+        }
+        changed_indices = [idx for idx in valid_indices if idx not in unchanged]
+        changed_ll = (
+            self._window_log_likelihoods_for_indices(data, changed_indices)
+            if changed_indices
+            else np.zeros(0, dtype=float)
+        )
+        changed_ll_by_index = {
+            int(idx): float(value)
+            for idx, value in zip(changed_indices, changed_ll)
+        }
+        for particle_idx in valid_indices:
             ll_old = float(
                 reference_log_likelihood_by_index.get(int(particle_idx), np.nan)
+            )
+            ll_new = (
+                ll_old
+                if int(particle_idx) in unchanged
+                else float(changed_ll_by_index.get(int(particle_idx), np.nan))
             )
             if not np.isfinite(ll_old) or not np.isfinite(ll_new):
                 continue
@@ -11649,6 +11660,10 @@ class IsotopeParticleFilter:
             proposal_data = birth_data
         elif support_data is not None and support_data.z_k.size:
             proposal_data = support_data
+        proposal_matches_support = self._same_measurement_block(
+            proposal_data,
+            support_data,
+        )
         refit_data = proposal_data
         if proposal_data is not None and global_candidates.size:
             global_candidates = self._exclude_birth_candidates_near_detectors(
@@ -11722,6 +11737,7 @@ class IsotopeParticleFilter:
         births_remaining = None if max_births is None else max(0, int(max_births))
         any_moved = False
         moved_indices: set[int] = set()
+        likelihood_unchanged_indices: set[int] = set()
         moved_refit_indices: list[int] = []
         refresh_reference_ll: dict[int, float] = {}
         has_support_data = support_data is not None and support_data.z_k.size > 0
@@ -11732,6 +11748,7 @@ class IsotopeParticleFilter:
                 NDArray[np.float64],
                 NDArray[np.float64],
                 NDArray[np.bool_],
+                NDArray[np.float64] | None,
             ],
         ] = {}
         structural_proposal_indices: set[int] | None = None
@@ -11755,12 +11772,19 @@ class IsotopeParticleFilter:
             for source_count, particle_indices in grouped.items():
                 if source_count <= 0 or not particle_indices:
                     continue
-                lambda_m_group, lambda_total_group = (
-                    self._lambda_components_for_particle_group(
-                        support_data,
-                        particle_indices,
-                        source_count,
-                    )
+                (
+                    k_tensor_group,
+                    background_counts_group,
+                    strengths_group,
+                ) = self._unit_kernel_tensor_for_particle_group(
+                    support_data,
+                    particle_indices,
+                    source_count,
+                )
+                lambda_m_group = k_tensor_group * strengths_group[None, :, :]
+                lambda_total_group = background_counts_group + np.sum(
+                    lambda_m_group,
+                    axis=2,
                 )
                 delta_ll_group = self._delta_log_likelihood_remove_group(
                     support_data,
@@ -11787,18 +11811,12 @@ class IsotopeParticleFilter:
                         dtype=bool,
                     )
                     if np.any(needs_prune_rows):
-                        subset_indices = [
-                            int(particle_indices[row_idx])
-                            for row_idx, needed in enumerate(needs_prune_rows)
-                            if bool(needed)
+                        k_tensor = k_tensor_group[:, needs_prune_rows, :]
+                        background_counts = background_counts_group[
+                            :,
+                            needs_prune_rows,
                         ]
-                        k_tensor, background_counts, strengths = (
-                            self._unit_kernel_tensor_for_particle_group(
-                                support_data,
-                                subset_indices,
-                                source_count,
-                            )
-                        )
+                        strengths = strengths_group[needs_prune_rows, :]
                         q_min = max(float(self.config.min_strength), 0.0)
                         q_max = float(self.config.birth_q_max)
                         if q_max < q_min:
@@ -11847,6 +11865,7 @@ class IsotopeParticleFilter:
                         lambda_total_group[:, row_idx],
                         delta_ll_group[row_idx],
                         prune_allowed,
+                        k_tensor_group[:, row_idx, :],
                     )
             for particle_idx in fallback_indices:
                 st = self.continuous_particles[particle_idx].state
@@ -11880,6 +11899,7 @@ class IsotopeParticleFilter:
                     lambda_total,
                     delta_ll,
                     prune_allowed,
+                    None,
                 )
             timing["cache"] += time.perf_counter() - cache_start
 
@@ -11906,6 +11926,13 @@ class IsotopeParticleFilter:
             lambda_m = None
             lambda_total = None
             cached_prune_allowed = None
+            cached_unit_counts = None
+            pseudo_response_snapshot: tuple[
+                NDArray[np.float64],
+                NDArray[np.float64],
+                float,
+                NDArray[np.bool_],
+            ] | None = None
             if has_support and st.num_sources > 0:
                 cached_support = support_cache.get(int(particle_idx))
                 if (
@@ -11918,6 +11945,7 @@ class IsotopeParticleFilter:
                         lambda_total,
                         delta_ll,
                         cached_prune_allowed,
+                        cached_unit_counts,
                     ) = cached_support
                 else:
                     lambda_m, lambda_total = self._lambda_components(st, support_data)
@@ -11931,7 +11959,7 @@ class IsotopeParticleFilter:
                 st.support_scores = (1.0 - alpha) * st.support_scores + alpha * delta_ll
             if refit_data is not None and refit_data.z_k.size > 0:
                 if (
-                    refit_data is support_data
+                    proposal_matches_support
                     and lambda_total is not None
                     and np.asarray(lambda_total).shape == (int(refit_data.z_k.size),)
                 ):
@@ -11951,6 +11979,15 @@ class IsotopeParticleFilter:
                     )
             if has_support and st.num_sources > 0:
                 pseudo_start = time.perf_counter()
+                pseudo_response_snapshot = (
+                    np.asarray(st.positions[: st.num_sources], dtype=float).copy(),
+                    np.asarray(st.strengths[: st.num_sources], dtype=float).copy(),
+                    float(st.background),
+                    self._active_source_mask(
+                        st,
+                        include_quarantined=False,
+                    ).copy(),
+                )
                 pseudo_moved = self._verify_pseudo_sources_for_state(
                     st,
                     support_data,
@@ -11967,6 +12004,7 @@ class IsotopeParticleFilter:
                     lambda_total = None
                     delta_ll = None
                     cached_prune_allowed = None
+                    cached_unit_counts = None
             if st.num_sources > 0 and has_support:
                 prune_start = time.perf_counter()
                 kill_mask = np.ones(st.num_sources, dtype=bool)
@@ -12116,6 +12154,11 @@ class IsotopeParticleFilter:
                                 split_candidate_strengths_for_trial,
                                 suppress_prune_after_refit=suppress_death,
                                 candidate_unit_counts=split_candidate_counts_for_trial,
+                                cached_existing_unit_counts=(
+                                    cached_unit_counts
+                                    if proposal_matches_support
+                                    else None
+                                ),
                             )
                         )
                         if (
@@ -12531,6 +12574,30 @@ class IsotopeParticleFilter:
                 moved_refit_indices.append(int(particle_idx))
             if moved:
                 moved_indices.add(int(particle_idx))
+                if pseudo_response_snapshot is not None:
+                    (
+                        positions_before,
+                        strengths_before,
+                        background_before,
+                        active_mask_before,
+                    ) = pseudo_response_snapshot
+                    active_mask_after = self._active_source_mask(
+                        st,
+                        include_quarantined=False,
+                    )
+                    if (
+                        np.array_equal(
+                            np.asarray(st.positions[: st.num_sources], dtype=float),
+                            positions_before,
+                        )
+                        and np.array_equal(
+                            np.asarray(st.strengths[: st.num_sources], dtype=float),
+                            strengths_before,
+                        )
+                        and float(st.background) == background_before
+                        and np.array_equal(active_mask_after, active_mask_before)
+                    ):
+                        likelihood_unchanged_indices.add(int(particle_idx))
             any_moved = any_moved or moved
 
         if (
@@ -12549,11 +12616,12 @@ class IsotopeParticleFilter:
                     and bool(self.config.birth_residual_suppress_death)
                 ),
             )
+            likelihood_unchanged_indices.difference_update(moved_refit_indices)
             timing["refit"] += time.perf_counter() - refit_start
         if any_moved and refit_data is not None:
             refresh_start = time.perf_counter()
             refresh_lambda_cache = None
-            if refit_data is support_data and support_cache:
+            if proposal_matches_support and support_cache:
                 refresh_lambda_cache = {
                     int(particle_idx): np.asarray(cached[1], dtype=float)
                     for particle_idx, cached in support_cache.items()
@@ -12565,6 +12633,7 @@ class IsotopeParticleFilter:
                 lambda_total_by_index=refresh_lambda_cache,
                 reference_log_likelihood_by_index=refresh_reference_ll,
                 moved_indices=moved_indices,
+                likelihood_unchanged_indices=likelihood_unchanged_indices,
             )
             timing["refresh_weights"] += time.perf_counter() - refresh_start
             self._maybe_resample_after_structural_update()

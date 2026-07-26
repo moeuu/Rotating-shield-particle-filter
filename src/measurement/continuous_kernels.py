@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Dict
+from typing import Callable, Dict, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -38,6 +38,14 @@ try:  # optional dependency
 except ImportError:  # pragma: no cover - optional dependency
     torch = None
     _TORCH_AVAILABLE = False
+
+
+_ChunkResult = TypeVar("_ChunkResult")
+_CUDA_CHUNK_MAX_WORKING_BYTES = 4 * 1024**3
+_CUDA_CHUNK_FREE_MEMORY_FRACTION = 0.20
+_CUDA_CHUNK_LOW_MEMORY_FRACTION = 0.05
+_CUDA_CHUNK_MIN_RESERVE_BYTES = 512 * 1024**2
+_CUDA_CHUNK_RESERVE_FRACTION = 0.10
 
 
 def _finite_sphere_geometric_term_torch(
@@ -1111,16 +1119,22 @@ class ContinuousKernel:
         self,
         requested: int,
         *,
+        isotope: str | None = None,
+        orientation_pair_count: int | None = None,
+        device: "torch.device | str | None" = None,
+        dtype: "torch.dtype | None" = None,
         all_orientation_pairs: bool = False,
     ) -> int:
         """
-        Return a GPU chunk size that preserves math while bounding tensors.
+        Return a memory-aware torch chunk size without changing kernel math.
 
         Obstacle attenuation with finite detector aperture expands each source
         into ``source_count * aperture_samples * obstacle_box_count`` segment-box
-        intersections. Random Manchester-style scenes can contain hundreds of
-        transport components, so the old fixed 8192-source chunk could allocate
-        tens of GB. This only changes batching, not the kernel being evaluated.
+        intersections. The CUDA path budgets a conservative working set from
+        currently free VRAM, while leaving headroom for the PF and driver. The
+        estimate uses the requested isotope's actual line count and requested
+        shield-pair count. CPU and unavailable-memory-query paths retain the
+        fixed conservative budget used before adaptive CUDA sizing.
         """
         chunk = max(1, int(requested))
         aperture_sample_count = (
@@ -1135,18 +1149,142 @@ class ContinuousKernel:
         )
         sample_count = aperture_sample_count * source_sample_count
         obstacle_count = int(self.obstacle_boxes_m().shape[0])
-        num_pairs = int(len(self.orientations)) ** 2
-        line_count = self._max_line_count()
-        denom = max(1, sample_count * line_count)
-        if obstacle_count > 0:
-            denom = max(denom, sample_count * obstacle_count * line_count)
-        if all_orientation_pairs:
-            denom = max(denom, sample_count * num_pairs * line_count)
-        element_budget = (
-            4_000_000 if str(self.gpu_dtype).lower() == "float64" else 8_000_000
+        all_pair_count = int(len(self.orientations)) ** 2
+        if orientation_pair_count is None:
+            pair_count = all_pair_count if all_orientation_pairs else 1
+        else:
+            pair_count = max(1, int(orientation_pair_count))
+        line_count = (
+            max(1, len(self._line_mu_values(isotope)))
+            if isotope is not None
+            else self._max_line_count()
         )
-        safe_chunk = max(1, int(element_budget // denom))
-        return max(1, min(chunk, safe_chunk))
+
+        dtype_name = str(dtype if dtype is not None else self.gpu_dtype).lower()
+        bytes_per_element = 8 if "64" in dtype_name else 4
+        legacy_element_budget = (
+            4_000_000 if bytes_per_element == 8 else 8_000_000
+        )
+        legacy_denom = max(1, sample_count * line_count)
+        if obstacle_count > 0:
+            legacy_denom = max(
+                legacy_denom,
+                sample_count * obstacle_count * line_count,
+            )
+        legacy_denom = max(
+            legacy_denom,
+            sample_count * pair_count * line_count,
+        )
+        legacy_safe_chunk = max(1, int(legacy_element_budget // legacy_denom))
+
+        device_name = str(device if device is not None else self.gpu_device)
+        if not device_name.startswith("cuda"):
+            return max(1, min(chunk, legacy_safe_chunk))
+        memory_info = self._torch_cuda_memory_info(device_name)
+        if memory_info is None:
+            return max(1, min(chunk, legacy_safe_chunk))
+        free_bytes, total_bytes = memory_info
+        reserve_bytes = max(
+            _CUDA_CHUNK_MIN_RESERVE_BYTES,
+            int(total_bytes * _CUDA_CHUNK_RESERVE_FRACTION),
+        )
+        unreserved_bytes = max(0, int(free_bytes) - reserve_bytes)
+        if unreserved_bytes > 0:
+            working_bytes = min(
+                _CUDA_CHUNK_MAX_WORKING_BYTES,
+                int(unreserved_bytes * _CUDA_CHUNK_FREE_MEMORY_FRACTION),
+            )
+        else:
+            working_bytes = int(
+                max(0, int(free_bytes)) * _CUDA_CHUNK_LOW_MEMORY_FRACTION
+            )
+
+        # Segment-box intersection retains several entry/exit tensors per axis.
+        obstacle_working = 18 * sample_count * obstacle_count
+        # Pair-resolved line attenuation retains optical-depth, buildup, and
+        # response tensors concurrently. These factors intentionally overbound
+        # the live fp64 tensors observed in the production RAL geometry.
+        pair_working = 8 * sample_count * pair_count
+        line_working = 8 * sample_count * pair_count * line_count
+        ray_working = 32 * sample_count
+        working_elements_per_source = max(
+            1,
+            obstacle_working + pair_working + line_working + ray_working,
+        )
+        cuda_safe_chunk = max(
+            1,
+            int(
+                working_bytes
+                // max(1, bytes_per_element * working_elements_per_source)
+            ),
+        )
+        return max(1, min(chunk, cuda_safe_chunk))
+
+    def _torch_cuda_memory_info(
+        self,
+        device: "torch.device | str",
+    ) -> tuple[int, int] | None:
+        """Return free and total CUDA bytes, or ``None`` when unavailable."""
+        if torch is None or not str(device).startswith("cuda"):
+            return None
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        except (RuntimeError, TypeError):
+            return None
+        return int(free_bytes), int(total_bytes)
+
+    @staticmethod
+    def _is_cuda_out_of_memory(error: RuntimeError) -> bool:
+        """Return whether a runtime error represents CUDA allocation failure."""
+        if torch is not None:
+            oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+            if oom_type is not None and isinstance(error, oom_type):
+                return True
+        message = str(error).lower()
+        return "cuda" in message and "out of memory" in message
+
+    @staticmethod
+    def _clear_cuda_cache_after_oom(device: "torch.device | str") -> None:
+        """Release cached CUDA blocks after a recoverable chunk allocation OOM."""
+        if torch is None or not str(device).startswith("cuda"):
+            return
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError:
+            return
+
+    def _evaluate_torch_chunks_with_oom_retry(
+        self,
+        *,
+        total_size: int,
+        initial_chunk: int,
+        device: "torch.device | str",
+        evaluator: Callable[[int, int], _ChunkResult],
+    ) -> tuple[list[_ChunkResult], int]:
+        """
+        Evaluate ordered chunks, halving deterministically after a CUDA OOM.
+
+        A failed attempt is discarded and restarted from index zero. Therefore
+        output order and every per-row reduction remain identical to a run that
+        selected the successful chunk size initially.
+        """
+        total = max(0, int(total_size))
+        chunk = max(1, min(int(initial_chunk), max(total, 1)))
+        while True:
+            parts: list[_ChunkResult] = []
+            try:
+                for start in range(0, total, chunk):
+                    stop = min(start + chunk, total)
+                    parts.append(evaluator(start, stop))
+                return parts, chunk
+            except RuntimeError as error:
+                if not self._is_cuda_out_of_memory(error) or chunk <= 1:
+                    raise
+                parts.clear()
+                chunk = max(1, chunk // 2)
+            # Run this after leaving the except block so the traceback and
+            # failed evaluator frame no longer retain temporary tensors.
+            self._clear_cuda_cache_after_oom(device)
 
     def _mu_values(self, isotope: str) -> tuple[float, float]:
         """Return (mu_fe, mu_pb) for the given isotope with fallbacks."""
@@ -3036,29 +3174,43 @@ class ContinuousKernel:
         all_pairs = pair_count >= int(len(self.orientations)) ** 2
         source_chunk = self._adaptive_torch_chunk_size(
             8192,
+            isotope=isotope,
+            orientation_pair_count=pair_count,
+            device=device,
+            dtype=dtype,
             all_orientation_pairs=all_pairs,
         )
         particle_chunk = max(1, int(source_chunk) // max(slot_count, 1))
-        source_terms: list["torch.Tensor"] = []
         strengths_masked = strengths * mask
+
+        def _evaluate_particle_chunk(
+            start: int,
+            stop: int,
+        ) -> "torch.Tensor":
+            """Return source terms for one contiguous particle chunk."""
+            flat_sources = positions[start:stop].reshape(-1, 3)
+            kernel_values = self._kernel_values_selected_pairs_torch_tensor(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources_t=flat_sources,
+                fe_indices=fe_arr,
+                pb_indices=pb_arr,
+            )
+            kernel_values = kernel_values.reshape(
+                pair_count,
+                stop - start,
+                slot_count,
+            )
+            weighted = kernel_values * strengths_masked[start:stop].unsqueeze(0)
+            return torch.sum(weighted, dim=-1)
+
         with torch.no_grad():
-            for start in range(0, particle_count, particle_chunk):
-                stop = min(start + particle_chunk, particle_count)
-                flat_sources = positions[start:stop].reshape(-1, 3)
-                kernel_values = self._kernel_values_selected_pairs_torch_tensor(
-                    isotope=isotope,
-                    detector_pos=detector_pos,
-                    sources_t=flat_sources,
-                    fe_indices=fe_arr,
-                    pb_indices=pb_arr,
-                )
-                kernel_values = kernel_values.reshape(
-                    pair_count,
-                    stop - start,
-                    slot_count,
-                )
-                weighted = kernel_values * strengths_masked[start:stop].unsqueeze(0)
-                source_terms.append(torch.sum(weighted, dim=-1))
+            source_terms, _ = self._evaluate_torch_chunks_with_oom_retry(
+                total_size=particle_count,
+                initial_chunk=particle_chunk,
+                device=device,
+                evaluator=_evaluate_particle_chunk,
+            )
             source_term = torch.cat(source_terms, dim=1)
             source_scale_t = _source_scale_rows_torch(
                 source_scale,
@@ -3674,17 +3826,34 @@ class ContinuousKernel:
             ]
             return np.vstack(rows).astype(float, copy=False)
         self._gpu_enabled()
-        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=True)
-        parts: list[NDArray[np.float64]] = []
-        for start in range(0, sources_arr.shape[0], chunk):
-            stop = min(start + chunk, sources_arr.shape[0])
-            parts.append(
-                self._kernel_values_all_pairs_torch_chunk(
-                    isotope=isotope,
-                    detector_pos=detector_pos,
-                    sources=sources_arr[start:stop],
-                )
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=num_pairs,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=True,
+        )
+
+        def _evaluate_source_chunk(
+            start: int,
+            stop: int,
+        ) -> NDArray[np.float64]:
+            """Return every shield-pair kernel for one source chunk."""
+            return self._kernel_values_all_pairs_torch_chunk(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources=sources_arr[start:stop],
             )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=int(sources_arr.shape[0]),
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_source_chunk,
+        )
         if not parts:
             return np.zeros((num_pairs, 0), dtype=float)
         return np.concatenate(parts, axis=1)
@@ -3729,17 +3898,34 @@ class ContinuousKernel:
         self._gpu_enabled()
         detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
         sources_flat = np.tile(sources_arr, (pose_count, 1))
-        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=True)
-        parts: list[NDArray[np.float64]] = []
-        for start in range(0, sources_flat.shape[0], chunk):
-            stop = min(start + chunk, sources_flat.shape[0])
-            parts.append(
-                self._kernel_values_all_pairs_for_detector_source_torch_chunk(
-                    isotope=isotope,
-                    detector_positions=detectors_flat[start:stop],
-                    sources=sources_flat[start:stop],
-                )
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=num_pairs,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=True,
+        )
+
+        def _evaluate_detector_source_chunk(
+            start: int,
+            stop: int,
+        ) -> NDArray[np.float64]:
+            """Return all shield-pair kernels for matched rows in one chunk."""
+            return self._kernel_values_all_pairs_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors_flat[start:stop],
+                sources=sources_flat[start:stop],
             )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=int(sources_flat.shape[0]),
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_detector_source_chunk,
+        )
         if not parts:
             return np.zeros((pose_count, num_pairs, source_count), dtype=float)
         flat_values = np.concatenate(parts, axis=0)
@@ -3791,22 +3977,36 @@ class ContinuousKernel:
         sources_flat = np.tile(sources_arr, (pose_count, 1))
         fe_flat = np.repeat(fe_arr, source_count)
         pb_flat = np.repeat(pb_arr, source_count)
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
         chunk = self._adaptive_torch_chunk_size(
             chunk_size,
+            isotope=isotope,
+            orientation_pair_count=1,
+            device=device,
+            dtype=dtype,
             all_orientation_pairs=False,
         )
-        parts: list[NDArray[np.float64]] = []
-        for start in range(0, sources_flat.shape[0], chunk):
-            stop = min(start + chunk, sources_flat.shape[0])
-            parts.append(
-                self._kernel_values_selected_pairs_for_detector_source_torch_chunk(
-                    isotope=isotope,
-                    detector_positions=detectors_flat[start:stop],
-                    sources=sources_flat[start:stop],
-                    fe_indices=fe_flat[start:stop],
-                    pb_indices=pb_flat[start:stop],
-                )
+
+        def _evaluate_selected_detector_source_chunk(
+            start: int,
+            stop: int,
+        ) -> NDArray[np.float64]:
+            """Return selected-pair kernels for matched rows in one chunk."""
+            return self._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors_flat[start:stop],
+                sources=sources_flat[start:stop],
+                fe_indices=fe_flat[start:stop],
+                pb_indices=pb_flat[start:stop],
             )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=int(sources_flat.shape[0]),
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_selected_detector_source_chunk,
+        )
         if not parts:
             return np.zeros((pose_count, source_count), dtype=float)
         return np.concatenate(parts).reshape(pose_count, source_count)
@@ -3841,19 +4041,36 @@ class ContinuousKernel:
                 dtype=float,
             )
         self._gpu_enabled()
-        chunk = self._adaptive_torch_chunk_size(chunk_size, all_orientation_pairs=False)
-        parts: list[NDArray[np.float64]] = []
-        for start in range(0, sources_arr.shape[0], chunk):
-            stop = min(start + chunk, sources_arr.shape[0])
-            parts.append(
-                self._kernel_values_pair_torch_chunk(
-                    isotope=isotope,
-                    detector_pos=detector_pos,
-                    sources=sources_arr[start:stop],
-                    fe_index=fe_index,
-                    pb_index=pb_index,
-                )
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=1,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=False,
+        )
+
+        def _evaluate_pair_source_chunk(
+            start: int,
+            stop: int,
+        ) -> NDArray[np.float64]:
+            """Return one shield-pair kernel for a contiguous source chunk."""
+            return self._kernel_values_pair_torch_chunk(
+                isotope=isotope,
+                detector_pos=detector_pos,
+                sources=sources_arr[start:stop],
+                fe_index=fe_index,
+                pb_index=pb_index,
             )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=int(sources_arr.shape[0]),
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_pair_source_chunk,
+        )
         return np.concatenate(parts) if parts else np.zeros(0, dtype=float)
 
     def attenuation_factor(

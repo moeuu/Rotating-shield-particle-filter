@@ -250,6 +250,43 @@ def main() -> None:
         help="Optional tag appended to result output filenames (ex: ex5 -> result_pf_ex5.png).",
     )
     parser.add_argument(
+        "--resume-measurement-stage",
+        type=str,
+        default=None,
+        help=(
+            "Adopt one hidden MeasurementLog stream directory at its final "
+            "station_complete boundary, replay its pure-PF prefix, and continue."
+        ),
+    )
+    parser.add_argument(
+        "--resume-runtime-log",
+        type=str,
+        default=None,
+        help=(
+            "Original live stdout log used to restore candidate-RNG and "
+            "remaining-measurement controller history for a legacy stage that "
+            "predates embedded station checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--resume-compatible-code-path",
+        action="append",
+        default=None,
+        help=(
+            "Repository-relative runtime path admitted only after a separate "
+            "state-equivalence gate; may be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--resume-compatibility-basis",
+        type=str,
+        default=None,
+        help=(
+            "Non-empty evidence label required whenever runtime code changed "
+            "between the acquisition and resumed execution."
+        ),
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Force a non-GUI simulator mode and disable the Matplotlib live plot.",
@@ -872,6 +909,10 @@ def main() -> None:
         num_particles=args.num_particles,
         pf_config_overrides=pf_overrides,
         output_tag=args.output_tag,
+        resume_measurement_stage=args.resume_measurement_stage,
+        resume_runtime_log=args.resume_runtime_log,
+        resume_compatible_code_paths=args.resume_compatible_code_path,
+        resume_compatibility_basis=args.resume_compatibility_basis,
         pose_candidates=args.pose_candidates,
         pose_min_dist=args.pose_min_dist,
         converge=args.converge,

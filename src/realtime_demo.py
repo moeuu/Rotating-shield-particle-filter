@@ -12,7 +12,10 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
+import tempfile
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -556,6 +559,7 @@ from pf.parallel import Measurement
 from pf.pure_estimator import RotatingShieldPFEstimator, RotatingShieldPFConfig
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
 from pf.provenance import json_safe, repository_commit, sha256_json
+from pf.replay import build_replay_estimator, replay_records
 from planning.candidate_generation import (
     generate_candidate_poses,
     resolve_detector_height_actions,
@@ -636,6 +640,467 @@ from runtime.measurement_log import (
     MeasurementLogStreamWriter,
     build_forward_model_manifest,
 )
+
+
+_RESUME_ORCHESTRATION_CODE_PATHS: frozenset[str] = frozenset()
+_RESUME_RUNTIME_STATUS_PATHS = (
+    "main.py",
+    "src",
+    "pyproject.toml",
+    "uv.lock",
+    "native",
+    "scripts/run_geant4_bridge.py",
+    "scripts/build_geant4_sidecar.py",
+)
+_RESUME_RUNTIME_EXACT_PATHS = frozenset(
+    {
+        "main.py",
+        "pyproject.toml",
+        "uv.lock",
+        "scripts/run_geant4_bridge.py",
+        "scripts/build_geant4_sidecar.py",
+    }
+)
+_LIVE_CONTROLLER_CHECKPOINT_KEY = "live_controller_checkpoint"
+
+
+def _git_command_text(repository_root: Path, *args: str) -> str:
+    """Run one read-only Git command and return stripped stdout."""
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"Cannot verify resume repository compatibility: git {' '.join(args)}"
+        ) from exc
+    return completed.stdout.strip()
+
+
+def _full_git_commit(value: object) -> bool:
+    """Return whether a value is one full lowercase hexadecimal Git commit."""
+    text = str(value)
+    return len(text) == 40 and all(character in "0123456789abcdef" for character in text)
+
+
+def _sha256_path(path: str | Path) -> str:
+    """Return a streaming SHA-256 digest for one regular file."""
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"Expected one regular file for SHA-256: {candidate}.")
+    digest = hashlib.sha256()
+    with candidate.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resume_stage_repository_commit(stage_dir: str | Path) -> str:
+    """Read the staged prefix commit before rebuilding its forward identity."""
+    stage = Path(stage_dir)
+    if stage.is_symlink() or not stage.is_dir():
+        raise ValueError("The resume MeasurementLog stage must be a real directory.")
+    commit_path = stage / "repository_commit.txt"
+    if commit_path.is_symlink() or not commit_path.is_file():
+        raise ValueError("The resume stage lacks a regular repository_commit.txt.")
+    try:
+        raw = commit_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("Cannot read the resume stage repository commit.") from exc
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise ValueError("The resume stage repository commit is not canonical.")
+    try:
+        commit = raw[:-1].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("The resume stage repository commit is not ASCII.") from exc
+    if not _full_git_commit(commit):
+        raise ValueError("The resume stage requires one full Git commit.")
+    return commit
+
+
+def _git_blob_at_commit(
+    repository_root: Path,
+    commit: str,
+    relative_path: str,
+) -> str | None:
+    """Return a Git blob identifier, or None when the path did not exist."""
+    try:
+        return _git_command_text(
+            repository_root,
+            "rev-parse",
+            "--verify",
+            f"{commit}:{relative_path}",
+        )
+    except RuntimeError:
+        return None
+
+
+def _is_resume_runtime_path(path: str) -> bool:
+    """Return whether a repository path can affect live runtime semantics."""
+    return (
+        path in _RESUME_RUNTIME_EXACT_PATHS
+        or path.startswith("src/")
+        or path.startswith("native/")
+    )
+
+
+def _build_resume_compatibility_provenance(
+    *,
+    repository_root: Path,
+    prefix_commit: str,
+    execution_commit: str,
+    additional_compatible_code_paths: Sequence[str] | None,
+    compatibility_basis: str | None,
+) -> dict[str, Any]:
+    """Verify clean tracked runtime code and describe the allowed commit delta."""
+    root = repository_root.resolve()
+    if not _full_git_commit(prefix_commit) or not _full_git_commit(execution_commit):
+        raise RuntimeError("Resume requires full prefix and execution Git commits.")
+    dirty_runtime = _git_command_text(
+        root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        *_RESUME_RUNTIME_STATUS_PATHS,
+    )
+    if dirty_runtime:
+        raise RuntimeError(
+            "Resume refuses dirty or untracked live-runtime code; "
+            "commit the verified implementation before continuing."
+        )
+    changed_text = _git_command_text(
+        root,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        prefix_commit,
+        execution_commit,
+    )
+    changed_paths = tuple(
+        sorted(path for path in changed_text.splitlines() if path.strip())
+    )
+    extra_allowed = {
+        Path(str(path)).as_posix()
+        for path in (additional_compatible_code_paths or ())
+    }
+    if any(
+        path.startswith("/")
+        or path == ".."
+        or path.startswith("../")
+        or "/../" in path
+        for path in extra_allowed
+    ):
+        raise RuntimeError("Resume compatible code paths must be repository-relative.")
+    allowed_runtime_paths = set(_RESUME_ORCHESTRATION_CODE_PATHS) | extra_allowed
+    changed_runtime_paths = {
+        path
+        for path in changed_paths
+        if _is_resume_runtime_path(path)
+    }
+    incompatible = sorted(changed_runtime_paths - allowed_runtime_paths)
+    if incompatible:
+        raise RuntimeError(
+            "Resume execution changes unapproved runtime code: "
+            f"{incompatible}. Prove state equivalence and pass each path explicitly."
+        )
+    used_extra_paths = sorted(changed_runtime_paths & extra_allowed)
+    basis = "" if compatibility_basis is None else str(compatibility_basis).strip()
+    if changed_runtime_paths and not basis:
+        raise RuntimeError(
+            "An explicit compatibility basis is required for every admitted "
+            "runtime change."
+        )
+    path_blobs = {
+        path: {
+            "prefix_git_blob": _git_blob_at_commit(root, prefix_commit, path),
+            "execution_git_blob": _git_blob_at_commit(root, execution_commit, path),
+        }
+        for path in changed_paths
+    }
+    return {
+        "schema_version": 1,
+        "prefix_repository_commit": str(prefix_commit),
+        "resume_execution_commit": str(execution_commit),
+        "changed_paths": path_blobs,
+        "allowed_runtime_paths": sorted(allowed_runtime_paths),
+        "explicitly_compatible_runtime_paths": used_extra_paths,
+        "compatibility_basis": (
+            basis if basis else "no_live_runtime_path_delta"
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class _LiveResumeControllerState:
+    """Store live-loop state reconstructed from a complete logged station."""
+
+    step_counter: int
+    pose_counter: int
+    current_pose: NDArray[np.float64]
+    current_pose_idx: int
+    current_shield_pair_id: int
+    visited_poses: tuple[NDArray[np.float64], ...]
+    last_station_pair_ids: tuple[int, ...]
+    elapsed_s: float
+    total_motion_distance_m: float
+    total_motion_time_s: float
+    total_rotation_time_s: float
+    measurement_live_times_s: tuple[float, ...]
+    last_spectrum: NDArray[np.float64]
+    last_counts: dict[str, float]
+    representative_spectrum: NDArray[np.float64]
+    representative_counts: dict[str, float]
+    representative_step_index: int
+
+
+def _online_compute_timing_provenance(
+    resume_prefix_measurement_count: int,
+) -> dict[str, object]:
+    """Describe which live measurements are covered by online compute timings."""
+    prefix_count = int(resume_prefix_measurement_count)
+    if prefix_count < 0:
+        raise ValueError("Resume prefix measurement count must be non-negative.")
+    resumed = prefix_count > 0
+    return {
+        "online_compute_timing_scope": (
+            "post_resume_suffix_only" if resumed else "full_live_run"
+        ),
+        "online_compute_timing_prefix_measurements_excluded": (
+            prefix_count if resumed else 0
+        ),
+        "online_compute_timing_includes_resume_pf_replay": False,
+    }
+
+
+@dataclass(frozen=True)
+class _LiveControllerCheckpoint:
+    """Store controller-only state restored at a durable station boundary."""
+
+    remaining_measurement_estimates: tuple[dict[str, Any], ...]
+    remaining_measurement_budget_history: tuple[dict[str, float], ...]
+    remaining_measurement_eta_ratios: tuple[float, ...]
+    max_poses: int | None
+    soft_pose_extension_used: int
+    ig_max_global: float
+    ig_max_pose: float
+    ig_threshold_current: float
+    last_max_ig: float | None
+
+
+def _planning_candidate_checkpoint_parameters(
+    *,
+    pose_candidates: int,
+    pose_min_dist: float,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
+    detector_heights_m: Sequence[float] | None,
+    continuous_height_anchor_count: int,
+    height_partner_xy_tolerance_m: float,
+    height_partner_z_tolerance_m: float,
+    height_partner_min_z_separation_m: float,
+) -> dict[str, Any]:
+    """Return the exact candidate-generation parameters guarded by a checkpoint."""
+    bounds_lo = np.asarray(bounds_xyz[0], dtype=float).reshape(3)
+    bounds_hi = np.asarray(bounds_xyz[1], dtype=float).reshape(3)
+    return {
+        "pose_candidates": int(pose_candidates),
+        "pose_min_dist_m": float(pose_min_dist),
+        "bounds_lo_xyz_m": [float(value) for value in bounds_lo],
+        "bounds_hi_xyz_m": [float(value) for value in bounds_hi],
+        "detector_heights_m": (
+            None
+            if detector_heights_m is None
+            else [float(value) for value in detector_heights_m]
+        ),
+        "continuous_height_anchor_count": int(continuous_height_anchor_count),
+        "height_partner_xy_tolerance_m": float(height_partner_xy_tolerance_m),
+        "height_partner_z_tolerance_m": float(height_partner_z_tolerance_m),
+        "height_partner_min_z_separation_m": float(
+            height_partner_min_z_separation_m
+        ),
+    }
+
+
+def _build_live_controller_checkpoint(
+    *,
+    planning_candidate_rng: np.random.Generator,
+    planning_candidate_parameters: Mapping[str, Any],
+    remaining_measurement_estimates: Sequence[Mapping[str, Any]],
+    estimator: RotatingShieldPFEstimator,
+    max_poses: int | None,
+    soft_pose_extension_used: int,
+    ig_max_global: float,
+    ig_max_pose: float,
+    ig_threshold_current: float,
+    last_max_ig: float | None,
+) -> dict[str, Any]:
+    """Build one truth-free controller checkpoint before post-station planning."""
+    budget_history_raw = getattr(
+        estimator,
+        "_remaining_measurement_budget_history",
+        (),
+    )
+    eta_ratios_raw = getattr(
+        estimator,
+        "_remaining_measurement_eta_ratios",
+        (),
+    )
+    payload = {
+        "schema_version": 1,
+        "planning_candidate_rng_state": json_safe(
+            planning_candidate_rng.bit_generator.state
+        ),
+        "planning_candidate_parameters": json_safe(
+            dict(planning_candidate_parameters)
+        ),
+        "remaining_measurement_estimates": json_safe(
+            [dict(value) for value in remaining_measurement_estimates]
+        ),
+        "remaining_measurement_budget_history": json_safe(
+            [dict(value) for value in budget_history_raw]
+        ),
+        "remaining_measurement_eta_ratios": json_safe(list(eta_ratios_raw)),
+        "mission_state": {
+            "max_poses": None if max_poses is None else int(max_poses),
+            "soft_pose_extension_used": int(soft_pose_extension_used),
+            "ig_max_global": float(ig_max_global),
+            "ig_max_pose": float(ig_max_pose),
+            "ig_threshold_current": float(ig_threshold_current),
+            "last_max_ig": (
+                None if last_max_ig is None else float(last_max_ig)
+            ),
+        },
+    }
+    try:
+        json.dumps(payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Live controller checkpoint contains a non-finite or non-JSON value."
+        ) from exc
+    return payload
+
+
+def _restore_live_controller_checkpoint(
+    *,
+    record: MeasurementLogRecord,
+    planning_candidate_rng: np.random.Generator,
+    expected_planning_candidate_parameters: Mapping[str, Any],
+) -> _LiveControllerCheckpoint | None:
+    """Restore and validate a durable station-boundary controller checkpoint."""
+    raw = record.metadata.get(_LIVE_CONTROLLER_CHECKPOINT_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("Live controller checkpoint must be a JSON object.")
+    checkpoint = dict(raw)
+    expected_keys = {
+        "schema_version",
+        "planning_candidate_rng_state",
+        "planning_candidate_parameters",
+        "remaining_measurement_estimates",
+        "remaining_measurement_budget_history",
+        "remaining_measurement_eta_ratios",
+        "mission_state",
+    }
+    if set(checkpoint) != expected_keys or checkpoint["schema_version"] != 1:
+        raise RuntimeError("Unsupported or malformed live controller checkpoint.")
+    actual_parameters = checkpoint["planning_candidate_parameters"]
+    if not isinstance(actual_parameters, Mapping) or sha256_json(
+        dict(actual_parameters)
+    ) != sha256_json(dict(expected_planning_candidate_parameters)):
+        raise RuntimeError(
+            "Live controller checkpoint candidate parameters differ from the "
+            "current runtime."
+        )
+    rng_state = checkpoint["planning_candidate_rng_state"]
+    if not isinstance(rng_state, Mapping):
+        raise RuntimeError("Checkpoint planning RNG state must be an object.")
+    try:
+        planning_candidate_rng.bit_generator.state = dict(rng_state)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Checkpoint planning RNG state is invalid.") from exc
+    if sha256_json(
+        json_safe(planning_candidate_rng.bit_generator.state)
+    ) != sha256_json(dict(rng_state)):
+        raise RuntimeError("Checkpoint planning RNG state did not restore exactly.")
+
+    estimates_raw = checkpoint["remaining_measurement_estimates"]
+    history_raw = checkpoint["remaining_measurement_budget_history"]
+    eta_raw = checkpoint["remaining_measurement_eta_ratios"]
+    mission_raw = checkpoint["mission_state"]
+    if (
+        not isinstance(estimates_raw, list)
+        or not all(isinstance(value, Mapping) for value in estimates_raw)
+        or not isinstance(history_raw, list)
+        or not all(isinstance(value, Mapping) for value in history_raw)
+        or not isinstance(eta_raw, list)
+        or not isinstance(mission_raw, Mapping)
+    ):
+        raise RuntimeError("Checkpoint controller history has invalid structure.")
+    mission = dict(mission_raw)
+    if set(mission) != {
+        "max_poses",
+        "soft_pose_extension_used",
+        "ig_max_global",
+        "ig_max_pose",
+        "ig_threshold_current",
+        "last_max_ig",
+    }:
+        raise RuntimeError("Checkpoint mission state has invalid fields.")
+    try:
+        history = tuple(
+            {
+                "budget": float(value["budget"]),
+                "predicted_gain": float(value["predicted_gain"]),
+            }
+            for value in history_raw
+        )
+        eta_ratios = tuple(float(value) for value in eta_raw)
+        max_poses_raw = mission["max_poses"]
+        max_poses = None if max_poses_raw is None else int(max_poses_raw)
+        soft_pose_extension_used = int(mission["soft_pose_extension_used"])
+        ig_max_global = float(mission["ig_max_global"])
+        ig_max_pose = float(mission["ig_max_pose"])
+        ig_threshold_current = float(mission["ig_threshold_current"])
+        last_max_ig_raw = mission["last_max_ig"]
+        last_max_ig = (
+            None if last_max_ig_raw is None else float(last_max_ig_raw)
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Checkpoint controller values are invalid.") from exc
+    finite_values = [
+        *(value for entry in history for value in entry.values()),
+        *eta_ratios,
+        ig_max_global,
+        ig_max_pose,
+        ig_threshold_current,
+    ]
+    if last_max_ig is not None:
+        finite_values.append(last_max_ig)
+    if (
+        any(not np.isfinite(value) for value in finite_values)
+        or soft_pose_extension_used < 0
+        or (max_poses is not None and max_poses < 1)
+    ):
+        raise RuntimeError("Checkpoint controller values are out of range.")
+    return _LiveControllerCheckpoint(
+        remaining_measurement_estimates=tuple(
+            dict(value) for value in estimates_raw
+        ),
+        remaining_measurement_budget_history=history,
+        remaining_measurement_eta_ratios=eta_ratios,
+        max_poses=max_poses,
+        soft_pose_extension_used=soft_pose_extension_used,
+        ig_max_global=ig_max_global,
+        ig_max_pose=ig_max_pose,
+        ig_threshold_current=ig_threshold_current,
+        last_max_ig=last_max_ig,
+    )
 
 
 def _pure_pf_profile_active(estimator: object) -> bool:
@@ -5029,16 +5494,45 @@ def _log_source_event_diagnostics(
     true_strengths: dict[str, float | Sequence[float]],
     *,
     step_index: int,
+    event_log_limit: int = 64,
 ) -> None:
-    """Log source birth, death, merge, and verification events with truth matching."""
+    """Log bounded source-event details plus a complete deterministic summary."""
     any_event = False
     for isotope, filt in sorted(estimator.filters.items()):
-        events = list(getattr(filt, "last_source_event_diagnostics", []))
+        events = [
+            dict(event)
+            for event in getattr(filt, "last_source_event_diagnostics", [])
+        ]
         if not events:
             continue
         any_event = True
-        for event_idx, event_raw in enumerate(events):
-            event = dict(event_raw)
+        event_counts = Counter(
+            str(event.get("event", "unspecified")) for event in events
+        )
+        reason_counts = Counter(
+            str(event.get("reason", "unspecified")) for event in events
+        )
+        event_digest = hashlib.sha256()
+        for event in events:
+            event_digest.update(_safe_json_dumps(event).encode("utf-8"))
+            event_digest.update(b"\n")
+        detail_indices = _diagnostic_detail_order(
+            np.arange(len(events), dtype=np.int64),
+            event_log_limit,
+        )
+        print(
+            f"[step {step_index}] source_event_summary[{isotope}] "
+            f"total={len(events)} logged={int(detail_indices.size)} "
+            f"omitted={len(events) - int(detail_indices.size)} "
+            f"raw_sha256={event_digest.hexdigest()} "
+            "event_counts="
+            f"{_safe_json_dumps(dict(sorted(event_counts.items())))} "
+            "reason_counts="
+            f"{_safe_json_dumps(dict(sorted(reason_counts.items())))}"
+        )
+        for raw_event_idx in detail_indices:
+            event_idx = int(raw_event_idx)
+            event = dict(events[event_idx])
             position = np.asarray(event.get("position", np.zeros(3)), dtype=float)
             if position.size >= 3:
                 event.update(
@@ -5112,6 +5606,7 @@ def _log_precision_degradation_diagnostics(
     step_index: int,
     candidate_log_limit: int,
     particle_log_limit: int,
+    source_event_log_limit: int = 64,
     birth_candidate_diagnostics_enabled: bool = False,
     full_spectrum_response_diagnostics_enabled: bool = False,
 ) -> None:
@@ -5209,6 +5704,7 @@ def _log_precision_degradation_diagnostics(
             true_sources,
             true_strengths,
             step_index=step_index,
+            event_log_limit=source_event_log_limit,
         ),
     )
     if bool(birth_candidate_diagnostics_enabled) and int(candidate_log_limit) != 0:
@@ -6609,6 +7105,410 @@ def _generate_planning_candidates(
         candidates=candidates,
     )
     return candidates, True, relaxed_dist
+
+
+def _records_by_station(
+    records: Sequence[MeasurementLogRecord],
+) -> tuple[tuple[MeasurementLogRecord, ...], ...]:
+    """Group a validated causal record prefix by contiguous station id."""
+    if not records:
+        raise ValueError("Resume requires at least one MeasurementLog record.")
+    grouped: list[list[MeasurementLogRecord]] = []
+    for record in records:
+        station_id = int(record.station_id)
+        if station_id == len(grouped):
+            grouped.append([record])
+        elif station_id == len(grouped) - 1:
+            grouped[-1].append(record)
+        else:
+            raise ValueError(
+                "Resume records require contiguous zero-based station identifiers."
+            )
+    return tuple(tuple(station) for station in grouped)
+
+
+def _reconstruct_resume_controller_state(
+    *,
+    records: Sequence[MeasurementLogRecord],
+    estimator: RotatingShieldPFEstimator,
+    isotopes: Sequence[str],
+    nominal_motion_speed_m_s: float,
+    expected_program_length: int,
+) -> _LiveResumeControllerState:
+    """Reconstruct counters, trajectory, timing, and display inputs from a prefix."""
+    stations = _records_by_station(records)
+    if len(estimator.poses) != len(stations):
+        raise RuntimeError(
+            "Pure replay pose count does not match the staged station count."
+        )
+    final_station = stations[-1]
+    if len(final_station) != int(expected_program_length):
+        raise RuntimeError(
+            "Resume currently requires the completed station to contain the full "
+            f"{int(expected_program_length)}-posture program."
+        )
+    final_pose = np.asarray(final_station[0].detector_pose_xyz, dtype=float)
+    current_pose_idx = len(estimator.poses) - 1
+    if not np.array_equal(
+        np.asarray(estimator.poses[current_pose_idx], dtype=float),
+        final_pose,
+    ):
+        raise RuntimeError(
+            "Pure replay final pose does not match the staged station boundary."
+        )
+    station_poses = tuple(
+        np.asarray(station[0].detector_pose_xyz, dtype=float).copy()
+        for station in stations
+    )
+    pair_ids = tuple(
+        int(record.fe_orientation_index) * 8 + int(record.pb_orientation_index)
+        for record in final_station
+    )
+    representative = max(
+        records,
+        key=lambda record: float(
+            np.sum(np.asarray(record.spectrum_counts, dtype=float))
+        ),
+    )
+    last = records[-1]
+    last_counts = {
+        str(isotope): float((last.isotope_counts or {}).get(str(isotope), 0.0))
+        for isotope in isotopes
+    }
+    representative_counts = {
+        str(isotope): float(
+            (representative.isotope_counts or {}).get(str(isotope), 0.0)
+        )
+        for isotope in isotopes
+    }
+    motion_time = float(sum(float(record.travel_time_s) for record in records))
+    rotation_time = float(
+        sum(float(record.shield_actuation_time_s) for record in records)
+    )
+    live_times = tuple(float(record.live_time_s) for record in records)
+    elapsed = motion_time + rotation_time + float(sum(live_times))
+    return _LiveResumeControllerState(
+        step_counter=len(records),
+        pose_counter=len(stations) - 1,
+        current_pose=final_pose.copy(),
+        current_pose_idx=current_pose_idx,
+        current_shield_pair_id=int(pair_ids[-1]),
+        visited_poses=tuple(pose.copy() for pose in station_poses[:-1]),
+        last_station_pair_ids=pair_ids,
+        elapsed_s=elapsed,
+        total_motion_distance_m=motion_time
+        * max(float(nominal_motion_speed_m_s), 0.0),
+        total_motion_time_s=motion_time,
+        total_rotation_time_s=rotation_time,
+        measurement_live_times_s=live_times,
+        last_spectrum=np.asarray(last.spectrum_counts, dtype=float).copy(),
+        last_counts=last_counts,
+        representative_spectrum=np.asarray(
+            representative.spectrum_counts,
+            dtype=float,
+        ).copy(),
+        representative_counts=representative_counts,
+        representative_step_index=int(representative.step_id),
+    )
+
+
+def _advance_resume_planning_candidate_rng(
+    *,
+    rng: np.random.Generator,
+    records: Sequence[MeasurementLogRecord],
+    map_api: object | None,
+    n_candidates: int,
+    min_dist_from_visited: float,
+    bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]],
+    detector_heights_m: Sequence[float] | None,
+    continuous_height_anchor_count: int,
+    height_partner_xy_tolerance_m: float,
+    height_partner_z_tolerance_m: float,
+    height_partner_min_z_separation_m: float,
+    expected_candidate_counts: Sequence[tuple[int, int, int]] | None = None,
+) -> None:
+    """Replay candidate generation and verify logged total/lateral/height counts."""
+    stations = _records_by_station(records)
+    transition_count = max(len(stations) - 1, 0)
+    if expected_candidate_counts is not None and len(expected_candidate_counts) != (
+        transition_count
+    ):
+        raise RuntimeError(
+            "Resume candidate diagnostics do not match the transition count."
+        )
+    visited: list[NDArray[np.float64]] = []
+    for station_index, station in enumerate(stations[:-1]):
+        current_pose = np.asarray(station[0].detector_pose_xyz, dtype=float)
+        visited.append(current_pose.copy())
+        visited_arr = np.vstack(visited)
+        candidates, _, _ = _generate_planning_candidates(
+            current_pose_xyz=current_pose,
+            map_api=map_api,
+            n_candidates=int(n_candidates),
+            min_dist_from_visited=float(min_dist_from_visited),
+            visited_poses_xyz=visited_arr,
+            bounds_xyz=bounds_xyz,
+            detector_heights_m=detector_heights_m,
+            continuous_height_anchor_count=int(continuous_height_anchor_count),
+            height_partner_xy_tolerance_m=float(
+                height_partner_xy_tolerance_m
+            ),
+            height_partner_z_tolerance_m=float(
+                height_partner_z_tolerance_m
+            ),
+            height_partner_min_z_separation_m=float(
+                height_partner_min_z_separation_m
+            ),
+            rng=rng,
+        )
+        if expected_candidate_counts is not None:
+            candidates_array = np.asarray(candidates, dtype=float).reshape(-1, 3)
+            lateral_distance = np.linalg.norm(
+                candidates_array[:, :2] - current_pose[None, :2],
+                axis=1,
+            )
+            lateral_count = int(
+                np.count_nonzero(
+                    lateral_distance
+                    > max(float(height_partner_xy_tolerance_m), 1.0e-9)
+                )
+            )
+            actual_counts = (
+                int(candidates_array.shape[0]),
+                lateral_count,
+                int(candidates_array.shape[0] - lateral_count),
+            )
+            if actual_counts != tuple(expected_candidate_counts[station_index]):
+                raise RuntimeError(
+                    "Regenerated candidate total/lateral/height counts differ "
+                    f"after station {station_index}: actual={actual_counts}, "
+                    f"expected={expected_candidate_counts[station_index]}."
+                )
+
+
+def _parse_candidate_generation_counts(
+    runtime_log_path: str | Path,
+) -> tuple[tuple[int, int, int], ...]:
+    """Parse post-station candidate total/lateral/height diagnostics."""
+    path = Path(runtime_log_path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Resume runtime log must be one regular file.")
+    pattern = re.compile(
+        r"Generated ([0-9]+) candidate poses "
+        r"\(lateral=([0-9]+), height=([0-9]+)\)\."
+    )
+    result: list[tuple[int, int, int]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            match = pattern.search(line)
+            if match is None:
+                continue
+            result.append(tuple(int(value) for value in match.groups()))
+    return tuple(result)
+
+
+def _parse_remaining_measurement_details(
+    runtime_log_path: str | Path,
+) -> dict[int, dict[str, Any]]:
+    """Parse structured estimator-only remaining-budget details from a live log."""
+    path = Path(runtime_log_path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Resume runtime log must be one regular file.")
+    parsed: dict[int, dict[str, Any]] = {}
+    marker = "Remaining measurement detail[pose_"
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            marker_index = line.find(marker)
+            if marker_index < 0:
+                continue
+            payload_line = line[marker_index:].rstrip("\n")
+            label, separator, payload = payload_line.partition("]: components=")
+            if not separator or not label.endswith("_next"):
+                continue
+            raw_index = label[len(marker) : -len("_next")]
+            try:
+                station_index = int(raw_index)
+                components_text, payload = payload.split(" gains=", 1)
+                gains_text, isotope_text = payload.split(" isotopes=", 1)
+                components = json.loads(components_text)
+                gains = json.loads(gains_text)
+                isotope_details = json.loads(isotope_text)
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "Malformed remaining-measurement detail in resume runtime log "
+                    f"at line {line_number}."
+                ) from exc
+            if station_index in parsed:
+                raise ValueError(
+                    "Resume runtime log contains duplicate next-budget details for "
+                    f"station {station_index}."
+                )
+            if not all(
+                isinstance(value, dict)
+                for value in (components, gains, isotope_details)
+            ):
+                raise ValueError(
+                    "Resume remaining-measurement details must be JSON objects."
+                )
+            parsed[station_index] = {
+                "components": components,
+                "gains": gains,
+                "isotope_details": isotope_details,
+            }
+    return parsed
+
+
+def _restore_remaining_measurement_history(
+    *,
+    estimator: RotatingShieldPFEstimator,
+    records: Sequence[MeasurementLogRecord],
+    runtime_log_path: str | Path,
+    config: RemainingMeasurementConfig,
+) -> list[dict[str, Any]]:
+    """Restore exact empirical-eta history from logged structured diagnostics."""
+    stations = _records_by_station(records)
+    expected_indices = list(range(max(len(stations) - 1, 0)))
+    details_by_station = _parse_remaining_measurement_details(runtime_log_path)
+    if sorted(details_by_station) != expected_indices:
+        raise RuntimeError(
+            "Resume runtime log does not contain exactly one next-budget detail "
+            "for every completed historical planning transition."
+        )
+    history: list[dict[str, float]] = []
+    eta_ratios: list[float] = []
+    payloads: list[dict[str, Any]] = []
+    for station_index in expected_indices:
+        detail = details_by_station[station_index]
+        components = {
+            str(key): float(value)
+            for key, value in dict(detail["components"]).items()
+        }
+        gains = {
+            str(key): float(value) for key, value in dict(detail["gains"]).items()
+        }
+        budget = (
+            float(config.uncertainty_weight) * components.get("uncertainty", 0.0)
+            + float(config.cardinality_weight)
+            * components.get("cardinality", 0.0)
+            + float(config.separation_weight)
+            * components.get("same_isotope_separation", 0.0)
+            + float(config.verification_weight)
+            * components.get("pseudo_source_verification", 0.0)
+            + float(config.residual_weight) * components.get("residual", 0.0)
+            + float(config.report_response_correlation_weight)
+            * components.get("report_response_correlation", 0.0)
+            + float(config.report_residual_weight)
+            * components.get("report_residual", 0.0)
+            + float(config.strength_absorption_weight)
+            * components.get("strength_absorption", 0.0)
+            + float(config.high_surface_ambiguity_weight)
+            * components.get("high_surface_ambiguity", 0.0)
+            + components.get("isotope_absence", 0.0)
+        )
+        predicted_gain = (
+            float(config.uncertainty_weight) * gains.get("uncertainty", 0.0)
+            + float(config.separation_weight)
+            * gains.get("same_isotope_separation", 0.0)
+            + float(config.verification_weight)
+            * gains.get("pseudo_source_verification", 0.0)
+            + float(config.residual_weight) * gains.get("residual", 0.0)
+            + float(config.high_surface_ambiguity_weight)
+            * gains.get("high_surface_ambiguity", 0.0)
+            + float(config.dss_information_gain_weight)
+            * gains.get("dss_information", 0.0)
+            + float(config.dss_count_utility_weight)
+            * gains.get("residual", 0.0)
+        )
+        if history:
+            previous = history[-1]
+            realized = max(float(previous["budget"]) - float(budget), 0.0)
+            denominator = max(float(previous["predicted_gain"]), 1.0e-12)
+            eta_ratios.append(realized / denominator)
+            eta_ratios = eta_ratios[-8:]
+        history.append(
+            {
+                "budget": float(budget),
+                "predicted_gain": float(predicted_gain),
+            }
+        )
+        history = history[-8:]
+        eta = (
+            float(np.median(np.asarray(eta_ratios, dtype=float)))
+            if eta_ratios
+            else float(config.eta_default)
+        )
+        eta = float(np.clip(eta, float(config.eta_min), float(config.eta_max)))
+        remaining_budget = max(float(budget) - float(config.stop_budget), 0.0)
+        denominator = max(
+            eta * float(predicted_gain),
+            float(config.gain_epsilon),
+        )
+        estimate = (
+            int(np.ceil(remaining_budget / denominator))
+            if remaining_budget > 0.0
+            else 0
+        )
+        estimate = min(
+            max(estimate, 0),
+            max(0, int(config.max_reported_stations)),
+        )
+        low = (
+            max(1, int(np.floor(float(estimate) / float(config.range_scale))))
+            if estimate > 0
+            else 0
+        )
+        high = min(
+            max(0, int(config.max_reported_stations)),
+            max(
+                estimate,
+                int(np.ceil(float(estimate) * float(config.range_scale))),
+            ),
+        )
+        next_station = stations[station_index + 1]
+        program = [
+            int(record.fe_orientation_index) * 8
+            + int(record.pb_orientation_index)
+            for record in next_station
+        ]
+        unresolved = [
+            key
+            for key, value in sorted(components.items())
+            if float(value) > 1.0e-9
+        ]
+        bottleneck = (
+            "none"
+            if not unresolved
+            else max(components, key=lambda key: float(components[key]))
+        )
+        next_pose = [
+            float(value) for value in next_station[0].detector_pose_xyz
+        ]
+        payloads.append(
+            {
+                "current_station_count": int(station_index + 1),
+                "estimated_remaining_stations": int(estimate),
+                "estimated_remaining_station_low": int(low),
+                "estimated_remaining_station_high": int(high),
+                "estimated_remaining_spectra_low": int(low * len(program)),
+                "estimated_remaining_spectra_high": int(high * len(program)),
+                "program_length": int(len(program)),
+                "current_budget": float(budget),
+                "stop_budget": float(config.stop_budget),
+                "predicted_gain": float(predicted_gain),
+                "empirical_eta": float(eta),
+                "bottleneck": str(bottleneck),
+                "unresolved_factors": unresolved,
+                "components": components,
+                "gains": gains,
+                "isotope_details": dict(detail["isotope_details"]),
+                "timings": {"restored_from_runtime_log": 1.0},
+                "next_pose": next_pose,
+                "planned_pairs": program,
+            }
+        )
+    setattr(estimator, "_remaining_measurement_budget_history", history)
+    setattr(estimator, "_remaining_measurement_eta_ratios", eta_ratios)
+    return payloads
 
 
 def _previous_move_was_height_partner(
@@ -8813,6 +9713,10 @@ def run_live_pf(
     save_outputs: bool = True,
     output_tag: str | None = None,
     measurement_log_output: str | None = None,
+    resume_measurement_stage: str | None = None,
+    resume_runtime_log: str | None = None,
+    resume_compatible_code_paths: Sequence[str] | None = None,
+    resume_compatibility_basis: str | None = None,
     pose_candidates: int = 64,
     pose_min_dist: float = 3.0,
     return_state: bool = False,
@@ -8873,6 +9777,14 @@ def run_live_pf(
         output_tag: Optional tag appended to result output filenames.
         measurement_log_output: Truth-free log directory. Pure runs require this
             argument or runtime_config.measurement_log_output_dir.
+        resume_measurement_stage: Hidden stream stage to adopt at a completed
+            station boundary before pure-PF replay.
+        resume_runtime_log: Original live stdout log used only to restore
+            estimator-neutral remaining-budget controller history.
+        resume_compatible_code_paths: Runtime paths whose commit delta passed an
+            external state-equivalence gate.
+        resume_compatibility_basis: Description of the equivalence evidence for
+            explicitly compatible runtime paths.
         pose_candidates: Number of pose candidates to generate per step.
         pose_min_dist: Minimum distance from visited poses for candidates (meters).
         return_state: When True, return the estimator for inspection/testing.
@@ -9390,6 +10302,9 @@ def run_live_pf(
     )
     precision_diagnostic_particle_log_limit = int(
         runtime_config.get("precision_diagnostic_particle_log_limit", 0)
+    )
+    precision_diagnostic_source_event_log_limit = int(
+        runtime_config.get("precision_diagnostic_source_event_log_limit", 64)
     )
     surface_observability_diagnostic_candidates = max(
         0,
@@ -12976,8 +13891,34 @@ def run_live_pf(
         plt.pause(5.0)
         plt.close(preview_viz.fig)
 
-    estimator, current_pose, current_pose_idx = _build_estimator()
+    estimator: RotatingShieldPFEstimator
+    current_pose: NDArray[np.float64]
+    current_pose_idx: int
     measurement_log_writer: MeasurementLogStreamWriter | None = None
+    resume_controller_state: _LiveResumeControllerState | None = None
+    resume_controller_checkpoint: _LiveControllerCheckpoint | None = None
+    resume_remaining_measurement_estimates: list[dict[str, Any]] = []
+    resume_replay_wall_s = 0.0
+    planning_candidate_checkpoint_parameters = (
+        _planning_candidate_checkpoint_parameters(
+            pose_candidates=int(pose_candidates),
+            pose_min_dist=float(pose_min_dist),
+            bounds_xyz=(bounds_lo, bounds_hi),
+            detector_heights_m=detector_height_candidates,
+            continuous_height_anchor_count=(
+                detector_continuous_height_partner_candidates
+            ),
+            height_partner_xy_tolerance_m=(
+                detector_height_pair_xy_tolerance_m
+            ),
+            height_partner_z_tolerance_m=(
+                detector_height_pair_z_tolerance_m
+            ),
+            height_partner_min_z_separation_m=(
+                detector_height_pair_min_separation_m
+            ),
+        )
+    )
     if measurement_log_target is not None:
         environment_payload: dict[str, Any] = {
             "environment_model_id": str(
@@ -12995,7 +13936,27 @@ def run_live_pf(
                 None if obstacle_grid is None else obstacle_grid.to_dict()
             ),
         }
-        commit = repository_commit()
+        execution_commit = repository_commit()
+        if not _full_git_commit(execution_commit):
+            raise RuntimeError(
+                "Pure live acquisition requires an available full Git commit."
+            )
+        compatibility: dict[str, Any] | None = None
+        if resume_measurement_stage is None:
+            commit = execution_commit
+        else:
+            commit = _resume_stage_repository_commit(resume_measurement_stage)
+            compatibility = _build_resume_compatibility_provenance(
+                repository_root=ROOT,
+                prefix_commit=commit,
+                execution_commit=execution_commit,
+                additional_compatible_code_paths=resume_compatible_code_paths,
+                compatibility_basis=resume_compatibility_basis,
+            )
+            if resume_runtime_log is not None:
+                compatibility["controller_history_log_sha256"] = _sha256_path(
+                    resume_runtime_log
+                )
         forward_manifest = build_forward_model_manifest(
             runtime_config=measurement_log_runtime_config,
             environment=environment_payload,
@@ -13006,22 +13967,187 @@ def run_live_pf(
             run_root=measurement_log_target,
             repository_root=ROOT,
         )
-        measurement_log_writer = MeasurementLogStreamWriter(
-            measurement_log_target,
-            run_id=str(
-                runtime_config.get(
-                    "measurement_log_run_id",
-                    measurement_log_target.name,
-                )
-            ),
-            repository_commit=commit,
-            runtime_config=measurement_log_runtime_config,
-            environment=environment_payload,
-            forward_model_manifest=forward_manifest,
-            isotopes=isotopes,
-            metadata={"acquisition": "live_append_before_pf_update"},
-            obstacle_layout_path=measurement_log_obstacle_layout_path,
+        log_run_id = str(
+            runtime_config.get(
+                "measurement_log_run_id",
+                measurement_log_target.name,
+            )
         )
+        writer_arguments = {
+            "run_id": log_run_id,
+            "repository_commit": commit,
+            "runtime_config": measurement_log_runtime_config,
+            "environment": environment_payload,
+            "forward_model_manifest": forward_manifest,
+            "isotopes": isotopes,
+            "obstacle_layout_path": measurement_log_obstacle_layout_path,
+        }
+        if resume_measurement_stage is None:
+            estimator, current_pose, current_pose_idx = _build_estimator()
+            measurement_log_writer = MeasurementLogStreamWriter(
+                measurement_log_target,
+                metadata={"acquisition": "live_append_before_pf_update"},
+                **writer_arguments,
+            )
+        else:
+            if pf_detected_isotopes_only or online_absent_pruning_enabled:
+                raise RuntimeError(
+                    "Exact station-boundary resume currently requires "
+                    "pf_detected_isotopes_only=false and "
+                    "online_absent_isotope_pruning=false."
+                )
+            assert compatibility is not None
+            measurement_log_writer = MeasurementLogStreamWriter.resume_from_stage(
+                measurement_log_target,
+                stage_dir=resume_measurement_stage,
+                metadata={"acquisition": "live_station_boundary_resume"},
+                resume_execution_commit=execution_commit,
+                resume_compatibility=compatibility,
+                **writer_arguments,
+            )
+            replay_start = time.perf_counter()
+            with tempfile.TemporaryDirectory(
+                prefix=f".{measurement_log_target.name}.resume-prefix-",
+                dir=measurement_log_target.parent,
+            ) as temporary_root:
+                prefix_path = Path(temporary_root) / "measurement-log"
+                prefix_log = measurement_log_writer.write_canonical_prefix(
+                    prefix_path
+                )
+                estimator = build_replay_estimator(
+                    prefix_log,
+                    runtime_config,
+                    profile=str(pf_conf.estimator_profile),
+                    seed=int(pf_random_seed),
+                    config_hash=input_config_hash,
+                    resolved_config_hash=measurement_log_config_hash,
+                )
+
+                def _report_replayed_station(
+                    replay_estimator: RotatingShieldPFEstimator,
+                    record: MeasurementLogRecord,
+                    record_index: int,
+                ) -> None:
+                    """Report durable replay progress only at station boundaries."""
+                    del replay_estimator
+                    print(
+                        "Resume PF replay completed station "
+                        f"{int(record.station_id)} at record {record_index + 1}/"
+                        f"{len(prefix_log.records)}.",
+                        flush=True,
+                    )
+
+                replay_trace = replay_records(
+                    prefix_log,
+                    estimator,
+                    station_complete_callback=_report_replayed_station,
+                )
+            resume_replay_wall_s = float(time.perf_counter() - replay_start)
+            if len(replay_trace) != len(measurement_log_writer.records):
+                raise RuntimeError(
+                    "Pure PF replay did not consume the complete staged prefix."
+                )
+            if len(estimator.measurements) != len(measurement_log_writer.records):
+                raise RuntimeError(
+                    "Pure PF replay measurement count differs from the staged prefix."
+                )
+            if not _pure_pf_profile_active(estimator):
+                raise RuntimeError("Live resume requires the strict pure-PF profile.")
+            resume_controller_state = _reconstruct_resume_controller_state(
+                records=measurement_log_writer.records,
+                estimator=estimator,
+                isotopes=isotopes,
+                nominal_motion_speed_m_s=nominal_motion_speed_m_s,
+                expected_program_length=int(estimator.pf_config.orientation_k),
+            )
+            current_pose = resume_controller_state.current_pose.copy()
+            current_pose_idx = int(resume_controller_state.current_pose_idx)
+            resume_controller_checkpoint = _restore_live_controller_checkpoint(
+                record=measurement_log_writer.records[-1],
+                planning_candidate_rng=planning_candidate_rng,
+                expected_planning_candidate_parameters=(
+                    planning_candidate_checkpoint_parameters
+                ),
+            )
+            if resume_controller_checkpoint is None:
+                if resume_runtime_log is None:
+                    raise RuntimeError(
+                        "A legacy stage without a controller checkpoint requires "
+                        "its original runtime log for exact candidate-RNG replay."
+                    )
+                _advance_resume_planning_candidate_rng(
+                    rng=planning_candidate_rng,
+                    records=measurement_log_writer.records,
+                    map_api=planning_map,
+                    n_candidates=int(pose_candidates),
+                    min_dist_from_visited=float(pose_min_dist),
+                    bounds_xyz=(bounds_lo, bounds_hi),
+                    detector_heights_m=detector_height_candidates,
+                    continuous_height_anchor_count=(
+                        detector_continuous_height_partner_candidates
+                    ),
+                    height_partner_xy_tolerance_m=(
+                        detector_height_pair_xy_tolerance_m
+                    ),
+                    height_partner_z_tolerance_m=(
+                        detector_height_pair_z_tolerance_m
+                    ),
+                    height_partner_min_z_separation_m=(
+                        detector_height_pair_min_separation_m
+                    ),
+                    expected_candidate_counts=(
+                        _parse_candidate_generation_counts(resume_runtime_log)
+                    ),
+                )
+                if bool(remaining_measurement_config.enabled):
+                    resume_remaining_measurement_estimates = (
+                        _restore_remaining_measurement_history(
+                            estimator=estimator,
+                            records=measurement_log_writer.records,
+                            runtime_log_path=resume_runtime_log,
+                            config=remaining_measurement_config,
+                        )
+                    )
+            else:
+                resume_remaining_measurement_estimates = [
+                    dict(value)
+                    for value in (
+                        resume_controller_checkpoint.remaining_measurement_estimates
+                    )
+                ]
+                setattr(
+                    estimator,
+                    "_remaining_measurement_budget_history",
+                    [
+                        dict(value)
+                        for value in (
+                            resume_controller_checkpoint
+                            .remaining_measurement_budget_history
+                        )
+                    ],
+                )
+                setattr(
+                    estimator,
+                    "_remaining_measurement_eta_ratios",
+                    list(
+                        resume_controller_checkpoint
+                        .remaining_measurement_eta_ratios
+                    ),
+                )
+            print(
+                "Station-boundary resume restored "
+                f"records={resume_controller_state.step_counter} "
+                f"stations={resume_controller_state.pose_counter + 1} "
+                f"next_step={resume_controller_state.step_counter} "
+                "controller_state="
+                f"{'checkpoint' if resume_controller_checkpoint else 'replayed'} "
+                f"replay_wall_s={resume_replay_wall_s:.3f}.",
+                flush=True,
+            )
+    else:
+        estimator, current_pose, current_pose_idx = _build_estimator()
+    if resume_controller_checkpoint is not None:
+        max_poses = resume_controller_checkpoint.max_poses
     viz = _build_visualizer()
     cui_split_viz = _build_cui_split_visualizer()
     if live:
@@ -13029,38 +14155,100 @@ def run_live_pf(
         plt.show(block=False)
         plt.pause(0.1)
 
-    elapsed = 0.0
+    elapsed = (
+        0.0
+        if resume_controller_state is None
+        else float(resume_controller_state.elapsed_s)
+    )
     last_frame: PFFrame | None = None
     pruned_display_cache: (
         dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] | None
     ) = None
     pruned_display_force_refresh = True
-    step_counter = 0
+    step_counter = (
+        0
+        if resume_controller_state is None
+        else int(resume_controller_state.step_counter)
+    )
     total_pairs = num_orients * num_orients
-    visited_poses: list[NDArray[np.float64]] = []
-    last_spectrum: np.ndarray | None = None
+    visited_poses: list[NDArray[np.float64]] = (
+        []
+        if resume_controller_state is None
+        else [pose.copy() for pose in resume_controller_state.visited_poses]
+    )
+    last_spectrum: np.ndarray | None = (
+        None
+        if resume_controller_state is None
+        else resume_controller_state.last_spectrum.copy()
+    )
     last_spectrum_components: dict[str, NDArray[np.float64]] = {}
-    last_counts: dict[str, float] | None = None
+    last_counts: dict[str, float] | None = (
+        None
+        if resume_controller_state is None
+        else dict(resume_controller_state.last_counts)
+    )
     last_measurement_for_diagnostics: Measurement | None = None
-    representative_spectrum: np.ndarray | None = None
+    representative_spectrum: np.ndarray | None = (
+        None
+        if resume_controller_state is None
+        else resume_controller_state.representative_spectrum.copy()
+    )
     representative_spectrum_components: dict[str, NDArray[np.float64]] = {}
-    representative_counts: dict[str, float] | None = None
+    representative_counts: dict[str, float] | None = (
+        None
+        if resume_controller_state is None
+        else dict(resume_controller_state.representative_counts)
+    )
     representative_candidates: set[str] = set()
-    representative_step_index: int | None = None
-    representative_total_counts = -np.inf
-    last_max_ig: float | None = None
-    total_motion_distance_m = 0.0
-    total_motion_time_s = 0.0
-    total_rotation_time_s = 0.0
+    representative_step_index: int | None = (
+        None
+        if resume_controller_state is None
+        else int(resume_controller_state.representative_step_index)
+    )
+    representative_total_counts = (
+        -np.inf
+        if representative_spectrum is None
+        else float(np.sum(representative_spectrum))
+    )
+    last_max_ig: float | None = (
+        None
+        if resume_controller_checkpoint is None
+        else resume_controller_checkpoint.last_max_ig
+    )
+    total_motion_distance_m = (
+        0.0
+        if resume_controller_state is None
+        else float(resume_controller_state.total_motion_distance_m)
+    )
+    total_motion_time_s = (
+        0.0
+        if resume_controller_state is None
+        else float(resume_controller_state.total_motion_time_s)
+    )
+    total_rotation_time_s = (
+        0.0
+        if resume_controller_state is None
+        else float(resume_controller_state.total_rotation_time_s)
+    )
     pending_motion_distance_m = 0.0
     pending_motion_time_s = 0.0
     pending_path_segment: dict[str, object] | None = None
     path_segments: list[dict[str, object]] = []
-    remaining_measurement_estimates: list[dict[str, Any]] = []
-    soft_pose_extension_used = 0
+    remaining_measurement_estimates: list[dict[str, Any]] = list(
+        resume_remaining_measurement_estimates
+    )
+    soft_pose_extension_used = (
+        0
+        if resume_controller_checkpoint is None
+        else int(resume_controller_checkpoint.soft_pose_extension_used)
+    )
     max_pose_stop_unresolved = False
     max_pose_stop_diagnostics: dict[str, object] = {}
-    measurement_live_times_s: list[float] = []
+    measurement_live_times_s: list[float] = (
+        []
+        if resume_controller_state is None
+        else list(resume_controller_state.measurement_live_times_s)
+    )
     total_ig_wall_s = 0.0
     total_pf_wall_s = 0.0
     total_prune_wall_s = 0.0
@@ -13070,6 +14258,43 @@ def run_live_pf(
     pf_wall_samples_s: list[float] = []
     path_planning_wall_samples_s: list[float] = []
     online_absent_pruned_isotopes: set[str] = set()
+    if resume_controller_state is not None:
+        assert measurement_log_writer is not None
+        resumed_stations = _records_by_station(measurement_log_writer.records)
+        for station_index in range(len(resumed_stations) - 1):
+            next_station = resumed_stations[station_index + 1]
+            planned_pairs = tuple(
+                int(record.fe_orientation_index) * num_orients
+                + int(record.pb_orientation_index)
+                for record in next_station
+            )
+            segment = _build_robot_path_segment(
+                map_api=planning_map,
+                from_pose_xyz=np.asarray(
+                    resumed_stations[station_index][0].detector_pose_xyz,
+                    dtype=float,
+                ),
+                to_pose_xyz=np.asarray(
+                    next_station[0].detector_pose_xyz,
+                    dtype=float,
+                ),
+                nominal_motion_speed_m_s=nominal_motion_speed_m_s,
+                path_planner=path_planner_resolved,
+                planned_shield_program=planned_pairs,
+                dss_diagnostics=None,
+            )
+            logged_travel = float(next_station[0].travel_time_s)
+            if not np.isclose(
+                float(segment["travel_time_s"]),
+                logged_travel,
+                rtol=0.0,
+                atol=1.0e-9,
+            ):
+                raise RuntimeError(
+                    "Reconstructed robot route time does not match the staged "
+                    f"transition into station {station_index + 1}."
+                )
+            path_segments.append(segment)
     gpu_runtime_enabled = False
     if bool(pf_conf.use_gpu):
         try:
@@ -14257,15 +15482,34 @@ def run_live_pf(
             "dss_one_step_guard_score_rel_margin": float(dss_one_step_guard_rel_margin),
         }
     )
-    ig_max_global = 0.0
-    pose_counter = 0
-    current_shield_pair_id: int | None = None
+    ig_max_global = (
+        0.0
+        if resume_controller_checkpoint is None
+        else float(resume_controller_checkpoint.ig_max_global)
+    )
+    pose_counter = (
+        0
+        if resume_controller_state is None
+        else int(resume_controller_state.pose_counter)
+    )
+    current_shield_pair_id: int | None = (
+        None
+        if resume_controller_state is None
+        else int(resume_controller_state.current_shield_pair_id)
+    )
     pending_shield_program: tuple[int, ...] | None = None
     pending_force_strict_shield_program = False
+    resume_station_boundary_pending = resume_controller_state is not None
     try:
         while True:
+            resume_station_boundary = bool(resume_station_boundary_pending)
+            resume_station_boundary_pending = False
             pose = current_pose
-            stop_run = False
+            stop_run = bool(
+                resume_station_boundary
+                and max_steps is not None
+                and step_counter >= max_steps
+            )
             pose_elapsed = 0.0
             zero_ig_override = False
             active_shield_program = pending_shield_program
@@ -14318,7 +15562,11 @@ def run_live_pf(
                     )
             force_active_shield_program = bool(active_shield_program)
             joint_update_records: list[tuple[object, ...]] = []
-            executed_pair_ids_this_pose: list[int] = []
+            executed_pair_ids_this_pose: list[int] = (
+                list(resume_controller_state.last_station_pair_ids)
+                if resume_station_boundary and resume_controller_state is not None
+                else []
+            )
             pose_raw_detected_isotopes: set[str] = set()
             deferred_update_records = 0
             executed_signature_vectors: list[NDArray[np.float64]] = []
@@ -14328,10 +15576,26 @@ def run_live_pf(
                 rotation_limit,
                 max(2, int(estimator.pf_config.min_rotations_per_pose)),
             )
-            rotation_count = 0
-            ig_max_pose = 0.0
-            ig_threshold_current = estimator.pf_config.ig_threshold
-            used_planned_program_this_pose = bool(force_active_shield_program)
+            rotation_count = rotation_limit if resume_station_boundary else 0
+            ig_max_pose = (
+                float(resume_controller_checkpoint.ig_max_pose)
+                if (
+                    resume_station_boundary
+                    and resume_controller_checkpoint is not None
+                )
+                else 0.0
+            )
+            ig_threshold_current = (
+                float(resume_controller_checkpoint.ig_threshold_current)
+                if (
+                    resume_station_boundary
+                    and resume_controller_checkpoint is not None
+                )
+                else estimator.pf_config.ig_threshold
+            )
+            used_planned_program_this_pose = bool(
+                force_active_shield_program or resume_station_boundary
+            )
             while True:
                 if rotation_count >= rotation_limit:
                     print(
@@ -15174,6 +16438,9 @@ def run_live_pf(
                     step_index=step_counter,
                     candidate_log_limit=precision_diagnostic_birth_candidate_log_limit,
                     particle_log_limit=precision_diagnostic_particle_log_limit,
+                    source_event_log_limit=(
+                        precision_diagnostic_source_event_log_limit
+                    ),
                     birth_candidate_diagnostics_enabled=(
                         precision_diagnostic_birth_candidate_enable
                     ),
@@ -15242,9 +16509,35 @@ def run_live_pf(
                 pose_elapsed += actual_live_time_s + step_rotation_time_s
                 if pose_elapsed >= estimator.pf_config.max_dwell_time_s:
                     break
-            if measurement_log_writer is not None and rotation_count > 0:
+            if (
+                measurement_log_writer is not None
+                and rotation_count > 0
+                and not resume_station_boundary
+            ):
                 measurement_log_writer.mark_station_complete_before_update(
-                    int(pose_counter)
+                    int(pose_counter),
+                    completion_metadata={
+                        _LIVE_CONTROLLER_CHECKPOINT_KEY: (
+                            _build_live_controller_checkpoint(
+                                planning_candidate_rng=planning_candidate_rng,
+                                planning_candidate_parameters=(
+                                    planning_candidate_checkpoint_parameters
+                                ),
+                                remaining_measurement_estimates=(
+                                    remaining_measurement_estimates
+                                ),
+                                estimator=estimator,
+                                max_poses=max_poses,
+                                soft_pose_extension_used=(
+                                    soft_pose_extension_used
+                                ),
+                                ig_max_global=ig_max_global,
+                                ig_max_pose=ig_max_pose,
+                                ig_threshold_current=ig_threshold_current,
+                                last_max_ig=last_max_ig,
+                            )
+                        )
+                    },
                 )
             if delayed_resample_update:
                 pf_start = time.perf_counter()
@@ -15286,6 +16579,9 @@ def run_live_pf(
                             precision_diagnostic_birth_candidate_log_limit
                         ),
                         particle_log_limit=precision_diagnostic_particle_log_limit,
+                        source_event_log_limit=(
+                            precision_diagnostic_source_event_log_limit
+                        ),
                         birth_candidate_diagnostics_enabled=(
                             precision_diagnostic_birth_candidate_enable
                         ),
@@ -15415,6 +16711,9 @@ def run_live_pf(
                     step_index=joint_step_index,
                     candidate_log_limit=precision_diagnostic_birth_candidate_log_limit,
                     particle_log_limit=precision_diagnostic_particle_log_limit,
+                    source_event_log_limit=(
+                        precision_diagnostic_source_event_log_limit
+                    ),
                     birth_candidate_diagnostics_enabled=(
                         precision_diagnostic_birth_candidate_enable
                     ),
@@ -15460,6 +16759,7 @@ def run_live_pf(
                 pruned_display_force_refresh = True
             if (
                 save_outputs
+                and not resume_station_boundary
                 and estimator.measurements
                 and estimator.measurements[-1].pose_idx == current_pose_idx
                 and pf_plot_save_every > 0
@@ -16689,6 +17989,11 @@ def run_live_pf(
         + total_viz_wall_s
         + total_path_planning_wall_s
     )
+    resume_prefix_measurement_count = (
+        0
+        if resume_controller_state is None
+        else int(resume_controller_state.step_counter)
+    )
     station_height_metrics = _operational_station_height_metrics(
         estimator.measurements,
         estimator.poses,
@@ -16777,6 +18082,7 @@ def run_live_pf(
         ),
         "pf_obstacle_attenuation": bool(pf_obstacle_attenuation_enabled),
         "pf_obstacle_grid_active": _has_environment_obstacles(pf_obstacle_grid),
+        **_online_compute_timing_provenance(resume_prefix_measurement_count),
         "total_compute_time_s": total_compute_time_s,
         "ig_compute_time_s": float(total_ig_wall_s),
         "mean_orientation_selection_time_s": mean_ig_wall_s,
@@ -16793,6 +18099,18 @@ def run_live_pf(
         "display_prune_time_s": float(total_prune_wall_s),
         "prune_time_s": float(total_prune_wall_s),
         "viz_time_s": float(total_viz_wall_s),
+        "resumed_from_station_boundary": bool(
+            resume_controller_state is not None
+        ),
+        "resume_prefix_measurement_count": (
+            resume_prefix_measurement_count
+        ),
+        "resume_prefix_station_count": (
+            0
+            if resume_controller_state is None
+            else int(resume_controller_state.pose_counter + 1)
+        ),
+        "resume_pf_replay_wall_s": float(resume_replay_wall_s),
         "online_wall_clock_s": float(online_wall_clock_s),
         "wall_clock_runtime_s": wall_clock_runtime_s,
         "operational_timing_definitions": {
@@ -16860,6 +18178,7 @@ def run_live_pf(
         f"rotation={total_rotation_time_s:.1f}s "
         f"end_to_end={mission_metrics['estimated_end_to_end_time_s']:.1f}s "
         f"compute={total_compute_time_s:.3f}s "
+        f"compute_scope={mission_metrics['online_compute_timing_scope']} "
         f"path_plan={total_path_planning_wall_s:.3f}s "
         f"ig_mean={mean_ig_wall_s:.3f}s "
         f"pf_mean={mean_pf_wall_s:.3f}s "
