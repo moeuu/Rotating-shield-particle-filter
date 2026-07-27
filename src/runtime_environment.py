@@ -87,6 +87,45 @@ def _obstacle_mode_message(
     return message
 
 
+def attach_random_manchester_transport_geometry(
+    grid: ObstacleGrid,
+    *,
+    room_size_xyz: tuple[float, float, float],
+    obstacle_height_m: float,
+    rng_seed: int | None = None,
+    include_room_boundaries: bool = False,
+    room_boundary_thickness_m: float = 0.1,
+) -> tuple[ObstacleGrid, tuple[KnownObstacleInstance, ...]]:
+    """
+    Attach one deterministic Manchester component union to a random grid.
+
+    This helper is shared by online runtime construction and offline RA-L
+    source-layout generation so a common obstacle seed describes the same
+    physical transport and collision geometry in both paths.
+    """
+    instances = generate_manchester_obstacle_instances(
+        grid,
+        room_size_xyz=room_size_xyz,
+        obstacle_height_m=float(obstacle_height_m),
+        rng_seed=rng_seed,
+    )
+    grid_with_transport = attach_known_obstacle_transport_model(
+        grid,
+        instances=instances,
+        room_size_xyz=room_size_xyz,
+        include_room_boundaries=include_room_boundaries,
+        room_boundary_thickness_m=room_boundary_thickness_m,
+    )
+    grid_with_transport = grid_with_transport.with_collision_model(
+        boxes_m=(
+            component.box_m
+            for instance in instances
+            for component in instance.components
+        )
+    )
+    return grid_with_transport, instances
+
+
 def build_runtime_obstacle_environment(
     *,
     root: Path,
@@ -131,25 +170,13 @@ def build_runtime_obstacle_environment(
     )
     known_obstacle_instances: tuple[KnownObstacleInstance, ...] | None = None
     if attach_known_transport and mode == "random":
-        known_obstacle_instances = generate_manchester_obstacle_instances(
+        grid, known_obstacle_instances = attach_random_manchester_transport_geometry(
             grid,
             room_size_xyz=room_size_xyz,
             obstacle_height_m=float(obstacle_height_m),
             rng_seed=obstacle_seed,
-        )
-        grid = attach_known_obstacle_transport_model(
-            grid,
-            instances=known_obstacle_instances,
-            room_size_xyz=room_size_xyz,
             include_room_boundaries=include_room_boundaries,
             room_boundary_thickness_m=room_boundary_thickness_m,
-        )
-        grid = grid.with_collision_model(
-            boxes_m=(
-                component.box_m
-                for instance in known_obstacle_instances
-                for component in instance.components
-            )
         )
     return RuntimeObstacleEnvironment(
         grid=grid,

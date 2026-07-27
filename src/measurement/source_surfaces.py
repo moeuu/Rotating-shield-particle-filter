@@ -10,6 +10,11 @@ from numpy.typing import NDArray
 
 from measurement.model import EnvironmentConfig, PointSource
 from measurement.obstacles import ObstacleGrid
+from measurement.surface_patches import (
+    SurfacePatchDictionary,
+    build_surface_patch_dictionary,
+    sample_continuous_surface_positions,
+)
 
 SourceSurfaceKind = Literal[
     "floor",
@@ -29,6 +34,7 @@ SOURCE_SURFACE_KINDS: tuple[SourceSurfaceKind, ...] = (
     "obstacle_bottom",
 )
 SOURCE_SURFACE_REPORT_LABELS = (*SOURCE_SURFACE_KINDS, "off_surface")
+_SOURCE_SURFACE_ATLAS_SPACING_M = 1.0
 
 
 def _cell_bounds(
@@ -376,6 +382,24 @@ def build_surface_candidate_sources(
     obstacle_height_m: float = 2.0,
 ) -> NDArray[np.float64]:
     """Create source candidates on known room and obstacle surfaces."""
+    if obstacle_grid is not None and obstacle_grid.has_transport_model:
+        patches = build_surface_patch_dictionary(
+            env,
+            obstacle_grid,
+            spacing,
+            obstacle_height_m=obstacle_height_m,
+        )
+        candidates = _filter_position_bounds(
+            patches.centers_xyz,
+            env,
+            position_min,
+            position_max,
+        )
+        if candidates.size == 0:
+            raise ValueError(
+                "Surface candidate grid is empty; check bounds and spacing."
+            )
+        return candidates.astype(float, copy=False)
     spacing_tuple = _surface_spacing_tuple(spacing)
     parts = [
         _room_surface_candidates(env, obstacle_grid, spacing_tuple),
@@ -560,6 +584,158 @@ def project_positions_to_allowed_surfaces(
     return best.reshape(original_shape)
 
 
+def _clipped_source_transport_boxes(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid,
+) -> NDArray[np.float64]:
+    """Return positive-volume transport components clipped inside the room."""
+    boxes = np.asarray(obstacle_grid.transport_boxes_m, dtype=float).reshape(-1, 6)
+    if boxes.size == 0:
+        return boxes
+    upper_room = np.asarray(
+        [float(env.size_x), float(env.size_y), float(env.size_z)],
+        dtype=float,
+    )
+    lower = np.maximum(boxes[:, :3], 0.0)
+    upper = np.minimum(boxes[:, 3:], upper_room[None, :])
+    keep = np.all(upper - lower > 1.0e-9, axis=1)
+    return np.column_stack([lower[keep], upper[keep]])
+
+
+def _points_inside_transport_box_union(
+    points_xyz: NDArray[np.float64],
+    boxes_m: NDArray[np.float64],
+    *,
+    tolerance_m: float,
+) -> NDArray[np.bool_]:
+    """Return strict interior membership for a clipped transport-box union."""
+    points = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    boxes = np.asarray(boxes_m, dtype=float).reshape(-1, 6)
+    inside_any = np.zeros(points.shape[0], dtype=bool)
+    if boxes.size == 0 or points.size == 0:
+        return inside_any
+    tol = max(0.0, float(tolerance_m))
+    for start in range(0, boxes.shape[0], 128):
+        chunk = boxes[start : start + 128]
+        inside = np.all(
+            (points[:, None, :] > chunk[None, :, :3] + tol)
+            & (points[:, None, :] < chunk[None, :, 3:] - tol),
+            axis=2,
+        )
+        inside_any |= np.any(inside, axis=1)
+    return inside_any
+
+
+def _transport_floor_footprint_mask(
+    points_xy: NDArray[np.float64],
+    boxes_m: NDArray[np.float64],
+    *,
+    tolerance_m: float,
+) -> NDArray[np.bool_]:
+    """Return points covered by floor-contact transport components."""
+    points = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    boxes = np.asarray(boxes_m, dtype=float).reshape(-1, 6)
+    if boxes.size == 0:
+        return np.zeros(points.shape[0], dtype=bool)
+    tol = max(0.0, float(tolerance_m))
+    floor_boxes = boxes[boxes[:, 2] <= tol]
+    covered = np.zeros(points.shape[0], dtype=bool)
+    for start in range(0, floor_boxes.shape[0], 128):
+        chunk = floor_boxes[start : start + 128]
+        inside = (
+            (points[:, None, 0] >= chunk[None, :, 0] - tol)
+            & (points[:, None, 0] <= chunk[None, :, 3] + tol)
+            & (points[:, None, 1] >= chunk[None, :, 1] - tol)
+            & (points[:, None, 1] <= chunk[None, :, 4] + tol)
+        )
+        covered |= np.any(inside, axis=1)
+    return covered
+
+
+def _transport_component_surface_kinds(
+    points_xyz: NDArray[np.float64],
+    boxes_m: NDArray[np.float64],
+    *,
+    tolerance_m: float,
+) -> NDArray[np.object_]:
+    """Classify points on attached transport-component box surfaces."""
+    points = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    boxes = np.asarray(boxes_m, dtype=float).reshape(-1, 6)
+    kinds = np.full(points.shape[0], None, dtype=object)
+    if boxes.size == 0 or points.size == 0:
+        return kinds
+    tol = max(0.0, float(tolerance_m))
+    eligible = ~_points_inside_transport_box_union(
+        points,
+        boxes,
+        tolerance_m=tol,
+    )
+    for start in range(0, boxes.shape[0], 128):
+        active = eligible & np.equal(kinds, None)
+        if not np.any(active):
+            break
+        chunk = boxes[start : start + 128]
+        selected = points[active]
+        within = (
+            (selected[:, None, :] >= chunk[None, :, :3] - tol)
+            & (selected[:, None, :] <= chunk[None, :, 3:] + tol)
+        )
+        within_all = np.all(within, axis=2)
+        on_lower = np.abs(
+            selected[:, None, :] - chunk[None, :, :3]
+        ) <= tol
+        on_upper = np.abs(
+            selected[:, None, :] - chunk[None, :, 3:]
+        ) <= tol
+        probe_step = max(4.0 * tol, 1.0e-8)
+        exposed_lower = np.zeros((selected.shape[0], 3), dtype=bool)
+        exposed_upper = np.zeros((selected.shape[0], 3), dtype=bool)
+        for axis in range(3):
+            lower_probe = selected.copy()
+            lower_probe[:, axis] -= probe_step
+            upper_probe = selected.copy()
+            upper_probe[:, axis] += probe_step
+            exposed_lower[:, axis] = ~_points_inside_transport_box_union(
+                lower_probe,
+                boxes,
+                tolerance_m=tol,
+            )
+            exposed_upper[:, axis] = ~_points_inside_transport_box_union(
+                upper_probe,
+                boxes,
+                tolerance_m=tol,
+            )
+        lower_faces = (
+            within_all[:, :, None]
+            & on_lower
+            & exposed_lower[:, None, :]
+        )
+        upper_faces = (
+            within_all[:, :, None]
+            & on_upper
+            & exposed_upper[:, None, :]
+        )
+        top = upper_faces[:, :, 2]
+        bottom = lower_faces[:, :, 2]
+        side = np.any(
+            np.concatenate(
+                [lower_faces[:, :, :2], upper_faces[:, :, :2]],
+                axis=2,
+            ),
+            axis=2,
+        )
+        active_indices = np.flatnonzero(active)
+        top_rows = active_indices[np.any(top, axis=1)]
+        kinds[top_rows] = "obstacle_top"
+        remaining = np.equal(kinds[active_indices], None)
+        bottom_rows = active_indices[remaining & np.any(bottom, axis=1)]
+        kinds[bottom_rows] = "obstacle_bottom"
+        remaining = np.equal(kinds[active_indices], None)
+        side_rows = active_indices[remaining & np.any(side, axis=1)]
+        kinds[side_rows] = "obstacle_side"
+    return kinds
+
+
 def source_surface_kind(
     position: Sequence[float],
     env: EnvironmentConfig,
@@ -571,6 +747,14 @@ def source_surface_kind(
     """Return the allowed source surface kind for a position, or None."""
     if len(position) != 3:
         raise ValueError("position must be a 3-element vector.")
+    if obstacle_grid is not None and obstacle_grid.has_transport_model:
+        return source_surface_kinds(
+            np.asarray(position, dtype=float).reshape(1, 3),
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=tolerance_m,
+        )[0]
     x, y, z = (float(position[0]), float(position[1]), float(position[2]))
     tol = max(0.0, float(tolerance_m))
     if x < -tol or y < -tol or z < -tol:
@@ -640,7 +824,27 @@ def source_surface_kinds(
     if not np.any(valid):
         return kinds
 
-    blocked = _blocked_mask_xy(points[:, :2], obstacle_grid)
+    use_transport_surfaces = bool(
+        obstacle_grid is not None and obstacle_grid.has_transport_model
+    )
+    if use_transport_surfaces:
+        transport_boxes = _clipped_source_transport_boxes(
+            env,
+            obstacle_grid,
+        )
+        valid &= ~_points_inside_transport_box_union(
+            points,
+            transport_boxes,
+            tolerance_m=tol,
+        )
+        blocked = _transport_floor_footprint_mask(
+            points[:, :2],
+            transport_boxes,
+            tolerance_m=tol,
+        )
+    else:
+        transport_boxes = np.zeros((0, 6), dtype=float)
+        blocked = _blocked_mask_xy(points[:, :2], obstacle_grid)
     floor = valid & (np.abs(points[:, 2]) <= tol) & ~blocked
     kinds[floor] = "floor"
 
@@ -656,6 +860,17 @@ def source_surface_kinds(
         | (np.abs(points[:, 1] - float(env.size_y)) <= tol)
     )
     kinds[wall] = "wall"
+
+    if use_transport_surfaces:
+        unset = valid & np.equal(kinds, None)
+        if np.any(unset):
+            component_kinds = _transport_component_surface_kinds(
+                points[unset],
+                transport_boxes,
+                tolerance_m=tol,
+            )
+            kinds[np.flatnonzero(unset)] = component_kinds
+        return kinds
 
     if obstacle_grid is None or not obstacle_grid.blocked_cells:
         return kinds
@@ -1007,18 +1222,26 @@ def is_ground_observable_source_position(
     return bool(fraction.size and fraction[0] >= float(min_visible_fraction))
 
 
-def _weighted_choice(
-    rng: np.random.Generator,
-    weights_by_kind: Sequence[tuple[SourceSurfaceKind, float]],
-) -> SourceSurfaceKind:
-    """Sample a surface kind from non-negative area weights."""
-    filtered = [(kind, float(weight)) for kind, weight in weights_by_kind if weight > 0.0]
-    if not filtered:
-        raise ValueError("No source-placement surfaces are available.")
-    kinds = [kind for kind, _ in filtered]
-    weights = np.array([weight for _, weight in filtered], dtype=float)
-    weights /= float(np.sum(weights))
-    return kinds[int(rng.choice(len(kinds), p=weights))]
+def _build_source_surface_atlas(
+    env: EnvironmentConfig,
+    obstacle_grid: ObstacleGrid | None,
+    *,
+    obstacle_height_m: float,
+) -> SurfacePatchDictionary:
+    """Build the shared exact physical-surface atlas used for truth sampling."""
+    patches = build_surface_patch_dictionary(
+        env,
+        obstacle_grid,
+        spacing=_SOURCE_SURFACE_ATLAS_SPACING_M,
+        obstacle_height_m=obstacle_height_m,
+    )
+    if not patches.obstacle_surfaces_available:
+        raise ValueError(
+            "Random source placement requires transport_boxes_m when blocked "
+            "obstacle cells are present; synthetic blocked-cell surfaces are "
+            "not physical Geant4 source support."
+        )
+    return patches
 
 
 def sample_surface_position(
@@ -1027,136 +1250,19 @@ def sample_surface_position(
     rng: np.random.Generator,
     *,
     obstacle_height_m: float = 2.0,
+    surface_atlas: SurfacePatchDictionary | None = None,
 ) -> tuple[float, float, float]:
-    """Sample one source position from room and obstacle surfaces."""
-    obstacle_height = min(max(0.0, float(obstacle_height_m)), float(env.size_z))
-    blocked_count = 0 if obstacle_grid is None else len(obstacle_grid.blocked_cells)
-    exposed_sides = [] if obstacle_grid is None else obstacle_surface_sides(obstacle_grid)
-    floor_area = float(env.size_x) * float(env.size_y)
-    if obstacle_grid is not None:
-        floor_area = max(
-            0.0,
-            floor_area - blocked_count * obstacle_grid.cell_size * obstacle_grid.cell_size,
+    """Sample one continuous point uniformly over total physical surface area."""
+    patches = surface_atlas
+    if patches is None:
+        patches = _build_source_surface_atlas(
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
         )
-    ceiling_area = float(env.size_x) * float(env.size_y)
-    wall_area = 2.0 * (float(env.size_x) + float(env.size_y)) * float(env.size_z)
-    obstacle_top_area = (
-        0.0
-        if obstacle_grid is None
-        else blocked_count * obstacle_grid.cell_size * obstacle_grid.cell_size
-    )
-    obstacle_side_area = (
-        0.0
-        if obstacle_grid is None
-        else len(exposed_sides) * obstacle_grid.cell_size * obstacle_height
-    )
-    kind = _weighted_choice(
-        rng,
-        (
-            ("floor", floor_area),
-            ("ceiling", ceiling_area),
-            ("wall", wall_area),
-            ("obstacle_side", obstacle_side_area),
-            ("obstacle_top", obstacle_top_area),
-        ),
-    )
-    if kind == "floor":
-        return _sample_floor_position(env, obstacle_grid, rng)
-    if kind == "ceiling":
-        return (
-            float(rng.uniform(0.0, float(env.size_x))),
-            float(rng.uniform(0.0, float(env.size_y))),
-            float(env.size_z),
-        )
-    if kind == "wall":
-        return _sample_wall_position(env, rng)
-    if kind == "obstacle_side":
-        return _sample_obstacle_side_position(obstacle_grid, exposed_sides, rng, obstacle_height)
-    return _sample_obstacle_top_position(obstacle_grid, rng, obstacle_height)
-
-
-def _sample_floor_position(
-    env: EnvironmentConfig,
-    obstacle_grid: ObstacleGrid | None,
-    rng: np.random.Generator,
-) -> tuple[float, float, float]:
-    """Sample a floor point outside obstacle footprints."""
-    if obstacle_grid is None or len(obstacle_grid.blocked_cells) == 0:
-        return (
-            float(rng.uniform(0.0, float(env.size_x))),
-            float(rng.uniform(0.0, float(env.size_y))),
-            0.0,
-        )
-    free_cells = [
-        (ix, iy)
-        for ix in range(obstacle_grid.grid_shape[0])
-        for iy in range(obstacle_grid.grid_shape[1])
-        if obstacle_grid.is_cell_free((ix, iy))
-    ]
-    if not free_cells:
-        raise ValueError("No free floor cells are available for source placement.")
-    cell = free_cells[int(rng.integers(0, len(free_cells)))]
-    x0, x1, y0, y1 = _cell_bounds(obstacle_grid, cell)
-    return (float(rng.uniform(x0, x1)), float(rng.uniform(y0, y1)), 0.0)
-
-
-def _sample_wall_position(
-    env: EnvironmentConfig,
-    rng: np.random.Generator,
-) -> tuple[float, float, float]:
-    """Sample a point from one of the four room walls."""
-    weights = np.array(
-        [float(env.size_y), float(env.size_y), float(env.size_x), float(env.size_x)],
-        dtype=float,
-    )
-    weights /= float(np.sum(weights))
-    wall = int(rng.choice(4, p=weights))
-    z = float(rng.uniform(0.0, float(env.size_z)))
-    if wall == 0:
-        return (0.0, float(rng.uniform(0.0, float(env.size_y))), z)
-    if wall == 1:
-        return (float(env.size_x), float(rng.uniform(0.0, float(env.size_y))), z)
-    if wall == 2:
-        return (float(rng.uniform(0.0, float(env.size_x))), 0.0, z)
-    return (float(rng.uniform(0.0, float(env.size_x))), float(env.size_y), z)
-
-
-def _sample_obstacle_side_position(
-    obstacle_grid: ObstacleGrid | None,
-    exposed_sides: Sequence[tuple[tuple[int, int], str]],
-    rng: np.random.Generator,
-    obstacle_height_m: float,
-) -> tuple[float, float, float]:
-    """Sample a point from an exposed obstacle side surface."""
-    if obstacle_grid is None or not exposed_sides:
-        raise ValueError("No exposed obstacle side is available.")
-    cell, side = exposed_sides[int(rng.integers(0, len(exposed_sides)))]
-    x0, x1, y0, y1 = _cell_bounds(obstacle_grid, cell)
-    z = float(rng.uniform(0.0, obstacle_height_m))
-    if side == "west":
-        return (x0, float(rng.uniform(y0, y1)), z)
-    if side == "east":
-        return (x1, float(rng.uniform(y0, y1)), z)
-    if side == "south":
-        return (float(rng.uniform(x0, x1)), y0, z)
-    return (float(rng.uniform(x0, x1)), y1, z)
-
-
-def _sample_obstacle_top_position(
-    obstacle_grid: ObstacleGrid | None,
-    rng: np.random.Generator,
-    obstacle_height_m: float,
-) -> tuple[float, float, float]:
-    """Sample a point from an obstacle top surface."""
-    if obstacle_grid is None or not obstacle_grid.blocked_cells:
-        raise ValueError("No obstacle top is available.")
-    cell = obstacle_grid.blocked_cells[int(rng.integers(0, len(obstacle_grid.blocked_cells)))]
-    x0, x1, y0, y1 = _cell_bounds(obstacle_grid, cell)
-    return (
-        float(rng.uniform(x0, x1)),
-        float(rng.uniform(y0, y1)),
-        float(obstacle_height_m),
-    )
+    positions, _ = sample_continuous_surface_positions(patches, 1, rng)
+    point = positions[0]
+    return float(point[0]), float(point[1]), float(point[2])
 
 
 def _sample_surface_position_batch(
@@ -1166,21 +1272,12 @@ def _sample_surface_position_batch(
     *,
     obstacle_height_m: float,
     batch_size: int,
-) -> NDArray[np.float64]:
+    surface_atlas: SurfacePatchDictionary,
+) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
     """Draw a small batch of surface positions before batched visibility tests."""
+    del env, obstacle_grid, obstacle_height_m
     batch = max(1, int(batch_size))
-    return np.asarray(
-        [
-            sample_surface_position(
-                env,
-                obstacle_grid,
-                rng,
-                obstacle_height_m=obstacle_height_m,
-            )
-            for _ in range(batch)
-        ],
-        dtype=float,
-    ).reshape(-1, 3)
+    return sample_continuous_surface_positions(surface_atlas, batch, rng)
 
 
 def _surface_candidate_constraint_mask(
@@ -1193,6 +1290,7 @@ def _surface_candidate_constraint_mask(
     preferred_max_z_m: float | None,
     min_distance_points: NDArray[np.float64] | None = None,
     min_distance_m: float = 0.0,
+    surface_kinds: NDArray[np.object_] | None = None,
 ) -> NDArray[np.bool_]:
     """Return candidates satisfying random-source placement constraints."""
     points = np.asarray(candidates, dtype=float).reshape(-1, 3)
@@ -1201,12 +1299,17 @@ def _surface_candidate_constraint_mask(
     mask = np.ones(points.shape[0], dtype=bool)
     mask &= ~transport_interior_mask(points, obstacle_grid)
     if excluded_surface_kinds:
-        kinds = source_surface_kinds(
-            points,
-            env,
-            obstacle_grid,
-            obstacle_height_m=obstacle_height_m,
-        )
+        if surface_kinds is None:
+            kinds = source_surface_kinds(
+                points,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+            )
+        else:
+            kinds = np.asarray(surface_kinds, dtype=object).reshape(-1)
+            if kinds.size != points.shape[0]:
+                raise ValueError("surface_kinds must align with candidates.")
         excluded = [str(kind) for kind in excluded_surface_kinds]
         mask &= ~np.isin(kinds, excluded)
     if preferred_max_z_m is not None:
@@ -1234,9 +1337,10 @@ def sample_observable_surface_position(
     batch_size: int = 256,
     max_attempts: int = 4096,
     excluded_surface_kinds: Sequence[SourceSurfaceKind] | None = None,
-    preferred_max_z_m: float | None = 5.0,
+    preferred_max_z_m: float | None = None,
     min_distance_points: NDArray[np.float64] | None = None,
     min_distance_m: float = 0.0,
+    surface_atlas: SurfacePatchDictionary | None = None,
 ) -> tuple[float, float, float]:
     """Sample a surface position with enough clear ground measurement views."""
     min_fraction = max(0.0, float(min_visible_fraction))
@@ -1251,6 +1355,14 @@ def sample_observable_surface_position(
             np.asarray(measurement_points, dtype=float),
             detector_height_m=detector_height_m,
         )
+    patches = surface_atlas
+    if patches is None:
+        patches = _build_source_surface_atlas(
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+        )
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
 
     def _draw_with_z_constraint(
         z_limit: float | None,
@@ -1259,12 +1371,13 @@ def sample_observable_surface_position(
         remaining = max(1, int(max_attempts))
         while remaining > 0:
             current_batch = min(sample_batch, remaining)
-            candidates = _sample_surface_position_batch(
+            candidates, patch_indices = _sample_surface_position_batch(
                 env,
                 obstacle_grid,
                 rng,
                 obstacle_height_m=obstacle_height_m,
                 batch_size=current_batch,
+                surface_atlas=patches,
             )
             valid_mask = _surface_candidate_constraint_mask(
                 candidates,
@@ -1275,6 +1388,7 @@ def sample_observable_surface_position(
                 preferred_max_z_m=z_limit,
                 min_distance_points=distance_points,
                 min_distance_m=distance_floor,
+                surface_kinds=patch_kinds[patch_indices],
             )
             valid = np.flatnonzero(valid_mask)
             if valid.size and detectors.size:
@@ -1338,6 +1452,7 @@ def _sample_constrained_source_position(
     preferred_max_z_m: float | None,
     min_distance_points: NDArray[np.float64] | None,
     min_distance_m: float,
+    surface_atlas: SurfacePatchDictionary,
 ) -> tuple[float, float, float]:
     """Sample one random source while enforcing scenario-level surface limits."""
     excluded: list[SourceSurfaceKind] = []
@@ -1361,6 +1476,7 @@ def _sample_constrained_source_position(
         preferred_max_z_m=preferred_max_z_m,
         min_distance_points=min_distance_points,
         min_distance_m=min_distance_m,
+        surface_atlas=surface_atlas,
     )
 
 
@@ -1379,16 +1495,32 @@ def generate_surface_sources(
     visibility_clear_path_max_m: float = 0.01,
     visibility_batch_size: int = 256,
     visibility_max_attempts_per_source: int = 4096,
-    max_ceiling_sources: int | None = 1,
-    preferred_max_z_m: float | None = 5.0,
+    max_ceiling_sources: int | None = None,
+    preferred_max_z_m: float | None = None,
     same_isotope_min_distance_m: float = 0.0,
 ) -> list[PointSource]:
-    """Generate point sources constrained to observable physical surfaces."""
+    """Generate point sources on physical surfaces with opt-in constraints."""
     if not isotopes:
         raise ValueError("At least one isotope is required.")
     source_count = len(isotopes) if count is None else max(1, int(count))
     ceiling_limit = _normalise_max_ceiling_sources(max_ceiling_sources)
     same_isotope_distance = max(0.0, float(same_isotope_min_distance_m))
+    surface_atlas = _build_source_surface_atlas(
+        env,
+        obstacle_grid,
+        obstacle_height_m=obstacle_height_m,
+    )
+    unconstrained = (
+        float(visibility_min_fraction) <= 0.0
+        and ceiling_limit is None
+        and preferred_max_z_m is None
+        and same_isotope_distance <= 0.0
+    )
+    unconstrained_positions = (
+        sample_continuous_surface_positions(surface_atlas, source_count, rng)[0]
+        if unconstrained
+        else None
+    )
     ceiling_count = 0
     sources: list[PointSource] = []
     for idx in range(source_count):
@@ -1406,30 +1538,35 @@ def generate_surface_sources(
             ],
             dtype=float,
         ).reshape(-1, 3)
-        position = _sample_constrained_source_position(
-            env,
-            obstacle_grid,
-            rng,
-            obstacle_height_m=obstacle_height_m,
-            visibility_measurement_points=visibility_measurement_points,
-            visibility_min_fraction=float(visibility_min_fraction),
-            visibility_detector_height_m=visibility_detector_height_m,
-            visibility_clear_path_max_m=visibility_clear_path_max_m,
-            visibility_batch_size=visibility_batch_size,
-            visibility_max_attempts_per_source=visibility_max_attempts_per_source,
-            ceiling_count=ceiling_count,
-            max_ceiling_sources=ceiling_limit,
-            preferred_max_z_m=preferred_max_z_m,
-            min_distance_points=same_isotope_positions,
-            min_distance_m=same_isotope_distance,
-        )
-        surface_kind = source_surface_kind(
-            position,
-            env,
-            obstacle_grid,
-            obstacle_height_m=obstacle_height_m,
-        )
-        if surface_kind == "ceiling":
+        if unconstrained_positions is not None:
+            sampled = unconstrained_positions[idx]
+            position = (
+                float(sampled[0]),
+                float(sampled[1]),
+                float(sampled[2]),
+            )
+        else:
+            position = _sample_constrained_source_position(
+                env,
+                obstacle_grid,
+                rng,
+                obstacle_height_m=obstacle_height_m,
+                visibility_measurement_points=visibility_measurement_points,
+                visibility_min_fraction=float(visibility_min_fraction),
+                visibility_detector_height_m=visibility_detector_height_m,
+                visibility_clear_path_max_m=visibility_clear_path_max_m,
+                visibility_batch_size=visibility_batch_size,
+                visibility_max_attempts_per_source=(
+                    visibility_max_attempts_per_source
+                ),
+                ceiling_count=ceiling_count,
+                max_ceiling_sources=ceiling_limit,
+                preferred_max_z_m=preferred_max_z_m,
+                min_distance_points=same_isotope_positions,
+                min_distance_m=same_isotope_distance,
+                surface_atlas=surface_atlas,
+            )
+        if np.isclose(float(position[2]), float(env.size_z), atol=1.0e-9):
             ceiling_count += 1
         sources.append(
             PointSource(

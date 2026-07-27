@@ -13,6 +13,7 @@ from baselines.ral_ablation.config_factory import (
     DEFAULT_ABLATION_VARIANTS,
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     _load_json,
+    _source_generation_options,
     _validate_ral_transport_sampling,
     build_ablation_plan,
 )
@@ -41,6 +42,20 @@ def test_pf_max_sources_default_is_shared() -> None:
     """PF entry points should use one shared default source-count support."""
     assert RotatingShieldPFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
     assert PFConfig().max_sources == DEFAULT_MAX_SOURCES_PER_ISOTOPE
+
+
+def test_ral_source_generation_defaults_are_unconditioned() -> None:
+    """Missing optional placement constraints should preserve area-uniform draws."""
+    options = _source_generation_options({})
+
+    assert options["visibility_filter"] is False
+    assert options["visibility_min_fraction"] == pytest.approx(0.0)
+    assert options["max_ceiling_sources"] is None
+    assert options["preferred_max_z_m"] is None
+    assert options["same_isotope_min_distance_m"] == pytest.approx(0.0)
+    assert options["obstacle_height_m"] == pytest.approx(2.0)
+    assert options["include_room_boundaries"] is False
+    assert options["room_boundary_thickness_m"] == pytest.approx(0.1)
 
 
 def test_ral_transport_sampling_requires_explicit_accelerated_mode() -> None:
@@ -401,7 +416,20 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     for source in source_payload["sources"]:
         isotope_counts[source["isotope"]] = isotope_counts.get(source["isotope"], 0) + 1
     assert isotope_counts == {"Cs-137": 4, "Co-60": 3, "Eu-154": 2}
-    assert source_payload["metadata"]["visibility_filter"] is True
+    source_metadata = source_payload["metadata"]
+    assert source_metadata["source_surface_sampling_schema_version"] == 1
+    assert source_metadata["sampling_measure"] == "continuous_area_uniform"
+    assert (
+        source_metadata["surface_geometry"]
+        == "runtime_transport_component_union"
+    )
+    assert source_metadata["visibility_filter"] is False
+    assert source_metadata["visibility_min_fraction"] == pytest.approx(0.0)
+    assert source_metadata["max_ceiling_sources"] is None
+    assert source_metadata["preferred_max_z_m"] is None
+    assert source_metadata["same_isotope_min_distance_m"] == pytest.approx(0.0)
+    assert source_metadata["obstacle_height_m"] == pytest.approx(2.0)
+    assert source_metadata["include_room_boundaries"] is True
     assert proposed_config["pf_max_sources"] == 5
     assert proposed_config["structural_cardinality_prior_probs"] == pytest.approx(
         [1.0 / 6.0] * 6

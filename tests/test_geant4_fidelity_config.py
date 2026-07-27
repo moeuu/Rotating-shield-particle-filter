@@ -386,14 +386,20 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert payload["secondary_transport_mode"] == "full_transport"
     assert payload["pf_line_resolved_shield_attenuation"] is True
     assert payload["pf_obstacle_attenuation"] is True
-    assert payload["random_source_visibility_filter"] is True
-    assert float(payload["random_source_min_visible_fraction"]) > 0.0
-    assert int(payload["random_source_max_ceiling_sources"]) == 1
-    assert float(payload["random_source_preferred_max_z_m"]) <= 5.0
-    assert float(payload["random_source_same_isotope_min_distance_m"]) >= 2.0
-    assert payload["random_source_response_observability_filter"] is True
-    assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.99
-    assert float(payload["random_source_response_condition_max"]) >= 1.0
+    assert (
+        payload["random_source_surface_sampling_measure"]
+        == "continuous_area_uniform"
+    )
+    assert payload["random_source_visibility_filter"] is False
+    assert float(payload["random_source_min_visible_fraction"]) == (
+        pytest.approx(0.0)
+    )
+    assert payload["random_source_max_ceiling_sources"] is None
+    assert payload["random_source_preferred_max_z_m"] is None
+    assert float(payload["random_source_same_isotope_min_distance_m"]) == (
+        pytest.approx(0.0)
+    )
+    assert payload["random_source_response_observability_filter"] is False
     assert int(payload["thread_count"]) == 32
     assert int(payload["python_worker_count"]) == 32
     assert int(payload["pose_selection_workers"]) == 32
@@ -445,14 +451,20 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert config.primary_sampling_fraction == pytest.approx(1.0)
     assert config.accelerated_weighted_transport_enable is False
     assert payload["pf_obstacle_attenuation"] is True
-    assert payload["random_source_visibility_filter"] is True
-    assert float(payload["random_source_min_visible_fraction"]) > 0.0
-    assert int(payload["random_source_max_ceiling_sources"]) == 1
-    assert float(payload["random_source_preferred_max_z_m"]) <= 5.0
-    assert float(payload["random_source_same_isotope_min_distance_m"]) >= 2.0
-    assert payload["random_source_response_observability_filter"] is True
-    assert float(payload["random_source_response_max_pairwise_corr"]) <= 0.99
-    assert float(payload["random_source_response_condition_max"]) >= 1.0
+    assert (
+        payload["random_source_surface_sampling_measure"]
+        == "continuous_area_uniform"
+    )
+    assert payload["random_source_visibility_filter"] is False
+    assert float(payload["random_source_min_visible_fraction"]) == (
+        pytest.approx(0.0)
+    )
+    assert payload["random_source_max_ceiling_sources"] is None
+    assert payload["random_source_preferred_max_z_m"] is None
+    assert float(payload["random_source_same_isotope_min_distance_m"]) == (
+        pytest.approx(0.0)
+    )
+    assert payload["random_source_response_observability_filter"] is False
     assert int(payload["python_worker_count"]) == 32
     assert int(payload["pose_selection_workers"]) == 32
     assert int(payload["ig_workers"]) == 32

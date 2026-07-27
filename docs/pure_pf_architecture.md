@@ -25,13 +25,21 @@ replay records fail closed instead of selecting historical behavior.
 
 ## Physical source support
 
-Python, Geant4, and Isaac Sim entry points construct the source state space
-directly from the physical environment. The exact structural kernel discretizes
-it into a finite dictionary of surface patches:
+Standard random ground truth is sampled as a continuous point from the shared
+physical room and transport-obstacle surfaces. Sampling is uniform with respect
+to physical surface area across the floor, ceiling, walls, and every exposed
+transport-component face, including the underside of a raised component. It
+does not condition the draw on height, visibility, ceiling count, source
+separation, or response observability.
+
+The current PF position state is more restrictive than that continuous truth
+support. Python, Geant4, and Isaac Sim entry points construct the source state
+space directly from the physical environment, but the exact structural kernel
+discretizes it into a finite dictionary of surface-patch centers:
 
 - floor and ceiling;
 - room walls;
-- exposed obstacle tops and sides.
+- every exposed obstacle-component face.
 
 Each patch carries its physical area. Initial positions and structural
 proposals use the same area-weighted dictionary, prohibit duplicate patch
@@ -44,6 +52,13 @@ All position transitions operate on patch indices and preserve the declared
 area-weighted surface measure. Detector measurement poses remain collision-free
 points in reachable free space; detector support and source support are
 intentionally different physical domains.
+
+The planned continuous-support migration will retain finite patches only as
+surface-atlas charts and store a continuous local coordinate within the chosen
+chart. Birth, death, and position proposals must then include the corresponding
+continuous surface densities and forward/reverse proposal terms. Until that
+migration is implemented, PF positions cannot take arbitrary values on a
+surface and the configured patch spacing remains a localization-error floor.
 
 ## Sequential likelihood and structural moves
 

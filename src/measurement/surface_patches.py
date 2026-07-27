@@ -27,6 +27,7 @@ class SurfacePatchDictionary:
     face_ids: tuple[str, ...]
     normals_xyz: NDArray[np.float64]
     local_uv_m: NDArray[np.float64]
+    vertices_xyz: NDArray[np.float64]
     adjacency_edges: NDArray[np.int64]
     shared_edge_lengths_m: NDArray[np.float64]
     obstacle_geometry_source: str = "none"
@@ -40,6 +41,7 @@ class SurfacePatchDictionary:
         areas = np.asarray(self.areas_m2, dtype=float).reshape(-1)
         normals = np.asarray(self.normals_xyz, dtype=float)
         local_uv = np.asarray(self.local_uv_m, dtype=float)
+        vertices = np.asarray(self.vertices_xyz, dtype=float)
         edges = np.asarray(self.adjacency_edges, dtype=np.int64)
         edge_lengths = np.asarray(self.shared_edge_lengths_m, dtype=float).reshape(-1)
         count = int(areas.size)
@@ -49,10 +51,51 @@ class SurfacePatchDictionary:
             raise ValueError("normals_xyz must be shaped (C, 3).")
         if local_uv.shape != (count, 2):
             raise ValueError("local_uv_m must be shaped (C, 2).")
+        if vertices.shape != (count, 4, 3):
+            raise ValueError("vertices_xyz must be shaped (C, 4, 3).")
         if len(self.kinds) != count or len(self.face_ids) != count:
             raise ValueError("kinds and face_ids must have one entry per patch.")
         if np.any(~np.isfinite(areas)) or np.any(areas <= 0.0):
             raise ValueError("areas_m2 must contain finite positive values.")
+        if (
+            np.any(~np.isfinite(centers))
+            or np.any(~np.isfinite(normals))
+            or np.any(~np.isfinite(local_uv))
+            or np.any(~np.isfinite(vertices))
+        ):
+            raise ValueError("Surface patch coordinates must be finite.")
+        expected_centers = np.mean(vertices, axis=1)
+        if not np.allclose(
+            centers,
+            expected_centers,
+            rtol=1.0e-10,
+            atol=_GEOMETRY_TOLERANCE_M,
+        ):
+            raise ValueError("centers_xyz must equal the rectangle vertex means.")
+        closure_error = vertices[:, 0] + vertices[:, 2] - (
+            vertices[:, 1] + vertices[:, 3]
+        )
+        if not np.allclose(
+            closure_error,
+            0.0,
+            rtol=0.0,
+            atol=_GEOMETRY_TOLERANCE_M,
+        ):
+            raise ValueError("vertices_xyz must describe parallelogram patches.")
+        vertex_areas = np.linalg.norm(
+            np.cross(
+                vertices[:, 1] - vertices[:, 0],
+                vertices[:, 3] - vertices[:, 0],
+            ),
+            axis=1,
+        )
+        if not np.allclose(
+            areas,
+            vertex_areas,
+            rtol=1.0e-10,
+            atol=_GEOMETRY_TOLERANCE_M,
+        ):
+            raise ValueError("areas_m2 must match the rectangle vertex geometry.")
         if edges.size == 0:
             edges = np.zeros((0, 2), dtype=np.int64)
         if edges.ndim != 2 or edges.shape[1] != 2:
@@ -70,6 +113,7 @@ class SurfacePatchDictionary:
         object.__setattr__(self, "areas_m2", areas)
         object.__setattr__(self, "normals_xyz", normals)
         object.__setattr__(self, "local_uv_m", local_uv)
+        object.__setattr__(self, "vertices_xyz", vertices)
         object.__setattr__(self, "adjacency_edges", edges)
         object.__setattr__(self, "shared_edge_lengths_m", edge_lengths)
         object.__setattr__(
@@ -104,6 +148,80 @@ class SurfacePatchDictionary:
             "obstacle_component_count": self.obstacle_component_count,
             "obstacle_geometry_warning": self.obstacle_geometry_warning,
         }
+
+
+def sample_continuous_surface_positions(
+    patches: SurfacePatchDictionary,
+    sample_count: int,
+    rng: np.random.Generator,
+) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
+    """Sample continuous positions uniformly over total exposed surface area.
+
+    Patch selection is proportional to each rectangle's physical area. Two
+    additional independent uniform variates are then mapped affinely within
+    the selected rectangle. The implementation is batched across all samples;
+    patch tessellation controls atlas topology only and does not quantize the
+    returned positions to patch centers.
+
+    Parameters
+    ----------
+    patches:
+        Valid physical-surface atlas whose rectangles cover the selectable
+        exposed surfaces.
+    sample_count:
+        Number of independent positions to draw. Zero returns empty arrays.
+    rng:
+        NumPy random generator that owns the caller's reproducible RNG stream.
+
+    Returns
+    -------
+    positions_xyz, patch_indices:
+        Cartesian positions shaped ``(N, 3)`` and their containing atlas patch
+        indices shaped ``(N,)``.
+    """
+    if isinstance(sample_count, bool) or not isinstance(
+        sample_count, (int, np.integer)
+    ):
+        raise TypeError("sample_count must be an integer.")
+    count = int(sample_count)
+    if count < 0:
+        raise ValueError("sample_count must be non-negative.")
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be a numpy.random.Generator.")
+    if count == 0:
+        return (
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=np.int64),
+        )
+
+    areas = np.asarray(patches.areas_m2, dtype=float).reshape(-1)
+    total_area = float(np.sum(areas))
+    if areas.size == 0 or not np.isfinite(total_area) or total_area <= 0.0:
+        raise ValueError("patches must have finite positive total surface area.")
+    unit_draws = np.asarray(rng.random((count, 3)), dtype=float)
+    if (
+        unit_draws.shape != (count, 3)
+        or np.any(~np.isfinite(unit_draws))
+        or np.any(unit_draws < 0.0)
+        or np.any(unit_draws >= 1.0)
+    ):
+        raise ValueError("rng must return finite draws in the interval [0, 1).")
+
+    cumulative_area = np.cumsum(areas)
+    cumulative_area[-1] = total_area
+    patch_indices = np.searchsorted(
+        cumulative_area,
+        unit_draws[:, 0] * total_area,
+        side="right",
+    ).astype(np.int64, copy=False)
+    selected_vertices = patches.vertices_xyz[patch_indices]
+    origins = selected_vertices[:, 0]
+    positions = (
+        origins
+        + unit_draws[:, 1, None] * (selected_vertices[:, 1] - origins)
+        + unit_draws[:, 2, None] * (selected_vertices[:, 3] - origins)
+    )
+    return positions, patch_indices
 
 
 @dataclass(frozen=True)
@@ -1157,6 +1275,10 @@ def _combine_patch_blocks(
         face_ids=tuple(face_ids.tolist()),
         normals_xyz=np.vstack([block.normals for block in active]),
         local_uv_m=np.vstack([block.local_uv for block in active]),
+        vertices_xyz=np.concatenate(
+            [block.boundary_segments[:, :, 0, :] for block in active],
+            axis=0,
+        ),
         adjacency_edges=edges,
         shared_edge_lengths_m=edge_lengths,
         obstacle_geometry_source=obstacle_geometry_source,

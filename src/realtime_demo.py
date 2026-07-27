@@ -7701,6 +7701,17 @@ def run_live_pf(
     }
     source_population_strength_bounds: tuple[float, float] | None = None
     if normalized_source_generation_mode == "surface_random":
+        source_surface_sampling_measure = str(
+            runtime_config.get(
+                "random_source_surface_sampling_measure",
+                "continuous_area_uniform",
+            )
+        ).strip().lower()
+        if source_surface_sampling_measure != "continuous_area_uniform":
+            raise ValueError(
+                "random_source_surface_sampling_measure must be "
+                "'continuous_area_uniform'."
+            )
         source_rng_seed = (
             obstacle_seed if random_source_seed is None else random_source_seed
         )
@@ -7711,11 +7722,11 @@ def run_live_pf(
             tuple(decomposer.isotope_names),
         )
         source_visibility_enabled = bool(
-            runtime_config.get("random_source_visibility_filter", True)
+            runtime_config.get("random_source_visibility_filter", False)
         )
         source_visibility_min_fraction = max(
             0.0,
-            float(runtime_config.get("random_source_min_visible_fraction", 0.10)),
+            float(runtime_config.get("random_source_min_visible_fraction", 0.0)),
         )
         source_visibility_clear_path_max_m = max(
             0.0,
@@ -7750,21 +7761,21 @@ def run_live_pf(
         )
         max_ceiling_payload = runtime_config.get(
             "random_source_max_ceiling_sources",
-            1,
+            None,
         )
         random_source_max_ceiling_sources = (
             None if max_ceiling_payload is None else max(0, int(max_ceiling_payload))
         )
         preferred_z_payload = runtime_config.get(
             "random_source_preferred_max_z_m",
-            5.0,
+            None,
         )
         random_source_preferred_max_z_m = (
             None if preferred_z_payload is None else float(preferred_z_payload)
         )
         random_source_same_isotope_min_distance_m = max(
             0.0,
-            float(runtime_config.get("random_source_same_isotope_min_distance_m", 2.0)),
+            float(runtime_config.get("random_source_same_isotope_min_distance_m", 0.0)),
         )
         intensity_min_payload = (
             random_source_intensity_min_cps_1m
@@ -7790,7 +7801,8 @@ def run_live_pf(
         else:
             random_source_intensity_spec = float(random_source_intensity_cps_1m)
         print(
-            "Random source placement constraints: "
+            "Random source surface sampling: "
+            f"measure={source_surface_sampling_measure} "
             f"max_ceiling_sources={random_source_max_ceiling_sources} "
             f"preferred_max_z_m={random_source_preferred_max_z_m} "
             "same_isotope_min_distance_m="

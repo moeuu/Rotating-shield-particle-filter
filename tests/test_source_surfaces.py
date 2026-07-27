@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from measurement.model import EnvironmentConfig
 from measurement.continuous_kernels import segment_box_intersection_length_m
@@ -31,6 +32,11 @@ def test_generate_surface_sources_never_places_sources_in_air_or_obstacles() -> 
         cell_size=1.0,
         grid_shape=(10, 20),
         blocked_cells=((3, 4), (4, 4), (3, 5)),
+        transport_boxes_m=(
+            (3.1, 4.1, 0.0, 3.8, 4.9, 1.6),
+            (3.2, 5.2, 0.0, 3.9, 5.8, 1.2),
+            (4.1, 4.2, 0.0, 4.8, 4.8, 1.8),
+        ),
     )
     sources = generate_surface_sources(
         env=env,
@@ -43,6 +49,10 @@ def test_generate_surface_sources_never_places_sources_in_air_or_obstacles() -> 
     )
 
     assert len(sources) == 200
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    kinds = source_surface_kinds(positions, env, grid)
+    assert not np.any(np.equal(kinds, None))
+    assert np.any(np.char.startswith(kinds.astype(str), "obstacle_"))
     for source in sources:
         assert is_allowed_source_surface_position(
             source.position,
@@ -66,6 +76,26 @@ def test_generate_surface_sources_samples_random_intensity_range() -> None:
     strengths = [source.intensity_cps_1m for source in sources]
     assert all(100000.0 <= value <= 200000.0 for value in strengths)
     assert len({round(value, 6) for value in strengths}) > 1
+
+
+def test_generate_surface_sources_rejects_synthetic_obstacle_surfaces() -> None:
+    """Truth generation should fail when physical obstacle faces are unknown."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1),),
+    )
+
+    with pytest.raises(ValueError, match="requires transport_boxes_m"):
+        generate_surface_sources(
+            env=env,
+            obstacle_grid=grid,
+            isotopes=("Cs-137",),
+            intensity_cps_1m=30000.0,
+            rng=np.random.default_rng(8),
+        )
 
 
 def test_generate_surface_sources_separates_same_isotope_sources() -> None:
@@ -94,8 +124,8 @@ def test_generate_surface_sources_separates_same_isotope_sources() -> None:
                 assert distance >= min_distance_m - 1.0e-9
 
 
-def test_generate_surface_sources_caps_ceiling_and_prefers_low_z() -> None:
-    """Random scenarios should avoid many ceiling or high-wall truth sources."""
+def test_generate_surface_sources_defaults_do_not_prefer_low_surfaces() -> None:
+    """Default truth generation should not cap ceilings or prefer low z."""
     env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
     sources = generate_surface_sources(
         env=env,
@@ -108,8 +138,8 @@ def test_generate_surface_sources_caps_ceiling_and_prefers_low_z() -> None:
     positions = np.asarray([source.position for source in sources], dtype=float)
     counts = source_surface_kind_counts(positions, env, None)
 
-    assert counts["ceiling"] <= 1
-    assert float(np.max(positions[:, 2])) <= 5.0
+    assert counts["ceiling"] > 1
+    assert float(np.max(positions[:, 2])) > 5.0
 
 
 def test_generate_surface_sources_ceiling_cap_without_low_z_preference() -> None:
@@ -138,6 +168,7 @@ def test_surface_observable_fraction_rejects_obstacle_top_sources() -> None:
         cell_size=1.0,
         grid_shape=(4, 4),
         blocked_cells=((1, 1),),
+        transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.0),),
     )
     measurement_points = np.array(
         [
@@ -226,6 +257,7 @@ def test_generate_surface_sources_respects_ground_visibility_filter() -> None:
         cell_size=1.0,
         grid_shape=(4, 4),
         blocked_cells=((1, 1),),
+        transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.0),),
     )
     measurement_points = np.array(
         [
@@ -369,7 +401,8 @@ def test_transport_component_interior_is_not_allowed_source_support() -> None:
 
     assert mask.tolist() == [True, False, False]
     assert not is_allowed_source_surface_position((1.5, 1.5, 0.8), env, grid)
-    assert is_allowed_source_surface_position((1.0, 1.5, 0.8), env, grid)
+    assert not is_allowed_source_surface_position((1.0, 1.5, 0.8), env, grid)
+    assert is_allowed_source_surface_position((1.2, 1.5, 0.8), env, grid)
 
 
 def test_source_surface_kinds_matches_scalar_classification() -> None:

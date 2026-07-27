@@ -12,6 +12,7 @@ from measurement.surface_patches import (
     _grid_component_neighbor_pairs,
     build_surface_patch_dictionary,
     estimate_surface_patch_count_upper_bound,
+    sample_continuous_surface_positions,
 )
 
 
@@ -27,6 +28,101 @@ def test_room_patch_areas_cover_each_surface_exactly() -> None:
     assert np.sum(patches.areas_m2[kinds == "wall"]) == pytest.approx(28.0)
     assert np.sum(patches.areas_m2) == pytest.approx(52.0)
     assert np.allclose(np.linalg.norm(patches.normals_xyz, axis=1), 1.0)
+
+
+def test_continuous_sampling_selects_patches_by_physical_area() -> None:
+    """Batched patch selection should exactly follow the area CDF."""
+    env = EnvironmentConfig(size_x=2.5, size_y=1.5, size_z=1.25)
+    patches = build_surface_patch_dictionary(env, None, spacing=1.0)
+    seed = 810_245
+    sample_count = 4_096
+    expected_draws = np.random.default_rng(seed).random((sample_count, 3))
+    cumulative_area = np.cumsum(patches.areas_m2)
+    expected_indices = np.searchsorted(
+        cumulative_area,
+        expected_draws[:, 0] * cumulative_area[-1],
+        side="right",
+    )
+
+    _, actual_indices = sample_continuous_surface_positions(
+        patches,
+        sample_count,
+        np.random.default_rng(seed),
+    )
+
+    assert np.array_equal(actual_indices, expected_indices)
+    assert np.unique(patches.areas_m2).size > 1
+
+
+def test_continuous_sampling_maps_unit_draws_affinely_within_patch() -> None:
+    """Continuous coordinates should be the exact rectangle affine map."""
+    env = EnvironmentConfig(size_x=2.5, size_y=1.5, size_z=1.25)
+    patches = build_surface_patch_dictionary(env, None, spacing=1.0)
+    seed = 91_304
+    sample_count = 1_024
+    expected_draws = np.random.default_rng(seed).random((sample_count, 3))
+
+    positions, patch_indices = sample_continuous_surface_positions(
+        patches,
+        sample_count,
+        np.random.default_rng(seed),
+    )
+
+    vertices = patches.vertices_xyz[patch_indices]
+    expected_positions = (
+        vertices[:, 0]
+        + expected_draws[:, 1, None] * (vertices[:, 1] - vertices[:, 0])
+        + expected_draws[:, 2, None] * (vertices[:, 3] - vertices[:, 0])
+    )
+    assert positions == pytest.approx(expected_positions, abs=1.0e-12)
+    center_offsets = positions - patches.centers_xyz[patch_indices]
+    assert np.any(np.linalg.norm(center_offsets, axis=1))
+
+
+def test_continuous_samples_use_exact_transport_component_surfaces() -> None:
+    """Obstacle samples should lie on the exact attached transport-box faces."""
+    env = EnvironmentConfig(size_x=5.0, size_y=5.0, size_z=4.0)
+    bounds = np.asarray([1.13, 1.27, 0.0, 2.41, 2.89, 2.37], dtype=float)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(5, 5),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=(tuple(bounds.tolist()),),
+    )
+    patches = build_surface_patch_dictionary(env, grid, spacing=0.7)
+
+    positions, patch_indices = sample_continuous_surface_positions(
+        patches,
+        20_000,
+        np.random.default_rng(452_810),
+    )
+
+    face_ids = np.asarray(patches.face_ids, dtype=str)[patch_indices]
+    obstacle_mask = np.char.startswith(face_ids, "transport_component_0_")
+    obstacle_positions = positions[obstacle_mask]
+    obstacle_faces = face_ids[obstacle_mask]
+    assert obstacle_positions.shape[0] > 0
+    assert set(obstacle_faces.tolist()) == {
+        "transport_component_0_x0",
+        "transport_component_0_x1",
+        "transport_component_0_y0",
+        "transport_component_0_y1",
+        "transport_component_0_z1",
+    }
+
+    face_specs = {
+        "transport_component_0_x0": (0, bounds[0]),
+        "transport_component_0_x1": (0, bounds[3]),
+        "transport_component_0_y0": (1, bounds[1]),
+        "transport_component_0_y1": (1, bounds[4]),
+        "transport_component_0_z1": (2, bounds[5]),
+    }
+    for face_id, (axis, plane) in face_specs.items():
+        selected = obstacle_positions[obstacle_faces == face_id]
+        assert selected[:, axis] == pytest.approx(plane, abs=1.0e-12)
+        assert np.all(selected >= bounds[:3] - 1.0e-12)
+        assert np.all(selected <= bounds[3:] + 1.0e-12)
 
 
 def test_patch_adjacency_has_physical_shared_edge_lengths() -> None:

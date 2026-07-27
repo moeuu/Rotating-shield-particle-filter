@@ -14,9 +14,11 @@ the standard RA-L ablation implementation:
 
 - `mix9_multi_isotope_cardinality`
 - ground truth source cardinality: `4 Cs-137 + 3 Co-60 + 2 Eu-154`
-- source support: walls, floor, ceiling, and exposed obstacle surfaces
-- random placement uses the standard visibility, ceiling-count, and preferred
-  height constraints from the Geant4 runtime config
+- source support: continuous walls, floor, ceiling, and every exposed
+  transport-component face from the shared physical surface geometry
+- random placement is uniform with respect to physical surface area and applies
+  no height preference, visibility filter, ceiling-count cap, source-separation
+  constraint, or response-observability screening
 
 Run only four closed-loop full-simulation variants for the main paper table:
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from runtime_environment import (
+    attach_random_manchester_transport_geometry,
     build_runtime_obstacle_environment,
     normalize_environment_mode,
 )
@@ -52,6 +53,49 @@ def test_random_runtime_environment_can_attach_transport_model(tmp_path: Path) -
     assert environment.grid.transport_boxes_m
     assert environment.grid.collision_boxes_m
     assert environment.asset_summary() is not None
+
+
+def test_shared_transport_attachment_matches_runtime_builder(tmp_path: Path) -> None:
+    """Shared attachment should reproduce the runtime component union exactly."""
+    base = build_runtime_obstacle_environment(
+        root=tmp_path,
+        environment_mode="random",
+        obstacle_layout_path=tmp_path / "random_unused.json",
+        room_size_xyz=(10.0, 20.0, 10.0),
+        detector_position_xy=(1.0, 1.0),
+        obstacle_seed=17,
+        obstacle_height_m=2.5,
+    )
+    runtime = build_runtime_obstacle_environment(
+        root=tmp_path,
+        environment_mode="random",
+        obstacle_layout_path=tmp_path / "random_unused.json",
+        room_size_xyz=(10.0, 20.0, 10.0),
+        detector_position_xy=(1.0, 1.0),
+        obstacle_seed=17,
+        attach_known_transport=True,
+        obstacle_height_m=2.5,
+        include_room_boundaries=True,
+        room_boundary_thickness_m=0.2,
+    )
+
+    assert base.grid is not None
+    shared_grid, shared_instances = attach_random_manchester_transport_geometry(
+        base.grid,
+        room_size_xyz=(10.0, 20.0, 10.0),
+        obstacle_height_m=2.5,
+        rng_seed=17,
+        include_room_boundaries=True,
+        room_boundary_thickness_m=0.2,
+    )
+
+    assert runtime.grid is not None
+    assert runtime.known_obstacle_instances == shared_instances
+    assert runtime.grid.transport_boxes_m == shared_grid.transport_boxes_m
+    assert runtime.grid.transport_mu_by_isotope == (
+        shared_grid.transport_mu_by_isotope
+    )
+    assert runtime.grid.collision_boxes_m == shared_grid.collision_boxes_m
 
 
 def test_random_runtime_environment_can_attach_room_boundary_transport(

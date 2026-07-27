@@ -21,6 +21,7 @@ from runtime_defaults import (
     DEFAULT_NO_ROTATION_OVERHEAD_S,
     DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
 )
+from runtime_environment import attach_random_manchester_transport_geometry
 from sim.runtime import load_runtime_config
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -466,14 +467,16 @@ def _free_cell_measurement_points(
 
 def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]:
     """Return source-placement options shared with standard random generation."""
-    preferred_raw = base_config.get("random_source_preferred_max_z_m", 5.0)
+    preferred_raw = base_config.get("random_source_preferred_max_z_m")
     preferred_max_z_m = None if preferred_raw is None else float(preferred_raw)
+    ceiling_raw = base_config.get("random_source_max_ceiling_sources")
+    max_ceiling_sources = None if ceiling_raw is None else int(ceiling_raw)
     return {
         "visibility_filter": bool(
-            base_config.get("random_source_visibility_filter", True)
+            base_config.get("random_source_visibility_filter", False)
         ),
         "visibility_min_fraction": float(
-            base_config.get("random_source_min_visible_fraction", 0.1)
+            base_config.get("random_source_min_visible_fraction", 0.0)
         ),
         "visibility_clear_path_max_m": float(
             base_config.get("random_source_clear_path_max_m", 0.01)
@@ -484,12 +487,17 @@ def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]
         "visibility_max_attempts_per_source": int(
             base_config.get("random_source_visibility_max_attempts_per_source", 4096)
         ),
-        "max_ceiling_sources": int(
-            base_config.get("random_source_max_ceiling_sources", 1)
-        ),
+        "max_ceiling_sources": max_ceiling_sources,
         "preferred_max_z_m": preferred_max_z_m,
         "same_isotope_min_distance_m": float(
-            base_config.get("random_source_same_isotope_min_distance_m", 2.0)
+            base_config.get("random_source_same_isotope_min_distance_m", 0.0)
+        ),
+        "obstacle_height_m": float(base_config.get("obstacle_height_m", 2.0)),
+        "include_room_boundaries": bool(
+            base_config.get("author_room_boundary_prims", False)
+        ),
+        "room_boundary_thickness_m": float(
+            base_config.get("room_boundary_thickness_m", 0.1)
         ),
     }
 
@@ -522,6 +530,19 @@ def _case_source_layout(
     )
     rng = np.random.default_rng(source_seed)
     options = dict(source_generation_options or {})
+    obstacle_height_m = float(options.get("obstacle_height_m", 2.0))
+    grid, _ = attach_random_manchester_transport_geometry(
+        grid,
+        room_size_xyz=(env.size_x, env.size_y, env.size_z),
+        obstacle_height_m=obstacle_height_m,
+        rng_seed=obstacle_seed,
+        include_room_boundaries=bool(
+            options.get("include_room_boundaries", False)
+        ),
+        room_boundary_thickness_m=float(
+            options.get("room_boundary_thickness_m", 0.1)
+        ),
+    )
     visibility_points = None
     if bool(options.get("visibility_filter", False)):
         visibility_points = _free_cell_measurement_points(grid, env)
@@ -533,7 +554,7 @@ def _case_source_layout(
         intensity_cps_1m=intensity_cps_1m,
         rng=rng,
         count=case.source_count,
-        obstacle_height_m=2.0,
+        obstacle_height_m=obstacle_height_m,
         visibility_measurement_points=visibility_points,
         visibility_min_fraction=float(options.get("visibility_min_fraction", 0.0)),
         visibility_clear_path_max_m=float(
@@ -543,10 +564,10 @@ def _case_source_layout(
         visibility_max_attempts_per_source=int(
             options.get("visibility_max_attempts_per_source", 4096)
         ),
-        max_ceiling_sources=options.get("max_ceiling_sources", 1),
-        preferred_max_z_m=options.get("preferred_max_z_m", 5.0),
+        max_ceiling_sources=options.get("max_ceiling_sources"),
+        preferred_max_z_m=options.get("preferred_max_z_m"),
         same_isotope_min_distance_m=float(
-            options.get("same_isotope_min_distance_m", 2.0)
+            options.get("same_isotope_min_distance_m", 0.0)
         ),
     )
     return {
@@ -557,13 +578,25 @@ def _case_source_layout(
             "isotope_counts": _case_isotope_count_metadata(case),
             "source_seed": int(source_seed),
             "obstacle_seed": int(obstacle_seed),
-            "sampling": "surface-constrained room/obstacle source placement",
+            "source_surface_sampling_schema_version": 1,
+            "sampling": "continuous area-uniform physical-surface placement",
+            "sampling_measure": "continuous_area_uniform",
+            "surface_geometry": "runtime_transport_component_union",
             "visibility_filter": bool(options.get("visibility_filter", False)),
             "visibility_min_fraction": float(
                 options.get("visibility_min_fraction", 0.0)
             ),
+            "max_ceiling_sources": options.get("max_ceiling_sources"),
+            "preferred_max_z_m": options.get("preferred_max_z_m"),
             "same_isotope_min_distance_m": float(
-                options.get("same_isotope_min_distance_m", 2.0)
+                options.get("same_isotope_min_distance_m", 0.0)
+            ),
+            "obstacle_height_m": obstacle_height_m,
+            "include_room_boundaries": bool(
+                options.get("include_room_boundaries", False)
+            ),
+            "room_boundary_thickness_m": float(
+                options.get("room_boundary_thickness_m", 0.1)
             ),
             "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
             "intensity_sampling": _intensity_sampling_metadata(intensity_cps_1m),
