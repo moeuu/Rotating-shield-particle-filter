@@ -1,16 +1,16 @@
 {
   "extends": "../high_fidelity_no_isaac.json",
+  "pure_pf_schema_version": 1,
   "estimator_profile": "pf_strict",
-  "source_surface_prior": true,
+  "variable_cardinality": true,
+  "pf_strength_prior_min_cps_1m": 0.0,
+  "pf_strength_prior_max_cps_1m": 2000000.0,
   "adaptive_cardinality_dwell_enable": false,
   "adaptive_mission_stop": false,
   "measurement_budget_max_steps": 160,
   "measurement_log_output_dir": "logs/pure_pf/python_pf_strict_3d_measurement_log",
   "spectrum_count_method": "response_poisson",
-  "joint_observation_update": false,
-  "delayed_resample_update": true,
   "mission_stop_max_poses": 20,
-  "mission_stop_soft_extend_on_unresolved": false,
   "parallel_isotope_updates": false,
   "detector_height_sampling_mode": "continuous",
   "measurement_pose_clearance_enabled": true,
@@ -18,7 +18,6 @@
     "horizon": 2,
     "beam_width": 8,
     "program_length": 8,
-    "residual_program_length": 16,
     "program_eval_workers": 32,
     "max_programs": 40,
     "signature_weight": 1,
@@ -47,8 +46,6 @@
     "enforce_min_observation": true,
     "signature_std_min_counts": 1,
     "augment_candidates": true,
-    "max_augmented_candidates": 256,
-    "adaptive_program_length_enable": false,
-    "residual_extension_requires_cardinality_evidence": false
+    "max_augmented_candidates": 256
   }
 }

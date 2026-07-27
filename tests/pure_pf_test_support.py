@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from pf.provenance import canonical_json_bytes
+from pf.runtime_route import RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
 from runtime.measurement_log import (
     MeasurementLogRecord,
     build_forward_model_manifest,
@@ -17,11 +18,26 @@ from runtime.measurement_log import (
 
 TEST_COMMIT = "a" * 40
 TEST_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
+TEST_CANDIDATE_SOURCES = np.asarray(
+    [
+        [0.25, 0.25, 0.0],
+        [1.0, 1.0, 0.0],
+        [1.75, 1.75, 1.5],
+    ],
+    dtype=float,
+)
+
+
+def count_likelihood_routes() -> dict[str, str]:
+    """Return the canonical count route for every fixture isotope."""
+    return {isotope: "count" for isotope in TEST_ISOTOPES}
 
 
 def runtime_config() -> dict[str, object]:
     """Return a small resolved physical configuration for replay tests."""
     return {
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
         "sim_backend": "analytic",
         "spectrum_count_method": "response_poisson",
         "source_rate_model": "detector_cps_1m",
@@ -102,6 +118,19 @@ def records(
                         )
                         else {}
                     ),
+                    **(
+                        {
+                            RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY: (
+                                count_likelihood_routes()
+                            )
+                        }
+                        if station_complete_markers
+                        and (
+                            index + 1 == int(record_count)
+                            or (index + 1) // 2 != station
+                        )
+                        else {}
+                    ),
                 },
             )
         )
@@ -148,15 +177,13 @@ def make_measurement_log(
 def replay_config() -> dict[str, object]:
     """Return a small deterministic strict-PF replay configuration."""
     return {
+        "pure_pf_schema_version": 1,
         "estimator_profile": "pf_strict",
         "num_particles": 12,
         "max_sources": 2,
         "init_num_sources": [1, 1],
-        "birth_enable": False,
+        "variable_cardinality": False,
+        "strength_prior_min_cps_1m": 0.0,
+        "strength_prior_max_cps_1m": 2_000_000.0,
         "use_gpu": False,
-        "replay_candidate_sources_xyz": [
-            [0.25, 0.25, 0.0],
-            [1.0, 1.0, 0.0],
-            [1.75, 1.75, 1.5],
-        ],
     }

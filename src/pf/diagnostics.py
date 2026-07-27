@@ -16,7 +16,6 @@ def reset_step_diagnostics(target: Any) -> None:
     target.last_resample_count = 0
     target.last_birth_count = 0
     target.last_death_count = 0
-    target.last_n_after_adapt = None
     target.last_temper_steps = []
     target.last_temper_resample_count = 0
     target.last_source_event_diagnostics = []

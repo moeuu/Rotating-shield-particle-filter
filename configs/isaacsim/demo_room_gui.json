@@ -1,7 +1,10 @@
 {
   "backend": "isaacsim",
+  "pure_pf_schema_version": 1,
   "estimator_profile": "pf_strict",
-  "source_surface_prior": true,
+  "variable_cardinality": true,
+  "pf_strength_prior_min_cps_1m": 0.0,
+  "pf_strength_prior_max_cps_1m": 2000000.0,
   "host": "127.0.0.1",
   "port": 5555,
   "timeout_s": 90.0,
@@ -27,7 +30,6 @@
     "horizon": 2,
     "beam_width": 8,
     "program_length": 8,
-    "residual_program_length": 16,
     "program_eval_workers": 32,
     "candidate_preselect_enable": true,
     "candidate_preselect_min": 64,
@@ -62,7 +64,7 @@
     "augment_candidates": true,
     "max_augmented_candidates": 256
   },
-  "pf_max_sources": null,
+  "pf_max_sources": 5,
   "detector_model": {
     "crystal_radius_m": 0.038,
     "crystal_length_m": 0.076,

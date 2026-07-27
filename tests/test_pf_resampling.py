@@ -1,37 +1,46 @@
-"""Tests for PF resampling helper utilities."""
+"""Tests for fixed-size PF systematic resampling."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from pf.resampling import systematic_resample_count
+from pf.resampling import systematic_resample
 
 
-def test_systematic_resample_count_handles_empty_draw() -> None:
-    """Zero requested draws should return an empty index array."""
-    idx = systematic_resample_count(np.array([0.2, 0.8]), count=0)
+def test_systematic_resample_preserves_particle_count() -> None:
+    """Standard PF resampling should always return one index per particle."""
+    probabilities = np.array([0.1, 0.2, 0.7], dtype=float)
 
-    assert idx.dtype == np.int64
-    assert idx.size == 0
+    indices = systematic_resample(
+        np.log(probabilities),
+        rng=np.random.default_rng(3),
+    )
 
-
-def test_systematic_resample_count_normalizes_weights() -> None:
-    """Positive non-normalized weights should be sampled as probabilities."""
-    np.random.seed(3)
-
-    idx = systematic_resample_count(np.array([0.0, 2.0, 8.0]), count=10)
-
-    assert idx.shape == (10,)
-    assert np.all(idx >= 0)
-    assert np.all(idx < 3)
-    assert np.count_nonzero(idx == 2) > np.count_nonzero(idx == 1)
+    assert indices.dtype == np.int64
+    assert indices.shape == (3,)
+    assert np.all(indices >= 0)
+    assert np.all(indices < probabilities.size)
 
 
-def test_systematic_resample_count_falls_back_to_uniform() -> None:
-    """Invalid total mass should fall back to uniform weights."""
-    np.random.seed(1)
+def test_systematic_resample_uniform_weights_select_each_particle() -> None:
+    """Uniform weights should preserve all particle representatives."""
+    log_weights = np.full(6, -np.log(6.0), dtype=float)
 
-    idx = systematic_resample_count(np.array([0.0, 0.0, 0.0]), count=6)
+    indices = systematic_resample(log_weights, rng=np.random.default_rng(1))
 
-    assert idx.shape == (6,)
-    assert set(idx.tolist()).issubset({0, 1, 2})
+    np.testing.assert_array_equal(indices, np.arange(6, dtype=np.int64))
+
+
+def test_systematic_resample_is_seed_reproducible() -> None:
+    """Equal NumPy states should produce identical ancestor indices."""
+    log_weights = np.log(np.array([0.05, 0.15, 0.3, 0.5], dtype=float))
+    first = systematic_resample(
+        log_weights,
+        rng=np.random.default_rng(20260727),
+    )
+    second = systematic_resample(
+        log_weights,
+        rng=np.random.default_rng(20260727),
+    )
+
+    np.testing.assert_array_equal(first, second)

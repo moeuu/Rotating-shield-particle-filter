@@ -70,6 +70,7 @@ from pf.likelihood import (
     DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA,
     DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA,
     CountLikelihoodSpec,
+    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
     count_likelihood_variance,
 )
 from pf.pure_estimator import PurePFEstimator
@@ -240,11 +241,11 @@ def _runtime_count_likelihood_value(
     key: str,
     default: object,
 ) -> object:
-    """Read one nested or legacy PF count-likelihood configuration value."""
+    """Read one versioned nested PF count-likelihood configuration value."""
     nested = runtime_config.get("pf_count_likelihood", {})
-    if isinstance(nested, Mapping) and key in nested:
-        return nested[key]
-    return runtime_config.get(f"pf_{key}", default)
+    if not isinstance(nested, Mapping):
+        raise ValueError("pf_count_likelihood must be an object.")
+    return nested.get(key, default)
 
 
 def _isotope_float_value(
@@ -309,18 +310,11 @@ def build_runtime_count_likelihood_specs(
         "low_count_transition_counts",
         DEFAULT_GEANT4_LOW_COUNT_TRANSITION_COUNTS if geant4_defaults else 0.0,
     )
-    observation_variance_includes_counting_noise = bool(
-        _runtime_count_likelihood_value(
-            runtime_config,
-            "observation_count_variance_includes_counting_noise",
-            False,
-        )
-    )
     observation_variance_semantics = str(
         _runtime_count_likelihood_value(
             runtime_config,
             "observation_count_variance_semantics",
-            "",
+            OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
         )
     )
     student_t_df = float(
@@ -357,9 +351,6 @@ def build_runtime_count_likelihood_specs(
                 low_count_transition,
                 isotope,
             ),
-            observation_count_variance_includes_counting_noise=(
-                observation_variance_includes_counting_noise
-            ),
             observation_count_variance_semantics=(observation_variance_semantics),
             student_t_df=max(student_t_df, 1.0),
         )
@@ -382,9 +373,6 @@ def _count_likelihood_spec_payload(spec: CountLikelihoodSpec) -> dict[str, Any]:
         "spectrum_count_abs_sigma": spec.spectrum_count_abs_sigma,
         "low_count_abs_sigma": spec.low_count_abs_sigma,
         "low_count_transition_counts": spec.low_count_transition_counts,
-        "observation_count_variance_includes_counting_noise": bool(
-            spec.observation_count_variance_includes_counting_noise
-        ),
         "observation_count_variance_semantics": str(
             spec.observation_count_variance_semantics
         ),
@@ -2734,8 +2722,8 @@ def _count_likelihood_scale_squared(
             float(projected_observation_variance),
             0.0,
         ),
-        observation_count_variance_includes_counting_noise=(
-            spec.observation_count_variance_includes_counting_noise
+        observation_count_variance_semantics=(
+            spec.observation_count_variance_semantics
         ),
     )
     return float(np.asarray(scale_squared, dtype=float).reshape(-1)[0])
@@ -2987,12 +2975,15 @@ def run_case(
         "pf_shield_view_ratio_likelihood",
         {},
     )
+    likelihood_config = runtime_config.get("pf_count_likelihood", {})
+    if not isinstance(likelihood_config, Mapping):
+        likelihood_config = {}
     pf_count_likelihood_diagnostics["runtime_likelihood_guards"] = {
         "observation_count_variance_semantics": str(
-            runtime_config.get("pf_observation_count_variance_semantics", "")
-        ),
-        "direct_spectrum_likelihood_enable": bool(
-            runtime_config.get("pf_direct_spectrum_likelihood_enable", True)
+            likelihood_config.get(
+                "observation_count_variance_semantics",
+                OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
+            )
         ),
         "shield_contrast_likelihood_enable": bool(
             shield_contrast_config.get("enabled", False)

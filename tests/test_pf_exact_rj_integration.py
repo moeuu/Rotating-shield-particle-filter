@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from measurement.kernels import KernelPrecomputer, ShieldParams
+from measurement.kernels import MeasurementGeometry, ShieldParams
 from measurement.shielding import generate_octant_orientations
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.likelihood import expected_counts_per_source
@@ -20,17 +20,12 @@ def _exact_config(**overrides: object) -> PFConfig:
     """Return a small exact RJ-MH configuration for deterministic tests."""
     values: dict[str, object] = {
         "num_particles": 18,
-        "min_particles": 18,
-        "max_particles": 18,
         "max_sources": 2,
         "use_gpu": False,
-        "position_min": (0.0, 0.0, 0.0),
         "position_max": (2.0, 2.0, 2.0),
-        "source_position_prior": "surface",
         "init_num_sources": (0, 2),
-        "init_strength_prior": "uniform",
-        "init_strength_min": 1.0,
-        "init_strength_max": 3.0,
+        "strength_prior_min_cps_1m": 1.0,
+        "strength_prior_max_cps_1m": 3.0,
         "structural_rj_patch_spacing_m": 1.0,
         "structural_rj_move_probability": 1.0,
         "structural_rj_birth_probability": 0.5,
@@ -100,9 +95,9 @@ def _discrete_kernel(
     orientations: np.ndarray | None = None,
     shield_params: ShieldParams | None = None,
     mu_by_isotope: dict[str, object] | None = None,
-) -> KernelPrecomputer:
-    """Build a CPU discrete kernel for cache-replacement tests."""
-    return KernelPrecomputer(
+) -> MeasurementGeometry:
+    """Build measurement geometry for cache-replacement tests."""
+    return MeasurementGeometry(
         candidate_sources=np.asarray([[0.5, 0.5, 0.5]], dtype=float),
         poses=(
             np.asarray([[0.4, 0.6, 0.5]], dtype=float)
@@ -116,7 +111,6 @@ def _discrete_kernel(
         ),
         shield_params=ShieldParams() if shield_params is None else shield_params,
         mu_by_isotope={} if mu_by_isotope is None else mu_by_isotope,
-        use_gpu=False,
     )
 
 
@@ -124,17 +118,12 @@ def _build_exact_estimator() -> RotatingShieldPFEstimator:
     """Build a small exact estimator for appended-pose cache tests."""
     config = RotatingShieldPFConfig(
         num_particles=18,
-        min_particles=18,
-        max_particles=18,
         max_sources=2,
         use_gpu=False,
-        position_min=(0.0, 0.0, 0.0),
         position_max=(2.0, 2.0, 2.0),
-        source_position_prior="surface",
         init_num_sources=(0, 2),
-        init_strength_prior="uniform",
-        init_strength_min=1.0,
-        init_strength_max=3.0,
+        strength_prior_min_cps_1m=1.0,
+        strength_prior_max_cps_1m=3.0,
         structural_rj_patch_spacing_m=1.0,
     )
     shield = ShieldParams()
@@ -202,18 +191,15 @@ def test_exact_initialization_reproduces_explicit_cardinality_mass() -> None:
     np.testing.assert_allclose(observed, expected, atol=1.0e-14, rtol=0.0)
 
 
-def test_fixed_cardinality_path_gates_structural_moves() -> None:
-    """A fixed-K PF must preserve every state and outer particle weight."""
+def test_fixed_cardinality_path_runs_exact_within_k_moves() -> None:
+    """Fixed-K must run exact state MH while preserving K and PF weights."""
     particle_filter = _build_filter(
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
     )
     data = _measurement_data(live_time=1.0)
     before = [
         (
-            particle.state.positions.copy(),
-            particle.state.strengths.copy(),
-            float(particle.state.background),
             float(particle.log_weight),
         )
         for particle in particle_filter.continuous_particles
@@ -221,19 +207,25 @@ def test_fixed_cardinality_path_gates_structural_moves() -> None:
 
     particle_filter.apply_structural_moves(data)
 
-    assert particle_filter.last_structural_timing_s == {
-        "total": 0.0,
-        "structural_moves_gated": 1.0,
-        "weights_preserved": 1.0,
-    }
-    for particle, (positions, strengths, background, log_weight) in zip(
+    timing = particle_filter.last_structural_timing_s
+    assert timing["rj_birth_attempted"] == 0.0
+    assert timing["rj_birth_accepted"] == 0.0
+    assert timing["rj_death_attempted"] == 0.0
+    assert timing["rj_death_accepted"] == 0.0
+    assert timing["rj_global_position_attempted"] == 18.0
+    assert timing["rj_local_position_attempted"] == 18.0
+    assert timing["rj_strength_attempted"] == 18.0
+    assert (
+        timing["rj_global_position_accepted"]
+        + timing["rj_local_position_accepted"]
+        + timing["rj_strength_accepted"]
+    ) > 0.0
+    assert timing["weights_preserved"] == 1.0
+    for particle, (log_weight,) in zip(
         particle_filter.continuous_particles,
         before,
     ):
         assert particle.state.num_sources == 1
-        np.testing.assert_array_equal(particle.state.positions, positions)
-        np.testing.assert_array_equal(particle.state.strengths, strengths)
-        assert particle.state.background == background
         assert particle.log_weight == log_weight
 
 

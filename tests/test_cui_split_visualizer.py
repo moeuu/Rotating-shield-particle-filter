@@ -206,7 +206,7 @@ def test_build_frame_from_pf_hides_inactive_particle_slots() -> None:
     config = PFConfig(
         num_particles=2,
         use_gpu=False,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
     )
     filt = SimpleNamespace(config=config)

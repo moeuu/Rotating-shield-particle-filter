@@ -14,7 +14,7 @@ import numpy as np
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import build_obstacle_grid
 from measurement.source_surfaces import generate_surface_sources
-from pf.profiles import reject_removed_estimator_config
+from pf.profiles import enforce_pure_runtime_settings
 from runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_MEASUREMENT_TIME_S,
@@ -98,7 +98,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
@@ -120,9 +119,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "advance_by_pose": True,
             },
             "strict_planned_shield_program": True,
-            "dss_pp": {
-                "adaptive_program_length_enable": False,
-            },
         },
     ),
     AblationVariant(
@@ -148,15 +144,12 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
                 "temporal_logdet_weight": 0.0,
                 "temporal_cover_weight": 0.0,
                 "correlation_reduction_weight": 0.0,
-                "same_isotope_direct_separation_guard": False,
                 "environment_signature_weight": 0.0,
                 "occlusion_boundary_weight": 0.0,
                 "vertical_environment_signature_weight": 0.0,
                 "elevation_signature_weight": 0.0,
                 "elevation_condition_weight": 0.0,
                 "station_condition_weight": 0.0,
-                "high_surface_pair_boost": 1.0,
-                "high_surface_cross_stratum_boost": 1.0,
             },
         },
     ),
@@ -183,7 +176,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
@@ -229,7 +221,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
@@ -247,7 +238,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
     ),
@@ -266,7 +256,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "path_planner": "one_step",
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
@@ -297,7 +286,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "path_planner": "one_step",
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
@@ -315,7 +303,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
             "path_planner": "one_step",
             "dss_pp": {
                 "program_length": 1,
-                "residual_program_length": 1,
             },
         },
     ),
@@ -620,11 +607,25 @@ def _variant_config(
     """Return the runtime config for one ablation variant."""
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
-    reject_removed_estimator_config(config)
-    if config.get("estimator_profile") != "pf_strict":
-        raise ValueError("RA-L ablations require estimator_profile='pf_strict'.")
-    if config.get("source_surface_prior") is not True:
-        raise ValueError("RA-L ablations require source_surface_prior=true.")
+    config = enforce_pure_runtime_settings(config)
+    if config.get("variable_cardinality") is not True:
+        raise ValueError(
+            "RA-L ablations require variable_cardinality=true for exact "
+            "reversible-jump PF."
+        )
+    strength_min = float(config.get("pf_strength_prior_min_cps_1m", np.nan))
+    strength_max = float(config.get("pf_strength_prior_max_cps_1m", np.nan))
+    if (
+        not np.isfinite(strength_min)
+        or strength_min < 0.0
+        or not np.isfinite(strength_max)
+        or strength_max <= strength_min
+    ):
+        raise ValueError(
+            "RA-L ablations require finite ordered "
+            "pf_strength_prior_min_cps_1m and "
+            "pf_strength_prior_max_cps_1m bounds."
+        )
     transport_history_mode = _validate_ral_transport_sampling(config)
     thread_count = int(config.get("thread_count", 1))
     if thread_count <= 1:

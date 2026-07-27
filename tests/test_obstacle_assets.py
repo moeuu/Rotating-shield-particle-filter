@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacle_assets import (
@@ -32,125 +31,6 @@ def _box_overlap_volume_m3(
     dy = max(0.0, min(first[4], second[4]) - max(first[1], second[1]))
     dz = max(0.0, min(first[5], second[5]) - max(first[2], second[2]))
     return float(dx * dy * dz)
-
-
-def test_gpu_obstacle_tau_chunks_known_components() -> None:
-    """GPU obstacle attenuation should support many material-specific boxes."""
-    torch = pytest.importorskip("torch")
-    from pf import gpu_utils
-
-    device = torch.device("cpu")
-    dtype = torch.float64
-    detector = np.array([4.0, 0.5, 0.5], dtype=float)
-    source = torch.as_tensor([[[0.0, 0.5, 0.5]]], device=device, dtype=dtype)
-    strengths = torch.ones((1, 1), device=device, dtype=dtype)
-    backgrounds = torch.zeros(1, device=device, dtype=dtype)
-    mask = torch.ones((1, 1), device=device, dtype=dtype)
-    boxes = torch.as_tensor(
-        [
-            [0.5, 0.0, 0.0, 1.0, 1.0, 1.0],
-            [1.5, 0.0, 0.0, 2.0, 1.0, 1.0],
-            [2.5, 0.0, 0.0, 3.0, 1.0, 1.0],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    mu_values = torch.as_tensor([0.1, 0.2, 0.3], device=device, dtype=dtype)
-
-    counts = gpu_utils.expected_counts_pair_torch(
-        detector_pos=detector,
-        positions=source,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_index=0,
-        pb_index=0,
-        mu_fe=0.0,
-        mu_pb=0.0,
-        thickness_fe_cm=0.0,
-        thickness_pb_cm=0.0,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        obstacle_boxes_m=boxes,
-        obstacle_mu_cm_inv_by_box=mu_values,
-        obstacle_box_chunk_size=1,
-    )
-
-    assert float(counts[0]) == pytest.approx(np.exp(-30.0) / 16.0, rel=1.0e-12)
-
-
-def test_gpu_obstacle_tau_chunk_size_equivalence() -> None:
-    """GPU obstacle optical depth should not depend on obstacle chunk size."""
-    torch = pytest.importorskip("torch")
-    from pf import gpu_utils
-
-    device = torch.device("cpu")
-    dtype = torch.float64
-    detector = np.array([4.0, 0.5, 0.5], dtype=float)
-    source = torch.as_tensor(
-        [
-            [[0.0, 0.25, 0.5], [0.0, 0.75, 0.5]],
-            [[0.0, 0.50, 0.5], [0.0, 1.25, 0.5]],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    strengths = torch.ones((2, 2), device=device, dtype=dtype)
-    backgrounds = torch.zeros(2, device=device, dtype=dtype)
-    mask = torch.ones((2, 2), device=device, dtype=dtype)
-    boxes = torch.as_tensor(
-        [
-            [0.5, 0.0, 0.0, 1.0, 1.0, 1.0],
-            [1.5, 0.0, 0.0, 2.0, 1.0, 1.0],
-            [2.5, 0.0, 0.0, 3.0, 1.0, 1.0],
-            [3.2, 1.0, 0.0, 3.7, 1.5, 1.0],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    mu_values = torch.as_tensor([0.1, 0.2, 0.3, 0.4], device=device, dtype=dtype)
-
-    scalar_chunks = gpu_utils.expected_counts_pair_torch(
-        detector_pos=detector,
-        positions=source,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_index=0,
-        pb_index=0,
-        mu_fe=0.0,
-        mu_pb=0.0,
-        thickness_fe_cm=0.0,
-        thickness_pb_cm=0.0,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        obstacle_boxes_m=boxes,
-        obstacle_mu_cm_inv_by_box=mu_values,
-        obstacle_box_chunk_size=1,
-    )
-    batched_chunks = gpu_utils.expected_counts_pair_torch(
-        detector_pos=detector,
-        positions=source,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_index=0,
-        pb_index=0,
-        mu_fe=0.0,
-        mu_pb=0.0,
-        thickness_fe_cm=0.0,
-        thickness_pb_cm=0.0,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        obstacle_boxes_m=boxes,
-        obstacle_mu_cm_inv_by_box=mu_values,
-        obstacle_box_chunk_size=64,
-    )
-
-    assert torch.allclose(scalar_chunks, batched_chunks, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_manchester_assets_provide_hollow_transport_components() -> None:

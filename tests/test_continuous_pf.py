@@ -37,125 +37,6 @@ from pf.particle_filter import (
 from pf.state import IsotopeState
 
 
-def test_selected_pair_gpu_counts_match_all_pair_selection() -> None:
-    """Selected-pair torch counts should equal all-pair counts indexed afterward."""
-    torch = pytest.importorskip("torch")
-    from measurement.kernels import ShieldParams
-    from pf import gpu_utils
-
-    device = torch.device("cpu")
-    dtype = torch.float64
-    positions = torch.as_tensor(
-        [
-            [[1.0, 0.5, 0.4], [2.0, 1.2, 1.4]],
-            [[0.8, 1.5, 0.9], [2.5, 0.2, 1.8]],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    strengths = torch.as_tensor(
-        [[1000.0, 500.0], [800.0, 300.0]],
-        device=device,
-        dtype=dtype,
-    )
-    backgrounds = torch.as_tensor([2.0, 3.0], device=device, dtype=dtype)
-    mask = torch.ones((2, 2), device=device, dtype=dtype)
-    shield = ShieldParams()
-    detector_pos = np.array([0.0, 0.0, 0.0], dtype=float)
-    fe_indices = np.array([0, 3, 7, 1], dtype=np.int64)
-    pb_indices = np.array([7, 2, 4, 1], dtype=np.int64)
-
-    all_counts = gpu_utils.expected_counts_all_pairs_torch(
-        detector_pos=detector_pos,
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        mu_fe=shield.mu_fe,
-        mu_pb=shield.mu_pb,
-        thickness_fe_cm=shield.thickness_fe_cm,
-        thickness_pb_cm=shield.thickness_pb_cm,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        inner_radius_fe_cm=shield.inner_radius_fe_cm,
-        inner_radius_pb_cm=shield.inner_radius_pb_cm,
-        shield_geometry_model=shield.shield_geometry_model,
-        use_angle_attenuation=shield.use_angle_attenuation,
-    )
-    selected_counts = gpu_utils.expected_counts_selected_pairs_torch(
-        detector_pos=detector_pos,
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-        mu_fe=shield.mu_fe,
-        mu_pb=shield.mu_pb,
-        thickness_fe_cm=shield.thickness_fe_cm,
-        thickness_pb_cm=shield.thickness_pb_cm,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        inner_radius_fe_cm=shield.inner_radius_fe_cm,
-        inner_radius_pb_cm=shield.inner_radius_pb_cm,
-        shield_geometry_model=shield.shield_geometry_model,
-        use_angle_attenuation=shield.use_angle_attenuation,
-    )
-    pair_indices = fe_indices * 8 + pb_indices
-
-    assert torch.allclose(selected_counts, all_counts[pair_indices], rtol=1e-10)
-
-    pair_scales = np.linspace(0.5, 1.5, 64, dtype=float)
-    all_scaled = gpu_utils.expected_counts_all_pairs_torch(
-        detector_pos=detector_pos,
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        mu_fe=shield.mu_fe,
-        mu_pb=shield.mu_pb,
-        thickness_fe_cm=shield.thickness_fe_cm,
-        thickness_pb_cm=shield.thickness_pb_cm,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        source_scale=pair_scales,
-        inner_radius_fe_cm=shield.inner_radius_fe_cm,
-        inner_radius_pb_cm=shield.inner_radius_pb_cm,
-        shield_geometry_model=shield.shield_geometry_model,
-        use_angle_attenuation=shield.use_angle_attenuation,
-    )
-    selected_scaled = gpu_utils.expected_counts_selected_pairs_torch(
-        detector_pos=detector_pos,
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_indices=fe_indices,
-        pb_indices=pb_indices,
-        mu_fe=shield.mu_fe,
-        mu_pb=shield.mu_pb,
-        thickness_fe_cm=shield.thickness_fe_cm,
-        thickness_pb_cm=shield.thickness_pb_cm,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        source_scale=pair_scales[pair_indices],
-        inner_radius_fe_cm=shield.inner_radius_fe_cm,
-        inner_radius_pb_cm=shield.inner_radius_pb_cm,
-        shield_geometry_model=shield.shield_geometry_model,
-        use_angle_attenuation=shield.use_angle_attenuation,
-    )
-
-    assert torch.allclose(
-        selected_scaled,
-        all_scaled[pair_indices],
-        rtol=1e-10,
-    )
-
-
 def test_gpu_pair_counts_match_continuous_kernel_with_line_obstacles() -> None:
     """Torch PF counts should match the shared line-resolved ContinuousKernel."""
     torch = pytest.importorskip("torch")
@@ -915,7 +796,7 @@ def test_estimator_exposes_transport_response_model_to_planner_kernel() -> None:
         mu_by_isotope={"Cs-137": {"fe": 0.01, "pb": 0.02}},
         pf_config=RotatingShieldPFConfig(
             num_particles=4,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             use_gpu=False,
         ),
@@ -1020,7 +901,7 @@ def test_poisson_weight_update_prefers_higher_lambda() -> None:
     """Weight update should favor particle with higher expected Λ for given z."""
     cfg = PFConfig(
         num_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
     )
     dummy_kernel = type("K", (), {})()
@@ -1059,7 +940,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
         spectrum_count_rel_sigma=0.1,
@@ -1067,7 +948,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
         station_view_covariance_enable=True,
         station_view_correlated_spectrum_fraction=1.0,
         shield_contrast_likelihood_enable=False,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
     )
     filt = IsotopeParticleFilter(isotope="Cs-137", kernel=None, config=cfg)
     lam = np.asarray(
@@ -1086,6 +967,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
             torch.as_tensor(lam, dtype=torch.float64),
             z_obs,
             obs_var,
+            runtime_likelihood_route="count_covariance",
             observation_count_covariance=obs_cov,
         )
         .cpu()
@@ -1103,7 +985,7 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
             spectrum_count_rel_sigma=0.1,
             spectrum_count_abs_sigma=2.0,
             observation_count_variance=obs_var,
-            observation_count_variance_includes_counting_noise=True,
+            observation_count_variance_semantics="counting_noise_inclusive",
         )
         common = (0.1**2) * np.outer(lam_vec, lam_vec) + 2.0**2
         np.fill_diagonal(common, 0.0)
@@ -1117,174 +999,6 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
     assert np.allclose(ll, np.asarray(expected), rtol=1.0e-8, atol=1.0e-8)
 
 
-def test_spectral_bin_sequence_likelihood_matches_poisson_oracle() -> None:
-    """Direct PF spectrum-bin likelihood should match a batched Poisson oracle."""
-    torch = pytest.importorskip("torch")
-    cfg = PFConfig(
-        num_particles=2,
-        birth_enable=False,
-        init_num_sources=(0, 0),
-        count_likelihood_model="poisson",
-    )
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=None, config=cfg)
-    expected = np.asarray(
-        [
-            [[12.0, 8.0], [3.0, 5.0], [40.0, 42.0]],
-            [[7.0, 10.0], [20.0, 18.0], [2.0, 4.0]],
-        ],
-        dtype=float,
-    )
-    observed = np.asarray([[11.0, 4.0, 39.0], [8.0, 19.0, 3.0]], dtype=float)
-
-    actual = (
-        filt._spectral_bin_sequence_log_likelihood_gpu(
-            torch.as_tensor(expected, dtype=torch.float64),
-            observed,
-        )
-        .detach()
-        .cpu()
-        .numpy()
-    )
-    oracle = np.sum(observed[:, :, None] * np.log(expected) - expected, axis=(0, 1))
-
-    np.testing.assert_allclose(actual, oracle, rtol=1.0e-12, atol=1.0e-12)
-
-
-def test_pair_sequence_update_uses_spectrum_bin_likelihood(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PF sequence updates should prefer particles matching spectrum bins."""
-    torch = pytest.importorskip("torch")
-    cfg = PFConfig(
-        num_particles=2,
-        birth_enable=False,
-        init_num_sources=(0, 0),
-        count_likelihood_model="poisson",
-        use_gpu=True,
-        use_tempering=False,
-        resample_threshold=0.0,
-    )
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0], dtype=float)]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0], dtype=float)]
-    dummy_kernel.num_sources = 1
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=0,
-                positions=np.zeros((0, 3), dtype=float),
-                strengths=np.zeros(0, dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-
-    def fake_gpu_enabled() -> bool:
-        """Pretend that the torch backend is available for this path test."""
-        return True
-
-    def fake_counts(**_kwargs: object) -> "torch.Tensor":
-        """Return two particles whose scalar counts favor different spectra."""
-        return torch.as_tensor([[10.0, 30.0]], dtype=torch.float64)
-
-    def noop() -> None:
-        """Skip non-likelihood side effects in this path test."""
-        return None
-
-    def noop_adapt_num_particles(**_kwargs: object) -> None:
-        """Skip adaptive particle-count side effects in this path test."""
-        return None
-
-    def noop_maybe_update_convergence(**_kwargs: object) -> None:
-        """Skip convergence side effects in this path test."""
-        return None
-
-    monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
-    monkeypatch.setattr(
-        filt,
-        "_continuous_expected_counts_pair_sequence_torch",
-        fake_counts,
-    )
-    monkeypatch.setattr(filt, "_maybe_resample_continuous", noop)
-    monkeypatch.setattr(filt, "_advance_adapt_cooldown", noop)
-    monkeypatch.setattr(filt, "adapt_num_particles", noop_adapt_num_particles)
-    monkeypatch.setattr(
-        filt,
-        "_maybe_update_convergence",
-        noop_maybe_update_convergence,
-    )
-
-    filt.update_continuous_pair_sequence(
-        z_obs=np.array([10.0], dtype=float),
-        pose_idx=0,
-        fe_indices=np.array([0], dtype=int),
-        pb_indices=np.array([0], dtype=int),
-        live_times_s=np.array([1.0], dtype=float),
-        observation_count_variances=np.array([1.0], dtype=float),
-        spectrum_counts=np.array([[30.0, 0.0]], dtype=float),
-        spectrum_response_template=np.array([[1.0, 0.0]], dtype=float),
-        spectrum_background=np.zeros((1, 2), dtype=float),
-    )
-
-    assert filt.continuous_weights[1] > filt.continuous_weights[0]
-
-
-def test_spectral_bin_chunked_likelihood_matches_full_tensor() -> None:
-    """Chunked spectrum-bin likelihood should match the full KxBxN oracle."""
-    torch = pytest.importorskip("torch")
-    cfg = PFConfig(
-        birth_enable=False,
-        init_num_sources=(0, 0),
-        count_likelihood_model="student_t",
-        spectrum_count_rel_sigma=0.05,
-        spectrum_count_abs_sigma=1.0,
-        count_likelihood_df=5.0,
-        spectrum_likelihood_bin_chunk=2,
-    )
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=None, config=cfg)
-    lam = torch.tensor(
-        [[10.0, 20.0, 30.0], [4.0, 8.0, 12.0]],
-        dtype=torch.float64,
-    )
-    observed = np.array(
-        [[12.0, 3.0, 7.0, 1.0, 0.0], [2.0, 4.0, 5.0, 3.0, 1.0]],
-        dtype=float,
-    )
-    template = np.array(
-        [[0.5, 0.1, 0.2, 0.1, 0.0], [0.1, 0.3, 0.4, 0.1, 0.05]],
-        dtype=float,
-    )
-    background = np.full_like(observed, 0.5, dtype=float)
-    variance = np.full_like(observed, 1.25, dtype=float)
-
-    expected = filt._expected_spectrum_sequence_torch(lam, template, background)
-    full = filt._spectral_bin_sequence_log_likelihood_gpu(
-        expected,
-        observed,
-        variance,
-    )
-    chunked = filt._spectral_bin_sequence_log_likelihood_from_lambda_gpu(
-        lam,
-        observed,
-        template,
-        background,
-        variance,
-    )
-
-    assert torch.allclose(chunked, full, rtol=1.0e-12, atol=1.0e-12)
-
-
 def test_surface_position_prior_projects_posterior_point_estimates() -> None:
     """PF point summaries should remain inside the surface-constrained state space."""
     env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
@@ -1292,10 +1006,8 @@ def test_surface_position_prior_projects_posterior_point_estimates() -> None:
         num_particles=3,
         use_gpu=False,
         init_num_sources=(1, 1),
-        birth_enable=False,
-        position_min=(0.0, 0.0, 0.0),
+        variable_cardinality=False,
         position_max=(env.size_x, env.size_y, env.size_z),
-        source_position_prior="surface",
     )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([1.0, 1.0, 1.0])]
@@ -1404,13 +1116,13 @@ def test_observation_count_variance_softens_spectrum_unfolding_update() -> None:
     assert uncertain_gap < certain_gap
 
 
-def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
-    """The batched NumPy likelihood path should normalize model aliases."""
+def test_matrix_count_likelihood_matches_scalar_gaussian() -> None:
+    """The batched NumPy likelihood path should match the scalar helper."""
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
-        count_likelihood_model="normal",
+        count_likelihood_model="gaussian",
         transport_model_rel_sigma=0.15,
         spectrum_count_abs_sigma=2.0,
         count_likelihood_df=3.0,
@@ -1440,7 +1152,7 @@ def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
             count_log_likelihood(
                 z_obs,
                 lambda_kp[:, idx],
-                model="normal",
+                model="gaussian",
                 transport_model_rel_sigma=0.15,
                 spectrum_count_abs_sigma=2.0,
                 observation_count_variance=obs_var,
@@ -1455,23 +1167,13 @@ def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
 
 
 def test_matrix_count_likelihood_rejects_unknown_model() -> None:
-    """The batched likelihood path should not silently reinterpret bad models."""
-    cfg = PFConfig(
-        num_particles=1,
-        birth_enable=False,
-        init_num_sources=(0, 0),
-        count_likelihood_model="not_a_model",
-    )
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
-    dummy_kernel.num_sources = 1
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
-
+    """PF configuration should reject unknown count-likelihood names eagerly."""
     with pytest.raises(ValueError, match="Unknown count likelihood model"):
-        filt._count_log_likelihood_matrix_np(
-            np.array([1.0], dtype=float),
-            np.array([[1.0]], dtype=float),
+        PFConfig(
+            num_particles=1,
+            variable_cardinality=False,
+            init_num_sources=(0, 0),
+            count_likelihood_model="not_a_model",
         )
 
 
@@ -1479,7 +1181,7 @@ def test_matrix_count_likelihood_scalar_variance_broadcasts() -> None:
     """Scalar unfolding variance should apply to every batched measurement."""
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
     )
@@ -1516,7 +1218,7 @@ def test_matrix_count_likelihood_rejects_mismatched_variance() -> None:
     """Batched likelihoods should reject ambiguous observation variance shapes."""
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
     )
@@ -1534,62 +1236,41 @@ def test_matrix_count_likelihood_rejects_mismatched_variance() -> None:
         )
 
 
-def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
-    """Scalar, matrix, and torch increments should agree on model aliases."""
-    torch = pytest.importorskip("torch")
-    cfg = PFConfig(
-        num_particles=1,
-        birth_enable=False,
-        init_num_sources=(0, 0),
-        count_likelihood_model="normal",
-        transport_model_rel_sigma=0.2,
-        spectrum_count_abs_sigma=1.5,
-    )
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
-    dummy_kernel.num_sources = 1
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
-    lam = torch.as_tensor([37.0, 41.0], dtype=torch.float64)
-
-    actual = (
-        filt._log_likelihood_increment_gpu(
-            lam,
-            z_obs=39.0,
-            observation_count_variance=4.0,
+@pytest.mark.parametrize(
+    "model",
+    ["", "normal", "robust", "robust_gaussian", "t"],
+)
+def test_count_likelihood_aliases_are_rejected(model: str) -> None:
+    """Retired count-likelihood aliases should fail at every config boundary."""
+    with pytest.raises(ValueError, match="Unknown count likelihood model"):
+        normalize_count_likelihood_model(model)
+    with pytest.raises(ValueError, match="Unknown count likelihood model"):
+        CountLikelihoodSpec(model=model)
+    with pytest.raises(ValueError, match="Unknown count likelihood model"):
+        PFConfig(
+            num_particles=1,
+            variable_cardinality=False,
+            init_num_sources=(0, 0),
+            count_likelihood_model=model,
         )
-        .detach()
-        .cpu()
-        .numpy()
-    )
-    expected = np.array(
-        [
-            count_log_likelihood(
-                np.array([39.0], dtype=float),
-                np.array([value], dtype=float),
-                model="gaussian",
-                transport_model_rel_sigma=0.2,
-                spectrum_count_abs_sigma=1.5,
-                observation_count_variance=4.0,
-            )
-            for value in (37.0, 41.0)
-        ],
-        dtype=float,
-    )
-
-    assert normalize_count_likelihood_model("") == "poisson"
-    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
+    with pytest.raises(ValueError, match="Unknown count likelihood model"):
+        RotatingShieldPFConfig(
+            num_particles=1,
+            variable_cardinality=False,
+            init_num_sources=(0, 0),
+            count_likelihood_model=model,
+        )
 
 
-def test_pf_counting_noise_flag_matches_shared_numpy_and_torch() -> None:
+def test_pf_counting_noise_semantics_matches_shared_numpy_and_torch() -> None:
     """PF matrix and Torch increments must share corrected variance semantics."""
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
     )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
@@ -1622,7 +1303,7 @@ def test_pf_counting_noise_flag_matches_shared_numpy_and_torch() -> None:
                 np.array([value], dtype=float),
                 model="gaussian",
                 observation_count_variance=observation_variance,
-                observation_count_variance_includes_counting_noise=True,
+                observation_count_variance_semantics="counting_noise_inclusive",
             )
             for value in lambdas
         ],
@@ -1639,7 +1320,7 @@ def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model=model,
         transport_model_rel_sigma=0.1,
@@ -1648,7 +1329,7 @@ def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
         spectrum_count_abs_sigma=0.25,
         low_count_abs_sigma=1.0,
         low_count_transition_counts=20.0,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
         count_likelihood_df=4.0,
     )
     dummy_kernel = type("K", (), {})()
@@ -1667,7 +1348,12 @@ def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
     z_obs = np.array([39.0, 9.0, 128.0], dtype=float)
     obs_var = np.array([4.0, 1.5, 16.0], dtype=float)
 
-    actual = filt._log_likelihood_sequence_gpu(lam_kn, z_obs, obs_var)
+    actual = filt._log_likelihood_sequence_gpu(
+        lam_kn,
+        z_obs,
+        obs_var,
+        runtime_likelihood_route="count",
+    )
     expected = torch.zeros(lam_kn.shape[1], dtype=torch.float64)
     for idx, z_val in enumerate(z_obs):
         expected = expected + filt._log_likelihood_increment_gpu(
@@ -1684,7 +1370,7 @@ def test_shield_contrast_likelihood_matches_numpy_signature_oracle() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         shield_contrast_likelihood_enable=True,
         shield_contrast_likelihood_weight=1.0,
@@ -1755,7 +1441,7 @@ def test_shield_view_ratio_likelihood_matches_dirichlet_multinomial_oracle() -> 
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         shield_contrast_likelihood_enable=False,
         shield_view_ratio_likelihood_enable=True,
@@ -1803,14 +1489,14 @@ def test_shield_view_ratio_likelihood_matches_dirichlet_multinomial_oracle() -> 
     assert actual[0] > actual[1]
 
 
-def test_spectrum_sequence_update_keeps_shield_view_ratio_term(
+def test_count_sequence_update_keeps_shield_view_ratio_term(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct spectral PF updates should retain same-station shield-ratio evidence."""
+    """Count PF updates should retain same-station shield-ratio evidence."""
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
         use_tempering=True,
         shield_contrast_likelihood_enable=False,
@@ -1858,23 +1544,6 @@ def test_spectrum_sequence_update_keeps_shield_view_ratio_term(
         del pose_idx, fe_indices, pb_indices, live_times_s
         return torch.as_tensor([[90.0, 50.0], [10.0, 50.0]], dtype=torch.float64)
 
-    def fake_spectrum_ll(
-        lam_kn: "torch.Tensor",
-        observed_spectrum_kb: np.ndarray,
-        response_template_kb: np.ndarray,
-        background_spectrum_kb: np.ndarray,
-        observation_spectrum_variance_kb: np.ndarray | None = None,
-    ) -> "torch.Tensor":
-        """Return a neutral spectral term so shield-ratio evidence is isolated."""
-        del (
-            observed_spectrum_kb,
-            response_template_kb,
-            background_spectrum_kb,
-            observation_spectrum_variance_kb,
-        )
-        calls["spectrum_shape"] = tuple(lam_kn.shape)
-        return torch.zeros(int(lam_kn.shape[1]), dtype=torch.float64)
-
     def fake_tempered_update_likelihood(
         ll_fn: object,
         **_kwargs: object,
@@ -1892,31 +1561,19 @@ def test_spectrum_sequence_update_keeps_shield_view_ratio_term(
     )
     monkeypatch.setattr(
         filt,
-        "_spectral_bin_sequence_log_likelihood_from_lambda_gpu",
-        fake_spectrum_ll,
-    )
-    monkeypatch.setattr(
-        filt,
         "_tempered_update_likelihood",
         fake_tempered_update_likelihood,
     )
-    monkeypatch.setattr(filt, "adapt_num_particles", lambda **_kwargs: None)
-    monkeypatch.setattr(filt, "_advance_adapt_cooldown", lambda: None)
-    monkeypatch.setattr(filt, "_maybe_update_convergence", lambda **_kwargs: None)
-
     filt.update_continuous_pair_sequence(
         z_obs=np.array([90.0, 10.0], dtype=float),
         pose_idx=0,
         fe_indices=np.array([0, 1], dtype=int),
         pb_indices=np.array([0, 1], dtype=int),
         live_times_s=np.array([1.0, 1.0], dtype=float),
+        runtime_likelihood_route="count",
         observation_count_variances=np.array([1.0, 1.0], dtype=float),
-        spectrum_counts=np.ones((2, 4), dtype=float),
-        spectrum_response_template=np.full((2, 4), 0.25, dtype=float),
-        spectrum_background=np.zeros((2, 4), dtype=float),
     )
 
-    assert calls["spectrum_shape"] == (2, 2)
     ll = np.asarray(calls["ll"], dtype=float)
     assert ll[0] > ll[1]
 
@@ -1928,7 +1585,7 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
         use_gpu=True,
         use_tempering=True,
@@ -1971,12 +1628,15 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         lam_kn: "torch.Tensor",
         z_obs: np.ndarray,
         observation_count_variances: np.ndarray,
+        *,
+        runtime_likelihood_route: str,
         observation_count_covariance: np.ndarray | None = None,
     ) -> "torch.Tensor":
         """Record batched likelihood inputs and return one particle increment."""
         calls["ll"] = (
             tuple(np.asarray(z_obs, dtype=float)),
             tuple(np.asarray(observation_count_variances, dtype=float)),
+            runtime_likelihood_route,
             None
             if observation_count_covariance is None
             else tuple(np.asarray(observation_count_covariance, dtype=float).shape),
@@ -1997,18 +1657,6 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         """Pretend that the torch backend is available for this path test."""
         return True
 
-    def noop_adapt_num_particles(**_kwargs: object) -> None:
-        """Skip adaptive particle-count side effects in this path test."""
-        return None
-
-    def noop_advance_adapt_cooldown() -> None:
-        """Skip adaptive cooldown side effects in this path test."""
-        return None
-
-    def noop_maybe_update_convergence(**_kwargs: object) -> None:
-        """Skip convergence side effects in this path test."""
-        return None
-
     monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
     monkeypatch.setattr(
         filt,
@@ -2021,17 +1669,6 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         "_tempered_update_likelihood",
         fake_tempered_update_likelihood,
     )
-    monkeypatch.setattr(filt, "adapt_num_particles", noop_adapt_num_particles)
-    monkeypatch.setattr(
-        filt,
-        "_advance_adapt_cooldown",
-        noop_advance_adapt_cooldown,
-    )
-    monkeypatch.setattr(
-        filt,
-        "_maybe_update_convergence",
-        noop_maybe_update_convergence,
-    )
 
     filt.update_continuous_pair_sequence(
         z_obs=np.array([8.0, 18.0], dtype=float),
@@ -2039,11 +1676,18 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         fe_indices=np.array([1, 2], dtype=int),
         pb_indices=np.array([3, 4], dtype=int),
         live_times_s=np.array([1.5, 2.0], dtype=float),
+        runtime_likelihood_route="count",
         observation_count_variances=np.array([2.0, 3.0], dtype=float),
     )
 
     assert calls["counts"] == (0, (1, 2), (3, 4), (1.5, 2.0))
-    assert calls["ll"] == ((8.0, 18.0), (2.0, 3.0), None, (2, 1))
+    assert calls["ll"] == (
+        (8.0, 18.0),
+        (2.0, 3.0),
+        "count",
+        None,
+        (2, 1),
+    )
     assert calls["tempered_ll"] == (1,)
 
 
@@ -2052,7 +1696,7 @@ def test_identical_source_state_gpu_compression_preserves_sequence_counts() -> N
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=3,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(2, 2),
         use_gpu=True,
         gpu_device="cpu",
@@ -2227,20 +1871,20 @@ def test_counting_noise_in_observation_variance_is_included_once() -> None:
         lambda_obs,
         observation_count_variance=observation_variance,
     )
-    explicit_legacy = count_likelihood_variance(
+    explicit_additional = count_likelihood_variance(
         z_obs,
         lambda_obs,
         observation_count_variance=observation_variance,
-        observation_count_variance_includes_counting_noise=False,
+        observation_count_variance_semantics="additional",
     )
     corrected = count_likelihood_variance(
         z_obs,
         lambda_obs,
         observation_count_variance=observation_variance,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
     )
 
-    np.testing.assert_array_equal(default_variance, explicit_legacy)
+    np.testing.assert_array_equal(default_variance, explicit_additional)
     np.testing.assert_allclose(
         corrected,
         lambda_obs + np.array([[300.0], [8.0]], dtype=float),
@@ -2258,7 +1902,7 @@ def test_counting_noise_variance_numpy_torch_equivalence() -> None:
     kwargs = {
         "transport_model_rel_sigma": 0.1,
         "spectrum_count_abs_sigma": 3.0,
-        "observation_count_variance_includes_counting_noise": True,
+        "observation_count_variance_semantics": "counting_noise_inclusive",
     }
 
     expected = count_likelihood_variance(
@@ -2285,7 +1929,7 @@ def test_counting_noise_variance_numpy_torch_equivalence() -> None:
     )
 
 
-@pytest.mark.parametrize("model", ["poisson", "normal", "student_t"])
+@pytest.mark.parametrize("model", ["poisson", "gaussian", "student_t"])
 def test_count_log_likelihood_terms_sum_matches_scalar(model: str) -> None:
     """Broadcast likelihood terms should sum to the scalar public helper."""
     z_obs = np.array([[5.0], [120.0]], dtype=float)
@@ -2305,7 +1949,7 @@ def test_count_log_likelihood_terms_sum_matches_scalar(model: str) -> None:
         spectrum_count_abs_sigma=5.0,
         low_count_abs_sigma=20.0,
         low_count_transition_counts=100.0,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
         student_t_df=3.0,
     )
 
@@ -2326,7 +1970,7 @@ def test_count_log_likelihood_terms_sum_matches_scalar(model: str) -> None:
         low_count_abs_sigma=20.0,
         low_count_transition_counts=100.0,
         observation_count_variance=observation_variance,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
         student_t_df=3.0,
     )
 
@@ -2335,7 +1979,7 @@ def test_count_log_likelihood_terms_sum_matches_scalar(model: str) -> None:
     assert float(np.sum(terms)) == pytest.approx(scalar, rel=0.0, abs=0.0)
 
 
-@pytest.mark.parametrize("model", ["poisson", "gaussian", "robust"])
+@pytest.mark.parametrize("model", ["poisson", "gaussian", "student_t"])
 def test_count_log_likelihood_terms_torch_matches_numpy(model: str) -> None:
     """Torch broadcast likelihood terms should match NumPy in float64."""
     torch = pytest.importorskip("torch")
@@ -2356,7 +2000,7 @@ def test_count_log_likelihood_terms_torch_matches_numpy(model: str) -> None:
         spectrum_count_abs_sigma=5.0,
         low_count_abs_sigma=20.0,
         low_count_transition_counts=100.0,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
         student_t_df=3.0,
     )
 
@@ -2431,7 +2075,7 @@ def test_predictive_count_likelihood_variance_torch_matches_numpy() -> None:
     posterior_mean = np.array([[0.0, 20.0], [200.0, 2000.0]], dtype=float)
     observation_variance = np.array([[3.0], [11.0]], dtype=float)
     spec = CountLikelihoodSpec(
-        model="t",
+        model="student_t",
         transport_model_rel_sigma=0.1,
         transport_model_abs_sigma=2.0,
         spectrum_count_rel_sigma=0.05,
@@ -2623,7 +2267,7 @@ def test_resampling_increases_neff() -> None:
     """Highly skewed weights should be flattened after resampling."""
     cfg = PFConfig(
         num_particles=3,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
     )
     dummy_kernel = type("K", (), {})()

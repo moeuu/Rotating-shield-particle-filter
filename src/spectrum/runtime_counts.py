@@ -363,15 +363,11 @@ class RuntimeCountExtractor:
         if not diagnostics:
             return variances
 
-        rel_sigma = self._diagnostic_relative_sigma(diagnostics)
         rel_sigma_by_isotope = self._diagnostic_relative_sigma_by_isotope(diagnostics)
         floors: dict[str, float] = {}
         inflated: dict[str, float] = {}
         for isotope, count in counts.items():
-            iso_rel_sigma = max(
-                float(rel_sigma),
-                float(rel_sigma_by_isotope.get(isotope, 0.0)),
-            )
+            iso_rel_sigma = float(rel_sigma_by_isotope.get(isotope, 0.0))
             if iso_rel_sigma <= 0.0:
                 inflated[isotope] = float(max(variances.get(isotope, 1.0), 1.0))
                 continue
@@ -708,74 +704,6 @@ class RuntimeCountExtractor:
             return 0.0
         return float(max((response_count - photopeak_count) ** 2, 0.0))
 
-    def _diagnostic_relative_sigma(self, diagnostics: Mapping[str, object]) -> float:
-        """Return a global relative sigma implied by response-fit diagnostics."""
-        config = self.decomposer.config
-        # A full-spectrum goodness-of-fit statistic is not an isotope-count
-        # calibration.  Applying it to every isotope made one continuum/tail
-        # mismatch flatten all PF channels.  Keep this legacy diagnostic path
-        # opt-in until an independent Geant4 calibration establishes a mapping
-        # from global fit residuals to isotope-count error.
-        if not bool(
-            getattr(
-                config,
-                "response_poisson_global_diagnostic_variance_enable",
-                False,
-            )
-        ):
-            return 0.0
-        rel_sigma = 0.0
-        reduced_chi2 = self._mapping_float(diagnostics, "reduced_chi2")
-        chi2_threshold = max(
-            float(
-                getattr(
-                    config,
-                    "response_poisson_diagnostic_reduced_chi2_threshold",
-                    2.0,
-                )
-            ),
-            1.0e-12,
-        )
-        if reduced_chi2 is not None and reduced_chi2 > chi2_threshold:
-            rel_sigma = max(
-                rel_sigma,
-                float(
-                    getattr(
-                        config,
-                        "response_poisson_diagnostic_reduced_chi2_scale",
-                        0.5,
-                    )
-                )
-                * np.sqrt(reduced_chi2 / chi2_threshold - 1.0),
-            )
-
-        condition = max(
-            self._mapping_float(diagnostics, "design_condition_number") or 0.0,
-            self._mapping_float(diagnostics, "fisher_condition_number") or 0.0,
-        )
-        condition_threshold = max(
-            float(
-                getattr(
-                    config,
-                    "response_poisson_diagnostic_condition_threshold",
-                    1.0e4,
-                )
-            ),
-            1.0,
-        )
-        if np.isfinite(condition) and condition > condition_threshold:
-            rel_sigma = max(
-                rel_sigma,
-                float(
-                    getattr(
-                        config,
-                        "response_poisson_diagnostic_condition_scale",
-                        0.25,
-                    )
-                )
-                * np.log10(condition / condition_threshold),
-            )
-        return float(max(rel_sigma, 0.0))
 
     def _diagnostic_relative_sigma_by_isotope(
         self,

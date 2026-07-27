@@ -544,7 +544,7 @@ def generate_octant_orientations() -> NDArray[np.float64]:
     """
     Return the eight octant normals (shared by Pb and Fe).
 
-    This is typically passed as the orientation matrix to KernelPrecomputer.
+    This is typically passed as an orientation matrix to the PF response kernel.
     """
     return OCTANT_NORMALS.copy()
 

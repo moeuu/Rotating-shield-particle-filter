@@ -1,182 +1,57 @@
-"""Tests for normalized source-strength priors."""
+"""Tests for the normalized bounded physical source-strength prior."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 from scipy.integrate import quad
-from scipy.stats import truncnorm
 
 from pf.strength_prior import StrengthPrior
 
 
-@pytest.mark.parametrize(
-    "prior,integration_bounds",
-    [
-        (
-            StrengthPrior("uniform", minimum=2.0, maximum=8.0),
-            (2.0, 8.0),
-        ),
-        (
-            StrengthPrior("log_uniform", minimum=1.0, maximum=100.0),
-            (1.0, 100.0),
-        ),
-        (
-            StrengthPrior(
-                "lognormal",
-                minimum=2.0,
-                maximum=20.0,
-                log_mean=1.5,
-                log_sigma=0.7,
-            ),
-            (2.0, 20.0),
-        ),
-        (
-            StrengthPrior(
-                "lognormal",
-                minimum=0.0,
-                maximum=None,
-                log_mean=1.5,
-                log_sigma=0.7,
-            ),
-            (0.0, np.inf),
-        ),
-    ],
-)
-def test_strength_prior_log_prob_is_normalized(
-    prior: StrengthPrior,
-    integration_bounds: tuple[float, float],
-) -> None:
-    """Every supported prior density should integrate to one."""
-    lower, upper = integration_bounds
+def test_strength_prior_log_prob_is_normalized() -> None:
+    """The bounded-uniform density should integrate to one."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
     integral, error = quad(
         lambda value: float(np.exp(prior.log_prob(value))),
-        lower,
-        upper,
-        epsabs=1.0e-10,
-        epsrel=1.0e-10,
+        prior.minimum,
+        prior.maximum,
+        epsabs=1.0e-12,
+        epsrel=1.0e-12,
     )
 
-    assert error < 1.0e-8
-    assert integral == pytest.approx(1.0, abs=1.0e-9)
+    assert error < 1.0e-10
+    assert integral == pytest.approx(1.0, abs=1.0e-12)
 
 
-@pytest.mark.parametrize(
-    "prior,inside,outside",
-    [
-        (
-            StrengthPrior("uniform", minimum=2.0, maximum=8.0),
-            np.array([2.0, 4.0, 8.0]),
-            np.array([-1.0, 1.99, 8.01, np.inf, np.nan]),
-        ),
-        (
-            StrengthPrior("log_uniform", minimum=1.0, maximum=100.0),
-            np.array([1.0, 10.0, 100.0]),
-            np.array([0.0, 0.99, 100.01, np.inf, np.nan]),
-        ),
-        (
-            StrengthPrior(
-                "lognormal",
-                minimum=2.0,
-                maximum=20.0,
-                log_mean=1.5,
-                log_sigma=0.7,
-            ),
-            np.array([2.0, 5.0, 20.0]),
-            np.array([0.0, 1.99, 20.01, np.inf, np.nan]),
-        ),
-    ],
-)
-def test_strength_prior_support_matches_finite_bounds(
-    prior: StrengthPrior,
-    inside: np.ndarray,
-    outside: np.ndarray,
-) -> None:
-    """Support masks and log densities should agree at all tested values."""
+def test_strength_prior_support_matches_physical_bounds() -> None:
+    """Support masks and log densities should agree at finite bounds."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
+    inside = np.array([2.0, 4.0, 8.0])
+    outside = np.array([-1.0, 1.99, 8.01, np.inf, np.nan])
+
     assert np.all(prior.in_support(inside))
     assert not np.any(prior.in_support(outside))
     assert np.all(np.isfinite(prior.log_prob(inside)))
     assert np.all(np.isneginf(prior.log_prob(outside)))
 
 
-@pytest.mark.parametrize(
-    "prior,expected_transformed_mean",
-    [
-        (
-            StrengthPrior("uniform", minimum=2.0, maximum=8.0),
-            5.0,
-        ),
-        (
-            StrengthPrior("log_uniform", minimum=1.0, maximum=100.0),
-            0.5 * np.log(100.0),
-        ),
-    ],
-)
-def test_uniform_prior_sampling_matches_expected_mean(
-    prior: StrengthPrior,
-    expected_transformed_mean: float,
-) -> None:
-    """Uniform and log-uniform batched draws should match their first moments."""
+def test_strength_prior_sampling_matches_uniform_mean() -> None:
+    """Batched draws should match the bounded-uniform first moment."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
     samples = prior.sample(50_000, rng=np.random.default_rng(781))
+
     assert isinstance(samples, np.ndarray)
     assert samples.shape == (50_000,)
     assert np.all(prior.in_support(samples))
     assert not np.any(samples == prior.minimum)
     assert not np.any(samples == prior.maximum)
-
-    transformed = samples if prior.kind == "uniform" else np.log(samples)
-    assert float(np.mean(transformed)) == pytest.approx(
-        expected_transformed_mean,
-        abs=0.02,
-    )
+    assert float(np.mean(samples)) == pytest.approx(5.0, abs=0.02)
 
 
-def test_truncated_lognormal_sampling_has_no_boundary_atoms() -> None:
-    """Truncated lognormal draws should be direct draws, not clipped samples."""
-    prior = StrengthPrior(
-        "lognormal",
-        minimum=2.0,
-        maximum=20.0,
-        log_mean=1.5,
-        log_sigma=0.7,
-    )
-    samples = prior.sample((250, 200), rng=np.random.default_rng(992))
-    alpha = (np.log(2.0) - 1.5) / 0.7
-    beta = (np.log(20.0) - 1.5) / 0.7
-    expected_log_mean = float(
-        truncnorm.mean(alpha, beta, loc=1.5, scale=0.7)
-    )
-
-    assert isinstance(samples, np.ndarray)
-    assert samples.shape == (250, 200)
-    assert np.all(prior.in_support(samples))
-    assert not np.any(samples == prior.minimum)
-    assert not np.any(samples == prior.maximum)
-    assert np.unique(samples).size > 49_000
-    assert float(np.mean(np.log(samples))) == pytest.approx(
-        expected_log_mean,
-        abs=0.01,
-    )
-
-
-@pytest.mark.parametrize(
-    "prior",
-    [
-        StrengthPrior("uniform", minimum=2.0, maximum=8.0),
-        StrengthPrior("log_uniform", minimum=1.0, maximum=100.0),
-        StrengthPrior(
-            "lognormal",
-            minimum=2.0,
-            maximum=20.0,
-            log_mean=1.5,
-            log_sigma=0.7,
-        ),
-    ],
-)
-def test_strength_prior_sampling_is_seed_reproducible(
-    prior: StrengthPrior,
-) -> None:
+def test_strength_prior_sampling_is_seed_reproducible() -> None:
     """Equal NumPy generator states should produce bitwise-equal batches."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
     first = prior.sample((7, 5), rng=np.random.default_rng(20260727))
     second = prior.sample((7, 5), rng=np.random.default_rng(20260727))
 
@@ -185,7 +60,7 @@ def test_strength_prior_sampling_is_seed_reproducible(
 
 def test_strength_prior_scalar_and_batch_interfaces() -> None:
     """Scalar inputs should return scalars while batches retain their shape."""
-    prior = StrengthPrior("uniform", minimum=2.0, maximum=8.0)
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
     scalar_sample = prior.sample(rng=np.random.default_rng(14))
     batch_sample = prior.sample((2, 3), rng=np.random.default_rng(14))
 
@@ -200,8 +75,6 @@ def test_strength_prior_scalar_and_batch_interfaces() -> None:
     batch_log_prob = prior.log_prob([[2.0, 4.0], [8.0, 9.0]])
     assert isinstance(batch_support, np.ndarray)
     assert isinstance(batch_log_prob, np.ndarray)
-    assert batch_support.shape == (2, 2)
-    assert batch_log_prob.shape == (2, 2)
     np.testing.assert_array_equal(
         batch_support,
         np.array([[True, True], [True, False]]),
@@ -209,26 +82,11 @@ def test_strength_prior_scalar_and_batch_interfaces() -> None:
     assert np.isneginf(batch_log_prob[1, 1])
 
 
-@pytest.mark.parametrize(
-    "prior",
-    [
-        StrengthPrior("uniform", minimum=2.0, maximum=8.0),
-        StrengthPrior("log_uniform", minimum=1.0, maximum=100.0),
-        StrengthPrior(
-            "lognormal",
-            minimum=2.0,
-            maximum=20.0,
-            log_mean=1.5,
-            log_sigma=0.7,
-        ),
-    ],
-)
-def test_batched_density_and_support_match_scalar_oracle(
-    prior: StrengthPrior,
-) -> None:
+def test_batched_density_and_support_match_scalar_oracle() -> None:
     """Batched evaluation should match independent scalar evaluations."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
     values = np.array(
-        [[0.0, 1.0, 2.0], [5.0, 20.0, 101.0]],
+        [[0.0, 1.0, 2.0], [5.0, 8.0, 9.0]],
         dtype=float,
     )
     batched_log_prob = prior.log_prob(values)
@@ -249,26 +107,24 @@ def test_batched_density_and_support_match_scalar_oracle(
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"kind": "unknown"}, "kind must"),
-        ({"kind": "uniform", "maximum": None}, "finite maximum"),
-        (
-            {"kind": "uniform", "minimum": 2.0, "maximum": 2.0},
-            "greater than minimum",
-        ),
-        (
-            {"kind": "log_uniform", "minimum": 0.0, "maximum": 2.0},
-            "positive minimum",
-        ),
-        (
-            {"kind": "lognormal", "log_sigma": 0.0},
-            "finite and positive",
-        ),
+        ({"minimum": -1.0, "maximum": 2.0}, "nonnegative"),
+        ({"minimum": np.inf, "maximum": 2.0}, "finite"),
+        ({"minimum": 2.0, "maximum": 2.0}, "greater than minimum"),
+        ({"minimum": 2.0, "maximum": np.inf}, "finite"),
     ],
 )
 def test_strength_prior_rejects_invalid_parameters(
-    kwargs: dict[str, object],
+    kwargs: dict[str, float],
     match: str,
 ) -> None:
-    """Invalid continuous-prior definitions should fail before sampling."""
+    """Invalid physical bounds should fail before sampling."""
     with pytest.raises(ValueError, match=match):
         StrengthPrior(**kwargs)
+
+
+def test_strength_prior_rejects_non_generator_rng() -> None:
+    """Sampling should reject RNG objects with incompatible semantics."""
+    prior = StrengthPrior(minimum=2.0, maximum=8.0)
+
+    with pytest.raises(TypeError, match="numpy.random.Generator"):
+        prior.sample(2, rng=object())  # type: ignore[arg-type]

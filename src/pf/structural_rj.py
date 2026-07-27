@@ -289,11 +289,6 @@ class SurfaceAdjacency:
         """Return the undirected graph degree of every surface patch."""
         return self._degrees
 
-    @property
-    def max_degree(self) -> int:
-        """Return the largest surface-graph degree."""
-        return int(self._neighbors.shape[1])
-
     def _available_neighbors(
         self,
         current_surface_sets: ArrayLike,

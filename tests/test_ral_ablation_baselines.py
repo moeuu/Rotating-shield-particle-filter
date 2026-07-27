@@ -157,8 +157,10 @@ def test_ablation_plan_preserves_accelerated_transport_provenance(
     assert payload["primary_sampling_fraction"] == pytest.approx(1.0)
     assert payload["target_sampled_primaries"] == pytest.approx(1500000.0)
     assert payload["accelerated_weighted_transport_enable"] is True
-    assert payload["pf_observation_count_variance_semantics"] == "complete_statistical"
-    assert payload["pf_direct_spectrum_likelihood_enable"] is False
+    assert (
+        payload["pf_count_likelihood"]["observation_count_variance_semantics"]
+        == "complete_statistical"
+    )
     assert payload["pf_shield_contrast_likelihood"]["enabled"] is False
     assert payload["pf_shield_view_ratio_likelihood"]["enabled"] is False
     assert payload["metadata"]["ral_transport_history_mode"] == (
@@ -213,18 +215,6 @@ def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> Non
         )
         == 8
     )
-    assert (
-        _resolve_rotation_limit_for_active_program(
-            base_rotation_limit=8,
-            active_shield_program=(2, 3),
-            strict_planned_shield_program=False,
-            baseline_shield_policy=None,
-            force_strict_program=True,
-        )
-        == 2
-    )
-
-
 def test_passive_serpentine_path_policy_selects_candidate_near_waypoint() -> None:
     """Passive path baseline should select by geometry, not PF information."""
     candidates = np.asarray(
@@ -268,7 +258,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "eig_only_path" in by_variant
     assert "no_obstacle_signature" in by_variant
     assert "no_pf_obstacle_attenuation" in by_variant
-    assert "volume_source_prior" not in by_variant
     fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
     proposed_config = json.loads(by_variant["proposed"].config_path.read_text())
     round_robin = json.loads(by_variant["round_robin_shield"].config_path.read_text())
@@ -280,104 +269,18 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         proposed_config["precision_diagnostic_full_spectrum_response_enable"] is False
     )
     assert proposed_config["surface_observability_diagnostic_candidates"] == 0
-    assert proposed_config["source_surface_prior"] is True
-    removed_prefixes = (
-        "adaptive_strength_prior",
-        "all_history_dictionary",
-        "birth_candidate_",
-        "birth_complexity_",
-        "birth_count_distance_",
-        "birth_detector_",
-        "birth_jitter_",
-        "birth_matching_",
-        "birth_max_per_update",
-        "birth_min_",
-        "birth_num_",
-        "birth_orthogonal_",
-        "birth_q_",
-        "birth_residual_",
-        "birth_softmax_",
-        "birth_stage_",
-        "birth_topk_",
-        "birth_use_",
-        "birth_global_rescue",
-        "birth_refit_residual",
-        "cardinality_preserving_",
-        "candidate_verification",
-        "conditional_strength",
-        "final_absent_",
-        "high_strength_split",
-        "label_",
-        "merge_",
-        "mode_preserving_",
-        "mode_preserving_report_cardinality",
-        "online_absent_",
-        "peak_suppression_",
-        "precision_diagnostic_birth_candidate_",
-        "pseudo_source_",
-        "report_best_so_far",
-        "report_cluster",
-        "report_mle_rescue",
-        "report_model_order",
-        "report_strength",
-        "report_surface_local_refine",
-        "residual_decomposition_",
-        "runtime_report_rescue",
-        "source_strength_absorption",
-        "source_strength_observation_overshoot",
-        "source_strength_prior",
-        "source_prune_",
-        "sparse_poisson",
-        "split_",
-        "structural_proposal_",
-        "structural_trial_",
-        "surface_map",
-    )
-    removed_fields = {
-        "background_sigma",
-        "birth_alpha",
-        "birth_bic_penalty_params",
-        "birth_delta_ll_threshold",
-        "converge_require_no_tentative",
-        "deferred_resample_roughening_scale",
-        "disable_regularize_on_temper_resample",
-        "init_grid_repeats",
-        "init_grid_spacing_m",
-        "init_joint_position_design",
-        "init_joint_position_retries",
-        "init_source_min_separation_m",
-        "max_sigma_pos",
-        "min_age_to_split",
-        "min_sigma_pos",
-        "p_birth",
-        "p_kill",
-        "pf_init_joint_position_design",
-        "pf_init_joint_position_retries",
-        "pf_init_source_min_separation_m",
-        "position_sigma",
-        "roughening_decay",
-        "roughening_k",
-        "roughening_min_mult",
-        "source_detector_exclusion_m",
-        "strength_log_sigma",
-        "strength_sigma",
-        "structural_kernel_mode",
-        "support_ema_alpha",
-        "surface_rejuvenation_enable",
-    }
     for entry in entries:
         generated = json.loads(entry.config_path.read_text())
-        assert generated["source_surface_prior"] is True
-        assert not any(key.startswith(removed_prefixes) for key in generated)
-        assert removed_fields.isdisjoint(generated)
-        assert "birth_residual_suppress_death" not in generated
-        assert "birth_residual_force_proposal_on_gate" not in generated
-        assert "birth_residual_force_relax_candidate_masks" not in generated
-        assert "birth_residual_forced_min_delta_ll" not in generated
-        assert "birth_residual_acceptance_complexity_scale" not in generated
-        assert "refit_after_moves" not in generated
-        assert "source_prune_refit_after_remove" not in generated
-    assert proposed_config["height_partner_reuse_shield_program"] is False
+        assert generated["pure_pf_schema_version"] == 1
+        assert generated["estimator_profile"] == "pf_strict"
+        assert generated["variable_cardinality"] is True
+        assert generated["pf_strength_prior_min_cps_1m"] == pytest.approx(300000.0)
+        assert generated["pf_strength_prior_max_cps_1m"] == pytest.approx(2000000.0)
+        assert float(generated["structural_rj_patch_spacing_m"]) > 0.0
+        assert float(generated["structural_rj_move_probability"]) > 0.0
+        assert len(generated["structural_cardinality_prior_probs"]) == (
+            int(generated["pf_max_sources"]) + 1
+        )
     assert round_robin["orientation_k"] == proposed_config["orientation_k"]
     assert (
         round_robin["min_rotations_per_pose"]
@@ -387,12 +290,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         round_robin["dss_pp"]["program_length"]
         == proposed_config["dss_pp"]["program_length"]
     )
-    assert (
-        round_robin["dss_pp"]["residual_program_length"]
-        == proposed_config["dss_pp"]["residual_program_length"]
-    )
     assert round_robin["strict_planned_shield_program"] is True
-    assert round_robin["dss_pp"]["adaptive_program_length_enable"] is False
     assert round_robin["baseline_shield_policy"]["name"] == "round_robin"
     assert "baseline_path_policy" not in round_robin
     assert fixed_config["baseline_shield_policy"]["name"] == "fixed"
@@ -409,7 +307,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert no_shield["orientation_k"] == 1
     assert no_shield["min_rotations_per_pose"] == 1
     assert no_shield["dss_pp"]["program_length"] == 1
-    assert no_shield["dss_pp"]["residual_program_length"] == 1
     obstacle_off = json.loads(
         by_variant["no_obstacle_signature"].config_path.read_text()
     )
@@ -430,7 +327,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert passive_no_shield["orientation_k"] == 1
     assert passive_no_shield["min_rotations_per_pose"] == 1
     assert passive_no_shield["dss_pp"]["program_length"] == 1
-    assert passive_no_shield["dss_pp"]["residual_program_length"] == 1
     assert passive_no_shield["baseline_path_policy"]["name"] == "passive_serpentine"
     assert passive_no_shield["baseline_shield_policy"]["name"] == "fixed"
     assert passive_no_shield["thread_count"] >= 1
@@ -453,10 +349,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         passive_equal_time["dss_pp"]["program_length"]
         == proposed_config["dss_pp"]["program_length"]
     )
-    assert (
-        passive_equal_time["dss_pp"]["residual_program_length"]
-        == proposed_config["dss_pp"]["residual_program_length"]
-    )
     assert passive_equal_time["baseline_path_policy"]["name"] == "passive_serpentine"
     assert passive_equal_time["baseline_shield_policy"]["name"] == "fixed"
     eig_only = json.loads(by_variant["eig_only_path"].config_path.read_text())
@@ -465,14 +357,12 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert eig_only["dss_pp"]["environment_signature_weight"] == 0.0
     assert eig_only["dss_pp"]["elevation_signature_weight"] == 0.0
     assert eig_only["dss_pp"]["correlation_reduction_weight"] == 0.0
-    assert eig_only["dss_pp"]["same_isotope_direct_separation_guard"] is False
     single_view = json.loads(
         by_variant["baseline_passive_fixed_shield_single_view"].config_path.read_text()
     )
     assert single_view["orientation_k"] == 1
     assert single_view["min_rotations_per_pose"] == 1
     assert single_view["dss_pp"]["program_length"] == 1
-    assert single_view["dss_pp"]["residual_program_length"] == 1
     assert single_view["baseline_path_policy"]["name"] == "passive_serpentine"
     assert single_view["baseline_shield_policy"]["name"] == "fixed"
     one_step_fixed = json.loads(
@@ -491,7 +381,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert one_step_no_shield["orientation_k"] == 1
     assert one_step_no_shield["min_rotations_per_pose"] == 1
     assert one_step_no_shield["dss_pp"]["program_length"] == 1
-    assert one_step_no_shield["dss_pp"]["residual_program_length"] == 1
     one_step_path = json.loads(by_variant["one_step_path"].config_path.read_text())
     assert one_step_path["path_planner"] == "one_step"
     assert one_step_path["strict_planned_shield_program"] is True
@@ -505,10 +394,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         one_step_path["dss_pp"]["program_length"]
         == proposed_config["dss_pp"]["program_length"]
     )
-    assert (
-        one_step_path["dss_pp"]["residual_program_length"]
-        == proposed_config["dss_pp"]["residual_program_length"]
-    )
     assert "baseline_shield_policy" not in one_step_path
     source_payload = json.loads(by_variant["proposed"].source_path.read_text())
     assert len(source_payload["sources"]) == DEFAULT_ABLATION_CASES[0].source_count
@@ -521,7 +406,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert proposed_config["structural_cardinality_prior_probs"] == pytest.approx(
         [1.0 / 6.0] * 6
     )
-    assert proposed_config.get("init_num_sources_max") is None
     assert proposed_config["measurement_log_output_dir"] == (
         "results/ral_ablation/measurement_logs/"
         "mix9_multi_isotope_cardinality_proposed_seed_1234"
@@ -535,7 +419,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     }
     assert len(measurement_log_targets) == len(entries)
     assert "--full-simulation" in by_variant["proposed"].command
-    assert "--birth" not in by_variant["proposed"].command
     assert "--max-sources" not in by_variant["proposed"].command
     assert "--adaptive-dwell" not in by_variant["proposed"].command
     assert "--measurement-time-s" in by_variant["proposed"].command

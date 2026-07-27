@@ -71,8 +71,6 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
             "600",
             "--rotations-per-pose",
             "4",
-            "--init-grid-spacing-m",
-            "0",
             "--planning-eig-samples",
             "12",
             "--planning-rollout-particles",
@@ -106,7 +104,6 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
     assert captured["num_particles"] == 600
     assert captured["pf_config_overrides"]["orientation_k"] == 4
     assert captured["pf_config_overrides"]["min_rotations_per_pose"] == 4
-    assert captured["pf_config_overrides"]["init_grid_spacing_m"] is None
     assert captured["pf_config_overrides"]["planning_eig_samples"] == 12
     assert captured["pf_config_overrides"]["planning_rollout_particles"] == 48
     assert captured["notify_spectrum"] is True
@@ -162,6 +159,28 @@ def test_main_default_max_poses_uses_runtime_config(monkeypatch) -> None:
         "obstacle_layouts/Ex5_obstacles.json"
     )
     assert captured["source_generation_mode"] == "surface_random"
+    assert "max_sources" not in captured["pf_config_overrides"]
+
+
+def test_main_explicit_max_sources_overrides_runtime_config(monkeypatch) -> None:
+    """An explicit source-count cap should be forwarded as a PF override."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--max-sources", "3"],
+    )
+
+    module.main()
+
+    assert captured["pf_config_overrides"]["max_sources"] == 3
 
 
 def test_main_explicit_source_config_keeps_fixed_sources_in_random_environment(
@@ -319,27 +338,23 @@ def test_main_default_selects_standard_geant4_full_simulation(monkeypatch) -> No
         "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     assert captured["live"] is False
-    assert captured["birth_enabled"] is True
+    assert captured["variable_cardinality"] is True
     runtime_config = load_runtime_config(Path(str(captured["sim_config_path"])))
-    assert runtime_config["birth_enable"] is True
+    assert runtime_config["pure_pf_schema_version"] == 1
+    assert runtime_config["variable_cardinality"] is True
     assert runtime_config["pf_max_sources"] == 5
     assert runtime_config["structural_cardinality_prior_probs"] == pytest.approx(
         [1.0 / 6.0] * 6
     )
-    assert runtime_config["source_surface_prior"] is True
+    assert runtime_config["estimator_profile"] == "pf_strict"
+    assert float(runtime_config["pf_strength_prior_min_cps_1m"]) >= 0.0
+    assert (
+        float(runtime_config["pf_strength_prior_max_cps_1m"])
+        > float(runtime_config["pf_strength_prior_min_cps_1m"])
+    )
     assert float(runtime_config["structural_rj_move_probability"]) > 0.0
     assert float(runtime_config["structural_rj_birth_probability"]) > 0.0
     assert float(runtime_config["structural_rj_death_probability"]) > 0.0
-    removed_keys = {
-        "structural_kernel_mode",
-        "surface_rejuvenation_enable",
-        "mode_preserving_resample",
-        "cardinality_preserving_resample",
-        "pseudo_source_verification_enable",
-        "split_prob",
-        "merge_prob",
-    }
-    assert removed_keys.isdisjoint(runtime_config)
 
 
 def test_main_backend_override_without_mode_keeps_matching_default_config(
@@ -412,11 +427,11 @@ def test_main_standard_full_aliases_select_geant4_cui(
         "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
     assert captured["live"] is False
-    assert captured["birth_enabled"] is True
+    assert captured["variable_cardinality"] is True
 
 
-def test_main_can_explicitly_disable_standard_structural_moves(monkeypatch) -> None:
-    """The no-birth CLI override must win over the standard exact config."""
+def test_main_can_explicitly_select_fixed_cardinality(monkeypatch) -> None:
+    """The fixed-cardinality CLI override must win over the exact RJ config."""
     module = _load_main_module()
     captured: dict[str, object] = {}
 
@@ -428,14 +443,14 @@ def test_main_can_explicitly_disable_standard_structural_moves(monkeypatch) -> N
     monkeypatch.setattr(
         sys,
         "argv",
-        ["main.py", "--full-simulation", "--no-birth"],
+        ["main.py", "--full-simulation", "--fixed-cardinality"],
     )
 
     module.main()
 
-    assert captured["birth_enabled"] is False
+    assert captured["variable_cardinality"] is False
     runtime_config = load_runtime_config(Path(str(captured["sim_config_path"])))
-    assert runtime_config["birth_enable"] is True
+    assert runtime_config["variable_cardinality"] is True
 
 
 def test_main_matplotlib_live_can_be_requested(monkeypatch) -> None:

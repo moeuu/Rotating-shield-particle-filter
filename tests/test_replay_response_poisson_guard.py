@@ -142,6 +142,26 @@ def test_replay_preserves_low_snr_threshold_variance() -> None:
     ) == pytest.approx(50000.0)
 
 
+def test_runtime_likelihood_settings_use_canonical_variance_semantics() -> None:
+    """Replay likelihood settings should expose only canonical covariance semantics."""
+    defaults = REPLAY_SCRIPT._runtime_likelihood_settings({})
+    configured = REPLAY_SCRIPT._runtime_likelihood_settings(
+        {
+            "pf_count_likelihood": {
+                "observation_count_variance_semantics": (
+                    "counting_noise_inclusive"
+                )
+            }
+        }
+    )
+
+    assert defaults["observation_count_variance_semantics"] == "additional"
+    assert (
+        configured["observation_count_variance_semantics"]
+        == "counting_noise_inclusive"
+    )
+
+
 def test_replay_records_projects_current_transport_target(tmp_path: Path) -> None:
     """Replay diagnostics should use current transport-response targets."""
     scaled_base_counts = 200.0

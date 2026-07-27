@@ -1,13 +1,23 @@
 {
   "extends": "variance_reduction_external_no_isaac_32threads.json",
-  "source_surface_prior": true,
   "accelerated_weighted_transport_enable": true,
   "accelerated_weighted_transport_label": "nonstandard_user_authorized_weighted_history",
   "primary_sampling_fraction": 1.0,
   "target_sampled_primaries": 1500000,
   "random_seed_base": 2026072900,
-  "pf_observation_count_variance_semantics": "complete_statistical",
-  "pf_direct_spectrum_likelihood_enable": false,
+  "pf_count_likelihood": {
+    "count_likelihood_df": 5.0,
+    "count_likelihood_model": "student_t",
+    "low_count_abs_sigma": 20.0,
+    "low_count_transition_counts": 100.0,
+    "observation_count_variance_semantics": "complete_statistical",
+    "spectrum_count_abs_sigma": 5.0,
+    "spectrum_count_rel_sigma": 0.05,
+    "station_view_correlated_spectrum_fraction": 1.0,
+    "station_view_covariance_enable": true,
+    "transport_model_abs_sigma": 5.0,
+    "transport_model_rel_sigma": 0.1
+  },
   "pf_shield_contrast_likelihood": {
     "enabled": false
   },

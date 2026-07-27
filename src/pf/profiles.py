@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any, Mapping, MutableMapping
+import math
+from typing import Any, Mapping
+
+
+PURE_PF_SCHEMA_VERSION = 1
 
 
 class EstimatorProfile(StrEnum):
@@ -34,12 +38,13 @@ class StructuralTransitionProvenance:
     posterior_semantics: str
     structural_kernel_family: str
     structural_moves_enabled: bool
+    variable_cardinality: bool
+    birth_death_moves_enabled: bool
+    within_cardinality_moves_enabled: bool
+    within_cardinality_kernel_exact_mh: bool
     structural_kernel_target_preserving: bool
     structural_kernel_exact_rj: bool
     reversible_jump_mcmc_used: bool
-    data_conditioned_structural_proposal: bool
-    data_conditioned_strength_proposal: bool
-    data_conditioned_strength_proposal_importance_corrected: bool
     structural_evidence_uses_pf_likelihood: bool
 
     def to_dict(self) -> dict[str, bool | str]:
@@ -51,324 +56,520 @@ class StructuralTransitionProvenance:
 
 
 _PURE_CAPABILITIES = EstimatorCapabilities()
-
-_PROFILE_ALIASES = {
-    "strict": EstimatorProfile.PF_STRICT,
-    "pure_pf": EstimatorProfile.PF_STRICT,
-    "pf_only": EstimatorProfile.PF_STRICT,
+_PURE_PF_RUNTIME_KEYS = frozenset(
+    {
+        "pf_buildup",
+        "pf_count_likelihood",
+        "pf_detector_aperture_radius_m",
+        "pf_detector_aperture_samples",
+        "pf_detector_aperture_sampling",
+        "pf_detector_count_radius_m",
+        "pf_line_resolved_shield_attenuation",
+        "pf_max_sources",
+        "pf_obstacle_attenuation",
+        "pf_obstacle_material",
+        "pf_obstacle_mu_by_isotope",
+        "pf_obstacle_source_extent_radius_m",
+        "pf_obstacle_source_extent_samples",
+        "pf_plot_save_every",
+        "pf_random_seed",
+        "pf_shield_contrast_likelihood",
+        "pf_shield_view_ratio_likelihood",
+        "pf_source_extent_radius_m",
+        "pf_source_extent_samples",
+        "pf_strength_prior_max_cps_1m",
+        "pf_strength_prior_min_cps_1m",
+        "pf_transport_response_model",
+        "pf_transport_response_model_path",
+        "pf_visual_estimate_cross_size_m",
+        "pf_visual_estimate_cross_width_m",
+        "pf_visual_estimate_radius_m",
+        "pf_visual_max_particles_per_isotope",
+        "pf_visual_min_weight_fraction",
+        "pf_visual_particle_radius_m",
+        "pf_visualization_enabled",
+    }
+)
+_PURE_PF_RUNTIME_MAPPING_KEYS = frozenset(
+    {
+        "dss_pp",
+        "pf_buildup",
+        "pf_count_likelihood",
+        "pf_obstacle_mu_by_isotope",
+        "pf_shield_contrast_likelihood",
+        "pf_shield_view_ratio_likelihood",
+        "pf_transport_response_model",
+        "remaining_measurement_estimate",
+    }
+)
+_PURE_PF_STRUCTURAL_RUNTIME_KEYS = frozenset(
+    {
+        "structural_cardinality_prior_probs",
+        "structural_rj_birth_probability",
+        "structural_rj_death_probability",
+        "structural_rj_local_position_move_probability",
+        "structural_rj_move_probability",
+        "structural_rj_patch_spacing_m",
+        "structural_rj_position_move_probability",
+        "structural_rj_strength_move_probability",
+    }
+)
+_DSS_PP_RUNTIME_KEYS = frozenset(
+    {
+        "augment_candidates",
+        "beam_width",
+        "bearing_diversity_weight",
+        "candidate_preselect_enable",
+        "candidate_preselect_min",
+        "candidate_preselect_multiplier",
+        "correlation_reduction_weight",
+        "count_balance_weight",
+        "count_utility_saturation_counts",
+        "count_utility_weight",
+        "count_variance_floor",
+        "coverage_floor_quantile",
+        "coverage_floor_weight",
+        "coverage_grid_max_cells",
+        "coverage_radius_m",
+        "coverage_weight",
+        "detector_aperture_samples",
+        "diagnostic_ranked_node_limit",
+        "differential_weight",
+        "distance_weight",
+        "dose_weight",
+        "eig_candidate_limit",
+        "eig_weight",
+        "elevation_angle_threshold_deg",
+        "elevation_condition_weight",
+        "elevation_pair_xy_scale_m",
+        "elevation_pair_z_scale_m",
+        "elevation_signature_weight",
+        "enforce_min_observation",
+        "environment_contrast_threshold",
+        "environment_signature_score_clip",
+        "environment_signature_weight",
+        "frontier_weight",
+        "horizon",
+        "isotope_balance_weight",
+        "local_orbit_sigma_m",
+        "local_orbit_weight",
+        "max_augmented_candidates",
+        "max_modes_per_isotope",
+        "max_programs",
+        "min_station_separation_m",
+        "mode_cluster_radius_m",
+        "observation_weight",
+        "occlusion_boundary_step_m",
+        "occlusion_boundary_weight",
+        "one_step_guard_enable",
+        "one_step_guard_score_abs_margin",
+        "one_step_guard_score_rel_margin",
+        "one_step_guard_use_gpu",
+        "planning_method",
+        "planning_particles",
+        "program_eval_workers",
+        "program_length",
+        "remaining_budget_guidance",
+        "remaining_budget_urgency_stations",
+        "remaining_route_backtrack_weight",
+        "remaining_route_coverage_weight",
+        "remaining_route_distance_weight",
+        "remaining_route_frontier_weight",
+        "remaining_route_revisit_weight",
+        "remaining_route_turn_weight",
+        "remaining_route_weight",
+        "revisit_penalty_weight",
+        "rotation_weight",
+        "signature_std_min_counts",
+        "signature_weight",
+        "station_condition_coherence_weight",
+        "station_condition_inverse_condition_weight",
+        "station_condition_min_singular_weight",
+        "station_condition_ridge",
+        "station_condition_weight",
+        "temporal_cover_beam_width",
+        "temporal_cover_programs",
+        "temporal_cover_weight",
+        "temporal_decorrelation_weight",
+        "temporal_logdet_ridge",
+        "temporal_logdet_weight",
+        "temporal_pair_contrast_threshold",
+        "temporal_separation_weight",
+        "time_weight",
+        "turn_smoothness_weight",
+        "vertical_environment_signature_weight",
+    }
+)
+_REMAINING_MEASUREMENT_RUNTIME_KEYS = frozenset(
+    {
+        "cardinality_weight",
+        "count_variance_floor",
+        "dss_information_gain_weight",
+        "enabled",
+        "eta_default",
+        "eta_max",
+        "eta_min",
+        "gain_epsilon",
+        "max_modes_per_isotope",
+        "max_particles",
+        "max_reported_stations",
+        "mode_cluster_radius_m",
+        "pairwise_separation_threshold",
+        "planning_method",
+        "range_scale",
+        "separation_weight",
+        "stop_budget",
+        "target_cardinality_confidence",
+        "target_position_spread_m",
+        "target_strength_cv",
+        "uncertainty_weight",
+    }
+)
+_PURE_PF_NESTED_KEYS = {
+    "dss_pp": _DSS_PP_RUNTIME_KEYS,
+    "pf_buildup": frozenset({"fe_coeff", "pb_coeff", "obstacle_coeff"}),
+    "pf_count_likelihood": frozenset(
+        {
+            "count_likelihood_df",
+            "count_likelihood_model",
+            "low_count_abs_sigma",
+            "low_count_transition_counts",
+            "observation_count_variance_semantics",
+            "spectrum_count_abs_sigma",
+            "spectrum_count_rel_sigma",
+            "station_view_correlated_spectrum_fraction",
+            "station_view_covariance_enable",
+            "transport_model_abs_sigma",
+            "transport_model_rel_sigma",
+        }
+    ),
+    "pf_shield_contrast_likelihood": frozenset(
+        {
+            "df",
+            "enabled",
+            "log_sigma_ceiling",
+            "log_sigma_floor",
+            "min_count",
+            "min_views",
+            "weight",
+        }
+    ),
+    "pf_shield_view_ratio_likelihood": frozenset(
+        {
+            "concentration",
+            "enabled",
+            "min_total_count",
+            "min_views",
+            "weight",
+        }
+    ),
+    "remaining_measurement_estimate": _REMAINING_MEASUREMENT_RUNTIME_KEYS,
 }
-
-_REMOVED_KEY_PREFIXES = (
+_TRANSPORT_MODEL_KEYS = frozenset(
+    {"by_isotope", "enabled", "feature_semantics", "model"}
+)
+_TRANSPORT_ISOTOPE_KEYS = frozenset(
+    {
+        "max_log_scale",
+        "min_log_scale",
+        "num_fit_records",
+        "scale",
+        "scale_by_pair",
+        "tau_coefficients",
+        "tau_feature_caps",
+    }
+)
+_TRANSPORT_TAU_KEYS = frozenset(
+    {
+        "distance",
+        "distance_fe",
+        "distance_obstacle",
+        "distance_pb",
+        "distance_shield",
+        "fe",
+        "fe_obstacle",
+        "fe_pb",
+        "fe_squared",
+        "obstacle",
+        "obstacle_squared",
+        "pb",
+        "pb_obstacle",
+        "pb_squared",
+        "shield",
+        "shield_obstacle",
+        "shield_squared",
+    }
+)
+_TRANSPORT_CAP_KEYS = frozenset(
+    {
+        "distance_fe",
+        "distance_obstacle",
+        "distance_pb",
+        "distance_shield",
+        "fe",
+        "obstacle",
+        "pb",
+        "shield",
+    }
+)
+_RETIRED_RUNTIME_KEYS = frozenset(
+    {
+        "adapt_cooldown_steps",
+        "adaptive_cardinality_condition_max",
+        "adaptive_cardinality_min_bic_margin",
+        "adaptive_cardinality_min_candidate_count",
+        "birth_enable",
+        "birth_enabled",
+        "converge_enable",
+        "converge_ess_ratio_high",
+        "converge_ll_improve_eps",
+        "converge_map_move_eps_m",
+        "converge_min_stations",
+        "converge_min_steps",
+        "converge_require_all",
+        "converge_window",
+        "ess_high",
+        "ess_low",
+        "fixed_cardinality_no_structural_moves",
+        "height_partner_reuse_shield_program",
+        "init_grid_spacing_m",
+        "init_num_sources_max",
+        "init_num_sources_min",
+        "init_strength_log_mean",
+        "init_strength_log_sigma",
+        "init_strength_max",
+        "init_strength_min",
+        "init_strength_prior",
+        "joint_observation_update",
+        "joint_station_update",
+        "delayed_resample_update",
+        "max_particles",
+        "min_particles",
+        "min_strength",
+        "orientation_selection_mode",
+        "position_min",
+        "refit_after_moves",
+        "short_time_s",
+        "source_position_prior",
+        "source_prior_mode",
+        "source_surface_prior",
+        "response_poisson_global_diagnostic_variance_enable",
+        "source_detector_exclusion_m",
+        "spectrum_likelihood_bin_chunk",
+    }
+)
+_RETIRED_RUNTIME_PREFIXES = (
     "adaptive_strength_prior",
-    "all_history_",
-    "birth_global_rescue_",
-    "birth_residual_force_",
+    "all_history_dictionary_proposal_",
+    "batch_fit_",
+    "birth_",
     "candidate_verification_",
+    "cardinality_preserving_",
     "conditional_strength_",
+    "converge_cluster_",
+    "death_",
+    "deferred_resample_",
+    "delayed_resample_",
+    "display_pruned_",
     "final_absent_",
+    "global_surface_",
     "high_strength_split_",
+    "high_surface_",
+    "init_grid_",
+    "init_num_sources_",
+    "maximum_likelihood_",
+    "merge_",
+    "mission_stop_birth_residual_",
+    "mission_stop_min_convergence_",
     "mission_stop_report_simple_",
+    "mission_stop_require_model_order_",
+    "mission_stop_require_no_unresolved_",
+    "mission_stop_require_pf_convergence_",
+    "mission_stop_require_quiet_birth_",
+    "mission_stop_soft_",
+    "mission_stop_unresolved_",
+    "mle_",
+    "mode_preserving_",
     "online_absent_",
+    "precision_diagnostic_birth_candidate_",
+    "pseudo_source_",
+    "raw_count_residual_",
+    "recovery_",
     "report_best_so_far_",
     "report_cluster_",
+    "report_exclude_unverified_",
     "report_mle_",
     "report_model_order_",
+    "report_refit_",
     "report_strength_",
-    "report_surface_local_",
+    "report_surface_",
+    "residual_birth_",
+    "residual_decomposition_",
+    "roughening_",
     "runtime_report_rescue_",
+    "soft_extension_",
+    "source_prune_",
+    "source_strength_",
     "sparse_poisson_",
-    "surface_map_",
+    "spectrum_likelihood_",
+    "split_",
+    "strength_refit_",
+    "structural_proposal_",
+    "structural_trial_",
     "structural_update_",
+    "surface_rejuvenation_",
+    "surface_map_",
+    "verification_",
     "weak_source_prune_",
 )
 
-_REMOVED_HEURISTIC_KEYS = frozenset(
-    {
-        "background_sigma",
-        "birth_alpha",
-        "birth_bic_penalty_params",
-        "birth_candidate_jitter_sigma",
-        "birth_candidate_support_fraction",
-        "birth_complexity_penalty",
-        "birth_count_distance_log_clip",
-        "birth_count_distance_prior_weight",
-        "birth_count_distance_strength_sigma",
-        "birth_count_distance_strength_weight",
-        "birth_delta_ll_threshold",
-        "birth_detector_min_sep_m",
-        "birth_jitter_topk_candidates",
-        "birth_matching_pursuit_max_new_sources",
-        "birth_matching_pursuit_topk_candidates",
-        "birth_max_per_update",
-        "birth_min_distinct_poses",
-        "birth_min_distinct_stations",
-        "birth_min_score",
-        "birth_min_sep_m",
-        "birth_num_local_jitter",
-        "birth_orthogonal_candidate_corr_max",
-        "birth_orthogonalize_residual_candidates",
-        "birth_q_max",
-        "birth_q_min",
-        "birth_residual_clip_quantile",
-        "birth_residual_expand_structural_particles",
-        "birth_residual_expanded_structural_topk_particles",
-        "birth_residual_gate_p_value",
-        "birth_residual_min_support",
-        "birth_residual_support_sigma",
-        "birth_softmax_temp",
-        "birth_stage_single_station_as_quarantine",
-        "birth_topk_particles",
-        "birth_use_shield_coded_residual",
-        "birth_use_weighted_topk",
-        "cardinality_preserving_min_stations",
-        "cardinality_preserving_require_confirmed_structure",
-        "cardinality_preserving_resample",
-        "converge_require_no_tentative",
-        "deferred_resample_roughening_scale",
-        "disable_regularize_on_temper_resample",
-        "init_grid_repeats",
-        "init_grid_spacing_m",
-        "init_joint_position_design",
-        "init_joint_position_retries",
-        "init_source_min_separation_m",
-        "label_alignment_iters",
-        "label_enable",
-        "label_missing_cost",
-        "label_pos_scale",
-        "label_pos_weight",
-        "label_strength_scale",
-        "label_strength_weight",
-        "max_sigma_pos",
-        "merge_delta_ll_threshold",
-        "merge_distance_max",
-        "merge_prob",
-        "merge_response_corr_min",
-        "merge_search_topk_pairs",
-        "min_age_to_split",
-        "min_sigma_pos",
-        "mode_preserving_cardinality_strata",
-        "mode_preserving_dynamic_cardinality_allocation",
-        "mode_preserving_dynamic_cardinality_entropy_min",
-        "mode_preserving_dynamic_cardinality_extra_particles",
-        "mode_preserving_dynamic_cardinality_min_mass",
-        "mode_preserving_dynamic_spatial_allocation",
-        "mode_preserving_dynamic_spatial_extra_particles",
-        "mode_preserving_dynamic_spatial_min_score_fraction",
-        "mode_preserving_height_bin_m",
-        "mode_preserving_high_surface_extra_particles",
-        "mode_preserving_high_surface_z_fraction",
-        "mode_preserving_max_modes",
-        "mode_preserving_min_particles_per_cardinality",
-        "mode_preserving_min_weight_fraction",
-        "mode_preserving_particles_per_mode",
-        "mode_preserving_radius_m",
-        "mode_preserving_resample",
-        "mode_preserving_residual_boost",
-        "mode_preserving_support_score_weight",
-        "mode_preserving_surface_strata",
-        "mode_preserving_tentative_boost",
-        "p_birth",
-        "p_kill",
-        "peak_suppression_enable",
-        "peak_suppression_factor",
-        "peak_suppression_min_source_fraction",
-        "position_sigma",
-        "pseudo_source_corr_max",
-        "pseudo_source_fail_grace_stations",
-        "pseudo_source_min_delta_ll",
-        "pseudo_source_min_distinct_views",
-        "pseudo_source_quarantine_on_suppress",
-        "pseudo_source_temporal_sep_min",
-        "pseudo_source_verification_enable",
-        "residual_decomposition_enable",
-        "residual_decomposition_max_layers",
-        "roughening_decay",
-        "roughening_k",
-        "roughening_min_mult",
-        "source_detector_exclusion_m",
-        "source_prune_bic_penalty_params",
-        "source_prune_delta_ll_threshold",
-        "source_prune_fail_grace_stations",
-        "source_prune_min_distinct_stations",
-        "source_prune_min_distinct_views",
-        "split_complexity_penalty",
-        "split_delta_ll_threshold",
-        "split_position_sigma",
-        "split_prob",
-        "split_residual_candidate_count",
-        "split_residual_guided",
-        "split_strength_max_frac",
-        "split_strength_min",
-        "split_strength_min_frac",
-        "strength_log_sigma",
-        "strength_sigma",
-        "structural_kernel_mode",
-        "structural_proposal_topk_particles",
-        "structural_trial_parallel_min_trials",
-        "structural_trial_workers",
-        "support_ema_alpha",
-        "surface_rejuvenation_enable",
-    }
-)
 
-_REMOVED_EXACT_KEYS = (
-    frozenset(
-        {
-            "birth_refit_residual_gate",
-            "birth_refit_residual_min_fraction",
-            "birth_existing_response_corr_max",
-            "birth_response_condition_max",
-            "birth_residual_acceptance_complexity_scale",
-            "birth_residual_always_try",
-            "birth_residual_forced_min_delta_ll",
-            "birth_residual_suppress_death",
-            "birth_window",
-            "cluster_eps_m",
-            "cluster_exact_max_points",
-            "cluster_min_samples",
-            "cluster_report_max_points",
-            "converge_cluster_min_support_fraction",
-            "converge_cluster_spread_max_m",
-            "converge_freeze_updates",
-            "death_delta_ll_threshold",
-            "death_low_q_streak",
-            "death_require_low_strength",
-            "death_strength_threshold",
-            "display_prune_refresh_every",
-            "display_pruned_estimates_every",
-            "final_absent_isotope_filter",
-            "mode_preserving_report_cardinality_extra_particles",
-            "mode_preserving_report_cardinality_strata",
-            "mission_stop_require_model_order_ready",
-            "mission_stop_soft_extension_require_report_progress",
-            "pseudo_source_quarantine_excludes_runtime",
-            "adaptive_cardinality_condition_max",
-            "adaptive_cardinality_min_bic_margin",
-            "adaptive_cardinality_min_candidate_count",
-            "refit_after_moves",
-            "refit_eps",
-            "refit_iters",
-            "report_pre_finalize_guard",
-            "report_exclude_unverified_sources",
-            "source_prune_refit_after_remove",
-            "source_position_max",
-            "source_position_min",
-            "source_strength_absorption_penalty_weight",
-            "source_strength_absorption_q_multiple",
-            "source_strength_observation_overshoot_min_visible_fraction",
-            "source_strength_observation_overshoot_min_visible_measurements",
-            "source_strength_observation_overshoot_penalty_weight",
-            "source_strength_observation_overshoot_quantile",
-            "source_strength_observation_overshoot_sigma",
-            "source_strength_prior_mean",
-            "source_strength_prior_rel_sigma",
-            "source_strength_prior_weight",
-            "source_z_max_m",
-            "source_z_min_m",
-            "split_residual_always_try",
-            "support_window",
-            "use_clustered_output",
-        }
-    )
-    | _REMOVED_HEURISTIC_KEYS
-)
-
-_REMOVED_DSS_KEYS = frozenset(
-    {
-        "include_global_surface_rescue_modes",
-        "include_runtime_rescue_modes",
-        "cardinality_bic_parameter_count_per_source",
-        "cardinality_evidence_gap_target",
-        "global_surface_rescue_mode_weight",
-        "lambda_cardinality_discrimination",
-        "runtime_rescue_mode_weight",
-    }
-)
-
-_REMOVED_REMAINING_MEASUREMENT_KEYS = frozenset(
-    {
-        "high_surface_absorption_q_multiple",
-        "report_positive_residual_fraction_threshold",
-        "report_residual_weight",
-        "report_response_correlation_threshold",
-        "report_response_correlation_weight",
-        "report_strength_concentration_threshold",
-        "residual_surface_gain_candidate_limit",
-        "strength_absorption_weight",
-    }
-)
-
-
-def removed_estimator_config_keys(config: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return removed estimator keys still present in a runtime mapping."""
-    removed = {
-        str(key)
-        for key in config
-        if str(key) in _REMOVED_EXACT_KEYS or str(key).startswith(_REMOVED_KEY_PREFIXES)
-    }
-    dss_payload = config.get("dss_pp")
-    if isinstance(dss_payload, Mapping):
-        removed.update(
-            f"dss_pp.{key}" for key in dss_payload if key in _REMOVED_DSS_KEYS
-        )
-    removed.update(f"dss_{key}" for key in _REMOVED_DSS_KEYS if f"dss_{key}" in config)
-    remaining_payload = config.get("remaining_measurement_estimate")
-    if isinstance(remaining_payload, Mapping):
-        removed.update(
-            f"remaining_measurement_estimate.{key}"
-            for key in remaining_payload
-            if key in _REMOVED_REMAINING_MEASUREMENT_KEYS
-        )
-    removed.update(
-        f"remaining_measurement_{key}"
-        for key in _REMOVED_REMAINING_MEASUREMENT_KEYS
-        if f"remaining_measurement_{key}" in config
-    )
-    return tuple(sorted(removed))
-
-
-def reject_removed_estimator_config(config: Mapping[str, Any]) -> None:
-    """Reject configuration for estimator implementations that no longer exist."""
-    removed = removed_estimator_config_keys(config)
-    if removed:
-        joined = ", ".join(removed)
+def _validate_allowed_keys(
+    name: str,
+    payload: Mapping[str, Any],
+    allowed: frozenset[str],
+) -> None:
+    """Reject unknown keys from one versioned pure-PF object."""
+    unknown = sorted(str(key) for key in payload if str(key) not in allowed)
+    if unknown:
         raise ValueError(
-            f"Removed non-PF estimator configuration is not supported: {joined}."
+            f"Unsupported {name} settings: " + ", ".join(unknown)
         )
+
+
+def _require_mapping(
+    name: str,
+    value: Any,
+) -> Mapping[str, Any]:
+    """Return a mapping value or fail closed with a schema error."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object.")
+    return value
+
+
+def _validate_transport_response_model(payload: Mapping[str, Any]) -> None:
+    """Validate the positive schema of an inline transport-response model."""
+    _validate_allowed_keys(
+        "pf_transport_response_model",
+        payload,
+        _TRANSPORT_MODEL_KEYS,
+    )
+    raw_by_isotope = payload.get("by_isotope")
+    if raw_by_isotope is None:
+        return
+    by_isotope = _require_mapping(
+        "pf_transport_response_model.by_isotope",
+        raw_by_isotope,
+    )
+    for isotope, raw_isotope_payload in by_isotope.items():
+        isotope_payload = _require_mapping(
+            f"pf_transport_response_model.by_isotope.{isotope}",
+            raw_isotope_payload,
+        )
+        _validate_allowed_keys(
+            f"pf_transport_response_model.by_isotope.{isotope}",
+            isotope_payload,
+            _TRANSPORT_ISOTOPE_KEYS,
+        )
+        for field_name, allowed in (
+            ("tau_coefficients", _TRANSPORT_TAU_KEYS),
+            ("tau_feature_caps", _TRANSPORT_CAP_KEYS),
+        ):
+            raw_nested = isotope_payload.get(field_name)
+            if raw_nested is None:
+                continue
+            nested = _require_mapping(
+                "pf_transport_response_model.by_isotope."
+                f"{isotope}.{field_name}",
+                raw_nested,
+            )
+            _validate_allowed_keys(
+                "pf_transport_response_model.by_isotope."
+                f"{isotope}.{field_name}",
+                nested,
+                allowed,
+            )
+        raw_scale_by_pair = isotope_payload.get("scale_by_pair")
+        if raw_scale_by_pair is not None:
+            _require_mapping(
+                "pf_transport_response_model.by_isotope."
+                f"{isotope}.scale_by_pair",
+                raw_scale_by_pair,
+            )
+
+
+def _validate_nested_runtime_settings(
+    runtime_config: Mapping[str, Any],
+) -> None:
+    """Validate every versioned nested pure-PF configuration block."""
+    for block_name, allowed in _PURE_PF_NESTED_KEYS.items():
+        if block_name not in runtime_config:
+            continue
+        block = _require_mapping(block_name, runtime_config[block_name])
+        _validate_allowed_keys(block_name, block, allowed)
+    if "pf_obstacle_mu_by_isotope" in runtime_config:
+        obstacle_mu = _require_mapping(
+            "pf_obstacle_mu_by_isotope",
+            runtime_config["pf_obstacle_mu_by_isotope"],
+        )
+        for isotope, value in obstacle_mu.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(
+                    "pf_obstacle_mu_by_isotope values must be finite "
+                    f"nonnegative numbers; invalid value for {isotope!s}."
+                )
+    if "pf_transport_response_model" in runtime_config:
+        transport = _require_mapping(
+            "pf_transport_response_model",
+            runtime_config["pf_transport_response_model"],
+        )
+        _validate_transport_response_model(transport)
+
+
+def _validate_structural_runtime_values(
+    runtime_config: Mapping[str, Any],
+) -> None:
+    """Validate pure-PF cardinality fields before runtime construction."""
+    if "variable_cardinality" in runtime_config and not isinstance(
+        runtime_config["variable_cardinality"],
+        bool,
+    ):
+        raise ValueError("variable_cardinality must be a boolean.")
+    if "pf_max_sources" in runtime_config:
+        value = runtime_config["pf_max_sources"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("pf_max_sources must be a positive integer.")
+    if "init_num_sources" in runtime_config:
+        value = runtime_config["init_num_sources"]
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+        ):
+            raise ValueError(
+                "init_num_sources must contain exactly two integer bounds."
+            )
 
 
 def resolve_estimator_profile(
-    value: EstimatorProfile | str | None,
+    value: EstimatorProfile | str,
 ) -> tuple[EstimatorProfile, EstimatorCapabilities]:
-    """Resolve the strict pure-PF profile and reject removed variants."""
-    if value is None:
-        profile = EstimatorProfile.PF_STRICT
-    elif isinstance(value, EstimatorProfile):
+    """Resolve the single pure-PF profile without compatibility aliases."""
+    if isinstance(value, EstimatorProfile):
         profile = value
+    elif value == EstimatorProfile.PF_STRICT.value:
+        profile = EstimatorProfile.PF_STRICT
     else:
-        normalized = str(value).strip().lower().replace("-", "_")
-        profile = _PROFILE_ALIASES.get(normalized)
-        if profile is None:
-            try:
-                profile = EstimatorProfile(normalized)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Unsupported estimator profile {value!r}; "
-                    "only 'pf_strict' is available."
-                ) from exc
+        raise ValueError(
+            f"Unsupported estimator profile {value!r}; "
+            "only 'pf_strict' is available."
+        )
     return profile, _PURE_CAPABILITIES
-
-
-def resolved_profile_diagnostics(
-    value: EstimatorProfile | str | None,
-) -> dict[str, Any]:
-    """Return JSON-safe pure-PF profile provenance."""
-    profile, capabilities = resolve_estimator_profile(value)
-    return {
-        "estimator_family": "particle_filter",
-        "estimator_variant": profile.value,
-        "profile_capabilities": capabilities.to_dict(),
-    }
 
 
 def resolve_structural_transition_provenance(
@@ -376,53 +577,37 @@ def resolve_structural_transition_provenance(
     *,
     capabilities: EstimatorCapabilities | None = None,
 ) -> StructuralTransitionProvenance:
-    """Resolve truthful provenance for the configured PF structural kernel."""
+    """Resolve provenance for the configured PF structural kernel."""
     del capabilities
-    structural_moves_enabled = bool(getattr(config, "birth_enable", False))
-    raw_initial_support = getattr(config, "init_num_sources", (0, 0))
-    try:
-        initial_lower, initial_upper = raw_initial_support
-        fixed_initial_cardinality = int(initial_lower) == int(initial_upper)
-    except (TypeError, ValueError):
-        fixed_initial_cardinality = True
+    variable_cardinality = bool(getattr(config, "variable_cardinality", False))
 
-    if structural_moves_enabled:
+    if variable_cardinality:
         kernel_family = "area_weighted_surface_birth_death_rj_mh"
         posterior_semantics = (
             "sequential_particle_filter_with_target_preserving_rj_mh_rejuvenation"
         )
-        target_preserving = True
         exact_rj = True
         reversible_jump_used = True
-        data_conditioned_proposal = False
-        data_conditioned_strength = False
     else:
-        kernel_family = (
-            "fixed_cardinality_no_structural_moves"
-            if fixed_initial_cardinality
-            else "static_cardinality_mixture_no_structural_moves"
-        )
+        kernel_family = "fixed_cardinality_surface_position_strength_mh"
         posterior_semantics = (
-            "fixed_cardinality_sequential_particle_filter"
-            if fixed_initial_cardinality
-            else "static_cardinality_mixture_sequential_particle_filter"
+            "fixed_cardinality_sequential_particle_filter_with_"
+            "target_preserving_mh_rejuvenation"
         )
-        target_preserving = True
         exact_rj = False
         reversible_jump_used = False
-        data_conditioned_proposal = False
-        data_conditioned_strength = False
 
     return StructuralTransitionProvenance(
         posterior_semantics=posterior_semantics,
         structural_kernel_family=kernel_family,
-        structural_moves_enabled=structural_moves_enabled,
-        structural_kernel_target_preserving=target_preserving,
+        structural_moves_enabled=True,
+        variable_cardinality=variable_cardinality,
+        birth_death_moves_enabled=variable_cardinality,
+        within_cardinality_moves_enabled=True,
+        within_cardinality_kernel_exact_mh=True,
+        structural_kernel_target_preserving=True,
         structural_kernel_exact_rj=exact_rj,
         reversible_jump_mcmc_used=reversible_jump_used,
-        data_conditioned_structural_proposal=data_conditioned_proposal,
-        data_conditioned_strength_proposal=data_conditioned_strength,
-        data_conditioned_strength_proposal_importance_corrected=False,
         structural_evidence_uses_pf_likelihood=True,
     )
 
@@ -432,11 +617,6 @@ def apply_profile_to_config(config: Any) -> EstimatorCapabilities:
     profile, capabilities = resolve_estimator_profile(
         getattr(config, "estimator_profile", EstimatorProfile.PF_STRICT.value)
     )
-    source_prior = str(getattr(config, "source_position_prior", "surface")).strip()
-    if source_prior.lower() != "surface":
-        raise ValueError(
-            "The pf_strict estimator requires source_position_prior='surface'."
-        )
     config.estimator_profile = profile.value
     return capabilities
 
@@ -446,63 +626,87 @@ def enforce_pure_runtime_settings(
     *,
     profile: EstimatorProfile | str | None = None,
 ) -> dict[str, Any]:
-    """Validate a runtime mapping and stamp the strict pure-PF profile."""
-    reject_removed_estimator_config(runtime_config)
-    if "source_surface_prior" in runtime_config:
-        raw_surface_prior = runtime_config["source_surface_prior"]
-        surface_prior_enabled = (
-            raw_surface_prior
-            if isinstance(raw_surface_prior, bool)
-            else str(raw_surface_prior).strip().lower()
-            in {"1", "true", "yes", "on", "surface", "surfaces"}
-        )
-        if not surface_prior_enabled:
-            raise ValueError(
-                "The pf_strict estimator requires source_surface_prior=true."
-            )
-    source_prior = runtime_config.get("source_position_prior")
-    normalized_source_prior = (
-        "surface"
-        if source_prior is True
-        else str(source_prior).strip().lower()
-        if source_prior is not None
-        else None
-    )
-    if normalized_source_prior is not None and normalized_source_prior != "surface":
+    """Validate the pure-PF schema marker and strict estimator profile."""
+    schema_version = runtime_config.get("pure_pf_schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != PURE_PF_SCHEMA_VERSION
+    ):
         raise ValueError(
-            "The pf_strict estimator requires source_position_prior='surface'."
+            "Runtime configuration requires pure_pf_schema_version=1."
         )
-    resolved_profile, _capabilities = resolve_estimator_profile(
-        profile
-        if profile is not None
-        else runtime_config.get("estimator_profile", EstimatorProfile.PF_STRICT.value)
+    retired_keys = sorted(
+        str(key)
+        for key in runtime_config
+        if str(key) in _RETIRED_RUNTIME_KEYS
+        or any(
+            str(key).startswith(prefix)
+            for prefix in _RETIRED_RUNTIME_PREFIXES
+        )
     )
+    if retired_keys:
+        raise ValueError(
+            "Retired particle-filter settings are not supported: "
+            + ", ".join(retired_keys)
+        )
+    unknown_pf_keys = sorted(
+        str(key)
+        for key in runtime_config
+        if str(key).startswith("pf_") and str(key) not in _PURE_PF_RUNTIME_KEYS
+    )
+    if unknown_pf_keys:
+        raise ValueError(
+            "Unsupported pure-PF runtime settings: "
+            + ", ".join(unknown_pf_keys)
+        )
+    unknown_structural_keys = sorted(
+        str(key)
+        for key in runtime_config
+        if (
+            str(key).startswith("structural_rj_")
+            or str(key).startswith("structural_cardinality_")
+        )
+        and str(key) not in _PURE_PF_STRUCTURAL_RUNTIME_KEYS
+    )
+    if unknown_structural_keys:
+        raise ValueError(
+            "Unsupported pure-PF structural settings: "
+            + ", ".join(unknown_structural_keys)
+        )
+    invalid_mapping_keys = sorted(
+        key
+        for key in _PURE_PF_RUNTIME_MAPPING_KEYS
+        if key in runtime_config and not isinstance(runtime_config[key], Mapping)
+    )
+    if invalid_mapping_keys:
+        raise ValueError(
+            "Pure-PF runtime settings must be objects: "
+            + ", ".join(invalid_mapping_keys)
+        )
+    _validate_nested_runtime_settings(runtime_config)
+    _validate_structural_runtime_values(runtime_config)
+    configured_profile, _capabilities = resolve_estimator_profile(
+        runtime_config.get("estimator_profile")
+    )
+    if profile is not None:
+        requested_profile, _ = resolve_estimator_profile(profile)
+        if requested_profile is not configured_profile:
+            raise ValueError(
+                "Requested estimator profile differs from the runtime schema."
+            )
     result = dict(runtime_config)
-    result["estimator_profile"] = resolved_profile.value
+    result["estimator_profile"] = configured_profile.value
     return result
 
 
-def enforce_pure_runtime_settings_in_place(
-    runtime_config: MutableMapping[str, Any],
-) -> EstimatorProfile:
-    """Validate and stamp a mutable runtime mapping in place."""
-    resolved = enforce_pure_runtime_settings(runtime_config)
-    runtime_config.clear()
-    runtime_config.update(resolved)
-    profile, _ = resolve_estimator_profile(runtime_config["estimator_profile"])
-    return profile
-
-
 __all__ = [
+    "PURE_PF_SCHEMA_VERSION",
     "EstimatorCapabilities",
     "EstimatorProfile",
     "StructuralTransitionProvenance",
     "apply_profile_to_config",
     "enforce_pure_runtime_settings",
-    "enforce_pure_runtime_settings_in_place",
-    "reject_removed_estimator_config",
-    "removed_estimator_config_keys",
     "resolve_estimator_profile",
     "resolve_structural_transition_provenance",
-    "resolved_profile_diagnostics",
 ]

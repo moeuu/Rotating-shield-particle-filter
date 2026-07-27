@@ -29,50 +29,18 @@ OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL = "complete_statistical"
 
 
 def normalize_observation_count_variance_semantics(
-    semantics: str | None,
-    *,
-    includes_counting_noise: bool = False,
+    semantics: str,
 ) -> str:
     """Return canonical observation-count variance semantics.
 
-    An empty value preserves the legacy boolean behavior. ``additional`` means
-    that the supplied variance excludes counting noise. The legacy
+    ``additional`` means that the supplied variance excludes counting noise. The
     ``counting_noise_inclusive`` mode replaces the observed plug-in Poisson
     component with the candidate-dependent expected count. In contrast,
     ``complete_statistical`` declares the supplied covariance to be the full
     statistical covariance of the observation, including weighted-transport
     and detector counting noise, so no extra Poisson term may be added.
     """
-    normalized = "" if semantics is None else str(semantics).strip().lower()
-    aliases = {
-        "": (
-            OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE
-            if bool(includes_counting_noise)
-            else OBSERVATION_COUNT_VARIANCE_ADDITIONAL
-        ),
-        "auto": (
-            OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE
-            if bool(includes_counting_noise)
-            else OBSERVATION_COUNT_VARIANCE_ADDITIONAL
-        ),
-        "legacy": (
-            OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE
-            if bool(includes_counting_noise)
-            else OBSERVATION_COUNT_VARIANCE_ADDITIONAL
-        ),
-        "excludes_counting_noise": OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
-        "extra": OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
-        "includes_counting_noise": (
-            OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE
-        ),
-        "legacy_includes_counting_noise": (
-            OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE
-        ),
-        "complete": OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
-        "full_statistical": OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
-        "transport_and_counting": OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
-    }
-    normalized = aliases.get(normalized, normalized)
+    normalized = str(semantics).strip().lower()
     allowed = {
         OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
         OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE,
@@ -89,22 +57,9 @@ def normalize_observation_count_variance_semantics(
 def normalize_count_likelihood_model(model: str) -> str:
     """Return a canonical count likelihood model name."""
     normalized = str(model).strip().lower()
-    aliases = {
-        "": "poisson",
-        "normal": "gaussian",
-        "robust": "student_t",
-        "robust_gaussian": "student_t",
-        "t": "student_t",
-    }
-    normalized = aliases.get(normalized, normalized)
     if normalized not in {"poisson", "gaussian", "student_t"}:
         raise ValueError(f"Unknown count likelihood model: {model}")
     return normalized
-
-
-def _normalize_count_likelihood_model(model: str) -> str:
-    """Return a canonical count likelihood model name for legacy callers."""
-    return normalize_count_likelihood_model(model)
 
 
 @dataclass(frozen=True)
@@ -118,34 +73,22 @@ class CountLikelihoodSpec:
     spectrum_count_abs_sigma: float = 0.0
     low_count_abs_sigma: float = 0.0
     low_count_transition_counts: float = 0.0
-    observation_count_variance_includes_counting_noise: bool = False
-    observation_count_variance_semantics: str = ""
+    observation_count_variance_semantics: str = (
+        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+    )
     student_t_df: float = 5.0
 
     def __post_init__(self) -> None:
-        """Normalize aliases and numeric inputs without changing their semantics."""
+        """Normalize canonical names and numeric likelihood inputs."""
         object.__setattr__(
             self,
             "model",
             normalize_count_likelihood_model(self.model),
         )
-        object.__setattr__(
-            self,
-            "observation_count_variance_includes_counting_noise",
-            bool(self.observation_count_variance_includes_counting_noise),
-        )
         semantics = normalize_observation_count_variance_semantics(
             self.observation_count_variance_semantics,
-            includes_counting_noise=(
-                self.observation_count_variance_includes_counting_noise
-            ),
         )
         object.__setattr__(self, "observation_count_variance_semantics", semantics)
-        object.__setattr__(
-            self,
-            "observation_count_variance_includes_counting_noise",
-            semantics != OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
-        )
         if (
             semantics == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
             and self.model == "poisson"
@@ -167,16 +110,6 @@ class CountLikelihoodSpec:
             object.__setattr__(self, field_name, float(getattr(self, field_name)))
 
 
-def poisson_log_likelihood(
-    z_k: NDArray[np.float64], lambda_k: NDArray[np.float64], epsilon: float = 1e-12
-) -> float:
-    """
-    Return the Poisson log-likelihood sum_k [z_k * log(lambda_k) - lambda_k] (constants omitted).
-    """
-    lambda_safe = np.maximum(lambda_k, float(epsilon))
-    return float(np.sum(z_k * np.log(lambda_safe) - lambda_safe))
-
-
 def count_likelihood_variance(
     z_k: NDArray[np.float64],
     lambda_k: NDArray[np.float64],
@@ -188,8 +121,9 @@ def count_likelihood_variance(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
-    observation_count_variance_includes_counting_noise: bool = False,
-    observation_count_variance_semantics: str = "",
+    observation_count_variance_semantics: str = (
+        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+    ),
     epsilon: float = 1e-12,
 ) -> NDArray[np.float64]:
     """
@@ -216,7 +150,6 @@ def count_likelihood_variance(
     obs_var = np.maximum(np.asarray(observation_count_variance, dtype=float), 0.0)
     semantics = normalize_observation_count_variance_semantics(
         observation_count_variance_semantics,
-        includes_counting_noise=observation_count_variance_includes_counting_noise,
     )
     poisson_variance = lam_arr
     if semantics == OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE:
@@ -257,8 +190,9 @@ def count_likelihood_variance_torch(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | "torch.Tensor" = 0.0,
-    observation_count_variance_includes_counting_noise: bool = False,
-    observation_count_variance_semantics: str = "",
+    observation_count_variance_semantics: str = (
+        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+    ),
     epsilon: float = 1e-12,
 ) -> "torch.Tensor":
     """Return torch observation variance equivalent to count_likelihood_variance."""
@@ -283,7 +217,6 @@ def count_likelihood_variance_torch(
     )
     semantics = normalize_observation_count_variance_semantics(
         observation_count_variance_semantics,
-        includes_counting_noise=observation_count_variance_includes_counting_noise,
     )
     poisson_variance = lam_arr
     if semantics == OBSERVATION_COUNT_VARIANCE_COUNTING_NOISE_INCLUSIVE:
@@ -345,9 +278,6 @@ def predictive_count_likelihood_variance(
         low_count_abs_sigma=spec.low_count_abs_sigma,
         low_count_transition_counts=spec.low_count_transition_counts,
         observation_count_variance=observation_count_variance,
-        observation_count_variance_includes_counting_noise=(
-            spec.observation_count_variance_includes_counting_noise
-        ),
         observation_count_variance_semantics=(
             spec.observation_count_variance_semantics
         ),
@@ -382,9 +312,6 @@ def predictive_count_likelihood_variance_torch(
         low_count_abs_sigma=spec.low_count_abs_sigma,
         low_count_transition_counts=spec.low_count_transition_counts,
         observation_count_variance=observation_count_variance,
-        observation_count_variance_includes_counting_noise=(
-            spec.observation_count_variance_includes_counting_noise
-        ),
         observation_count_variance_semantics=(
             spec.observation_count_variance_semantics
         ),
@@ -416,9 +343,6 @@ def count_log_likelihood_terms_np(
         low_count_abs_sigma=spec.low_count_abs_sigma,
         low_count_transition_counts=spec.low_count_transition_counts,
         observation_count_variance=observation_count_variance,
-        observation_count_variance_includes_counting_noise=(
-            spec.observation_count_variance_includes_counting_noise
-        ),
         observation_count_variance_semantics=(
             spec.observation_count_variance_semantics
         ),
@@ -465,9 +389,6 @@ def count_log_likelihood_terms_torch(
         low_count_abs_sigma=spec.low_count_abs_sigma,
         low_count_transition_counts=spec.low_count_transition_counts,
         observation_count_variance=observation_count_variance,
-        observation_count_variance_includes_counting_noise=(
-            spec.observation_count_variance_includes_counting_noise
-        ),
         observation_count_variance_semantics=(
             spec.observation_count_variance_semantics
         ),
@@ -495,8 +416,9 @@ def count_log_likelihood(
     low_count_abs_sigma: float = 0.0,
     low_count_transition_counts: float = 0.0,
     observation_count_variance: float | NDArray[np.float64] = 0.0,
-    observation_count_variance_includes_counting_noise: bool = False,
-    observation_count_variance_semantics: str = "",
+    observation_count_variance_semantics: str = (
+        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+    ),
     student_t_df: float = 5.0,
     epsilon: float = 1e-12,
 ) -> float:
@@ -515,9 +437,6 @@ def count_log_likelihood(
         spectrum_count_abs_sigma=spectrum_count_abs_sigma,
         low_count_abs_sigma=low_count_abs_sigma,
         low_count_transition_counts=low_count_transition_counts,
-        observation_count_variance_includes_counting_noise=(
-            observation_count_variance_includes_counting_noise
-        ),
         observation_count_variance_semantics=observation_count_variance_semantics,
         student_t_df=student_t_df,
     )
@@ -531,179 +450,6 @@ def count_log_likelihood(
     return float(np.sum(terms))
 
 
-def delta_log_likelihood_remove(
-    z_k: NDArray[np.float64],
-    lambda_total: NDArray[np.float64],
-    lambda_m: NDArray[np.float64],
-    epsilon: float = 1e-12,
-    model: str = "poisson",
-    transport_model_rel_sigma: float = 0.0,
-    transport_model_abs_sigma: float = 0.0,
-    spectrum_count_rel_sigma: float = 0.0,
-    spectrum_count_abs_sigma: float = 0.0,
-    low_count_abs_sigma: float = 0.0,
-    low_count_transition_counts: float = 0.0,
-    observation_count_variance: float | NDArray[np.float64] = 0.0,
-    observation_count_variance_includes_counting_noise: bool = False,
-    observation_count_variance_semantics: str = "",
-    student_t_df: float = 5.0,
-) -> NDArray[np.float64]:
-    """
-    Compute ΔLL when removing each source m using a stable log1p formulation.
-
-    lambda_m must be shaped (K, M). Returns a vector (M,).
-    """
-    if lambda_m.ndim != 2:
-        raise ValueError("lambda_m must be a (K, M) array.")
-    normalized_model = _normalize_count_likelihood_model(model)
-    normalized_semantics = normalize_observation_count_variance_semantics(
-        observation_count_variance_semantics,
-        includes_counting_noise=observation_count_variance_includes_counting_noise,
-    )
-    if (
-        normalized_model == "poisson"
-        and normalized_semantics == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
-    ):
-        raise ValueError(
-            "complete_statistical observation variance requires gaussian or "
-            "student_t count likelihood."
-        )
-    if normalized_model != "poisson":
-        base_ll = count_log_likelihood(
-            z_k,
-            lambda_total,
-            model=normalized_model,
-            transport_model_rel_sigma=transport_model_rel_sigma,
-            transport_model_abs_sigma=transport_model_abs_sigma,
-            spectrum_count_rel_sigma=spectrum_count_rel_sigma,
-            spectrum_count_abs_sigma=spectrum_count_abs_sigma,
-            low_count_abs_sigma=low_count_abs_sigma,
-            low_count_transition_counts=low_count_transition_counts,
-            observation_count_variance=observation_count_variance,
-            observation_count_variance_includes_counting_noise=(
-                observation_count_variance_includes_counting_noise
-            ),
-            observation_count_variance_semantics=(observation_count_variance_semantics),
-            student_t_df=student_t_df,
-            epsilon=epsilon,
-        )
-        delta_values = np.zeros(lambda_m.shape[1], dtype=float)
-        for source_idx in range(lambda_m.shape[1]):
-            reduced_lambda = np.maximum(
-                lambda_total - lambda_m[:, source_idx],
-                float(epsilon),
-            )
-            reduced_ll = count_log_likelihood(
-                z_k,
-                reduced_lambda,
-                model=normalized_model,
-                transport_model_rel_sigma=transport_model_rel_sigma,
-                transport_model_abs_sigma=transport_model_abs_sigma,
-                spectrum_count_rel_sigma=spectrum_count_rel_sigma,
-                spectrum_count_abs_sigma=spectrum_count_abs_sigma,
-                low_count_abs_sigma=low_count_abs_sigma,
-                low_count_transition_counts=low_count_transition_counts,
-                observation_count_variance=observation_count_variance,
-                observation_count_variance_includes_counting_noise=(
-                    observation_count_variance_includes_counting_noise
-                ),
-                observation_count_variance_semantics=(
-                    observation_count_variance_semantics
-                ),
-                student_t_df=student_t_df,
-                epsilon=epsilon,
-            )
-            delta_values[source_idx] = base_ll - reduced_ll
-        return delta_values
-    lambda_total_safe = np.maximum(lambda_total, float(epsilon))
-    ratio = lambda_m / lambda_total_safe[:, None]
-    ratio = np.clip(ratio, 0.0, 1.0 - float(epsilon))
-    log_term = -np.log1p(-ratio)
-    delta_ll = np.sum(z_k[:, None] * log_term - lambda_m, axis=0)
-    return delta_ll
-
-
-def delta_log_likelihood_update(
-    z_k: NDArray[np.float64],
-    lambda_old: NDArray[np.float64],
-    lambda_new: NDArray[np.float64],
-    epsilon: float = 1e-12,
-    model: str = "poisson",
-    transport_model_rel_sigma: float = 0.0,
-    transport_model_abs_sigma: float = 0.0,
-    spectrum_count_rel_sigma: float = 0.0,
-    spectrum_count_abs_sigma: float = 0.0,
-    low_count_abs_sigma: float = 0.0,
-    low_count_transition_counts: float = 0.0,
-    observation_count_variance: float | NDArray[np.float64] = 0.0,
-    observation_count_variance_includes_counting_noise: bool = False,
-    observation_count_variance_semantics: str = "",
-    student_t_df: float = 5.0,
-) -> float:
-    """
-    Compute ΔLL for replacing lambda_old with lambda_new across measurements.
-    """
-    normalized_model = _normalize_count_likelihood_model(model)
-    normalized_semantics = normalize_observation_count_variance_semantics(
-        observation_count_variance_semantics,
-        includes_counting_noise=observation_count_variance_includes_counting_noise,
-    )
-    if (
-        normalized_model == "poisson"
-        and normalized_semantics == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
-    ):
-        raise ValueError(
-            "complete_statistical observation variance requires gaussian or "
-            "student_t count likelihood."
-        )
-    if normalized_model != "poisson":
-        ll_old = count_log_likelihood(
-            z_k,
-            lambda_old,
-            model=normalized_model,
-            transport_model_rel_sigma=transport_model_rel_sigma,
-            transport_model_abs_sigma=transport_model_abs_sigma,
-            spectrum_count_rel_sigma=spectrum_count_rel_sigma,
-            spectrum_count_abs_sigma=spectrum_count_abs_sigma,
-            low_count_abs_sigma=low_count_abs_sigma,
-            low_count_transition_counts=low_count_transition_counts,
-            observation_count_variance=observation_count_variance,
-            observation_count_variance_includes_counting_noise=(
-                observation_count_variance_includes_counting_noise
-            ),
-            observation_count_variance_semantics=(observation_count_variance_semantics),
-            student_t_df=student_t_df,
-            epsilon=epsilon,
-        )
-        ll_new = count_log_likelihood(
-            z_k,
-            lambda_new,
-            model=normalized_model,
-            transport_model_rel_sigma=transport_model_rel_sigma,
-            transport_model_abs_sigma=transport_model_abs_sigma,
-            spectrum_count_rel_sigma=spectrum_count_rel_sigma,
-            spectrum_count_abs_sigma=spectrum_count_abs_sigma,
-            low_count_abs_sigma=low_count_abs_sigma,
-            low_count_transition_counts=low_count_transition_counts,
-            observation_count_variance=observation_count_variance,
-            observation_count_variance_includes_counting_noise=(
-                observation_count_variance_includes_counting_noise
-            ),
-            observation_count_variance_semantics=(observation_count_variance_semantics),
-            student_t_df=student_t_df,
-            epsilon=epsilon,
-        )
-        return float(ll_new - ll_old)
-    lambda_old_safe = np.maximum(lambda_old, float(epsilon))
-    lambda_new_safe = np.maximum(lambda_new, float(epsilon))
-    return float(
-        np.sum(
-            z_k * (np.log(lambda_new_safe) - np.log(lambda_old_safe))
-            - (lambda_new - lambda_old)
-        )
-    )
-
-
 def expected_counts_per_source(
     kernel: ContinuousKernel,
     isotope: str,
@@ -711,92 +457,52 @@ def expected_counts_per_source(
     sources: NDArray[np.float64],
     strengths: NDArray[np.float64],
     live_times: NDArray[np.float64],
-    fe_indices: NDArray[np.int64] | None = None,
-    pb_indices: NDArray[np.int64] | None = None,
-    orient_indices: NDArray[np.int64] | None = None,
+    fe_indices: NDArray[np.int64],
+    pb_indices: NDArray[np.int64],
     source_scale: float | NDArray[np.float64] = 1.0,
 ) -> NDArray[np.float64]:
     """
     Return per-source expected counts Λ_{k,m} for each measurement k.
 
-    Supports either paired Fe/Pb indices or single orientation indices.
     source_scale maps ideal source counts into the measurement domain while
     leaving the additive background term to the caller. It may be a scalar or a
     length-``num_meas`` vector for shield-pair-conditioned calibration.
     """
-    if sources.size == 0:
-        return np.zeros((len(live_times), 0), dtype=float)
-    if sources.shape[0] != strengths.shape[0]:
-        raise ValueError("sources and strengths must have matching length.")
-    num_meas = int(len(live_times))
-    num_sources = int(sources.shape[0])
-    lambda_m = np.zeros((num_meas, num_sources), dtype=float)
-    scale_arr = _source_scale_vector(source_scale, num_meas)
-    if fe_indices is None or pb_indices is None:
-        if orient_indices is None:
-            raise ValueError(
-                "Either fe_indices/pb_indices or orient_indices must be provided."
-            )
-        fe_indices_use = np.asarray(orient_indices, dtype=int)
-        pb_indices_use = fe_indices_use
-    else:
-        fe_indices_use = np.asarray(fe_indices, dtype=int)
-        pb_indices_use = np.asarray(pb_indices, dtype=int)
-    if hasattr(kernel, "kernel_values_selected_pairs_for_detectors"):
-        values = kernel.kernel_values_selected_pairs_for_detectors(
-            isotope=isotope,
-            detector_positions=np.asarray(detector_positions, dtype=float),
-            sources=np.asarray(sources, dtype=float),
-            fe_indices=fe_indices_use,
-            pb_indices=pb_indices_use,
+    detector_arr = np.asarray(detector_positions, dtype=float)
+    source_arr = np.asarray(sources, dtype=float)
+    strength_arr = np.asarray(strengths, dtype=float).reshape(-1)
+    live_arr = np.asarray(live_times, dtype=float).reshape(-1)
+    fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
+    pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
+    num_meas = int(live_arr.size)
+    if detector_arr.shape != (num_meas, 3):
+        raise ValueError("detector_positions must be shaped num_measurements x 3.")
+    if fe_arr.size != num_meas or pb_arr.size != num_meas:
+        raise ValueError(
+            "fe_indices and pb_indices must contain one value per measurement."
         )
-        values_arr = np.asarray(values, dtype=float)
-        if values_arr.shape != (num_meas, num_sources):
-            raise ValueError(
-                "Batched selected-pair kernel returned shape "
-                f"{values_arr.shape}, expected {(num_meas, num_sources)}."
-            )
-        strengths_arr = np.asarray(strengths, dtype=float)
-        scale = np.asarray(live_times, dtype=float) * scale_arr
-        return scale[:, None] * values_arr * strengths_arr[None, :]
-    if getattr(kernel, "use_gpu", False) and hasattr(kernel, "kernel_values_pair"):
-        scale = np.asarray(live_times, dtype=float) * scale_arr
-        strengths_arr = np.asarray(strengths, dtype=float)
-        for k in range(num_meas):
-            values = kernel.kernel_values_pair(
-                isotope=isotope,
-                detector_pos=detector_positions[k],
-                sources=sources,
-                fe_index=int(fe_indices_use[k]),
-                pb_index=int(pb_indices_use[k]),
-            )
-            lambda_m[k, :] = scale[k] * values * strengths_arr
-        return lambda_m
-    for k in range(num_meas):
-        det = detector_positions[k]
-        live_time = float(live_times[k])
-        for m in range(num_sources):
-            if fe_indices is not None and pb_indices is not None:
-                kernel_val = kernel.kernel_value_pair(
-                    isotope=isotope,
-                    detector_pos=det,
-                    source_pos=sources[m],
-                    fe_index=int(fe_indices[k]),
-                    pb_index=int(pb_indices[k]),
-                )
-            elif orient_indices is not None:
-                kernel_val = kernel.kernel_value(
-                    isotope=isotope,
-                    detector_pos=det,
-                    source_pos=sources[m],
-                    orient_idx=int(orient_indices[k]),
-                )
-            else:
-                raise ValueError(
-                    "Either fe_indices/pb_indices or orient_indices must be provided."
-                )
-            lambda_m[k, m] = live_time * scale_arr[k] * kernel_val * float(strengths[m])
-    return lambda_m
+    if source_arr.size == 0:
+        return np.zeros((num_meas, 0), dtype=float)
+    source_arr = source_arr.reshape(-1, 3)
+    if source_arr.shape[0] != strength_arr.shape[0]:
+        raise ValueError("sources and strengths must have matching length.")
+    num_sources = int(source_arr.shape[0])
+    scale_arr = _source_scale_vector(source_scale, num_meas)
+    values = kernel.kernel_values_selected_pairs_for_detectors(
+        isotope=isotope,
+        detector_positions=detector_arr,
+        sources=source_arr,
+        fe_indices=fe_arr,
+        pb_indices=pb_arr,
+    )
+    values_arr = np.asarray(values, dtype=float)
+    if values_arr.shape != (num_meas, num_sources):
+        raise ValueError(
+            "Batched selected-pair kernel returned shape "
+            f"{values_arr.shape}, expected {(num_meas, num_sources)}."
+        )
+    scale = live_arr * scale_arr
+    return scale[:, None] * values_arr * strength_arr[None, :]
 
 
 def _source_scale_vector(

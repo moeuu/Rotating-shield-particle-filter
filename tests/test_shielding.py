@@ -25,7 +25,7 @@ from measurement.shielding import (
     shield_blocks_radiation,
     transmission_from_hvl,
 )
-from measurement.kernels import KernelPrecomputer, ShieldParams
+from measurement.kernels import ShieldParams
 
 
 def test_cartesian_to_spherical_roundtrip_axes() -> None:
@@ -68,28 +68,6 @@ def test_octant_shield_blocks_ray_by_angles() -> None:
     assert not shield.blocks_ray(detector_position=det_mmp, source_position=src, octant_index=1)
 
 
-def test_kernel_attenuation_factor_applies_exponential_when_blocked() -> None:
-    """KernelPrecomputer should attenuate according to exp(-mu*L) when blocked."""
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    poses = np.array([[1.0, 1.0, 1.0]], dtype=float)
-    orientations = OCTANT_NORMALS
-    shield_params = ShieldParams()
-    mu = {"Cs-137": {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb}}
-    kernel = KernelPrecomputer(
-        candidate_sources=candidate_sources,
-        poses=poses,
-        orientations=orientations,
-        shield_params=shield_params,
-        mu_by_isotope=mu,
-    )
-    k_block = kernel.kernel("Cs-137", pose_idx=0, orient_idx=0)[0]
-    k_free = kernel.kernel("Cs-137", pose_idx=0, orient_idx=7)[0]
-    expected_ratio = np.exp(
-        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
-    )
-    assert np.isclose(k_block, expected_ratio * k_free, rtol=1e-6)
-
-
 def test_generate_octant_orientations_and_index() -> None:
     """Orientation helper should return 8 normals and index mapping should be consistent."""
     normals = generate_octant_orientations()
@@ -113,34 +91,6 @@ def test_generate_rotation_matrices_and_pairs() -> None:
     assert len(pairs) == 64
     assert pairs[0]["id"] == 0
     assert pairs[-1]["id"] == 63
-
-
-def test_rotation_changes_counts_by_exponential_when_blocked() -> None:
-    """
-    Rotating from an unblocked to a blocked octant should attenuate counts via exp(-mu*L).
-
-    This reproduces the qualitative behavior in IAS-19 Fig. 1: orientation
-    modulates count rate and provides directional information.
-    """
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    poses = np.array([[1.0, 1.0, 1.0]], dtype=float)
-    orientations = generate_octant_orientations()
-    shield_params = ShieldParams()
-    mu = {"Cs-137": {"fe": shield_params.mu_fe, "pb": shield_params.mu_pb}}
-    kernel = KernelPrecomputer(
-        candidate_sources=candidate_sources,
-        poses=poses,
-        orientations=orientations,
-        shield_params=shield_params,
-        mu_by_isotope=mu,
-    )
-    strength = np.array([10.0])
-    unblocked = kernel.expected_counts("Cs-137", pose_idx=0, orient_idx=7, source_strengths=strength, background=0.0)
-    blocked = kernel.expected_counts("Cs-137", pose_idx=0, orient_idx=0, source_strengths=strength, background=0.0)
-    expected_ratio = np.exp(
-        -(shield_params.mu_fe * shield_params.thickness_fe_cm + shield_params.mu_pb * shield_params.thickness_pb_cm)
-    )
-    assert blocked == pytest.approx(expected_ratio * unblocked, rel=1e-6)
 
 
 def test_tvl_table_mu_and_attenuation_factors() -> None:

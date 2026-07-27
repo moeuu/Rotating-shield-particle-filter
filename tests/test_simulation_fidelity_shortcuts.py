@@ -271,7 +271,6 @@ def test_global_response_chi2_does_not_inflate_every_isotope_by_default(
     decomposer = SpectralDecomposer(
         SpectrumConfig(
             response_poisson_diagnostic_variance_enable=True,
-            response_poisson_global_diagnostic_variance_enable=False,
         )
     )
     spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
@@ -314,23 +313,6 @@ def test_global_response_chi2_does_not_inflate_every_isotope_by_default(
     ]
     assert components["Cs-137"]["final_variance"] == pytest.approx(25.0)
     assert components["Co-60"]["final_variance"] == pytest.approx(36.0)
-
-
-def test_global_response_chi2_variance_remains_explicitly_opt_in() -> None:
-    """Legacy global diagnostic inflation should require an explicit setting."""
-    decomposer = SpectralDecomposer(
-        SpectrumConfig(
-            response_poisson_global_diagnostic_variance_enable=True,
-            response_poisson_diagnostic_reduced_chi2_threshold=2.0,
-            response_poisson_diagnostic_reduced_chi2_scale=0.5,
-        )
-    )
-    extractor = RuntimeCountExtractor(decomposer)
-
-    sigma = extractor._diagnostic_relative_sigma({"reduced_chi2": 10.0})
-
-    assert sigma == pytest.approx(1.0)
-
 
 def test_response_diagnostics_inflate_runtime_count_variance(
     monkeypatch: pytest.MonkeyPatch,
@@ -978,11 +960,23 @@ def test_shield_systematics_skip_zero_thickness_no_shield(
     )
 
 
+def _pure_runtime_with_count_method(method: str) -> dict[str, object]:
+    """Return a minimal current-schema runtime with one count extractor."""
+    return {
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
+        "variable_cardinality": False,
+        "pf_strength_prior_min_cps_1m": 0.0,
+        "pf_strength_prior_max_cps_1m": 2_000_000.0,
+        "spectrum_count_method": method,
+    }
+
+
 def test_runtime_rejects_peak_window_count_method(tmp_path: Path) -> None:
     """Runtime simulations should reject lower-fidelity peak-window counting."""
     config_path = tmp_path / "runtime.json"
     config_path.write_text(
-        json.dumps({"spectrum_count_method": "peak_window"}),
+        json.dumps(_pure_runtime_with_count_method("peak_window")),
         encoding="utf-8",
     )
 
@@ -999,7 +993,7 @@ def test_runtime_rejects_photopeak_nnls_count_method(tmp_path: Path) -> None:
     """Runtime simulations should keep photopeak NNLS out of PF ingestion."""
     config_path = tmp_path / "runtime.json"
     config_path.write_text(
-        json.dumps({"spectrum_count_method": "photopeak_nnls"}),
+        json.dumps(_pure_runtime_with_count_method("photopeak_nnls")),
         encoding="utf-8",
     )
 
@@ -1016,7 +1010,7 @@ def test_runtime_rejects_full_spectrum_response_count_method(tmp_path: Path) -> 
     """Runtime simulations should reject continuum-fitting count extraction."""
     config_path = tmp_path / "runtime.json"
     config_path.write_text(
-        json.dumps({"spectrum_count_method": "response_matrix"}),
+        json.dumps(_pure_runtime_with_count_method("response_matrix")),
         encoding="utf-8",
     )
 

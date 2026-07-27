@@ -17,6 +17,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from pf.provenance import canonical_json_bytes, json_safe
+from pf.runtime_route import (
+    RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY,
+    canonical_runtime_likelihood_route_mapping,
+    normalize_runtime_likelihood_route,
+)
 from runtime.forward_model_manifest import (
     CANONICAL_UNITS,
     REQUIRED_MODEL_NAMES,
@@ -162,6 +167,17 @@ class MeasurementLogValidationError(ValueError):
     """Report a schema, hash, shape, or forward-model incompatibility."""
 
 
+def _canonical_runtime_likelihood_routes(
+    value: object,
+    isotopes: Sequence[str],
+) -> dict[str, str]:
+    """Return validated station-level likelihood routes for a measurement log."""
+    try:
+        return canonical_runtime_likelihood_route_mapping(value, isotopes)
+    except ValueError as exc:
+        raise MeasurementLogValidationError(str(exc)) from exc
+
+
 @dataclass(frozen=True)
 class MeasurementLogRecord:
     """Store one ordered, estimator-independent measurement action."""
@@ -293,6 +309,18 @@ class MeasurementLogRecord:
                 )
         if not isinstance(self.metadata, Mapping):
             raise MeasurementLogValidationError("metadata must be an object.")
+        route_payload = self.metadata.get(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY)
+        if route_payload is not None:
+            if not isinstance(route_payload, Mapping) or not route_payload:
+                raise MeasurementLogValidationError(
+                    f"{RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY} must be a "
+                    "non-empty object."
+                )
+            try:
+                for route in route_payload.values():
+                    normalize_runtime_likelihood_route(route)
+            except ValueError as exc:
+                raise MeasurementLogValidationError(str(exc)) from exc
         _validate_truth_free_payload(self.metadata, location="record.metadata")
         try:
             canonical_json_bytes(dict(self.metadata))
@@ -568,6 +596,15 @@ def _validate_record_sequence(
                 raise MeasurementLogValidationError(
                     f"records[{index}] covariance must match manifest isotope order."
                 )
+        station_complete = record.metadata.get("station_complete", False)
+        route_payload = record.metadata.get(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY)
+        if bool(station_complete):
+            _canonical_runtime_likelihood_routes(route_payload, isotope_names)
+        elif route_payload is not None:
+            raise MeasurementLogValidationError(
+                f"{RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY} is writer-owned and "
+                "may appear only on a completed station record."
+            )
     return isotope_names
 
 
@@ -885,7 +922,12 @@ def _validate_run_manifest(payload: Mapping[str, Any]) -> dict[str, Any]:
         },
         location="run_manifest",
     )
-    if int(payload.get("schema_version", -1)) != MEASUREMENT_LOG_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != MEASUREMENT_LOG_SCHEMA_VERSION
+    ):
         raise MeasurementLogValidationError("run_manifest schema_version must be 1.")
     run_id = str(payload.get("run_id", "")).strip()
     repository_value = str(payload.get("repository_commit", "")).strip()
@@ -1916,28 +1958,7 @@ class MeasurementLogStreamWriter:
                     "next incomplete station."
                 )
 
-        effective_replay = staged_runtime.get("effective_pf_replay")
-        if isinstance(effective_replay, Mapping):
-            api_settings = effective_replay.get("api_settings")
-            if not isinstance(api_settings, Mapping):
-                raise MeasurementLogValidationError(
-                    "effective_pf_replay.api_settings must be an object."
-                )
-            update_settings = api_settings
-        else:
-            update_settings = staged_runtime
-        joint_update = update_settings.get("joint_observation_update", False)
-        delayed_update = update_settings.get("delayed_resample_update", False)
-        if not isinstance(joint_update, bool) or not isinstance(delayed_update, bool):
-            raise MeasurementLogValidationError(
-                "Station update modes must be booleans for live recovery."
-            )
         discarded_record_count = len(shard_entries) - prefix_record_count
-        if discarded_record_count > 0 and not (joint_update or delayed_update):
-            raise MeasurementLogValidationError(
-                "Only joint or delayed station updates may roll back an "
-                "incomplete station tail."
-            )
 
         prefix_metadata_bytes = b"".join(
             _json_line_bytes(
@@ -2126,17 +2147,20 @@ class MeasurementLogStreamWriter:
                 "station_complete is writer-owned and must be marked only after "
                 "the station acquisition finishes."
             )
+        if RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY in record.metadata:
+            raise MeasurementLogValidationError(
+                f"{RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY} is writer-owned and "
+                "must be marked only after the station acquisition finishes."
+            )
         if self.records:
             previous = self.records[-1]
-            joint_update, delayed_update = self._station_update_modes()
             if (
-                (joint_update or delayed_update)
-                and int(previous.station_id) != int(record.station_id)
+                int(previous.station_id) != int(record.station_id)
                 and not bool(previous.metadata.get("station_complete", False))
             ):
                 raise MeasurementLogValidationError(
-                    "A joint/delayed station must be durably marked complete "
-                    "before staging the next station."
+                    "A station must be durably marked complete before staging "
+                    "the next station."
                 )
             if bool(previous.metadata.get("station_complete", False)) and int(
                 previous.station_id
@@ -2176,6 +2200,7 @@ class MeasurementLogStreamWriter:
         self,
         station_id: int,
         *,
+        runtime_likelihood_route_by_isotope: Mapping[str, str],
         completion_metadata: Mapping[str, Any] | None = None,
     ) -> int:
         """Durably mark the last staged record as a causal station boundary."""
@@ -2203,6 +2228,15 @@ class MeasurementLogStreamWriter:
                 "station_complete is writer-owned and cannot appear in completion "
                 "metadata."
             )
+        if RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY in completion_payload:
+            raise MeasurementLogValidationError(
+                f"{RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY} is writer-owned and "
+                "must be supplied through its dedicated argument."
+            )
+        runtime_likelihood_routes = _canonical_runtime_likelihood_routes(
+            runtime_likelihood_route_by_isotope,
+            self.isotopes,
+        )
         conflicting_keys = sorted(set(record.metadata) & set(completion_payload))
         if conflicting_keys:
             raise MeasurementLogValidationError(
@@ -2214,6 +2248,7 @@ class MeasurementLogStreamWriter:
             metadata={
                 **dict(record.metadata),
                 **completion_payload,
+                RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY: runtime_likelihood_routes,
                 "station_complete": True,
             },
         )
@@ -2251,46 +2286,9 @@ class MeasurementLogStreamWriter:
         self.records[record_index] = completed
         return record_index
 
-    def _station_update_modes(self) -> tuple[bool, bool]:
-        """Return explicit station-level modes from canonical live provenance."""
-        effective = self.runtime_config.get("effective_pf_replay")
-        settings: Mapping[str, Any]
-        if effective is not None:
-            if not isinstance(effective, Mapping) or not isinstance(
-                effective.get("api_settings"), Mapping
-            ):
-                raise MeasurementLogValidationError(
-                    "effective_pf_replay.api_settings must be an object."
-                )
-            settings = effective["api_settings"]
-        else:
-            settings = self.runtime_config
-        resolved: dict[str, bool] = {}
-        for name in ("joint_observation_update", "delayed_resample_update"):
-            raw = settings.get(name)
-            if raw is None and effective is None:
-                resolved[name] = False
-                continue
-            if not isinstance(raw, bool):
-                raise MeasurementLogValidationError(
-                    f"The logged {name} mode must be a boolean."
-                )
-            if effective is not None:
-                top_level = self.runtime_config.get(name)
-                if top_level is not None:
-                    if not isinstance(top_level, bool) or top_level is not raw:
-                        raise MeasurementLogValidationError(
-                            f"Top-level {name} conflicts with the canonical "
-                            "effective_pf_replay API setting."
-                        )
-            resolved[name] = raw
-        joint = resolved["joint_observation_update"]
-        return joint, resolved["delayed_resample_update"] and not joint
-
     def finalize(self) -> MeasurementLog:
         """Consolidate staged records into the canonical hashed bundle."""
-        joint_update, delayed_update = self._station_update_modes()
-        if (joint_update or delayed_update) and self.records:
+        if self.records:
             for index, record in enumerate(self.records):
                 is_station_end = index + 1 == len(self.records) or int(
                     self.records[index + 1].station_id
@@ -2302,8 +2300,8 @@ class MeasurementLogStreamWriter:
                     )
                 if bool(marker) != bool(is_station_end):
                     raise MeasurementLogValidationError(
-                        "Every joint/delayed station must have exactly one causal "
-                        "station_complete marker on its final record."
+                        "Every station must have exactly one causal station_complete "
+                        "marker on its final record."
                     )
         result = write_measurement_log(
             self.output_dir,

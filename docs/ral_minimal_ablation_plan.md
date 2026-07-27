@@ -51,10 +51,9 @@ these mechanisms in one expensive run.
   elevation terms from DSS-PP. It tests whether ordinary information-driven
   planning is sufficient.
 
-The exact reversible-jump particle filter is shared by every variant. Deleted
-heuristic structural proposals, pseudo-source verification, and particle
-injection are not estimator ablations and must not be restored as replay or
-full-simulation variants.
+Every variant uses `pure_pf_schema_version: 1`, the `pf_strict` profile, and the
+same exact reversible-jump particle filter. Ablations vary only the declared
+shield and planning policies above.
 
 ## Generated Files
 

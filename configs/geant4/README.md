@@ -41,10 +41,3 @@ response provenance before returning any observation to the PF.
   thinning in reports.
 - `external_gui_scene.json`: explicit USD-backed Manchester Drum Store scene.
 - `shield_validation_scene.json`: material/shield validation config.
-
-Older duplicated or scene-specific configs are isolated under `legacy/`.
-They are archival inputs and some still document the former unlabelled
-fractional-history mode. The standard Python runtime rejects those values.
-Migrate a legacy config to full-history sampling, or use the explicit
-accelerated overlay and its uncertainty semantics; do not promote a legacy
-config back to the top-level runtime set unchanged.

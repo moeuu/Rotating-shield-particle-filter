@@ -22,38 +22,8 @@ def _count_likelihood_spec_for_estimator(
     estimator: RotatingShieldPFEstimator,
     isotope: str,
 ) -> CountLikelihoodSpec:
-    """Return an isotope spec while preserving lightweight estimator test doubles."""
-    getter = getattr(estimator, "count_likelihood_spec_for_isotope", None)
-    if callable(getter):
-        return getter(isotope)
-    config = estimator.pf_config
-
-    def _isotope_float(name: str) -> float:
-        """Resolve one scalar or isotope-mapped fallback configuration value."""
-        value = getattr(config, name, 0.0)
-        if isinstance(value, dict):
-            value = value.get(str(isotope), 0.0)
-        return float(value)
-
-    return CountLikelihoodSpec(
-        model=str(getattr(config, "count_likelihood_model", "poisson")),
-        transport_model_rel_sigma=_isotope_float("transport_model_rel_sigma"),
-        transport_model_abs_sigma=_isotope_float("transport_model_abs_sigma"),
-        spectrum_count_rel_sigma=_isotope_float("spectrum_count_rel_sigma"),
-        spectrum_count_abs_sigma=_isotope_float("spectrum_count_abs_sigma"),
-        low_count_abs_sigma=_isotope_float("low_count_abs_sigma"),
-        low_count_transition_counts=_isotope_float(
-            "low_count_transition_counts"
-        ),
-        observation_count_variance_includes_counting_noise=bool(
-            getattr(
-                config,
-                "observation_count_variance_includes_counting_noise",
-                False,
-            )
-        ),
-        student_t_df=float(getattr(config, "count_likelihood_df", 5.0)),
-    )
+    """Return the exact likelihood specification used by the isotope PF."""
+    return estimator.count_likelihood_spec_for_isotope(isotope)
 
 
 def _resolve_gpu_context(
@@ -833,37 +803,3 @@ def select_separation_orientations(
         (int(pair_id) // num_orients, int(pair_id) % num_orients)
         for pair_id in program.pair_ids[:program_length]
     ]
-
-
-def rotation_policy_step(
-    estimator: RotatingShieldPFEstimator,
-    pose_idx: int,
-    ig_threshold: float = 1e-3,
-    live_time_s: float = 0.5,
-) -> Tuple[bool, int, float]:
-    """
-    One step of the shield-rotation policy (Sec. 3.4.3, Eqs. 3.47–3.48).
-
-    - Compute expected IG for all orientations at the current pose using
-      the continuous particle states.
-    - If max IG is below the threshold, stop rotating.
-    - Otherwise select the best orientation (short acquisition suggested by live_time_s).
-
-    Returns:
-        (should_stop, orient_idx, score)
-    """
-    igs: List[float] = []
-    scores: List[float] = []
-    for oid in range(estimator.num_orientations):
-        ig = estimator.orientation_information_gain(
-            pose_idx=pose_idx,
-            orient_idx=oid,
-            live_time_s=live_time_s,
-        )
-        igs.append(ig)
-        scores.append(ig)
-    max_ig = max(igs) if igs else 0.0
-    if max_ig < ig_threshold:
-        return True, -1, 0.0
-    best_idx = int(np.argmax(scores))
-    return False, best_idx, float(scores[best_idx])

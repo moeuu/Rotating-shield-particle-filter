@@ -141,58 +141,39 @@ def _normalize_isotope_key(isotope: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", str(isotope)).upper()
 
 
-_TRANSPORT_RESPONSE_COEFFICIENT_ALIASES: dict[str, tuple[str, ...]] = {
-    "shield": ("shield", "shield_tau"),
-    "obstacle": ("obstacle", "obstacle_tau"),
-    "shield_squared": ("shield_squared", "shield_tau_squared"),
-    "obstacle_squared": ("obstacle_squared", "obstacle_tau_squared"),
-    "shield_obstacle": ("shield_obstacle", "shield_tau_obstacle_tau"),
-    "fe": ("fe", "fe_tau", "tau_fe"),
-    "pb": ("pb", "pb_tau", "tau_pb"),
-    "fe_squared": ("fe_squared", "fe_tau_squared", "tau_fe_squared"),
-    "pb_squared": ("pb_squared", "pb_tau_squared", "tau_pb_squared"),
-    "fe_pb": ("fe_pb", "fe_tau_pb_tau", "tau_fe_tau_pb"),
-    "fe_obstacle": (
-        "fe_obstacle",
-        "fe_tau_obstacle_tau",
-        "tau_fe_tau_obstacle",
-    ),
-    "pb_obstacle": (
-        "pb_obstacle",
-        "pb_tau_obstacle_tau",
-        "tau_pb_tau_obstacle",
-    ),
-    "distance": (
+_TRANSPORT_RESPONSE_COEFFICIENT_KEYS = frozenset(
+    {
         "distance",
-        "distance_m",
-        "source_distance",
-        "source_detector_distance_m",
-    ),
-    "distance_shield": (
-        "distance_shield",
-        "distance_shield_tau",
-        "shield_distance",
-        "source_distance_shield_tau",
-    ),
-    "distance_fe": (
         "distance_fe",
-        "distance_fe_tau",
-        "fe_distance",
-        "source_distance_fe_tau",
-    ),
-    "distance_pb": (
-        "distance_pb",
-        "distance_pb_tau",
-        "pb_distance",
-        "source_distance_pb_tau",
-    ),
-    "distance_obstacle": (
         "distance_obstacle",
-        "distance_obstacle_tau",
-        "obstacle_distance",
-        "source_distance_obstacle_tau",
-    ),
-}
+        "distance_pb",
+        "distance_shield",
+        "fe",
+        "fe_obstacle",
+        "fe_pb",
+        "fe_squared",
+        "obstacle",
+        "obstacle_squared",
+        "pb",
+        "pb_obstacle",
+        "pb_squared",
+        "shield",
+        "shield_obstacle",
+        "shield_squared",
+    }
+)
+_TRANSPORT_RESPONSE_CAP_KEYS = frozenset(
+    {
+        "distance_fe",
+        "distance_obstacle",
+        "distance_pb",
+        "distance_shield",
+        "fe",
+        "obstacle",
+        "pb",
+        "shield",
+    }
+)
 
 
 def transport_response_payload_for_isotope(
@@ -225,17 +206,21 @@ def transport_response_coefficients_from_payload(
         return {}, float(default_min_log), float(default_max_log)
     coeffs = payload.get("tau_coefficients", {})
     if not isinstance(coeffs, dict):
-        coeffs = {}
-    parsed: dict[str, float] = {}
-    for canonical, keys in _TRANSPORT_RESPONSE_COEFFICIENT_ALIASES.items():
-        for key in keys:
-            if key in coeffs:
-                parsed[canonical] = float(coeffs[key])
-                break
+        raise ValueError("tau_coefficients must be an object.")
+    unknown = sorted(set(coeffs) - _TRANSPORT_RESPONSE_COEFFICIENT_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unsupported tau_coefficients settings: " + ", ".join(unknown)
+        )
+    parsed = {
+        key: float(coeffs[key])
+        for key in _TRANSPORT_RESPONSE_COEFFICIENT_KEYS
+        if key in coeffs
+    }
     min_log = float(payload.get("min_log_scale", default_min_log))
     max_log = float(payload.get("max_log_scale", default_max_log))
     if max_log < min_log:
-        min_log, max_log = max_log, min_log
+        raise ValueError("max_log_scale must be greater than or equal to min_log_scale.")
     return parsed, min_log, max_log
 
 
@@ -252,37 +237,37 @@ def transport_response_feature_caps_from_payload(
     float | None,
 ]:
     """Return optional optical-depth feature caps from one payload."""
-    caps = payload.get("tau_feature_caps", payload.get("feature_caps", {}))
+    if "feature_caps" in payload:
+        raise ValueError(
+            "feature_caps is retired; use the canonical tau_feature_caps field."
+        )
+    caps = payload.get("tau_feature_caps", {})
     if not isinstance(caps, dict):
-        return None, None, None, None, None, None, None, None
+        raise ValueError("tau_feature_caps must be an object.")
+    unknown = sorted(set(caps) - _TRANSPORT_RESPONSE_CAP_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unsupported tau_feature_caps settings: " + ", ".join(unknown)
+        )
 
-    def _cap_value(*names: str) -> float | None:
-        """Return the first finite nonnegative cap from candidate keys."""
-        for name in names:
-            if name not in caps:
-                continue
-            value = float(caps[name])
-            if np.isfinite(value) and value >= 0.0:
-                return value
+    def _cap_value(name: str) -> float | None:
+        """Return one finite nonnegative cap when configured."""
+        if name not in caps:
+            return None
+        value = float(caps[name])
+        if np.isfinite(value) and value >= 0.0:
+            return value
         return None
 
     return (
-        _cap_value("shield", "shield_tau", "tau_shield"),
-        _cap_value("obstacle", "obstacle_tau", "tau_obstacle"),
-        _cap_value("fe", "fe_tau", "tau_fe"),
-        _cap_value("pb", "pb_tau", "tau_pb"),
-        _cap_value(
-            "distance_shield",
-            "distance_shield_tau",
-            "source_distance_shield_tau",
-        ),
-        _cap_value("distance_fe", "distance_fe_tau", "source_distance_fe_tau"),
-        _cap_value("distance_pb", "distance_pb_tau", "source_distance_pb_tau"),
-        _cap_value(
-            "distance_obstacle",
-            "distance_obstacle_tau",
-            "source_distance_obstacle_tau",
-        ),
+        _cap_value("shield"),
+        _cap_value("obstacle"),
+        _cap_value("fe"),
+        _cap_value("pb"),
+        _cap_value("distance_shield"),
+        _cap_value("distance_fe"),
+        _cap_value("distance_pb"),
+        _cap_value("distance_obstacle"),
     )
 
 

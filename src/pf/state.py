@@ -18,8 +18,6 @@ class IsotopeState:
     positions: NDArray[np.float64]  # shape (r_h,3)
     strengths: NDArray[np.float64]  # shape (r_h,)
     background: float
-    # Optional shape (r_h, 4, 4) across (x, y, z, q).
-    covariances: NDArray[np.float64] | None = None
 
     def copy(self) -> "IsotopeState":
         """Return a deep copy of the isotope state arrays."""
@@ -28,5 +26,4 @@ class IsotopeState:
             positions=self.positions.copy(),
             strengths=self.strengths.copy(),
             background=float(self.background),
-            covariances=None if self.covariances is None else self.covariances.copy(),
         )

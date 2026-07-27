@@ -8,6 +8,8 @@ from measurement.continuous_kernels import (
     finite_sphere_geometric_term,
     geometric_term,
     segment_rotated_octant_shell_path_length_cm_torch,
+    transport_response_coefficients_from_payload,
+    transport_response_feature_caps_from_payload,
 )
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
@@ -16,7 +18,30 @@ from measurement.shielding import (
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
 )
 from measurement.continuous_kernels import expected_counts_single_isotope
-from pf.gpu_utils import expected_counts_all_pairs_torch, expected_counts_pair_torch
+
+
+def test_transport_response_rejects_historical_coefficient_aliases() -> None:
+    """Transport-response files must use canonical schema-v1 coefficient names."""
+    with pytest.raises(ValueError, match="Unsupported tau_coefficients"):
+        transport_response_coefficients_from_payload(
+            {"tau_coefficients": {"shield_tau": 0.1}}
+        )
+
+
+def test_transport_response_rejects_historical_feature_cap_aliases() -> None:
+    """Transport-response files must use canonical feature-cap names."""
+    with pytest.raises(ValueError, match="Unsupported tau_feature_caps"):
+        transport_response_feature_caps_from_payload(
+            {"tau_feature_caps": {"shield_tau": 1.0}}
+        )
+
+
+def test_transport_response_rejects_historical_feature_caps_wrapper() -> None:
+    """Transport-response files must not accept the old feature_caps wrapper."""
+    with pytest.raises(ValueError, match="feature_caps is retired"):
+        transport_response_feature_caps_from_payload(
+            {"feature_caps": {"shield": 1.0}}
+        )
 
 
 def test_geometric_term_inverse_square() -> None:
@@ -861,160 +886,7 @@ def test_concrete_obstacle_misses_off_axis_ray() -> None:
     ) == pytest.approx(1.0)
 
 
-def test_gpu_expected_counts_include_obstacle_attenuation_on_cpu_device() -> None:
-    """The torch expected-count path should apply the same obstacle attenuation."""
-    torch = pytest.importorskip("torch")
-    device = torch.device("cpu")
-    dtype = torch.float64
-    positions = torch.as_tensor([[[-1.0, 0.0, 1.0]]], device=device, dtype=dtype)
-    strengths = torch.as_tensor([[9.0]], device=device, dtype=dtype)
-    backgrounds = torch.zeros(1, device=device, dtype=dtype)
-    mask = torch.ones(1, 1, device=device, dtype=dtype)
-    detector = np.array([2.0, 0.0, 1.0], dtype=float)
-    boxes = np.array([[0.0, -0.5, 0.0, 1.0, 0.5, 2.0]], dtype=float)
 
-    counts = expected_counts_pair_torch(
-        detector_pos=detector,
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_index=0,
-        pb_index=0,
-        mu_fe=0.0,
-        mu_pb=0.0,
-        thickness_fe_cm=0.0,
-        thickness_pb_cm=0.0,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-        obstacle_boxes_m=boxes,
-        obstacle_mu_cm_inv=0.01,
-    )
-    expected = (9.0 / 9.0) * np.exp(-1.0)
-    assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
-
-
-def test_gpu_expected_counts_all_pairs_matches_pair_loop() -> None:
-    """The batched all-pair GPU helper should match scalar pair evaluation."""
-    torch = pytest.importorskip("torch")
-    device = torch.device("cpu")
-    dtype = torch.float64
-    positions = torch.as_tensor(
-        [
-            [[-1.0, 0.0, 1.0], [-0.5, 0.4, 0.9]],
-            [[1.2, -0.8, 1.1], [0.2, 1.1, 0.7]],
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    strengths = torch.as_tensor(
-        [[9.0, 4.0], [6.0, 3.0]],
-        device=device,
-        dtype=dtype,
-    )
-    backgrounds = torch.as_tensor([0.1, 0.2], device=device, dtype=dtype)
-    mask = torch.ones(2, 2, device=device, dtype=dtype)
-    detector = np.array([2.0, 0.25, 1.0], dtype=float)
-    boxes = np.array(
-        [
-            [0.0, -0.5, 0.0, 1.0, 0.5, 2.0],
-            [0.5, 0.7, 0.0, 1.0, 1.2, 1.5],
-        ],
-        dtype=float,
-    )
-    for aperture_samples in (1, 3):
-        all_pairs = expected_counts_all_pairs_torch(
-            detector_pos=detector,
-            positions=positions,
-            strengths=strengths,
-            backgrounds=backgrounds,
-            mask=mask,
-            mu_fe=0.03,
-            mu_pb=0.06,
-            thickness_fe_cm=1.5,
-            thickness_pb_cm=0.8,
-            inner_radius_fe_cm=3.0,
-            inner_radius_pb_cm=4.5,
-            live_time_s=2.0,
-            device=device,
-            dtype=dtype,
-            obstacle_boxes_m=boxes,
-            obstacle_mu_cm_inv=0.01,
-            detector_radius_m=0.04,
-            detector_aperture_samples=aperture_samples,
-            buildup_fe_coeff=0.02,
-            buildup_pb_coeff=0.01,
-            obstacle_buildup_coeff=0.03,
-        )
-        rows = []
-        for fe_idx in range(8):
-            for pb_idx in range(8):
-                rows.append(
-                    expected_counts_pair_torch(
-                        detector_pos=detector,
-                        positions=positions,
-                        strengths=strengths,
-                        backgrounds=backgrounds,
-                        mask=mask,
-                        fe_index=fe_idx,
-                        pb_index=pb_idx,
-                        mu_fe=0.03,
-                        mu_pb=0.06,
-                        thickness_fe_cm=1.5,
-                        thickness_pb_cm=0.8,
-                        inner_radius_fe_cm=3.0,
-                        inner_radius_pb_cm=4.5,
-                        live_time_s=2.0,
-                        device=device,
-                        dtype=dtype,
-                        obstacle_boxes_m=boxes,
-                        obstacle_mu_cm_inv=0.01,
-                        detector_radius_m=0.04,
-                        detector_aperture_samples=aperture_samples,
-                        buildup_fe_coeff=0.02,
-                        buildup_pb_coeff=0.01,
-                        obstacle_buildup_coeff=0.03,
-                    )
-                )
-        pair_loop = torch.stack(rows, dim=0)
-        assert all_pairs.shape == pair_loop.shape
-        assert torch.allclose(all_pairs, pair_loop, rtol=1e-10, atol=1e-10)
-
-
-def test_gpu_expected_counts_use_exact_spherical_shell_overlap() -> None:
-    """The torch expected-count path should match exact spherical-shell path length."""
-    torch = pytest.importorskip("torch")
-    device = torch.device("cpu")
-    dtype = torch.float64
-    direction = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
-    source_distance_m = (DEFAULT_FE_SHIELD_INNER_RADIUS_CM + 0.55) / 100.0
-    source = direction * source_distance_m
-    positions = torch.as_tensor(source.reshape(1, 1, 3), device=device, dtype=dtype)
-    strengths = torch.ones(1, 1, device=device, dtype=dtype)
-    backgrounds = torch.zeros(1, device=device, dtype=dtype)
-    mask = torch.ones(1, 1, device=device, dtype=dtype)
-
-    counts = expected_counts_pair_torch(
-        detector_pos=np.zeros(3, dtype=float),
-        positions=positions,
-        strengths=strengths,
-        backgrounds=backgrounds,
-        mask=mask,
-        fe_index=7,
-        pb_index=0,
-        mu_fe=0.1,
-        mu_pb=0.0,
-        thickness_fe_cm=5.0,
-        thickness_pb_cm=0.0,
-        inner_radius_fe_cm=DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
-        inner_radius_pb_cm=DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
-        live_time_s=1.0,
-        device=device,
-        dtype=dtype,
-    )
-    expected = (1.0 / (source_distance_m**2)) * np.exp(-0.055)
-    assert float(counts[0]) == pytest.approx(expected, rel=1e-12)
 
 
 def test_continuous_kernel_cuda_matches_cpu_with_detector_aperture() -> None:

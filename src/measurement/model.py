@@ -50,11 +50,6 @@ class PointSource:
         """Return the position as a NumPy array."""
         return np.array(self.position, dtype=float)
 
-    @property
-    def strength(self) -> float:
-        """Backward-compatible strength accessor (detector cps at 1 m)."""
-        return self.intensity_cps_1m
-
 
 def inverse_square_scale(detector: np.ndarray, source: PointSource) -> float:
     """

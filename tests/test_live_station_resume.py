@@ -12,9 +12,9 @@ import pytest
 from pf.profiles import apply_profile_to_config
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import RotatingShieldPFConfig
-from pf.replay import PFReplayError, build_replay_estimator
+from pf.replay import build_replay_estimator
+from pf.runtime_route import RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
 from realtime_demo import (
-    _advance_resume_planning_candidate_rng,
     _build_effective_live_runtime_config,
     _build_resume_compatibility_provenance,
     _build_resume_replay_estimator,
@@ -23,9 +23,7 @@ from realtime_demo import (
     _planning_candidate_checkpoint_parameters,
     _reconstruct_resume_controller_state,
     _restore_live_controller_checkpoint,
-    _restore_remaining_measurement_history,
 )
-from planning.remaining_measurements import RemainingMeasurementConfig
 from runtime.measurement_log import (
     MeasurementLogStreamWriter,
     MeasurementLogValidationError,
@@ -35,6 +33,7 @@ from runtime.measurement_log import (
 from tests.pure_pf_test_support import (
     TEST_COMMIT,
     TEST_ISOTOPES,
+    count_likelihood_routes,
     environment,
     make_measurement_log,
     records,
@@ -51,8 +50,8 @@ def _stream_writer(
     config = {
         **runtime_config(),
         "candidate_isotopes": list(TEST_ISOTOPES),
-        "joint_observation_update": True,
-        "delayed_resample_update": False,
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
     }
     env = environment()
     config_hash = sha256(canonical_json_bytes(config)).hexdigest()
@@ -76,11 +75,15 @@ def _stream_writer(
     first, second, third, fourth = records(4)
     writer.append_before_update(first)
     writer.append_before_update(second)
-    writer.mark_station_complete_before_update(0)
+    writer.mark_station_complete_before_update(
+        0,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     writer.append_before_update(third)
     writer.append_before_update(fourth)
     writer.mark_station_complete_before_update(
         1,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
         completion_metadata=final_completion_metadata,
     )
     return writer, config, env, forward
@@ -145,10 +148,10 @@ def test_online_compute_timing_scope_distinguishes_resumed_suffix() -> None:
         _online_compute_timing_provenance(-1)
 
 
-def test_resume_replay_uses_logged_effective_pf_over_legacy_alias(
+def test_resume_replay_restores_logged_effective_pf_config(
     tmp_path: Path,
 ) -> None:
-    """Resume must not reinterpret legacy top-level fields as PF overrides."""
+    """Resume must restore the exact logged pure-PF configuration."""
     candidates = np.asarray(
         [
             [x, y, z]
@@ -163,18 +166,19 @@ def test_resume_replay_uses_logged_effective_pf_over_legacy_alias(
         num_particles=12,
         max_sources=2,
         init_num_sources=[1, 1],
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         parallel_isotope_updates=False,
-        position_min=(0.0, 0.0, 0.0),
         position_max=(2.0, 2.0, 1.5),
-        converge_min_stations=0,
+        strength_prior_min_cps_1m=0.0,
+        strength_prior_max_cps_1m=2_000_000.0,
     )
     apply_profile_to_config(pf_config)
     effective_runtime = _build_effective_live_runtime_config(
         {
             **runtime_config(),
-            "converge_min_stations": 4,
+            "pure_pf_schema_version": 1,
+            "estimator_profile": "pf_strict",
         },
         pf_config=pf_config,
         candidate_sources_xyz=candidates,
@@ -184,10 +188,7 @@ def test_resume_replay_uses_logged_effective_pf_over_legacy_alias(
         ),
         api_settings={
             "candidate_grid_spacing_m": [2.0, 2.0, 1.5],
-            "source_surface_prior": True,
             "obstacle_height_m": 1.0,
-            "joint_observation_update": True,
-            "delayed_resample_update": False,
             "pf_random_seed": 41,
         },
     )
@@ -200,22 +201,23 @@ def test_resume_replay_uses_logged_effective_pf_over_legacy_alias(
         )
     )
 
-    with pytest.raises(PFReplayError, match="converge_min_stations"):
-        build_replay_estimator(
-            log,
-            effective_runtime,
-            profile="pf_strict",
-            seed=41,
-        )
-
-    estimator = _build_resume_replay_estimator(
+    direct = build_replay_estimator(
+        log,
+        effective_runtime,
+        profile="pf_strict",
+        seed=41,
+    )
+    resumed = _build_resume_replay_estimator(
         log,
         profile="pf_strict",
         seed=41,
         config_hash=sha256_json(effective_runtime),
         resolved_config_hash=str(log.resolved_config_sha256),
     )
-    assert estimator.pf_config.converge_min_stations == 0
+    assert resumed.pf_config.num_particles == 12
+    assert resumed.pf_config.position_max == (2.0, 2.0, 1.5)
+    assert resumed.pf_config.strength_prior_max_cps_1m == 2_000_000.0
+    assert resumed.serialized_state() == direct.serialized_state()
 
 
 def test_resume_compatibility_requires_every_runtime_delta_explicitly(
@@ -323,7 +325,10 @@ def test_stream_stage_adopts_old_prefix_and_continues_without_overwrite(
 
     fifth = records(5)[4]
     assert resumed.append_before_update(fifth) == 4
-    resumed.mark_station_complete_before_update(2)
+    resumed.mark_station_complete_before_update(
+        2,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     finalized = resumed.finalize()
     assert stage.exists()
     assert _tree_hashes(stage) == source_hashes
@@ -373,7 +378,10 @@ def test_stream_stage_rolls_back_partial_station_and_can_resume_twice(
     assert _tree_hashes(first_fork) == first_fork_hashes
 
     second_resume.append_before_update(fifth)
-    second_resume.mark_station_complete_before_update(2)
+    second_resume.mark_station_complete_before_update(
+        2,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     finalized = second_resume.finalize()
     assert len(finalized.records) == 5
     assert not second_fork.exists()
@@ -473,6 +481,7 @@ def test_stream_stage_resume_rejects_incomplete_station_boundary(
     ]
     for row in rows:
         row["metadata"].pop("station_complete", None)
+        row["metadata"].pop(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY, None)
     writer.metadata_stage_path.write_text(
         "".join(
             json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
@@ -553,7 +562,6 @@ def test_controller_checkpoint_survives_stage_adoption_and_restores_rng(
         ),
         estimator=Estimator(),  # type: ignore[arg-type]
         max_poses=22,
-        soft_pose_extension_used=2,
         ig_max_global=4.5,
         ig_max_pose=1.5,
         ig_threshold_current=0.2,
@@ -577,7 +585,6 @@ def test_controller_checkpoint_survives_stage_adoption_and_restores_rng(
         {"budget": 7.5, "predicted_gain": 2.5},
     )
     assert restored.max_poses == 22
-    assert restored.soft_pose_extension_used == 2
     assert restored.ig_max_global == 4.5
     assert restored.ig_max_pose == 1.5
     assert restored.ig_threshold_current == 0.2
@@ -608,7 +615,6 @@ def test_controller_checkpoint_rejects_candidate_parameter_drift(
         remaining_measurement_estimates=(),
         estimator=Estimator(),  # type: ignore[arg-type]
         max_poses=2,
-        soft_pose_extension_used=0,
         ig_max_global=0.0,
         ig_max_pose=0.0,
         ig_threshold_current=0.1,
@@ -625,98 +631,3 @@ def test_controller_checkpoint_rejects_candidate_parameter_drift(
             planning_candidate_rng=np.random.default_rng(5),
             expected_planning_candidate_parameters=drifted,
         )
-
-
-def test_candidate_rng_replays_each_historical_transition(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Candidate RNG advancement makes one call per prior station transition."""
-    marked = records(4, station_complete_markers=True)
-    expected_next = [
-        np.asarray(marked[2].detector_pose_xyz, dtype=float),
-    ]
-    calls: list[tuple[np.ndarray, np.ndarray, float]] = []
-
-    def _fake_generate(**kwargs: object) -> tuple[np.ndarray, bool, float]:
-        """Consume RNG once and return the recorded next station."""
-        rng = kwargs["rng"]
-        assert isinstance(rng, np.random.Generator)
-        draw = float(rng.random())
-        calls.append(
-            (
-                np.asarray(kwargs["current_pose_xyz"], dtype=float),
-                np.asarray(kwargs["visited_poses_xyz"], dtype=float),
-                draw,
-            )
-        )
-        return expected_next[len(calls) - 1][None, :], False, 1.0
-
-    monkeypatch.setattr("realtime_demo._generate_planning_candidates", _fake_generate)
-    rng = np.random.default_rng(17)
-    reference = np.random.default_rng(17)
-    _advance_resume_planning_candidate_rng(
-        rng=rng,
-        records=marked,
-        map_api=None,
-        n_candidates=8,
-        min_dist_from_visited=1.0,
-        bounds_xyz=(np.zeros(3), np.ones(3) * 2.0),
-        detector_heights_m=(0.4,),
-        continuous_height_anchor_count=0,
-        height_partner_xy_tolerance_m=1.0e-9,
-        height_partner_z_tolerance_m=1.0e-9,
-        height_partner_min_z_separation_m=0.0,
-    )
-    assert len(calls) == 1
-    assert calls[0][1].shape == (1, 3)
-    assert calls[0][2] == reference.random()
-    assert rng.random() == reference.random()
-
-
-def test_remaining_history_restores_eta_state_from_structured_log(
-    tmp_path: Path,
-) -> None:
-    """Structured next-budget diagnostics restore history without PF refitting."""
-    marked = records(4, station_complete_markers=True)
-    detail = {
-        "components": {
-            "uncertainty": 2.0,
-            "cardinality": 1.0,
-            "same_isotope_separation": 0.0,
-            "residual": 3.0,
-            "high_surface_ambiguity": 0.0,
-            "isotope_absence": 0.0,
-        },
-        "gains": {
-            "uncertainty": 1.0,
-            "same_isotope_separation": 0.0,
-            "residual": 1.0,
-            "high_surface_ambiguity": 0.0,
-            "dss_information": 0.5,
-        },
-        "isotopes": {"Cs-137": {"residual_chi2": 3.0}},
-    }
-    log_path = tmp_path / "runtime.log"
-    log_path.write_text(
-        "Remaining measurement detail[pose_0_next]: "
-        f"components={json.dumps(detail['components'])} "
-        f"gains={json.dumps(detail['gains'])} "
-        f"isotopes={json.dumps(detail['isotopes'])}\n",
-        encoding="utf-8",
-    )
-
-    class Estimator:
-        """Dynamic history target used by the restoration helper."""
-
-    estimator = Estimator()
-    payloads = _restore_remaining_measurement_history(
-        estimator=estimator,  # type: ignore[arg-type]
-        records=marked,
-        runtime_log_path=log_path,
-        config=RemainingMeasurementConfig(),
-    )
-    assert len(payloads) == 1
-    assert payloads[0]["current_station_count"] == 1
-    assert payloads[0]["next_pose"] == list(marked[2].detector_pose_xyz)
-    assert len(estimator._remaining_measurement_budget_history) == 1
-    assert estimator._remaining_measurement_eta_ratios == []

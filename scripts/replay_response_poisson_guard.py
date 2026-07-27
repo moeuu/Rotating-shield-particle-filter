@@ -24,6 +24,7 @@ from pf.likelihood import (
     DEFAULT_GEANT4_SPECTRUM_COUNT_REL_SIGMA,
     DEFAULT_GEANT4_TRANSPORT_MODEL_ABS_SIGMA,
     DEFAULT_GEANT4_TRANSPORT_MODEL_REL_SIGMA,
+    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
     count_likelihood_variance,
 )
 from measurement.observation_model import build_runtime_observation_model
@@ -462,28 +463,20 @@ def _replay_case(
 
 def _runtime_likelihood_settings(
     runtime_config: dict[str, object],
-) -> dict[str, bool | float]:
-    """Return PF likelihood variance settings from nested or legacy config keys."""
+) -> dict[str, float | str]:
+    """Return PF likelihood variance settings from the versioned nested block."""
     payload = runtime_config.get("pf_count_likelihood", {})
-    likelihood = payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        raise ValueError("pf_count_likelihood must be an object.")
+    likelihood = payload
 
     def value(name: str, default: float) -> float:
         """Return one likelihood parameter value."""
-        if name in likelihood:
-            return float(likelihood[name])
-        legacy_name = f"pf_{name}"
-        if legacy_name in runtime_config:
-            return float(runtime_config[legacy_name])
-        return float(default)
+        return float(likelihood.get(name, default))
 
-    def boolean_value(name: str, default: bool) -> bool:
-        """Return one boolean likelihood parameter value."""
-        if name in likelihood:
-            return bool(likelihood[name])
-        legacy_name = f"pf_{name}"
-        if legacy_name in runtime_config:
-            return bool(runtime_config[legacy_name])
-        return bool(default)
+    def string_value(name: str, default: str) -> str:
+        """Return one string likelihood parameter value."""
+        return str(likelihood.get(name, default))
 
     return {
         "transport_model_rel_sigma": max(
@@ -525,9 +518,9 @@ def _runtime_likelihood_settings(
             ),
             0.0,
         ),
-        "observation_count_variance_includes_counting_noise": boolean_value(
-            "observation_count_variance_includes_counting_noise",
-            False,
+        "observation_count_variance_semantics": string_value(
+            "observation_count_variance_semantics",
+            OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
         ),
     }
 

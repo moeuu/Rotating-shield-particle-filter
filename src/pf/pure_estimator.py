@@ -15,11 +15,11 @@ from pf.estimator import (
 from pf.posterior import (
     PFPointEstimate,
     PFPosteriorSnapshot,
-    PFSourceMode,
     cardinality_distribution_from_states,
     posterior_point_estimate_from_states,
 )
 from pf.profiles import (
+    PURE_PF_SCHEMA_VERSION,
     apply_profile_to_config,
     resolve_structural_transition_provenance,
 )
@@ -57,7 +57,7 @@ def _resolved_cardinality_prior(
     config: RotatingShieldPFConfig,
 ) -> tuple[tuple[int, ...], tuple[float, ...], str]:
     """Return resolved cardinality support, normalized mass, and its source."""
-    if not bool(config.birth_enable):
+    if not bool(config.variable_cardinality):
         fixed_cardinality = int(config.init_num_sources[0])
         return (fixed_cardinality,), (1.0,), "fixed_init_num_sources"
     max_sources = config.max_sources
@@ -98,7 +98,7 @@ class PurePFEstimator(_PFEstimatorCore):
 
     def __init__(
         self,
-        *args: Any,
+        *,
         measurement_log_schema_version: int = 1,
         config_hash: str | None = None,
         resolved_config_hash: str | None = None,
@@ -107,32 +107,26 @@ class PurePFEstimator(_PFEstimatorCore):
         **kwargs: Any,
     ) -> None:
         """Initialize the PF and its immutable result provenance."""
-        positional_args = list(args)
-        if "pf_config" in kwargs:
-            pure_config = kwargs["pf_config"]
-            if pure_config is None:
-                pure_config = RotatingShieldPFConfig()
-                kwargs["pf_config"] = pure_config
-        elif len(positional_args) > 4:
-            pure_config = positional_args[4]
-            if pure_config is None:
-                pure_config = RotatingShieldPFConfig()
-                positional_args[4] = pure_config
-        else:
+        pure_config = kwargs.get("pf_config")
+        if pure_config is None:
             pure_config = RotatingShieldPFConfig()
             kwargs["pf_config"] = pure_config
         capabilities = apply_profile_to_config(pure_config)
-        super().__init__(*positional_args, **kwargs)
+        super().__init__(**kwargs)
         if apply_profile_to_config(self.pf_config) != capabilities:
             raise PurePFBoundaryError(
                 "PF capabilities changed during estimator initialization."
             )
         self.profile_capabilities = capabilities
-        self.measurement_log_schema_version = int(measurement_log_schema_version)
-        if self.measurement_log_schema_version != 1:
+        if (
+            isinstance(measurement_log_schema_version, bool)
+            or not isinstance(measurement_log_schema_version, int)
+            or measurement_log_schema_version != 1
+        ):
             raise ValueError(
                 "PurePFEstimator supports MeasurementLog schema version 1."
             )
+        self.measurement_log_schema_version = measurement_log_schema_version
         self.resolved_config_hash = (
             str(resolved_config_hash)
             if resolved_config_hash is not None
@@ -154,59 +148,73 @@ class PurePFEstimator(_PFEstimatorCore):
 
     def structural_transition_diagnostics(self) -> dict[str, bool | str]:
         """Return target-preservation provenance for structural moves."""
-        return resolve_structural_transition_provenance(
+        provenance = resolve_structural_transition_provenance(
             self.pf_config,
             capabilities=self.profile_capabilities,
         ).to_dict()
+        variable_cardinality = bool(self.pf_config.variable_cardinality)
+        provenance.update(
+            {
+                "support_domain": "environment_surface",
+                "structural_moves_enabled": True,
+                "variable_cardinality": variable_cardinality,
+                "birth_death_moves_enabled": variable_cardinality,
+                "within_cardinality_moves_enabled": True,
+                "within_cardinality_kernel_exact_mh": True,
+            }
+        )
+        if not variable_cardinality:
+            provenance.update(
+                {
+                    "posterior_semantics": (
+                        "fixed_cardinality_sequential_particle_filter_with_"
+                        "target_preserving_mh_rejuvenation"
+                    ),
+                    "structural_kernel_family": (
+                        "fixed_cardinality_surface_position_strength_mh"
+                    ),
+                }
+            )
+        return provenance
 
     def structural_model_manifest(self) -> dict[str, Any]:
         """Return outcome-independent structural-prior and RJ-kernel provenance."""
         support, probabilities, prior_source = _resolved_cardinality_prior(
             self.pf_config
         )
-        structural_moves_enabled = bool(self.pf_config.birth_enable)
-        exact_enabled = structural_moves_enabled
-        surface_prior_enabled = True
+        variable_cardinality = bool(self.pf_config.variable_cardinality)
         configured_isotopes = sorted(
-            {
-                str(isotope)
-                for isotope in (
-                    *getattr(self, "all_isotopes", ()),
-                    *getattr(self, "isotopes", ()),
-                    *getattr(self, "filters", {}).keys(),
-                )
-            }
+            {str(isotope) for isotope in self.isotopes}
         )
         dictionary_groups: dict[str, dict[str, Any]] = {}
         missing_isotopes: list[str] = []
-        if surface_prior_enabled:
-            for isotope in configured_isotopes:
-                filt = self.filters.get(isotope)
-                patches = (
-                    None
-                    if filt is None
-                    else getattr(filt, "_structural_rj_surface_patches", None)
-                )
-                if patches is None:
-                    missing_isotopes.append(isotope)
-                    continue
-                centers = np.asarray(patches.centers_xyz, dtype=float)
-                areas = np.asarray(patches.areas_m2, dtype=float)
-                dictionary_hash = _ordered_surface_dictionary_sha256(
-                    centers,
-                    areas,
-                )
-                group = dictionary_groups.setdefault(
-                    dictionary_hash,
-                    {
-                        "ordered_centers_areas_sha256": dictionary_hash,
-                        "patch_count": int(patches.patch_count),
-                        "total_area_m2": float(np.sum(areas, dtype=np.float64)),
-                        "geometry_metadata": dict(patches.geometry_metadata),
-                        "isotopes": [],
-                    },
-                )
-                group["isotopes"].append(isotope)
+        for isotope in configured_isotopes:
+            filt = self.filters.get(isotope)
+            patches = (
+                None
+                if filt is None
+                else getattr(filt, "_structural_rj_surface_patches", None)
+            )
+            if patches is None:
+                missing_isotopes.append(isotope)
+                continue
+            centers = np.asarray(patches.centers_xyz, dtype=float)
+            areas = np.asarray(patches.areas_m2, dtype=float)
+            dictionary_hash = _ordered_surface_dictionary_sha256(
+                centers,
+                areas,
+            )
+            group = dictionary_groups.setdefault(
+                dictionary_hash,
+                {
+                    "ordered_centers_areas_sha256": dictionary_hash,
+                    "patch_count": int(patches.patch_count),
+                    "total_area_m2": float(np.sum(areas, dtype=np.float64)),
+                    "geometry_metadata": dict(patches.geometry_metadata),
+                    "isotopes": [],
+                },
+            )
+            group["isotopes"].append(isotope)
         if not dictionary_groups:
             dictionary_status = "not_initialized"
             dictionaries_identical: bool | None = None
@@ -240,12 +248,20 @@ class PurePFEstimator(_PFEstimatorCore):
         )
         return {
             "schema_version": 1,
+            "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION,
             "manifest_completeness": manifest_completeness,
-            "structural_moves_enabled": structural_moves_enabled,
+            "support_domain": "environment_surface",
+            "structural_moves_enabled": True,
+            "variable_cardinality": variable_cardinality,
+            "birth_death_moves_enabled": variable_cardinality,
+            "within_cardinality_moves_enabled": True,
+            "structural_kernel_target_preserving": True,
+            "within_cardinality_kernel_exact_mh": True,
+            "structural_kernel_exact_rj": variable_cardinality,
             "structural_kernel_family": (
                 "area_weighted_surface_birth_death_rj_mh"
-                if structural_moves_enabled
-                else "fixed_cardinality_no_structural_moves"
+                if variable_cardinality
+                else "fixed_cardinality_surface_position_strength_mh"
             ),
             "cardinality_prior": {
                 "support": [int(value) for value in support],
@@ -254,21 +270,20 @@ class PurePFEstimator(_PFEstimatorCore):
                 "applies_independently_per_isotope": True,
             },
             "strength_prior": {
-                "kind": str(self.pf_config.init_strength_prior),
-                "minimum_cps_1m": float(self.pf_config.init_strength_min),
-                "maximum_cps_1m": (
-                    None
-                    if self.pf_config.init_strength_max is None
-                    else float(self.pf_config.init_strength_max)
+                "kind": "bounded_uniform",
+                "minimum_cps_1m": float(
+                    self.pf_config.strength_prior_min_cps_1m
                 ),
-                "log_mean": float(self.pf_config.init_strength_log_mean),
-                "log_sigma": float(self.pf_config.init_strength_log_sigma),
+                "maximum_cps_1m": float(
+                    self.pf_config.strength_prior_max_cps_1m
+                ),
                 "units": "detector_cps_1m",
                 "unit_definition": ("expected_net_detector_count_rate_at_1m"),
                 "used_for_initialization": True,
-                "shared_by_initialization_and_rj_moves": exact_enabled,
+                "shared_by_initialization_and_state_moves": True,
             },
             "surface_set_prior": {
+                "support": "environment_surface",
                 "semantics": "area_product_distinct_patch_sets",
                 "probability_mass": (
                     "product(patch_area_m2)/elementary_symmetric_normalizer(K)"
@@ -287,7 +302,12 @@ class PurePFEstimator(_PFEstimatorCore):
                 "dictionary_groups": grouped_dictionaries,
             },
             "rj_move_kernel": {
-                "enabled": exact_enabled,
+                "enabled": True,
+                "target_preserving": True,
+                "within_cardinality_exact_mh": True,
+                "variable_cardinality_enabled": variable_cardinality,
+                "birth_death_enabled": variable_cardinality,
+                "exact_reversible_jump_mh": variable_cardinality,
                 "structural_attempt_probability": float(
                     self.pf_config.structural_rj_move_probability
                 ),
@@ -339,7 +359,7 @@ class PurePFEstimator(_PFEstimatorCore):
         }
 
     def posterior_cardinality_distribution(self) -> dict[str, dict[int, float]]:
-        """Return source-count posterior mass for every active isotope."""
+        """Return source-count posterior mass for every isotope PF."""
         result: dict[str, dict[int, float]] = {}
         for isotope, filt in self.filters.items():
             states = [particle.state for particle in filt.continuous_particles]
@@ -362,13 +382,6 @@ class PurePFEstimator(_PFEstimatorCore):
                 position_projector=filt._project_positions_to_source_prior,
             )
         return result
-
-    def posterior_modes(self) -> dict[str, tuple[PFSourceMode, ...]]:
-        """Return aligned PF posterior modes for every active isotope."""
-        return {
-            isotope: estimate.modes
-            for isotope, estimate in self.posterior_point_estimate().items()
-        }
 
     def posterior_snapshot(self) -> PFPosteriorSnapshot:
         """Return a schema-v1 PF posterior result with reproducibility metadata."""
@@ -449,6 +462,7 @@ class PurePFEstimator(_PFEstimatorCore):
                 "pose_idx": int(measurement.pose_idx),
                 "fe_index": measurement.fe_index,
                 "pb_index": measurement.pb_index,
+                "detector_position_xyz_m": measurement.detector_position_xyz_m,
                 "live_time_s": float(measurement.live_time_s),
                 "z_variance_k": measurement.z_variance_k,
                 "z_covariance_k": measurement.z_covariance_k,
@@ -456,9 +470,6 @@ class PurePFEstimator(_PFEstimatorCore):
                 "station_view_index": measurement.station_view_index,
                 "runtime_likelihood_route_by_isotope": (
                     measurement.runtime_likelihood_route_by_isotope
-                ),
-                "runtime_spectrum_variance_used_by_isotope": (
-                    measurement.runtime_spectrum_variance_used_by_isotope
                 ),
                 "station_view_covariance_by_isotope": (
                     measurement.station_view_covariance_by_isotope
@@ -478,21 +489,13 @@ class PurePFEstimator(_PFEstimatorCore):
                     int(measurement.pose_idx) for measurement in self.measurements
                 ],
                 "measurement_history_sha256": sha256_json(measurement_history),
-                "deferred_pose_update_active": bool(self._defer_structural_moves),
-                "deferred_measurement_count": int(self._deferred_measurement_count),
+                "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION,
                 "isotopes": isotope_payload,
             }
         )
-
-
-RotatingShieldPurePFEstimator = PurePFEstimator
-RotatingShieldPFEstimator = PurePFEstimator
-
 
 __all__ = [
     "PurePFBoundaryError",
     "PurePFEstimator",
     "RotatingShieldPFConfig",
-    "RotatingShieldPFEstimator",
-    "RotatingShieldPurePFEstimator",
 ]

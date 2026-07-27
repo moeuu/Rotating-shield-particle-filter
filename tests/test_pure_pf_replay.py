@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -19,17 +18,20 @@ from pf.pure_estimator import PurePFEstimator
 from pf.replay import (
     PFReplayError,
     _resolved_physical_config,
+    _station_runtime_likelihood_routes,
     build_replay_estimator,
     replay_measurement_log,
     replay_records,
     validate_local_forward_model,
 )
+from pf.runtime_route import RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
 from runtime.measurement_log import (
     MeasurementLog,
     MeasurementLogValidationError,
     load_measurement_log,
 )
 from tests.pure_pf_test_support import (
+    TEST_CANDIDATE_SOURCES,
     TEST_ISOTOPES,
     make_measurement_log,
     records,
@@ -40,42 +42,80 @@ from tests.pure_pf_test_support import (
 def _effective_runtime_overrides(
     *,
     seed: int = 41,
-    joint: bool = True,
-    delayed: bool = False,
+    candidates: np.ndarray | None = None,
+    pf_overrides: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Return a complete live-effective PF block for replay parity tests."""
-    candidates = np.asarray(
-        replay_config()["replay_candidate_sources_xyz"], dtype=float
+    resolved_candidates = np.asarray(
+        TEST_CANDIDATE_SOURCES
+        if candidates is None
+        else candidates,
+        dtype=float,
     )
+    config_values: dict[str, object] = {
+        "estimator_profile": "pf_strict",
+        "num_particles": 12,
+        "max_sources": 2,
+        "init_num_sources": [1, 1],
+        "variable_cardinality": False,
+        "use_gpu": False,
+        "parallel_isotope_updates": False,
+        "position_max": (2.0, 2.0, 1.5),
+        "strength_prior_min_cps_1m": 0.0,
+        "strength_prior_max_cps_1m": 2_000_000.0,
+    }
+    config_values.update(pf_overrides or {})
     config = RotatingShieldPFConfig(
-        estimator_profile="pf_strict",
-        num_particles=12,
-        max_sources=2,
-        init_num_sources=[1, 1],
-        birth_enable=False,
-        use_gpu=False,
-        parallel_isotope_updates=False,
-        position_min=(0.0, 0.0, 0.0),
-        position_max=(2.0, 2.0, 1.5),
+        **config_values,
     )
     apply_profile_to_config(config)
     return {
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
         "effective_pf_replay": {
             "api_settings": {
                 "pf_random_seed": int(seed),
-                "joint_observation_update": bool(joint),
-                "delayed_resample_update": bool(delayed),
             },
             "pf_config": json_safe(config),
             "candidate_grid": {
-                "point_count": int(candidates.shape[0]),
-                "xyz_sha256": sha256_json(candidates),
-                "candidate_sources_xyz": candidates.tolist(),
+                "point_count": int(resolved_candidates.shape[0]),
+                "xyz_sha256": sha256_json(resolved_candidates),
+                "candidate_sources_xyz": resolved_candidates.tolist(),
                 "position_min_xyz_m": [0.0, 0.0, 0.0],
                 "position_max_xyz_m": [2.0, 2.0, 1.5],
             },
         }
     }
+
+
+def test_replay_rejects_logs_without_effective_pf_inputs(tmp_path: Path) -> None:
+    """Replay must not reconstruct current PF state from an external config."""
+    log = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    )
+
+    with pytest.raises(PFReplayError, match="requires effective_pf_replay"):
+        build_replay_estimator(log, replay_config(), profile="pf_strict", seed=0)
+
+
+def test_replay_rejects_incomplete_logged_pf_config(tmp_path: Path) -> None:
+    """Replay must not fill missing logged PF fields from current defaults."""
+    overrides = _effective_runtime_overrides(seed=7)
+    effective = overrides["effective_pf_replay"]
+    assert isinstance(effective, dict)
+    pf_config = effective["pf_config"]
+    assert isinstance(pf_config, dict)
+    pf_config.pop("structural_rj_birth_probability")
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=overrides,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="incomplete"):
+        build_replay_estimator(log, replay_config(), profile="pf_strict", seed=7)
 
 
 def test_replay_binds_transport_asset_to_validated_run_root(
@@ -142,38 +182,16 @@ def test_measurement_log_schema_rejects_invalid_energy_axis() -> None:
         )
 
 
-def test_active_pure_modules_do_not_import_batch_estimators() -> None:
-    """The active runtime must not import deleted solvers at any scope."""
-    root = Path(__file__).resolve().parents[1]
-    active_modules = (
-        root / "src/pf/pure_estimator.py",
-        root / "src/pf/estimator.py",
-        root / "src/pf/particle_filter.py",
-        root / "src/pf/replay.py",
-        root / "src/planning/dss_pp.py",
-        root / "src/realtime_demo.py",
-    )
-    forbidden = {
-        "pf.sparse_evidence",
-        "pf.surface_map",
-        "three_d_estimation",
-    }
-    imported: set[str] = set()
-    for module in active_modules:
-        tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                imported.add(node.module)
-    assert imported.isdisjoint(forbidden)
-
-
 def test_replay_outputs_are_deterministic_and_provenance_hashes_bind_inputs(
     tmp_path: Path,
 ) -> None:
     """The same strict input must produce one reproducible, causally bound bundle."""
-    log_path = make_measurement_log(tmp_path / "measurement-log", record_count=3)
+    log_path = make_measurement_log(
+        tmp_path / "measurement-log",
+        record_count=3,
+        runtime_overrides=_effective_runtime_overrides(seed=17),
+        station_complete_markers=True,
+    )
     config_path = tmp_path / "pf-config.json"
     config_path.write_bytes(canonical_json_bytes(replay_config()))
     first_output = tmp_path / "first-result"
@@ -208,23 +226,17 @@ def test_replay_outputs_are_deterministic_and_provenance_hashes_bind_inputs(
     diagnostics = json.loads((first_output / "pf_diagnostics.json").read_text())
     provenance = posterior["provenance"]
     assert provenance["config_sha256"] == sha256(config_path.read_bytes()).hexdigest()
-    assert provenance["resolved_config_sha256"] == sha256_json(
-        enforce_pure_runtime_settings(replay_config(), profile="pf_strict")
-    )
-    assert provenance["resolved_config_sha256"] == provenance["config_sha256"]
+    logged = load_measurement_log(log_path)
+    assert provenance["resolved_config_sha256"] == logged.resolved_config_sha256
+    assert provenance["resolved_config_sha256"] != provenance["config_sha256"]
     assert diagnostics["record_count"] == 3
     assert posterior["final_estimate_source"] == "pf_posterior"
-    assert "forbidden_batch_methods_invoked" not in diagnostics
-    assert "batch_methods_invoked" not in diagnostics
-    assert "uses_all_history_batch_fit" not in posterior
-    assert "mle_estimate" not in posterior
-    assert "surface_map_estimate" not in posterior
-    assert "strength_refit_applied" not in posterior
     assert posterior["posterior_semantics"] == (
-        "fixed_cardinality_sequential_particle_filter"
+        "fixed_cardinality_sequential_particle_filter_with_target_preserving_"
+        "mh_rejuvenation"
     )
     assert posterior["structural_kernel_family"] == (
-        "fixed_cardinality_no_structural_moves"
+        "fixed_cardinality_surface_position_strength_mh"
     )
     assert posterior["structural_kernel_target_preserving"] is True
     assert posterior["structural_kernel_exact_rj"] is False
@@ -249,7 +261,19 @@ def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(
 ) -> None:
     """CPU views are one packed batch and retain the configured count equation."""
     log = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=_effective_runtime_overrides(
+                seed=101,
+                pf_overrides={
+                    "gpu_device": "cpu",
+                    "gpu_dtype": "float64",
+                    "use_tempering": False,
+                    "resample_threshold": 0.0,
+                },
+            ),
+        )
     )
     config = {
         **replay_config(),
@@ -257,8 +281,6 @@ def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(
         "gpu_dtype": "float64",
         "use_tempering": False,
         "resample_threshold": 0.0,
-        "min_particles": 12,
-        "max_particles": 12,
     }
     estimator = build_replay_estimator(
         log,
@@ -328,47 +350,75 @@ def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(
 
 def test_resolved_hash_binds_replay_candidate_grid_inputs(tmp_path: Path) -> None:
     """Changing the response-grid inputs must change estimator provenance."""
-    log = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    first_candidates = np.asarray(
+        TEST_CANDIDATE_SOURCES,
+        dtype=float,
     )
-    first_config = replay_config()
-    second_config = {**first_config, "replay_candidate_spacing_m": 0.75}
+    second_candidates = np.vstack((first_candidates, [0.0, 2.0, 0.0]))
+    first_log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "first-log",
+            record_count=1,
+            runtime_overrides=_effective_runtime_overrides(
+                seed=3,
+                candidates=first_candidates,
+            ),
+        )
+    )
+    second_log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "second-log",
+            record_count=1,
+            runtime_overrides=_effective_runtime_overrides(
+                seed=3,
+                candidates=second_candidates,
+            ),
+        )
+    )
 
-    first = build_replay_estimator(log, first_config, profile="pf_strict", seed=3)
-    second = build_replay_estimator(log, second_config, profile="pf_strict", seed=3)
+    first = build_replay_estimator(
+        first_log, replay_config(), profile="pf_strict", seed=3
+    )
+    second = build_replay_estimator(
+        second_log, replay_config(), profile="pf_strict", seed=3
+    )
 
     assert first.resolved_config_hash != second.resolved_config_hash
 
 
 def test_replay_rejects_off_surface_response_candidates(tmp_path: Path) -> None:
-    """A strict replay must not retain a legacy volume candidate grid."""
+    """Every strict replay response candidate must lie on the room surface."""
     log = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=_effective_runtime_overrides(
+                seed=3,
+                candidates=np.asarray([[1.0, 1.0, 0.75]], dtype=float),
+            ),
+        )
     )
-    config = {
-        **replay_config(),
-        "replay_candidate_sources_xyz": [[1.0, 1.0, 0.75]],
-    }
 
     with pytest.raises(PFReplayError, match="environment surface"):
-        build_replay_estimator(log, config, profile="pf_strict", seed=3)
+        build_replay_estimator(log, replay_config(), profile="pf_strict", seed=3)
 
 
 def test_replay_uses_complete_logged_environment_bounds(tmp_path: Path) -> None:
     """Replay configuration cannot shrink the PF surface search domain."""
     log = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=_effective_runtime_overrides(seed=3),
+        )
     )
     config = {
         **replay_config(),
-        "position_min": [0.0, 0.0, 0.0],
         "position_max": [1.0, 1.0, 1.0],
     }
 
-    estimator = build_replay_estimator(log, config, profile="pf_strict", seed=3)
-
-    assert estimator.pf_config.position_min == (0.0, 0.0, 0.0)
-    assert estimator.pf_config.position_max == (2.0, 2.0, 1.5)
+    with pytest.raises(PFReplayError, match="position_max"):
+        build_replay_estimator(log, config, profile="pf_strict", seed=3)
 
 
 def test_prefix_causality_matches_full_log_stopped_at_same_record(
@@ -376,11 +426,16 @@ def test_prefix_causality_matches_full_log_stopped_at_same_record(
 ) -> None:
     """A future suffix must not alter any state after the same causal prefix."""
     log = load_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=4)
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=4,
+            runtime_overrides=_effective_runtime_overrides(seed=23),
+            station_complete_markers=True,
+        )
     )
     config = enforce_pure_runtime_settings(replay_config(), profile="pf_strict")
     raw_hash = sha256_json(replay_config())
-    resolved_hash = sha256_json(config)
+    resolved_hash = str(log.resolved_config_sha256)
 
     full_estimator = build_replay_estimator(
         log,
@@ -407,24 +462,15 @@ def test_prefix_causality_matches_full_log_stopped_at_same_record(
     assert full_trace == prefix_trace
 
 
-@pytest.mark.parametrize(
-    ("joint", "delayed"),
-    ((True, False), (False, True)),
-)
 def test_station_prefix_never_infers_completion_from_eof_or_future_rows(
     tmp_path: Path,
-    joint: bool,
-    delayed: bool,
 ) -> None:
     """An exact-N log and the first N rows of a longer log have identical state."""
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
             record_count=4,
-            runtime_overrides=_effective_runtime_overrides(
-                joint=joint,
-                delayed=delayed,
-            ),
+            runtime_overrides=_effective_runtime_overrides(),
             station_complete_markers=True,
         )
     )
@@ -451,11 +497,9 @@ def test_station_prefix_never_infers_completion_from_eof_or_future_rows(
 
         assert future_estimator.serialized_state() == exact_estimator.serialized_state()
         assert future_trace == exact_trace
-        expected_deferred = delayed and record_count % 2 == 1
-        assert exact_estimator._defer_structural_moves is expected_deferred
 
 
-def test_joint_replay_uses_only_explicit_station_markers(
+def test_replay_uses_only_explicit_station_markers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,21 +546,6 @@ def test_joint_replay_uses_only_explicit_station_markers(
     )
     with pytest.raises(PFReplayError, match="before the next station"):
         replay_records(missing_boundary, malformed)
-
-    conflicting_modes = replace(
-        log,
-        runtime_config={
-            **log.runtime_config,
-            "joint_observation_update": False,
-            "delayed_resample_update": False,
-        },
-    )
-    conflicting = build_replay_estimator(
-        conflicting_modes, replay_config(), profile="pf_strict", seed=41
-    )
-    with pytest.raises(PFReplayError, match="conflicts with"):
-        replay_records(conflicting_modes, conflicting)
-
 
 @pytest.mark.parametrize("off_diagonal", (False, True))
 def test_serialized_live_station_ingestion_matches_replay_covariance_path(
@@ -584,35 +613,18 @@ def test_serialized_live_station_ingestion_matches_replay_covariance_path(
             pair = (*pair, covariance)
         pending.append(pair)
         if bool(record.metadata.get("station_complete", False)):
-            live.update_pair_sequence(tuple(pending), pose_idx=pose_idx)
+            routes = record.metadata.get(
+                RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
+            )
+            assert isinstance(routes, dict)
+            live.update_pair_sequence(
+                tuple(pending),
+                pose_idx=pose_idx,
+                runtime_likelihood_route_by_isotope=routes,
+            )
             pending = []
 
     assert replayed.serialized_state() == live.serialized_state()
-
-
-def test_same_effective_log_supports_only_strict_profile(
-    tmp_path: Path,
-) -> None:
-    """A strict recorded run must reject the removed profiled estimator."""
-    log = load_measurement_log(
-        make_measurement_log(
-            tmp_path / "measurement-log",
-            record_count=2,
-            runtime_overrides=_effective_runtime_overrides(),
-            station_complete_markers=True,
-        )
-    )
-    strict = build_replay_estimator(log, replay_config(), profile="pf_strict", seed=41)
-
-    assert strict.resolved_config_hash == log.resolved_config_sha256
-    assert strict.estimator_variant == "pf_strict"
-    with pytest.raises(ValueError, match="only 'pf_strict' is available"):
-        build_replay_estimator(
-            log,
-            replay_config(),
-            profile="pf_profiled",
-            seed=41,
-        )
 
 
 def test_tiny_live_run_finalized_log_replays_to_identical_state(
@@ -653,22 +665,32 @@ def test_tiny_live_run_finalized_log_replays_to_identical_state(
         "_compute_shield_selection_grid",
         lightweight_shield_grid,
     )
+    simulation_config = {
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
+        "sim_backend": "analytic",
+        "spectrum_count_method": "response_poisson",
+        "source_rate_model": "detector_cps_1m",
+        "pf_strength_prior_min_cps_1m": 0.0,
+        "pf_strength_prior_max_cps_1m": 2_000_000.0,
+    }
+    simulation_config_path = tmp_path / "simulation.json"
+    simulation_config_path.write_bytes(canonical_json_bytes(simulation_config))
     log_path = tmp_path / "live-measurement-log"
     live_estimator = realtime_demo.run_live_pf(
         live=False,
+        sim_config_path=str(simulation_config_path),
         max_steps=1,
         max_poses=1,
         obstacle_layout_path=None,
         candidate_grid_spacing=(5.0, 10.0, 5.0),
-        birth_enabled=False,
+        variable_cardinality=False,
         num_particles=8,
         pf_config_overrides={
             "orientation_k": 1,
             "min_rotations_per_pose": 1,
             "max_sources": 1,
             "init_num_sources": [1, 1],
-            "min_particles": 8,
-            "max_particles": 8,
             "resample_threshold": 0.0,
             "use_tempering": False,
             "use_gpu": False,
@@ -680,10 +702,20 @@ def test_tiny_live_run_finalized_log_replays_to_identical_state(
         return_state=True,
     )
     assert isinstance(live_estimator, PurePFEstimator)
+    live_log = load_measurement_log(log_path)
+    recorded_routes = live_log.records[-1].metadata.get(
+        RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
+    )
+    assert isinstance(recorded_routes, dict)
+    assert set(recorded_routes.values()) <= {"count", "count_covariance"}
 
     replayed, trace = replay_measurement_log(
         log_path,
-        {"use_gpu": False},
+        {
+            "pure_pf_schema_version": 1,
+            "estimator_profile": "pf_strict",
+            "use_gpu": False,
+        },
         profile="pf_strict",
         seed=0,
     )
@@ -691,39 +723,29 @@ def test_tiny_live_run_finalized_log_replays_to_identical_state(
     assert replayed.serialized_state() == live_estimator.serialized_state()
 
 
-def test_full_strict_replay_exposes_no_removed_estimator_methods(
-    tmp_path: Path,
-) -> None:
-    """A complete replay must finish without reintroducing deleted API stubs."""
-    removed_methods = (
-        "_refit_reported_strengths",
-        "final_report_estimate",
-        "fit_surface_map",
-        "planning_surface_rescue_modes",
-        "refresh_sparse_poisson_evidence",
-        "report_model_order_diagnostics",
-        "runtime_report_rescue_modes",
-        "sparse_poisson_evidence_diagnostics",
-    )
-    for name in removed_methods:
-        assert not hasattr(PurePFEstimator, name)
+def test_replay_rejects_completed_station_without_likelihood_routes() -> None:
+    """Replay must not infer a missing route from covariance or configuration."""
+    record = records(1, station_complete_markers=True)[0]
+    metadata = dict(record.metadata)
+    metadata.pop(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY)
+    missing_route_record = replace(record, metadata=metadata)
 
-    estimator, trace = replay_measurement_log(
-        make_measurement_log(tmp_path / "measurement-log", record_count=3),
-        replay_config(),
-        profile="pf_strict",
-        seed=31,
-    )
-    assert len(trace) == 3
-    for name in removed_methods:
-        assert not hasattr(estimator, name)
+    with pytest.raises(PFReplayError, match="canonical runtime likelihood"):
+        _station_runtime_likelihood_routes(
+            missing_route_record,
+            TEST_ISOTOPES,
+        )
 
 
 def test_replay_rejects_forward_model_mismatch_and_existing_output(
     tmp_path: Path,
 ) -> None:
     """There is no fallback for a changed line table or overwrite target."""
-    log_path = make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    log_path = make_measurement_log(
+        tmp_path / "measurement-log",
+        record_count=1,
+        runtime_overrides=_effective_runtime_overrides(seed=7),
+    )
     log = load_measurement_log(log_path)
     mutated = json.loads(json.dumps(log.forward_model_manifest))
     mutated["model_identifiers"]["spectrum"]["id"] = "unknown-spectrum"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from pf.posterior_uncertainty import (
     SURFACE_KINDS,
     posterior_mode_uncertainty_batched,
 )
+from pf.pure_estimator import PurePFEstimator
 from pf.reporting import measurement_vector
 from pf.state import IsotopeState
 
@@ -245,7 +247,7 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
         mu_by_isotope={"Cs-137": 0.5},
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(1, 1),
             use_gpu=False,
         ),
@@ -305,3 +307,66 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
         assert mode["ellipsoid_90"]["available"] is True
         assert mode["ellipsoid_90"]["nominal_gaussian_probability_mass"] == 0.9
         assert np.allclose(orientation.T @ orientation, np.eye(3))
+
+
+def test_fixed_cardinality_pure_estimator_dispatches_state_mh_moves() -> None:
+    """Fixed-K estimator updates must still dispatch exact within-K state MH."""
+    evidence = object()
+    dispatched: list[object] = []
+
+    def measurement_data_for_iso(
+        isotope: str,
+        window: int | None,
+    ) -> object:
+        """Return the sentinel history passed to the per-isotope kernel."""
+        assert isotope == "Cs-137"
+        assert window is None
+        return evidence
+
+    def apply_structural_moves(payload: object) -> None:
+        """Record the exact state-kernel dispatch."""
+        dispatched.append(payload)
+
+    estimator = object.__new__(PurePFEstimator)
+    estimator.pf_config = RotatingShieldPFConfig(
+        num_particles=3,
+        max_sources=1,
+        variable_cardinality=False,
+        init_num_sources=(1, 1),
+        parallel_isotope_updates=False,
+        use_gpu=False,
+    )
+    estimator.filters = {
+        "Cs-137": SimpleNamespace(
+            apply_structural_moves=apply_structural_moves,
+        )
+    }
+    estimator.isotopes = ("Cs-137",)
+    estimator._measurement_data_for_iso = measurement_data_for_iso
+    estimator.last_structural_update_workers = 0
+    estimator.last_structural_update_wall_s = 0.0
+
+    estimator._apply_structural_moves()
+
+    assert dispatched == [evidence]
+    assert estimator.last_structural_update_workers == 1
+    manifest = estimator.structural_model_manifest()
+    assert manifest["pure_pf_schema_version"] == 1
+    assert manifest["support_domain"] == "environment_surface"
+    assert manifest["structural_kernel_family"] == (
+        "fixed_cardinality_surface_position_strength_mh"
+    )
+    assert manifest["within_cardinality_kernel_exact_mh"] is True
+    assert manifest["structural_kernel_exact_rj"] is False
+    assert manifest["strength_prior"] == {
+        "kind": "bounded_uniform",
+        "minimum_cps_1m": 0.0,
+        "maximum_cps_1m": 2_000_000.0,
+        "units": "detector_cps_1m",
+        "unit_definition": "expected_net_detector_count_rate_at_1m",
+        "used_for_initialization": True,
+        "shared_by_initialization_and_state_moves": True,
+    }
+    assert manifest["rj_move_kernel"]["enabled"] is True
+    assert manifest["rj_move_kernel"]["birth_death_enabled"] is False
+    assert manifest["rj_move_kernel"]["within_cardinality_exact_mh"] is True

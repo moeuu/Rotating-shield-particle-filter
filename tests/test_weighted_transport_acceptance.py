@@ -90,7 +90,6 @@ def _accelerated_record(name: str, pair_id: int = 0) -> dict[str, Any]:
         "pf_count_likelihood_diagnostics": {
             "runtime_likelihood_guards": {
                 "observation_count_variance_semantics": "complete_statistical",
-                "direct_spectrum_likelihood_enable": False,
                 "shield_contrast_likelihood_enable": False,
                 "shield_view_ratio_likelihood_enable": False,
             },

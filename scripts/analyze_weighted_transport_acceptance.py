@@ -284,7 +284,6 @@ def _likelihood_semantics_errors(record: Mapping[str, Any]) -> list[str]:
     if guards.get("observation_count_variance_semantics") != "complete_statistical":
         errors.append("runtime observation variance is not complete_statistical")
     for key in (
-        "direct_spectrum_likelihood_enable",
         "shield_contrast_likelihood_enable",
         "shield_view_ratio_likelihood_enable",
     ):

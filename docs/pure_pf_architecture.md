@@ -2,8 +2,8 @@
 
 ## Estimator boundary
 
-The scientific runtime has one estimator profile, `pf_strict`, and one
-sequential data flow:
+The scientific runtime requires `pure_pf_schema_version: 1`, accepts the single
+estimator profile `pf_strict`, and follows one sequential data flow:
 
 ```text
 raw spectrum + detector pose + shield state
@@ -16,20 +16,18 @@ raw spectrum + detector pose + shield state
 ```
 
 The log append precedes the update. Ground truth is stored separately and is
-used only for evaluation. Runtime and replay do not contain a second estimator,
-an accumulated-history fit, a report-time position or strength optimizer, or a
-posterior-external source rescue path.
-
-`pf.profiles.resolve_estimator_profile` accepts only `pf_strict`. Source
-cardinality, three-dimensional position, strength, and background are particle
-state throughout the run. Compatibility configuration keys for the deleted
-estimator and rescue paths are invalid rather than dormant switches.
+used only for evaluation. Source cardinality, three-dimensional position,
+strength, and background remain particle state throughout runtime, replay,
+planning, and reporting. The versioned schema is the complete compatibility
+boundary; runtime configurations do not depend on a catalog of historical
+options. Unknown or retired estimator keys, likelihood aliases, and incomplete
+replay records fail closed instead of selecting historical behavior.
 
 ## Physical source support
 
-The standard Python, Geant4, and Isaac Sim entry points set
-`source_surface_prior=true`. The exact structural kernel discretizes the
-physical environment into a finite dictionary of surface patches:
+Python, Geant4, and Isaac Sim entry points construct the source state space
+directly from the physical environment. The exact structural kernel discretizes
+it into a finite dictionary of surface patches:
 
 - floor and ceiling;
 - room walls;
@@ -42,14 +40,10 @@ order. The finite patch spacing is part of the declared model and sets a
 discretization error floor; exactness below refers to this finite-state target,
 not to an undiscretized continuous surface.
 
-The standard exact kernel does not project or jitter positions after
-resampling, exclude source patches near measured detector poses, or impose an
-initial-only pairwise separation rule. Those operations would change the
-declared position prior without a reversible transition. The standard RAL
-factory does not provide a full-volume source-prior ablation. Detector
-measurement poses remain collision-free points in reachable free space;
-detector support and source support are intentionally different physical
-domains.
+All position transitions operate on patch indices and preserve the declared
+area-weighted surface measure. Detector measurement poses remain collision-free
+points in reachable free space; detector support and source support are
+intentionally different physical domains.
 
 ## Sequential likelihood and structural moves
 
@@ -79,10 +73,13 @@ invariant target is the current finite-surface posterior:
 - accepted rejuvenation moves leave the outer particle weights unchanged.
 
 Move probabilities are normalized at the `K=0` and `K=max_sources`
-boundaries. Split/merge, BIC thresholds, residual matching pursuit,
-pseudo-source pruning, mode-preserving particle injection, and post-resample
-position/strength roughening are not part of the runtime implementation. No
-MLE, batch fit, surface-map rescue, or strength refit is invoked.
+boundaries. Thus both fixed-cardinality operation and variable-cardinality
+operation have explicit target-preserving semantics within the same PF.
+
+There is no second full-spectrum PF likelihood. Spectrum processing produces
+the isotope count vector and propagated covariance once; runtime updates,
+structural moves, planning, and replay all consume that same statistical
+contract.
 
 ## Posterior reporting
 
@@ -95,26 +92,25 @@ interval.
 The public reporting API is:
 
 - `posterior_cardinality_distribution()`;
-- `posterior_modes()`;
 - `posterior_point_estimate()`;
 - `posterior_snapshot()`.
 
-Compatibility `estimates()` is only a projection of the current PF posterior.
-It cannot refit strengths, choose source count with a second model, refine
-positions against accumulated history, or substitute a best-so-far snapshot.
+Compatibility `estimates()` is a deterministic projection of the current PF
+posterior.
 
 ## Planner and mission control
 
-DSS-PP receives only the current PF posterior. It cannot read tentative,
-report-rescue, or global-surface-rescue modes. Cardinality pressure is derived
-from the normalized PF posterior cardinality distribution.
-Expected future response discrimination remains a planning heuristic evaluated
-from PF modes and hypothetical future observations.
+DSS-PP receives the current PF posterior. Cardinality pressure is derived from
+the normalized PF posterior cardinality distribution. Expected future response
+discrimination is evaluated from PF modes and hypothetical future observations.
+Every candidate station, including a same-XY height change, is scored with its
+own optimized shield program. The previous station's shield sequence is never
+reused as a height-transition special case.
 
-Standard experiment configs use a fixed measurement/action budget and disable
-adaptive batch-evidence stopping. Continuous XYZ detector candidates,
-collision-aware workspace filtering, height changes, collision-free motion,
-and shared Geant4/PF obstacle attenuation remain unchanged.
+Standard experiment configs use a fixed measurement/action budget. Continuous
+XYZ detector candidates, collision-aware workspace filtering, height changes,
+collision-free motion, and shared Geant4/PF obstacle attenuation remain
+unchanged.
 
 ## Execution model
 

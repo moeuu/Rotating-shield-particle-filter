@@ -132,8 +132,9 @@ Useful overrides:
 For longer Geant4 runs, the standard full-simulation config already uses the
 balanced Geant4 physics profile, 32 native/Python workers, response-Poisson
 spectrum counting, eight shield measurements per station, and the no-Isaac CUI
-runtime. Add `--init-grid-spacing-m 0` only when `--num-particles` should
-control the PF size instead of the default grid initialization.
+runtime. `--num-particles` controls the PF ensemble size; source positions are
+initialized from the same finite physical-surface dictionary used by the
+target-preserving state and reversible-jump moves.
 
 The standard full-simulation config is
 `configs/geant4/variance_reduction_external_no_isaac_32threads.json`. It uses
@@ -398,8 +399,8 @@ uv run python main.py \
 
 The native source is `native/geant4_sidecar/geant4_sidecar.cpp`. The Python
 bridge communicates with it through a file-based request/response protocol, so
-the C++ executable does not need a JSON dependency. Older Geant4 configs that
-are not part of the standard runtime are isolated under `configs/geant4/legacy/`.
+the C++ executable does not need a JSON dependency. Runtime configurations are
+kept under `configs/geant4/` and use the current pure-PF schema.
 
 Under the standard `source_rate_model = detector_cps_1m` model, the native
 sidecar uses detector-equivalent source sampling and Geant4 geometry for shield,
@@ -435,10 +436,10 @@ Use these commands to exercise the two supported pure-PF modes:
 
 ```
 # Fixed-cardinality PF: the runtime default fixed cardinality is K=1.
-uv run python main.py --no-birth --max-steps 20
+uv run python main.py --fixed-cardinality --max-steps 20
 
 # Variable-cardinality PF with the exact finite-surface RJ-MH kernel.
-uv run python main.py --birth --max-sources 3 --max-steps 20
+uv run python main.py --variable-cardinality --max-sources 3 --max-steps 20
 
 ```
 

@@ -1,7 +1,10 @@
 {
   "backend": "isaacsim",
+  "pure_pf_schema_version": 1,
   "estimator_profile": "pf_strict",
-  "source_surface_prior": true,
+  "variable_cardinality": true,
+  "pf_strength_prior_min_cps_1m": 0.0,
+  "pf_strength_prior_max_cps_1m": 2000000.0,
   "host": "127.0.0.1",
   "port": 5555,
   "timeout_s": 10.0,

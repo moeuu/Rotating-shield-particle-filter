@@ -3834,29 +3834,40 @@ def test_run_live_pf_uses_simulation_runtime(
             """Skip saving estimate snapshots in tests."""
             return None
 
-    def _fake_update_pair(
+    def _fake_update_pair_sequence(
         self: RotatingShieldPFEstimator,
-        z_k: dict[str, float],
+        records: list[tuple[object, ...]],
+        *,
         pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        z_variance_k: dict[str, float] | None = None,
-        z_covariance_k: dict[str, dict[str, float]] | None = None,
+        **_kwargs: object,
     ) -> None:
-        """Append a lightweight measurement record without GPU updates."""
-        self.measurements.append(
-            MeasurementRecord(
-                z_k={iso: float(v) for iso, v in z_k.items()},
-                pose_idx=pose_idx,
-                orient_idx=fe_index,
-                live_time_s=live_time_s,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                z_variance_k=z_variance_k,
-                z_covariance_k=z_covariance_k,
-            )
+        """Append lightweight joint-station records without GPU updates."""
+        route_mapping = _kwargs.get("runtime_likelihood_route_by_isotope")
+        if not isinstance(route_mapping, dict):
+            raise AssertionError("Runtime likelihood routes must be explicit.")
+        station_sequence_id = len(self.measurements)
+        detector_position = tuple(
+            float(value)
+            for value in np.asarray(self.poses[pose_idx], dtype=float).reshape(3)
         )
+        for station_view_index, record in enumerate(records):
+            z_k, fe_index, pb_index, live_time_s, z_variance_k, *tail = record
+            z_covariance_k = tail[0] if tail else None
+            self.measurements.append(
+                MeasurementRecord(
+                    z_k={iso: float(value) for iso, value in dict(z_k).items()},
+                    pose_idx=pose_idx,
+                    live_time_s=float(live_time_s),
+                    fe_index=int(fe_index),
+                    pb_index=int(pb_index),
+                    detector_position_xyz_m=detector_position,
+                    station_sequence_id=station_sequence_id,
+                    station_view_index=station_view_index,
+                    runtime_likelihood_route_by_isotope=dict(route_mapping),
+                    z_variance_k=dict(z_variance_k),
+                    z_covariance_k=z_covariance_k,
+                )
+            )
 
     def _fake_estimates(
         self: RotatingShieldPFEstimator,
@@ -3880,21 +3891,6 @@ def test_run_live_pf_uses_simulation_runtime(
     def _fake_ig_grid(*args: object, **kwargs: object) -> np.ndarray:
         """Return a zero IG grid to bypass heavy IG evaluation."""
         return np.zeros((8, 8), dtype=float)
-
-    def _fake_shield_selection_grid(
-        *args: object,
-        **kwargs: object,
-    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Return a lightweight shield selection grid for reset-payload tests."""
-        ig_scores = np.asarray(kwargs.get("ig_scores", np.zeros((8, 8))), dtype=float)
-        zeros = np.zeros_like(ig_scores, dtype=float)
-        return ig_scores, {
-            "signature": zeros,
-            "signature_utility": zeros,
-            "low_count_penalty": zeros,
-            "count_balance_penalty": zeros,
-            "rotation_cost": zeros,
-        }
 
     def _fake_shield_selection_grid(
         *args: object,
@@ -3947,18 +3943,33 @@ def test_run_live_pf_uses_simulation_runtime(
     monkeypatch.setattr(
         SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
     )
-    monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "update_pair_sequence",
+        _fake_update_pair_sequence,
+    )
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
 
+    config_path = tmp_path / "runtime.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "variable_cardinality": False,
+                "pf_strength_prior_min_cps_1m": 0.0,
+                "pf_strength_prior_max_cps_1m": 2_000_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
     estimator = run_live_pf(
         live=False,
         max_steps=1,
         max_poses=1,
         detect_threshold_abs=0.0,
         detect_threshold_rel=0.0,
-        detect_consecutive=1,
-        detect_min_steps=1,
         min_peaks_by_isotope={"Cs-137": 1, "Co-60": 1, "Eu-154": 1},
         ig_threshold_mode="absolute",
         ig_threshold_min=0.0,
@@ -3968,6 +3979,7 @@ def test_run_live_pf_uses_simulation_runtime(
         measurement_log_output=(tmp_path / "runtime-measurement-log").as_posix(),
         return_state=True,
         sim_backend="isaacsim",
+        sim_config_path=config_path.as_posix(),
     )
 
     assert estimator is not None
@@ -4076,29 +4088,40 @@ def test_run_live_pf_random_environment_uses_blender_usd(
             """Skip saving estimate snapshots in tests."""
             return None
 
-    def _fake_update_pair(
+    def _fake_update_pair_sequence(
         self: RotatingShieldPFEstimator,
-        z_k: dict[str, float],
+        records: list[tuple[object, ...]],
+        *,
         pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        z_variance_k: dict[str, float] | None = None,
-        z_covariance_k: dict[str, dict[str, float]] | None = None,
+        **_kwargs: object,
     ) -> None:
-        """Append a lightweight measurement record without GPU updates."""
-        self.measurements.append(
-            MeasurementRecord(
-                z_k={iso: float(v) for iso, v in z_k.items()},
-                pose_idx=pose_idx,
-                orient_idx=fe_index,
-                live_time_s=live_time_s,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                z_variance_k=z_variance_k,
-                z_covariance_k=z_covariance_k,
-            )
+        """Append lightweight joint-station records without GPU updates."""
+        route_mapping = _kwargs.get("runtime_likelihood_route_by_isotope")
+        if not isinstance(route_mapping, dict):
+            raise AssertionError("Runtime likelihood routes must be explicit.")
+        station_sequence_id = len(self.measurements)
+        detector_position = tuple(
+            float(value)
+            for value in np.asarray(self.poses[pose_idx], dtype=float).reshape(3)
         )
+        for station_view_index, record in enumerate(records):
+            z_k, fe_index, pb_index, live_time_s, z_variance_k, *tail = record
+            z_covariance_k = tail[0] if tail else None
+            self.measurements.append(
+                MeasurementRecord(
+                    z_k={iso: float(value) for iso, value in dict(z_k).items()},
+                    pose_idx=pose_idx,
+                    live_time_s=float(live_time_s),
+                    fe_index=int(fe_index),
+                    pb_index=int(pb_index),
+                    detector_position_xyz_m=detector_position,
+                    station_sequence_id=station_sequence_id,
+                    station_view_index=station_view_index,
+                    runtime_likelihood_route_by_isotope=dict(route_mapping),
+                    z_variance_k=dict(z_variance_k),
+                    z_covariance_k=z_covariance_k,
+                )
+            )
 
     def _fake_estimates(
         self: RotatingShieldPFEstimator,
@@ -4160,7 +4183,17 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     config_path = tmp_path / "configs" / "isaacsim" / "manchester_random.json"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
-        '{"usd_path": "../../base_manchester.usda", "obstacle_material": "air"}\n',
+        json.dumps(
+            {
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+                "variable_cardinality": False,
+                "pf_strength_prior_min_cps_1m": 0.0,
+                "pf_strength_prior_max_cps_1m": 2_000_000.0,
+                "usd_path": "../../base_manchester.usda",
+                "obstacle_material": "air",
+            }
+        ),
         encoding="utf-8",
     )
     expected_base_usd = (tmp_path / "base_manchester.usda").resolve()
@@ -4213,7 +4246,11 @@ def test_run_live_pf_random_environment_uses_blender_usd(
     monkeypatch.setattr(
         SpectralDecomposer, "isotope_counts_with_detection", _fake_counts
     )
-    monkeypatch.setattr(RotatingShieldPFEstimator, "update_pair", _fake_update_pair)
+    monkeypatch.setattr(
+        RotatingShieldPFEstimator,
+        "update_pair_sequence",
+        _fake_update_pair_sequence,
+    )
     monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _fake_estimates)
     monkeypatch.setattr(RotatingShieldPFEstimator, "_gpu_enabled", _fake_gpu_enabled)
 
@@ -4223,8 +4260,6 @@ def test_run_live_pf_random_environment_uses_blender_usd(
         max_poses=1,
         detect_threshold_abs=0.0,
         detect_threshold_rel=0.0,
-        detect_consecutive=1,
-        detect_min_steps=1,
         min_peaks_by_isotope={"Cs-137": 1, "Co-60": 1, "Eu-154": 1},
         ig_threshold_mode="absolute",
         ig_threshold_min=0.0,

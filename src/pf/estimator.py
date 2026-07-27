@@ -16,7 +16,7 @@ from numpy.typing import NDArray
 from scipy.special import logsumexp
 from scipy.stats import chi2
 
-from measurement.kernels import KernelPrecomputer, ShieldParams
+from measurement.kernels import MeasurementGeometry, ShieldParams
 from measurement.model import EnvironmentConfig
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
@@ -30,6 +30,7 @@ from pf.likelihood import (
     count_log_likelihood_terms_np,
     count_log_likelihood_terms_torch,
     expected_counts_per_source,
+    normalize_count_likelihood_model,
     predictive_count_likelihood_variance,
     predictive_count_likelihood_variance_torch,
     normalize_observation_count_variance_semantics,
@@ -39,6 +40,11 @@ from pf.posterior import posterior_point_estimate_from_states
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.reporting import measurement_vector
 from pf.resampling import systematic_resample
+from pf.runtime_route import (
+    COUNT_COVARIANCE_LIKELIHOOD_ROUTE,
+    COUNT_LIKELIHOOD_ROUTE,
+    canonical_runtime_likelihood_route_mapping,
+)
 from pf.state import IsotopeState
 
 if TYPE_CHECKING:
@@ -80,10 +86,6 @@ class RotatingShieldPFConfig:
 
     estimator_profile: str = "pf_strict"
     num_particles: int = 200
-    min_particles: int | None = None
-    max_particles: int | None = None
-    ess_low: float = 0.5
-    ess_high: float = 0.9
     max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     resample_threshold: float = 0.5
     background_level: float | dict[str, float] = 0.0
@@ -96,8 +98,9 @@ class RotatingShieldPFConfig:
     spectrum_count_abs_sigma: float | Dict[str, float] = 0.0
     low_count_abs_sigma: float | Dict[str, float] = 0.0
     low_count_transition_counts: float | Dict[str, float] = 0.0
-    observation_count_variance_includes_counting_noise: bool = False
-    observation_count_variance_semantics: str = ""
+    observation_count_variance_semantics: str = (
+        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+    )
     count_likelihood_df: float = 5.0
     shield_contrast_likelihood_enable: bool = False
     shield_contrast_likelihood_weight: float = 1.0
@@ -113,10 +116,7 @@ class RotatingShieldPFConfig:
     shield_view_ratio_likelihood_min_views: int = 2
     station_view_covariance_enable: bool = False
     station_view_correlated_spectrum_fraction: float = 0.0
-    direct_spectrum_likelihood_enable: bool = True
-    spectrum_likelihood_bin_chunk: int = 512
-    min_strength: float = 0.01
-    birth_enable: bool = True
+    variable_cardinality: bool = True
     history_estimate_interval: int = 1
     candidate_response_cache_max_entries: int = 24
     structural_rj_patch_spacing_m: float = 1.0
@@ -127,7 +127,6 @@ class RotatingShieldPFConfig:
     structural_rj_local_position_move_probability: float = 1.0
     structural_rj_strength_move_probability: float = 1.0
     structural_cardinality_prior_probs: tuple[float, ...] | list[float] | None = None
-    short_time_s: float = 0.5  # Recommended short-time measurement (Sec. 3.4.3).
     ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
     lambda_cost: float = 1.0  # Motion-cost weight (Eq. 3.51).
@@ -140,19 +139,13 @@ class RotatingShieldPFConfig:
     max_resamples_per_observation: int = 2
     temper_resample_cooldown_steps: int = 2
     temper_resample_force_ratio: float = 0.1
-    adapt_cooldown_steps: int = 0
-    position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
-    source_position_prior: str = "surface"
     init_num_sources: Tuple[int, int] = (
         0,
         DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     )
-    init_strength_prior: str = "lognormal"
-    init_strength_min: float = 0.0
-    init_strength_max: float | None = None
-    init_strength_log_mean: float = 9.0
-    init_strength_log_sigma: float = 1.0
+    strength_prior_min_cps_1m: float = 0.0
+    strength_prior_max_cps_1m: float = 2_000_000.0
     observation_covariance_projection_enable: bool = True
     observation_covariance_projection_weight: float = 1.0
     observation_covariance_projection_max_corr: float = 0.999
@@ -163,7 +156,6 @@ class RotatingShieldPFConfig:
     pose_min_observation_quantile: float = 0.25
     orientation_k: int = 8
     min_rotations_per_pose: int = 0
-    orientation_selection_mode: str = "eig"
     planning_particles: int | None = None
     planning_method: str = "top_weight"
     use_gpu: bool = True
@@ -182,62 +174,31 @@ class RotatingShieldPFConfig:
     ig_workers: int = 0
     parallel_isotope_updates: bool = True
     parallel_isotope_workers: int | None = None
-    converge_enable: bool = False
-    converge_window: int = 8
-    converge_map_move_eps_m: float = 0.4
-    converge_ess_ratio_high: float = 0.2
-    converge_ll_improve_eps: float = 1e5
-    converge_min_steps: int = 30
-    converge_require_all: bool = True
     converge_cardinality_var_max: float = 0.05
-    converge_min_stations: int = 0
 
     def __post_init__(self) -> None:
         """Validate and normalize estimator configuration values."""
         self.num_particles = int(self.num_particles)
         if self.num_particles < 1:
             raise ValueError("num_particles must be positive.")
-        if self.min_particles is None:
-            self.min_particles = max(1, int(self.num_particles * 0.5))
-        else:
-            self.min_particles = int(self.min_particles)
-        if self.max_particles is None:
-            self.max_particles = max(self.num_particles, int(self.num_particles * 2.0))
-        else:
-            self.max_particles = int(self.max_particles)
-        if self.min_particles < 1 or self.max_particles < 1:
-            raise ValueError("min_particles and max_particles must be positive.")
-        if self.min_particles > self.max_particles:
-            raise ValueError("min_particles cannot exceed max_particles.")
-        self.ess_low = float(self.ess_low)
-        self.ess_high = float(self.ess_high)
-        if not 0.0 < self.ess_low < self.ess_high < 1.0:
-            raise ValueError(
-                "ess_low and ess_high must satisfy 0 < ess_low < ess_high < 1."
-            )
-        self.init_strength_prior = (
-            str(self.init_strength_prior).strip().lower().replace("-", "_")
-        )
-        if self.init_strength_prior not in {"lognormal", "uniform", "log_uniform"}:
-            raise ValueError(
-                "init_strength_prior must be lognormal, uniform, or log_uniform."
-            )
-        self.init_strength_min = max(float(self.init_strength_min), 0.0)
-        self.init_strength_max = (
-            None if self.init_strength_max is None else float(self.init_strength_max)
-        )
+        self.strength_prior_min_cps_1m = float(self.strength_prior_min_cps_1m)
+        self.strength_prior_max_cps_1m = float(self.strength_prior_max_cps_1m)
         if (
-            self.init_strength_max is not None
-            and self.init_strength_max < self.init_strength_min
+            not np.isfinite(self.strength_prior_min_cps_1m)
+            or self.strength_prior_min_cps_1m < 0.0
         ):
-            raise ValueError("init_strength_max must be >= init_strength_min.")
-        if self.init_strength_prior in {"uniform", "log_uniform"}:
-            if self.init_strength_max is None or not np.isfinite(
-                self.init_strength_max
-            ):
-                raise ValueError("bounded strength priors require a finite maximum.")
-        if self.init_strength_prior == "log_uniform" and self.init_strength_min <= 0.0:
-            raise ValueError("log_uniform strength prior requires a positive minimum.")
+            raise ValueError(
+                "strength_prior_min_cps_1m must be finite and nonnegative."
+            )
+        if (
+            not np.isfinite(self.strength_prior_max_cps_1m)
+            or self.strength_prior_max_cps_1m
+            <= self.strength_prior_min_cps_1m
+        ):
+            raise ValueError(
+                "strength_prior_max_cps_1m must be finite and greater than "
+                "strength_prior_min_cps_1m."
+            )
         self.ig_workers = int(self.ig_workers)
         if self.ig_workers < 0:
             raise ValueError("ig_workers must be >= 0.")
@@ -277,27 +238,13 @@ class RotatingShieldPFConfig:
         self.pose_min_observation_quantile = float(self.pose_min_observation_quantile)
         if not 0.0 <= self.pose_min_observation_quantile <= 1.0:
             raise ValueError("pose_min_observation_quantile must be in [0, 1].")
-        normalized_likelihood = str(self.count_likelihood_model).strip().lower()
-        if normalized_likelihood in {"normal"}:
-            normalized_likelihood = "gaussian"
-        if normalized_likelihood in {"robust", "robust_gaussian", "t"}:
-            normalized_likelihood = "student_t"
-        if normalized_likelihood not in {"poisson", "gaussian", "student_t"}:
-            raise ValueError(
-                "count_likelihood_model must be poisson, gaussian, or student_t."
-            )
-        self.count_likelihood_model = normalized_likelihood
+        self.count_likelihood_model = normalize_count_likelihood_model(
+            self.count_likelihood_model
+        )
         self.observation_count_variance_semantics = (
             normalize_observation_count_variance_semantics(
                 self.observation_count_variance_semantics,
-                includes_counting_noise=(
-                    self.observation_count_variance_includes_counting_noise
-                ),
             )
-        )
-        self.observation_count_variance_includes_counting_noise = (
-            self.observation_count_variance_semantics
-            != OBSERVATION_COUNT_VARIANCE_ADDITIONAL
         )
         if (
             self.observation_count_variance_semantics
@@ -345,22 +292,6 @@ class RotatingShieldPFConfig:
             0.0,
             float(self.station_view_correlated_spectrum_fraction),
         )
-        self.direct_spectrum_likelihood_enable = bool(
-            self.direct_spectrum_likelihood_enable
-        )
-        self.spectrum_likelihood_bin_chunk = max(
-            1,
-            int(self.spectrum_likelihood_bin_chunk),
-        )
-        if isinstance(self.source_position_prior, bool):
-            prior = "surface" if self.source_position_prior else "volume"
-        else:
-            prior = str(self.source_position_prior).strip().lower()
-        if prior in {"surface_constrained", "surface-constrained", "surfaces"}:
-            prior = "surface"
-        if prior != "surface":
-            raise ValueError("Pure PF requires source_position_prior='surface'.")
-        self.source_position_prior = "surface"
         self.structural_rj_patch_spacing_m = float(self.structural_rj_patch_spacing_m)
         if (
             not np.isfinite(self.structural_rj_patch_spacing_m)
@@ -413,11 +344,10 @@ class RotatingShieldPFConfig:
             0.0,
             float(self.converge_cardinality_var_max),
         )
-        self.converge_min_stations = max(0, int(self.converge_min_stations))
         self.parallel_isotope_updates = bool(self.parallel_isotope_updates)
         if self.parallel_isotope_workers is not None:
             self.parallel_isotope_workers = max(1, int(self.parallel_isotope_workers))
-        self.birth_enable = bool(self.birth_enable)
+        self.variable_cardinality = bool(self.variable_cardinality)
         if self.max_sources is None or int(self.max_sources) < 1:
             raise ValueError("Pure PF requires a finite positive max_sources.")
         self.max_sources = int(self.max_sources)
@@ -433,7 +363,7 @@ class RotatingShieldPFConfig:
             int(self.init_num_sources[0]),
             int(self.init_num_sources[1]),
         )
-        if self.birth_enable:
+        if self.variable_cardinality:
             if (
                 self.structural_rj_move_probability <= 0.0
                 or self.structural_rj_birth_probability <= 0.0
@@ -459,7 +389,7 @@ class RotatingShieldPFConfig:
             or initial_upper > self.max_sources
         ):
             raise ValueError(
-                "Structural moves disabled requires fixed "
+                "Fixed-cardinality pure PF requires "
                 "init_num_sources=(K, K) within zero through max_sources."
             )
         self.init_num_sources = (initial_lower, initial_upper)
@@ -471,24 +401,15 @@ class MeasurementRecord:
 
     z_k: Dict[str, float]
     pose_idx: int
-    orient_idx: int
     live_time_s: float
-    fe_index: int | None = None
-    pb_index: int | None = None
+    fe_index: int
+    pb_index: int
+    detector_position_xyz_m: tuple[float, float, float]
+    station_sequence_id: int
+    station_view_index: int
+    runtime_likelihood_route_by_isotope: Dict[str, str]
     z_variance_k: Dict[str, float] | None = None
     z_covariance_k: Dict[str, Dict[str, float]] | None = None
-    ig_value: float | None = None
-    spectrum_counts: tuple[float, ...] | None = None
-    spectrum_variance: tuple[float, ...] | None = None
-    spectrum_background: tuple[float, ...] | None = None
-    spectrum_background_source: str | None = None
-    spectrum_background_observation_independent: bool = False
-    spectrum_response_templates_by_isotope: Dict[str, tuple[float, ...]] | None = None
-    detector_position_xyz_m: tuple[float, float, float] | None = None
-    station_sequence_id: int | None = None
-    station_view_index: int | None = None
-    runtime_likelihood_route_by_isotope: Dict[str, str] | None = None
-    runtime_spectrum_variance_used_by_isotope: Dict[str, bool] | None = None
     station_view_covariance_by_isotope: (
         Dict[str, tuple[tuple[float, ...], ...]] | None
     ) = None
@@ -524,7 +445,6 @@ class RotatingShieldPFEstimator:
         transport_response_model: Dict[str, object] | None = None,
     ) -> None:
         """Initialize per-isotope filters and shared measurement-model state."""
-        self.all_isotopes = list(isotopes)
         self.isotopes = list(isotopes)
         self.pf_config = pf_config or RotatingShieldPFConfig()
         self.shield_params = shield_params or ShieldParams()
@@ -551,16 +471,13 @@ class RotatingShieldPFEstimator:
         else:
             self.normals = shield_normals
         self.mu_by_isotope = self._resolve_mu_by_isotope(mu_by_isotope)
-        self.kernel_cache: KernelPrecomputer | None = None
+        self.kernel_cache: MeasurementGeometry | None = None
         self.filters: Dict[str, IsotopeParticleFilter] = {}
         self.candidate_sources = candidate_sources
         self.history_estimates: List[
             Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]
         ] = []
-        self.history_scores: List[float] = []
         self.measurements: List[MeasurementRecord] = []
-        self._defer_structural_moves = False
-        self._deferred_measurement_count = 0
         self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = 0.0
         self.last_pair_sequence_stage_wall_s: Dict[str, float] = {}
@@ -576,11 +493,6 @@ class RotatingShieldPFEstimator:
             dict[str, NDArray[np.float64]],
         ] = {}
         self._candidate_response_prefix_cache_order: list[tuple[Any, ...]] = []
-        self._configured_response_kernel_registry: dict[str, ContinuousKernel] = {}
-        self._configured_spectrum_response_registry: dict[
-            tuple[str, int],
-            tuple[float, ...],
-        ] = {}
 
     def _record_history_estimate(self, measurement_count: int) -> None:
         """Record an exact report estimate when the configured history stride allows it."""
@@ -870,7 +782,7 @@ class RotatingShieldPFEstimator:
         sources: NDArray[np.float64],
         strengths: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Return expected counts using an active filter's physical kernel."""
+        """Return expected counts using one isotope filter's physical kernel."""
         return self._cached_expected_counts_for_kernel(
             kernel=filt.continuous_kernel,
             isotope=isotope,
@@ -905,9 +817,7 @@ class RotatingShieldPFEstimator:
         normalized: Dict[str, object] = {}
         for key, value in resolved.items():
             normalized[_norm_key(key)] = value
-        isotope_names = (
-            self.all_isotopes if hasattr(self, "all_isotopes") else self.isotopes
-        )
+        isotope_names = self.isotopes
         if isotope_names:
             still_missing: List[str] = []
             for iso in isotope_names:
@@ -944,23 +854,23 @@ class RotatingShieldPFEstimator:
         if len(self.poses) == 0:
             raise ValueError("No poses added; cannot build kernel cache.")
         poses_arr = np.stack(self.poses, axis=0)
-        self.kernel_cache = KernelPrecomputer(
+        self.kernel_cache = MeasurementGeometry(
             candidate_sources=self.candidate_sources,
             poses=poses_arr,
             orientations=self.normals,
             shield_params=self.shield_params,
             mu_by_isotope=self.mu_by_isotope,
-            use_gpu=self.pf_config.use_gpu,
-            gpu_device=self.pf_config.gpu_device,
-            gpu_dtype=self.pf_config.gpu_dtype,
         )
         pf_conf = self._build_pf_config()
         if self.filters:
+            expected = set(self.isotopes)
+            actual = set(self.filters)
+            if actual != expected:
+                raise RuntimeError(
+                    "Pure PF requires exactly one initialized filter per isotope."
+                )
             for iso in self.isotopes:
-                if iso in self.filters:
-                    self.filters[iso].set_kernel(self.kernel_cache)
-                else:
-                    self.filters[iso] = self._build_filter(iso, pf_conf)
+                self.filters[iso].set_kernel(self.kernel_cache)
         else:
             for iso in self.isotopes:
                 self.filters[iso] = self._build_filter(iso, pf_conf)
@@ -1019,18 +929,13 @@ class RotatingShieldPFEstimator:
         self,
         isotope: str,
         *,
-        fe_index: int | None = None,
-        pb_index: int | None = None,
-        shield_pair_id: int | None = None,
+        fe_index: int,
+        pb_index: int,
     ) -> float:
         """Return the configured source response scale for one isotope."""
-        pair_id = self._shield_pair_id(
-            fe_index=fe_index,
-            pb_index=pb_index,
-            shield_pair_id=shield_pair_id,
-        )
+        pair_id = int(fe_index) * int(self.num_orientations) + int(pb_index)
         pair_scales = self.pf_config.measurement_scale_by_isotope_and_pair
-        if pair_id is not None and isinstance(pair_scales, Mapping):
+        if isinstance(pair_scales, Mapping):
             iso_pair_scales = pair_scales.get(str(isotope), {})
             if isinstance(iso_pair_scales, Mapping):
                 value = iso_pair_scales.get(int(pair_id))
@@ -1065,20 +970,6 @@ class RotatingShieldPFEstimator:
             ],
             dtype=float,
         )
-
-    def _shield_pair_id(
-        self,
-        *,
-        fe_index: int | None = None,
-        pb_index: int | None = None,
-        shield_pair_id: int | None = None,
-    ) -> int | None:
-        """Return the canonical shield-pair id when a pair is available."""
-        if shield_pair_id is not None:
-            return int(shield_pair_id)
-        if fe_index is None or pb_index is None:
-            return None
-        return int(fe_index) * int(self.num_orientations) + int(pb_index)
 
     def _project_observation_covariance_to_variance(
         self,
@@ -1235,508 +1126,58 @@ class RotatingShieldPFEstimator:
             for row_idx, row_iso in enumerate(isotopes)
         }
 
-    @staticmethod
-    def _sanitize_spectrum_vector(
-        values: object,
+    def select_runtime_likelihood_routes(
+        self,
         *,
-        name: str,
-        expected_size: int | None = None,
-    ) -> tuple[float, ...] | None:
-        """Return a finite non-negative spectrum vector payload."""
-        if values is None:
-            return None
-        arr = np.asarray(values, dtype=float).reshape(-1)
-        if arr.size == 0:
-            return None
-        if expected_size is not None and arr.size != int(expected_size):
-            raise ValueError(f"{name} must have {int(expected_size)} bins.")
-        arr = np.maximum(np.where(np.isfinite(arr), arr, 0.0), 0.0)
-        return tuple(float(value) for value in arr)
-
-    @staticmethod
-    def _looks_like_spectrum_payload(payload: object) -> bool:
-        """Return True when a mapping carries direct spectrum-bin fields."""
-        if not isinstance(payload, Mapping):
-            return False
-        keys = {str(key) for key in payload.keys()}
-        return bool(
-            {
-                "spectrum_counts",
-                "spectrum_variance",
-                "spectrum_background",
-                "spectrum_response_templates_by_isotope",
-            }
-            & keys
-        )
-
-    @staticmethod
-    def _sanitize_spectrum_payload(
-        payload: Mapping[str, object] | None,
-    ) -> dict[str, object] | None:
-        """Return a normalized spectrum-bin payload for measurement history."""
-        if payload is None:
-            return None
-        spectrum_counts = RotatingShieldPFEstimator._sanitize_spectrum_vector(
-            payload.get("spectrum_counts"),
-            name="spectrum_counts",
-        )
-        if spectrum_counts is None:
-            return None
-        bin_count = len(spectrum_counts)
-        spectrum_variance = RotatingShieldPFEstimator._sanitize_spectrum_vector(
-            payload.get("spectrum_variance"),
-            name="spectrum_variance",
-            expected_size=bin_count,
-        )
-        spectrum_background = RotatingShieldPFEstimator._sanitize_spectrum_vector(
-            payload.get("spectrum_background"),
-            name="spectrum_background",
-            expected_size=bin_count,
-        )
-        template_payload = payload.get("spectrum_response_templates_by_isotope", {})
-        templates: dict[str, tuple[float, ...]] = {}
-        if isinstance(template_payload, Mapping):
-            for isotope, values in template_payload.items():
-                template = RotatingShieldPFEstimator._sanitize_spectrum_vector(
-                    values,
-                    name=f"spectrum_response_templates_by_isotope[{isotope}]",
-                    expected_size=bin_count,
-                )
-                if template is not None:
-                    templates[str(isotope)] = template
-        return {
-            "spectrum_counts": spectrum_counts,
-            "spectrum_variance": spectrum_variance,
-            "spectrum_background": spectrum_background,
-            "spectrum_background_source": str(
-                payload.get("spectrum_background_source", "unspecified")
-            ),
-            "spectrum_background_observation_independent": bool(
-                payload.get(
-                    "spectrum_background_observation_independent",
-                    False,
-                )
-            ),
-            "spectrum_response_templates_by_isotope": templates,
-        }
-
-    def register_configured_isotope_spectrum_responses(
-        self,
-        templates_by_isotope: Mapping[str, object],
-    ) -> tuple[str, ...]:
-        """Retain configured spectral responses independently of active PF filters.
-
-        Entries are keyed by isotope and spectrum-bin count so an exact response is
-        reused only for histories with the same binning.  Partial registration is
-        allowed because response providers may populate configured isotopes in
-        batches; unknown isotopes are rejected to prevent silent model mismatch.
-        """
-        configured = set(self.configured_isotope_order())
-        registered: list[str] = []
-        for isotope, values in templates_by_isotope.items():
-            isotope_key = str(isotope)
-            if isotope_key not in configured:
-                raise ValueError(
-                    f"Cannot register spectrum response for unconfigured isotope "
-                    f"{isotope_key!r}."
-                )
-            response = self._sanitize_spectrum_vector(
-                values,
-                name=f"configured_spectrum_response[{isotope_key}]",
-            )
-            if response is None:
-                continue
-            self._configured_spectrum_response_registry[
-                (isotope_key, len(response))
-            ] = response
-            registered.append(isotope_key)
-        return tuple(registered)
-
-    def configured_isotope_spectrum_response(
-        self,
-        isotope: str,
-        *,
-        bin_count: int,
-    ) -> NDArray[np.float64] | None:
-        """Return a copied configured spectral response for an exact binning."""
-        isotope_key = str(isotope)
-        if isotope_key not in self.configured_isotope_order():
-            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
-        response = self._configured_spectrum_response_registry.get(
-            (isotope_key, int(bin_count))
-        )
-        if response is None:
-            return None
-        return np.asarray(response, dtype=float).copy()
-
-    def _complete_spectrum_payload_with_configured_responses(
-        self,
-        payload: Mapping[str, object] | None,
-    ) -> dict[str, object] | None:
-        """Register exact templates and fill configured responses of equal binning."""
-        if payload is None:
-            return None
-        counts = payload.get("spectrum_counts")
-        if counts is None:
-            return dict(payload)
-        bin_count = int(np.asarray(counts, dtype=float).size)
-        raw_templates = payload.get("spectrum_response_templates_by_isotope", {})
-        templates = (
-            {str(key): value for key, value in raw_templates.items()}
-            if isinstance(raw_templates, Mapping)
-            else {}
-        )
-        configured = set(self.configured_isotope_order())
-        configured_templates = {
-            isotope: values
-            for isotope, values in templates.items()
-            if isotope in configured
-        }
-        self.register_configured_isotope_spectrum_responses(configured_templates)
-        completed = dict(templates)
-        for isotope in self.configured_isotope_order():
-            response = self.configured_isotope_spectrum_response(
+        sequence_length: int,
+        z_view_covariance_by_isotope: (
+            Mapping[str, NDArray[np.float64]] | None
+        ) = None,
+    ) -> dict[str, str]:
+        """Select one explicit likelihood route per isotope before PF ingestion."""
+        length = int(sequence_length)
+        if length <= 0:
+            raise ValueError("sequence_length must be positive.")
+        if not self.filters:
+            self._ensure_kernel_cache()
+        routes: dict[str, str] = {}
+        for isotope, filt in self.filters.items():
+            view_covariance = self._view_covariance_for_isotope(
                 isotope,
-                bin_count=bin_count,
+                sequence_length=length,
+                z_view_covariance_by_isotope=z_view_covariance_by_isotope,
             )
-            if response is not None:
-                completed[isotope] = tuple(float(value) for value in response)
-        return {
-            **dict(payload),
-            "spectrum_response_templates_by_isotope": completed,
-        }
-
-    @staticmethod
-    def _pf_spectrum_update_payload_for_isotope(
-        isotope: str,
-        z_k: Mapping[str, float],
-        spectrum_payload: Mapping[str, object] | None,
-    ) -> dict[str, NDArray[np.float64]] | None:
-        """Return target-isotope spectrum arrays for a PF weight update."""
-        if spectrum_payload is None:
-            return None
-        counts_raw = spectrum_payload.get("spectrum_counts")
-        templates_raw = spectrum_payload.get("spectrum_response_templates_by_isotope")
-        if counts_raw is None or not isinstance(templates_raw, Mapping):
-            return None
-        isotope_key = str(isotope)
-        if isotope_key not in templates_raw:
-            return None
-        counts = np.asarray(counts_raw, dtype=float).reshape(-1)
-        target_template = np.asarray(templates_raw[isotope_key], dtype=float).reshape(
-            -1
+            model = normalize_count_likelihood_model(
+                str(filt.config.count_likelihood_model)
+            )
+            routes[str(isotope)] = (
+                COUNT_COVARIANCE_LIKELIHOOD_ROUTE
+                if model != "poisson"
+                and filt._sequence_covariance_enabled(length, view_covariance)
+                else COUNT_LIKELIHOOD_ROUTE
+            )
+        return canonical_runtime_likelihood_route_mapping(
+            routes,
+            self.configured_isotope_order(),
         )
-        if counts.size == 0 or target_template.size != counts.size:
-            return None
-        background_raw = spectrum_payload.get("spectrum_background")
-        if background_raw is None:
-            background = np.zeros_like(counts, dtype=float)
-        else:
-            background = np.asarray(background_raw, dtype=float).reshape(-1)
-            if background.size != counts.size:
-                background = np.zeros_like(counts, dtype=float)
-        for other_isotope, other_template_raw in templates_raw.items():
-            other_key = str(other_isotope)
-            if other_key == isotope_key:
-                continue
-            other_template = np.asarray(other_template_raw, dtype=float).reshape(-1)
-            if other_template.size != counts.size:
-                continue
-            other_counts = max(float(z_k.get(other_key, 0.0)), 0.0)
-            if other_counts > 0.0:
-                background = background + other_counts * np.maximum(
-                    np.where(np.isfinite(other_template), other_template, 0.0),
-                    0.0,
-                )
-        variance = None
-        variance_raw = spectrum_payload.get("spectrum_variance")
-        if variance_raw is not None:
-            variance_candidate = np.asarray(variance_raw, dtype=float).reshape(-1)
-            if variance_candidate.size == counts.size:
-                variance = np.maximum(
-                    np.where(np.isfinite(variance_candidate), variance_candidate, 0.0),
-                    0.0,
-                )
-        payload = {
-            "spectrum_counts": np.maximum(
-                np.where(np.isfinite(counts), counts, 0.0),
-                0.0,
-            ),
-            "spectrum_response_template": np.maximum(
-                np.where(np.isfinite(target_template), target_template, 0.0),
-                0.0,
-            ),
-            "spectrum_background": np.maximum(
-                np.where(np.isfinite(background), background, 0.0),
-                0.0,
-            ),
-        }
-        if variance is not None:
-            payload["spectrum_variance"] = variance
-        return payload
-
-    @staticmethod
-    def _stack_pf_spectrum_sequence_payloads(
-        payloads: Sequence[dict[str, NDArray[np.float64]] | None],
-    ) -> dict[str, NDArray[np.float64]] | None:
-        """Stack per-view PF spectrum payloads into KxB arrays."""
-        if not payloads or any(payload is None for payload in payloads):
-            return None
-        concrete = [payload for payload in payloads if payload is not None]
-        if not concrete:
-            return None
-        bin_count = int(concrete[0]["spectrum_counts"].reshape(-1).size)
-        if bin_count <= 0:
-            return None
-        required_keys = (
-            "spectrum_counts",
-            "spectrum_response_template",
-            "spectrum_background",
-        )
-        stacked: dict[str, NDArray[np.float64]] = {}
-        for key in required_keys:
-            rows = [
-                np.asarray(payload[key], dtype=float).reshape(-1)
-                for payload in concrete
-            ]
-            if any(row.size != bin_count for row in rows):
-                return None
-            stacked[key] = np.vstack(rows)
-        if any("spectrum_variance" in payload for payload in concrete):
-            variance_rows = [
-                (
-                    np.zeros(bin_count, dtype=float)
-                    if "spectrum_variance" not in payload
-                    else np.asarray(
-                        payload["spectrum_variance"],
-                        dtype=float,
-                    ).reshape(-1)
-                )
-                for payload in concrete
-            ]
-            if any(row.size != bin_count for row in variance_rows):
-                return None
-            stacked["spectrum_variance"] = np.vstack(variance_rows)
-        return stacked
-
-    @staticmethod
-    def _recorded_runtime_likelihood_route(
-        filt: IsotopeParticleFilter,
-    ) -> str:
-        """Return the validated likelihood route selected by a runtime update."""
-        route = str(filt.last_spectrum_likelihood_route)
-        if route not in {"count", "count_covariance", "direct_spectrum"}:
-            return "count"
-        return route
 
     def _runtime_likelihood_routes_for_records(
         self,
         isotope: str,
         records: Sequence[MeasurementRecord],
-        spectrum_payloads: Sequence[dict[str, NDArray[np.float64]] | None],
     ) -> NDArray[np.str_]:
         """Return the exact per-row runtime likelihood route for one isotope."""
-        if len(records) != len(spectrum_payloads):
-            raise ValueError("Records and spectrum payloads must have matching length.")
-        filters = getattr(self, "filters", {})
-        filt = filters.get(str(isotope)) if isinstance(filters, Mapping) else None
-        pf_config = getattr(self, "pf_config", None)
-        if filt is not None:
-            direct_enabled = filt._direct_spectrum_likelihood_enabled()
-        elif pf_config is None:
-            direct_enabled = True
-        else:
-            direct_enabled = (
-                IsotopeParticleFilter._direct_spectrum_likelihood_config_enabled(
-                    pf_config,
-                    str(isotope),
-                )
-            )
+        configured_isotopes = self.configured_isotope_order()
+        if str(isotope) not in configured_isotopes:
+            raise ValueError(f"Isotope {isotope!r} is not configured.")
         routes: list[str] = []
-        explicit_routes: list[bool] = []
-        for record, spectrum_payload in zip(records, spectrum_payloads):
-            explicit = record.runtime_likelihood_route_by_isotope
-            route = None if explicit is None else explicit.get(str(isotope))
-            explicit_routes.append(route is not None)
-            if route is None:
-                route = (
-                    "direct_spectrum"
-                    if direct_enabled and spectrum_payload is not None
-                    else "count"
-                )
-            normalized = str(route)
-            if normalized not in {
-                "count",
-                "count_covariance",
-                "direct_spectrum",
-            }:
-                raise ValueError(
-                    f"Unsupported recorded runtime likelihood route: {normalized!r}."
-                )
-            routes.append(normalized)
-        sequence_ids = self._station_sequence_ids_for_records(records)
-        route_array = np.asarray(routes, dtype="<U16")
-        explicit_array = np.asarray(explicit_routes, dtype=bool)
-        likelihood_config = getattr(filt, "config", pf_config)
-        configured_station_covariance = (
-            bool(
-                getattr(
-                    likelihood_config,
-                    "station_view_covariance_enable",
-                    False,
-                )
+        for record in records:
+            mapping = canonical_runtime_likelihood_route_mapping(
+                record.runtime_likelihood_route_by_isotope,
+                configured_isotopes,
             )
-            and float(
-                getattr(
-                    likelihood_config,
-                    "station_view_correlated_spectrum_fraction",
-                    0.0,
-                )
-            )
-            > 0.0
-        )
-        for sequence_id in np.unique(sequence_ids):
-            block_mask = sequence_ids == int(sequence_id)
-            if np.any(explicit_array[block_mask]) or np.count_nonzero(block_mask) < 2:
-                continue
-            supplied_station_covariance = any(
-                isinstance(
-                    records[int(index)].station_view_covariance_by_isotope,
-                    Mapping,
-                )
-                and str(isotope)
-                in records[int(index)].station_view_covariance_by_isotope
-                for index in np.flatnonzero(block_mask)
-            )
-            if supplied_station_covariance or configured_station_covariance:
-                route_array[block_mask] = "count_covariance"
-        return route_array
-
-    @staticmethod
-    def _runtime_spectrum_variance_usage_for_records(
-        isotope: str,
-        records: Sequence[MeasurementRecord],
-        spectrum_payloads: Sequence[dict[str, NDArray[np.float64]] | None],
-        runtime_routes: NDArray[np.str_],
-    ) -> NDArray[np.bool_]:
-        """
-        Return whether each runtime direct-spectrum row used a variance array.
-
-        A joint station update supplies one stacked variance array to every row
-        when any row in that station has a variance payload. Independent
-        updates retain their row-local ``None`` semantics. New records store
-        the exact runtime choice; station grouping provides a compatible
-        fallback for legacy or directly constructed records.
-        """
-        routes = np.asarray(runtime_routes, dtype=str).reshape(-1)
-        if len(records) != len(spectrum_payloads) or routes.size != len(records):
-            raise ValueError(
-                "Records, spectrum payloads, and routes must have matching length."
-            )
-        if not records:
-            return np.zeros(0, dtype=bool)
-        sequence_ids = RotatingShieldPFEstimator._station_sequence_ids_for_records(
-            records
-        )
-        result = np.zeros(len(records), dtype=bool)
-        for sequence_id in np.unique(sequence_ids):
-            block_mask = sequence_ids == int(sequence_id)
-            block_routes = routes[block_mask]
-            if np.any(block_routes != block_routes[:1]):
-                raise ValueError(
-                    "Rows in one station sequence must share one runtime "
-                    "likelihood route."
-                )
-            if block_routes[0] != "direct_spectrum":
-                continue
-            block_indices = np.flatnonzero(block_mask)
-            explicit_values = [
-                bool(explicit[str(isotope)])
-                for index in block_indices
-                if (
-                    (
-                        explicit := records[
-                            int(index)
-                        ].runtime_spectrum_variance_used_by_isotope
-                    )
-                    is not None
-                    and str(isotope) in explicit
-                )
-            ]
-            if explicit_values:
-                if any(value != explicit_values[0] for value in explicit_values):
-                    raise ValueError(
-                        "Rows in one station sequence recorded inconsistent "
-                        "spectrum-variance usage."
-                    )
-                variance_used = bool(explicit_values[0])
-            else:
-                variance_used = any(
-                    spectrum_payloads[int(index)] is not None
-                    and "spectrum_variance" in spectrum_payloads[int(index)]
-                    for index in block_indices
-                )
-            result[block_mask] = variance_used
-        return result
-
-    @staticmethod
-    def _stack_pf_spectrum_history_payloads(
-        payloads: Sequence[dict[str, NDArray[np.float64]] | None],
-        runtime_routes: NDArray[np.str_],
-        spectrum_variance_used: NDArray[np.bool_],
-    ) -> dict[str, NDArray[np.float64]] | None:
-        """
-        Stack only rows that actually used the direct-spectrum runtime route.
-
-        Count-route rows receive zero placeholders and are excluded by their
-        explicit route before likelihood evaluation. Spectrum math remains
-        batched; the metadata pass only resolves optional row payloads.
-        """
-        routes = np.asarray(runtime_routes, dtype=str).reshape(-1)
-        if routes.size != len(payloads):
-            raise ValueError(
-                "runtime_likelihood_routes must contain one route per payload."
-            )
-        variance_used = np.asarray(spectrum_variance_used, dtype=bool).reshape(-1)
-        if variance_used.size != len(payloads):
-            raise ValueError(
-                "spectrum_variance_used must contain one flag per payload."
-            )
-        direct_mask = routes == "direct_spectrum"
-        if not np.any(direct_mask):
-            return None
-        direct_indices = np.flatnonzero(direct_mask)
-        direct_payloads = [payloads[int(index)] for index in direct_indices]
-        if any(payload is None for payload in direct_payloads):
-            raise ValueError(
-                "A recorded direct-spectrum route is missing its spectrum payload."
-            )
-        stacked_direct = RotatingShieldPFEstimator._stack_pf_spectrum_sequence_payloads(
-            direct_payloads
-        )
-        if stacked_direct is None:
-            raise ValueError("Recorded direct-spectrum payload rows are inconsistent.")
-        if (
-            np.any(variance_used[direct_indices])
-            and "spectrum_variance" not in stacked_direct
-        ):
-            stacked_direct["spectrum_variance"] = np.zeros_like(
-                stacked_direct["spectrum_counts"],
-                dtype=float,
-            )
-        bin_count = int(stacked_direct["spectrum_counts"].shape[1])
-        stacked_history: dict[str, NDArray[np.float64]] = {}
-        for key, direct_values in stacked_direct.items():
-            history_values = np.zeros(
-                (len(payloads), bin_count),
-                dtype=float,
-            )
-            history_values[direct_indices, :] = np.asarray(
-                direct_values,
-                dtype=float,
-            )
-            stacked_history[key] = history_values
-        return stacked_history
+            routes.append(mapping[str(isotope)])
+        return np.asarray(routes, dtype="<U16")
 
     @staticmethod
     def _normalize_pair_sequence_record(
@@ -1748,21 +1189,12 @@ class RotatingShieldPFEstimator:
         float,
         Dict[str, float] | None,
         Dict[str, Dict[str, float]] | None,
-        dict[str, object] | None,
     ]:
         """Return a canonical same-pose shield-program observation record."""
-        spectrum_payload = None
         if len(record) == 5:
             z_k, fe_index, pb_index, live_time_s, z_variance_k = record
             z_covariance_k = None
         elif len(record) == 6:
-            z_k, fe_index, pb_index, live_time_s, z_variance_k, sixth = record
-            if RotatingShieldPFEstimator._looks_like_spectrum_payload(sixth):
-                z_covariance_k = None
-                spectrum_payload = sixth
-            else:
-                z_covariance_k = sixth
-        elif len(record) == 7:
             (
                 z_k,
                 fe_index,
@@ -1770,13 +1202,11 @@ class RotatingShieldPFEstimator:
                 live_time_s,
                 z_variance_k,
                 z_covariance_k,
-                spectrum_payload,
             ) = record
         else:
             raise ValueError(
                 "Pair sequence records must have 5 fields "
-                "(z, fe, pb, live, variance), 6 fields with covariance or "
-                "spectrum payload, or 7 fields with both."
+                "(z, fe, pb, live, variance) or 6 fields with covariance."
             )
         return (
             {str(isotope): float(value) for isotope, value in dict(z_k).items()},
@@ -1798,9 +1228,6 @@ class RotatingShieldPFEstimator:
                 }
                 for row_iso, row_payload in dict(z_covariance_k).items()
             },
-            RotatingShieldPFEstimator._sanitize_spectrum_payload(
-                spectrum_payload if isinstance(spectrum_payload, Mapping) else None
-            ),
         )
 
     @staticmethod
@@ -1861,30 +1288,8 @@ class RotatingShieldPFEstimator:
         )
 
     def configured_isotope_order(self) -> tuple[str, ...]:
-        """Return the stable configured isotope order, including inactive PFs."""
-        return tuple(dict.fromkeys(str(isotope) for isotope in self.all_isotopes))
-
-    def configured_isotope_response_kernel(self, isotope: str) -> ContinuousKernel:
-        """Return a shared physical response kernel without creating a PF filter."""
-        isotope_key = str(isotope)
-        configured = self.configured_isotope_order()
-        if isotope_key not in configured:
-            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
-        kernel = self._configured_response_kernel_registry.get(isotope_key)
-        if kernel is not None:
-            return kernel
-        shared_kernel = next(
-            iter(self._configured_response_kernel_registry.values()),
-            None,
-        )
-        if shared_kernel is None:
-            shared_kernel = self.continuous_kernel()
-        for configured_isotope in configured:
-            self._configured_response_kernel_registry.setdefault(
-                configured_isotope,
-                shared_kernel,
-            )
-        return self._configured_response_kernel_registry[isotope_key]
+        """Return the stable pure-PF isotope order."""
+        return tuple(dict.fromkeys(str(isotope) for isotope in self.isotopes))
 
     def configured_isotope_response_counts(
         self,
@@ -1893,13 +1298,22 @@ class RotatingShieldPFEstimator:
         source_positions: NDArray[np.float64],
         strengths: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
-        """Return batched configured-isotope responses independent of PF state.
+        """Return batched responses from the configured isotope PF kernel.
 
         Measurement rows and source positions are evaluated by the same continuous
         transport, obstacle, aperture, shield, and calibrated response-scale model
-        used by active PF filters.  Candidate positions remain batched; no particle
-        state or active-isotope gate is read.
+        used by the PF. Candidate positions remain batched and particle state is not
+        read.
         """
+        isotope_key = str(isotope)
+        if isotope_key not in self.configured_isotope_order():
+            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
+        filt = self.filters.get(isotope_key)
+        if filt is None:
+            raise RuntimeError(
+                "Pure PF isotope filters must be initialized before response "
+                "diagnostics are evaluated."
+            )
         positions = np.asarray(source_positions, dtype=float).reshape(-1, 3)
         if strengths is None:
             strength_values = np.ones(positions.shape[0], dtype=float)
@@ -1908,24 +1322,12 @@ class RotatingShieldPFEstimator:
         if strength_values.size != positions.shape[0]:
             raise ValueError("strengths must contain one value per source position.")
         return self._cached_expected_counts_for_kernel(
-            kernel=self.configured_isotope_response_kernel(str(isotope)),
-            isotope=str(isotope),
+            kernel=filt.continuous_kernel,
+            isotope=isotope_key,
             data=data,
             sources=positions,
             strengths=strength_values,
         )
-
-    def configured_isotope_measurement_history(
-        self,
-        isotope: str,
-        *,
-        window: int | None = None,
-    ) -> MeasurementData | None:
-        """Return count/geometry history for a configured, possibly inactive isotope."""
-        isotope_key = str(isotope)
-        if isotope_key not in self.configured_isotope_order():
-            raise KeyError(f"Isotope {isotope_key!r} is not configured.")
-        return self._measurement_data_for_iso(isotope_key, window)
 
     def _continuous_kernel(self) -> ContinuousKernel:
         """Build a ContinuousKernel matching the estimator observation model."""
@@ -2540,39 +1942,6 @@ class RotatingShieldPFEstimator:
             subsets[iso] = (states, sel_weights)
         return subsets
 
-    def weight_entropy_ratio(
-        self,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None = None,
-    ) -> float:
-        """
-        Return the mean normalized weight entropy across isotopes.
-
-        The entropy ratio is H(w)/log(N) in [0, 1]. Lower values indicate a more
-        concentrated posterior (less multi-modality).
-        """
-        entropies: List[float] = []
-        eps = 1e-12
-        for iso, filt in self.filters.items():
-            if particles_by_isotope is not None and iso in particles_by_isotope:
-                _, weights = particles_by_isotope[iso]
-            else:
-                if not filt.continuous_particles:
-                    continue
-                weights = filt.continuous_weights
-            weights = np.asarray(weights, dtype=float)
-            if weights.size == 0:
-                continue
-            weights = weights / max(float(np.sum(weights)), eps)
-            if weights.size == 1:
-                entropies.append(0.0)
-                continue
-            entropy = float(-np.sum(weights * np.log(weights + eps)))
-            entropies.append(entropy / max(np.log(weights.size), eps))
-        if not entropies:
-            return 0.0
-        return float(np.mean(entropies))
-
     def add_measurement_pose(
         self, pose: NDArray[np.float64], reset_filters: bool = True
     ) -> None:
@@ -2583,109 +1952,17 @@ class RotatingShieldPFEstimator:
         if reset_filters:
             self.filters = {}
 
-    def restrict_isotopes(
+    def _registered_detector_position_xyz(
         self,
-        active_isotopes: Sequence[str],
-        *,
-        allow_empty: bool = False,
-    ) -> None:
-        """
-        Restrict estimator state to the specified isotopes.
-
-        This drops filters and cached estimates for isotopes that are not in
-        active_isotopes while preserving the original isotope ordering. When
-        allow_empty is true, no isotope PFs remain active until add_isotopes()
-        is called by the spectrum-detection gate.
-        """
-        active_set = set(active_isotopes)
-        if not active_set and not allow_empty:
-            raise ValueError("active_isotopes must contain at least one isotope.")
-        self.isotopes = [iso for iso in self.all_isotopes if iso in active_set]
-        if self.filters:
-            self.filters = {
-                iso: filt for iso, filt in self.filters.items() if iso in active_set
-            }
-        if self.history_estimates:
-            self.history_estimates = [
-                {iso: val for iso, val in est.items() if iso in active_set}
-                for est in self.history_estimates
-            ]
-
-    def add_isotopes(self, new_isotopes: Sequence[str]) -> None:
-        """
-        Add isotopes to the estimator and initialize their PF filters.
-
-        This is useful when new isotopes are detected after an initial restriction.
-        """
-        requested = set(new_isotopes)
-        active_set = set(self.isotopes) | requested
-        to_add = [
-            iso
-            for iso in self.all_isotopes
-            if iso in requested and iso not in self.isotopes
-        ]
-        if not to_add:
-            return
-        self.isotopes = [iso for iso in self.all_isotopes if iso in active_set]
-        if self.kernel_cache is None and self.poses:
-            self._ensure_kernel_cache()
-        if self.kernel_cache is None:
-            return
-        pf_conf = self._build_pf_config()
-        for iso in to_add:
-            if iso not in self.filters:
-                self.filters[iso] = self._build_filter(iso, pf_conf)
-
-    def update(
-        self,
-        z_k: Dict[str, float],
         pose_idx: int,
-        orient_idx: int,
-        live_time_s: float,
-    ) -> None:
-        """
-        Update per-isotope PFs using isotope-wise counts z_k.
-
-        z_k must come from the spectrum unfolding pipeline (Sec. 2.5.7); this method
-        never fabricates observations from geometric kernels or ground truth.
-        """
-        raise RuntimeError(
-            "Single-orientation updates are disabled. Use update_pair or short_time_update "
-            "with Fe/Pb indices to preserve the 64-orientation shield model."
-        )
-
-    def predict(self) -> None:
-        """Run the prediction step for all PFs."""
-        for f in self.filters.values():
-            f.predict()
-
-    def short_time_update(
-        self,
-        z_k: Dict[str, float],
-        pose_idx: int,
-        RFe: NDArray[np.float64],
-        RPb: NDArray[np.float64],
-        live_time_s: float | None = None,
-    ) -> None:
-        """
-        Apply a short-time measurement update (Sec. 3.4.3).
-
-        - Use shield orientations (RFe, RPb) and isotope-wise counts z_k.
-        - T_k defaults to pf_config.short_time_s unless specified.
-        - z_k must come from the spectrum pipeline (Sec. 2.5.7), not from geometry.
-        """
-        duration = (
-            live_time_s if live_time_s is not None else self.pf_config.short_time_s
-        )
-        fe_index = octant_index_from_rotation(RFe)
-        pb_index = octant_index_from_rotation(RPb)
-        self.update_pair(
-            z_k=z_k,
-            pose_idx=pose_idx,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            live_time_s=duration,
-        )
+    ) -> tuple[float, float, float]:
+        """Return the canonical registered detector position for a pose index."""
+        position = np.asarray(self.poses[int(pose_idx)], dtype=float).reshape(-1)
+        if position.size != 3 or not np.all(np.isfinite(position)):
+            raise ValueError(
+                "Registered measurement poses must contain three finite coordinates."
+            )
+        return tuple(float(value) for value in position)
 
     def update_pair(
         self,
@@ -2696,7 +1973,6 @@ class RotatingShieldPFEstimator:
         live_time_s: float,
         z_variance_k: Dict[str, float] | None = None,
         z_covariance_k: Dict[str, Dict[str, float]] | None = None,
-        spectrum_payload: Mapping[str, object] | None = None,
     ) -> None:
         """
         Update PFs using Fe/Pb orientation indices (RFe, RPb) and isotope-wise counts z_k.
@@ -2707,6 +1983,7 @@ class RotatingShieldPFEstimator:
         """
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
+        detector_position_xyz_m = self._registered_detector_position_xyz(pose_idx)
         effective_variance_k, sanitized_covariance_k = (
             self._project_observation_covariance_to_variance(
                 z_k,
@@ -2714,26 +1991,11 @@ class RotatingShieldPFEstimator:
                 z_covariance_k,
             )
         )
-        sanitized_spectrum_payload = None
-        if spectrum_payload is not None:
-            sanitized_spectrum_payload = (
-                self._complete_spectrum_payload_with_configured_responses(
-                    self._sanitize_spectrum_payload(spectrum_payload)
-                )
-            )
-        runtime_likelihood_routes: dict[str, str] = {}
-        runtime_spectrum_variance_used: dict[str, bool] = {}
+        runtime_likelihood_routes = {
+            str(isotope): COUNT_LIKELIHOOD_ROUTE for isotope in self.filters
+        }
         for iso, filt in self.filters.items():
             val = float(z_k.get(iso, 0.0))
-            pf_spectrum_payload = (
-                None
-                if sanitized_spectrum_payload is None
-                else self._pf_spectrum_update_payload_for_isotope(
-                    iso,
-                    z_k,
-                    sanitized_spectrum_payload,
-                )
-            )
             # Use continuous PF update that relies on spectrum-unfolded counts.
             filt.update_continuous_pair(
                 z_obs=val,
@@ -2747,25 +2009,17 @@ class RotatingShieldPFEstimator:
                     else float(effective_variance_k.get(iso, 0.0))
                 ),
                 step_idx=len(self.measurements),
-                defer_resample=bool(self._defer_structural_moves),
-                **({} if pf_spectrum_payload is None else pf_spectrum_payload),
-            )
-            runtime_likelihood_routes[str(iso)] = (
-                self._recorded_runtime_likelihood_route(filt)
-            )
-            runtime_spectrum_variance_used[str(iso)] = bool(
-                runtime_likelihood_routes[str(iso)] == "direct_spectrum"
-                and pf_spectrum_payload is not None
-                and "spectrum_variance" in pf_spectrum_payload
             )
         self.measurements.append(
             MeasurementRecord(
                 z_k={iso: float(v) for iso, v in z_k.items()},
-                pose_idx=pose_idx,
-                orient_idx=fe_index,
-                live_time_s=live_time_s,
-                fe_index=fe_index,
-                pb_index=pb_index,
+                pose_idx=int(pose_idx),
+                live_time_s=float(live_time_s),
+                fe_index=int(fe_index),
+                pb_index=int(pb_index),
+                detector_position_xyz_m=detector_position_xyz_m,
+                station_sequence_id=int(len(self.measurements)),
+                station_view_index=0,
                 z_variance_k={
                     str(iso): (
                         0.0
@@ -2775,93 +2029,18 @@ class RotatingShieldPFEstimator:
                     for iso in self.filters
                 },
                 z_covariance_k=sanitized_covariance_k,
-                ig_value=None,
-                spectrum_counts=(
-                    None
-                    if sanitized_spectrum_payload is None
-                    else sanitized_spectrum_payload.get("spectrum_counts")
-                ),
-                spectrum_variance=(
-                    None
-                    if sanitized_spectrum_payload is None
-                    else sanitized_spectrum_payload.get("spectrum_variance")
-                ),
-                spectrum_background=(
-                    None
-                    if sanitized_spectrum_payload is None
-                    else sanitized_spectrum_payload.get("spectrum_background")
-                ),
-                spectrum_background_source=(
-                    None
-                    if sanitized_spectrum_payload is None
-                    else str(
-                        sanitized_spectrum_payload.get(
-                            "spectrum_background_source",
-                            "unspecified",
-                        )
-                    )
-                ),
-                spectrum_background_observation_independent=(
-                    False
-                    if sanitized_spectrum_payload is None
-                    else bool(
-                        sanitized_spectrum_payload.get(
-                            "spectrum_background_observation_independent",
-                            False,
-                        )
-                    )
-                ),
-                spectrum_response_templates_by_isotope=(
-                    None
-                    if sanitized_spectrum_payload is None
-                    else sanitized_spectrum_payload.get(
-                        "spectrum_response_templates_by_isotope"
-                    )
-                ),
-                station_sequence_id=int(len(self.measurements)),
-                station_view_index=0,
                 runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
-                runtime_spectrum_variance_used_by_isotope=(
-                    runtime_spectrum_variance_used
-                ),
             )
         )
-        if self._defer_structural_moves:
-            self._deferred_measurement_count += 1
-        else:
-            self._apply_structural_moves()
-        if not self._defer_structural_moves:
-            self._record_history_estimate(len(self.measurements))
-
-    def begin_deferred_pose_update(self) -> None:
-        """Start a station-level update that delays exact structural moves."""
-        self._defer_structural_moves = True
-        self._deferred_measurement_count = 0
-
-    def finalize_deferred_pose_update(self) -> int:
-        """
-        Finish a station-level delayed update and return finalized measurements.
-
-        During a delayed update, each shield posture updates particle weights
-        immediately and may resample on ESS. This method performs station-level
-        particle-count adaptation and then one exact structural RJ-MH update.
-        """
-        count = int(self._deferred_measurement_count)
-        self._defer_structural_moves = False
-        self._deferred_measurement_count = 0
-        if count <= 0:
-            return 0
-        for filt in self.filters.values():
-            filt.finalize_deferred_update()
         self._apply_structural_moves()
         self._record_history_estimate(len(self.measurements))
-        return count
 
     def update_pair_sequence(
         self,
         records: Sequence[Sequence[object]],
         *,
         pose_idx: int,
+        runtime_likelihood_route_by_isotope: Mapping[str, str],
         z_view_covariance_by_isotope: Mapping[str, NDArray[np.float64]] | None = None,
     ) -> None:
         """
@@ -2870,8 +2049,6 @@ class RotatingShieldPFEstimator:
         Each record is ``(z_k, fe_index, pb_index, live_time_s, z_variance_k)``.
         A sixth ``z_covariance_k`` field may be supplied for same-spectrum
         isotope covariance.
-        A seventh spectrum payload field may be supplied for the direct
-        spectrum-bin PF likelihood.
         ``z_view_covariance_by_isotope`` may also supply KxK same-station
         shield-view covariance for each isotope. The joint update uses one
         station-level likelihood over all postures and only applies birth/death
@@ -2879,11 +2056,25 @@ class RotatingShieldPFEstimator:
         """
         if not records:
             return
+        runtime_likelihood_routes = canonical_runtime_likelihood_route_mapping(
+            runtime_likelihood_route_by_isotope,
+            self.configured_isotope_order(),
+        )
+        expected_runtime_likelihood_routes = self.select_runtime_likelihood_routes(
+            sequence_length=len(records),
+            z_view_covariance_by_isotope=z_view_covariance_by_isotope,
+        )
+        if runtime_likelihood_routes != expected_runtime_likelihood_routes:
+            raise ValueError(
+                "Explicit runtime likelihood routes do not match the configured "
+                "count/covariance likelihood inputs."
+            )
         sequence_start = time.perf_counter()
         stage_wall: Dict[str, float] = {}
         stage_start = sequence_start
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
+        detector_position_xyz_m = self._registered_detector_position_xyz(pose_idx)
         normalized_records = []
         for record in records:
             (
@@ -2893,14 +2084,7 @@ class RotatingShieldPFEstimator:
                 live_time_s,
                 z_variance_k,
                 z_covariance_k,
-                spectrum_payload,
             ) = self._normalize_pair_sequence_record(record)
-            if spectrum_payload is not None:
-                spectrum_payload = (
-                    self._complete_spectrum_payload_with_configured_responses(
-                        spectrum_payload
-                    )
-                )
             effective_variance_k, sanitized_covariance_k = (
                 self._project_observation_covariance_to_variance(
                     z_k,
@@ -2916,7 +2100,6 @@ class RotatingShieldPFEstimator:
                     live_time_s,
                     effective_variance_k,
                     sanitized_covariance_k,
-                    spectrum_payload,
                 )
             )
         stage_wall["normalize_records"] = time.perf_counter() - stage_start
@@ -2932,41 +2115,38 @@ class RotatingShieldPFEstimator:
                 NDArray[np.float64],
                 NDArray[np.float64],
                 NDArray[np.float64] | None,
+                str,
                 int,
                 int,
-                NDArray[np.float64] | None,
-                NDArray[np.float64] | None,
-                NDArray[np.float64] | None,
-                NDArray[np.float64] | None,
             ]
         ] = []
         for iso, filt in self.filters.items():
             z_arr = np.asarray(
                 [
                     float(z_k.get(iso, 0.0))
-                    for z_k, _, _, _, _, _, _ in normalized_records
+                    for z_k, _, _, _, _, _ in normalized_records
                 ],
                 dtype=float,
             )
             var_arr = np.asarray(
                 [
                     0.0 if z_variance_k is None else float(z_variance_k.get(iso, 0.0))
-                    for _, _, _, _, z_variance_k, _, _ in normalized_records
+                    for _, _, _, _, z_variance_k, _ in normalized_records
                 ],
                 dtype=float,
             )
             fe_arr = np.asarray(
-                [int(fe_index) for _, fe_index, _, _, _, _, _ in normalized_records],
+                [int(fe_index) for _, fe_index, _, _, _, _ in normalized_records],
                 dtype=int,
             )
             pb_arr = np.asarray(
-                [int(pb_index) for _, _, pb_index, _, _, _, _ in normalized_records],
+                [int(pb_index) for _, _, pb_index, _, _, _ in normalized_records],
                 dtype=int,
             )
             live_arr = np.asarray(
                 [
                     float(live_time_s)
-                    for _, _, _, live_time_s, _, _, _ in normalized_records
+                    for _, _, _, live_time_s, _, _ in normalized_records
                 ],
                 dtype=float,
             )
@@ -2975,26 +2155,6 @@ class RotatingShieldPFEstimator:
                 sequence_length=z_arr.size,
                 z_view_covariance_by_isotope=z_view_covariance_by_isotope,
             )
-            sequence_spectrum_payload = None
-            if any(record[6] is not None for record in normalized_records):
-                sequence_spectrum_payload = self._stack_pf_spectrum_sequence_payloads(
-                    [
-                        self._pf_spectrum_update_payload_for_isotope(
-                            iso,
-                            z_k,
-                            spectrum_payload,
-                        )
-                        for (
-                            z_k,
-                            _fe_index,
-                            _pb_index,
-                            _live_time_s,
-                            _z_variance_k,
-                            _z_covariance_k,
-                            spectrum_payload,
-                        ) in normalized_records
-                    ]
-                )
             tasks.append(
                 (
                     iso,
@@ -3005,20 +2165,9 @@ class RotatingShieldPFEstimator:
                     live_arr,
                     var_arr,
                     view_covariance,
+                    runtime_likelihood_routes[str(iso)],
                     int(pose_idx),
                     int(step_idx),
-                    None
-                    if sequence_spectrum_payload is None
-                    else sequence_spectrum_payload["spectrum_counts"],
-                    None
-                    if sequence_spectrum_payload is None
-                    else sequence_spectrum_payload["spectrum_response_template"],
-                    None
-                    if sequence_spectrum_payload is None
-                    else sequence_spectrum_payload["spectrum_background"],
-                    None
-                    if sequence_spectrum_payload is None
-                    else sequence_spectrum_payload.get("spectrum_variance"),
                 )
             )
         stage_wall["build_isotope_tasks"] = time.perf_counter() - stage_start
@@ -3034,17 +2183,6 @@ class RotatingShieldPFEstimator:
         self.last_pair_sequence_update_wall_s = time.perf_counter() - stage_start
         stage_wall["isotope_sequence_update"] = self.last_pair_sequence_update_wall_s
         stage_start = time.perf_counter()
-        runtime_likelihood_routes = {
-            str(isotope): self._recorded_runtime_likelihood_route(filt)
-            for isotope, filt in self.filters.items()
-        }
-        runtime_spectrum_variance_used = {
-            str(task[0]): bool(
-                runtime_likelihood_routes.get(str(task[0])) == "direct_spectrum"
-                and task[13] is not None
-            )
-            for task in tasks
-        }
         sequence_view_covariance = {
             str(task[0]): tuple(
                 tuple(float(value) for value in row)
@@ -3061,16 +2199,17 @@ class RotatingShieldPFEstimator:
                 live_time_s,
                 z_variance_k,
                 z_covariance_k,
-                spectrum_payload,
             ) = normalized_record
             self.measurements.append(
                 MeasurementRecord(
                     z_k={iso: float(v) for iso, v in z_k.items()},
-                    pose_idx=pose_idx,
-                    orient_idx=int(fe_index),
+                    pose_idx=int(pose_idx),
                     live_time_s=float(live_time_s),
                     fe_index=int(fe_index),
                     pb_index=int(pb_index),
+                    detector_position_xyz_m=detector_position_xyz_m,
+                    station_sequence_id=int(step_idx),
+                    station_view_index=int(view_index),
                     z_variance_k={
                         str(iso): (
                             0.0
@@ -3080,55 +2219,7 @@ class RotatingShieldPFEstimator:
                         for iso in self.filters
                     },
                     z_covariance_k=z_covariance_k,
-                    ig_value=None,
-                    spectrum_counts=(
-                        None
-                        if spectrum_payload is None
-                        else spectrum_payload.get("spectrum_counts")
-                    ),
-                    spectrum_variance=(
-                        None
-                        if spectrum_payload is None
-                        else spectrum_payload.get("spectrum_variance")
-                    ),
-                    spectrum_background=(
-                        None
-                        if spectrum_payload is None
-                        else spectrum_payload.get("spectrum_background")
-                    ),
-                    spectrum_background_source=(
-                        None
-                        if spectrum_payload is None
-                        else str(
-                            spectrum_payload.get(
-                                "spectrum_background_source",
-                                "unspecified",
-                            )
-                        )
-                    ),
-                    spectrum_background_observation_independent=(
-                        False
-                        if spectrum_payload is None
-                        else bool(
-                            spectrum_payload.get(
-                                "spectrum_background_observation_independent",
-                                False,
-                            )
-                        )
-                    ),
-                    spectrum_response_templates_by_isotope=(
-                        None
-                        if spectrum_payload is None
-                        else spectrum_payload.get(
-                            "spectrum_response_templates_by_isotope"
-                        )
-                    ),
-                    station_sequence_id=int(step_idx),
-                    station_view_index=int(view_index),
                     runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
-                    runtime_spectrum_variance_used_by_isotope=(
-                        runtime_spectrum_variance_used
-                    ),
                     station_view_covariance_by_isotope=(
                         None
                         if not sequence_view_covariance
@@ -3159,12 +2250,9 @@ class RotatingShieldPFEstimator:
             NDArray[np.float64],
             NDArray[np.float64],
             NDArray[np.float64] | None,
+            str,
             int,
             int,
-            NDArray[np.float64] | None,
-            NDArray[np.float64] | None,
-            NDArray[np.float64] | None,
-            NDArray[np.float64] | None,
         ],
     ) -> None:
         """Run one isotope's same-station shield-program likelihood update."""
@@ -3177,12 +2265,9 @@ class RotatingShieldPFEstimator:
             live_arr,
             var_arr,
             view_covariance,
+            runtime_likelihood_route,
             pose_idx,
             step_idx,
-            spectrum_counts,
-            spectrum_response_template,
-            spectrum_background,
-            spectrum_variance,
         ) = task
         filt.update_continuous_pair_sequence(
             z_obs=z_arr,
@@ -3190,110 +2275,11 @@ class RotatingShieldPFEstimator:
             fe_indices=fe_arr,
             pb_indices=pb_arr,
             live_times_s=live_arr,
+            runtime_likelihood_route=runtime_likelihood_route,
             observation_count_variances=var_arr,
             observation_count_covariance=view_covariance,
             step_idx=step_idx,
-            spectrum_counts=spectrum_counts,
-            spectrum_response_template=spectrum_response_template,
-            spectrum_background=spectrum_background,
-            spectrum_variance=spectrum_variance,
         )
-
-    def update_pair_at_pose(
-        self,
-        z_k: Dict[str, float],
-        detector_pos: NDArray[np.float64],
-        pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        z_variance_k: Dict[str, float] | None = None,
-        z_covariance_k: Dict[str, Dict[str, float]] | None = None,
-    ) -> None:
-        """
-        Update PFs using explicit detector position without rebuilding the kernel cache.
-
-        Configured isotopes omitted from ``z_k`` are observed as zero. This
-        avoids kernel-cache growth with many poses by using per-pose updates.
-        """
-        if pose_idx < 0 or pose_idx >= len(self.poses):
-            raise IndexError("pose_idx out of range")
-        detector_pos = np.asarray(detector_pos, dtype=float)
-        if not self.filters:
-            pf_conf = self._build_pf_config()
-            for iso in self.isotopes:
-                self.filters[iso] = IsotopeParticleFilter(
-                    iso,
-                    kernel=None,
-                    config=pf_conf,
-                    obstacle_grid=self.obstacle_grid,
-                    obstacle_height_m=self.obstacle_height_m,
-                    obstacle_mu_by_isotope=self.obstacle_mu_by_isotope,
-                    obstacle_buildup_coeff=self.obstacle_buildup_coeff,
-                    detector_radius_m=self.detector_radius_m,
-                    detector_aperture_radius_m=self.detector_aperture_radius_m,
-                    detector_aperture_samples=self.detector_aperture_samples,
-                    detector_aperture_sampling=self.detector_aperture_sampling,
-                    source_extent_radius_m=self.source_extent_radius_m,
-                    source_extent_samples=self.source_extent_samples,
-                    line_mu_by_isotope=self.line_mu_by_isotope,
-                    transport_response_model=self.transport_response_model,
-                )
-        effective_variance_k, sanitized_covariance_k = (
-            self._project_observation_covariance_to_variance(
-                z_k,
-                z_variance_k,
-                z_covariance_k,
-            )
-        )
-        runtime_likelihood_routes: dict[str, str] = {}
-        for iso, filt in self.filters.items():
-            val = float(z_k.get(iso, 0.0))
-            filt.update_continuous_pair_at_pose(
-                z_obs=val,
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-                observation_count_variance=(
-                    0.0
-                    if effective_variance_k is None
-                    else float(effective_variance_k.get(iso, 0.0))
-                ),
-                step_idx=len(self.measurements),
-            )
-            runtime_likelihood_routes[str(iso)] = (
-                self._recorded_runtime_likelihood_route(filt)
-            )
-        self.measurements.append(
-            MeasurementRecord(
-                z_k={iso: float(v) for iso, v in z_k.items()},
-                pose_idx=pose_idx,
-                orient_idx=fe_index,
-                live_time_s=live_time_s,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                z_variance_k={
-                    str(iso): (
-                        0.0
-                        if effective_variance_k is None
-                        else float(effective_variance_k.get(iso, 0.0))
-                    )
-                    for iso in self.filters
-                },
-                z_covariance_k=sanitized_covariance_k,
-                ig_value=None,
-                detector_position_xyz_m=tuple(float(value) for value in detector_pos),
-                station_sequence_id=int(len(self.measurements)),
-                station_view_index=0,
-                runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
-                runtime_spectrum_variance_used_by_isotope={
-                    str(iso): False for iso in runtime_likelihood_routes
-                },
-            )
-        )
-        self._apply_structural_moves()
-        self._record_history_estimate(len(self.measurements))
 
     @staticmethod
     def _station_view_covariance_for_records(
@@ -3312,11 +2298,7 @@ class RotatingShieldPFEstimator:
             ],
         ] = {}
         for row_index, record in enumerate(records):
-            if (
-                record.station_sequence_id is None
-                or record.station_view_index is None
-                or record.station_view_covariance_by_isotope is None
-            ):
+            if record.station_view_covariance_by_isotope is None:
                 continue
             covariance_payload = record.station_view_covariance_by_isotope.get(
                 str(isotope)
@@ -3368,46 +2350,12 @@ class RotatingShieldPFEstimator:
     def _station_sequence_ids_for_records(
         records: Sequence[MeasurementRecord],
     ) -> NDArray[np.int64]:
-        """
-        Return an explicit runtime-likelihood block ID for every history row.
-
-        Joint sequence records retain their shared ID. Legacy records without
-        an ID are assigned distinct synthetic blocks, matching independent
-        per-row runtime updates instead of inferring a block from coordinates.
-        """
-        explicit_ids = [
-            int(record.station_sequence_id)
-            for record in records
-            if record.station_sequence_id is not None
-        ]
-        next_synthetic_id = max(explicit_ids, default=-1) + 1
-        sequence_ids = np.empty(len(records), dtype=np.int64)
-        for row_index, record in enumerate(records):
-            if record.station_sequence_id is None:
-                sequence_ids[row_index] = int(next_synthetic_id)
-                next_synthetic_id += 1
-            else:
-                sequence_ids[row_index] = int(record.station_sequence_id)
-        return sequence_ids
-
-    @staticmethod
-    def _record_spectrum_payload(
-        record: MeasurementRecord,
-    ) -> dict[str, object] | None:
-        """Return the stored spectrum payload needed by a PF likelihood."""
-        if (
-            record.spectrum_counts is None
-            or record.spectrum_response_templates_by_isotope is None
-        ):
-            return None
-        return {
-            "spectrum_counts": record.spectrum_counts,
-            "spectrum_variance": record.spectrum_variance,
-            "spectrum_background": record.spectrum_background,
-            "spectrum_response_templates_by_isotope": (
-                record.spectrum_response_templates_by_isotope
-            ),
-        }
+        """Return the required runtime-likelihood block ID for every history row."""
+        return np.fromiter(
+            (int(record.station_sequence_id) for record in records),
+            dtype=np.int64,
+            count=len(records),
+        )
 
     def _measurement_data_for_iso(
         self,
@@ -3426,29 +2374,9 @@ class RotatingShieldPFEstimator:
             selected_records = self.measurements[-int(window) :]
         if not selected_records:
             return None
-        spectrum_payloads = [
-            self._pf_spectrum_update_payload_for_isotope(
-                isotope,
-                record.z_k,
-                self._record_spectrum_payload(record),
-            )
-            for record in selected_records
-        ]
         runtime_likelihood_routes = self._runtime_likelihood_routes_for_records(
             isotope,
             selected_records,
-            spectrum_payloads,
-        )
-        spectrum_variance_present = self._runtime_spectrum_variance_usage_for_records(
-            isotope,
-            selected_records,
-            spectrum_payloads,
-            runtime_likelihood_routes,
-        )
-        spectrum_payload = self._stack_pf_spectrum_history_payloads(
-            spectrum_payloads,
-            runtime_likelihood_routes,
-            spectrum_variance_present,
         )
         view_covariance = self._station_view_covariance_for_records(
             isotope,
@@ -3470,18 +2398,10 @@ class RotatingShieldPFEstimator:
                 variance_list.append(
                     max(variance_value, 0.0) if np.isfinite(variance_value) else 0.0
                 )
-            poses.append(
-                self.poses[rec.pose_idx]
-                if rec.detector_position_xyz_m is None
-                else rec.detector_position_xyz_m
-            )
+            poses.append(rec.detector_position_xyz_m)
             live_times.append(float(rec.live_time_s))
-            if rec.fe_index is not None and rec.pb_index is not None:
-                fe_indices.append(int(rec.fe_index))
-                pb_indices.append(int(rec.pb_index))
-            else:
-                fe_indices.append(int(rec.orient_idx))
-                pb_indices.append(int(rec.orient_idx))
+            fe_indices.append(int(rec.fe_index))
+            pb_indices.append(int(rec.pb_index))
         return MeasurementData(
             z_k=np.asarray(z_list, dtype=float),
             observation_variances=np.asarray(variance_list, dtype=float),
@@ -3492,27 +2412,6 @@ class RotatingShieldPFEstimator:
             station_sequence_ids=station_sequence_ids,
             runtime_likelihood_routes=runtime_likelihood_routes,
             observation_count_covariance=view_covariance,
-            spectrum_counts=(
-                None
-                if spectrum_payload is None
-                else spectrum_payload["spectrum_counts"]
-            ),
-            spectrum_response_template=(
-                None
-                if spectrum_payload is None
-                else spectrum_payload["spectrum_response_template"]
-            ),
-            spectrum_background=(
-                None
-                if spectrum_payload is None
-                else spectrum_payload["spectrum_background"]
-            ),
-            spectrum_variance=(
-                None
-                if spectrum_payload is None
-                else spectrum_payload.get("spectrum_variance")
-            ),
-            spectrum_variance_present=spectrum_variance_present,
         )
 
     def _source_prior_environment(self) -> EnvironmentConfig:
@@ -3819,105 +2718,6 @@ class RotatingShieldPFEstimator:
         """Alias for estimates() to align with visualization helpers."""
         return self.estimates()
 
-    def unresolved_isotope_evidence(
-        self,
-        *,
-        window: int | None = None,
-        min_total_counts: float = 25.0,
-        min_max_count: float = 5.0,
-        min_snr: float = 2.0,
-    ) -> dict[str, dict[str, Any]]:
-        """Return isotopes whose observations remain unsupported by zero-source PF MAPs."""
-        evidence: dict[str, dict[str, Any]] = {}
-        total_floor = max(float(min_total_counts), 0.0)
-        max_floor = max(float(min_max_count), 0.0)
-        snr_floor = max(float(min_snr), 0.0)
-        for isotope, filt in self.filters.items():
-            data = self._measurement_data_for_iso(isotope, window)
-            if data is None or data.z_k.size == 0:
-                continue
-            counts = np.maximum(np.asarray(data.z_k, dtype=float).reshape(-1), 0.0)
-            variances = np.maximum(
-                np.asarray(data.observation_variances, dtype=float).reshape(-1),
-                1.0,
-            )
-            total_counts = float(np.sum(counts))
-            max_count = float(np.max(counts)) if counts.size else 0.0
-            snr = float(total_counts / np.sqrt(max(float(np.sum(variances)), 1.0e-12)))
-            if not filt.continuous_particles:
-                map_count = 0
-                source_probability = 0.0
-                map_confidence = 1.0
-            else:
-                weights = np.asarray(filt.continuous_weights, dtype=float).reshape(-1)
-                weights_sum = float(np.sum(weights))
-                if weights.size == 0 or weights_sum <= 0.0:
-                    weights = np.full(
-                        len(filt.continuous_particles),
-                        1.0 / max(len(filt.continuous_particles), 1),
-                        dtype=float,
-                    )
-                else:
-                    weights = weights / weights_sum
-                source_counts = np.asarray(
-                    [
-                        int(particle.state.num_sources)
-                        for particle in filt.continuous_particles
-                    ],
-                    dtype=int,
-                )
-                unique, inverse = np.unique(source_counts, return_inverse=True)
-                probs = np.zeros(unique.size, dtype=float)
-                np.add.at(probs, inverse, weights)
-                best = int(np.argmax(probs)) if probs.size else 0
-                map_count = int(unique[best]) if unique.size else 0
-                map_confidence = float(probs[best]) if probs.size else 1.0
-                source_probability = float(np.sum(weights[source_counts > 0]))
-            total_ratio = (
-                total_counts / total_floor
-                if total_floor > 0.0
-                else float(total_counts > 0.0)
-            )
-            max_ratio = (
-                max_count / max_floor if max_floor > 0.0 else float(max_count > 0.0)
-            )
-            snr_ratio = snr / snr_floor if snr_floor > 0.0 else float(snr > 0.0)
-            count_floor_met = total_counts >= total_floor or max_count >= max_floor
-            snr_floor_met = snr >= snr_floor
-            if snr_floor <= 0.0:
-                observed = count_floor_met
-            elif total_floor <= 0.0 and max_floor <= 0.0:
-                observed = snr_floor_met
-            else:
-                observed = count_floor_met and snr_floor_met
-            if map_count <= 0 and observed:
-                evidence[str(isotope)] = {
-                    "reason": "observed_counts_without_map_source",
-                    "total_counts": total_counts,
-                    "max_count": max_count,
-                    "count_snr": snr,
-                    "map_source_count": int(map_count),
-                    "map_cardinality_confidence": map_confidence,
-                    "source_probability": source_probability,
-                    "budget": float(max(total_ratio, max_ratio, snr_ratio, 1.0) - 1.0),
-                    "min_total_counts": total_floor,
-                    "min_max_count": max_floor,
-                    "min_snr": snr_floor,
-                }
-        return evidence
-
-    def unresolved_structural_evidence(self) -> dict[str, dict[str, Any]]:
-        """Return observations that conflict with a background-only PF mode."""
-        absent_evidence = self.unresolved_isotope_evidence(
-            min_total_counts=25.0,
-            min_max_count=5.0,
-            min_snr=2.0,
-        )
-        return {
-            str(isotope): {"isotope_absence": payload}
-            for isotope, payload in absent_evidence.items()
-        }
-
     def step_diagnostics(
         self,
         top_k: int = 3,
@@ -3940,7 +2740,7 @@ class RotatingShieldPFEstimator:
                     "ess_pre": 0.0,
                     "resampled": False,
                     "ess_post": None,
-                    "n_after_adapt": 0,
+                    "particle_count": 0,
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
                     "death_count": int(getattr(filt, "last_death_count", 0)),
@@ -3958,7 +2758,6 @@ class RotatingShieldPFEstimator:
                     "map": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "top_k": [],
-                    "converged": bool(getattr(filt, "is_converged", False)),
                 }
                 continue
             weights = np.asarray(filt.continuous_weights, dtype=float)
@@ -3996,9 +2795,7 @@ class RotatingShieldPFEstimator:
                 ess_pre = 0.0
             resampled = bool(getattr(filt, "last_resample_ess", False))
             ess_post = getattr(filt, "last_ess_post", None)
-            n_after_adapt = getattr(filt, "last_n_after_adapt", None)
-            if n_after_adapt is None:
-                n_after_adapt = int(len(filt.continuous_particles))
+            particle_count = int(len(filt.continuous_particles))
             best_state = filt.best_particle().state
             best_source_count = max(0, int(best_state.num_sources))
             map_positions = best_state.positions[:best_source_count].copy()
@@ -4030,7 +2827,7 @@ class RotatingShieldPFEstimator:
                 "ess_pre": float(ess_pre),
                 "resampled": resampled,
                 "ess_post": ess_post,
-                "n_after_adapt": int(n_after_adapt),
+                "particle_count": particle_count,
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
                 "death_count": int(getattr(filt, "last_death_count", 0)),
@@ -4048,63 +2845,8 @@ class RotatingShieldPFEstimator:
                 "map": (map_positions, map_strengths),
                 "mmse": (mmse_positions, mmse_strengths),
                 "top_k": top_entries,
-                "converged": bool(getattr(filt, "is_converged", False)),
             }
         return diagnostics
-
-    def isotope_log_likelihood_gain(
-        self, window: int | None = None
-    ) -> Dict[str, float]:
-        """
-        Return per-isotope log-likelihood gain vs background-only (evidence mixing).
-        """
-        if not self.measurements:
-            return {iso: 0.0 for iso in self.filters}
-        estimates = self.estimates()
-        gains: Dict[str, float] = {}
-        for iso, filt in self.filters.items():
-            data = self._measurement_data_for_iso(iso, window)
-            if data is None or data.z_k.size == 0:
-                gains[iso] = 0.0
-                continue
-            positions, strengths = estimates.get(iso, (np.zeros((0, 3)), np.zeros(0)))
-            if filt.continuous_particles:
-                background_rate = float(filt.best_particle().state.background)
-            else:
-                background_rate = 0.0
-            background_counts = background_rate * data.live_times
-            if positions.size == 0:
-                gains[iso] = 0.0
-                continue
-            lambda_m = self._cached_expected_counts_per_source(
-                filt=filt,
-                isotope=iso,
-                data=data,
-                sources=positions,
-                strengths=strengths,
-            )
-            lambda_total = background_counts + np.sum(lambda_m, axis=1)
-            ll = filt._count_log_likelihood_np(
-                data.z_k,
-                lambda_total,
-                observation_count_variance=data.observation_variances,
-            )
-            ll_bg = filt._count_log_likelihood_np(
-                data.z_k,
-                background_counts,
-                observation_count_variance=data.observation_variances,
-            )
-            gains[iso] = float(ll - ll_bg)
-        return gains
-
-    def isotopes_by_evidence(
-        self, min_delta_ll: float = 0.0, window: int | None = None
-    ) -> List[str]:
-        """
-        Return isotopes whose LL gain exceeds min_delta_ll for the given window.
-        """
-        gains = self.isotope_log_likelihood_gain(window=window)
-        return [iso for iso, gain in gains.items() if gain >= float(min_delta_ll)]
 
     @property
     def num_orientations(self) -> int:
@@ -4404,54 +3146,6 @@ class RotatingShieldPFEstimator:
             0.0,
         )
         return float(np.mean(np.sum(posterior_variance, axis=1)))
-
-    def orientation_information_gain(
-        self, pose_idx: int, orient_idx: int, live_time_s: float = 1.0
-    ) -> float:
-        """
-        Information gain surrogate using Eq. (3.40)–(3.42) style variance ratio.
-
-        The denominator is the configured likelihood's predictive variance at
-        the posterior-mean count. It reduces to the original mean-count
-        denominator exactly for a Poisson likelihood.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        ig_total = 0.0
-        eps = 1e-9
-        for iso, filt in self.filters.items():
-            use_continuous = bool(filt.continuous_particles)
-            if use_continuous:
-                lam = filt._continuous_expected_counts(
-                    pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
-                )
-                w = filt.continuous_weights
-            else:
-                lam = np.zeros(0, dtype=float)
-                w = np.zeros(0, dtype=float)
-            mean = float(np.sum(w * lam))
-            var = float(np.sum(w * (lam - mean) ** 2))
-            predictive_variance = float(
-                predictive_count_likelihood_variance(
-                    np.asarray(mean, dtype=float),
-                    spec=self.count_likelihood_spec_for_isotope(iso),
-                    epsilon=eps,
-                )
-            )
-            ig_total += 0.5 * float(np.log1p(var / predictive_variance))
-        return ig_total
-
-    def max_orientation_information_gain(
-        self, pose_idx: int, live_time_s: float = 1.0
-    ) -> float:
-        """Return max_phi IG_k(phi) at pose k (Eq. 3.45 surrogate)."""
-        scores = [
-            self.orientation_information_gain(
-                pose_idx=pose_idx, orient_idx=oidx, live_time_s=live_time_s
-            )
-            for oidx in range(self.num_orientations)
-        ]
-        return float(np.max(scores)) if scores else 0.0
 
     def orientation_expected_information_gain(
         self,
@@ -4762,116 +3456,6 @@ class RotatingShieldPFEstimator:
             )
             total_ig += alphas.get(iso, 0.0) * ig_h
         return float(total_ig)
-
-    def _strength_matrix(self, filt: IsotopeParticleFilter) -> NDArray[np.float64]:
-        """
-        Build a (N, max_r) matrix of source strengths for variance computation (Eq. 3.38 surrogate).
-        """
-        max_r = max((p.state.num_sources for p in filt.continuous_particles), default=0)
-        mat = np.zeros((len(filt.continuous_particles), max_r), dtype=float)
-        for i, p in enumerate(filt.continuous_particles):
-            r = p.state.num_sources
-            if r > 0:
-                mat[i, :r] = p.state.strengths
-        return mat
-
-    def expected_uncertainty_after_pose(
-        self,
-        pose_idx: int,
-        fe_index: int | None = None,
-        pb_index: int | None = None,
-        orient_idx: int = 0,
-        live_time_s: float = 1.0,
-        num_samples: int = 20,
-        rng: np.random.Generator | None = None,
-    ) -> float:
-        """
-        Monte-Carlo estimate of E[U | q_cand] where U = Σ_h Σ_m Var(q_{h,m}) (Eq. 3.38 surrogate).
-
-        Draw hypothetical observations from the configured count model and
-        average posterior strength variance. Uses either Fe/Pb indices or the
-        legacy single-orientation index.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        rng = rng or np.random.default_rng()
-        eps = 1e-12
-        total_U = 0.0
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
-            weights = filt.continuous_weights
-            if fe_index is not None and pb_index is not None:
-                lam = filt._continuous_expected_counts_pair(
-                    pose_idx=pose_idx,
-                    fe_index=fe_index,
-                    pb_index=pb_index,
-                    live_time_s=live_time_s,
-                )
-            else:
-                lam = filt._continuous_expected_counts(
-                    pose_idx=pose_idx, orient_idx=orient_idx, live_time_s=live_time_s
-                )
-            strengths_mat = self._strength_matrix(filt)
-            total_U += self._expected_strength_uncertainty_from_lambdas_np(
-                lam,
-                np.asarray(weights, dtype=float),
-                strengths_mat,
-                spec=self.count_likelihood_spec_for_isotope(iso),
-                num_samples=int(num_samples),
-                rng=rng,
-                epsilon=eps,
-            )
-        return float(total_U)
-
-    def expected_uncertainty_after_pose_xyz(
-        self,
-        pose_xyz: NDArray[np.float64],
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float = 1.0,
-        num_samples: int = 20,
-        rng: np.random.Generator | None = None,
-    ) -> float:
-        """
-        Monte-Carlo estimate of E[U | pose_xyz] for an explicit detector position.
-
-        Uses Fe/Pb indices and the configured count likelihood without relying
-        on pose indices.
-        """
-        detector_pos = np.asarray(pose_xyz, dtype=float)
-        if detector_pos.shape != (3,):
-            raise ValueError("pose_xyz must be shape (3,).")
-        rng = rng or np.random.default_rng()
-        num_samples = max(int(num_samples), 1)
-        eps = 1e-12
-        total_U = 0.0
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
-            weights = np.asarray(filt.continuous_weights, dtype=float)
-            if weights.size == 0:
-                continue
-            weights = weights / max(np.sum(weights), eps)
-            lam = filt._continuous_expected_counts_pair_at_pose(
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-            )
-            if lam.size == 0:
-                continue
-            strengths_mat = self._strength_matrix(filt)
-            total_U += self._expected_strength_uncertainty_from_lambdas_np(
-                lam,
-                weights,
-                strengths_mat,
-                spec=self.count_likelihood_spec_for_isotope(iso),
-                num_samples=num_samples,
-                rng=rng,
-                epsilon=eps,
-            )
-        return float(total_U)
 
     def expected_uncertainty_after_rotation(
         self,
@@ -5326,7 +3910,10 @@ class RotatingShieldPFEstimator:
                     )
                     ess = 1.0 / max(np.sum(weights**2), eps)
                     if ess < float(data["resample_threshold"]) * len(weights):
-                        resampled = systematic_resample(np.log(weights + eps))
+                        resampled = systematic_resample(
+                            np.log(weights + eps),
+                            rng=rng,
+                        )
                         indices = indices[resampled]
                         weights = np.ones_like(weights) / max(len(weights), 1)
                     weights_by_iso[iso] = weights
@@ -5358,35 +3945,6 @@ class RotatingShieldPFEstimator:
             debug_payload = {"rollouts": debug_rollouts, "u_vals": u_vals}
             return mean_u, debug_payload
         return mean_u
-
-    def expected_uncertainty_after_rotation_at_pose(
-        self,
-        detector_pos: NDArray[np.float64],
-        *,
-        tau_ig: float,
-        t_max_s: float,
-        t_short_s: float,
-        num_rollouts: int = 0,
-        use_mean_measurement: bool = True,
-        rng_seed: int | None = 0,
-        return_debug: bool = False,
-    ) -> float | Tuple[float, Dict[str, Any]]:
-        """
-        Backward-compatible wrapper for expected_uncertainty_after_rotation.
-        """
-        n_rollouts = int(num_rollouts)
-        if n_rollouts <= 0 and not use_mean_measurement:
-            n_rollouts = 1
-        return self.expected_uncertainty_after_rotation(
-            pose_xyz=detector_pos,
-            live_time_per_rot_s=t_short_s,
-            tau_ig=tau_ig,
-            tmax_s=t_max_s,
-            n_rollouts=n_rollouts,
-            orient_selection="IG",
-            return_debug=return_debug,
-            rng_seed=rng_seed,
-        )
 
     def estimate_change_norm(self) -> float:
         """
@@ -5505,14 +4063,11 @@ class RotatingShieldPFEstimator:
             self._ensure_kernel_cache()
         if len(self.history_estimates) < 2:
             return False
-        ig_scores = []
-        for oidx in range(self.num_orientations):
-            ig_scores.append(
-                self.orientation_information_gain(
-                    pose_idx=pose_idx, orient_idx=oidx, live_time_s=live_time_s
-                )
-            )
-        max_ig = max(ig_scores) if ig_scores else 0.0
+        ig_grid = self.orientation_expected_information_gain_grid(
+            pose_idx=pose_idx,
+            live_time_s=live_time_s,
+        )
+        max_ig = float(np.max(ig_grid)) if ig_grid.size else 0.0
         dwell_time = sum(
             rec.live_time_s for rec in self.measurements if rec.pose_idx == pose_idx
         )

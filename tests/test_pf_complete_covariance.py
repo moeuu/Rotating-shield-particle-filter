@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -10,7 +12,6 @@ from pf.likelihood import (
     CountLikelihoodSpec,
     count_likelihood_variance,
     count_likelihood_variance_torch,
-    delta_log_likelihood_update,
     normalize_observation_count_variance_semantics,
 )
 from pf.particle_filter import (
@@ -74,20 +75,37 @@ def test_complete_statistical_variance_numpy_torch_equivalence() -> None:
     )
 
 
-def test_legacy_boolean_maps_to_counting_noise_inclusive_semantics() -> None:
-    """The old boolean must keep its plug-in counting-noise behavior."""
-    assert (
-        normalize_observation_count_variance_semantics(
-            "",
-            includes_counting_noise=True,
+@pytest.mark.parametrize(
+    "semantics",
+    [
+        "",
+        "auto",
+        "legacy",
+        "excludes_counting_noise",
+        "extra",
+        "includes_counting_noise",
+        "legacy_includes_counting_noise",
+        "complete",
+        "full_statistical",
+        "transport_and_counting",
+    ],
+)
+def test_observation_variance_semantics_rejects_legacy_aliases(
+    semantics: str,
+) -> None:
+    """Only the three canonical observation-variance semantics are accepted."""
+    with pytest.raises(ValueError, match="observation_count_variance_semantics"):
+        normalize_observation_count_variance_semantics(semantics)
+    with pytest.raises(ValueError, match="observation_count_variance_semantics"):
+        CountLikelihoodSpec(
+            model="gaussian",
+            observation_count_variance_semantics=semantics,
         )
-        == "counting_noise_inclusive"
-    )
-    config = PFConfig(
-        count_likelihood_model="gaussian",
-        observation_count_variance_includes_counting_noise=True,
-    )
-    assert config.observation_count_variance_semantics == "counting_noise_inclusive"
+    with pytest.raises(ValueError, match="observation_count_variance_semantics"):
+        PFConfig(
+            count_likelihood_model="gaussian",
+            observation_count_variance_semantics=semantics,
+        )
 
 
 def test_complete_covariance_rejects_poisson_likelihood() -> None:
@@ -100,15 +118,6 @@ def test_complete_covariance_rejects_poisson_likelihood() -> None:
     with pytest.raises(ValueError, match="complete_statistical.*requires"):
         PFConfig(
             count_likelihood_model="poisson",
-            observation_count_variance_semantics="complete_statistical",
-        )
-    with pytest.raises(ValueError, match="complete_statistical.*requires"):
-        delta_log_likelihood_update(
-            np.asarray([10.0], dtype=float),
-            np.asarray([9.0], dtype=float),
-            np.asarray([10.0], dtype=float),
-            model="poisson",
-            observation_count_variance=np.asarray([500.0], dtype=float),
             observation_count_variance_semantics="complete_statistical",
         )
 
@@ -129,6 +138,45 @@ def test_complete_covariance_disables_derived_count_likelihoods(
     assert config.shield_view_ratio_likelihood_enable is False
 
 
+def test_station_likelihood_blocks_require_explicit_sequence_ids() -> None:
+    """Structural likelihood blocks must never be inferred from detector positions."""
+    parameter = inspect.signature(MeasurementData).parameters[
+        "station_sequence_ids"
+    ]
+    assert parameter.default is inspect.Parameter.empty
+    route_parameter = inspect.signature(MeasurementData).parameters[
+        "runtime_likelihood_routes"
+    ]
+    assert route_parameter.default is inspect.Parameter.empty
+    filt = IsotopeParticleFilter(
+        isotope="Cs-137",
+        kernel=None,
+        config=PFConfig(
+            num_particles=1,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(0, 0),
+            use_gpu=False,
+        ),
+    )
+    data = MeasurementData(
+        z_k=np.ones(2, dtype=float),
+        observation_variances=np.ones(2, dtype=float),
+        detector_positions=np.zeros((2, 3), dtype=float),
+        fe_indices=np.zeros(2, dtype=np.int64),
+        pb_indices=np.zeros(2, dtype=np.int64),
+        live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.asarray([0, 1], dtype=np.int64),
+        runtime_likelihood_routes=np.asarray(
+            ["count", "count"],
+            dtype="<U16",
+        ),
+    )
+
+    blocks = filt._station_likelihood_block_rows(data)
+    np.testing.assert_array_equal(blocks[1], [[0], [1]])
+
+
 @pytest.mark.parametrize("likelihood_model", ["gaussian", "student_t"])
 def test_exact_structural_likelihood_matches_runtime_covariance_sequence(
     likelihood_model: str,
@@ -140,10 +188,8 @@ def test_exact_structural_likelihood_matches_runtime_covariance_sequence(
         kernel=None,
         config=PFConfig(
             num_particles=1,
-            min_particles=1,
-            max_particles=1,
             max_sources=2,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             count_likelihood_model=likelihood_model,
             count_likelihood_df=6.0,
@@ -177,11 +223,6 @@ def test_exact_structural_likelihood_matches_runtime_covariance_sequence(
         [72.0, 48.0, 31.0, 26.0, 39.0, 57.0],
         dtype=float,
     )
-    spectrum_template = np.repeat(
-        np.asarray([[0.4, 0.6]], dtype=float),
-        z_values.size,
-        axis=0,
-    )
     data = MeasurementData(
         z_k=z_values,
         observation_variances=np.asarray(
@@ -208,10 +249,6 @@ def test_exact_structural_likelihood_matches_runtime_covariance_sequence(
             dtype="<U20",
         ),
         observation_count_covariance=covariance,
-        spectrum_counts=z_values[:, None] * spectrum_template,
-        spectrum_response_template=spectrum_template,
-        spectrum_background=np.zeros_like(spectrum_template),
-        spectrum_variance=np.ones_like(spectrum_template),
     )
     expected_counts = np.asarray(
         [
@@ -235,6 +272,7 @@ def test_exact_structural_likelihood_matches_runtime_covariance_sequence(
             torch.as_tensor(expected_counts[rows], dtype=torch.float64),
             data.z_k[rows],
             data.observation_variances[rows],
+            runtime_likelihood_route="count_covariance",
             observation_count_covariance=covariance[np.ix_(rows, rows)],
         )
 
@@ -260,14 +298,14 @@ def test_additional_variance_keeps_derived_count_likelihoods(
     assert config.shield_view_ratio_likelihood_enable is True
 
 
-def test_complete_covariance_routes_weighted_spectrum_to_count_likelihood(
+def test_complete_covariance_uses_count_likelihood(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Correlated weighted spectra must bypass the independent-bin likelihood."""
+    """Complete statistical variance must use the count likelihood."""
     torch = pytest.importorskip("torch")
     config = PFConfig(
         num_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
         observation_count_variance_semantics="complete_statistical",
@@ -305,16 +343,8 @@ def test_complete_covariance_routes_weighted_spectrum_to_count_likelihood(
         """Return count predictions favoring the first particle."""
         return torch.as_tensor([[10.0, 30.0]], dtype=torch.float64)
 
-    def forbidden_spectrum(*_args: object, **_kwargs: object) -> "torch.Tensor":
-        """Fail if the diagonal direct-spectrum helper is reached."""
-        raise AssertionError("direct spectrum likelihood was invoked")
-
     def noop() -> None:
         """Skip non-likelihood side effects in this path test."""
-        return None
-
-    def noop_kwargs(**_kwargs: object) -> None:
-        """Skip keyword-only non-likelihood side effects in this path test."""
         return None
 
     monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
@@ -323,15 +353,7 @@ def test_complete_covariance_routes_weighted_spectrum_to_count_likelihood(
         "_continuous_expected_counts_pair_sequence_torch",
         fake_counts,
     )
-    monkeypatch.setattr(
-        filt,
-        "_spectral_bin_sequence_log_likelihood_from_lambda_gpu",
-        forbidden_spectrum,
-    )
     monkeypatch.setattr(filt, "_maybe_resample_continuous", noop)
-    monkeypatch.setattr(filt, "_advance_adapt_cooldown", noop)
-    monkeypatch.setattr(filt, "adapt_num_particles", noop_kwargs)
-    monkeypatch.setattr(filt, "_maybe_update_convergence", noop_kwargs)
 
     filt.update_continuous_pair_sequence(
         z_obs=np.asarray([10.0], dtype=float),
@@ -339,119 +361,22 @@ def test_complete_covariance_routes_weighted_spectrum_to_count_likelihood(
         fe_indices=np.asarray([0], dtype=int),
         pb_indices=np.asarray([0], dtype=int),
         live_times_s=np.asarray([1.0], dtype=float),
+        runtime_likelihood_route="count",
         observation_count_variances=np.asarray([500.0], dtype=float),
-        spectrum_counts=np.asarray([[0.0, 30.0]], dtype=float),
-        spectrum_response_template=np.asarray([[0.0, 1.0]], dtype=float),
-        spectrum_background=np.zeros((1, 2), dtype=float),
-        spectrum_variance=np.asarray([[500.0, 500.0]], dtype=float),
     )
 
-    assert filt.last_spectrum_likelihood_route == "count"
+    assert filt.last_runtime_likelihood_route == "count"
     assert filt.continuous_weights[0] > filt.continuous_weights[1]
 
 
-def test_standard_defaults_keep_direct_spectrum_likelihood_enabled() -> None:
-    """Standard unweighted defaults must retain the existing spectrum path."""
-    filt = IsotopeParticleFilter(
-        isotope="Cs-137",
-        kernel=None,
-        config=PFConfig(
-            num_particles=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-        ),
-    )
-
-    assert filt.config.observation_count_variance_semantics == "additional"
-    assert filt._direct_spectrum_likelihood_enabled() is True
-
-
-@pytest.mark.parametrize(
-    "transport_kwargs",
-    [
-        {"transport_model_rel_sigma": 0.1},
-        {"transport_model_abs_sigma": {"Cs-137": 5.0}},
-    ],
-)
-def test_transport_uncertainty_disables_independent_spectrum_bins(
-    transport_kwargs: dict[str, object],
-) -> None:
-    """Count-level transport discrepancy must not be copied across spectrum bins."""
-    filt = IsotopeParticleFilter(
-        isotope="Cs-137",
-        kernel=None,
-        config=PFConfig(
-            num_particles=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-            count_likelihood_model="student_t",
-            **transport_kwargs,
-        ),
-    )
-
-    assert filt._direct_spectrum_likelihood_enabled() is False
-    assert (
-        filt._direct_spectrum_route_admissible(
-            sequence_length=1,
-            observation_count_covariance=None,
-        )
-        is False
-    )
-
-
-@pytest.mark.parametrize(
-    ("configured_covariance", "supplied_covariance"),
-    [
-        (True, None),
-        (
-            False,
-            np.asarray(
-                [[0.0, 2.0], [2.0, 0.0]],
-                dtype=float,
-            ),
-        ),
-    ],
-)
-def test_station_covariance_disables_independent_spectrum_bins(
-    configured_covariance: bool,
-    supplied_covariance: np.ndarray | None,
-) -> None:
-    """A cross-view covariance must take precedence over direct spectrum bins."""
-    filt = IsotopeParticleFilter(
-        isotope="Cs-137",
-        kernel=None,
-        config=PFConfig(
-            num_particles=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-            count_likelihood_model="student_t",
-            station_view_covariance_enable=configured_covariance,
-            station_view_correlated_spectrum_fraction=(
-                1.0 if configured_covariance else 0.0
-            ),
-        ),
-    )
-
-    assert filt._direct_spectrum_likelihood_enabled() is True
-    assert (
-        filt._direct_spectrum_route_admissible(
-            sequence_length=2,
-            observation_count_covariance=supplied_covariance,
-        )
-        is False
-    )
-
-
-def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
+def test_ral_uncertainty_uses_count_covariance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RAL transport and station uncertainty must select batched count covariance."""
+    """RAL transport and station uncertainty must use batched count covariance."""
     torch = pytest.importorskip("torch")
     config = PFConfig(
         num_particles=2,
-        min_particles=2,
-        max_particles=2,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         count_likelihood_model="student_t",
         count_likelihood_df=5.0,
@@ -500,6 +425,7 @@ def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
         expected_counts,
         z_obs,
         count_variances,
+        runtime_likelihood_route="count_covariance",
         observation_count_covariance=count_covariance,
     )
     expected_weights = torch.softmax(expected_ll, dim=0).numpy()
@@ -512,16 +438,8 @@ def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
         """Return deterministic batched particle count predictions."""
         return expected_counts
 
-    def forbidden_spectrum(*_args: object, **_kwargs: object) -> "torch.Tensor":
-        """Fail if the inadmissible independent-bin helper is reached."""
-        raise AssertionError("direct spectrum likelihood was invoked")
-
     def noop() -> None:
         """Skip non-likelihood side effects in this route test."""
-        return None
-
-    def noop_kwargs(**_kwargs: object) -> None:
-        """Skip keyword-only non-likelihood side effects in this route test."""
         return None
 
     monkeypatch.setattr(filt, "_gpu_enabled", fake_gpu_enabled)
@@ -530,15 +448,7 @@ def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
         "_continuous_expected_counts_pair_sequence_torch",
         fake_counts,
     )
-    monkeypatch.setattr(
-        filt,
-        "_spectral_bin_sequence_log_likelihood_from_lambda_gpu",
-        forbidden_spectrum,
-    )
     monkeypatch.setattr(filt, "_maybe_resample_continuous", noop)
-    monkeypatch.setattr(filt, "_advance_adapt_cooldown", noop)
-    monkeypatch.setattr(filt, "adapt_num_particles", noop_kwargs)
-    monkeypatch.setattr(filt, "_maybe_update_convergence", noop_kwargs)
 
     filt.update_continuous_pair_sequence(
         z_obs=z_obs,
@@ -546,21 +456,12 @@ def test_ral_uncertainty_routes_complete_spectrum_to_count_covariance(
         fe_indices=np.asarray([0, 0], dtype=int),
         pb_indices=np.asarray([0, 0], dtype=int),
         live_times_s=np.ones(2, dtype=float),
+        runtime_likelihood_route="count_covariance",
         observation_count_variances=count_variances,
         observation_count_covariance=count_covariance,
-        spectrum_counts=np.asarray(
-            [[4.0, 9.0], [7.0, 13.0]],
-            dtype=float,
-        ),
-        spectrum_response_template=np.asarray(
-            [[0.4, 0.6], [0.4, 0.6]],
-            dtype=float,
-        ),
-        spectrum_background=np.zeros((2, 2), dtype=float),
-        spectrum_variance=np.ones((2, 2), dtype=float),
     )
 
-    assert filt.last_spectrum_likelihood_route == "count_covariance"
+    assert filt.last_runtime_likelihood_route == "count_covariance"
     np.testing.assert_allclose(
         filt.continuous_weights,
         expected_weights,

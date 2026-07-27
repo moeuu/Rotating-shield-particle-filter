@@ -97,41 +97,79 @@ class PFPosteriorSnapshot:
     structural_transition_provenance: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = 1
     structural_model_manifest: Mapping[str, Any] = field(default_factory=dict)
+    pure_pf_schema_version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         """Return the required JSON-safe PF result contract."""
+        for field_name, value in (
+            ("schema_version", self.schema_version),
+            ("pure_pf_schema_version", self.pure_pf_schema_version),
+            (
+                "measurement_log_schema_version",
+                self.measurement_log_schema_version,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value != 1:
+                raise ValueError(f"{field_name} must be the integer 1.")
         structural = {
             str(key): value
             for key, value in sorted(self.structural_transition_provenance.items())
         }
         if not structural:
-            structural = {
-                "posterior_semantics": "unspecified",
-                "structural_kernel_exact_rj": False,
-                "structural_kernel_family": "unspecified",
-                "structural_kernel_target_preserving": False,
-                "structural_moves_enabled": False,
-                "reversible_jump_mcmc_used": False,
-                "data_conditioned_structural_proposal": False,
-                "data_conditioned_strength_proposal": False,
-                "data_conditioned_strength_proposal_importance_corrected": False,
-            }
+            raise ValueError(
+                "Pure-PF posterior snapshots require structural-transition "
+                "provenance."
+            )
+        required_structural_fields = {
+            "posterior_semantics",
+            "structural_kernel_exact_rj",
+            "structural_kernel_family",
+            "structural_kernel_target_preserving",
+            "structural_moves_enabled",
+            "reversible_jump_mcmc_used",
+            "support_domain",
+            "variable_cardinality",
+            "birth_death_moves_enabled",
+            "within_cardinality_moves_enabled",
+            "within_cardinality_kernel_exact_mh",
+        }
+        missing_structural_fields = sorted(
+            required_structural_fields.difference(structural)
+        )
+        if missing_structural_fields:
+            raise ValueError(
+                "Pure-PF structural provenance is incomplete: "
+                + ", ".join(missing_structural_fields)
+            )
         structural_model = dict(self.structural_model_manifest)
+        if (
+            structural_model.get("pure_pf_schema_version")
+            != self.pure_pf_schema_version
+            or structural_model.get("support_domain") != "environment_surface"
+            or "strength_prior" not in structural_model
+        ):
+            raise ValueError(
+                "Pure-PF posterior snapshots require a schema-v1 structural "
+                "model over the environment surface with a declared strength "
+                "prior."
+            )
         provenance = {
             "estimator_repository": "moeuu/Rotating-shield-particle-filter",
             "estimator_commit": str(self.repository_commit),
-            "measurement_log_schema_version": int(self.measurement_log_schema_version),
+            "measurement_log_schema_version": self.measurement_log_schema_version,
             "measurement_log_sha256": str(self.measurement_log_sha256),
             "resolved_config_sha256": str(self.resolved_config_hash),
             "config_sha256": str(self.config_hash),
             "random_seed": int(self.random_seed),
+            "pure_pf_schema_version": self.pure_pf_schema_version,
             "planner_belief_sources": list(self.planner_belief_sources),
             "posterior_semantics": str(structural["posterior_semantics"]),
             "structural_transition_provenance": dict(structural),
             "structural_model_manifest": dict(structural_model),
         }
         return {
-            "schema_version": int(self.schema_version),
+            "schema_version": self.schema_version,
+            "pure_pf_schema_version": self.pure_pf_schema_version,
             "estimator_family": "particle_filter",
             "estimator_variant": str(self.estimator_variant),
             "estimator_profile": str(self.estimator_variant),

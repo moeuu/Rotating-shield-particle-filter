@@ -27,6 +27,7 @@ from runtime.measurement_log import (
 from tests.pure_pf_test_support import (
     TEST_COMMIT,
     TEST_ISOTOPES,
+    count_likelihood_routes,
     environment,
     make_measurement_log,
     records,
@@ -52,6 +53,25 @@ def test_measurement_log_is_byte_deterministic_and_round_trips(
     }
     for artifact in sorted(path.name for path in first.iterdir()):
         assert (first / artifact).read_bytes() == (second / artifact).read_bytes()
+
+
+@pytest.mark.parametrize("invalid_version", (True, 1.0, "1"))
+def test_run_manifest_schema_version_requires_exact_integer(
+    tmp_path: Path,
+    invalid_version: object,
+) -> None:
+    """Boolean, floating-point, and string aliases must not pass as v1."""
+    path = make_measurement_log(tmp_path / "measurement-log")
+    manifest_path = path / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = invalid_version
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(
+        MeasurementLogValidationError,
+        match="schema_version must be 1",
+    ):
+        load_measurement_log(path)
 
 
 def test_forward_line_registry_is_bound_to_production_hashes() -> None:
@@ -274,6 +294,10 @@ def test_stream_writer_stages_record_before_estimator_update(
     shard = writer.stage_dir / "record_00000000.npz"
     assert shard.is_file()
     assert shard.stat().st_size > 0
+    writer.mark_station_complete_before_update(
+        0,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
 
     class Estimator:
         def update(self) -> None:
@@ -293,8 +317,8 @@ def test_stream_writer_owns_and_durably_persists_station_boundaries(
     """Only the writer may mark a completed station immediately before update."""
     config = {
         **runtime_config(),
-        "joint_observation_update": True,
-        "delayed_resample_update": False,
+        "pure_pf_schema_version": 1,
+        "estimator_profile": "pf_strict",
     }
     env = environment()
     config_hash = sha256(canonical_json_bytes(config)).hexdigest()
@@ -321,9 +345,20 @@ def test_stream_writer_owns_and_durably_persists_station_boundaries(
 
     writer.append_before_update(first)
     writer.append_before_update(second)
+    with pytest.raises(
+        MeasurementLogValidationError,
+        match="exactly every configured isotope",
+    ):
+        writer.mark_station_complete_before_update(
+            0,
+            runtime_likelihood_route_by_isotope={"Cs-137": "count"},
+        )
     with pytest.raises(MeasurementLogValidationError, match="marked complete"):
         writer.append_before_update(third)
-    marked_index = writer.mark_station_complete_before_update(0)
+    marked_index = writer.mark_station_complete_before_update(
+        0,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     assert marked_index == 1
     staged_rows = [
         json.loads(line)
@@ -331,18 +366,24 @@ def test_stream_writer_owns_and_durably_persists_station_boundaries(
     ]
     assert "station_complete" not in staged_rows[0]["metadata"]
     assert staged_rows[1]["metadata"]["station_complete"] is True
+    assert staged_rows[1]["metadata"][
+        "runtime_likelihood_route_by_isotope"
+    ] == count_likelihood_routes()
 
     writer.append_before_update(third)
     with pytest.raises(MeasurementLogValidationError, match="exactly one"):
         writer.finalize()
-    writer.mark_station_complete_before_update(1)
+    writer.mark_station_complete_before_update(
+        1,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     finalized = writer.finalize()
     assert finalized.records[1].metadata["station_complete"] is True
     assert finalized.records[2].metadata["station_complete"] is True
 
 
-def test_live_runtime_appends_each_record_before_any_pf_update() -> None:
-    """The active live loop must stage observations before direct or joint updates."""
+def test_live_runtime_marks_station_complete_before_pf_update() -> None:
+    """The live loop must durably mark a station before its PF sequence update."""
     source = (
         Path(__file__).resolve().parents[1] / "src" / "realtime_demo.py"
     ).read_text(encoding="utf-8")
@@ -351,9 +392,7 @@ def test_live_runtime_appends_each_record_before_any_pf_update() -> None:
         "measurement_log_writer.mark_station_complete_before_update(",
         append_index,
     )
-    direct_update_index = source.index("estimator.update_pair(", append_index)
     joint_update_index = source.index("estimator.update_pair_sequence(", append_index)
-    assert append_index < direct_update_index
     assert append_index < marker_index < joint_update_index
 
 
@@ -384,6 +423,10 @@ def test_forward_manifest_mutation_is_rejected_before_publication(
         isotopes=TEST_ISOTOPES,
     )
     writer.append_before_update(records(1)[0])
+    writer.mark_station_complete_before_update(
+        0,
+        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
+    )
     with pytest.raises(MeasurementLogValidationError, match="Forward-model"):
         writer.finalize()
     assert not (tmp_path / "bad-forward").exists()

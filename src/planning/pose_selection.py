@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import inspect
-from typing import Callable, Sequence
 import sys
 import threading
 import time
@@ -14,7 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from pf.estimator import RotatingShieldPFEstimator
-from planning.candidate_generation import generate_candidate_poses
+from runtime_defaults import DEFAULT_MEASUREMENT_TIME_S
 
 
 DEFAULT_PLANNING_ROLLOUTS = 8
@@ -144,193 +142,6 @@ def _auto_scale_observation_penalty(
     return scale * base_range / penalty_range
 
 
-def recommend_num_rollouts(
-    *,
-    estimator: RotatingShieldPFEstimator | None = None,
-    pose_xyz: NDArray[np.float64] | None = None,
-    live_time_per_rot_s: float | None = None,
-    tau_ig: float | None = None,
-    tmax_s: float | None = None,
-    candidate_rollouts: Sequence[int] = (1, 2, 4, 8),
-    trials: int = 4,
-    rel_se_target: float = 0.1,
-    rng_seed: int = 0,
-    eval_fn: Callable[[int, int], float] | None = None,
-) -> int:
-    """
-    Recommend a rollout count by targeting a relative standard error threshold.
-
-    Returns the smallest rollout count whose relative SE is <= rel_se_target.
-    """
-    if trials <= 0:
-        raise ValueError("trials must be positive.")
-    if rel_se_target < 0.0:
-        raise ValueError("rel_se_target must be non-negative.")
-    if not candidate_rollouts:
-        raise ValueError("candidate_rollouts must not be empty.")
-    rollouts_sorted = [int(n) for n in candidate_rollouts]
-    if any(n <= 0 for n in rollouts_sorted):
-        raise ValueError("candidate_rollouts must be positive integers.")
-
-    if eval_fn is None:
-        if estimator is None:
-            raise ValueError("estimator is required when eval_fn is not provided.")
-        if pose_xyz is None:
-            raise ValueError("pose_xyz is required when eval_fn is not provided.")
-        if live_time_per_rot_s is None:
-            raise ValueError(
-                "live_time_per_rot_s is required when eval_fn is not provided."
-            )
-        if tau_ig is None:
-            raise ValueError("tau_ig is required when eval_fn is not provided.")
-        if tmax_s is None:
-            raise ValueError("tmax_s is required when eval_fn is not provided.")
-
-        def _eval(n_rollouts: int, seed: int) -> float:
-            """Evaluate expected uncertainty for one rollout budget and seed."""
-            return float(
-                estimator.expected_uncertainty_after_rotation(
-                    pose_xyz=np.asarray(pose_xyz, dtype=float),
-                    live_time_per_rot_s=float(live_time_per_rot_s),
-                    tau_ig=float(tau_ig),
-                    tmax_s=float(tmax_s),
-                    n_rollouts=int(n_rollouts),
-                    orient_selection="IG",
-                    rng_seed=int(seed),
-                )
-            )
-
-        eval_fn = _eval
-
-    eps = 1e-12
-    for n_rollouts in rollouts_sorted:
-        values = []
-        seed_base = int(rng_seed) + 1000 * int(n_rollouts)
-        for trial_idx in range(int(trials)):
-            seed = seed_base + trial_idx
-            values.append(float(eval_fn(int(n_rollouts), seed)))
-        mean = float(np.mean(values))
-        if abs(mean) <= eps:
-            return int(n_rollouts)
-        std = float(np.std(values, ddof=1)) if trials > 1 else 0.0
-        se = std / np.sqrt(len(values))
-        rel_se = se / max(abs(mean), eps)
-        if rel_se <= rel_se_target:
-            return int(n_rollouts)
-    return int(rollouts_sorted[-1])
-
-
-def select_next_pose(
-    estimator: RotatingShieldPFEstimator,
-    candidate_pose_indices: NDArray[np.int64],
-    current_pose_idx: int,
-    *,
-    criterion: str = "after_rotation",
-    lambda_cost: float | None = None,
-    tau_ig: float | None = None,
-    t_max_s: float | None = None,
-    t_short_s: float | None = None,
-    num_rollouts: int = 0,
-    use_mean_measurement: bool = True,
-    rng_seed: int | None = 0,
-    use_gpu: bool | None = None,
-    gpu_device: str | None = None,
-    gpu_dtype: str | None = None,
-    auto_lambda_cost: bool = False,
-    lambda_cost_method: str = "range",
-    lambda_cost_scale: float = 1.0,
-) -> int:
-    """
-    Select the next pose using either uncertainty or after-rotation uncertainty.
-
-    criterion:
-        - "after_rotation": uses E[U_after-rotation | q] with rotating-shield policy
-        - "uncertainty": uses single-measurement E[U | q] (legacy)
-
-    Score_k = E[U | q_k] + lambda_cost * C_move
-
-    GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
-    If auto_lambda_cost is True, lambda_cost is computed from candidate scales.
-    """
-    with _temporary_gpu_settings(estimator, use_gpu, gpu_device, gpu_dtype):
-        current_pos = estimator.poses[current_pose_idx]
-        pf_config = getattr(estimator, "pf_config", None)
-        if lambda_cost is None:
-            lam_cost = pf_config.lambda_cost if pf_config is not None else 1.0
-        else:
-            lam_cost = float(lambda_cost)
-        tau_ig = (
-            pf_config.ig_threshold if pf_config is not None else 1e-3
-        ) if tau_ig is None else tau_ig
-        t_max_s = (
-            pf_config.max_dwell_time_s if pf_config is not None else 1.0
-        ) if t_max_s is None else t_max_s
-        t_short_s = (
-            pf_config.short_time_s if pf_config is not None else 1.0
-        ) if t_short_s is None else t_short_s
-        planning_rng = (
-            np.random.default_rng()
-            if rng_seed is None
-            else np.random.default_rng(int(rng_seed))
-        )
-        rollouts = int(num_rollouts)
-        if rollouts <= 0 and not use_mean_measurement:
-            rollouts = 1
-        uncertainties = []
-        motion_costs = []
-        for idx in candidate_pose_indices:
-            idx_int = int(idx)
-            if criterion == "after_rotation" and hasattr(
-                estimator, "expected_uncertainty_after_rotation"
-            ):
-                rotation_kwargs: dict[str, object] = {}
-                rotation_method = estimator.expected_uncertainty_after_rotation
-                if "rng_seed" in inspect.signature(rotation_method).parameters:
-                    rotation_kwargs["rng_seed"] = int(
-                        planning_rng.integers(0, 2**32 - 1)
-                    )
-                uncertainty = rotation_method(
-                    pose_xyz=estimator.poses[idx_int],
-                    live_time_per_rot_s=t_short_s,
-                    tau_ig=tau_ig,
-                    tmax_s=t_max_s,
-                    n_rollouts=rollouts,
-                    orient_selection="IG",
-                    **rotation_kwargs,
-                )
-            elif criterion == "uncertainty" and hasattr(
-                estimator, "expected_uncertainty_after_pose"
-            ):
-                pose_method = estimator.expected_uncertainty_after_pose
-                pose_kwargs: dict[str, object] = {}
-                if "rng" in inspect.signature(pose_method).parameters:
-                    pose_kwargs["rng"] = planning_rng
-                uncertainty = pose_method(
-                    pose_idx=idx_int,
-                    orient_idx=0,
-                    live_time_s=t_short_s,
-                    **pose_kwargs,
-                )
-            else:
-                uncertainty = estimator.expected_uncertainty(
-                    pose_idx=idx_int, live_time_s=t_short_s
-                )
-            motion_cost = float(np.linalg.norm(estimator.poses[idx_int] - current_pos))
-            uncertainties.append(float(uncertainty))
-            motion_costs.append(motion_cost)
-        uncertainties_arr = np.asarray(uncertainties, dtype=float)
-        motion_costs_arr = np.asarray(motion_costs, dtype=float)
-        if auto_lambda_cost:
-            lam_cost = estimate_lambda_cost(
-                uncertainties_arr,
-                motion_costs_arr,
-                method=lambda_cost_method,
-                scale=lambda_cost_scale,
-            )
-        scores = uncertainties_arr + lam_cost * motion_costs_arr
-    return int(candidate_pose_indices[int(np.argmin(scores))])
-
-
 def select_next_pose_from_candidates(
     estimator: RotatingShieldPFEstimator,
     candidate_poses_xyz: NDArray[np.float64],
@@ -339,7 +150,7 @@ def select_next_pose_from_candidates(
     lambda_cost: float | None = None,
     tau_ig: float | None = None,
     t_max_s: float | None = None,
-    t_short_s: float | None = None,
+    t_short_s: float = DEFAULT_MEASUREMENT_TIME_S,
     num_rollouts: int = 0,
     use_mean_measurement: bool = True,
     rng_seed: int | None = 0,
@@ -356,7 +167,6 @@ def select_next_pose_from_candidates(
     ig_breakdown_k: int | None = None,
     ig_breakdown_max_steps: int = 6,
     ig_breakdown_max_rollouts: int = 2,
-    criterion: str = "after_rotation",
     min_observation_counts: float = 0.0,
     min_observation_penalty_scale: float = 1.0,
     min_observation_aggregate: str = "max",
@@ -364,10 +174,9 @@ def select_next_pose_from_candidates(
     worker_count: int | None = None,
 ) -> int:
     """
-    Select the next pose from explicit candidate coordinates using an uncertainty criterion.
+    Select the next pose from explicit candidates using after-rotation uncertainty.
 
-    Score_k = E[U | q_k] + lambda_cost * C_move + eta * G(q_k), where U is
-    either after-rotation or after-pose uncertainty depending on criterion.
+    Score_k = E[U_after-rotation | q_k] + lambda_cost * C_move + eta * G(q_k).
     If any candidate satisfies the all-isotope ``min_observation_counts``
     target, infeasible candidates are excluded. If none do, G(q_k) remains a
     soft fallback penalty so planning does not deadlock.
@@ -376,8 +185,6 @@ def select_next_pose_from_candidates(
     When verbose is True, top_k and ig_breakdown_k control extra diagnostics.
     If ig_breakdown_k is None, the IG breakdown is reported for top_k candidates.
     If auto_lambda_cost is True, lambda_cost is computed from candidate scales.
-    criterion controls whether the uncertainty is computed after rotation
-    ("after_rotation") or after a single pose measurement ("after_pose").
     """
 
     def _evaluate_candidate(
@@ -385,31 +192,15 @@ def select_next_pose_from_candidates(
     ) -> tuple[int, float, float, dict[str, float], float]:
         """Return uncertainty, motion cost, and observation penalty for one pose."""
         idx, pose_eval = item
-        if criterion == "after_rotation":
-            uncertainty_eval = estimator.expected_uncertainty_after_rotation(
-                pose_xyz=pose_eval,
-                live_time_per_rot_s=t_short_s,
-                tau_ig=tau_ig,
-                tmax_s=t_max_s,
-                n_rollouts=rollouts,
-                orient_selection="IG",
-                rng_seed=int(candidate_seeds[idx]),
-            )
-        else:
-            if not hasattr(estimator, "expected_uncertainty_after_pose_xyz"):
-                raise ValueError(
-                    "Estimator missing expected_uncertainty_after_pose_xyz."
-                )
-            rng_local = np.random.default_rng(int(candidate_seeds[idx]))
-            num_samples = max(1, int(rollouts))
-            uncertainty_eval = estimator.expected_uncertainty_after_pose_xyz(
-                pose_xyz=pose_eval,
-                fe_index=0,
-                pb_index=0,
-                live_time_s=t_short_s,
-                num_samples=num_samples,
-                rng=rng_local,
-            )
+        uncertainty_eval = estimator.expected_uncertainty_after_rotation(
+            pose_xyz=pose_eval,
+            live_time_per_rot_s=t_short_s,
+            tau_ig=tau_ig,
+            tmax_s=t_max_s,
+            n_rollouts=rollouts,
+            orient_selection="IG",
+            rng_seed=int(candidate_seeds[idx]),
+        )
         motion_cost_eval = float(np.linalg.norm(pose_eval - current_pose_xyz))
         if min_observation_counts > 0.0:
             counts_by_iso_eval = (
@@ -455,9 +246,6 @@ def select_next_pose_from_candidates(
             stop_event.wait(0.1)
 
     with _temporary_gpu_settings(estimator, use_gpu, gpu_device, gpu_dtype):
-        criterion = criterion.strip().lower()
-        if criterion not in {"after_rotation", "after_pose"}:
-            raise ValueError(f"Unknown criterion: {criterion}")
         candidate_poses_xyz = np.asarray(candidate_poses_xyz, dtype=float)
         if candidate_poses_xyz.ndim != 2 or candidate_poses_xyz.shape[1] != 3:
             raise ValueError("candidate_poses_xyz must be shape (N, 3).")
@@ -482,9 +270,9 @@ def select_next_pose_from_candidates(
         t_max_s = (
             pf_config.max_dwell_time_s if pf_config is not None else 1.0
         ) if t_max_s is None else t_max_s
-        t_short_s = (
-            pf_config.short_time_s if pf_config is not None else 1.0
-        ) if t_short_s is None else t_short_s
+        t_short_s = float(t_short_s)
+        if not np.isfinite(t_short_s) or t_short_s <= 0.0:
+            raise ValueError("t_short_s must be finite and positive.")
         seed_rng = (
             np.random.default_rng(rng_seed)
             if rng_seed is not None
@@ -674,11 +462,10 @@ def select_next_pose_from_candidates(
                     f"observation_penalty={observation_penalties_arr[int(idx)]:.6g} "
                     f"score={scores[int(idx)]:.6g}"
                 )
-        if verbose and ig_breakdown_k is None and criterion == "after_rotation":
+        if verbose and ig_breakdown_k is None:
             ig_breakdown_k = top_k
         if (
             verbose
-            and criterion == "after_rotation"
             and ig_breakdown_k is not None
             and ig_breakdown_k > 0
             and scores.size
@@ -721,73 +508,3 @@ def select_next_pose_from_candidates(
                     mean_ig = float(np.mean(ig_vals))
                     print(f"    rollout {r_idx}: ig=[{ig_str}]{suffix} mean={mean_ig:.4g}")
         return int(np.argmin(scores))
-
-
-def select_next_pose_after_rotation(
-    estimator: RotatingShieldPFEstimator,
-    current_pose_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64],
-    map_api: object | None = None,
-    n_candidates: int = 1024,
-    n_rollouts: int = 64,
-    live_time_per_rot_s: float = 1.0,
-    tau_ig: float = 0.01,
-    tmax_s: float = 10.0,
-    lambda_cost: float = 0.0,
-    candidate_strategy: str = "free_space_sobol",
-    use_gpu: bool | None = None,
-    gpu_device: str | None = None,
-    gpu_dtype: str | None = None,
-) -> NDArray[np.float64]:
-    """
-    Choose q_{k+1} by minimizing after-rotation uncertainty plus motion cost.
-
-    The score is:
-        E[U_after-rotation | q] + lambda_cost * ||q - q_current||_2
-
-    Candidate poses are generated on-demand using the requested strategy.
-    map_api can be used to reject poses inside obstacle cells.
-
-    GPU settings can be overridden for planning with use_gpu/gpu_device/gpu_dtype.
-    """
-    with _temporary_gpu_settings(estimator, use_gpu, gpu_device, gpu_dtype):
-        current_pose_xyz = np.asarray(current_pose_xyz, dtype=float)
-        if current_pose_xyz.shape != (3,):
-            raise ValueError("current_pose_xyz must be shape (3,).")
-        visited_poses_xyz = np.asarray(visited_poses_xyz, dtype=float)
-        if visited_poses_xyz.ndim != 2 or visited_poses_xyz.shape[1] != 3:
-            raise ValueError("visited_poses_xyz must be shape (N, 3).")
-        pf_config = getattr(estimator, "pf_config", None)
-        bounds_xyz = None
-        if pf_config is not None and hasattr(pf_config, "position_min") and hasattr(
-            pf_config, "position_max"
-        ):
-            bounds_xyz = (
-                np.asarray(pf_config.position_min, dtype=float),
-                np.asarray(pf_config.position_max, dtype=float),
-            )
-
-        candidates = generate_candidate_poses(
-            current_pose_xyz=current_pose_xyz,
-            map_api=map_api,
-            n_candidates=n_candidates,
-            strategy=candidate_strategy,
-            visited_poses_xyz=visited_poses_xyz,
-            bounds_xyz=bounds_xyz,
-        )
-        if candidates.size == 0:
-            raise ValueError("No candidate poses generated.")
-
-        scores = []
-        for pose in candidates:
-            uncertainty = estimator.expected_uncertainty_after_rotation(
-                pose_xyz=pose,
-                live_time_per_rot_s=live_time_per_rot_s,
-                tau_ig=tau_ig,
-                tmax_s=tmax_s,
-                n_rollouts=n_rollouts,
-                orient_selection="IG",
-            )
-            motion_cost = float(np.linalg.norm(pose - current_pose_xyz))
-            scores.append(float(uncertainty) + lambda_cost * motion_cost)
-        return candidates[int(np.argmin(scores))]

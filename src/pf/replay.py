@@ -25,6 +25,10 @@ from measurement.source_surfaces import (
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
+from pf.runtime_route import (
+    RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY,
+    canonical_runtime_likelihood_route_mapping,
+)
 from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from runtime.measurement_log import (
     MeasurementLog,
@@ -177,56 +181,17 @@ def _validated_surface_candidates(
     return points
 
 
-def _candidate_sources(
-    log: MeasurementLog,
-    config: Mapping[str, Any],
-    lower: NDArray[np.float64],
-    upper: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return deterministic surface-response candidates for replay."""
-    obstacle_height_m = float(config.get("obstacle_height_m", 2.0))
-    explicit = config.get("replay_candidate_sources_xyz")
-    if explicit is not None:
-        return _validated_surface_candidates(
-            log,
-            np.asarray(explicit, dtype=np.float64),
-            obstacle_height_m=obstacle_height_m,
-        )
-    spacing_raw = config.get("replay_candidate_spacing_m", 1.0)
-    spacing = np.asarray(spacing_raw, dtype=np.float64)
-    if spacing.ndim == 0:
-        spacing = np.full(3, float(spacing), dtype=np.float64)
-    if spacing.shape != (3,) or np.any(~np.isfinite(spacing)) or np.any(spacing <= 0.0):
-        raise PFReplayError("replay_candidate_spacing_m must be positive scalar/XYZ.")
-    candidates = build_surface_candidate_sources(
-        _environment_config(log),
-        _obstacle_grid_from_log(log),
-        tuple(float(value) for value in spacing),
-        position_min=tuple(float(value) for value in lower),
-        position_max=tuple(float(value) for value in upper),
-        obstacle_height_m=obstacle_height_m,
-    )
-    return _validated_surface_candidates(
-        log,
-        candidates,
-        obstacle_height_m=obstacle_height_m,
-    )
-
-
 def _pf_config_values(
     config: Mapping[str, Any],
     *,
     profile: str,
-    lower: NDArray[np.float64],
     upper: NDArray[np.float64],
 ) -> dict[str, Any]:
     """Select only declared PF dataclass fields from a resolved runtime config."""
     allowed = {field.name for field in fields(RotatingShieldPFConfig)}
     values = {key: value for key, value in config.items() if key in allowed}
     values["estimator_profile"] = str(profile)
-    values["position_min"] = tuple(float(value) for value in lower)
     values["position_max"] = tuple(float(value) for value in upper)
-    values["source_position_prior"] = "surface"
     return values
 
 
@@ -235,10 +200,6 @@ def _logged_candidate_sources(
     raw_grid: Mapping[str, Any],
 ) -> NDArray[np.float64]:
     """Load or regenerate the logged complete-surface response grid."""
-    if raw_grid.get("source_surface_prior", True) is not True:
-        raise PFReplayError(
-            "Pure PF replay refuses a logged non-surface candidate grid."
-        )
     obstacle_height_m = float(raw_grid.get("obstacle_height_m", 2.0))
     explicit = raw_grid.get("candidate_sources_xyz")
     if explicit is not None:
@@ -247,10 +208,7 @@ def _logged_candidate_sources(
             np.asarray(explicit, dtype=np.float64),
             obstacle_height_m=obstacle_height_m,
         )
-    if raw_grid.get("generator") not in {
-        "realtime_surface_response_grid.v1",
-        "realtime_source_candidate_grid.v1",
-    }:
+    if raw_grid.get("generator") != "realtime_surface_response_grid.v1":
         raise PFReplayError(
             "Logged effective candidate grid lacks coordinates or a known generator."
         )
@@ -297,11 +255,14 @@ def _logged_effective_replay_config(
     external_config: Mapping[str, Any],
     *,
     seed: int,
-) -> dict[str, Any] | None:
-    """Resolve exact live-run PF inputs when the log provides them."""
+) -> tuple[dict[str, Any], NDArray[np.float64]]:
+    """Resolve the exact live-run PF inputs required by replay."""
     raw = log.runtime_config.get("effective_pf_replay")
     if raw is None:
-        return None
+        raise PFReplayError(
+            "MeasurementLog v1 replay requires effective_pf_replay; "
+            "external configuration reconstruction is not supported."
+        )
     if not isinstance(raw, Mapping):
         raise PFReplayError("effective_pf_replay must be an object.")
     raw_pf = raw.get("pf_config")
@@ -316,11 +277,6 @@ def _logged_effective_replay_config(
             "effective_pf_replay requires pf_config, candidate_grid, and "
             "api_settings objects."
         )
-    for mode_name in ("joint_observation_update", "delayed_resample_update"):
-        if not isinstance(raw_api.get(mode_name), bool):
-            raise PFReplayError(
-                f"effective_pf_replay.api_settings.{mode_name} must be a boolean."
-            )
     candidates = _logged_candidate_sources(log, raw_grid)
     if candidates.ndim != 2 or candidates.shape[1] != 3 or candidates.shape[0] == 0:
         raise PFReplayError("Logged effective candidate grid must have shape (N, 3).")
@@ -328,15 +284,39 @@ def _logged_effective_replay_config(
         raise PFReplayError("Logged effective candidate-grid count is incompatible.")
     if str(raw_grid.get("xyz_sha256", "")) != sha256_json(candidates):
         raise PFReplayError("Logged effective candidate-grid SHA-256 is incompatible.")
-    if isinstance(raw_api, Mapping) and "pf_random_seed" in raw_api:
-        if int(raw_api["pf_random_seed"]) != int(seed):
+    raw_seed = raw_api.get("pf_random_seed")
+    if isinstance(raw_seed, bool) or not isinstance(raw_seed, int):
+        raise PFReplayError(
+            "effective_pf_replay.api_settings.pf_random_seed must be an integer."
+        )
+    if raw_seed != int(seed):
+        raise PFReplayError(
+            "Replay seed differs from the logged effective PF random seed."
+        )
+    if external_config:
+        try:
+            enforce_pure_runtime_settings(external_config)
+        except ValueError as exc:
             raise PFReplayError(
-                "Replay seed differs from the logged effective PF random seed."
-            )
+                "External replay configuration is not a valid pure-PF schema: "
+                f"{exc}"
+            ) from exc
     allowed_compute_overrides = {"use_gpu", "gpu_device", "gpu_dtype"}
     allowed_profile_overrides = {"estimator_profile"}
     allowed_replay_overrides = allowed_compute_overrides | allowed_profile_overrides
     declared_pf_fields = {field.name for field in fields(RotatingShieldPFConfig)}
+    unknown_pf_fields = sorted(set(raw_pf) - declared_pf_fields)
+    if unknown_pf_fields:
+        raise PFReplayError(
+            "Logged effective PF configuration contains unknown fields: "
+            + ", ".join(str(field) for field in unknown_pf_fields)
+        )
+    missing_pf_fields = sorted(declared_pf_fields - set(raw_pf))
+    if missing_pf_fields:
+        raise PFReplayError(
+            "Logged effective PF configuration is incomplete: "
+            + ", ".join(str(field) for field in missing_pf_fields)
+        )
     for key, value in external_config.items():
         if (
             key in declared_pf_fields
@@ -347,13 +327,14 @@ def _logged_effective_replay_config(
             raise PFReplayError(
                 f"External PF field {key!r} differs from the logged effective run."
             )
-    merged = dict(external_config)
-    merged.update({str(key): value for key, value in raw_pf.items()})
+    merged = {str(key): value for key, value in raw_pf.items()}
+    merged["pure_pf_schema_version"] = log.runtime_config.get(
+        "pure_pf_schema_version"
+    )
     for key in allowed_replay_overrides:
         if key in external_config:
             merged[key] = external_config[key]
-    merged["replay_candidate_sources_xyz"] = candidates.tolist()
-    return merged
+    return merged, candidates
 
 
 def build_replay_estimator(
@@ -377,25 +358,20 @@ def build_replay_estimator(
     if not isotopes:
         raise PFReplayError("MeasurementLog must declare at least one isotope.")
     lower, upper = _environment_bounds(log)
-    logged_config = _logged_effective_replay_config(
+    logged_config, candidates = _logged_effective_replay_config(
         log,
         config,
         seed=int(seed),
     )
-    pure_config = enforce_pure_runtime_settings(
-        dict(config) if logged_config is None else logged_config,
-        profile=profile,
-    )
+    pure_config = enforce_pure_runtime_settings(logged_config, profile=profile)
     pf_config = RotatingShieldPFConfig(
         **_pf_config_values(
             pure_config,
             profile=profile,
-            lower=lower,
             upper=upper,
         )
     )
     apply_profile_to_config(pf_config)
-    candidates = _candidate_sources(log, pure_config, lower, upper)
     physical_config = _resolved_physical_config(log)
     observation_model = build_runtime_observation_model(
         physical_config,
@@ -410,29 +386,26 @@ def build_replay_estimator(
         not in {"0", "false", "no", "off", "disable", "disabled"}
     )
     if resolved_config_hash is None:
-        if logged_config is None:
-            replay_config_sha256 = sha256_json(pure_config)
-        else:
-            raw_effective = log.runtime_config["effective_pf_replay"]
-            assert isinstance(raw_effective, Mapping)
-            raw_pf = raw_effective["pf_config"]
-            assert isinstance(raw_pf, Mapping)
-            actual_pf = {
-                field.name: getattr(pf_config, field.name)
-                for field in fields(RotatingShieldPFConfig)
-            }
-            exact_live_pf = sha256_json(actual_pf) == sha256_json(raw_pf)
-            replay_config_sha256 = (
-                str(log.resolved_config_sha256)
-                if exact_live_pf
-                else sha256_json(
-                    {
-                        "base_live_config_sha256": log.resolved_config_sha256,
-                        "pf_config": actual_pf,
-                        "candidate_sources_xyz": candidates,
-                    }
-                )
+        raw_effective = log.runtime_config["effective_pf_replay"]
+        assert isinstance(raw_effective, Mapping)
+        raw_pf = raw_effective["pf_config"]
+        assert isinstance(raw_pf, Mapping)
+        actual_pf = {
+            field.name: getattr(pf_config, field.name)
+            for field in fields(RotatingShieldPFConfig)
+        }
+        exact_live_pf = sha256_json(actual_pf) == sha256_json(raw_pf)
+        replay_config_sha256 = (
+            str(log.resolved_config_sha256)
+            if exact_live_pf
+            else sha256_json(
+                {
+                    "base_live_config_sha256": log.resolved_config_sha256,
+                    "pf_config": actual_pf,
+                    "candidate_sources_xyz": candidates,
+                }
             )
+        )
     else:
         replay_config_sha256 = str(resolved_config_hash)
     input_config_sha256 = (
@@ -505,56 +478,26 @@ def _covariance_mapping(
     }
 
 
-def _runtime_station_update_modes(log: MeasurementLog) -> tuple[bool, bool]:
-    """Return explicitly logged modes, preserving legacy per-row compatibility."""
-    effective = log.runtime_config.get("effective_pf_replay")
-    if effective is not None:
-        if not isinstance(effective, Mapping) or not isinstance(
-            effective.get("api_settings"), Mapping
-        ):
-            raise PFReplayError("effective_pf_replay.api_settings must be an object.")
-        api_settings = effective["api_settings"]
-        assert isinstance(api_settings, Mapping)
-        values: dict[str, bool] = {}
-        for name in ("joint_observation_update", "delayed_resample_update"):
-            raw = api_settings.get(name)
-            if not isinstance(raw, bool):
-                raise PFReplayError(
-                    f"effective_pf_replay.api_settings.{name} must be a boolean."
-                )
-            top_level = log.runtime_config.get(name)
-            if top_level is not None:
-                if not isinstance(top_level, bool):
-                    raise PFReplayError(f"runtime_config.{name} must be a boolean.")
-                if top_level is not raw:
-                    raise PFReplayError(
-                        f"runtime_config.{name} conflicts with "
-                        f"effective_pf_replay.api_settings.{name}."
-                    )
-            values[name] = raw
-        joint = values["joint_observation_update"]
-        return joint, values["delayed_resample_update"] and not joint
-
-    resolved: dict[str, bool] = {}
-    for name in ("joint_observation_update", "delayed_resample_update"):
-        raw = log.runtime_config.get(name)
-        if raw is None:
-            resolved[name] = False
-            continue
-        if not isinstance(raw, bool):
-            raise PFReplayError(f"runtime_config.{name} must be a boolean.")
-        resolved[name] = raw
-    joint = resolved["joint_observation_update"]
-    delayed = resolved["delayed_resample_update"] and not joint
-    return joint, delayed
-
-
 def _station_complete(record: MeasurementLogRecord) -> bool:
     """Return the writer-owned causal station-boundary marker."""
     raw = record.metadata.get("station_complete", False)
     if not isinstance(raw, bool):
         raise PFReplayError("record.metadata.station_complete must be a boolean.")
     return raw
+
+
+def _station_runtime_likelihood_routes(
+    record: MeasurementLogRecord,
+    isotopes: Sequence[str],
+) -> dict[str, str]:
+    """Return the required station-level routes recorded before PF ingestion."""
+    payload = record.metadata.get(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY)
+    try:
+        return canonical_runtime_likelihood_route_mapping(payload, isotopes)
+    except ValueError as exc:
+        raise PFReplayError(
+            "Completed station lacks canonical runtime likelihood routes."
+        ) from exc
 
 
 def _pair_record(
@@ -638,7 +581,6 @@ def replay_records(
     station_pose: dict[int, NDArray[np.float64]] = {}
     station_pose_index: dict[int, int] = {}
     trace: list[dict[str, Any]] = []
-    joint_update, delayed_update = _runtime_station_update_modes(log)
     pending_station_id: int | None = None
     pending_pose_idx: int | None = None
     pending_pairs: list[tuple[object, ...]] = []
@@ -668,26 +610,6 @@ def replay_records(
         if pre_record_callback is not None:
             pre_record_callback(estimator, record, record_index, pose_idx)
 
-        if not joint_update and not delayed_update:
-            normalized = PurePFEstimator._normalize_pair_sequence_record(pair)
-            z_k, fe, pb, live, variances, covariance, _spectrum = normalized
-            kwargs: dict[str, object] = {}
-            if covariance is not None:
-                kwargs["z_covariance_k"] = covariance
-            estimator.update_pair(
-                z_k=z_k,
-                pose_idx=pose_idx,
-                fe_index=fe,
-                pb_index=pb,
-                live_time_s=live,
-                z_variance_k=variances,
-                **kwargs,
-            )
-            if station_complete and station_complete_callback is not None:
-                station_complete_callback(estimator, record, record_index)
-            trace.append(_trace_row(estimator, record, record_index=record_index))
-            continue
-
         if station_id in completed_station_ids:
             raise PFReplayError(
                 f"station_id {station_id} has observations after station_complete."
@@ -700,48 +622,28 @@ def replay_records(
         if pending_station_id is None:
             pending_station_id = station_id
             pending_pose_idx = pose_idx
-            if delayed_update:
-                estimator.begin_deferred_pose_update()
         pending_pairs.append(pair)
 
-        if joint_update:
-            if station_complete:
-                assert pending_pose_idx is not None
-                estimator.update_pair_sequence(
-                    tuple(pending_pairs),
-                    pose_idx=pending_pose_idx,
-                )
-                if station_complete_callback is not None:
-                    station_complete_callback(estimator, record, record_index)
-            trace.append(_trace_row(estimator, record, record_index=record_index))
-        else:
-            normalized = PurePFEstimator._normalize_pair_sequence_record(pair)
-            z_k, fe, pb, live, variances, covariance, _spectrum = normalized
-            kwargs = {}
-            if covariance is not None:
-                kwargs["z_covariance_k"] = covariance
-            estimator.update_pair(
-                z_k=z_k,
-                pose_idx=pose_idx,
-                fe_index=fe,
-                pb_index=pb,
-                live_time_s=live,
-                z_variance_k=variances,
-                **kwargs,
-            )
-            if station_complete:
-                estimator.finalize_deferred_pose_update()
-                if station_complete_callback is not None:
-                    station_complete_callback(estimator, record, record_index)
-            trace.append(_trace_row(estimator, record, record_index=record_index))
-
         if station_complete:
+            assert pending_pose_idx is not None
+            runtime_likelihood_routes = _station_runtime_likelihood_routes(
+                record,
+                isotopes,
+            )
+            estimator.update_pair_sequence(
+                tuple(pending_pairs),
+                pose_idx=pending_pose_idx,
+                runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
+            )
+            if station_complete_callback is not None:
+                station_complete_callback(estimator, record, record_index)
             completed_station_ids.add(station_id)
             pending_station_id = None
             pending_pose_idx = None
             pending_pairs = []
+        trace.append(_trace_row(estimator, record, record_index=record_index))
 
-    # An unfinished joint/deferred station is a valid causal snapshot.  EOF is
+    # An unfinished station is a valid causal snapshot. EOF is
     # deliberately not interpreted as a boundary: the same first N records
     # produce the same pending state whether or not a future suffix exists.
     return tuple(trace)

@@ -17,13 +17,12 @@ from realtime_demo import (
     DEFAULT_OBSTACLE_CONFIG,
     DEFAULT_SOURCE_CONFIG,
     load_sources_from_json,
-    resolve_runtime_structural_moves_enabled,
+    resolve_runtime_variable_cardinality,
     run_live_pf,
 )
 from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
 from runtime_defaults import (
     DEFAULT_ENVIRONMENT_MODE,
-    DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     DEFAULT_MEASUREMENT_TIME_S,
     DEFAULT_RANDOM_SOURCE_COUNT,
     DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
@@ -211,7 +210,7 @@ def main() -> None:
         dest="max_steps",
         type=int,
         default=None,
-        help="Maximum number of measurement steps (default: run until convergence).",
+        help="Maximum number of measurement steps (default: runtime budget).",
     )
     parser.add_argument(
         "--max-poses",
@@ -257,16 +256,6 @@ def main() -> None:
         help=(
             "Adopt one hidden MeasurementLog stream directory at its final "
             "station_complete boundary, replay its pure-PF prefix, and continue."
-        ),
-    )
-    parser.add_argument(
-        "--resume-runtime-log",
-        type=str,
-        default=None,
-        help=(
-            "Original live stdout log used to restore candidate-RNG and "
-            "remaining-measurement controller history for a legacy stage that "
-            "predates embedded station checkpoints."
         ),
     )
     parser.add_argument(
@@ -407,35 +396,23 @@ def main() -> None:
         help="Relative detection threshold as a fraction of max peak-matched activity.",
     )
     parser.add_argument(
-        "--detect-consecutive",
-        type=int,
-        default=20,
-        help="Consecutive detections required to enable an isotope.",
-    )
-    parser.add_argument(
-        "--detect-min-steps",
-        type=int,
-        default=None,
-        help="Minimum steps before locking detected isotopes (defaults to detect_consecutive).",
-    )
-    parser.add_argument(
         "--eval-match-radius",
         type=float,
         default=0.5,
         help="Match radius (m) for evaluation metrics.",
     )
     parser.add_argument(
-        "--birth",
-        dest="birth",
+        "--variable-cardinality",
+        dest="variable_cardinality",
         action="store_true",
         default=None,
-        help="Enable PF structural moves, overriding the runtime config.",
+        help="Enable exact RJ birth/death moves, overriding the runtime config.",
     )
     parser.add_argument(
-        "--no-birth",
-        dest="birth",
+        "--fixed-cardinality",
+        dest="variable_cardinality",
         action="store_false",
-        help="Disable PF structural moves, overriding the runtime config.",
+        help="Keep cardinality fixed while retaining exact within-K MH moves.",
     )
     parser.add_argument(
         "--num-particles",
@@ -446,11 +423,10 @@ def main() -> None:
     parser.add_argument(
         "--max-sources",
         type=int,
-        default=DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+        default=None,
         help=(
-            "Maximum number of sources per isotope. Defaults to "
-            f"{DEFAULT_MAX_SOURCES_PER_ISOTOPE}; use an explicit value only "
-            "for ablation/debug cases."
+            "Override the runtime-config maximum number of sources per isotope; "
+            "use only for explicit ablation/debug cases."
         ),
     )
     parser.add_argument(
@@ -458,11 +434,6 @@ def main() -> None:
         type=int,
         default=2,
         help="Max resamples per observation during tempering (default: 2).",
-    )
-    parser.add_argument(
-        "--converge",
-        action="store_true",
-        help="Enable per-isotope convergence gating (default: disabled).",
     )
     parser.add_argument(
         "--sim-backend",
@@ -648,15 +619,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--init-grid-spacing-m",
-        type=float,
-        default=None,
-        help=(
-            "Initial PF grid spacing in meters. Use <=0 to disable grid "
-            "initialization and use --num-particles random particles."
-        ),
-    )
-    parser.add_argument(
         "--planning-eig-samples",
         type=int,
         default=None,
@@ -737,16 +699,15 @@ def main() -> None:
         args,
         parser,
     )
-    structural_moves_enabled = resolve_runtime_structural_moves_enabled(
-        args.birth,
+    variable_cardinality = resolve_runtime_variable_cardinality(
+        args.variable_cardinality,
         sim_config_path,
     )
-    if args.max_sources is None:
-        args.max_sources = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     pf_overrides: dict[str, object] = {
-        "max_sources": args.max_sources,
         "max_resamples_per_observation": args.temper_max_resamples,
     }
+    if args.max_sources is not None:
+        pf_overrides["max_sources"] = int(args.max_sources)
     if args.rotations_per_pose is not None:
         pf_overrides["orientation_k"] = max(1, int(args.rotations_per_pose))
         pf_overrides["min_rotations_per_pose"] = max(1, int(args.rotations_per_pose))
@@ -754,12 +715,6 @@ def main() -> None:
         pf_overrides["min_rotations_per_pose"] = max(
             0,
             int(args.min_rotations_per_pose),
-        )
-    if args.init_grid_spacing_m is not None:
-        pf_overrides["init_grid_spacing_m"] = (
-            None
-            if float(args.init_grid_spacing_m) <= 0.0
-            else float(args.init_grid_spacing_m)
         )
     if args.planning_eig_samples is not None:
         pf_overrides["planning_eig_samples"] = max(1, int(args.planning_eig_samples))
@@ -813,8 +768,6 @@ def main() -> None:
         sources=sources,
         detect_threshold_abs=args.detect_threshold_abs,
         detect_threshold_rel=args.detect_threshold_rel,
-        detect_consecutive=args.detect_consecutive,
-        detect_min_steps=args.detect_min_steps,
         ig_threshold_mode=args.ig_threshold_mode,
         ig_threshold_rel=args.ig_threshold_rel,
         ig_threshold_min=args.ig_threshold_min,
@@ -822,17 +775,15 @@ def main() -> None:
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
         eval_match_radius_m=args.eval_match_radius,
-        birth_enabled=structural_moves_enabled,
+        variable_cardinality=variable_cardinality,
         num_particles=args.num_particles,
         pf_config_overrides=pf_overrides,
         output_tag=args.output_tag,
         resume_measurement_stage=args.resume_measurement_stage,
-        resume_runtime_log=args.resume_runtime_log,
         resume_compatible_code_paths=args.resume_compatible_code_path,
         resume_compatibility_basis=args.resume_compatibility_basis,
         pose_candidates=args.pose_candidates,
         pose_min_dist=args.pose_min_dist,
-        converge=args.converge,
         sim_backend=sim_backend,
         sim_config_path=sim_config_path,
         blender_executable=args.blender_executable,

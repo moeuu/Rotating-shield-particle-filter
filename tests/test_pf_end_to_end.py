@@ -12,7 +12,6 @@ import pytest
 
 import pf.estimator as estimator_module
 from pf.estimator import (
-    MeasurementRecord,
     RotatingShieldPFEstimator,
     RotatingShieldPFConfig,
 )
@@ -44,7 +43,7 @@ def test_pf_estimator_runs_one_step():
             num_particles=50,
             max_sources=1,
             init_num_sources=(1, 1),
-            birth_enable=False,
+            variable_cardinality=False,
         ),
         shield_params=ShieldParams(),
     )
@@ -68,62 +67,6 @@ def test_pf_estimator_runs_one_step():
     assert strengths.shape == (1,)
 
 
-def test_estimator_can_start_without_active_detected_isotopes():
-    """Estimator can activate spectrum-detected isotopes after an empty start."""
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137", "Co-60"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.5, "Co-60": 0.4},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=8,
-            max_sources=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
-    est.restrict_isotopes([], allow_empty=True)
-
-    assert est.isotopes == []
-    assert est.filters == {}
-
-    est.add_isotopes(["Co-60"])
-    assert est.isotopes == ["Co-60"]
-    assert set(est.filters) == {"Co-60"}
-
-    est.add_isotopes(["Cs-137"])
-    assert est.isotopes == ["Cs-137", "Co-60"]
-    assert set(est.filters) == {"Cs-137", "Co-60"}
-
-
-def test_removed_secondary_estimator_apis_are_physically_absent() -> None:
-    """The sequential PF must not retain deleted solver or refit entry points."""
-    removed_estimator_methods = (
-        "_apply_birth_death",
-        "_refit_reported_strengths",
-        "adapt_strength_prior_to_observation",
-        "best_report_summary",
-        "final_report_estimate",
-        "fit_surface_map",
-        "prune_spurious_sources",
-        "pruned_estimates",
-        "record_report_snapshot",
-        "refresh_sparse_poisson_evidence",
-        "report_model_order_diagnostics",
-        "runtime_report_rescue_modes",
-        "sparse_poisson_evidence_diagnostics",
-    )
-
-    for method_name in removed_estimator_methods:
-        assert not hasattr(RotatingShieldPFEstimator, method_name)
-    assert not hasattr(IsotopeParticleFilter, "apply_birth_death")
-    assert not hasattr(IsotopeParticleFilter, "refit_strengths_for_particles")
-    assert not hasattr(IsotopeParticleFilter, "set_external_protected_cardinalities")
-
-
 def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
     """Station joint updates should dispatch independent isotopes in parallel."""
     est = RotatingShieldPFEstimator(
@@ -134,7 +77,7 @@ def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             history_estimate_interval=0,
             parallel_isotope_updates=True,
@@ -167,11 +110,21 @@ def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
             ({"Cs-137": 3.0, "Co-60": 4.0}, 0, 0, 1.0, None),
         ],
         pose_idx=0,
+        runtime_likelihood_route_by_isotope={
+            "Cs-137": "count",
+            "Co-60": "count",
+        },
     )
 
     assert est.last_pair_sequence_update_workers == 2
     assert {isotope for isotope, _values in calls} == {"Cs-137", "Co-60"}
     assert len(est.measurements) == 2
+    assert [record.detector_position_xyz_m for record in est.measurements] == [
+        (0.5, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+    ]
+    assert [record.station_sequence_id for record in est.measurements] == [0, 0]
+    assert [record.station_view_index for record in est.measurements] == [0, 1]
 
 
 def test_update_pair_sequence_records_stage_timings(monkeypatch):
@@ -184,7 +137,7 @@ def test_update_pair_sequence_records_stage_timings(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
@@ -211,15 +164,13 @@ def test_update_pair_sequence_records_stage_timings(monkeypatch):
     est.update_pair_sequence(
         [({"Cs-137": 1.0}, 0, 0, 1.0, None)],
         pose_idx=0,
+        runtime_likelihood_route_by_isotope={"Cs-137": "count"},
     )
 
     stages = est.last_pair_sequence_stage_wall_s
     assert stages["isotope_sequence_update"] >= 0.0
     assert stages["structural_moves"] >= 0.0
-    assert "birth_death" not in stages
     assert stages["history_estimate"] >= 0.0
-    assert "sparse_poisson_refresh" not in stages
-    assert "report_snapshot" not in stages
     assert stages["total"] >= stages["isotope_sequence_update"]
 
 
@@ -233,7 +184,7 @@ def test_update_pair_sequence_passes_view_covariance(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
@@ -268,76 +219,11 @@ def test_update_pair_sequence_passes_view_covariance(monkeypatch):
             ({"Cs-137": 3.0}, 0, 0, 1.0, {"Cs-137": 20.0}),
         ],
         pose_idx=0,
+        runtime_likelihood_route_by_isotope={"Cs-137": "count"},
         z_view_covariance_by_isotope={"Cs-137": view_covariance},
     )
 
     assert np.allclose(captured["Cs-137"], view_covariance)
-
-
-def test_update_pair_sequence_records_spectrum_payload(monkeypatch):
-    """Station sequence records should preserve direct spectrum-bin payloads."""
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-            max_sources=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-            history_estimate_interval=0,
-            use_gpu=False,
-        ),
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-    )
-    est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
-
-    def fake_sequence_update(self, **_kwargs):
-        """Avoid stochastic PF updates while preserving measurement history."""
-        return None
-
-    def fake_structural_moves(*_args, **_kwargs):
-        """Skip structural moves so this test isolates history storage."""
-        return None
-
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "update_continuous_pair_sequence",
-        fake_sequence_update,
-    )
-    monkeypatch.setattr(est, "_apply_structural_moves", fake_structural_moves)
-    spectrum_payload = {
-        "spectrum_counts": np.array([10.0, 3.0, 1.0], dtype=float),
-        "spectrum_variance": np.array([10.0, 3.0, 1.0], dtype=float),
-        "spectrum_background": np.array([1.0, 1.0, 1.0], dtype=float),
-        "spectrum_response_templates_by_isotope": {
-            "Cs-137": np.array([1.0, 0.2, 0.0], dtype=float)
-        },
-    }
-
-    est.update_pair_sequence(
-        [
-            (
-                {"Cs-137": 10.0},
-                0,
-                0,
-                1.0,
-                {"Cs-137": 10.0},
-                None,
-                spectrum_payload,
-            ),
-        ],
-        pose_idx=0,
-    )
-
-    record = est.measurements[-1]
-    assert record.spectrum_counts == pytest.approx((10.0, 3.0, 1.0))
-    assert record.spectrum_background == pytest.approx((1.0, 1.0, 1.0))
-    assert record.spectrum_response_templates_by_isotope is not None
-    assert record.spectrum_response_templates_by_isotope["Cs-137"] == pytest.approx(
-        (1.0, 0.2, 0.0)
-    )
 
 
 def test_update_pair_projects_isotope_covariance_to_pf_variance(monkeypatch):
@@ -350,7 +236,7 @@ def test_update_pair_projects_isotope_covariance_to_pf_variance(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
@@ -393,6 +279,9 @@ def test_update_pair_projects_isotope_covariance_to_pf_variance(monkeypatch):
     assert est.measurements[-1].z_covariance_k["Cs-137"]["Co-60"] == pytest.approx(
         -12.0
     )
+    assert est.measurements[-1].detector_position_xyz_m == (0.5, 0.0, 0.0)
+    assert est.measurements[-1].station_sequence_id == 0
+    assert est.measurements[-1].station_view_index == 0
 
 
 def test_update_pair_updates_missing_configured_isotope_as_zero(monkeypatch):
@@ -404,10 +293,8 @@ def test_update_pair_updates_missing_configured_isotope_as_zero(monkeypatch):
         mu_by_isotope={"Cs-137": 0.0, "Co-60": 0.0},
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
-            min_particles=1,
-            max_particles=1,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
@@ -452,11 +339,9 @@ def test_estimator_uses_canonical_pf_posterior_projection():
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
-            min_particles=3,
-            max_particles=3,
             max_sources=2,
             init_num_sources=(0, 2),
-            birth_enable=True,
+            variable_cardinality=True,
             use_gpu=False,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -511,11 +396,9 @@ def test_step_diagnostics_can_skip_posterior_projection_recomputation():
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
-            min_particles=3,
-            max_particles=3,
             max_sources=2,
             init_num_sources=(0, 2),
-            birth_enable=True,
+            variable_cardinality=True,
             use_gpu=False,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -557,7 +440,7 @@ def test_continuous_pair_expected_counts_supports_cpu_config():
         kernel=dummy_kernel,
         config=PFConfig(
             num_particles=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(1, 1),
             use_gpu=False,
         ),
@@ -584,222 +467,11 @@ def test_continuous_pair_expected_counts_supports_cpu_config():
     assert lam == pytest.approx(np.array([12.0], dtype=float))
 
 
-def test_deferred_pose_update_delays_structural_update(monkeypatch):
-    """Deferred pose updates should postpone only station-level structure moves."""
-    update_defer_flags = []
-    finalize_calls = []
-    structural_calls = []
-
-    def _fake_update_continuous_pair(
-        self,
-        z_obs,
-        pose_idx,
-        fe_index,
-        pb_index,
-        live_time_s,
-        observation_count_variance=0.0,
-        step_idx=None,
-        defer_resample=False,
-    ):
-        """Record whether the estimator requested a deferred update."""
-        update_defer_flags.append(bool(defer_resample))
-        self.last_ess_pre = 3.0
-        self.last_ess = 3.0
-        self.last_resample_ess = False
-
-    def _fake_finalize_deferred_update(self):
-        """Record station-level finalization calls."""
-        finalize_calls.append(self.isotope)
-        self.last_resample_ess = True
-        self.last_ess_post = float(len(self.continuous_particles))
-
-    def _fake_apply_structural_moves(self):
-        """Record structural-move applications."""
-        structural_calls.append(len(self.measurements))
-
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "update_continuous_pair",
-        _fake_update_continuous_pair,
-    )
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "finalize_deferred_update",
-        _fake_finalize_deferred_update,
-    )
-    monkeypatch.setattr(
-        RotatingShieldPFEstimator,
-        "_apply_structural_moves",
-        _fake_apply_structural_moves,
-    )
-
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=4,
-            max_sources=1,
-            init_num_sources=(0, 1),
-        ),
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
-
-    est.begin_deferred_pose_update()
-    est.update_pair(
-        z_k={"Cs-137": 4.0},
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-    )
-    est.update_pair(
-        z_k={"Cs-137": 5.0},
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-    )
-
-    assert update_defer_flags == [True, True]
-    assert structural_calls == []
-    assert len(est.measurements) == 2
-
-    finalized = est.finalize_deferred_pose_update()
-
-    assert finalized == 2
-    assert finalize_calls == ["Cs-137"]
-    assert structural_calls == [2]
-
-
-def test_deferred_pose_update_uses_full_structural_history(monkeypatch):
-    """Station finalization must score structural moves on all observations."""
-    evidence_data_sizes = []
-
-    def _fake_update_continuous_pair(self, *args, **kwargs):
-        """Avoid particle work while recording deferred estimator behavior."""
-        _ = (self, args, kwargs)
-
-    def _fake_finalize_deferred_update(self):
-        """Avoid particle finalization in the structural-history regression."""
-        _ = self
-
-    def _record_structural_update(self, task):
-        """Record the measurement count delivered to structural evidence."""
-        _ = self
-        evidence_data = task[2]
-        evidence_data_sizes.append(
-            0 if evidence_data is None else int(evidence_data.z_k.size)
-        )
-
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "update_continuous_pair",
-        _fake_update_continuous_pair,
-    )
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "finalize_deferred_update",
-        _fake_finalize_deferred_update,
-    )
-    monkeypatch.setattr(
-        RotatingShieldPFEstimator,
-        "_run_isotope_structural_update",
-        _record_structural_update,
-    )
-
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=4,
-            max_sources=1,
-            init_num_sources=(0, 1),
-        ),
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
-    est.measurements.extend(
-        MeasurementRecord(
-            z_k={"Cs-137": float(count)},
-            pose_idx=0,
-            orient_idx=0,
-            live_time_s=1.0,
-            fe_index=0,
-            pb_index=0,
-        )
-        for count in (1, 2, 3)
-    )
-    est.begin_deferred_pose_update()
-    est.update_pair(
-        z_k={"Cs-137": 4.0},
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-    )
-
-    assert est.finalize_deferred_pose_update() == 1
-    assert evidence_data_sizes == [4]
-
-
-def test_deferred_pose_update_defers_posterior_history_recompute(monkeypatch):
-    """Deferred updates should not project the PF posterior per shield posture."""
-
-    def _fake_update_continuous_pair(self, *args, **kwargs):
-        """Record a no-op PF update for the posterior-history regression."""
-        _ = (self, args, kwargs)
-
-    def _forbidden_estimates(self, *args, **kwargs):
-        """Raise if update_pair enters expensive report estimate recomputation."""
-        _ = (self, args, kwargs)
-        raise AssertionError("deferred update should not recompute estimates")
-
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "update_continuous_pair",
-        _fake_update_continuous_pair,
-    )
-    monkeypatch.setattr(RotatingShieldPFEstimator, "estimates", _forbidden_estimates)
-
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=4,
-            max_sources=1,
-            birth_enable=False,
-            init_num_sources=(0, 0),
-        ),
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
-
-    est.begin_deferred_pose_update()
-    est.update_pair(
-        z_k={"Cs-137": 4.0},
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-    )
-
-    assert len(est.history_estimates) == 0
-    assert len(est.measurements) == 1
-    assert est._deferred_measurement_count == 1
-
-
 def test_posterior_history_interval_can_skip_exact_projection():
     """Posterior-history recording must not alter the PF state."""
     est = object.__new__(RotatingShieldPFEstimator)
     est.pf_config = RotatingShieldPFConfig(
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         history_estimate_interval=0,
     )
@@ -816,7 +488,7 @@ def test_posterior_history_interval_can_skip_exact_projection():
     assert est.history_estimates == []
 
     est.pf_config = RotatingShieldPFConfig(
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(0, 0),
         history_estimate_interval=2,
     )
@@ -850,7 +522,7 @@ def test_candidate_response_cache_reuses_full_surface_grid(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             use_gpu=False,
             candidate_response_cache_max_entries=4,
@@ -867,6 +539,11 @@ def test_candidate_response_cache_reuses_full_surface_grid(monkeypatch):
         fe_indices=np.array([0, 1], dtype=np.int64),
         pb_indices=np.array([1, 0], dtype=np.int64),
         live_times=np.ones(2, dtype=float),
+        station_sequence_ids=np.array([0, 1], dtype=np.int64),
+        runtime_likelihood_routes=np.asarray(
+            ["count", "count"],
+            dtype="<U16",
+        ),
     )
     calls = []
 
@@ -909,104 +586,6 @@ def test_candidate_response_cache_reuses_full_surface_grid(monkeypatch):
     assert second == pytest.approx(np.ones_like(second))
 
 
-def test_deferred_pose_update_runs_convergence_once_at_finalize(monkeypatch):
-    """Deferred updates should move convergence clustering to station finalization."""
-    convergence_steps = []
-
-    def _fake_gpu_enabled(self):
-        """Bypass hardware availability for the branch test."""
-        _ = self
-        return True
-
-    def _fake_tempered_update(
-        self,
-        lam_fn,
-        z_obs,
-        observation_count_variance=0.0,
-    ):
-        """Avoid expected-count evaluation while exercising deferred control flow."""
-        _ = (
-            self,
-            lam_fn,
-            z_obs,
-            observation_count_variance,
-        )
-        return 3.0, False
-
-    def _fake_maybe_update_convergence(
-        self,
-        step_idx,
-        detector_pos,
-        fe_index,
-        pb_index,
-        live_time_s,
-        z_obs,
-    ):
-        """Record convergence checks without running clustered reports."""
-        _ = (self, detector_pos, fe_index, pb_index, live_time_s, z_obs)
-        convergence_steps.append(step_idx)
-
-    def _fake_apply_structural_moves(self):
-        """Avoid structural moves so the test isolates convergence scheduling."""
-        _ = self
-
-    monkeypatch.setattr(IsotopeParticleFilter, "_gpu_enabled", _fake_gpu_enabled)
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "_tempered_update",
-        _fake_tempered_update,
-    )
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "_maybe_update_convergence",
-        _fake_maybe_update_convergence,
-    )
-    monkeypatch.setattr(
-        RotatingShieldPFEstimator,
-        "_apply_structural_moves",
-        _fake_apply_structural_moves,
-    )
-
-    est = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
-        shield_normals=np.array([[1.0, 0.0, 0.0]], dtype=float),
-        mu_by_isotope={"Cs-137": 0.0},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=4,
-            max_sources=1,
-            birth_enable=False,
-            init_num_sources=(1, 1),
-            use_tempering=True,
-        ),
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
-
-    est.begin_deferred_pose_update()
-    est.update_pair(
-        z_k={"Cs-137": 4.0},
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-    )
-    est.update_pair(
-        z_k={"Cs-137": 5.0},
-        pose_idx=0,
-        fe_index=1,
-        pb_index=1,
-        live_time_s=1.0,
-    )
-
-    assert convergence_steps == []
-
-    finalized = est.finalize_deferred_pose_update()
-
-    assert finalized == 2
-    assert convergence_steps == [1]
-
-
 def test_tempered_update_batches_remainder_after_resample_cap():
     """Tempering should not loop in tiny beta steps after resampling is capped."""
     torch = pytest.importorskip("torch")
@@ -1015,7 +594,7 @@ def test_tempered_update_batches_remainder_after_resample_cap():
         kernel=None,
         config=PFConfig(
             num_particles=2,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(0, 0),
             min_delta_beta=1.0e-3,
             target_ess_ratio=0.99,
@@ -1047,64 +626,6 @@ def test_tempered_update_batches_remainder_after_resample_cap():
     assert final_logw == pytest.approx(expected_logw)
 
 
-def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
-    """Deferred station updates should retain standard tempered resampling."""
-    calls = []
-
-    def _fake_gpu_enabled(self):
-        """Bypass hardware availability for the branch test."""
-        return True
-
-    def _fake_tempered_update(
-        self,
-        lam_fn,
-        z_obs,
-        observation_count_variance=0.0,
-    ):
-        """Record the deferred tempered-update request."""
-        _ = lam_fn, z_obs, observation_count_variance
-        calls.append(True)
-        self.last_resample_ess = True
-        self.last_ess_pre = 1.0
-        self.last_ess_post = float(len(self.continuous_particles))
-        return 1.0, True
-
-    monkeypatch.setattr(IsotopeParticleFilter, "_gpu_enabled", _fake_gpu_enabled)
-    monkeypatch.setattr(
-        IsotopeParticleFilter,
-        "_tempered_update",
-        _fake_tempered_update,
-    )
-
-    dummy_kernel = types.SimpleNamespace(
-        poses=[np.array([0.0, 0.0, 0.0], dtype=float)],
-        orientations=[np.array([1.0, 0.0, 0.0], dtype=float)],
-        num_sources=1,
-    )
-    filt = IsotopeParticleFilter(
-        "Cs-137",
-        kernel=dummy_kernel,
-        config=PFConfig(
-            num_particles=2,
-            birth_enable=False,
-            init_num_sources=(1, 1),
-            use_tempering=True,
-        ),
-    )
-
-    filt.update_continuous_pair(
-        z_obs=1.0,
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-        defer_resample=True,
-    )
-
-    assert calls == [True]
-    assert filt._deferred_resampled_any
-
-
 def test_estimator_passes_obstacle_attenuation_to_filters():
     """PF filters should include active concrete obstacle attenuation in their kernels."""
     grid = ObstacleGrid(
@@ -1121,10 +642,8 @@ def test_estimator_passes_obstacle_attenuation_to_filters():
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
-            min_particles=1,
-            max_particles=1,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(1, 1),
             use_gpu=False,
         ),
@@ -1150,16 +669,11 @@ def test_rotating_config_passes_physical_strength_prior():
     """Estimator config must preserve the declared physical strength prior."""
     config = RotatingShieldPFConfig(
         num_particles=1,
-        min_particles=1,
-        max_particles=1,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
-        init_strength_log_mean=2.5,
-        init_strength_log_sigma=0.25,
-        init_strength_prior="uniform",
-        init_strength_min=300000.0,
-        init_strength_max=2000000.0,
+        strength_prior_min_cps_1m=300000.0,
+        strength_prior_max_cps_1m=2000000.0,
     )
     est = RotatingShieldPFEstimator(
         isotopes=["Cs-137"],
@@ -1172,31 +686,23 @@ def test_rotating_config_passes_physical_strength_prior():
 
     pf_config = est._build_pf_config()
 
-    assert pf_config.init_strength_log_mean == pytest.approx(2.5)
-    assert pf_config.init_strength_log_sigma == pytest.approx(0.25)
-    assert pf_config.init_strength_prior == "uniform"
-    assert pf_config.init_strength_min == pytest.approx(300000.0)
-    assert pf_config.init_strength_max == pytest.approx(2000000.0)
+    assert pf_config.strength_prior_min_cps_1m == pytest.approx(300000.0)
+    assert pf_config.strength_prior_max_cps_1m == pytest.approx(2000000.0)
 
 
-def test_pf_configs_share_only_sequential_runtime_fields():
-    """Core PF fields must be strict-runtime fields exposed by the estimator."""
+def test_pf_configs_share_the_exact_runtime_kernel_fields():
+    """Estimator configuration must expose every exact PF kernel setting."""
     pf_fields = {field.name for field in fields(PFConfig)}
     rotating_fields = {field.name for field in fields(RotatingShieldPFConfig)}
-    removed_fields = {
-        "adaptive_strength_prior",
-        "conditional_strength_profile_before_likelihood",
-        "conditional_strength_refit",
-        "death_strength_threshold",
-        "mode_preserving_report_cardinality_extra_particles",
-        "mode_preserving_report_cardinality_strata",
-        "report_exclude_unverified_sources",
-        "source_strength_prior_mean",
-    }
 
-    assert removed_fields.isdisjoint(pf_fields)
-    assert removed_fields.isdisjoint(rotating_fields)
     assert pf_fields <= rotating_fields
+    assert {
+        "variable_cardinality",
+        "strength_prior_min_cps_1m",
+        "strength_prior_max_cps_1m",
+        "structural_rj_position_move_probability",
+        "structural_rj_strength_move_probability",
+    } <= pf_fields
 
 
 def test_rotating_config_has_no_duplicate_field_annotations():

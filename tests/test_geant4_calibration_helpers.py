@@ -468,7 +468,9 @@ def test_runtime_likelihood_specs_match_nested_standard_config() -> None:
                 "spectrum_count_abs_sigma": 3.0,
                 "low_count_abs_sigma": 10.0,
                 "low_count_transition_counts": 50.0,
-                "observation_count_variance_includes_counting_noise": True,
+                "observation_count_variance_semantics": (
+                    "counting_noise_inclusive"
+                ),
             },
         }
     )
@@ -479,7 +481,10 @@ def test_runtime_likelihood_specs_match_nested_standard_config() -> None:
     assert specs["Co-60"].transport_model_rel_sigma == pytest.approx(0.1)
     assert specs["Eu-154"].transport_model_rel_sigma == pytest.approx(0.0)
     assert specs["Eu-154"].spectrum_count_rel_sigma == pytest.approx(0.05)
-    assert specs["Cs-137"].observation_count_variance_includes_counting_noise is True
+    assert (
+        specs["Cs-137"].observation_count_variance_semantics
+        == "counting_noise_inclusive"
+    )
 
 
 def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
@@ -496,7 +501,7 @@ def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
             spectrum_count_abs_sigma=5.0,
             low_count_abs_sigma=20.0,
             low_count_transition_counts=100.0,
-            observation_count_variance_includes_counting_noise=True,
+            observation_count_variance_semantics="counting_noise_inclusive",
             student_t_df=5.0,
         )
         for isotope in VALIDATION_SCRIPT.ISOTOPES
@@ -521,7 +526,7 @@ def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
         low_count_abs_sigma=20.0,
         low_count_transition_counts=100.0,
         observation_count_variance=25.0,
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
     )[0]
 
     assert runtime_target["likelihood_scale_squared_by_isotope"]["Cs-137"] == (
@@ -529,9 +534,9 @@ def test_pf_likelihood_summary_uses_shared_student_t_scale() -> None:
     )
     assert (
         diagnostic["likelihood_spec_by_isotope"]["Cs-137"][
-            "observation_count_variance_includes_counting_noise"
+            "observation_count_variance_semantics"
         ]
-        is True
+        == "counting_noise_inclusive"
     )
     assert "not its marginal variance" in diagnostic["scale_semantics"]
 

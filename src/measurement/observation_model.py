@@ -154,12 +154,8 @@ def build_runtime_observation_model(
         thickness_pb_cm=float(shield_thickness.thickness_pb_cm),
         inner_radius_fe_cm=inner_radius_fe_cm,
         inner_radius_pb_cm=inner_radius_pb_cm,
-        buildup_fe_coeff=float(
-            buildup.get("fe_coeff", payload.get("pf_buildup_fe_coeff", 0.0))
-        ),
-        buildup_pb_coeff=float(
-            buildup.get("pb_coeff", payload.get("pf_buildup_pb_coeff", 0.0))
-        ),
+        buildup_fe_coeff=float(buildup.get("fe_coeff", 0.0)),
+        buildup_pb_coeff=float(buildup.get("pb_coeff", 0.0)),
     )
     mu_by_isotope = mu_by_isotope_from_tvl_mm(HVL_TVL_TABLE_MM, isotopes=isotopes)
     if not mu_by_isotope:
@@ -190,10 +186,7 @@ def build_runtime_observation_model(
         obstacle_mu_by_isotope=obstacle_mu_by_isotope,
         obstacle_height_m=float(payload.get("obstacle_height_m", 2.0)),
         obstacle_buildup_coeff=float(
-            buildup.get(
-                "obstacle_coeff",
-                payload.get("pf_obstacle_buildup_coeff", 0.0),
-            )
+            buildup.get("obstacle_coeff", 0.0)
         ),
         source_extent_radius_m=max(
             float(

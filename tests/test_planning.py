@@ -17,10 +17,7 @@ from pf.state import IsotopeState
 from planning.pose_selection import (
     estimate_lambda_cost,
     minimum_observation_shortfall,
-    recommend_num_rollouts,
-    select_next_pose,
     select_next_pose_from_candidates,
-    select_next_pose_after_rotation,
 )
 from planning.dss_pp import (
     DSSPPConfig,
@@ -38,7 +35,7 @@ from planning.candidate_generation import (
     generate_candidate_poses,
     resolve_detector_height_actions,
 )
-from planning.shield_rotation import rotation_policy_step, select_best_orientation
+from planning.shield_rotation import select_best_orientation
 from planning.shield_rotation import select_separation_orientations
 from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
@@ -49,7 +46,7 @@ def test_fast_gpu_rollout_respects_disabled_gpu_override() -> None:
     """Fast rollout falls back instead of raising when planning disables GPU."""
     estimator = object.__new__(RotatingShieldPFEstimator)
     estimator.pf_config = RotatingShieldPFConfig(
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
         use_gpu=False,
         use_fast_gpu_rollout=True,
@@ -82,7 +79,7 @@ def _build_simple_estimator() -> RotatingShieldPFEstimator:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
         resample_threshold=0.5,
     )
@@ -192,7 +189,7 @@ def test_shield_selection_batch_grids_match_pairwise_scores() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
         use_gpu=False,
         planning_particles=None,
@@ -298,7 +295,7 @@ def test_multi_detector_all_pair_counts_match_serial_detector_calls() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
             max_sources=2,
-            birth_enable=False,
+            variable_cardinality=False,
             use_gpu=False,
             init_num_sources=(0, 0),
         ),
@@ -459,118 +456,6 @@ def test_planning_eig_decreases_with_declared_model_noise() -> None:
     )
 
     assert np.all(certain > uncertain)
-
-
-def test_orientation_information_gain_uses_predictive_model_variance() -> None:
-    """The analytic rotation surrogate should inherit the PF noise model."""
-    estimator = _build_simple_estimator()
-    filt = estimator.filters["Cs-137"]
-    filt.config.count_likelihood_model = "student_t"
-    filt.config.spectrum_count_abs_sigma = 0.0
-    certain = estimator.orientation_information_gain(
-        pose_idx=0,
-        orient_idx=0,
-        live_time_s=1.0,
-    )
-
-    filt.config.spectrum_count_abs_sigma = 100.0
-    uncertain = estimator.orientation_information_gain(
-        pose_idx=0,
-        orient_idx=0,
-        live_time_s=1.0,
-    )
-
-    assert certain > uncertain >= 0.0
-
-
-def test_rotation_policy_stops_when_information_low() -> None:
-    """rotation_policy_step should stop if IG is below the threshold."""
-    est = _build_simple_estimator()
-    # Zero out strengths to make IG ~ 0
-    filt = est.filters["Cs-137"]
-    for p in filt.continuous_particles:
-        p.state.strengths[:] = 0.0
-    should_stop, orient_idx, score = rotation_policy_step(
-        estimator=est, pose_idx=0, ig_threshold=1e-6, live_time_s=1.0
-    )
-    assert should_stop
-    assert orient_idx == -1
-    assert score == 0.0
-
-
-def test_select_next_pose_balances_information_and_cost() -> None:
-    """Pose selection should trade off uncertainty and motion cost (Eq. 3.51)."""
-
-    class DummyEstimator:
-        def __init__(self) -> None:
-            self.poses = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=float)
-
-        def expected_uncertainty(
-            self, pose_idx: int, live_time_s: float = 1.0
-        ) -> float:
-            return [2.0, 0.5][pose_idx]
-
-        def max_orientation_information_gain(
-            self, pose_idx: int, live_time_s: float = 1.0
-        ) -> float:
-            return [0.0, 0.4][pose_idx]
-
-    est = DummyEstimator()
-    next_idx = select_next_pose(
-        estimator=est,
-        candidate_pose_indices=np.array([0, 1], dtype=np.int64),
-        current_pose_idx=0,
-        criterion="uncertainty",
-        lambda_cost=0.1,
-        t_short_s=1.0,
-    )
-    assert next_idx == 1
-
-
-def test_select_next_pose_after_rotation_prefers_lower_score() -> None:
-    """After-rotation selection should pick the candidate with lower expected uncertainty."""
-
-    class DummyEstimator:
-        def __init__(self) -> None:
-            """Track calls for expected uncertainty evaluations."""
-            self.calls: list[np.ndarray] = []
-
-        def expected_uncertainty_after_rotation(
-            self,
-            pose_xyz: np.ndarray,
-            live_time_per_rot_s: float,
-            tau_ig: float,
-            tmax_s: float,
-            n_rollouts: int,
-            orient_selection: str = "IG",
-            return_debug: bool = False,
-        ) -> float:
-            """Return a deterministic score based on pose norm."""
-            self.calls.append(np.asarray(pose_xyz, dtype=float))
-            return float(np.linalg.norm(pose_xyz))
-
-    est = DummyEstimator()
-    current_pose = np.array([5.0, 5.0, 5.0], dtype=float)
-    visited = np.array([[5.0, 5.0, 5.0]], dtype=float)
-    candidates = generate_candidate_poses(
-        current_pose_xyz=current_pose,
-        n_candidates=4,
-        strategy="ring",
-        visited_poses_xyz=visited,
-    )
-    expected_scores = [np.linalg.norm(pose) for pose in candidates]
-    expected_pose = candidates[int(np.argmin(expected_scores))]
-    selected = select_next_pose_after_rotation(
-        estimator=est,
-        current_pose_xyz=current_pose,
-        visited_poses_xyz=visited,
-        n_candidates=4,
-        n_rollouts=0,
-        candidate_strategy="ring",
-    )
-    assert selected.shape == (3,)
-    assert np.allclose(selected, expected_pose)
-    assert len(est.calls) == candidates.shape[0]
 
 
 def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
@@ -1338,7 +1223,6 @@ def test_pose_selection_uses_planning_particle_cap_for_observability() -> None:
         lambda_cost = 0.0
         ig_threshold = 0.0
         max_dwell_time_s = 2.0
-        short_time_s = 1.0
         planning_rollout_particles = 7
         planning_particles = None
 
@@ -1389,7 +1273,6 @@ def test_pose_selection_parallel_matches_serial_selection() -> None:
         lambda_cost = 0.0
         ig_threshold = 0.0
         max_dwell_time_s = 2.0
-        short_time_s = 1.0
         planning_rollout_particles = None
         planning_particles = None
         use_gpu = False
@@ -1447,7 +1330,6 @@ def test_pose_selection_gpu_override_allows_parallel_candidate_workers(
         lambda_cost = 0.0
         ig_threshold = 0.0
         max_dwell_time_s = 2.0
-        short_time_s = 1.0
         planning_rollout_particles = None
         planning_particles = None
         use_gpu = True
@@ -1499,48 +1381,6 @@ def test_pose_selection_gpu_override_allows_parallel_candidate_workers(
     assert estimator.pf_config.use_gpu is True
 
 
-def test_recommend_num_rollouts_selects_minimum_stable_value() -> None:
-    """recommend_num_rollouts should pick the smallest rollout meeting the target SE."""
-    samples = {
-        1: [6.0, 14.0, 8.0, 12.0],
-        2: [9.0, 11.0, 10.0, 10.0],
-        4: [9.6, 10.4, 9.8, 10.2],
-        8: [9.9, 10.1, 9.95, 10.05],
-    }
-
-    def eval_fn(n_rollouts: int, seed: int) -> float:
-        values = samples[int(n_rollouts)]
-        idx = int(seed) % len(values)
-        return float(values[idx])
-
-    recommended = recommend_num_rollouts(
-        candidate_rollouts=(1, 2, 4, 8),
-        trials=4,
-        rel_se_target=0.015,
-        rng_seed=0,
-        eval_fn=eval_fn,
-    )
-    assert recommended == 8
-
-
-def test_select_next_pose_after_rotation_runs_with_estimator() -> None:
-    """After-rotation selection should run with the real estimator."""
-    est = _build_simple_estimator()
-    est.pf_config.eig_num_samples = 0
-    current_pose = np.array([5.0, 5.0, 5.0], dtype=float)
-    visited = np.array([[5.0, 5.0, 5.0]], dtype=float)
-    selected = select_next_pose_after_rotation(
-        estimator=est,
-        current_pose_xyz=current_pose,
-        visited_poses_xyz=visited,
-        n_candidates=1,
-        n_rollouts=0,
-        candidate_strategy="ring",
-    )
-    assert isinstance(selected, np.ndarray)
-    assert selected.shape == (3,)
-
-
 def test_orientation_expected_information_gain_positive_when_strengths_differ() -> None:
     """Monte-Carlo EIG (Eq. 3.44) should be positive when particles predict different Λ."""
     np.random.seed(0)
@@ -1551,7 +1391,7 @@ def test_orientation_expected_information_gain_positive_when_strengths_differ() 
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         init_num_sources=(1, 1),
     )
     est = RotatingShieldPFEstimator(
@@ -1621,14 +1461,6 @@ def test_planning_rollouts_do_not_advance_or_reseed_pf_numpy_stream() -> None:
         tmax_s=1.0,
         n_rollouts=0,
     )
-    est.expected_uncertainty_after_rotation_at_pose(
-        np.array([0.0, 0.0, 0.0]),
-        tau_ig=1e9,
-        t_max_s=1.0,
-        t_short_s=1.0,
-        num_rollouts=0,
-        rng_seed=91,
-    )
     after = np.random.get_state()
 
     assert before[0] == after[0]
@@ -1664,136 +1496,6 @@ def test_expected_uncertainty_after_rotation_one_step() -> None:
     )
     assert isinstance(u_after, float)
     assert debug["rollouts"][0]["num_rotations"] == 1
-
-
-def test_short_time_update_uses_default_duration() -> None:
-    """short_time_update should use pf_config.short_time_s when live_time_s is omitted."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(
-        num_particles=10,
-        max_sources=1,
-        birth_enable=False,
-        init_num_sources=(1, 1),
-        short_time_s=0.25,
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=normals,
-        mu_by_isotope=mu,
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    mats = generate_octant_rotation_matrices()
-    z_k = {"Cs-137": 5.0}
-    est.short_time_update(
-        z_k=z_k, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=None
-    )
-    import pytest
-
-    assert est.measurements[-1].live_time_s == pytest.approx(0.25, rel=1e-12)
-    assert est.measurements[-1].fe_index == 0
-    assert est.measurements[-1].pb_index == 0
-
-
-def test_should_stop_shield_rotation_by_dwell_time() -> None:
-    """Rotation should stop when dwell time exceeds max_dwell_time_s (Eq. 3.49)."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(
-        num_particles=5,
-        max_sources=1,
-        birth_enable=False,
-        init_num_sources=(1, 1),
-        max_dwell_time_s=0.5,
-        ig_threshold=1e6,
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=normals,
-        mu_by_isotope=mu,
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    mats = generate_octant_rotation_matrices()
-    # Two short updates totaling > max_dwell_time_s
-    est.short_time_update(
-        z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3
-    )
-    est.short_time_update(
-        z_k={"Cs-137": 1.0}, pose_idx=0, RFe=mats[0], RPb=mats[0], live_time_s=0.3
-    )
-    assert est.should_stop_shield_rotation(
-        pose_idx=0,
-        ig_threshold=config.ig_threshold,
-        change_tol=1e6,
-        uncertainty_tol=1e6,
-        live_time_s=config.short_time_s,
-    )
-
-
-def test_expected_uncertainty_after_pose_is_finite() -> None:
-    """Expected uncertainty surrogate should return a finite positive value."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(
-        num_particles=5,
-        max_sources=1,
-        birth_enable=False,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=normals,
-        mu_by_isotope=mu,
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    # Setup simple continuous particles with two different strengths
-    filt = est.filters["Cs-137"]
-    from pf.particle_filter import IsotopeParticle
-    from pf.state import IsotopeState
-
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([2.0]),
-                background=0.1,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([5.0]),
-                background=0.1,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-    U = est.expected_uncertainty_after_pose(
-        pose_idx=0, orient_idx=0, live_time_s=1.0, num_samples=10
-    )
-    assert np.isfinite(U)
-    assert U >= 0.0
 
 
 def test_dss_pp_program_library_contains_differential_primitives() -> None:
@@ -1954,71 +1656,6 @@ def test_dss_pp_has_no_external_or_tentative_mode_boundary() -> None:
     assert not hasattr(dss_pp, "_preserve_external_modes")
 
 
-def test_recovery_isotope_mode_weights_boost_target_isotope_only() -> None:
-    """DSS-PP recovery mode should prioritize only unresolved isotopes."""
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
-                strength_cps_1m=100.0,
-                weight=0.5,
-                spread_m=0.1,
-            )
-        ],
-        "Co-60": [
-            dss_pp.SignatureMode(
-                isotope="Co-60",
-                position_xyz=np.array([1.0, 0.0, 0.0], dtype=float),
-                strength_cps_1m=100.0,
-                weight=0.5,
-                spread_m=0.1,
-            )
-        ],
-    }
-
-    boosted = dss_pp._apply_recovery_isotope_mode_weights(
-        modes,
-        dss_pp.DSSPPConfig(
-            recovery_isotopes=("Cs-137",),
-            recovery_isotope_mode_weight_multiplier=3.0,
-        ),
-    )
-
-    assert boosted["Cs-137"][0].weight == pytest.approx(1.5)
-    assert boosted["Co-60"][0].weight == pytest.approx(0.5)
-
-
-def test_signature_mode_weight_cap_keeps_weak_modes_visible() -> None:
-    """Planner-only mode weights should cap dominant modes without moving them."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=100.0,
-            spread_m=0.1,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([5.0, 0.0, 0.0], dtype=float),
-            strength_cps_1m=100.0,
-            weight=1.0,
-            spread_m=0.1,
-        ),
-    ]
-
-    rebalanced = dss_pp._rebalance_signature_mode_weights(
-        modes,
-        weak_floor=0.2,
-        dominant_cap=0.7,
-    )
-
-    assert max(mode.weight for mode in rebalanced) <= 0.700001
-    assert min(mode.weight for mode in rebalanced) >= 0.199999
-    assert np.allclose(rebalanced[0].position_xyz, modes[0].position_xyz)
-
-
 def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
     """Temporal separation should add a pose-specific pairwise cover program."""
     isotopes = ["Cs-137"]
@@ -2028,7 +1665,7 @@ def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2096,7 +1733,7 @@ def test_dss_pp_batched_program_scores_match_scalar_oracle() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2217,7 +1854,7 @@ def test_dss_pp_pair_signature_cache_uses_pair_response_scales() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2316,7 +1953,7 @@ def test_dss_pp_station_response_uses_transport_kernel_and_pair_scales() -> None
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2426,7 +2063,7 @@ def test_dss_pp_station_response_uses_obstacle_attenuation_kernel() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2513,7 +2150,7 @@ def test_dss_pp_batched_pairwise_cover_matches_scalar_oracle() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2592,7 +2229,7 @@ def test_select_separation_orientations_returns_fe_pb_pairs() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=2,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -2629,7 +2266,7 @@ def test_select_best_orientation_preselect_supports_cpu_config() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
         preselect_orientations=True,
@@ -2674,7 +2311,7 @@ def test_shield_rotation_gpu_surrogate_maps_reordered_candidates_to_octants() ->
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
         ),
@@ -2781,12 +2418,15 @@ def test_shield_rotation_gpu_eig_maps_reordered_candidates_to_octants() -> None:
     estimator = SimpleNamespace(
         poses=[np.array([2.0, 1.0, 0.5], dtype=float)],
         pf_config=RotatingShieldPFConfig(
-            birth_enable=False,
+            variable_cardinality=False,
             init_num_sources=(1, 1),
             eig_num_samples=0,
         ),
         continuous_kernel=lambda: RecordingKernel(),
         response_scale_for_isotope=lambda isotope, fe_index, pb_index: 1.0,
+        count_likelihood_spec_for_isotope=lambda isotope: CountLikelihoodSpec(
+            model="poisson"
+        ),
     )
 
     shield_rotation._eig_scores_gpu(
@@ -2816,7 +2456,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2899,7 +2539,7 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2956,14 +2596,11 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
             lambda_rotation=0.0,
             augment_candidates=False,
         ),
-        height_partner_forced_program_pair_ids=(0,),
     )
 
     assert result.shield_program.pair_ids == forced_pairs
     assert result.shield_program.kind == "forced_baseline"
     assert result.diagnostics["program_count"] == 1
-    assert result.diagnostics["height_partner_forced_program_requested"] is True
-    assert result.diagnostics["height_partner_forced_program_applied"] is False
     assert {tuple(node["pair_ids"]) for node in result.diagnostics["ranked_nodes"]} == {
         forced_pairs
     }
@@ -2971,53 +2608,6 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     assert pair_diag["mode_count"] == 2
     assert pair_diag["program_measurements"] == len(result.shield_program.pair_ids)
     assert pair_diag["bottleneck_pairs"]
-
-
-def _build_height_partner_program_test_estimator() -> RotatingShieldPFEstimator:
-    """Build a two-mode estimator for height-partner program ranking tests."""
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array(
-            [[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]],
-            dtype=float,
-        ),
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        birth_enable=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-        ),
-        shield_params=ShieldParams(),
-    )
-    estimator.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    estimator._ensure_kernel_cache()
-    estimator.filters["Cs-137"].continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-    return estimator
 
 
 def test_joint_program_eig_uses_program_views_and_pf_likelihood() -> None:
@@ -3758,171 +3348,7 @@ def test_joint_program_eig_broadcasts_truth_transport_covariance(
     np.testing.assert_allclose(supplied[..., 1], expected_supplied)
 
 
-def test_height_optimized_twin_does_not_scale_first_action_penalty() -> None:
-    """A non-executable height twin must not affect first-action normalization."""
-
-    def _node(
-        pose_index: int,
-        pose_xyz: np.ndarray,
-        program_kind: str,
-        static_score: float,
-        observation_penalty: float,
-    ) -> dss_pp.DSSPPNode:
-        """Build one compact DSS node for observation-policy testing."""
-        return dss_pp.DSSPPNode(
-            pose_index=pose_index,
-            pose_xyz=pose_xyz,
-            program=dss_pp.ShieldProgram(program_kind, (0,), program_kind),
-            score=static_score,
-            static_score=static_score,
-            distance_weight=0.0,
-            observation_penalty_weight=0.0,
-            information_gain=0.0,
-            signature_score=0.0,
-            temporal_separation_score=0.0,
-            observation_penalty=observation_penalty,
-            count_balance_penalty=0.0,
-            differential_penalty=0.0,
-            dose_score=0.0,
-            count_utility=0.0,
-            coverage_gain=0.0,
-            revisit_penalty=0.0,
-            bearing_diversity_gain=0.0,
-            frontier_gain=0.0,
-            turn_penalty=0.0,
-            local_orbit_gain=0.0,
-            station_condition_gain=0.0,
-            correlation_reduction_gain=0.0,
-            isotope_balance_gain=0.0,
-            environment_signature_score=0.0,
-            occlusion_boundary_gain=0.0,
-            elevation_signature_score=0.0,
-            elevation_condition_gain=0.0,
-            vertical_environment_signature_score=0.0,
-        )
-
-    current = np.array([1.0, 1.0, 0.5], dtype=float)
-    height = np.array([1.0, 1.0, 1.5], dtype=float)
-    normal = np.array([4.0, 1.0, 0.5], dtype=float)
-    forced = _node(0, height, "forced_height_partner", 1.0, 0.25)
-    optimized_twin = _node(0, height, "optimized", 1.0e6, 1.0)
-    normal_node = _node(1, normal, "optimized", 0.0, 0.75)
-    first_nodes, _ = dss_pp._split_height_partner_first_action_nodes(
-        [forced, optimized_twin, normal_node],
-        visited_poses_xyz=current.reshape(1, 3),
-        current_pose_xyz=current,
-        enabled=True,
-    )
-    estimator = SimpleNamespace(normals=np.array([[1.0, 0.0, 0.0]]))
-    config = DSSPPConfig(
-        eta_observation=1.0,
-        enforce_min_observation=False,
-        lambda_distance=0.0,
-        lambda_rotation=0.0,
-        lambda_time=0.0,
-    )
-
-    rescored = dss_pp._apply_node_observation_policy(
-        first_nodes,
-        current_pose_xyz=current,
-        current_pair_id=None,
-        estimator=estimator,
-        map_api=None,
-        config=config,
-    )
-    expected = dss_pp._apply_node_observation_policy(
-        [forced, normal_node],
-        current_pose_xyz=current,
-        current_pair_id=None,
-        estimator=estimator,
-        map_api=None,
-        config=config,
-    )
-
-    assert {node.program.kind for node in first_nodes} == {
-        "forced_height_partner",
-        "optimized",
-    }
-    assert [node.score for node in rescored] == pytest.approx(
-        [node.score for node in expected]
-    )
-    assert [node.observation_penalty_weight for node in rescored] == pytest.approx(
-        [node.observation_penalty_weight for node in expected]
-    )
-
-
-@pytest.mark.parametrize("worker_count", [1, 2])
-def test_dss_pp_scores_forced_height_partner_program_before_ranking(
-    worker_count: int,
-) -> None:
-    """Height-pair reuse must alter planner ranking before action selection."""
-    estimator = _build_height_partner_program_test_estimator()
-    visited = np.array([[2.0, 2.0, 0.5]], dtype=float)
-    candidates = np.array(
-        [[2.0, 2.0, 1.5], [2.0, 6.0, 0.5]],
-        dtype=float,
-    )
-    config = DSSPPConfig(
-        horizon=2,
-        beam_width=4,
-        max_programs=8,
-        program_length=4,
-        temporal_cover_programs=1,
-        live_time_s=1.0,
-        lambda_eig=1.0,
-        lambda_signature=1.0,
-        lambda_distance=0.0,
-        eta_observation=1.0,
-        eta_differential=0.0,
-        lambda_rotation=0.0,
-        augment_candidates=False,
-        candidate_preselect_enable=False,
-        same_isotope_direct_separation_guard=False,
-        program_eval_workers=worker_count,
-        diagnostic_ranked_node_limit=100,
-    )
-
-    unrestricted = select_dss_pp_next_station(
-        estimator=estimator,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=visited[0],
-        visited_poses_xyz=visited,
-        config=config,
-    )
-    forced_pairs = (63, 63, 63, 63)
-    constrained = select_dss_pp_next_station(
-        estimator=estimator,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=visited[0],
-        visited_poses_xyz=visited,
-        config=config,
-        height_partner_forced_program_pair_ids=forced_pairs,
-    )
-
-    assert np.allclose(unrestricted.next_pose, candidates[0])
-    assert np.allclose(constrained.next_pose, candidates[1])
-    height_nodes = [
-        node
-        for node in constrained.diagnostics["ranked_nodes"]
-        if np.allclose(node["pose_xyz"], candidates[0])
-    ]
-    normal_nodes = [
-        node
-        for node in constrained.diagnostics["ranked_nodes"]
-        if np.allclose(node["pose_xyz"], candidates[1])
-    ]
-    assert {tuple(node["pair_ids"]) for node in height_nodes} == {forced_pairs}
-    assert {node["program_kind"] for node in height_nodes} == {"forced_height_partner"}
-    assert normal_nodes
-    assert all(node["program_kind"] != "forced_height_partner" for node in normal_nodes)
-    assert constrained.diagnostics["height_partner_forced_candidate_count"] == 1
-    assert constrained.diagnostics["height_partner_forced_node_count"] == 1
-    assert constrained.diagnostics["height_partner_forced_program_applied"] is True
-    assert len(constrained.sequence) == 2
-    assert constrained.sequence[1].program.kind != "forced_height_partner"
-
-
-def test_height_partner_program_is_not_forced_for_visited_exact_action() -> None:
+def test_height_partner_mask_excludes_visited_exact_action() -> None:
     """A previously sampled height must not qualify via another sampled height."""
     candidates = np.array(
         [[2.0, 2.0, 0.5], [2.0, 2.0, 1.5], [2.0, 2.0, 2.5]],
@@ -3947,7 +3373,7 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -4172,92 +3598,6 @@ def test_dss_pp_remaining_budget_guidance_avoids_backtracking() -> None:
     assert result.diagnostics["remaining_route_pressure"] > 0.0
 
 
-def test_dss_pp_filters_zero_separation_nodes_for_multimode_sources() -> None:
-    """Multi-source planning should not choose zero-signature nodes when avoidable."""
-    program = dss_pp.ShieldProgram(name="p", pair_ids=(0,), kind="test")
-
-    def node(
-        index: int,
-        temporal: float,
-        *,
-        environment: float = 0.0,
-    ) -> dss_pp.DSSPPNode:
-        """Build a minimal DSS-PP node for separation filtering tests."""
-        return dss_pp.DSSPPNode(
-            pose_index=index,
-            pose_xyz=np.array([float(index), 0.0, 0.5], dtype=float),
-            program=program,
-            score=float(index),
-            static_score=float(index),
-            distance_weight=0.0,
-            observation_penalty_weight=0.0,
-            information_gain=0.0,
-            signature_score=0.0,
-            temporal_separation_score=float(temporal),
-            elevation_signature_score=0.0,
-            observation_penalty=0.0,
-            count_balance_penalty=0.0,
-            differential_penalty=0.0,
-            dose_score=0.0,
-            count_utility=1.0,
-            coverage_gain=0.0,
-            revisit_penalty=0.0,
-            bearing_diversity_gain=0.0,
-            frontier_gain=0.0,
-            turn_penalty=0.0,
-            local_orbit_gain=0.0,
-            station_condition_gain=0.0,
-            correlation_reduction_gain=0.0,
-            isotope_balance_gain=0.0,
-            environment_signature_score=float(environment),
-            occlusion_boundary_gain=0.0,
-            elevation_condition_gain=0.0,
-            vertical_environment_signature_score=0.0,
-        )
-
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-        ]
-    }
-
-    filtered = dss_pp._filter_nodes_for_multimode_separation(
-        [node(0, 0.0), node(1, 0.25), node(2, 0.0, environment=10.0)],
-        modes,
-    )
-
-    assert [item.pose_index for item in filtered] == [1]
-
-    fallback = dss_pp._filter_nodes_for_multimode_separation(
-        [node(0, 0.0), node(2, 0.0, environment=10.0)],
-        modes,
-    )
-
-    assert [item.pose_index for item in fallback] == [2]
-
-    single_mode = {"Cs-137": modes["Cs-137"][:1]}
-    unresolved_filtered = dss_pp._filter_nodes_for_multimode_separation(
-        [node(0, 0.0), node(1, 0.25), node(2, 0.0, environment=10.0)],
-        single_mode,
-        unresolved_evidence=True,
-    )
-
-    assert [item.pose_index for item in unresolved_filtered] == [1]
-
-
 def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:
     """DSS-PP should prefer stations where known obstacles separate modes."""
     isotopes = ["Cs-137"]
@@ -4277,7 +3617,7 @@ def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -4411,115 +3751,6 @@ def test_dss_pp_elevation_signature_scores_vertical_mode_pairs() -> None:
     assert scores[1] == 0.0
 
 
-def test_dss_pp_temporal_score_prioritizes_high_surface_pairs() -> None:
-    """High-surface mode pairs should receive extra temporal-separation focus."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([1.0, 1.0, 10.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.25,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([4.0, 1.0, 10.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.25,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([1.0, 1.0, 0.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.5,
-            spread_m=0.2,
-        ),
-    ]
-    raw = np.array(
-        [
-            [
-                [20.0, 2.0, 12.0],
-                [2.0, 20.0, 12.0],
-            ],
-        ],
-        dtype=float,
-    )
-    base_config = DSSPPConfig(
-        temporal_pair_contrast_threshold=2.0,
-        temporal_logdet_weight=0.0,
-        temporal_decorrelation_weight=0.0,
-    )
-    boosted_config = DSSPPConfig(
-        temporal_pair_contrast_threshold=2.0,
-        temporal_logdet_weight=0.0,
-        temporal_decorrelation_weight=0.0,
-        high_surface_pair_boost=4.0,
-        high_surface_z_fraction=0.75,
-    )
-    priority = dss_pp._high_surface_pair_priority_weights(
-        modes,
-        config=boosted_config,
-        room_z_m=10.0,
-    )
-
-    base = dss_pp._batched_temporal_separation_scores(
-        raw,
-        np.array([0.25, 0.25, 0.5], dtype=float),
-        config=base_config,
-    )
-    boosted = dss_pp._batched_temporal_separation_scores(
-        raw,
-        np.array([0.25, 0.25, 0.5], dtype=float),
-        config=boosted_config,
-        pair_priority_weights=priority,
-    )
-
-    assert boosted[0] > base[0]
-
-
-def test_high_surface_pair_priority_boosts_ceiling_wall_ambiguity() -> None:
-    """Ceiling-vs-high-wall mode pairs should get the strongest priority."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([1.0, 1.0, 10.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.25,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([1.0, 1.0, 8.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.25,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([1.0, 1.0, 0.0], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.5,
-            spread_m=0.2,
-        ),
-    ]
-    config = DSSPPConfig(
-        high_surface_pair_boost=2.0,
-        high_surface_cross_stratum_boost=3.0,
-        high_surface_z_fraction=0.75,
-    )
-
-    priority = dss_pp._high_surface_pair_priority_weights(
-        modes,
-        config=config,
-        room_z_m=10.0,
-    )
-
-    assert priority[0] == pytest.approx(6.0)
-    assert priority[0] > priority[1]
-    assert priority[0] > priority[2]
-
-
 def test_dss_pp_elevation_condition_prefers_elevation_separating_view() -> None:
     """Candidate views with different elevation angles should score higher."""
     modes = {
@@ -4586,7 +3817,7 @@ def test_dss_pp_batched_environment_features_match_scalar_oracle() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
             max_sources=1,
-            birth_enable=False,
+            variable_cardinality=False,
             use_gpu=False,
             planning_particles=None,
             init_num_sources=(1, 1),
@@ -5001,7 +4232,7 @@ def test_dss_pp_enforces_all_isotope_observability_when_feasible() -> None:
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5069,7 +4300,7 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5237,10 +4468,10 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
-        observation_count_variance_includes_counting_noise=True,
+        observation_count_variance_semantics="counting_noise_inclusive",
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
@@ -5322,38 +4553,8 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
     assert result.diagnostics["planning_eig_joint_program_views"] is True
     assert result.diagnostics["planning_eig_likelihood_models"] == {"Cs-137": "poisson"}
     assert result.diagnostics[
-        "planning_eig_observation_variance_includes_counting_noise"
-    ] == {"Cs-137": True}
-
-
-def test_candidate_information_gain_uses_cached_current_uncertainty() -> None:
-    """Candidate EIG should reuse station-level current uncertainty when present."""
-    calls = {"global_uncertainty": 0}
-
-    class DummyEstimator:
-        """Minimal estimator facade for candidate EIG cache behavior."""
-
-        _dss_pp_current_uncertainty_cache = 9.0
-        pf_config = SimpleNamespace(ig_threshold=0.0)
-
-        def global_uncertainty(self) -> float:
-            """Record unexpected uncached uncertainty requests."""
-            calls["global_uncertainty"] += 1
-            return 100.0
-
-        def expected_uncertainty_after_rotation(self, **_kwargs: object) -> float:
-            """Return deterministic posterior uncertainty."""
-            return 4.0
-
-    value = dss_pp._candidate_information_gain(
-        DummyEstimator(),
-        np.array([0.0, 0.0, 0.5], dtype=float),
-        config=DSSPPConfig(lambda_eig=1.0, live_time_s=1.0, program_length=1),
-        rng_seed=7,
-    )
-
-    assert calls["global_uncertainty"] == 0
-    assert value == pytest.approx(np.log1p(9.0) - np.log1p(4.0))
+        "planning_eig_observation_count_variance_semantics"
+    ] == {"Cs-137": "counting_noise_inclusive"}
 
 
 def test_dss_pp_preselects_candidates_before_program_scoring(
@@ -5367,7 +4568,7 @@ def test_dss_pp_preselects_candidates_before_program_scoring(
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5703,7 +4904,7 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
-        birth_enable=False,
+        variable_cardinality=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
