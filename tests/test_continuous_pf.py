@@ -33,7 +33,6 @@ from pf.particle_filter import (
     IsotopeParticleFilter,
     PFConfig,
     IsotopeParticle,
-    MeasurementData,
 )
 from pf.state import IsotopeState
 
@@ -914,7 +913,12 @@ def test_estimator_exposes_transport_response_model_to_planner_kernel() -> None:
         candidate_sources=np.array([[1.0, 1.0, 1.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={"Cs-137": {"fe": 0.01, "pb": 0.02}},
-        pf_config=RotatingShieldPFConfig(num_particles=4, use_gpu=False),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=4,
+            birth_enable=False,
+            init_num_sources=(0, 0),
+            use_gpu=False,
+        ),
         transport_response_model=transport_model,
     )
     estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0], dtype=float))
@@ -936,7 +940,6 @@ def test_runtime_expected_counts_use_shared_kernel_component() -> None:
         "src/measurement/continuous_kernels.py",
         "src/pf/particle_filter.py",
         "src/pf/estimator.py",
-        "src/pf/parallel.py",
         "src/planning/dss_pp.py",
         "src/planning/remaining_measurements.py",
         "src/planning/shield_rotation.py",
@@ -1015,7 +1018,11 @@ def test_shield_attenuation_factor_both_materials() -> None:
 
 def test_poisson_weight_update_prefers_higher_lambda() -> None:
     """Weight update should favor particle with higher expected Λ for given z."""
-    cfg = PFConfig(num_particles=2)
+    cfg = PFConfig(
+        num_particles=2,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
@@ -1052,6 +1059,8 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
         spectrum_count_rel_sigma=0.1,
         spectrum_count_abs_sigma=2.0,
@@ -1111,7 +1120,12 @@ def test_sequence_covariance_likelihood_matches_numpy_oracle() -> None:
 def test_spectral_bin_sequence_likelihood_matches_poisson_oracle() -> None:
     """Direct PF spectrum-bin likelihood should match a batched Poisson oracle."""
     torch = pytest.importorskip("torch")
-    cfg = PFConfig(num_particles=2, count_likelihood_model="poisson")
+    cfg = PFConfig(
+        num_particles=2,
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        count_likelihood_model="poisson",
+    )
     filt = IsotopeParticleFilter(isotope="Cs-137", kernel=None, config=cfg)
     expected = np.asarray(
         [
@@ -1143,6 +1157,8 @@ def test_pair_sequence_update_uses_spectrum_bin_likelihood(
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="poisson",
         use_gpu=True,
         use_tempering=False,
@@ -1201,7 +1217,6 @@ def test_pair_sequence_update_uses_spectrum_bin_likelihood(
         fake_counts,
     )
     monkeypatch.setattr(filt, "_maybe_resample_continuous", noop)
-    monkeypatch.setattr(filt, "align_continuous_labels", noop)
     monkeypatch.setattr(filt, "_advance_adapt_cooldown", noop)
     monkeypatch.setattr(filt, "adapt_num_particles", noop_adapt_num_particles)
     monkeypatch.setattr(
@@ -1229,6 +1244,8 @@ def test_spectral_bin_chunked_likelihood_matches_full_tensor() -> None:
     """Chunked spectrum-bin likelihood should match the full KxBxN oracle."""
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="student_t",
         spectrum_count_rel_sigma=0.05,
         spectrum_count_abs_sigma=1.0,
@@ -1268,94 +1285,6 @@ def test_spectral_bin_chunked_likelihood_matches_full_tensor() -> None:
     assert torch.allclose(chunked, full, rtol=1.0e-12, atol=1.0e-12)
 
 
-def test_deferred_pair_update_allows_scaled_roughening() -> None:
-    """Deferred station updates should resample with small roughening, not freeze positions."""
-    cfg = PFConfig(
-        num_particles=2,
-        use_tempering=True,
-        deferred_resample_roughening_scale=0.15,
-    )
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
-    dummy_kernel.num_sources = 1
-    pf = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
-    captured: dict[str, float | bool] = {}
-
-    def fake_tempered_update(
-        *,
-        lam_fn,
-        z_obs,
-        observation_count_variance=0.0,
-        disable_regularize_on_resample=None,
-        roughening_scale_on_resample=1.0,
-    ):
-        """Capture resampling options passed by the deferred update path."""
-        captured["disable_regularize"] = bool(disable_regularize_on_resample)
-        captured["roughening_scale"] = float(roughening_scale_on_resample)
-        return 1.0, True
-
-    pf._tempered_update = fake_tempered_update
-    pf.update_continuous_pair(
-        z_obs=1.0,
-        pose_idx=0,
-        fe_index=0,
-        pb_index=0,
-        live_time_s=1.0,
-        defer_resample=True,
-    )
-
-    assert captured["disable_regularize"] is False
-    assert captured["roughening_scale"] == 0.15
-
-
-def test_surface_position_prior_initializes_and_roughens_on_surfaces() -> None:
-    """Surface source prior should keep PF particles on known source surfaces."""
-    env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(2, 2),
-        blocked_cells=((1, 1),),
-    )
-    cfg = PFConfig(
-        num_particles=4,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-        init_grid_spacing_m=1.0,
-        init_grid_repeats=1,
-        position_min=(0.0, 0.0, 0.0),
-        position_max=(env.size_x, env.size_y, env.size_z),
-        source_position_prior="surface",
-    )
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
-    dummy_kernel.num_sources = 1
-
-    pf = IsotopeParticleFilter(
-        isotope="Cs-137",
-        kernel=dummy_kernel,
-        config=cfg,
-        obstacle_grid=grid,
-        obstacle_height_m=1.0,
-    )
-    pf.regularize_continuous(
-        sigma_pos=np.array([0.2, 0.2, 0.2]),
-        strength_log_sigma=0.0,
-    )
-
-    assert pf.continuous_particles
-    for particle in pf.continuous_particles:
-        for position in particle.state.positions:
-            assert is_allowed_source_surface_position(
-                position,
-                env,
-                grid,
-                obstacle_height_m=1.0,
-            )
-
-
 def test_surface_position_prior_projects_posterior_point_estimates() -> None:
     """PF point summaries should remain inside the surface-constrained state space."""
     env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
@@ -1363,11 +1292,10 @@ def test_surface_position_prior_projects_posterior_point_estimates() -> None:
         num_particles=3,
         use_gpu=False,
         init_num_sources=(1, 1),
+        birth_enable=False,
         position_min=(0.0, 0.0, 0.0),
         position_max=(env.size_x, env.size_y, env.size_z),
         source_position_prior="surface",
-        cluster_eps_m=3.0,
-        cluster_min_samples=1,
     )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([1.0, 1.0, 1.0])]
@@ -1396,10 +1324,9 @@ def test_surface_position_prior_projects_posterior_point_estimates() -> None:
         for position in particle_positions
     ]
 
-    mean_positions, _ = pf.estimate()
-    clustered_positions, _ = pf.estimate_clustered()
+    posterior_positions, _ = pf.estimate()
 
-    for position in np.vstack([mean_positions, clustered_positions]):
+    for position in posterior_positions:
         assert is_allowed_source_surface_position(position, env)
 
 
@@ -1481,6 +1408,8 @@ def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
     """The batched NumPy likelihood path should normalize model aliases."""
     cfg = PFConfig(
         num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="normal",
         transport_model_rel_sigma=0.15,
         spectrum_count_abs_sigma=2.0,
@@ -1527,7 +1456,12 @@ def test_matrix_count_likelihood_normal_alias_matches_scalar_gaussian() -> None:
 
 def test_matrix_count_likelihood_rejects_unknown_model() -> None:
     """The batched likelihood path should not silently reinterpret bad models."""
-    cfg = PFConfig(num_particles=1, count_likelihood_model="not_a_model")
+    cfg = PFConfig(
+        num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        count_likelihood_model="not_a_model",
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
@@ -1543,7 +1477,12 @@ def test_matrix_count_likelihood_rejects_unknown_model() -> None:
 
 def test_matrix_count_likelihood_scalar_variance_broadcasts() -> None:
     """Scalar unfolding variance should apply to every batched measurement."""
-    cfg = PFConfig(num_particles=1, count_likelihood_model="gaussian")
+    cfg = PFConfig(
+        num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        count_likelihood_model="gaussian",
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
@@ -1575,7 +1514,12 @@ def test_matrix_count_likelihood_scalar_variance_broadcasts() -> None:
 
 def test_matrix_count_likelihood_rejects_mismatched_variance() -> None:
     """Batched likelihoods should reject ambiguous observation variance shapes."""
-    cfg = PFConfig(num_particles=1, count_likelihood_model="gaussian")
+    cfg = PFConfig(
+        num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        count_likelihood_model="gaussian",
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
@@ -1595,6 +1539,8 @@ def test_count_likelihood_aliases_are_consistent_across_gpu_increment() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="normal",
         transport_model_rel_sigma=0.2,
         spectrum_count_abs_sigma=1.5,
@@ -1640,6 +1586,8 @@ def test_pf_counting_noise_flag_matches_shared_numpy_and_torch() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model="gaussian",
         observation_count_variance_includes_counting_noise=True,
     )
@@ -1691,6 +1639,8 @@ def test_sequence_gpu_likelihood_matches_scalar_sum(model: str) -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         count_likelihood_model=model,
         transport_model_rel_sigma=0.1,
         transport_model_abs_sigma=0.5,
@@ -1734,6 +1684,8 @@ def test_shield_contrast_likelihood_matches_numpy_signature_oracle() -> None:
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=1,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         shield_contrast_likelihood_enable=True,
         shield_contrast_likelihood_weight=1.0,
         shield_contrast_log_sigma_floor=0.5,
@@ -1803,6 +1755,8 @@ def test_shield_view_ratio_likelihood_matches_dirichlet_multinomial_oracle() -> 
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
+        birth_enable=False,
+        init_num_sources=(0, 0),
         shield_contrast_likelihood_enable=False,
         shield_view_ratio_likelihood_enable=True,
         shield_view_ratio_likelihood_weight=0.7,
@@ -1856,6 +1810,8 @@ def test_spectrum_sequence_update_keeps_shield_view_ratio_term(
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=2,
+        birth_enable=False,
+        init_num_sources=(1, 1),
         use_tempering=True,
         shield_contrast_likelihood_enable=False,
         shield_view_ratio_likelihood_enable=True,
@@ -1945,7 +1901,6 @@ def test_spectrum_sequence_update_keeps_shield_view_ratio_term(
         fake_tempered_update_likelihood,
     )
     monkeypatch.setattr(filt, "adapt_num_particles", lambda **_kwargs: None)
-    monkeypatch.setattr(filt, "align_continuous_labels", lambda: None)
     monkeypatch.setattr(filt, "_advance_adapt_cooldown", lambda: None)
     monkeypatch.setattr(filt, "_maybe_update_convergence", lambda **_kwargs: None)
 
@@ -1971,7 +1926,13 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
 ) -> None:
     """Joint shield-program updates should call the batched sequence path once."""
     torch = pytest.importorskip("torch")
-    cfg = PFConfig(num_particles=1, use_gpu=True, use_tempering=True)
+    cfg = PFConfig(
+        num_particles=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+        use_gpu=True,
+        use_tempering=True,
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]
@@ -2040,10 +2001,6 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         """Skip adaptive particle-count side effects in this path test."""
         return None
 
-    def noop_align_continuous_labels() -> None:
-        """Skip label alignment side effects in this path test."""
-        return None
-
     def noop_advance_adapt_cooldown() -> None:
         """Skip adaptive cooldown side effects in this path test."""
         return None
@@ -2065,11 +2022,6 @@ def test_pair_sequence_update_uses_batched_gpu_likelihood(
         fake_tempered_update_likelihood,
     )
     monkeypatch.setattr(filt, "adapt_num_particles", noop_adapt_num_particles)
-    monkeypatch.setattr(
-        filt,
-        "align_continuous_labels",
-        noop_align_continuous_labels,
-    )
     monkeypatch.setattr(
         filt,
         "_advance_adapt_cooldown",
@@ -2100,6 +2052,8 @@ def test_identical_source_state_gpu_compression_preserves_sequence_counts() -> N
     torch = pytest.importorskip("torch")
     cfg = PFConfig(
         num_particles=3,
+        birth_enable=False,
+        init_num_sources=(2, 2),
         use_gpu=True,
         gpu_device="cpu",
         gpu_dtype="float64",
@@ -2145,77 +2099,6 @@ def test_identical_source_state_gpu_compression_preserves_sequence_counts() -> N
 
     assert compressed.shape == (3, 3)
     assert torch.allclose(compressed, uncompressed, rtol=1.0e-12, atol=1.0e-12)
-
-
-def test_identical_source_state_cpu_group_refresh_preserves_counts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Grouped structural likelihoods should compress duplicate rows exactly."""
-    cfg = PFConfig(num_particles=3, use_gpu=False)
-    dummy_kernel = type("K", (), {})()
-    dummy_kernel.poses = [np.array([0.0, 0.0, 0.0], dtype=float)]
-    dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0], dtype=float)]
-    dummy_kernel.num_sources = 2
-    filt = IsotopeParticleFilter(isotope="Cs-137", kernel=dummy_kernel, config=cfg)
-    shared_positions = np.array(
-        [[1.0, 0.2, 0.1], [1.5, 0.7, 0.4]],
-        dtype=float,
-    )
-    shared_strengths = np.array([100.0, 40.0], dtype=float)
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=2,
-                positions=shared_positions.copy(),
-                strengths=shared_strengths.copy(),
-                background=background,
-            ),
-            log_weight=-math.log(3.0),
-        )
-        for background in (0.0, 2.5, 8.0)
-    ]
-    data = MeasurementData(
-        z_k=np.array([10.0, 12.0], dtype=float),
-        observation_variances=np.zeros(2, dtype=float),
-        detector_positions=np.array(
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
-            dtype=float,
-        ),
-        fe_indices=np.array([0, 0], dtype=int),
-        pb_indices=np.array([0, 0], dtype=int),
-        live_times=np.array([1.0, 2.0], dtype=float),
-    )
-    call_count = 0
-    original = filt.continuous_kernel.kernel_values_selected_pairs_for_detectors
-
-    def counted_kernel_values(*args: object, **kwargs: object) -> object:
-        """Count response evaluations before delegating to the real kernel."""
-        nonlocal call_count
-        call_count += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        filt.continuous_kernel,
-        "kernel_values_selected_pairs_for_detectors",
-        counted_kernel_values,
-    )
-    lambda_m, lambda_total = filt._lambda_components_for_particle_group(
-        data,
-        [0, 1, 2],
-        2,
-    )
-
-    assert call_count == 1
-    assert lambda_m.shape == (2, 3, 2)
-    expected_total = np.stack(
-        [
-            np.sum(lambda_m[:, idx, :], axis=1)
-            + filt.continuous_particles[idx].state.background * data.live_times
-            for idx in range(3)
-        ],
-        axis=1,
-    )
-    np.testing.assert_allclose(lambda_total, expected_total, rtol=1.0e-12)
 
 
 def test_low_count_variance_floor_decays_for_informative_counts() -> None:
@@ -2738,7 +2621,11 @@ def test_transport_absolute_floor_softens_low_count_model_mismatch() -> None:
 
 def test_resampling_increases_neff() -> None:
     """Highly skewed weights should be flattened after resampling."""
-    cfg = PFConfig(num_particles=3)
+    cfg = PFConfig(
+        num_particles=3,
+        birth_enable=False,
+        init_num_sources=(0, 0),
+    )
     dummy_kernel = type("K", (), {})()
     dummy_kernel.poses = [np.array([0.0, 0.0, 0.0])]
     dummy_kernel.orientations = [np.array([1.0, 0.0, 0.0])]

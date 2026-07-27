@@ -1,5 +1,6 @@
 """Tests for shield rotation and pose selection logic (Chapter 3.4)."""
 
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -48,6 +49,8 @@ def test_fast_gpu_rollout_respects_disabled_gpu_override() -> None:
     """Fast rollout falls back instead of raising when planning disables GPU."""
     estimator = object.__new__(RotatingShieldPFEstimator)
     estimator.pf_config = RotatingShieldPFConfig(
+        birth_enable=False,
+        init_num_sources=(1, 1),
         use_gpu=False,
         use_fast_gpu_rollout=True,
     )
@@ -77,7 +80,11 @@ def _build_simple_estimator() -> RotatingShieldPFEstimator:
     normals = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
     config = RotatingShieldPFConfig(
-        num_particles=2, max_sources=1, resample_threshold=0.5
+        num_particles=2,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+        resample_threshold=0.5,
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
@@ -185,6 +192,8 @@ def test_shield_selection_batch_grids_match_pairwise_scores() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
         use_gpu=False,
         planning_particles=None,
         planning_method="top_weight",
@@ -289,6 +298,7 @@ def test_multi_detector_all_pair_counts_match_serial_detector_calls() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
             max_sources=2,
+            birth_enable=False,
             use_gpu=False,
             init_num_sources=(0, 0),
         ),
@@ -1538,7 +1548,12 @@ def test_orientation_expected_information_gain_positive_when_strengths_differ() 
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=2, max_sources=1)
+    config = RotatingShieldPFConfig(
+        num_particles=2,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+    )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=candidate_sources,
@@ -1657,7 +1672,13 @@ def test_short_time_update_uses_default_duration() -> None:
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=10, max_sources=1, short_time_s=0.25)
+    config = RotatingShieldPFConfig(
+        num_particles=10,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+        short_time_s=0.25,
+    )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=candidate_sources,
@@ -1687,7 +1708,12 @@ def test_should_stop_shield_rotation_by_dwell_time() -> None:
     normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
     config = RotatingShieldPFConfig(
-        num_particles=5, max_sources=1, max_dwell_time_s=0.5, ig_threshold=1e6
+        num_particles=5,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+        max_dwell_time_s=0.5,
+        ig_threshold=1e6,
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
@@ -1722,7 +1748,12 @@ def test_expected_uncertainty_after_pose_is_finite() -> None:
     candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
     normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
     mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(num_particles=5, max_sources=1)
+    config = RotatingShieldPFConfig(
+        num_particles=5,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
+    )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
         candidate_sources=candidate_sources,
@@ -1841,82 +1872,86 @@ def test_temporal_separation_uses_response_shape_not_strength_scale() -> None:
     assert separated_score > 1.0
 
 
-def test_extract_signature_modes_boosts_tentative_residual_sources() -> None:
-    """Residual-aware planning should prioritize tentative source signatures."""
-    est = _build_simple_estimator()
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-                tentative_sources=np.array([False], dtype=bool),
-            ),
-            log_weight=float(np.log(0.5)),
+def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
+    """Signature modes should preserve normalized PF posterior mass."""
+    states = [
+        IsotopeState(
+            num_sources=1,
+            positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
+            strengths=np.array([100.0], dtype=float),
+            background=0.0,
         ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[5.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-                tentative_sources=np.array([True], dtype=bool),
-            ),
-            log_weight=float(np.log(0.5)),
+        IsotopeState(
+            num_sources=1,
+            positions=np.array([[5.0, 0.0, 0.0]], dtype=float),
+            strengths=np.array([100.0], dtype=float),
+            background=0.0,
         ),
     ]
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        planning_particles=lambda **_kwargs: {
+            "Cs-137": (states, np.array([0.8, 0.2], dtype=float))
+        },
+    )
 
     modes = dss_pp.extract_signature_modes(
-        est,
+        estimator,
         mode_cluster_radius_m=0.1,
         max_modes_per_isotope=2,
-        tentative_weight_multiplier=5.0,
     )["Cs-137"]
 
     assert len(modes) == 2
-    assert np.allclose(modes[0].position_xyz, np.array([5.0, 0.0, 0.0]))
+    assert np.allclose(modes[0].position_xyz, np.array([1.0, 0.0, 0.0]))
+    assert modes[0].weight == pytest.approx(0.8)
+    assert modes[1].weight == pytest.approx(0.2)
     assert modes[0].weight > modes[1].weight
 
 
-def test_extract_signature_modes_keeps_soft_quarantined_sources() -> None:
-    """Soft-quarantined tentative modes should remain visible to DSS-PP."""
-    est = _build_simple_estimator()
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-                tentative_sources=np.array([False], dtype=bool),
-                verification_fail_streaks=np.array([0], dtype=int),
+def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:
+    """Every distinct active source in the PF posterior should remain visible."""
+    states = [
+        IsotopeState(
+            num_sources=2,
+            positions=np.array(
+                [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+                dtype=float,
             ),
-            log_weight=float(np.log(0.5)),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[5.0, 0.0, 0.0]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-                tentative_sources=np.array([True], dtype=bool),
-                verification_fail_streaks=np.array([3], dtype=int),
-            ),
-            log_weight=float(np.log(0.5)),
+            strengths=np.array([90.0, 10.0], dtype=float),
+            background=0.0,
         ),
     ]
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        planning_particles=lambda **_kwargs: {
+            "Cs-137": (states, np.array([1.0], dtype=float))
+        },
+    )
 
     modes = dss_pp.extract_signature_modes(
-        est,
+        estimator,
         mode_cluster_radius_m=0.1,
         max_modes_per_isotope=2,
-        tentative_weight_multiplier=1.0,
     )["Cs-137"]
 
     assert len(modes) == 2
+    assert np.allclose(modes[0].position_xyz, np.array([1.0, 0.0, 0.0]))
+    assert np.allclose(modes[1].position_xyz, np.array([5.0, 0.0, 0.0]))
+    assert modes[0].weight == pytest.approx(0.9)
+    assert modes[1].weight == pytest.approx(0.1)
+
+
+def test_dss_pp_has_no_external_or_tentative_mode_boundary() -> None:
+    """DSS-PP should accept only the ordinary PF posterior mode source."""
+    extract_parameters = inspect.signature(dss_pp.extract_signature_modes).parameters
+    select_parameters = inspect.signature(
+        dss_pp.select_dss_pp_next_station
+    ).parameters
+
+    assert "tentative_weight_multiplier" not in extract_parameters
+    assert "_planner_only_external_mode_token" not in extract_parameters
+    assert "_planner_only_external_mode_token" not in select_parameters
+    assert not hasattr(dss_pp, "_preserve_external_modes")
 
 
 def test_recovery_isotope_mode_weights_boost_target_isotope_only() -> None:
@@ -1993,6 +2028,7 @@ def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2060,6 +2096,7 @@ def test_dss_pp_batched_program_scores_match_scalar_oracle() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2180,6 +2217,7 @@ def test_dss_pp_pair_signature_cache_uses_pair_response_scales() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2278,6 +2316,7 @@ def test_dss_pp_station_response_uses_transport_kernel_and_pair_scales() -> None
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2387,6 +2426,7 @@ def test_dss_pp_station_response_uses_obstacle_attenuation_kernel() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2473,6 +2513,7 @@ def test_dss_pp_batched_pairwise_cover_matches_scalar_oracle() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2551,6 +2592,7 @@ def test_select_separation_orientations_returns_fe_pb_pairs() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=2,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -2587,6 +2629,7 @@ def test_select_best_orientation_preselect_supports_cpu_config() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
         preselect_orientations=True,
@@ -2630,9 +2673,10 @@ def test_shield_rotation_gpu_surrogate_maps_reordered_candidates_to_octants() ->
         mu_by_isotope={"Cs-137": {"fe": 0.4, "pb": 0.9}},
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
-            max_sources=1,
-            use_gpu=False,
-            init_num_sources=(1, 1),
+        max_sources=1,
+        birth_enable=False,
+        use_gpu=False,
+        init_num_sources=(1, 1),
         ),
         shield_params=ShieldParams(thickness_fe_cm=1.0, thickness_pb_cm=0.5),
     )
@@ -2736,7 +2780,11 @@ def test_shield_rotation_gpu_eig_maps_reordered_candidates_to_octants() -> None:
     ]
     estimator = SimpleNamespace(
         poses=[np.array([2.0, 1.0, 0.5], dtype=float)],
-        pf_config=RotatingShieldPFConfig(eig_num_samples=0),
+        pf_config=RotatingShieldPFConfig(
+            birth_enable=False,
+            init_num_sources=(1, 1),
+            eig_num_samples=0,
+        ),
         continuous_kernel=lambda: RecordingKernel(),
         response_scale_for_isotope=lambda isotope, fe_index, pb_index: 1.0,
     )
@@ -2768,6 +2816,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2830,6 +2879,7 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     assert result.next_pose.shape == (3,)
     assert result.shield_program.pair_ids
     assert result.diagnostics["node_count"] > 0
+    assert result.diagnostics["planner_belief_sources"] == ["pf_posterior"]
     assert result.diagnostics["ranked_nodes"]
     assert (
         result.diagnostics["ranked_nodes"][0]["score"]
@@ -2849,6 +2899,7 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -2935,11 +2986,12 @@ def _build_height_partner_program_test_estimator() -> RotatingShieldPFEstimator:
         shield_normals=shield_normals,
         mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
         pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-            max_sources=1,
-            use_gpu=False,
-            planning_particles=None,
-            init_num_sources=(1, 1),
+        num_particles=2,
+        max_sources=1,
+        birth_enable=False,
+        use_gpu=False,
+        planning_particles=None,
+        init_num_sources=(1, 1),
         ),
         shield_params=ShieldParams(),
     )
@@ -3895,6 +3947,7 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -4219,10 +4272,12 @@ def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:
         cell_size=1.0,
         grid_shape=(1, 1),
         blocked_cells=((0, 0),),
+        transport_boxes_m=((0.0, -0.5, 0.0, 1.0, 0.5, 2.0),),
     )
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         planning_particles=None,
         init_num_sources=(1, 1),
@@ -4517,6 +4572,11 @@ def test_dss_pp_batched_environment_features_match_scalar_oracle() -> None:
         cell_size=1.0,
         grid_shape=(2, 3),
         blocked_cells=((0, 0), (1, 1), (0, 2)),
+        transport_boxes_m=(
+            (0.0, -0.5, 0.0, 1.0, 0.5, 2.0),
+            (1.0, 0.5, 0.0, 2.0, 1.5, 2.0),
+            (0.0, 1.5, 0.0, 1.0, 2.5, 2.0),
+        ),
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
@@ -4526,6 +4586,7 @@ def test_dss_pp_batched_environment_features_match_scalar_oracle() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=3,
             max_sources=1,
+            birth_enable=False,
             use_gpu=False,
             planning_particles=None,
             init_num_sources=(1, 1),
@@ -4940,6 +5001,7 @@ def test_dss_pp_enforces_all_isotope_observability_when_feasible() -> None:
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5007,6 +5069,7 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5174,6 +5237,7 @@ def test_dss_pp_limits_expensive_eig_candidate_evaluation(
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
         observation_count_variance_includes_counting_noise=True,
@@ -5303,6 +5367,7 @@ def test_dss_pp_preselects_candidates_before_program_scoring(
     config = RotatingShieldPFConfig(
         num_particles=1,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )
@@ -5638,6 +5703,7 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
+        birth_enable=False,
         use_gpu=False,
         init_num_sources=(1, 1),
     )

@@ -18,7 +18,10 @@ from measurement.observation_model import build_runtime_observation_model
 from measurement.obstacles import ObstacleGrid
 from measurement.model import EnvironmentConfig
 from measurement.shielding import generate_octant_orientations
-from measurement.source_surfaces import build_surface_candidate_sources
+from measurement.source_surfaces import (
+    build_surface_candidate_sources,
+    source_surface_kinds,
+)
 from pf.profiles import apply_profile_to_config, enforce_pure_runtime_settings
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import PurePFEstimator, RotatingShieldPFConfig
@@ -126,39 +129,88 @@ def _environment_bounds(
     return np.zeros(3, dtype=np.float64), upper
 
 
+def _environment_config(log: MeasurementLog) -> EnvironmentConfig:
+    """Build the room geometry declared by a measurement log."""
+    lower, upper = _environment_bounds(log)
+    del lower
+    try:
+        detector_position = tuple(
+            float(value) for value in log.environment["detector_position"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PFReplayError(
+            "MeasurementLog environment requires detector_position."
+        ) from exc
+    return EnvironmentConfig(
+        size_x=float(upper[0]),
+        size_y=float(upper[1]),
+        size_z=float(upper[2]),
+        detector_position=detector_position,
+    )
+
+
+def _validated_surface_candidates(
+    log: MeasurementLog,
+    candidates: NDArray[np.float64],
+    *,
+    obstacle_height_m: float,
+) -> NDArray[np.float64]:
+    """Validate that every response candidate lies on the logged environment."""
+    points = np.asarray(candidates, dtype=np.float64)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or points.shape[0] == 0
+        or not np.all(np.isfinite(points))
+    ):
+        raise PFReplayError("Replay surface candidates must have finite shape (N, 3).")
+    kinds = source_surface_kinds(
+        points,
+        _environment_config(log),
+        _obstacle_grid_from_log(log),
+        obstacle_height_m=float(obstacle_height_m),
+    )
+    if np.any(np.equal(kinds, None)):
+        raise PFReplayError(
+            "Pure PF replay candidates must lie on the complete environment surface."
+        )
+    return points
+
+
 def _candidate_sources(
+    log: MeasurementLog,
     config: Mapping[str, Any],
     lower: NDArray[np.float64],
     upper: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return deterministic replay birth candidates from config or room bounds."""
+    """Return deterministic surface-response candidates for replay."""
+    obstacle_height_m = float(config.get("obstacle_height_m", 2.0))
     explicit = config.get("replay_candidate_sources_xyz")
     if explicit is not None:
-        candidates = np.asarray(explicit, dtype=np.float64)
-        if candidates.ndim != 2 or candidates.shape[1] != 3:
-            raise PFReplayError("replay_candidate_sources_xyz must have shape (N, 3).")
-        if candidates.shape[0] == 0 or not np.all(np.isfinite(candidates)):
-            raise PFReplayError("Replay candidates must be non-empty and finite.")
-        return candidates
+        return _validated_surface_candidates(
+            log,
+            np.asarray(explicit, dtype=np.float64),
+            obstacle_height_m=obstacle_height_m,
+        )
     spacing_raw = config.get("replay_candidate_spacing_m", 1.0)
     spacing = np.asarray(spacing_raw, dtype=np.float64)
     if spacing.ndim == 0:
         spacing = np.full(3, float(spacing), dtype=np.float64)
     if spacing.shape != (3,) or np.any(~np.isfinite(spacing)) or np.any(spacing <= 0.0):
         raise PFReplayError("replay_candidate_spacing_m must be positive scalar/XYZ.")
-    axes: list[NDArray[np.float64]] = []
-    for axis in range(3):
-        values = np.arange(
-            float(lower[axis]),
-            float(upper[axis]) + 0.5 * float(spacing[axis]),
-            float(spacing[axis]),
-            dtype=np.float64,
-        )
-        values = values[values <= float(upper[axis]) + 1.0e-12]
-        if values.size == 0:
-            values = np.asarray([(lower[axis] + upper[axis]) / 2.0])
-        axes.append(values)
-    return np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    candidates = build_surface_candidate_sources(
+        _environment_config(log),
+        _obstacle_grid_from_log(log),
+        tuple(float(value) for value in spacing),
+        position_min=tuple(float(value) for value in lower),
+        position_max=tuple(float(value) for value in upper),
+        obstacle_height_m=obstacle_height_m,
+    )
+    return _validated_surface_candidates(
+        log,
+        candidates,
+        obstacle_height_m=obstacle_height_m,
+    )
 
 
 def _pf_config_values(
@@ -172,8 +224,9 @@ def _pf_config_values(
     allowed = {field.name for field in fields(RotatingShieldPFConfig)}
     values = {key: value for key, value in config.items() if key in allowed}
     values["estimator_profile"] = str(profile)
-    values.setdefault("position_min", tuple(float(value) for value in lower))
-    values.setdefault("position_max", tuple(float(value) for value in upper))
+    values["position_min"] = tuple(float(value) for value in lower)
+    values["position_max"] = tuple(float(value) for value in upper)
+    values["source_position_prior"] = "surface"
     return values
 
 
@@ -181,11 +234,23 @@ def _logged_candidate_sources(
     log: MeasurementLog,
     raw_grid: Mapping[str, Any],
 ) -> NDArray[np.float64]:
-    """Load or deterministically regenerate the exact logged birth grid."""
+    """Load or regenerate the logged complete-surface response grid."""
+    if raw_grid.get("source_surface_prior", True) is not True:
+        raise PFReplayError(
+            "Pure PF replay refuses a logged non-surface candidate grid."
+        )
+    obstacle_height_m = float(raw_grid.get("obstacle_height_m", 2.0))
     explicit = raw_grid.get("candidate_sources_xyz")
     if explicit is not None:
-        return np.asarray(explicit, dtype=np.float64)
-    if raw_grid.get("generator") != "realtime_source_candidate_grid.v1":
+        return _validated_surface_candidates(
+            log,
+            np.asarray(explicit, dtype=np.float64),
+            obstacle_height_m=obstacle_height_m,
+        )
+    if raw_grid.get("generator") not in {
+        "realtime_surface_response_grid.v1",
+        "realtime_source_candidate_grid.v1",
+    }:
         raise PFReplayError(
             "Logged effective candidate grid lacks coordinates or a known generator."
         )
@@ -202,49 +267,28 @@ def _logged_candidate_sources(
         or np.any(~np.isfinite(upper))
     ):
         raise PFReplayError("Logged candidate generator requires finite XYZ inputs.")
-    try:
-        env = EnvironmentConfig(
-            size_x=float(log.environment["size_x"]),
-            size_y=float(log.environment["size_y"]),
-            size_z=float(log.environment["size_z"]),
-            detector_position=tuple(
-                float(value) for value in log.environment["detector_position"]
-            ),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
+    expected_lower, expected_upper = _environment_bounds(log)
+    if not np.allclose(lower, expected_lower, rtol=0.0, atol=1.0e-12) or not np.allclose(
+        upper,
+        expected_upper,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
         raise PFReplayError(
-            "Candidate-grid regeneration requires the logged room environment."
-        ) from exc
-    if bool(raw_grid.get("source_surface_prior", False)):
-        return build_surface_candidate_sources(
-            env,
-            _obstacle_grid_from_log(log),
-            tuple(float(value) for value in spacing),
-            position_min=tuple(float(value) for value in lower),
-            position_max=tuple(float(value) for value in upper),
-            obstacle_height_m=float(raw_grid.get("obstacle_height_m", 2.0)),
+            "Pure PF replay requires the complete logged environment bounds."
         )
-    margin = float(raw_grid.get("margin_m", 0.0))
-
-    def _axis(start: float, stop: float, step: float) -> NDArray[np.float64]:
-        if stop < start:
-            return np.zeros(0, dtype=np.float64)
-        count = int(np.floor((stop - start) / step)) + 1
-        return start + step * np.arange(max(count, 0), dtype=np.float64)
-
-    axes = [
-        _axis(
-            float(lower[index] + margin),
-            float(upper[index] - margin),
-            float(spacing[index]),
-        )
-        for index in range(3)
-    ]
-    if any(axis.size == 0 for axis in axes):
-        raise PFReplayError("Logged candidate generator produced an empty grid.")
-    return np.asarray(
-        [[x, y, z] for x in axes[0] for y in axes[1] for z in axes[2]],
-        dtype=np.float64,
+    candidates = build_surface_candidate_sources(
+        _environment_config(log),
+        _obstacle_grid_from_log(log),
+        tuple(float(value) for value in spacing),
+        position_min=tuple(float(value) for value in expected_lower),
+        position_max=tuple(float(value) for value in expected_upper),
+        obstacle_height_m=obstacle_height_m,
+    )
+    return _validated_surface_candidates(
+        log,
+        candidates,
+        obstacle_height_m=obstacle_height_m,
     )
 
 
@@ -351,7 +395,7 @@ def build_replay_estimator(
         )
     )
     apply_profile_to_config(pf_config)
-    candidates = _candidate_sources(pure_config, lower, upper)
+    candidates = _candidate_sources(log, pure_config, lower, upper)
     physical_config = _resolved_physical_config(log)
     observation_model = build_runtime_observation_model(
         physical_config,

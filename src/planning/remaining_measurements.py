@@ -38,7 +38,6 @@ class RemainingMeasurementConfig:
     uncertainty_weight: float = 1.0
     cardinality_weight: float = 1.0
     separation_weight: float = 1.5
-    verification_weight: float = 1.0
     residual_weight: float = 1.0
     high_surface_ambiguity_weight: float = 1.0
     high_surface_z_fraction: float = 0.75
@@ -478,7 +477,6 @@ def _state_budget_components(
         method=config.planning_method,
         mode_cluster_radius_m=float(config.mode_cluster_radius_m),
         max_modes_per_isotope=int(config.max_modes_per_isotope),
-        tentative_weight_multiplier=1.5,
     )
     _timer_add(timings, "state_signature_modes_s", time.perf_counter() - modes_start)
     target_spread = max(float(config.target_position_spread_m), 1.0e-12)
@@ -491,7 +489,6 @@ def _state_budget_components(
         "uncertainty": 0.0,
         "cardinality": 0.0,
         "same_isotope_separation": 0.0,
-        "pseudo_source_verification": 0.0,
         "residual": 0.0,
         "isotope_absence": 0.0,
         "high_surface_ambiguity": 0.0,
@@ -575,20 +572,6 @@ def _state_budget_components(
             mode_arrays[isotope] = []
         strength_budget = max(strength_cv / target_cv - 1.0, 0.0)
         cardinality_budget = entropy + max(target_cardinality - confidence, 0.0)
-        tentative_expected = _weighted_tentative_source_count(particles, weights)
-        verification_views = int(getattr(filt, "last_birth_residual_distinct_poses", 0))
-        required_views = max(1, int(filt.config.pseudo_source_min_distinct_views))
-        verification_budget = (
-            tentative_expected
-            * max(
-                required_views - min(verification_views, required_views),
-                0,
-            )
-            / float(required_views)
-        )
-        verification_budget += float(
-            max(int(getattr(filt, "last_pseudo_source_quarantine_active", 0)), 0)
-        )
         separation_budget = 0.0
         min_separation = float("inf")
         unresolved_pairs = 0
@@ -616,9 +599,6 @@ def _state_budget_components(
                 "cardinality_entropy": float(entropy),
                 "cardinality_variance": float(cardinality_var),
                 "strength_cv": float(strength_cv),
-                "tentative_source_expectation": float(tentative_expected),
-                "verification_views": int(verification_views),
-                "required_verification_views": int(required_views),
                 "min_pairwise_separation": 0.0,
                 "unresolved_pair_count": 0,
                 "high_surface_mode_count": 0,
@@ -702,7 +682,6 @@ def _state_budget_components(
         components["uncertainty"] += spread_budget + strength_budget
         components["cardinality"] += cardinality_budget
         components["same_isotope_separation"] += separation_budget
-        components["pseudo_source_verification"] += verification_budget
         components["residual"] += residual_budget
         components["isotope_absence"] += float(
             config.unresolved_absent_budget_weight
@@ -720,9 +699,6 @@ def _state_budget_components(
             "cardinality_entropy": float(entropy),
             "cardinality_variance": float(cardinality_var),
             "strength_cv": float(strength_cv),
-            "tentative_source_expectation": float(tentative_expected),
-            "verification_views": int(verification_views),
-            "required_verification_views": int(required_views),
             "min_pairwise_separation": (
                 0.0 if not np.isfinite(min_separation) else float(min_separation)
             ),
@@ -786,41 +762,6 @@ def _measurement_data_count_evidence(
     return bool(supported), total_counts, max_count, signal_snr
 
 
-def _weighted_tentative_source_count(
-    particles: Sequence[object],
-    weights: NDArray[np.float64],
-) -> float:
-    """Return the weighted number of tentative or failed source slots."""
-    total = 0.0
-    for particle, weight in zip(particles, weights):
-        state = particle.state
-        count = max(0, int(state.num_sources))
-        if count <= 0:
-            continue
-        tentative_raw = getattr(state, "tentative_sources", None)
-        tentative = (
-            np.zeros(count, dtype=bool)
-            if tentative_raw is None
-            else np.asarray(tentative_raw, dtype=bool)[:count]
-        )
-        failed_raw = getattr(state, "verification_fail_streaks", None)
-        failed = (
-            np.zeros(count, dtype=int)
-            if failed_raw is None
-            else np.asarray(failed_raw, dtype=int)[:count]
-        )
-        if tentative.size != count:
-            padded = np.zeros(count, dtype=bool)
-            padded[: min(tentative.size, count)] = tentative[:count]
-            tentative = padded
-        if failed.size != count:
-            padded = np.zeros(count, dtype=int)
-            padded[: min(failed.size, count)] = failed[:count]
-            failed = padded
-        total += float(weight) * float(np.count_nonzero(tentative | (failed > 0)))
-    return float(total)
-
-
 def _prediction_gain_components(
     estimator: RotatingShieldPFEstimator,
     next_pose_xyz: NDArray[np.float64] | None,
@@ -845,7 +786,6 @@ def _prediction_gain_components(
     gains = {
         "uncertainty": 0.0,
         "same_isotope_separation": 0.0,
-        "pseudo_source_verification": 0.0,
         "residual": 0.0,
         "dss_information": 0.0,
         "high_surface_ambiguity": 0.0,
@@ -923,7 +863,6 @@ def _prediction_gain_components(
             if key in dss_diagnostics:
                 gains["dss_information"] += max(float(dss_diagnostics[key]), 0.0)
                 break
-    gains["pseudo_source_verification"] += float(program_length)
     _timer_add(timings, "prediction_total_s", time.perf_counter() - start)
     return gains, program_length
 
@@ -1019,7 +958,6 @@ def estimate_remaining_measurement_budget(
         float(cfg.uncertainty_weight) * components["uncertainty"]
         + float(cfg.cardinality_weight) * components["cardinality"]
         + float(cfg.separation_weight) * components["same_isotope_separation"]
-        + float(cfg.verification_weight) * components["pseudo_source_verification"]
         + float(cfg.residual_weight) * components["residual"]
         + float(cfg.high_surface_ambiguity_weight)
         * components["high_surface_ambiguity"]
@@ -1028,7 +966,6 @@ def estimate_remaining_measurement_budget(
     weighted_gain = (
         float(cfg.uncertainty_weight) * gains["uncertainty"]
         + float(cfg.separation_weight) * gains["same_isotope_separation"]
-        + float(cfg.verification_weight) * gains["pseudo_source_verification"]
         + float(cfg.residual_weight) * gains["residual"]
         + float(cfg.high_surface_ambiguity_weight) * gains["high_surface_ambiguity"]
         + float(cfg.dss_information_gain_weight) * gains["dss_information"]

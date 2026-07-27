@@ -35,6 +35,7 @@ from pf.likelihood import (
     normalize_observation_count_variance_semantics,
 )
 from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
+from pf.posterior import posterior_point_estimate_from_states
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
 from pf.reporting import measurement_vector
 from pf.resampling import systematic_resample
@@ -75,179 +76,7 @@ def _weighted_quantile(
 
 @dataclass
 class RotatingShieldPFConfig:
-    """
-    Configuration parameters for the rotating-shield PF (Sec. 3.4–3.5).
-
-    Users can tune convergence thresholds and planning settings:
-        - max_sources: cap on sources per isotope
-        - ig_threshold: max IG below which rotation stops (Eq. 3.49)
-        - max_dwell_time_s: per-pose dwell cap
-        - credible_volume_threshold: max ellipsoid volume for positional credible regions
-        - lambda_cost: motion-cost weight in Eq. 3.51
-        - position_sigma: Gaussian jitter for positions (meters)
-        - alpha_weights: isotope weights for IG criteria
-        - support_ema_alpha: EMA weight for per-source ΔLL support
-        - birth_softmax_temp: temperature for residual proposal sampling
-        - birth_min_score: score floor for residual proposal sampling
-        - birth_enable: enable birth/death/split/merge moves
-        - birth_topk_particles: number of top-weight particles for residual mix
-        - birth_use_weighted_topk: weight residual mix by particle weights
-        - birth_min_sep_m: minimum separation between sources during birth
-        - birth_detector_min_sep_m: minimum separation from measured detector poses
-        - source_detector_exclusion_m: prioritize evidence-prunable sources near detector poses
-        - birth_candidate_jitter_sigma: position jitter (m) for birth candidates
-        - birth_num_local_jitter: local jitter samples per candidate
-        - birth_alpha: damping factor for new source strength
-        - birth_q_max: clamp max for new source strength
-        - birth_q_min: clamp min for new source strength
-        - birth_max_per_update: cap accepted birth proposals per structural update
-        - birth_delta_ll_threshold: likelihood-gain floor for accepting birth
-        - birth_complexity_penalty: extra model-complexity penalty for birth
-        - birth_bic_penalty_params: source parameter count for BIC birth penalty
-        - birth_residual_clip_quantile: clip residuals at this quantile
-        - birth_residual_gate_p_value: chi-square p-value for residual birth evidence
-        - birth_residual_min_support: minimum independent residual-supported measurements
-        - birth_residual_support_sigma: per-measurement residual z-score support floor
-        - birth_min_distinct_stations: minimum robot stations with residual birth evidence
-        - birth_candidate_support_fraction: per-candidate residual overlap floor
-        - birth_use_shield_coded_residual: rank birth candidates by full shield-coded residual response
-        - birth_count_distance_prior_weight: soft proposal weight for high unit-response candidates
-        - birth_count_distance_strength_weight: soft penalty for candidates needing high fitted strength
-        - birth_count_distance_log_clip: robust log-ratio clip for count-distance proposal terms
-        - birth_count_distance_strength_sigma: log-strength scale for the high-strength penalty
-        - birth_residual_expand_structural_particles: expand residual birth proposals beyond normal top-k
-        - birth_residual_expanded_structural_topk_particles: cap residual-gated structural proposals
-        - birth_matching_pursuit_max_new_sources: max sequential residual births per particle
-        - birth_matching_pursuit_topk_candidates: candidates evaluated per matching-pursuit birth
-        - birth_jitter_topk_candidates: base residual-supported candidates jittered for birth
-        - residual_decomposition_enable: enable raw/peak-suppressed residual layers
-        - peak_suppression_enable: use strong-source leave-one-out residual layers
-        - peak_suppression_min_source_fraction: source fraction defining suppressible peaks
-        - peak_suppression_factor: fraction of a strong source contribution added back
-        - residual_decomposition_max_layers: max residual layers used for birth proposals
-        - pseudo_source_verification_enable: verify tentative birth sources before pruning
-        - pseudo_source_min_delta_ll: leave-one-out ΔLL floor for confirming sources
-        - pseudo_source_min_distinct_views: distinct shield views needed to confirm sources
-        - pseudo_source_fail_grace_stations: failed verifications before pruning tentative sources
-        - pseudo_source_corr_max: response-correlation ceiling against stronger sources
-        - pseudo_source_temporal_sep_min: whitened temporal-code separation that can confirm high-correlation sources
-        - source_prune_bic_penalty_params: source parameter count for BIC prune gain
-        - min_age_to_split: minimum age before split proposals
-        - use_clustered_output: use clustered estimate when birth is enabled
-        - cluster_eps_m: clustering radius in meters
-        - cluster_min_samples: minimum samples per cluster
-        - split_prob: probability of split proposals per particle
-        - split_strength_min: minimum strength for split candidates
-        - split_position_sigma: position jitter for split proposals
-        - split_strength_min_frac: min split fraction for q1/q2
-        - split_strength_max_frac: max split fraction for q1/q2
-        - split_delta_ll_threshold: ΔLL threshold for split acceptance
-        - split_complexity_penalty: extra model-complexity penalty for split
-        - split_residual_guided: use posterior residual candidates for split moves
-        - split_residual_candidate_count: residual candidates evaluated per split
-        - merge_prob: probability of merge proposals per particle
-        - merge_distance_max: max distance for merge candidates
-        - merge_delta_ll_threshold: ΔLL threshold for merge acceptance
-        - merge_response_corr_min: response-correlation floor for merge candidates
-        - merge_search_topk_pairs: max response-redundant pairs tested per merge move
-        - structural_proposal_topk_particles: posterior-support cap for split/merge proposals
-        - structural_trial_workers: worker count for deterministic split/merge trial chunks
-        - structural_trial_parallel_min_trials: minimum trial count before worker chunks
-        - structural_kernel_mode: heuristic legacy moves or target-preserving RJ-MH
-        - structural_rj_patch_spacing_m: finite surface-patch spacing for RJ-MH
-        - structural_rj_move_probability: per-particle RJ birth/death attempt rate
-        - structural_rj_birth_probability: interior-state birth move weight
-        - structural_rj_death_probability: interior-state death move weight
-        - structural_rj_position_move_probability: global within-K move rate
-        - structural_rj_local_position_move_probability: adjacent-patch move rate
-        - structural_rj_strength_move_probability: within-K strength-move attempt rate
-        - structural_cardinality_prior_probs: optional positive prior masses for K
-        - source_position_prior: environment-surface PF source-position support
-        - init_num_sources: inclusive range for initial source count per particle
-        - init_grid_spacing_m: grid spacing for deterministic particle initialization
-        - init_grid_repeats: repeated strength samples per deterministic grid point
-        - init_joint_position_design: independent or Latin-hypercube source tuples
-        - init_joint_position_retries: complete tuples tested per anchor
-        - init_source_min_separation_m: prior minimum within-isotope spacing
-        - roughening_k: roughening coefficient for post-resample position jitter
-        - min_sigma_pos: minimum roughening sigma (meters)
-        - max_sigma_pos: maximum roughening sigma (meters)
-        - roughening_decay: multiplier decay per resample within an observation
-        - roughening_min_mult: minimum multiplier for roughening decay
-        - init_strength_prior: lognormal, uniform, or log_uniform strength prior
-        - init_strength_min: optional lower source-strength support in cps@1m
-        - init_strength_max: optional upper source-strength support in cps@1m
-        - init_strength_log_mean: log-normal median for fallback strength initialization
-        - init_strength_log_sigma: log-normal spread for fallback strength initialization
-        - strength_log_sigma: log-space jitter for strengths
-        - pose_min_observation_quantile: posterior quantile used for observability guarantees
-        - orientation_k: maximum number of orientations to execute per pose
-        - min_rotations_per_pose: minimum orientations before IG early stopping
-        - orientation_selection_mode: "eig"
-        - planning_particles: particle count used for orientation scoring (None = all)
-        - planning_method: how to select planning particles (top_weight/resample)
-        - use_gpu: enable torch acceleration for continuous kernel evaluation
-        - gpu_device: torch device string (e.g., "cuda" or "cpu")
-        - gpu_dtype: torch dtype string ("float32" or "float64")
-        - target_ess_ratio: target ESS/N for tempered updates
-        - max_temper_steps: max sub-steps for tempered updates
-        - min_delta_beta: minimum delta_beta for tempering
-        - use_tempering: enable ESS-targeted likelihood tempering
-        - max_resamples_per_observation: cap resamples per observation update
-        - temper_resample_cooldown_steps: substeps to skip resampling after resample
-        - temper_resample_force_ratio: ESS/N ratio forcing resample despite cooldown
-        - disable_regularize_on_temper_resample: skip roughening on temper resamples
-        - deferred_resample_roughening_scale: roughening scale during station-burst resampling
-        - cardinality_preserving_resample: preserve posterior source-count mass during resampling
-        - mode_preserving_resample: keep distinct source modes during resampling
-        - mode_preserving_max_modes: max spatial source modes protected per resample
-        - mode_preserving_particles_per_mode: particles retained per protected mode
-        - mode_preserving_radius_m: spatial clustering radius for protected source modes
-        - mode_preserving_min_weight_fraction: minimum mode support fraction to protect
-        - mode_preserving_cardinality_strata: keep source-count hypotheses during mode protection
-        - mode_preserving_min_particles_per_cardinality: particles protected per source count
-        - adapt_cooldown_steps: block particle-count shrink steps after resampling
-        - eig_num_samples: Monte-Carlo samples for EIG (Eq. 3.44)
-        - planning_eig_samples: Monte-Carlo samples for EIG inside planning rollouts
-        - planning_rollout_particles: particle cap for IG evaluation in rollouts
-        - planning_rollout_method: selection method for rollout particles
-        - preselect_*: optional surrogate stage settings for candidate reduction
-        - use_fast_gpu_rollout: enable approximate fast GPU rollouts for uncertainty prediction
-        - ig_workers: number of parallel workers for IG grid evaluation (0 = auto)
-        - use_tempering: enable ESS-targeted tempered updates in the PF
-        - measurement_scale_by_isotope: isotope-wise source response scales
-        - measurement_scale_by_isotope_and_pair: shield-pair response scales
-        - count_likelihood_model: "poisson", "gaussian", or "student_t"
-        - transport_model_rel_sigma: relative model mismatch from scatter/build-up omissions
-        - transport_model_abs_sigma: absolute transport-model mismatch floor in counts
-        - spectrum_count_rel_sigma: relative spectrum-decomposition count uncertainty
-        - spectrum_count_abs_sigma: additive spectrum-decomposition count uncertainty
-        - observation_count_variance_includes_counting_noise: whether propagated
-          extraction variance already contains its source-equivalent Poisson term
-        - observation_count_variance_semantics: explicit covariance meaning;
-          complete_statistical prevents adding a second Poisson term
-        - low_count_abs_sigma: extra low-count uncertainty floor in counts
-        - low_count_transition_counts: count scale where the low-count floor decays
-        - count_likelihood_df: Student-t degrees of freedom for robust count likelihood
-        - history_estimate_interval: exact report-history stride; 0 disables history
-        - candidate_response_cache_max_entries: LRU entries for deterministic candidate responses
-        - parallel_isotope_updates: run independent isotope structural updates in parallel
-        - parallel_isotope_workers: worker count for parallel isotope structural updates
-        - label_enable: enable label alignment for continuous particles
-        - label_alignment_iters: iterations for label alignment refinement
-        - label_pos_weight: position cost weight for label alignment
-        - label_strength_weight: strength cost weight for label alignment
-        - label_missing_cost: missing-source cost for label alignment
-        - label_pos_scale: optional position scale for label alignment
-        - label_strength_scale: optional strength scale for label alignment
-        - converge_enable: enable per-isotope convergence gating
-        - converge_window: window length for convergence checks
-        - converge_map_move_eps_m: MMSE position stability threshold (meters)
-        - converge_ess_ratio_high: ESS/N threshold for convergence
-        - converge_ll_improve_eps: LL improvement tolerance
-        - converge_min_steps: minimum steps before convergence
-        - converge_require_all: if True, all criteria must hold; else any two
-    """
+    """Configure the exact finite-surface PF and its active planner."""
 
     estimator_profile: str = "pf_strict"
     num_particles: int = 200
@@ -257,9 +86,6 @@ class RotatingShieldPFConfig:
     ess_high: float = 0.9
     max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
     resample_threshold: float = 0.5
-    position_sigma: float = 0.1
-    strength_sigma: float = 0.1
-    background_sigma: float = 0.1
     background_level: float | dict[str, float] = 0.0
     measurement_scale_by_isotope: Dict[str, float] | None = None
     measurement_scale_by_isotope_and_pair: Dict[str, Dict[int, float]] | None = None
@@ -290,89 +116,9 @@ class RotatingShieldPFConfig:
     direct_spectrum_likelihood_enable: bool = True
     spectrum_likelihood_bin_chunk: int = 512
     min_strength: float = 0.01
-    p_birth: float = 0.05
-    p_kill: float = 0.1
-    support_ema_alpha: float = 0.3
-    birth_softmax_temp: float = 1.0
-    birth_min_score: float = 1e-12
     birth_enable: bool = True
-    birth_topk_particles: int = 10
-    birth_use_weighted_topk: bool = True
-    birth_min_sep_m: float = 0.8
-    birth_detector_min_sep_m: float = 1.0
-    source_detector_exclusion_m: float = 0.0
-    birth_candidate_jitter_sigma: float = 0.5
-    birth_num_local_jitter: int = 8
-    birth_alpha: float = 0.2
-    birth_q_max: float = 5e6
-    birth_q_min: float = 1e2
-    birth_max_per_update: int | None = None
-    birth_delta_ll_threshold: float = 0.0
-    birth_complexity_penalty: float = 0.0
-    birth_bic_penalty_params: int = 4
-    birth_min_distinct_poses: int = 1
-    birth_residual_clip_quantile: float = 0.95
-    birth_residual_gate_p_value: float = 0.05
-    birth_residual_min_support: int = 2
-    birth_residual_support_sigma: float = 1.0
-    birth_min_distinct_stations: int = 1
-    birth_candidate_support_fraction: float = 0.05
-    birth_use_shield_coded_residual: bool = True
-    birth_count_distance_prior_weight: float = 0.5
-    birth_count_distance_strength_weight: float = 0.25
-    birth_count_distance_log_clip: float = 3.0
-    birth_count_distance_strength_sigma: float = 2.0
-    birth_residual_expand_structural_particles: bool = True
-    birth_residual_expanded_structural_topk_particles: int | None = 256
-    birth_matching_pursuit_max_new_sources: int = 3
-    birth_matching_pursuit_topk_candidates: int = 16
-    birth_orthogonalize_residual_candidates: bool = False
-    birth_orthogonal_candidate_corr_max: float = 0.98
-    birth_jitter_topk_candidates: int | None = 512
-    residual_decomposition_enable: bool = True
-    peak_suppression_enable: bool = True
-    peak_suppression_min_source_fraction: float = 0.25
-    peak_suppression_factor: float = 1.0
-    residual_decomposition_max_layers: int = 4
-    pseudo_source_verification_enable: bool = True
-    pseudo_source_min_delta_ll: float = 0.0
-    pseudo_source_min_distinct_views: int = 2
-    pseudo_source_fail_grace_stations: int = 2
-    pseudo_source_corr_max: float = 0.995
-    pseudo_source_temporal_sep_min: float = 0.0
-    pseudo_source_quarantine_on_suppress: bool = True
-    source_prune_min_distinct_stations: int = 2
-    source_prune_min_distinct_views: int = 2
-    source_prune_fail_grace_stations: int = 2
-    source_prune_delta_ll_threshold: float = 0.0
-    source_prune_bic_penalty_params: int = 4
-    birth_stage_single_station_as_quarantine: bool = True
     history_estimate_interval: int = 1
     candidate_response_cache_max_entries: int = 24
-    min_age_to_split: int = 5
-    use_clustered_output: bool = True
-    cluster_eps_m: float = 0.8
-    cluster_min_samples: int = 20
-    cluster_report_max_points: int = 6000
-    cluster_exact_max_points: int = 5000
-    split_prob: float = 0.05
-    split_strength_min: float = 0.1
-    split_position_sigma: float = 0.25
-    split_strength_min_frac: float = 0.3
-    split_strength_max_frac: float = 0.7
-    split_delta_ll_threshold: float = 0.0
-    split_complexity_penalty: float = 0.0
-    split_residual_guided: bool = True
-    split_residual_candidate_count: int = 8
-    merge_prob: float = 0.0
-    merge_distance_max: float = 0.5
-    merge_delta_ll_threshold: float = 0.0
-    merge_response_corr_min: float = 0.995
-    merge_search_topk_pairs: int = 8
-    structural_proposal_topk_particles: int | None = None
-    structural_trial_workers: int = 1
-    structural_trial_parallel_min_trials: int = 8
-    structural_kernel_mode: str = "heuristic"
     structural_rj_patch_spacing_m: float = 1.0
     structural_rj_move_probability: float = 1.0
     structural_rj_birth_probability: float = 0.5
@@ -394,54 +140,19 @@ class RotatingShieldPFConfig:
     max_resamples_per_observation: int = 2
     temper_resample_cooldown_steps: int = 2
     temper_resample_force_ratio: float = 0.1
-    disable_regularize_on_temper_resample: bool = False
-    deferred_resample_roughening_scale: float = 0.15
-    cardinality_preserving_resample: bool = True
-    cardinality_preserving_min_stations: int = 0
-    cardinality_preserving_require_confirmed_structure: bool = False
-    mode_preserving_resample: bool = True
-    mode_preserving_max_modes: int = 6
-    mode_preserving_particles_per_mode: int = 3
-    mode_preserving_radius_m: float = 1.5
-    mode_preserving_min_weight_fraction: float = 1e-4
-    mode_preserving_surface_strata: bool = True
-    mode_preserving_height_bin_m: float = 2.0
-    mode_preserving_high_surface_extra_particles: int = 0
-    mode_preserving_high_surface_z_fraction: float = 0.75
-    mode_preserving_support_score_weight: float = 0.0
-    mode_preserving_tentative_boost: float = 1.0
-    mode_preserving_residual_boost: float = 1.0
-    mode_preserving_cardinality_strata: bool = True
-    mode_preserving_min_particles_per_cardinality: int = 2
-    mode_preserving_dynamic_cardinality_allocation: bool = False
-    mode_preserving_dynamic_cardinality_extra_particles: int = 0
-    mode_preserving_dynamic_cardinality_min_mass: float = 0.02
-    mode_preserving_dynamic_cardinality_entropy_min: float = 0.5
-    mode_preserving_dynamic_spatial_allocation: bool = False
-    mode_preserving_dynamic_spatial_extra_particles: int = 0
-    mode_preserving_dynamic_spatial_min_score_fraction: float = 0.005
     adapt_cooldown_steps: int = 0
     position_min: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     source_position_prior: str = "surface"
-    init_num_sources: Tuple[int, int] = (0, 3)
-    init_grid_spacing_m: float | None = None
-    init_grid_repeats: int = 1
-    init_joint_position_design: str = "independent"
-    init_joint_position_retries: int = 1
-    init_source_min_separation_m: float = 0.0
-    roughening_k: float = 0.5
-    surface_rejuvenation_enable: bool = True
-    min_sigma_pos: float = 0.05
-    max_sigma_pos: float = 1.5
-    roughening_decay: float = 0.5
-    roughening_min_mult: float = 0.25
+    init_num_sources: Tuple[int, int] = (
+        0,
+        DEFAULT_MAX_SOURCES_PER_ISOTOPE,
+    )
     init_strength_prior: str = "lognormal"
     init_strength_min: float = 0.0
     init_strength_max: float | None = None
     init_strength_log_mean: float = 9.0
     init_strength_log_sigma: float = 1.0
-    strength_log_sigma: float = 0.3
     observation_covariance_projection_enable: bool = True
     observation_covariance_projection_weight: float = 1.0
     observation_covariance_projection_max_corr: float = 0.999
@@ -471,13 +182,6 @@ class RotatingShieldPFConfig:
     ig_workers: int = 0
     parallel_isotope_updates: bool = True
     parallel_isotope_workers: int | None = None
-    label_enable: bool = True
-    label_alignment_iters: int = 2
-    label_pos_weight: float = 1.0
-    label_strength_weight: float = 0.2
-    label_missing_cost: float = 1e3
-    label_pos_scale: float | None = None
-    label_strength_scale: float | None = None
     converge_enable: bool = False
     converge_window: int = 8
     converge_map_move_eps_m: float = 0.4
@@ -486,40 +190,31 @@ class RotatingShieldPFConfig:
     converge_min_steps: int = 30
     converge_require_all: bool = True
     converge_cardinality_var_max: float = 0.05
-    converge_require_no_tentative: bool = True
-    converge_freeze_updates: bool = False
     converge_min_stations: int = 0
-    converge_cluster_spread_max_m: float = 0.0
-    converge_cluster_min_support_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate and normalize estimator configuration values."""
+        self.num_particles = int(self.num_particles)
+        if self.num_particles < 1:
+            raise ValueError("num_particles must be positive.")
         if self.min_particles is None:
             self.min_particles = max(1, int(self.num_particles * 0.5))
+        else:
+            self.min_particles = int(self.min_particles)
         if self.max_particles is None:
             self.max_particles = max(self.num_particles, int(self.num_particles * 2.0))
+        else:
+            self.max_particles = int(self.max_particles)
+        if self.min_particles < 1 or self.max_particles < 1:
+            raise ValueError("min_particles and max_particles must be positive.")
+        if self.min_particles > self.max_particles:
+            raise ValueError("min_particles cannot exceed max_particles.")
         self.ess_low = float(self.ess_low)
         self.ess_high = float(self.ess_high)
         if not 0.0 < self.ess_low < self.ess_high < 1.0:
             raise ValueError(
                 "ess_low and ess_high must satisfy 0 < ess_low < ess_high < 1."
             )
-        self.init_grid_repeats = max(1, int(self.init_grid_repeats))
-        self.init_joint_position_design = (
-            str(self.init_joint_position_design).strip().lower().replace("-", "_")
-        )
-        if self.init_joint_position_design not in {"independent", "latin_hypercube"}:
-            raise ValueError(
-                "init_joint_position_design must be independent or latin_hypercube."
-            )
-        self.init_joint_position_retries = max(
-            1,
-            int(self.init_joint_position_retries),
-        )
-        self.init_source_min_separation_m = max(
-            float(self.init_source_min_separation_m),
-            0.0,
-        )
         self.init_strength_prior = (
             str(self.init_strength_prior).strip().lower().replace("-", "_")
         )
@@ -657,168 +352,16 @@ class RotatingShieldPFConfig:
             1,
             int(self.spectrum_likelihood_bin_chunk),
         )
-        self.birth_residual_gate_p_value = float(self.birth_residual_gate_p_value)
-        if self.birth_residual_gate_p_value < 0.0:
-            raise ValueError("birth_residual_gate_p_value must be >= 0.")
-        self.birth_residual_gate_p_value = min(self.birth_residual_gate_p_value, 1.0)
-        self.birth_residual_min_support = max(1, int(self.birth_residual_min_support))
-        self.birth_residual_support_sigma = max(
-            0.0,
-            float(self.birth_residual_support_sigma),
-        )
-        self.birth_candidate_support_fraction = float(
-            np.clip(float(self.birth_candidate_support_fraction), 0.0, 1.0)
-        )
-        self.source_detector_exclusion_m = max(
-            0.0,
-            float(self.source_detector_exclusion_m),
-        )
-        self.converge_cluster_spread_max_m = max(
-            0.0,
-            float(self.converge_cluster_spread_max_m),
-        )
-        self.converge_cluster_min_support_fraction = float(
-            np.clip(float(self.converge_cluster_min_support_fraction), 0.0, 1.0)
-        )
-        self.birth_count_distance_prior_weight = max(
-            0.0,
-            float(self.birth_count_distance_prior_weight),
-        )
-        self.birth_count_distance_strength_weight = max(
-            0.0,
-            float(self.birth_count_distance_strength_weight),
-        )
-        self.birth_count_distance_log_clip = max(
-            0.0,
-            float(self.birth_count_distance_log_clip),
-        )
-        self.birth_count_distance_strength_sigma = max(
-            1.0e-12,
-            float(self.birth_count_distance_strength_sigma),
-        )
-        self.birth_matching_pursuit_max_new_sources = max(
-            1,
-            int(self.birth_matching_pursuit_max_new_sources),
-        )
-        self.birth_matching_pursuit_topk_candidates = max(
-            1,
-            int(self.birth_matching_pursuit_topk_candidates),
-        )
-        self.birth_orthogonalize_residual_candidates = bool(
-            self.birth_orthogonalize_residual_candidates
-        )
-        self.birth_orthogonal_candidate_corr_max = float(
-            np.clip(float(self.birth_orthogonal_candidate_corr_max), 0.0, 1.0)
-        )
-        if self.birth_residual_expanded_structural_topk_particles is not None:
-            expanded_topk = int(self.birth_residual_expanded_structural_topk_particles)
-            self.birth_residual_expanded_structural_topk_particles = (
-                None if expanded_topk <= 0 else expanded_topk
-            )
-        self.mode_preserving_max_modes = max(
-            0,
-            int(self.mode_preserving_max_modes),
-        )
-        self.cardinality_preserving_min_stations = max(
-            0,
-            int(self.cardinality_preserving_min_stations),
-        )
-        self.cardinality_preserving_require_confirmed_structure = bool(
-            self.cardinality_preserving_require_confirmed_structure
-        )
-        self.deferred_resample_roughening_scale = max(
-            0.0,
-            float(self.deferred_resample_roughening_scale),
-        )
-        self.mode_preserving_particles_per_mode = max(
-            0,
-            int(self.mode_preserving_particles_per_mode),
-        )
-        self.mode_preserving_radius_m = max(
-            1.0e-6,
-            float(self.mode_preserving_radius_m),
-        )
-        self.mode_preserving_min_weight_fraction = max(
-            0.0,
-            float(self.mode_preserving_min_weight_fraction),
-        )
-        self.mode_preserving_surface_strata = bool(self.mode_preserving_surface_strata)
-        self.mode_preserving_height_bin_m = max(
-            0.0,
-            float(self.mode_preserving_height_bin_m),
-        )
-        self.mode_preserving_high_surface_extra_particles = max(
-            0,
-            int(self.mode_preserving_high_surface_extra_particles),
-        )
-        self.mode_preserving_high_surface_z_fraction = float(
-            np.clip(float(self.mode_preserving_high_surface_z_fraction), 0.0, 1.0)
-        )
-        self.mode_preserving_support_score_weight = max(
-            0.0,
-            float(self.mode_preserving_support_score_weight),
-        )
-        self.mode_preserving_tentative_boost = max(
-            1.0,
-            float(self.mode_preserving_tentative_boost),
-        )
-        self.mode_preserving_residual_boost = max(
-            1.0,
-            float(self.mode_preserving_residual_boost),
-        )
-        self.mode_preserving_cardinality_strata = bool(
-            self.mode_preserving_cardinality_strata
-        )
-        self.mode_preserving_min_particles_per_cardinality = max(
-            0,
-            int(self.mode_preserving_min_particles_per_cardinality),
-        )
-        self.mode_preserving_dynamic_cardinality_allocation = bool(
-            self.mode_preserving_dynamic_cardinality_allocation
-        )
-        self.mode_preserving_dynamic_cardinality_extra_particles = max(
-            0,
-            int(self.mode_preserving_dynamic_cardinality_extra_particles),
-        )
-        self.mode_preserving_dynamic_cardinality_min_mass = max(
-            0.0,
-            float(self.mode_preserving_dynamic_cardinality_min_mass),
-        )
-        self.mode_preserving_dynamic_cardinality_entropy_min = max(
-            0.0,
-            float(self.mode_preserving_dynamic_cardinality_entropy_min),
-        )
-        self.mode_preserving_dynamic_spatial_allocation = bool(
-            self.mode_preserving_dynamic_spatial_allocation
-        )
-        self.mode_preserving_dynamic_spatial_extra_particles = max(
-            0,
-            int(self.mode_preserving_dynamic_spatial_extra_particles),
-        )
-        self.mode_preserving_dynamic_spatial_min_score_fraction = max(
-            0.0,
-            float(self.mode_preserving_dynamic_spatial_min_score_fraction),
-        )
         if isinstance(self.source_position_prior, bool):
             prior = "surface" if self.source_position_prior else "volume"
         else:
             prior = str(self.source_position_prior).strip().lower()
         if prior in {"surface_constrained", "surface-constrained", "surfaces"}:
             prior = "surface"
-        if prior not in {"volume", "surface"}:
-            raise ValueError("source_position_prior must be 'volume' or 'surface'.")
-        self.source_position_prior = prior
-        self.surface_rejuvenation_enable = bool(self.surface_rejuvenation_enable)
-        self.structural_kernel_mode = (
-            str(self.structural_kernel_mode).strip().lower().replace("-", "_")
-        )
-        if self.structural_kernel_mode not in {"heuristic", "rj_mh"}:
-            raise ValueError(
-                "structural_kernel_mode must be 'heuristic' or 'rj_mh'."
-            )
-        self.structural_rj_patch_spacing_m = float(
-            self.structural_rj_patch_spacing_m
-        )
+        if prior != "surface":
+            raise ValueError("Pure PF requires source_position_prior='surface'.")
+        self.source_position_prior = "surface"
+        self.structural_rj_patch_spacing_m = float(self.structural_rj_patch_spacing_m)
         if (
             not np.isfinite(self.structural_rj_patch_spacing_m)
             or self.structural_rj_patch_spacing_m <= 0.0
@@ -842,166 +385,25 @@ class RotatingShieldPFConfig:
                 (tuple, list),
             ):
                 raise ValueError(
-                    "structural_cardinality_prior_probs must be a tuple, "
-                    "list, or None."
+                    "structural_cardinality_prior_probs must be a tuple, list, or None."
                 )
-            cardinality_prior = tuple(
-                float(value)
-                for value in self.structural_cardinality_prior_probs
+            cardinality_prior = np.asarray(
+                [float(value) for value in self.structural_cardinality_prior_probs],
+                dtype=float,
             )
-            if not cardinality_prior or any(
-                not np.isfinite(value) or value <= 0.0
-                for value in cardinality_prior
+            if (
+                cardinality_prior.size == 0
+                or np.any(~np.isfinite(cardinality_prior))
+                or np.any(cardinality_prior <= 0.0)
             ):
                 raise ValueError(
                     "structural_cardinality_prior_probs must contain only "
                     "positive finite values."
                 )
-            self.structural_cardinality_prior_probs = cardinality_prior
-        self.cardinality_preserving_resample = bool(
-            self.cardinality_preserving_resample
-        )
-        self.mode_preserving_resample = bool(self.mode_preserving_resample)
-        if self.structural_kernel_mode == "rj_mh" and bool(self.birth_enable):
-            if self.source_position_prior != "surface":
-                raise ValueError(
-                    "structural_kernel_mode='rj_mh' requires "
-                    "source_position_prior='surface'."
-                )
-            if self.max_sources is None or int(self.max_sources) < 1:
-                raise ValueError(
-                    "structural_kernel_mode='rj_mh' requires a finite "
-                    "positive max_sources."
-                )
-            expected_cardinalities = int(self.max_sources) + 1
-            if (
-                self.structural_cardinality_prior_probs is not None
-                and len(self.structural_cardinality_prior_probs)
-                != expected_cardinalities
-            ):
-                raise ValueError(
-                    "structural_cardinality_prior_probs must contain "
-                    "max_sources + 1 entries in rj_mh mode."
-                )
-            initial_lower, initial_upper = self.init_num_sources
-            if (
-                int(initial_lower) != 0
-                or int(initial_upper) != int(self.max_sources)
-            ):
-                raise ValueError(
-                    "structural_kernel_mode='rj_mh' requires "
-                    "init_num_sources=(0, max_sources)."
-                )
-            if (
-                self.structural_rj_birth_probability <= 0.0
-                or self.structural_rj_death_probability <= 0.0
-            ):
-                raise ValueError(
-                    "structural_kernel_mode='rj_mh' with structural moves "
-                    "enabled requires positive birth and death probabilities."
-                )
-            incompatible = {
-                "split_prob": float(self.split_prob) != 0.0,
-                "merge_prob": float(self.merge_prob) != 0.0,
-                "surface_rejuvenation_enable": self.surface_rejuvenation_enable,
-                "mode_preserving_resample": self.mode_preserving_resample,
-                "cardinality_preserving_resample": (
-                    self.cardinality_preserving_resample
-                ),
-                "pseudo_source_verification_enable": bool(
-                    self.pseudo_source_verification_enable
-                ),
-                "source_detector_exclusion_m": (
-                    self.source_detector_exclusion_m > 0.0
-                ),
-                "init_source_min_separation_m": (
-                    self.init_source_min_separation_m > 0.0
-                ),
-            }
-            enabled_incompatible = [
-                name for name, enabled in incompatible.items() if enabled
-            ]
-            if enabled_incompatible:
-                joined = ", ".join(enabled_incompatible)
-                raise ValueError(
-                    "structural_kernel_mode='rj_mh' requires incompatible "
-                    f"options to be disabled or zero: {joined}."
-                )
-        if (
-            bool(self.birth_enable)
-            and self.max_sources is not None
-            and int(self.max_sources) > 1
-        ):
-            self.use_clustered_output = True
-        if self.birth_jitter_topk_candidates is not None:
-            self.birth_jitter_topk_candidates = max(
-                1,
-                int(self.birth_jitter_topk_candidates),
+            cardinality_prior /= float(np.sum(cardinality_prior))
+            self.structural_cardinality_prior_probs = tuple(
+                float(value) for value in cardinality_prior
             )
-        self.residual_decomposition_enable = bool(self.residual_decomposition_enable)
-        self.peak_suppression_enable = bool(self.peak_suppression_enable)
-        self.peak_suppression_min_source_fraction = float(
-            np.clip(float(self.peak_suppression_min_source_fraction), 0.0, 1.0)
-        )
-        self.peak_suppression_factor = float(
-            np.clip(float(self.peak_suppression_factor), 0.0, 1.0)
-        )
-        self.residual_decomposition_max_layers = max(
-            1,
-            int(self.residual_decomposition_max_layers),
-        )
-        self.pseudo_source_verification_enable = bool(
-            self.pseudo_source_verification_enable
-        )
-        self.pseudo_source_min_delta_ll = float(self.pseudo_source_min_delta_ll)
-        self.pseudo_source_min_distinct_views = max(
-            1,
-            int(self.pseudo_source_min_distinct_views),
-        )
-        self.pseudo_source_fail_grace_stations = max(
-            0,
-            int(self.pseudo_source_fail_grace_stations),
-        )
-        self.pseudo_source_corr_max = float(
-            np.clip(float(self.pseudo_source_corr_max), 0.0, 1.0)
-        )
-        self.pseudo_source_temporal_sep_min = max(
-            0.0,
-            float(self.pseudo_source_temporal_sep_min),
-        )
-        self.pseudo_source_quarantine_on_suppress = bool(
-            self.pseudo_source_quarantine_on_suppress
-        )
-        self.source_prune_min_distinct_stations = max(
-            1,
-            int(self.source_prune_min_distinct_stations),
-        )
-        self.source_prune_min_distinct_views = max(
-            1,
-            int(self.source_prune_min_distinct_views),
-        )
-        self.source_prune_fail_grace_stations = max(
-            1,
-            int(self.source_prune_fail_grace_stations),
-        )
-        self.source_prune_delta_ll_threshold = float(
-            self.source_prune_delta_ll_threshold
-        )
-        self.source_prune_bic_penalty_params = max(
-            0,
-            int(self.source_prune_bic_penalty_params),
-        )
-        self.birth_residual_expand_structural_particles = bool(
-            self.birth_residual_expand_structural_particles
-        )
-        if self.birth_max_per_update is not None:
-            self.birth_max_per_update = max(0, int(self.birth_max_per_update))
-        self.birth_delta_ll_threshold = float(self.birth_delta_ll_threshold)
-        self.birth_complexity_penalty = max(0.0, float(self.birth_complexity_penalty))
-        self.birth_bic_penalty_params = max(0, int(self.birth_bic_penalty_params))
-        self.birth_stage_single_station_as_quarantine = bool(
-            self.birth_stage_single_station_as_quarantine
-        )
         self.history_estimate_interval = max(0, int(self.history_estimate_interval))
         self.candidate_response_cache_max_entries = max(
             0,
@@ -1011,27 +413,56 @@ class RotatingShieldPFConfig:
             0.0,
             float(self.converge_cardinality_var_max),
         )
-        self.converge_require_no_tentative = bool(self.converge_require_no_tentative)
-        self.converge_freeze_updates = bool(self.converge_freeze_updates)
         self.converge_min_stations = max(0, int(self.converge_min_stations))
-        self.split_residual_guided = bool(self.split_residual_guided)
-        self.split_complexity_penalty = max(0.0, float(self.split_complexity_penalty))
-        self.split_residual_candidate_count = max(
-            1,
-            int(self.split_residual_candidate_count),
-        )
-        self.merge_response_corr_min = float(
-            np.clip(float(self.merge_response_corr_min), 0.0, 1.0)
-        )
-        self.merge_search_topk_pairs = max(1, int(self.merge_search_topk_pairs))
-        self.structural_trial_workers = max(1, int(self.structural_trial_workers))
-        self.structural_trial_parallel_min_trials = max(
-            1,
-            int(self.structural_trial_parallel_min_trials),
-        )
         self.parallel_isotope_updates = bool(self.parallel_isotope_updates)
         if self.parallel_isotope_workers is not None:
             self.parallel_isotope_workers = max(1, int(self.parallel_isotope_workers))
+        self.birth_enable = bool(self.birth_enable)
+        if self.max_sources is None or int(self.max_sources) < 1:
+            raise ValueError("Pure PF requires a finite positive max_sources.")
+        self.max_sources = int(self.max_sources)
+        if (
+            self.structural_cardinality_prior_probs is not None
+            and len(self.structural_cardinality_prior_probs) != self.max_sources + 1
+        ):
+            raise ValueError(
+                "structural_cardinality_prior_probs must contain "
+                "max_sources + 1 entries."
+            )
+        initial_lower, initial_upper = (
+            int(self.init_num_sources[0]),
+            int(self.init_num_sources[1]),
+        )
+        if self.birth_enable:
+            if (
+                self.structural_rj_move_probability <= 0.0
+                or self.structural_rj_birth_probability <= 0.0
+                or self.structural_rj_death_probability <= 0.0
+            ):
+                raise ValueError(
+                    "Variable-cardinality pure PF requires positive structural "
+                    "move, birth, and death proposal probabilities."
+                )
+            if initial_lower != 0 or initial_upper != self.max_sources:
+                raise ValueError(
+                    "Variable-cardinality pure PF initialization must cover "
+                    "every cardinality from zero through max_sources."
+                )
+            if self.num_particles < self.max_sources + 1:
+                raise ValueError(
+                    "Variable-cardinality pure PF requires at least one initial "
+                    "particle per cardinality from zero through max_sources."
+                )
+        elif (
+            initial_lower != initial_upper
+            or initial_lower < 0
+            or initial_upper > self.max_sources
+        ):
+            raise ValueError(
+                "Structural moves disabled requires fixed "
+                "init_num_sources=(K, K) within zero through max_sources."
+            )
+        self.init_num_sources = (initial_lower, initial_upper)
 
 
 @dataclass(frozen=True)
@@ -1128,7 +559,7 @@ class RotatingShieldPFEstimator:
         ] = []
         self.history_scores: List[float] = []
         self.measurements: List[MeasurementRecord] = []
-        self._defer_resample_birth = False
+        self._defer_structural_moves = False
         self._deferred_measurement_count = 0
         self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = 0.0
@@ -1447,26 +878,6 @@ class RotatingShieldPFEstimator:
             sources=sources,
             strengths=strengths,
         )
-
-    def _cached_candidate_grid_counts(
-        self,
-        *,
-        filt: IsotopeParticleFilter,
-        isotope: str,
-        data: MeasurementData,
-    ) -> NDArray[np.float64]:
-        """Return unit-strength responses for the full source-candidate grid."""
-        pool = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
-        if pool.size == 0:
-            return np.zeros((int(data.z_k.size), 0), dtype=float)
-        counts = self._cached_expected_counts_per_source(
-            filt=filt,
-            isotope=isotope,
-            data=data,
-            sources=pool,
-            strengths=np.ones(pool.shape[0], dtype=float),
-        )
-        return np.asarray(counts, dtype=float)
 
     def _resolve_mu_by_isotope(
         self, mu_by_isotope: Dict[str, object] | None
@@ -2167,19 +1578,23 @@ class RotatingShieldPFEstimator:
         route_array = np.asarray(routes, dtype="<U16")
         explicit_array = np.asarray(explicit_routes, dtype=bool)
         likelihood_config = getattr(filt, "config", pf_config)
-        configured_station_covariance = bool(
-            getattr(
-                likelihood_config,
-                "station_view_covariance_enable",
-                False,
+        configured_station_covariance = (
+            bool(
+                getattr(
+                    likelihood_config,
+                    "station_view_covariance_enable",
+                    False,
+                )
             )
-        ) and float(
-            getattr(
-                likelihood_config,
-                "station_view_correlated_spectrum_fraction",
-                0.0,
+            and float(
+                getattr(
+                    likelihood_config,
+                    "station_view_correlated_spectrum_fraction",
+                    0.0,
+                )
             )
-        ) > 0.0
+            > 0.0
+        )
         for sequence_id in np.unique(sequence_ids):
             block_mask = sequence_ids == int(sequence_id)
             if np.any(explicit_array[block_mask]) or np.count_nonzero(block_mask) < 2:
@@ -2239,7 +1654,11 @@ class RotatingShieldPFEstimator:
                 bool(explicit[str(isotope)])
                 for index in block_indices
                 if (
-                    (explicit := records[int(index)].runtime_spectrum_variance_used_by_isotope)
+                    (
+                        explicit := records[
+                            int(index)
+                        ].runtime_spectrum_variance_used_by_isotope
+                    )
                     is not None
                     and str(isotope) in explicit
                 )
@@ -2292,10 +1711,8 @@ class RotatingShieldPFEstimator:
             raise ValueError(
                 "A recorded direct-spectrum route is missing its spectrum payload."
             )
-        stacked_direct = (
-            RotatingShieldPFEstimator._stack_pf_spectrum_sequence_payloads(
-                direct_payloads
-            )
+        stacked_direct = RotatingShieldPFEstimator._stack_pf_spectrum_sequence_payloads(
+            direct_payloads
         )
         if stacked_direct is None:
             raise ValueError("Recorded direct-spectrum payload rows are inconsistent.")
@@ -2825,10 +2242,6 @@ class RotatingShieldPFEstimator:
             )
 
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:
@@ -3045,10 +2458,6 @@ class RotatingShieldPFEstimator:
         score = 0.0
         floor = max(float(variance_floor), eps)
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if particles_by_isotope is not None and iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:
@@ -3100,10 +2509,6 @@ class RotatingShieldPFEstimator:
         rng = rng or np.random.default_rng()
         subsets: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] = {}
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if not filt.continuous_particles:
                 continue
             weights = filt.continuous_weights
@@ -3342,7 +2747,7 @@ class RotatingShieldPFEstimator:
                     else float(effective_variance_k.get(iso, 0.0))
                 ),
                 step_idx=len(self.measurements),
-                defer_resample=bool(self._defer_resample_birth),
+                defer_resample=bool(self._defer_structural_moves),
                 **({} if pf_spectrum_payload is None else pf_spectrum_payload),
             )
             runtime_likelihood_routes[str(iso)] = (
@@ -3421,16 +2826,16 @@ class RotatingShieldPFEstimator:
                 ),
             )
         )
-        if self._defer_resample_birth:
+        if self._defer_structural_moves:
             self._deferred_measurement_count += 1
         else:
             self._apply_structural_moves()
-        if not self._defer_resample_birth:
+        if not self._defer_structural_moves:
             self._record_history_estimate(len(self.measurements))
 
     def begin_deferred_pose_update(self) -> None:
-        """Start a station-level update that delays only structural moves."""
-        self._defer_resample_birth = True
+        """Start a station-level update that delays exact structural moves."""
+        self._defer_structural_moves = True
         self._deferred_measurement_count = 0
 
     def finalize_deferred_pose_update(self) -> int:
@@ -3438,12 +2843,11 @@ class RotatingShieldPFEstimator:
         Finish a station-level delayed update and return finalized measurements.
 
         During a delayed update, each shield posture updates particle weights
-        immediately and may resample on ESS. This method then performs
-        station-level adaptation, label alignment, and residual-gated
-        birth/death once.
+        immediately and may resample on ESS. This method performs station-level
+        particle-count adaptation and then one exact structural RJ-MH update.
         """
         count = int(self._deferred_measurement_count)
-        self._defer_resample_birth = False
+        self._defer_structural_moves = False
         self._deferred_measurement_count = 0
         if count <= 0:
             return 0
@@ -4035,13 +3439,11 @@ class RotatingShieldPFEstimator:
             selected_records,
             spectrum_payloads,
         )
-        spectrum_variance_present = (
-            self._runtime_spectrum_variance_usage_for_records(
-                isotope,
-                selected_records,
-                spectrum_payloads,
-                runtime_likelihood_routes,
-            )
+        spectrum_variance_present = self._runtime_spectrum_variance_usage_for_records(
+            isotope,
+            selected_records,
+            spectrum_payloads,
+            runtime_likelihood_routes,
         )
         spectrum_payload = self._stack_pf_spectrum_history_payloads(
             spectrum_payloads,
@@ -4052,9 +3454,7 @@ class RotatingShieldPFEstimator:
             isotope,
             selected_records,
         )
-        station_sequence_ids = self._station_sequence_ids_for_records(
-            selected_records
-        )
+        station_sequence_ids = self._station_sequence_ids_for_records(selected_records)
         z_list = []
         poses = []
         fe_indices = []
@@ -4068,9 +3468,7 @@ class RotatingShieldPFEstimator:
             else:
                 variance_value = float(rec.z_variance_k.get(isotope, 0.0))
                 variance_list.append(
-                    max(variance_value, 0.0)
-                    if np.isfinite(variance_value)
-                    else 0.0
+                    max(variance_value, 0.0) if np.isfinite(variance_value) else 0.0
                 )
             poses.append(
                 self.poses[rec.pose_idx]
@@ -4275,11 +3673,7 @@ class RotatingShieldPFEstimator:
     ) -> None:
         """Run one isotope's PF-native structural update."""
         _isotope, filt, evidence_data = task
-        filt.apply_structural_moves(
-            evidence_data=evidence_data,
-            candidate_positions=self.candidate_sources,
-            allow_structural_birth_proposals=True,
-        )
+        filt.apply_structural_moves(evidence_data)
 
     def _structural_update_worker_count(self, task_count: int) -> int:
         """Return the worker count for independent per-isotope structural updates."""
@@ -4301,10 +3695,6 @@ class RotatingShieldPFEstimator:
             ]
         ] = []
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             structural_data = self._measurement_data_for_iso(iso, None)
             tasks.append((iso, filt, structural_data))
         worker_count = self._structural_update_worker_count(len(tasks))
@@ -4321,18 +3711,26 @@ class RotatingShieldPFEstimator:
     def estimates(
         self,
     ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
-        """Return the current PF posterior projection without a secondary solver."""
+        """Return the canonical MAP-cardinality PF posterior projection."""
         estimates: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
         for isotope, filt in self.filters.items():
-            use_clustered = bool(
-                filt.config.birth_enable and filt.config.use_clustered_output
+            point_estimate = posterior_point_estimate_from_states(
+                [particle.state for particle in filt.continuous_particles],
+                np.asarray(filt.continuous_weights, dtype=float),
+                max_cardinality=self.pf_config.max_sources,
+                position_projector=filt._project_positions_to_source_prior,
             )
-            positions, strengths = (
-                filt.estimate_clustered() if use_clustered else filt.estimate()
+            positions = np.asarray(
+                [mode.position_mean_xyz for mode in point_estimate.modes],
+                dtype=float,
+            ).reshape(-1, 3)
+            strengths = np.asarray(
+                [mode.strength_mean_cps_1m for mode in point_estimate.modes],
+                dtype=float,
             )
             estimates[isotope] = (
-                np.asarray(positions, dtype=float).reshape(-1, 3).copy(),
-                np.asarray(strengths, dtype=float).reshape(-1).copy(),
+                positions,
+                strengths,
             )
         return estimates
 
@@ -4361,11 +3759,7 @@ class RotatingShieldPFEstimator:
         estimate_map = (
             self.estimates() if reported_estimates is None else dict(reported_estimates)
         )
-        radius = (
-            max(float(self.pf_config.cluster_eps_m), 1.0e-6)
-            if match_radius_m is None
-            else float(match_radius_m)
-        )
+        radius = 0.8 if match_radius_m is None else float(match_radius_m)
         environment = self._source_prior_environment()
         output: Dict[str, List[Dict[str, Any]]] = {}
         for isotope, estimate in estimate_map.items():
@@ -4513,52 +3907,16 @@ class RotatingShieldPFEstimator:
         return evidence
 
     def unresolved_structural_evidence(self) -> dict[str, dict[str, Any]]:
-        """Return PF-native structural evidence that still needs measurements."""
-        unresolved: dict[str, dict[str, Any]] = {}
-        discriminative_reasons = {
-            "needs_discriminative_views",
-            "insufficient_distinct_views",
-            "high_response_corr",
-            "too_young_to_prune",
-        }
-        support_floor = max(1, int(self.pf_config.birth_residual_min_support))
-        for isotope, filt in self.filters.items():
-            payload: dict[str, Any] = {}
-            reasons = getattr(filt, "last_pseudo_source_fail_reasons", {})
-            reason_payload = (
-                {str(reason): int(count) for reason, count in reasons.items()}
-                if isinstance(reasons, dict)
-                else {}
-            )
-            unresolved_pseudo = {
-                reason: count
-                for reason, count in reason_payload.items()
-                if reason in discriminative_reasons and int(count) > 0
-            }
-            if unresolved_pseudo:
-                payload["pseudo_source_fail_reasons"] = unresolved_pseudo
-            birth_gate_passed = bool(
-                getattr(filt, "last_birth_residual_gate_passed", False)
-            )
-            birth_support = int(getattr(filt, "last_birth_residual_support", 0))
-            if birth_gate_passed and birth_support >= support_floor:
-                payload["birth_residual"] = {
-                    "gate_passed": True,
-                    "support": int(birth_support),
-                    "support_floor": int(support_floor),
-                    "chi2": float(getattr(filt, "last_birth_residual_chi2", 0.0)),
-                    "p_value": float(getattr(filt, "last_birth_residual_p_value", 1.0)),
-                }
-            if payload:
-                unresolved[str(isotope)] = payload
+        """Return observations that conflict with a background-only PF mode."""
         absent_evidence = self.unresolved_isotope_evidence(
             min_total_counts=25.0,
             min_max_count=5.0,
             min_snr=2.0,
         )
-        for isotope, payload in absent_evidence.items():
-            unresolved.setdefault(str(isotope), {})["isotope_absence"] = payload
-        return unresolved
+        return {
+            str(isotope): {"isotope_absence": payload}
+            for isotope, payload in absent_evidence.items()
+        }
 
     def step_diagnostics(
         self,
@@ -4569,10 +3927,9 @@ class RotatingShieldPFEstimator:
         """
         Return per-isotope diagnostics for the current PF state.
 
-        The diagnostics include ESS, resample/birth/kill counts, and the source
-        count distribution.  When include_estimates is false, the routine avoids
-        report-only clustered MMSE recomputation so per-measurement health logs
-        cannot stall the runtime path.
+        The diagnostics include ESS, resample/birth/death counts, and the source
+        count distribution. When include_estimates is false, the routine avoids
+        the posterior point-estimate projection.
         """
         diagnostics: Dict[str, Dict[str, Any]] = {}
         eps = 1e-12
@@ -4585,79 +3942,8 @@ class RotatingShieldPFEstimator:
                     "ess_post": None,
                     "n_after_adapt": 0,
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
-                    "mode_preserved_count": int(
-                        getattr(filt, "last_mode_preserved_count", 0)
-                    ),
-                    "mode_preserving_strata_summary": dict(
-                        getattr(filt, "last_mode_preserving_strata_summary", {})
-                    ),
-                    "mode_preserving_selected_strata": list(
-                        getattr(filt, "last_mode_preserving_selected_strata", [])
-                    ),
-                    "mode_preserving_cardinality_summary": dict(
-                        getattr(filt, "last_mode_preserving_cardinality_summary", {})
-                    ),
-                    "mode_preserving_selected_cardinalities": list(
-                        getattr(
-                            filt,
-                            "last_mode_preserving_selected_cardinalities",
-                            [],
-                        )
-                    ),
-                    "mode_preserving_dynamic_spatial_summary": list(
-                        getattr(
-                            filt,
-                            "last_mode_preserving_dynamic_spatial_summary",
-                            [],
-                        )
-                    ),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
-                    "kill_count": int(getattr(filt, "last_kill_count", 0)),
-                    "birth_residual_chi2": float(
-                        getattr(filt, "last_birth_residual_chi2", 0.0)
-                    ),
-                    "birth_residual_p_value": float(
-                        getattr(filt, "last_birth_residual_p_value", 1.0)
-                    ),
-                    "birth_residual_support": int(
-                        getattr(filt, "last_birth_residual_support", 0)
-                    ),
-                    "birth_residual_distinct_poses": int(
-                        getattr(filt, "last_birth_residual_distinct_poses", 0)
-                    ),
-                    "birth_residual_distinct_stations": int(
-                        getattr(filt, "last_birth_residual_distinct_stations", 0)
-                    ),
-                    "birth_residual_gate_passed": bool(
-                        getattr(filt, "last_birth_residual_gate_passed", False)
-                    ),
-                    "birth_residual_layer": str(
-                        getattr(filt, "last_birth_residual_layer", "none")
-                    ),
-                    "birth_residual_layer_count": int(
-                        getattr(filt, "last_birth_residual_layer_count", 0)
-                    ),
-                    "birth_structural_eligible": int(
-                        getattr(filt, "last_birth_structural_eligible", 0)
-                    ),
-                    "pseudo_source_verified": int(
-                        getattr(filt, "last_pseudo_source_verified", 0)
-                    ),
-                    "pseudo_source_failed": int(
-                        getattr(filt, "last_pseudo_source_failed", 0)
-                    ),
-                    "pseudo_source_pruned": int(
-                        getattr(filt, "last_pseudo_source_pruned", 0)
-                    ),
-                    "pseudo_source_quarantined": int(
-                        getattr(filt, "last_pseudo_source_quarantined", 0)
-                    ),
-                    "pseudo_source_quarantine_active": int(
-                        getattr(filt, "last_pseudo_source_quarantine_active", 0)
-                    ),
-                    "pseudo_source_fail_reasons": dict(
-                        getattr(filt, "last_pseudo_source_fail_reasons", {})
-                    ),
+                    "death_count": int(getattr(filt, "last_death_count", 0)),
                     "structural_timing_s": dict(
                         getattr(filt, "last_structural_timing_s", {})
                     ),
@@ -4673,7 +3959,6 @@ class RotatingShieldPFEstimator:
                     "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
                     "top_k": [],
                     "converged": bool(getattr(filt, "is_converged", False)),
-                    "updates_skipped": int(getattr(filt, "updates_skipped", 0)),
                 }
                 continue
             weights = np.asarray(filt.continuous_weights, dtype=float)
@@ -4720,12 +4005,7 @@ class RotatingShieldPFEstimator:
             map_strengths = best_state.strengths[:best_source_count].copy()
             if include_estimates:
                 try:
-                    if bool(
-                        filt.config.birth_enable and filt.config.use_clustered_output
-                    ) and hasattr(filt, "estimate_clustered"):
-                        mmse_positions, mmse_strengths = filt.estimate_clustered()
-                    else:
-                        mmse_positions, mmse_strengths = filt.estimate()
+                    mmse_positions, mmse_strengths = filt.estimate()
                 except RuntimeError:
                     mmse_positions = np.zeros((0, 3), dtype=float)
                     mmse_strengths = np.zeros(0, dtype=float)
@@ -4752,79 +4032,8 @@ class RotatingShieldPFEstimator:
                 "ess_post": ess_post,
                 "n_after_adapt": int(n_after_adapt),
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
-                "mode_preserved_count": int(
-                    getattr(filt, "last_mode_preserved_count", 0)
-                ),
-                "mode_preserving_strata_summary": dict(
-                    getattr(filt, "last_mode_preserving_strata_summary", {})
-                ),
-                "mode_preserving_selected_strata": list(
-                    getattr(filt, "last_mode_preserving_selected_strata", [])
-                ),
-                "mode_preserving_cardinality_summary": dict(
-                    getattr(filt, "last_mode_preserving_cardinality_summary", {})
-                ),
-                "mode_preserving_selected_cardinalities": list(
-                    getattr(
-                        filt,
-                        "last_mode_preserving_selected_cardinalities",
-                        [],
-                    )
-                ),
-                "mode_preserving_dynamic_spatial_summary": list(
-                    getattr(
-                        filt,
-                        "last_mode_preserving_dynamic_spatial_summary",
-                        [],
-                    )
-                ),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
-                "kill_count": int(getattr(filt, "last_kill_count", 0)),
-                "birth_residual_chi2": float(
-                    getattr(filt, "last_birth_residual_chi2", 0.0)
-                ),
-                "birth_residual_p_value": float(
-                    getattr(filt, "last_birth_residual_p_value", 1.0)
-                ),
-                "birth_residual_support": int(
-                    getattr(filt, "last_birth_residual_support", 0)
-                ),
-                "birth_residual_distinct_poses": int(
-                    getattr(filt, "last_birth_residual_distinct_poses", 0)
-                ),
-                "birth_residual_distinct_stations": int(
-                    getattr(filt, "last_birth_residual_distinct_stations", 0)
-                ),
-                "birth_residual_gate_passed": bool(
-                    getattr(filt, "last_birth_residual_gate_passed", False)
-                ),
-                "birth_residual_layer": str(
-                    getattr(filt, "last_birth_residual_layer", "none")
-                ),
-                "birth_residual_layer_count": int(
-                    getattr(filt, "last_birth_residual_layer_count", 0)
-                ),
-                "birth_structural_eligible": int(
-                    getattr(filt, "last_birth_structural_eligible", 0)
-                ),
-                "pseudo_source_verified": int(
-                    getattr(filt, "last_pseudo_source_verified", 0)
-                ),
-                "pseudo_source_failed": int(
-                    getattr(filt, "last_pseudo_source_failed", 0)
-                ),
-                "pseudo_source_pruned": int(
-                    getattr(filt, "last_pseudo_source_pruned", 0)
-                ),
-                "pseudo_source_quarantined": int(
-                    getattr(filt, "last_pseudo_source_quarantined", 0)
-                ),
-                "pseudo_source_quarantine_active": int(
-                    getattr(filt, "last_pseudo_source_quarantine_active", 0)
-                ),
-                "pseudo_source_fail_reasons": dict(
-                    getattr(filt, "last_pseudo_source_fail_reasons", {})
-                ),
+                "death_count": int(getattr(filt, "last_death_count", 0)),
                 "structural_timing_s": dict(
                     getattr(filt, "last_structural_timing_s", {})
                 ),
@@ -4840,7 +4049,6 @@ class RotatingShieldPFEstimator:
                 "mmse": (mmse_positions, mmse_strengths),
                 "top_k": top_entries,
                 "converged": bool(getattr(filt, "is_converged", False)),
-                "updates_skipped": int(getattr(filt, "updates_skipped", 0)),
             }
         return diagnostics
 
@@ -5212,10 +4420,6 @@ class RotatingShieldPFEstimator:
         ig_total = 0.0
         eps = 1e-9
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             use_continuous = bool(filt.continuous_particles)
             if use_continuous:
                 lam = filt._continuous_expected_counts(
@@ -5339,10 +4543,6 @@ class RotatingShieldPFEstimator:
 
         total_ig = 0.0
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if particles_by_isotope is not None and iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:
@@ -5414,12 +4614,6 @@ class RotatingShieldPFEstimator:
             rng = np.random.default_rng()
             scores = np.zeros(num_pairs, dtype=float)
             for iso, filt in self.filters.items():
-                if getattr(filt, "is_converged", False) and getattr(
-                    filt.config,
-                    "converge_enable",
-                    False,
-                ):
-                    continue
                 if particles_by_isotope is not None and iso in particles_by_isotope:
                     states, weights = particles_by_isotope[iso]
                 else:
@@ -5466,10 +4660,6 @@ class RotatingShieldPFEstimator:
             tuple["torch.Tensor", "torch.Tensor", CountLikelihoodSpec],
         ] = {}
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if particles_by_isotope is not None and iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:
@@ -5540,10 +4730,6 @@ class RotatingShieldPFEstimator:
         alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
         total_ig = 0.0
         for iso, filt in self.filters.items():
-            if getattr(filt, "is_converged", False) and getattr(
-                filt.config, "converge_enable", False
-            ):
-                continue
             if particles_by_isotope is not None and iso in particles_by_isotope:
                 states, weights = particles_by_isotope[iso]
             else:

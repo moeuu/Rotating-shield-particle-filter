@@ -19,6 +19,7 @@ from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from measurement.obstacles import ObstacleGrid
+from pf.posterior import posterior_point_estimate_from_states
 
 
 @dataclass
@@ -249,46 +250,6 @@ def _format_pos(pos: NDArray[np.float64]) -> str:
     return f"[{coords}]"
 
 
-def _mmse_estimate_by_slot(
-    states: Sequence[Any],
-    weights: NDArray[np.float64],
-    *,
-    max_r: int | None = None,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
-    """Compute per-slot MMSE estimates for positions/strengths and a slot-valid mask."""
-    if not states:
-        return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
-    if max_r is None:
-        max_r = max(int(getattr(st, "num_sources", 0)) for st in states)
-    max_r = int(max_r)
-    if max_r < 0:
-        max_r = 0
-    if max_r <= 0:
-        return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=bool)
-    positions = np.zeros((max_r, 3), dtype=float)
-    strengths = np.zeros(max_r, dtype=float)
-    slot_valid = np.zeros(max_r, dtype=bool)
-    w = _normalize_weights(weights)
-    for j in range(max_r):
-        pos_stack: list[NDArray[np.float64]] = []
-        str_stack: list[float] = []
-        w_stack: list[float] = []
-        for wi, st in zip(w, states):
-            if int(getattr(st, "num_sources", 0)) > j:
-                pos_stack.append(st.positions[j])
-                str_stack.append(float(st.strengths[j]))
-                w_stack.append(float(wi))
-        if not w_stack:
-            continue
-        slot_valid[j] = True
-        wj = _normalize_weights(np.asarray(w_stack, dtype=float))
-        pos_arr = np.vstack(pos_stack)
-        str_arr = np.asarray(str_stack, dtype=float)
-        positions[j] = np.sum(wj[:, None] * pos_arr, axis=0)
-        strengths[j] = float(np.sum(wj * str_arr))
-    return positions, strengths, slot_valid
-
-
 def _filter_estimates(
     positions: NDArray[np.float64],
     strengths: NDArray[np.float64],
@@ -316,8 +277,8 @@ def _filter_estimates(
     return positions[mask], strengths[mask]
 
 
-def _active_display_positions(filt: Any, state: Any) -> NDArray[np.float64]:
-    """Return source positions that should be rendered as active PF particles."""
+def _active_display_positions(state: Any) -> NDArray[np.float64]:
+    """Return the active source positions stored in one PF particle."""
     num_sources = max(0, int(getattr(state, "num_sources", 0)))
     raw_positions = np.asarray(
         getattr(state, "positions", np.zeros((0, 3), dtype=float)),
@@ -329,22 +290,7 @@ def _active_display_positions(filt: Any, state: Any) -> NDArray[np.float64]:
     count = min(num_sources, positions.shape[0])
     if count <= 0:
         return np.zeros((0, 3), dtype=float)
-    mask = np.ones(count, dtype=bool)
-    tentative = getattr(state, "tentative_sources", None)
-    failed = getattr(state, "verification_fail_streaks", None)
-    if tentative is not None and failed is not None:
-        tentative_arr = np.asarray(tentative, dtype=bool).ravel()[:count]
-        failed_arr = np.asarray(failed, dtype=int).ravel()[:count]
-        if tentative_arr.size == count and failed_arr.size == count:
-            config = getattr(filt, "config", None)
-            grace = max(
-                0,
-                int(getattr(config, "pseudo_source_fail_grace_stations", 0)),
-                int(getattr(config, "source_prune_fail_grace_stations", 0)),
-            )
-            quarantined = tentative_arr & (failed_arr > 0) & (failed_arr >= grace)
-            mask &= ~quarantined
-    return positions[:count][mask]
+    return positions[:count]
 
 
 class RealTimePFVisualizer:
@@ -2490,10 +2436,10 @@ def build_frame_from_pf(
     estimated_override: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] | None = None,
 ) -> PFFrame:
     """
-    Construct a PFFrame snapshot from a PF (ParallelIsotopePF-like) and a Measurement.
+    Construct a PFFrame snapshot from the sequential PF and one measurement.
 
     Args:
-        pf: ParallelIsotopePF or compatible with .filters and .estimate_all()
+        pf: Sequential estimator exposing ``filters`` and ``estimate_all()``.
         measurement: Measurement with counts_by_isotope, pose_idx/orient_idx/RFe/RPb (optional)
         step_index: integer step
         time_sec: cumulative time in seconds
@@ -2528,7 +2474,7 @@ def build_frame_from_pf(
         cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
         if cont_particles and len(cont_weights) == len(cont_particles):
             for p, w in zip(cont_particles, cont_weights):
-                active_positions = _active_display_positions(filt, p.state)
+                active_positions = _active_display_positions(p.state)
                 if active_positions.size == 0:
                     continue
                 representative_positions.append(
@@ -2562,18 +2508,7 @@ def build_frame_from_pf(
         elif cont_particles and len(cont_weights) == len(cont_particles):
             states = [p.state for p in cont_particles]
             weights_arr = np.asarray(cont_weights, dtype=float)
-            use_clustered = bool(
-                getattr(filt, "config", None)
-                and getattr(filt.config, "birth_enable", False)
-                and getattr(filt.config, "use_clustered_output", False)
-            )
-            if use_clustered and hasattr(filt, "estimate_clustered"):
-                est_pos, est_str = filt.estimate_clustered()
-                if min_est_strength is not None and est_str.size:
-                    mask = est_str >= min_est_strength
-                    est_pos = est_pos[mask]
-                    est_str = est_str[mask]
-            elif mode == "map":
+            if mode == "map":
                 best = max(cont_particles, key=lambda p: p.log_weight).state
                 best_r = int(getattr(best, "num_sources", 0))
                 if best_r <= 0:
@@ -2598,26 +2533,36 @@ def build_frame_from_pf(
                     min_existence_prob=min_existence_prob,
                 )
             else:
-                max_r_all = max(int(getattr(st, "num_sources", 0)) for st in states) if states else 0
-                est_pos, est_str, slot_valid = _mmse_estimate_by_slot(
+                projector = getattr(
+                    filt,
+                    "_project_positions_to_source_prior",
+                    None,
+                )
+                point_estimate = posterior_point_estimate_from_states(
                     states,
                     weights_arr,
-                    max_r=max_r_all,
+                    max_cardinality=getattr(
+                        getattr(filt, "config", None),
+                        "max_sources",
+                        None,
+                    ),
+                    position_projector=projector if callable(projector) else None,
                 )
-                exist_probs_full = (
-                    _existence_probabilities(states, weights_arr, max_r_all)
-                    if min_existence_prob is not None and max_r_all > 0
-                    else np.zeros(0, dtype=float)
+                est_pos = np.asarray(
+                    [mode.position_mean_xyz for mode in point_estimate.modes],
+                    dtype=float,
+                ).reshape(-1, 3)
+                est_str = np.asarray(
+                    [
+                        mode.strength_mean_cps_1m
+                        for mode in point_estimate.modes
+                    ],
+                    dtype=float,
                 )
-                exist_probs = exist_probs_full[: est_str.shape[0]] if exist_probs_full.size else np.zeros(0)
-                est_pos, est_str = _filter_estimates(
-                    est_pos,
-                    est_str,
-                    slot_valid,
-                    exist_probs,
-                    min_strength=min_est_strength,
-                    min_existence_prob=min_existence_prob,
-                )
+                if min_est_strength is not None and est_str.size:
+                    strength_mask = est_str >= min_est_strength
+                    est_pos = est_pos[strength_mask]
+                    est_str = est_str[strength_mask]
             estimated_sources[iso] = est_pos
             estimated_strengths[iso] = est_str
         else:

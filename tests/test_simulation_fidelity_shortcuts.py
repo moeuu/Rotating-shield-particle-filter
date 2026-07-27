@@ -70,8 +70,6 @@ def test_demo_entrypoints_do_not_expose_expected_count_bypasses() -> None:
     checked_paths = (
         root / "main.py",
         root / "src" / "realtime_demo.py",
-        root / "src" / "baselines" / "legacy_no_shield" / "cli.py",
-        root / "src" / "baselines" / "legacy_no_shield" / "realtime_demo.py",
     )
     forbidden_tokens = (
         "--count",

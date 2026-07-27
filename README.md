@@ -24,7 +24,7 @@ To run tests:
 uv run pytest
 ```
 
-## Pure-PF replay and opt-in hybrid boundary
+## Pure-PF replay
 
 The scientific runtime has one estimator profile, `pf_strict`: count-domain
 sequential PF localization on physical environment surfaces. Its public
@@ -37,32 +37,6 @@ uv run python -m pf.replay \
   --profile pf_strict \
   --output-dir results/pf-replay
 ```
-
-Hybrid support is deliberately isolated from the scientific runtime. The
-experimental `pf.hybrid_replay` relocation kernel is defined only for a uniform
-volume prior, so every non-empty schedule fails closed under the required
-surface-constrained `pf_strict` profile. An empty schedule remains a byte-for-byte
-no-op.
-
-`pf.hybrid_planning` causally replays the same prefix and emits one algorithmic DSS-PP
-XYZ/height/shield-program recommendation from PF modes plus pending/verified external
-modes. Quarantined modes are excluded. It requires a collision/reachability-attested
-candidate set, proves PF bytes are unchanged, and always reports
-`robot_actuation_authorized=false`.
-
-```bash
-uv run python -m pf.hybrid_planning \
-  --measurement-log /path/to/station_marked_log \
-  --config /path/to/pf_config.json \
-  --planning-request /path/to/planning_request.json \
-  --directive-schedule /path/to/directives.json \
-  --profile pf_strict \
-  --output results/hybrid_planning_recommendation.json
-```
-
-These hybrid entry points do not alter or get called by normal `pf.replay`. See
-[`docs/external_relocation_boundary.md`](docs/external_relocation_boundary.md) and
-[`docs/hybrid_planning_boundary.md`](docs/hybrid_planning_boundary.md).
 
 ## GPU acceleration (optional)
 
@@ -455,15 +429,20 @@ writes diagnostics to `results/geant4_net_response_validation.csv` and a
 diagnostic count-extraction check under `results/`; runtime PF configs do not
 load a net-response calibration JSON.
 
-## Birth move smoke test
+## Structural PF smoke test
 
-Use these commands to verify birth is disabled/enabled:
+Use these commands to exercise the two supported pure-PF modes:
 
 ```
-# Birth disabled (default): r_mean stays at 1 and births remain 0.
-uv run python main.py --max-steps 20
+# Fixed-cardinality PF: the runtime default fixed cardinality is K=1.
+uv run python main.py --no-birth --max-steps 20
 
-# Birth enabled: with max_sources=3, births should become >0 within a few steps.
+# Variable-cardinality PF with the exact finite-surface RJ-MH kernel.
 uv run python main.py --birth --max-sources 3 --max-steps 20
 
 ```
+
+The standard RA-L Geant4 configuration enables the exact variable-cardinality
+kernel. Acceptance is stochastic; inspect the structural diagnostics for
+attempt and acceptance counts instead of requiring a birth in a fixed number
+of steps.

@@ -367,7 +367,7 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
         3,
         1,
         height_ratios=(1.22, 0.78, 0.95),
-        hspace=0.18,
+        hspace=0.28,
     )
 
     posture_grid = right[0].subgridspec(1, 4, wspace=0.04)
@@ -439,16 +439,20 @@ def render_method_overview(output_path: Path = FIG2_PATH) -> Path:
         spine.set_linewidth(0.65)
 
     ax_birth = fig.add_subplot(flow_grid[0, 2])
-    ax_birth.set_title("residual birth / verify", fontsize=6.8, pad=1.5)
-    bars = np.asarray([0.20, 0.48, 0.34, 0.72, 0.26])
-    ax_birth.bar(np.arange(len(bars)), bars, color="#d95f5f", width=0.58, alpha=0.82)
-    ax_birth.scatter([3.7], [0.74], marker="*", s=58, color="#f5a623",
-                     edgecolor="#8a5a00", lw=0.45, zorder=4)
-    ax_birth.plot([3.48, 3.60, 3.92], [0.42, 0.30, 0.55],
-                  color="#2ca02c", lw=1.2, solid_capstyle="round")
+    ax_birth.set_title("exact RJ-MH: $P(K)$", fontsize=7.0, pad=1.5)
+    cardinalities = np.arange(5)
+    probabilities = np.asarray([0.08, 0.18, 0.39, 0.25, 0.10])
+    ax_birth.bar(
+        cardinalities,
+        probabilities,
+        color="#4e79a7",
+        width=0.62,
+        alpha=0.86,
+    )
     ax_birth.set_xlim(-0.6, 4.6)
-    ax_birth.set_ylim(0.0, 0.95)
-    ax_birth.set_xticks([])
+    ax_birth.set_ylim(0.0, 0.46)
+    ax_birth.set_xticks(cardinalities, labels=[str(value) for value in cardinalities])
+    ax_birth.tick_params(axis="x", length=0, labelsize=7.0, pad=0.5)
     ax_birth.set_yticks([])
     for spine in ax_birth.spines.values():
         spine.set_linewidth(0.65)

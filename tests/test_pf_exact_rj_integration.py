@@ -8,6 +8,7 @@ import pytest
 from measurement.kernels import KernelPrecomputer, ShieldParams
 from measurement.shielding import generate_octant_orientations
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
+from pf.likelihood import expected_counts_per_source
 from pf.particle_filter import (
     IsotopeParticleFilter,
     MeasurementData,
@@ -27,11 +28,9 @@ def _exact_config(**overrides: object) -> PFConfig:
         "position_max": (2.0, 2.0, 2.0),
         "source_position_prior": "surface",
         "init_num_sources": (0, 2),
-        "init_grid_repeats": 1,
         "init_strength_prior": "uniform",
         "init_strength_min": 1.0,
         "init_strength_max": 3.0,
-        "structural_kernel_mode": "rj_mh",
         "structural_rj_patch_spacing_m": 1.0,
         "structural_rj_move_probability": 1.0,
         "structural_rj_birth_probability": 0.5,
@@ -39,14 +38,6 @@ def _exact_config(**overrides: object) -> PFConfig:
         "structural_rj_position_move_probability": 1.0,
         "structural_rj_local_position_move_probability": 1.0,
         "structural_rj_strength_move_probability": 1.0,
-        "cardinality_preserving_resample": False,
-        "mode_preserving_resample": False,
-        "surface_rejuvenation_enable": False,
-        "pseudo_source_verification_enable": False,
-        "split_prob": 0.0,
-        "merge_prob": 0.0,
-        "source_detector_exclusion_m": 0.0,
-        "init_source_min_separation_m": 0.0,
     }
     values.update(overrides)
     return PFConfig(**values)
@@ -144,16 +135,7 @@ def _build_exact_estimator() -> RotatingShieldPFEstimator:
         init_strength_prior="uniform",
         init_strength_min=1.0,
         init_strength_max=3.0,
-        structural_kernel_mode="rj_mh",
         structural_rj_patch_spacing_m=1.0,
-        cardinality_preserving_resample=False,
-        mode_preserving_resample=False,
-        surface_rejuvenation_enable=False,
-        pseudo_source_verification_enable=False,
-        split_prob=0.0,
-        merge_prob=0.0,
-        source_detector_exclusion_m=0.0,
-        init_source_min_separation_m=0.0,
     )
     shield = ShieldParams()
     return RotatingShieldPFEstimator(
@@ -197,19 +179,6 @@ def test_exact_initialization_uses_complete_canonical_surface_prior() -> None:
         )
 
 
-def test_exact_initialization_ignores_legacy_grid_repeats() -> None:
-    """Legacy grid repeats must not expand an exact prior-sampling population."""
-    config = _exact_config()
-    config.init_grid_repeats = 100
-    particle_filter = IsotopeParticleFilter(
-        "Cs-137",
-        kernel=None,
-        config=config,
-    )
-
-    assert particle_filter.N == config.num_particles
-
-
 def test_exact_initialization_reproduces_explicit_cardinality_mass() -> None:
     """Stratified initial particles must carry the configured total mass per K."""
     expected = np.asarray([0.10, 0.25, 0.65], dtype=float)
@@ -231,6 +200,41 @@ def test_exact_initialization_reproduces_explicit_cardinality_mass() -> None:
     )
 
     np.testing.assert_allclose(observed, expected, atol=1.0e-14, rtol=0.0)
+
+
+def test_fixed_cardinality_path_gates_structural_moves() -> None:
+    """A fixed-K PF must preserve every state and outer particle weight."""
+    particle_filter = _build_filter(
+        birth_enable=False,
+        init_num_sources=(1, 1),
+    )
+    data = _measurement_data(live_time=1.0)
+    before = [
+        (
+            particle.state.positions.copy(),
+            particle.state.strengths.copy(),
+            float(particle.state.background),
+            float(particle.log_weight),
+        )
+        for particle in particle_filter.continuous_particles
+    ]
+
+    particle_filter.apply_structural_moves(data)
+
+    assert particle_filter.last_structural_timing_s == {
+        "total": 0.0,
+        "structural_moves_gated": 1.0,
+        "weights_preserved": 1.0,
+    }
+    for particle, (positions, strengths, background, log_weight) in zip(
+        particle_filter.continuous_particles,
+        before,
+    ):
+        assert particle.state.num_sources == 1
+        np.testing.assert_array_equal(particle.state.positions, positions)
+        np.testing.assert_array_equal(particle.state.strengths, strengths)
+        assert particle.state.background == background
+        assert particle.log_weight == log_weight
 
 
 def test_exact_batched_response_matches_scalar_particle_oracle() -> None:
@@ -263,15 +267,28 @@ def test_exact_batched_response_matches_scalar_particle_oracle() -> None:
         backgrounds,
         data.live_times,
     )
-    scalar = np.column_stack(
-        [
-            particle_filter._lambda_components(
-                particle_filter.continuous_particles[int(index)].state,
-                data,
-            )[1]
-            for index in particle_indices
-        ]
-    )
+    scalar_columns = []
+    for index in particle_indices:
+        state = particle_filter.continuous_particles[int(index)].state
+        per_source = expected_counts_per_source(
+            kernel=particle_filter.continuous_kernel,
+            isotope=particle_filter.isotope,
+            detector_positions=data.detector_positions,
+            sources=state.positions,
+            strengths=state.strengths,
+            live_times=data.live_times,
+            fe_indices=data.fe_indices,
+            pb_indices=data.pb_indices,
+            source_scale=particle_filter._measurement_source_scale_vector(
+                data.fe_indices,
+                data.pb_indices,
+            ),
+        )
+        scalar_columns.append(
+            float(state.background) * data.live_times
+            + np.sum(per_source, axis=1)
+        )
+    scalar = np.column_stack(scalar_columns)
 
     np.testing.assert_allclose(batched, scalar, rtol=1.0e-12, atol=1.0e-12)
 
@@ -518,57 +535,6 @@ def test_exact_response_cache_invalidates_on_kernel_physics_change(
     )
 
 
-def test_equivalent_kernel_replacement_preserves_nonexact_runtime_output() -> None:
-    """Legacy mode must update its discrete kernel without changing responses."""
-    original = _discrete_kernel()
-    particle_filter = IsotopeParticleFilter(
-        "Cs-137",
-        kernel=original,
-        config=PFConfig(
-            num_particles=4,
-            min_particles=4,
-            max_particles=4,
-            max_sources=1,
-            use_gpu=False,
-        ),
-    )
-    continuous_kernel = particle_filter.continuous_kernel
-    detector_positions = np.asarray([[0.4, 0.6, 0.5]], dtype=float)
-    sources = np.asarray([[1.2, 1.0, 0.8]], dtype=float)
-    before = continuous_kernel.kernel_values_selected_pairs_for_detectors(
-        isotope="Cs-137",
-        detector_positions=detector_positions,
-        sources=sources,
-        fe_indices=np.asarray([0], dtype=np.int64),
-        pb_indices=np.asarray([1], dtype=np.int64),
-    )
-    replacement = _discrete_kernel(
-        poses=np.asarray(
-            [[0.4, 0.6, 0.5], [1.4, 1.2, 0.5]],
-            dtype=float,
-        ),
-        mu_by_isotope={
-            "Cs-137": {
-                "fe": ShieldParams().mu_fe,
-                "pb": ShieldParams().mu_pb,
-            }
-        },
-    )
-
-    particle_filter.set_kernel(replacement)
-    after = particle_filter.continuous_kernel.kernel_values_selected_pairs_for_detectors(
-        isotope="Cs-137",
-        detector_positions=detector_positions,
-        sources=sources,
-        fe_indices=np.asarray([0], dtype=np.int64),
-        pb_indices=np.asarray([1], dtype=np.int64),
-    )
-
-    assert particle_filter.kernel is replacement
-    assert particle_filter.continuous_kernel is continuous_kernel
-    np.testing.assert_array_equal(after, before)
-
-
 def test_lazy_response_cache_matches_eager_exact_move_results() -> None:
     """Lazy response evaluation must preserve RNG use and accepted PF states."""
     eager_filter = _build_filter()
@@ -580,7 +546,7 @@ def test_lazy_response_cache_matches_eager_exact_move_results() -> None:
     lazy_filter.apply_structural_moves(data)
 
     assert eager_filter.last_birth_count == lazy_filter.last_birth_count
-    assert eager_filter.last_kill_count == lazy_filter.last_kill_count
+    assert eager_filter.last_death_count == lazy_filter.last_death_count
     assert (
         eager_filter.last_structural_timing_s[
             "rj_local_position_accepted"
@@ -619,7 +585,7 @@ def test_exact_standard_path_runs_global_and_local_position_kernels(
 ) -> None:
     """The standard exact path must retain global moves and invoke local moves."""
     particle_filter = _build_filter(
-        structural_rj_move_probability=0.0,
+        structural_rj_move_probability=np.finfo(float).tiny,
         structural_rj_position_move_probability=0.0,
         structural_rj_local_position_move_probability=0.0,
         structural_rj_strength_move_probability=0.0,
@@ -650,10 +616,7 @@ def test_exact_standard_path_runs_global_and_local_position_kernels(
         record_local,
     )
 
-    particle_filter.apply_structural_moves(
-        data,
-        allow_structural_birth_proposals=False,
-    )
+    particle_filter.apply_structural_moves(data)
 
     assert calls == ["global", "local"]
     assert particle_filter._structural_rj_surface_adjacency is not None
@@ -720,7 +683,7 @@ def test_exact_runtime_records_outer_weight_invariant_failure(
 ) -> None:
     """A violated outer-weight invariant must retain its exact diagnostics."""
     particle_filter = _build_filter(
-        structural_rj_move_probability=0.0,
+        structural_rj_move_probability=np.finfo(float).tiny,
         structural_rj_position_move_probability=0.0,
         structural_rj_local_position_move_probability=0.0,
         structural_rj_strength_move_probability=0.0,
@@ -741,10 +704,7 @@ def test_exact_runtime_records_outer_weight_invariant_failure(
     )
 
     with pytest.raises(RuntimeError, match="must not alter PF weights"):
-        particle_filter.apply_structural_moves(
-            data,
-            allow_structural_birth_proposals=False,
-        )
+        particle_filter.apply_structural_moves(data)
 
     diagnostics = particle_filter.last_structural_timing_s
     assert diagnostics["outer_log_weight_max_abs_diff"] == pytest.approx(
@@ -757,7 +717,7 @@ def test_exact_runtime_records_outer_weight_invariant_failure(
 def test_exact_local_position_runtime_preserves_weights_and_backgrounds() -> None:
     """Batched local acceptance must alter only source surface positions."""
     particle_filter = _build_filter(
-        structural_rj_move_probability=0.0,
+        structural_rj_move_probability=np.finfo(float).tiny,
         structural_rj_position_move_probability=0.0,
         structural_rj_strength_move_probability=0.0,
     )
@@ -781,10 +741,7 @@ def test_exact_local_position_runtime_preserves_weights_and_backgrounds() -> Non
         for particle in particle_filter.continuous_particles
     ]
 
-    particle_filter.apply_structural_moves(
-        data,
-        allow_structural_birth_proposals=False,
-    )
+    particle_filter.apply_structural_moves(data)
 
     np.testing.assert_array_equal(
         [
@@ -881,7 +838,7 @@ def test_exact_birth_death_runtime_respects_cardinality_boundaries() -> None:
     assert np.all(np.abs(after - before) <= 1)
 
 
-def test_exact_rejuvenation_preserves_weights_support_and_disables_roughening() -> None:
+def test_exact_rejuvenation_preserves_weights_and_prior_support() -> None:
     """RJ/MH moves may change states but must not change outer PF weights."""
     particle_filter = _build_filter()
     zero_information_data = _measurement_data(live_time=0.0)
@@ -927,23 +884,3 @@ def test_exact_rejuvenation_preserves_weights_support_and_disables_roughening() 
             )
         )
         particle_filter._canonicalize_structural_rj_state(particle.state)
-
-    positions_before = [
-        particle.state.positions.copy()
-        for particle in particle_filter.continuous_particles
-    ]
-    strengths_before = [
-        particle.state.strengths.copy()
-        for particle in particle_filter.continuous_particles
-    ]
-    particle_filter.regularize_continuous(
-        sigma_pos=10.0,
-        strength_log_sigma=10.0,
-    )
-    for particle, positions, strengths in zip(
-        particle_filter.continuous_particles,
-        positions_before,
-        strengths_before,
-    ):
-        np.testing.assert_array_equal(particle.state.positions, positions)
-        np.testing.assert_array_equal(particle.state.strengths, strengths)

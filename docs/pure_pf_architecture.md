@@ -59,9 +59,8 @@ station-view uncertainty are composed once by the production likelihood.
 Sequential weight updates and structural trials call the same likelihood
 implementation.
 
-The standard RA-L Geant4 configuration selects
-`structural_kernel_mode=rj_mh`. It applies a PF-internal resample-move kernel
-whose invariant target is the current finite-surface PF posterior:
+The PF applies one exact, internal reversible-jump resample-move kernel whose
+invariant target is the current finite-surface posterior:
 
 - the cardinality prior is declared before inference;
 - a distinct set of source patches has probability proportional to the product
@@ -81,16 +80,9 @@ whose invariant target is the current finite-surface PF posterior:
 
 Move probabilities are normalized at the `K=0` and `K=max_sources`
 boundaries. Split/merge, BIC thresholds, residual matching pursuit,
-pseudo-source pruning, mode-preserving injection, and post-resample
-position/strength roughening are disabled in this standard mode. No MLE, batch
-fit, surface-map rescue, or strength refit is invoked.
-
-The legacy `structural_kernel_mode=heuristic` remains available only for
-explicit diagnostics and historical replay. It uses data-conditioned residual
-proposals and likelihood/BIC gates without a reverse proposal, complete prior
-ratio, or Jacobian. Its provenance is therefore
-`structural_kernel_target_preserving=false`, and its cardinality mass must not
-be interpreted as an exact Bayesian posterior.
+pseudo-source pruning, mode-preserving particle injection, and post-resample
+position/strength roughening are not part of the runtime implementation. No
+MLE, batch fit, surface-map rescue, or strength refit is invoked.
 
 ## Posterior reporting
 
@@ -113,9 +105,9 @@ positions against accumulated history, or substitute a best-so-far snapshot.
 
 ## Planner and mission control
 
-DSS-PP receives only current PF posterior and causal tentative-source modes.
-It cannot read report-rescue or global-surface-rescue modes. Cardinality
-pressure is derived from the normalized PF posterior cardinality distribution.
+DSS-PP receives only the current PF posterior. It cannot read tentative,
+report-rescue, or global-surface-rescue modes. Cardinality pressure is derived
+from the normalized PF posterior cardinality distribution.
 Expected future response discrimination remains a planning heuristic evaluated
 from PF modes and hypothetical future observations.
 
@@ -130,10 +122,10 @@ When CUDA is available, expected-count kernels, observation likelihoods,
 spectrum processing, and shield-pair information-gain grids use batched torch
 operations. CPU execution uses the same equations in batched NumPy form.
 
-Geant4 transport uses native worker threads. Candidate-pose evaluation, DSS-PP
-program evaluation, and PF structural trials use explicit worker or batched
-paths. Per-isotope update ordering remains deterministic; parallel work occurs
-inside the particle, candidate, and structural-trial kernels.
+Geant4 transport uses native worker threads. Candidate-pose and DSS-PP program
+evaluation use worker or batched paths; exact RJ response and likelihood
+evaluation is batched across proposed particle states. Per-isotope update
+ordering remains deterministic.
 
 ## MeasurementLog replay
 

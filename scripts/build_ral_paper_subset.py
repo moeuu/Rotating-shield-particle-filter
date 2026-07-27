@@ -22,7 +22,6 @@ CORE_VARIANTS = (
     "round_robin_shield",
     "eig_only_path",
 )
-REPLAY_ABLATION_VARIANTS = ("no_residual_birth", "no_verification")
 MANIFEST_FIELDS = ("case", "variant", "seed", "config_path", "source_path", "command")
 
 
@@ -73,13 +72,6 @@ def selected_variants_for_case(case: str) -> tuple[str, ...]:
     if str(case) not in PAPER_CASES:
         return ()
     return CORE_VARIANTS
-
-
-def replay_variants_for_case(case: str) -> tuple[str, ...]:
-    """Return estimator-side replay variants for one paper case."""
-    if str(case) not in PAPER_CASES:
-        return ()
-    return REPLAY_ABLATION_VARIANTS
 
 
 def select_paper_subset(

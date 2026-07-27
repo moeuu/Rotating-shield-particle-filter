@@ -30,7 +30,6 @@ from realtime_demo import (
     _all_pf_filters_converged,
     _apply_baseline_shield_program_to_dss_config,
     _argv_requests_cui,
-    _build_candidate_sources,
     _build_effective_live_runtime_config,
     _build_intermediate_estimate_trace_payload,
     _build_robot_path_segment,
@@ -45,8 +44,6 @@ from realtime_demo import (
     _format_truth_coverage_log_line,
     _best_dss_first_step_guard_candidate,
     _final_pf_cardinality_status,
-    _has_birth_residual_evidence,
-    _has_unresolved_discriminative_pseudo_failures,
     _inflate_low_signal_variances,
     _is_adaptive_spectrum_ready,
     _isotope_count_balance_penalty,
@@ -68,13 +65,11 @@ from realtime_demo import (
     _resolve_python_worker_count,
     _resolve_cui_split_view_enabled,
     _resolve_candidate_isotopes,
-    _resolve_structural_trial_parallelism,
     _resolve_station_update_modes,
     _resolve_required_measurement_log_target,
     _particle_surface_diagnostics,
     _select_best_pair_from_scores,
     _signature_vector_is_dependent,
-    _resolve_source_position_bounds,
     _spectrum_evidence_payload,
     _spectrum_config_from_runtime_config,
     _source_cardinality_dwell_status,
@@ -709,7 +704,7 @@ def test_pure_pf_summary_embeds_complete_posterior_provenance() -> None:
             "structural_kernel_exact_rj": False,
             "reversible_jump_mcmc_used": False,
         },
-        "planner_belief_sources": ["pf_posterior", "pf_tentative"],
+        "planner_belief_sources": ["pf_posterior"],
         "repository_commit": "a" * 40,
         "measurement_log_schema_version": 1,
         "measurement_log_sha256": "b" * 64,
@@ -878,6 +873,8 @@ def test_particle_surface_diagnostics_use_all_posterior_sources() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
             max_sources=2,
+            birth_enable=False,
+            init_num_sources=(2, 2),
             use_gpu=False,
         ),
     )
@@ -888,10 +885,6 @@ def test_particle_surface_diagnostics_use_all_posterior_sources() -> None:
         positions=np.array([[1.0, 1.0, 0.0], [2.0, 2.0, 1.0]], dtype=float),
         strengths=np.array([100.0, 50.0], dtype=float),
         background=0.0,
-        ages=np.array([3, 0], dtype=int),
-        support_scores=np.zeros(2, dtype=float),
-        tentative_sources=np.array([False, True], dtype=bool),
-        verification_fail_streaks=np.array([0, 0], dtype=int),
     )
     estimator.filters[isotope].continuous_particles = [
         IsotopeParticle(state=state, log_weight=0.0)
@@ -985,62 +978,6 @@ def test_intermediate_estimate_trace_reports_position_and_strength_error() -> No
     assert "source_count_error=-1" in line
     assert "pf_truth_coverage[Cs-137]" in truth_line
     assert "covered=2/3" in truth_line
-
-
-def test_intermediate_estimate_trace_includes_source_slot_metadata() -> None:
-    """Intermediate estimate traces should keep MAP source-slot diagnostics."""
-    isotope = "Cs-137"
-    env = EnvironmentConfig(size_x=10.0, size_y=10.0, size_z=10.0)
-    frame = {
-        "estimate_source": "post_finalize_map",
-        "step_index": 8,
-        "time": 130.0,
-        "robot_position": np.array([1.0, 2.0, 0.5], dtype=float),
-        "counts_by_isotope": {isotope: 500.0},
-        "estimated_sources": {
-            isotope: np.array([[0.0, 1.0, 1.0]], dtype=float),
-        },
-        "estimated_strengths": {isotope: np.array([12.0], dtype=float)},
-        "estimated_metadata": {
-            isotope: [
-                {
-                    "age": 4,
-                    "tentative": True,
-                    "verification_fail_streak": 2,
-                    "support_score": 3.5,
-                }
-            ],
-        },
-    }
-
-    payload = _build_intermediate_estimate_trace_payload(
-        frame,
-        {isotope: np.array([[0.0, 1.0, 1.0]], dtype=float)},
-        {isotope: [10.0]},
-        env,
-        None,
-        obstacle_height_m=2.0,
-        match_radius_m=0.5,
-    )
-    record = payload["estimates"][0]
-    line = _format_estimate_trace_log_line(
-        8,
-        isotope,
-        {
-            **payload["isotopes"][isotope],
-            "estimate_source": payload["estimate_source"],
-        },
-        payload["estimates"],
-    )
-
-    assert record["age"] == 4
-    assert record["tentative"] is True
-    assert record["verification_fail_streak"] == 2
-    assert record["support_score"] == pytest.approx(3.5)
-    assert "mode=post_finalize_map" in line
-    assert "age=4" in line
-    assert "tent=True" in line
-    assert "fail=2" in line
 
 
 def test_pf_obstacle_attenuation_config_defaults_to_fidelity_path() -> None:
@@ -1177,8 +1114,8 @@ def test_source_event_diagnostics_bound_details_and_summarize_all(
     """Source-event logs should retain complete counts without dumping particles."""
     events = [
         {
-            "event": "pseudo_source_verified",
-            "reason": "supported",
+            "event": "rj_birth_accepted",
+            "reason": "metropolis_hastings",
             "position": [float(index), 0.0, 0.0],
         }
         for index in range(3)
@@ -1199,8 +1136,8 @@ def test_source_event_diagnostics_bound_details_and_summarize_all(
 
     output = capsys.readouterr().out
     assert "source_event_summary[Cs-137] total=3 logged=1 omitted=2" in output
-    assert 'event_counts={"pseudo_source_verified": 3}' in output
-    assert 'reason_counts={"supported": 3}' in output
+    assert 'event_counts={"rj_birth_accepted": 3}' in output
+    assert 'reason_counts={"metropolis_hastings": 3}' in output
     assert "raw_sha256=" in output
     assert output.count("source_event[Cs-137]") == 1
     assert "event_idx=0" in output
@@ -1218,68 +1155,6 @@ def test_pf_timing_formatter_keeps_counters_unitless() -> None:
         _format_pf_timing_item("structural_moves_gated", 1.0)
         == "structural_moves_gated=1"
     )
-
-
-def test_precision_diagnostics_skip_birth_candidate_grid_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime precision diagnostics should not score all birth candidates by default."""
-    calls: list[str] = []
-
-    def noop(*args: object, **kwargs: object) -> None:
-        """Replace lightweight diagnostic callbacks during this routing test."""
-        _ = (args, kwargs)
-
-    def record_birth(*args: object, **kwargs: object) -> None:
-        """Record whether the expensive birth-candidate diagnostic is invoked."""
-        _ = (args, kwargs)
-        calls.append("birth")
-
-    for name in (
-        "_log_spectrum_response_poisson_diagnostics",
-        "_log_current_map_prediction_residuals",
-        "_log_truth_observability_diagnostics",
-        "_log_posterior_truth_mass_diagnostics",
-        "_log_particle_cloud_diagnostics",
-        "_log_source_event_diagnostics",
-    ):
-        monkeypatch.setattr(realtime_demo_module, name, noop)
-    monkeypatch.setattr(
-        realtime_demo_module,
-        "_log_birth_candidate_diagnostics",
-        record_birth,
-    )
-
-    _log_precision_degradation_diagnostics(
-        object(),
-        object(),
-        None,
-        {},
-        {},
-        EnvironmentConfig(),
-        None,
-        obstacle_height_m=2.0,
-        step_index=0,
-        candidate_log_limit=64,
-        particle_log_limit=0,
-    )
-    assert calls == []
-
-    _log_precision_degradation_diagnostics(
-        object(),
-        object(),
-        None,
-        {},
-        {},
-        EnvironmentConfig(),
-        None,
-        obstacle_height_m=2.0,
-        step_index=0,
-        candidate_log_limit=64,
-        particle_log_limit=0,
-        birth_candidate_diagnostics_enabled=True,
-    )
-    assert calls == ["birth"]
 
 
 def test_precision_diagnostics_use_compact_spectrum_log_by_default(
@@ -1308,7 +1183,6 @@ def test_precision_diagnostics_use_compact_spectrum_log_by_default(
         "_log_posterior_truth_mass_diagnostics",
         "_log_particle_cloud_diagnostics",
         "_log_source_event_diagnostics",
-        "_log_birth_candidate_diagnostics",
     ):
         monkeypatch.setattr(realtime_demo_module, name, noop)
     monkeypatch.setattr(
@@ -1332,7 +1206,6 @@ def test_precision_diagnostics_use_compact_spectrum_log_by_default(
         None,
         obstacle_height_m=2.0,
         step_index=0,
-        candidate_log_limit=0,
         particle_log_limit=0,
     )
     _log_precision_degradation_diagnostics(
@@ -1345,7 +1218,6 @@ def test_precision_diagnostics_use_compact_spectrum_log_by_default(
         None,
         obstacle_height_m=2.0,
         step_index=0,
-        candidate_log_limit=0,
         particle_log_limit=0,
         full_spectrum_response_diagnostics_enabled=True,
     )
@@ -1374,7 +1246,6 @@ def test_precision_diagnostics_route_source_event_log_limit(
         "_log_truth_observability_diagnostics",
         "_log_posterior_truth_mass_diagnostics",
         "_log_particle_cloud_diagnostics",
-        "_log_birth_candidate_diagnostics",
     ):
         monkeypatch.setattr(realtime_demo_module, name, noop)
     monkeypatch.setattr(
@@ -1393,7 +1264,6 @@ def test_precision_diagnostics_route_source_event_log_limit(
         None,
         obstacle_height_m=2.0,
         step_index=0,
-        candidate_log_limit=0,
         particle_log_limit=0,
         source_event_log_limit=7,
     )
@@ -1467,20 +1337,6 @@ def test_particle_cloud_diagnostics_zero_limit_skips_details(
     assert "particle_cloud[Cs-137]" in output
     assert "particle_slot_cloud" not in output
     assert "particle_source" not in output
-
-
-def test_structural_trial_parallelism_reads_runtime_config() -> None:
-    """Full runtime config should reach PF structural-trial parallelism."""
-    workers, min_trials = _resolve_structural_trial_parallelism(
-        {
-            "structural_trial_workers": 32,
-            "structural_trial_parallel_min_trials": 4,
-        }
-    )
-
-    assert workers == 32
-    assert min_trials == 4
-    assert _resolve_structural_trial_parallelism({}) == (1, 8)
 
 
 def test_plot_save_interval_can_disable_intermediate_pf_plots() -> None:
@@ -1816,135 +1672,11 @@ def test_selected_station_action_fails_fast_on_consecutive_height_move() -> None
         )
 
 
-def test_adaptive_mission_coverage_waits_for_quiet_birth_residuals() -> None:
-    """Coverage should not stop a mission while residual birth evidence remains."""
-
-    class _DummyFilter:
-        """Minimal filter state exposing residual-birth diagnostics."""
-
-        last_birth_residual_gate_passed = True
-        last_birth_residual_support = 3
-
-    class _DummyEstimator:
-        """Minimal estimator state for adaptive mission stop tests."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a non-converged global exploration state."""
-            return False
-
-        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
-            """Return a non-converged local rotation state."""
-            return False
-
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(2, 1),
-        blocked_cells=(),
-    )
-    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
-
-    reason = _adaptive_mission_stop_reason(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=visited,
-        map_api=grid,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=0.5,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        require_quiet_birth_residual=True,
-        birth_residual_min_support=2,
-    )
-
-    assert reason is None
-    assert _has_birth_residual_evidence(
-        _DummyEstimator(),  # type: ignore[arg-type]
-        min_support=2,
-    )
-
-
-def test_adaptive_mission_waits_for_discriminative_pseudo_failures() -> None:
-    """Mission stop should wait while source verification needs new views."""
-
-    class _DummyFilter:
-        """Minimal filter state exposing discriminative pseudo-source failures."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-        last_pseudo_source_fail_reasons = {
-            "needs_discriminative_views": 2,
-            "high_response_corr": 1,
-        }
-
-    class _DummyEstimator:
-        """Minimal estimator state for adaptive mission stop tests."""
-
-        filters = {"Cs-137": _DummyFilter()}
-
-        def should_stop_exploration(self, **kwargs: object) -> bool:
-            """Return a non-converged global exploration state."""
-            return False
-
-        def should_stop_shield_rotation(self, **kwargs: object) -> bool:
-            """Return a non-converged local rotation state."""
-            return False
-
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(2, 1),
-        blocked_cells=(),
-    )
-    visited = [np.array([0.5, 0.5, 0.0], dtype=float)]
-    estimator = _DummyEstimator()
-
-    reason = _adaptive_mission_stop_reason(
-        estimator,  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=visited,
-        map_api=grid,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=0.5,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-    )
-
-    assert reason is None
-    assert _has_unresolved_discriminative_pseudo_failures(
-        estimator,  # type: ignore[arg-type]
-        min_count=1,
-    )
-
-    reason_without_guard = _adaptive_mission_stop_reason(
-        estimator,  # type: ignore[arg-type]
-        current_pose_idx=0,
-        visited_poses_xyz=visited,
-        map_api=grid,
-        min_poses=1,
-        coverage_radius_m=10.0,
-        coverage_fraction_threshold=0.5,
-        ig_threshold=1e-3,
-        planning_live_time_s=1.0,
-        require_no_unresolved_discriminative_failures=False,
-    )
-
-    assert reason_without_guard == "environment_coverage:1.000"
-
-
 def test_adaptive_mission_waits_for_remaining_measurement_budget() -> None:
     """Coverage should not stop while the remaining-measurement budget is unresolved."""
 
     class _DummyFilter:
-        """Minimal filter state without residual or pseudo-source blockers."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
-        last_pseudo_source_fail_reasons: dict[str, int] = {}
+        """Minimal filter state with a concentrated cardinality posterior."""
 
     class _DummyEstimator:
         """Minimal estimator state for adaptive mission stop tests."""
@@ -2029,20 +1761,8 @@ def test_cardinality_dwell_waits_for_unresolved_structural_evidence() -> None:
 def test_final_pf_cardinality_status_uses_only_pf_structural_evidence() -> None:
     """Final cardinality output should summarize the PF posterior and its gates."""
 
-    class _DummyFilter:
-        """Expose current PF pseudo-source transition diagnostics."""
-
-        last_pseudo_source_verified = 1
-        last_pseudo_source_failed = 2
-        last_pseudo_source_pruned = 0
-        last_pseudo_source_quarantined = 1
-        last_pseudo_source_quarantine_active = 1
-        last_pseudo_source_fail_reasons = {"needs_discriminative_views": 2}
-
     class _DummyEstimator:
         """Expose one normalized PF cardinality distribution."""
-
-        filters = {"Cs-137": _DummyFilter()}
 
         def posterior_cardinality_distribution(
             self,
@@ -2052,7 +1772,7 @@ def test_final_pf_cardinality_status_uses_only_pf_structural_evidence() -> None:
 
         def unresolved_structural_evidence(self) -> dict[str, dict[str, object]]:
             """Return one open PF structural decision."""
-            return {"Cs-137": {"birth": {"reason": "needs_discriminative_views"}}}
+            return {"Cs-137": {"birth": {"reason": "reverse_support_empty"}}}
 
     status = _final_pf_cardinality_status(_DummyEstimator())
     cs_status = status["pf_cardinality"]["Cs-137"]
@@ -2063,8 +1783,8 @@ def test_final_pf_cardinality_status_uses_only_pf_structural_evidence() -> None:
     assert cs_status["mean"] == pytest.approx(1.75)
     assert cs_status["variance"] == pytest.approx(0.1875)
     assert cs_status["entropy_nats"] > 0.0
-    assert status["unresolved_pseudo_source_reasons"] == {
-        "needs_discriminative_views": 2
+    assert status["unresolved_structural_evidence"] == {
+        "Cs-137": {"birth": {"reason": "reverse_support_empty"}}
     }
 
 
@@ -2107,7 +1827,7 @@ def test_cardinality_dwell_waits_for_diffuse_pf_count_posterior() -> None:
             return {}
 
         def unresolved_structural_evidence(self) -> dict[str, object]:
-            """Return no separate open structural trial."""
+            """Return no open structural evidence."""
             return {}
 
     ready, reason = _source_cardinality_dwell_status(_DummyEstimator())
@@ -2178,8 +1898,6 @@ def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
 
         config = _DummyConfig()
         is_converged = True
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
 
     class _DummyEstimator:
         """Estimator whose global IG condition is not yet quiet."""
@@ -2228,14 +1946,11 @@ def test_adaptive_mission_stops_when_all_filter_flags_converged() -> None:
     assert reason_after_min == "pf_filters_converged"
 
 
-def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> None:
-    """Coverage can stop a mission once residual birth evidence is quiet."""
+def test_adaptive_mission_coverage_can_stop_when_posterior_is_ready() -> None:
+    """Coverage can stop a mission once PF posterior gates are ready."""
 
     class _DummyFilter:
-        """Minimal filter state exposing quiet residual-birth diagnostics."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
+        """Minimal filter state with a concentrated cardinality posterior."""
 
     class _DummyEstimator:
         """Minimal estimator state for adaptive mission stop tests."""
@@ -2268,8 +1983,6 @@ def test_adaptive_mission_coverage_can_stop_when_birth_residuals_are_quiet() -> 
         coverage_fraction_threshold=0.5,
         ig_threshold=1e-3,
         planning_live_time_s=1.0,
-        require_quiet_birth_residual=True,
-        birth_residual_min_support=2,
     )
 
     assert reason == "environment_coverage:1.000"
@@ -2279,10 +1992,7 @@ def test_adaptive_mission_coverage_can_require_pf_convergence() -> None:
     """Coverage alone should not stop a mission when convergence is required."""
 
     class _DummyFilter:
-        """Minimal filter state exposing quiet residual-birth diagnostics."""
-
-        last_birth_residual_gate_passed = False
-        last_birth_residual_support = 0
+        """Minimal filter state with a concentrated cardinality posterior."""
 
     class _DummyEstimator:
         """Minimal estimator state for adaptive mission stop tests."""
@@ -2315,32 +2025,10 @@ def test_adaptive_mission_coverage_can_require_pf_convergence() -> None:
         coverage_fraction_threshold=0.5,
         ig_threshold=1e-3,
         planning_live_time_s=1.0,
-        require_quiet_birth_residual=True,
-        birth_residual_min_support=2,
         require_pf_convergence_for_coverage=True,
     )
 
     assert reason is None
-
-
-def test_source_position_support_limits_candidate_grid_z() -> None:
-    """Configured source support should restrict PF candidates without using truth."""
-    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=5.0)
-    bounds = _resolve_source_position_bounds(
-        env,
-        {"source_z_min_m": 0.0, "source_z_max_m": 1.5},
-    )
-
-    grid = _build_candidate_sources(
-        env,
-        spacing=(1.0, 1.0, 0.5),
-        margin=0.0,
-        position_min=bounds[0],
-        position_max=bounds[1],
-    )
-
-    assert np.min(grid[:, 2]) >= 0.0
-    assert np.max(grid[:, 2]) <= 1.5
 
 
 def test_demo_pf_gate_retains_all_configured_counts_for_final_evaluation(

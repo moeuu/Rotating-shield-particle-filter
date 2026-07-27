@@ -23,10 +23,6 @@ from pf.estimator import RotatingShieldPFConfig
 from pf.particle_filter import PFConfig
 from realtime_demo import _resolve_rotation_limit_for_active_program
 from runtime_defaults import DEFAULT_MEASUREMENT_TIME_S, DEFAULT_NO_ROTATION_OVERHEAD_S
-from scripts.build_cs4_feature_validation import (
-    build_cs4_feature_validation_plan,
-    build_feature_validation_plan,
-)
 
 
 def test_fixed_shield_policy_repeats_one_pair() -> None:
@@ -270,7 +266,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert "baseline_passive_fixed_shield_single_view" in by_variant
     assert "baseline_onestep_fixed_shield" in by_variant
     assert "eig_only_path" in by_variant
-    assert "no_verification" in by_variant
     assert "no_obstacle_signature" in by_variant
     assert "no_pf_obstacle_attenuation" in by_variant
     assert "volume_source_prior" not in by_variant
@@ -280,8 +275,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert proposed_config["primary_sampling_fraction"] == 1.0
     assert proposed_config["thread_count"] > 1
     assert proposed_config["response_poisson_low_snr_suppress_count"] is False
-    assert proposed_config["precision_diagnostic_birth_candidate_enable"] is False
-    assert proposed_config["precision_diagnostic_birth_candidate_log_limit"] == 0
     assert proposed_config["precision_diagnostic_particle_log_limit"] == 0
     assert (
         proposed_config["precision_diagnostic_full_spectrum_response_enable"] is False
@@ -291,31 +284,92 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     removed_prefixes = (
         "adaptive_strength_prior",
         "all_history_dictionary",
+        "birth_candidate_",
+        "birth_complexity_",
+        "birth_count_distance_",
+        "birth_detector_",
+        "birth_jitter_",
+        "birth_matching_",
+        "birth_max_per_update",
+        "birth_min_",
+        "birth_num_",
+        "birth_orthogonal_",
+        "birth_q_",
+        "birth_residual_",
+        "birth_softmax_",
+        "birth_stage_",
+        "birth_topk_",
+        "birth_use_",
         "birth_global_rescue",
         "birth_refit_residual",
+        "cardinality_preserving_",
         "candidate_verification",
         "conditional_strength",
         "final_absent_",
         "high_strength_split",
+        "label_",
+        "merge_",
+        "mode_preserving_",
         "mode_preserving_report_cardinality",
         "online_absent_",
+        "peak_suppression_",
+        "precision_diagnostic_birth_candidate_",
+        "pseudo_source_",
         "report_best_so_far",
         "report_cluster",
         "report_mle_rescue",
         "report_model_order",
         "report_strength",
         "report_surface_local_refine",
+        "residual_decomposition_",
         "runtime_report_rescue",
         "source_strength_absorption",
         "source_strength_observation_overshoot",
         "source_strength_prior",
+        "source_prune_",
         "sparse_poisson",
+        "split_",
+        "structural_proposal_",
+        "structural_trial_",
         "surface_map",
     )
+    removed_fields = {
+        "background_sigma",
+        "birth_alpha",
+        "birth_bic_penalty_params",
+        "birth_delta_ll_threshold",
+        "converge_require_no_tentative",
+        "deferred_resample_roughening_scale",
+        "disable_regularize_on_temper_resample",
+        "init_grid_repeats",
+        "init_grid_spacing_m",
+        "init_joint_position_design",
+        "init_joint_position_retries",
+        "init_source_min_separation_m",
+        "max_sigma_pos",
+        "min_age_to_split",
+        "min_sigma_pos",
+        "p_birth",
+        "p_kill",
+        "pf_init_joint_position_design",
+        "pf_init_joint_position_retries",
+        "pf_init_source_min_separation_m",
+        "position_sigma",
+        "roughening_decay",
+        "roughening_k",
+        "roughening_min_mult",
+        "source_detector_exclusion_m",
+        "strength_log_sigma",
+        "strength_sigma",
+        "structural_kernel_mode",
+        "support_ema_alpha",
+        "surface_rejuvenation_enable",
+    }
     for entry in entries:
         generated = json.loads(entry.config_path.read_text())
         assert generated["source_surface_prior"] is True
         assert not any(key.startswith(removed_prefixes) for key in generated)
+        assert removed_fields.isdisjoint(generated)
         assert "birth_residual_suppress_death" not in generated
         assert "birth_residual_force_proposal_on_gate" not in generated
         assert "birth_residual_force_relax_candidate_masks" not in generated
@@ -368,9 +422,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert pf_obstacle_off["pf_obstacle_attenuation"] is False
     assert pf_obstacle_off["author_obstacle_prims"] is True
     assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
-    no_birth = json.loads(by_variant["no_residual_birth"].config_path.read_text())
-    assert no_birth["birth_max_per_update"] == 0
-    assert no_birth["pf_max_sources"] == 5
     passive_no_shield = json.loads(
         by_variant["baseline_passive_no_shield"].config_path.read_text()
     )
@@ -415,8 +466,6 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert eig_only["dss_pp"]["elevation_signature_weight"] == 0.0
     assert eig_only["dss_pp"]["correlation_reduction_weight"] == 0.0
     assert eig_only["dss_pp"]["same_isotope_direct_separation_guard"] is False
-    no_verification = json.loads(by_variant["no_verification"].config_path.read_text())
-    assert no_verification["pseudo_source_verification_enable"] is False
     single_view = json.loads(
         by_variant["baseline_passive_fixed_shield_single_view"].config_path.read_text()
     )
@@ -486,6 +535,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     }
     assert len(measurement_log_targets) == len(entries)
     assert "--full-simulation" in by_variant["proposed"].command
+    assert "--birth" not in by_variant["proposed"].command
     assert "--max-sources" not in by_variant["proposed"].command
     assert "--adaptive-dwell" not in by_variant["proposed"].command
     assert "--measurement-time-s" in by_variant["proposed"].command
@@ -503,90 +553,3 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"
         in by_variant["baseline_passive_no_shield_single_view"].command
     )
-
-
-def test_cs4_feature_validation_plan_generates_feature_toggles(tmp_path) -> None:
-    """Cs4 validation plan should compare feature toggles on one source layout."""
-    manifest_path, script_path = build_cs4_feature_validation_plan(
-        output_dir=tmp_path,
-        seeds=(2026051001,),
-    )
-    assert manifest_path.exists()
-    assert script_path.exists()
-    rows = manifest_path.read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 6
-    manifest = {
-        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5) for line in rows[1:]
-    }
-    assert set(manifest) == {
-        "feature_all_on",
-        "no_dynamic_particle_allocation",
-        "no_condition_planning",
-        "no_verification_pressure",
-        "no_orthogonal_birth",
-    }
-    all_on_config = json.loads(Path(manifest["feature_all_on"][3]).read_text())
-    no_dynamic_config = json.loads(
-        Path(manifest["no_dynamic_particle_allocation"][3]).read_text()
-    )
-    no_condition_config = json.loads(
-        Path(manifest["no_condition_planning"][3]).read_text()
-    )
-    no_verification_pressure_config = json.loads(
-        Path(manifest["no_verification_pressure"][3]).read_text()
-    )
-    no_orthogonal_config = json.loads(
-        Path(manifest["no_orthogonal_birth"][3]).read_text()
-    )
-    source_payload = json.loads(Path(manifest["feature_all_on"][4]).read_text())
-    assert len(source_payload["sources"]) == 4
-    assert {source["isotope"] for source in source_payload["sources"]} == {"Cs-137"}
-    assert all_on_config["candidate_isotopes"] == ["Cs-137"]
-    assert no_dynamic_config["candidate_isotopes"] == ["Cs-137"]
-    assert no_condition_config["candidate_isotopes"] == ["Cs-137"]
-    assert no_verification_pressure_config["candidate_isotopes"] == ["Cs-137"]
-    assert no_orthogonal_config["candidate_isotopes"] == ["Cs-137"]
-    assert all_on_config["birth_orthogonalize_residual_candidates"] is True
-    assert all_on_config["mode_preserving_dynamic_cardinality_allocation"] is True
-    assert no_dynamic_config["mode_preserving_dynamic_cardinality_allocation"] is False
-    assert no_condition_config["dss_pp"]["station_condition_weight"] == 0.0
-    assert no_condition_config["dss_pp"]["elevation_condition_weight"] == 0.0
-    assert (
-        "include_runtime_rescue_modes"
-        not in no_verification_pressure_config["dss_pp"]
-    )
-    assert (
-        no_verification_pressure_config["remaining_measurement_estimate"][
-            "verification_weight"
-        ]
-        == 0.0
-    )
-    assert no_orthogonal_config["birth_orthogonalize_residual_candidates"] is False
-
-
-def test_mix9_feature_validation_plan_uses_all_candidate_isotopes(
-    tmp_path,
-) -> None:
-    """Mix9 validation plan should keep all isotope channels as PF candidates."""
-    manifest_path, script_path = build_feature_validation_plan(
-        case_name="mix9",
-        output_dir=tmp_path,
-        seeds=(2026051001,),
-    )
-    assert manifest_path.exists()
-    assert script_path.exists()
-    rows = manifest_path.read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 6
-    manifest = {
-        line.split(",", maxsplit=5)[1]: line.split(",", maxsplit=5) for line in rows[1:]
-    }
-    all_on_config = json.loads(Path(manifest["feature_all_on"][3]).read_text())
-    source_payload = json.loads(Path(manifest["feature_all_on"][4]).read_text())
-
-    assert all_on_config["candidate_isotopes"] == ["Cs-137", "Co-60", "Eu-154"]
-    assert len(source_payload["sources"]) == 9
-    assert {source["isotope"] for source in source_payload["sources"]} == {
-        "Cs-137",
-        "Co-60",
-        "Eu-154",
-    }

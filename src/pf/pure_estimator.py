@@ -20,7 +20,6 @@ from pf.posterior import (
     posterior_point_estimate_from_states,
 )
 from pf.profiles import (
-    ProposalOrigin,
     apply_profile_to_config,
     resolve_structural_transition_provenance,
 )
@@ -58,6 +57,9 @@ def _resolved_cardinality_prior(
     config: RotatingShieldPFConfig,
 ) -> tuple[tuple[int, ...], tuple[float, ...], str]:
     """Return resolved cardinality support, normalized mass, and its source."""
+    if not bool(config.birth_enable):
+        fixed_cardinality = int(config.init_num_sources[0])
+        return (fixed_cardinality,), (1.0,), "fixed_init_num_sources"
     max_sources = config.max_sources
     if max_sources is None:
         return (), (), "unbounded_support_unavailable"
@@ -92,12 +94,7 @@ def _resolved_cardinality_prior(
 class PurePFEstimator(_PFEstimatorCore):
     """Run causal PF updates and report only the resulting PF posterior."""
 
-    planner_belief_sources: tuple[str, ...] = ("pf_posterior", "pf_tentative")
-    allowed_proposal_origins: tuple[ProposalOrigin, ...] = (
-        ProposalOrigin.PF_BIRTH,
-        ProposalOrigin.PF_RESIDUAL,
-        ProposalOrigin.PF_SPLIT,
-    )
+    planner_belief_sources: tuple[str, ...] = ("pf_posterior",)
 
     def __init__(
         self,
@@ -168,13 +165,8 @@ class PurePFEstimator(_PFEstimatorCore):
             self.pf_config
         )
         structural_moves_enabled = bool(self.pf_config.birth_enable)
-        exact_enabled = structural_moves_enabled and (
-            str(self.pf_config.structural_kernel_mode)
-            .strip()
-            .lower()
-            .replace("-", "_")
-            == "rj_mh"
-        )
+        exact_enabled = structural_moves_enabled
+        surface_prior_enabled = True
         configured_isotopes = sorted(
             {
                 str(isotope)
@@ -187,7 +179,7 @@ class PurePFEstimator(_PFEstimatorCore):
         )
         dictionary_groups: dict[str, dict[str, Any]] = {}
         missing_isotopes: list[str] = []
-        if exact_enabled:
+        if surface_prior_enabled:
             for isotope in configured_isotopes:
                 filt = self.filters.get(isotope)
                 patches = (
@@ -215,18 +207,12 @@ class PurePFEstimator(_PFEstimatorCore):
                     },
                 )
                 group["isotopes"].append(isotope)
-        if not exact_enabled:
-            dictionary_status = "not_applicable"
-            dictionaries_identical: bool | None = None
-            missing_isotopes = []
-        elif not dictionary_groups:
+        if not dictionary_groups:
             dictionary_status = "not_initialized"
-            dictionaries_identical = None
+            dictionaries_identical: bool | None = None
         elif missing_isotopes:
             dictionary_status = "partially_initialized"
-            dictionaries_identical = (
-                False if len(dictionary_groups) > 1 else None
-            )
+            dictionaries_identical = False if len(dictionary_groups) > 1 else None
         else:
             dictionary_status = "complete"
             dictionaries_identical = len(dictionary_groups) == 1
@@ -240,12 +226,8 @@ class PurePFEstimator(_PFEstimatorCore):
         birth_weight = float(self.pf_config.structural_rj_birth_probability)
         death_weight = float(self.pf_config.structural_rj_death_probability)
         interior_total = birth_weight + death_weight
-        interior_birth = (
-            birth_weight / interior_total if interior_total > 0.0 else 0.0
-        )
-        interior_death = (
-            death_weight / interior_total if interior_total > 0.0 else 0.0
-        )
+        interior_birth = birth_weight / interior_total if interior_total > 0.0 else 0.0
+        interior_death = death_weight / interior_total if interior_total > 0.0 else 0.0
         max_cardinality = None if not support else int(support[-1])
         manifest_completeness = (
             "complete"
@@ -260,8 +242,10 @@ class PurePFEstimator(_PFEstimatorCore):
             "schema_version": 1,
             "manifest_completeness": manifest_completeness,
             "structural_moves_enabled": structural_moves_enabled,
-            "structural_kernel_mode": str(
-                self.pf_config.structural_kernel_mode
+            "structural_kernel_family": (
+                "area_weighted_surface_birth_death_rj_mh"
+                if structural_moves_enabled
+                else "fixed_cardinality_no_structural_moves"
             ),
             "cardinality_prior": {
                 "support": [int(value) for value in support],
@@ -280,39 +264,26 @@ class PurePFEstimator(_PFEstimatorCore):
                 "log_mean": float(self.pf_config.init_strength_log_mean),
                 "log_sigma": float(self.pf_config.init_strength_log_sigma),
                 "units": "detector_cps_1m",
-                "unit_definition": (
-                    "expected_net_detector_count_rate_at_1m"
-                ),
+                "unit_definition": ("expected_net_detector_count_rate_at_1m"),
+                "used_for_initialization": True,
                 "shared_by_initialization_and_rj_moves": exact_enabled,
             },
             "surface_set_prior": {
-                "semantics": (
-                    "area_product_distinct_patch_sets"
-                    if exact_enabled
-                    else "not_applicable"
-                ),
+                "semantics": "area_product_distinct_patch_sets",
                 "probability_mass": (
-                    "product(patch_area_m2)/"
-                    "elementary_symmetric_normalizer(K)"
-                    if exact_enabled
-                    else "not_applicable"
+                    "product(patch_area_m2)/elementary_symmetric_normalizer(K)"
                 ),
-                "canonical_strictly_increasing_patch_indices": exact_enabled,
-                "duplicate_patch_indices_allowed": (
-                    False if exact_enabled else None
-                ),
-                "patch_spacing_m": float(
-                    self.pf_config.structural_rj_patch_spacing_m
-                ),
+                "used_for_initialization": True,
+                "canonical_strictly_increasing_patch_indices": True,
+                "duplicate_patch_indices_allowed": False,
+                "patch_spacing_m": float(self.pf_config.structural_rj_patch_spacing_m),
                 "dictionary_hash_encoding": (
                     "ordered_centers_xyz_and_areas_m2_float64_little_endian_v1"
                 ),
                 "dictionary_status": dictionary_status,
                 "configured_isotopes": configured_isotopes,
                 "missing_isotopes": sorted(missing_isotopes),
-                "dictionaries_identical_across_isotopes": (
-                    dictionaries_identical
-                ),
+                "dictionaries_identical_across_isotopes": (dictionaries_identical),
                 "dictionary_groups": grouped_dictionaries,
             },
             "rj_move_kernel": {
@@ -335,8 +306,7 @@ class PurePFEstimator(_PFEstimatorCore):
                     "area_weighted_conditional_prior_independence"
                 ),
                 "local_position_move_attempt_probability": float(
-                    self.pf_config
-                    .structural_rj_local_position_move_probability
+                    self.pf_config.structural_rj_local_position_move_probability
                 ),
                 "local_position_move_proposal": (
                     "uniform_unoccupied_physical_surface_neighbor"
@@ -349,9 +319,7 @@ class PurePFEstimator(_PFEstimatorCore):
                     self.pf_config.structural_rj_strength_move_probability
                 ),
                 "boundary_normalization": {
-                    "rule": (
-                        "renormalize_admissible_birth_death_direction_weights"
-                    ),
+                    "rule": ("renormalize_admissible_birth_death_direction_weights"),
                     "at_k_zero": {"birth": 1.0, "death": 0.0},
                     "at_k_max": (
                         None
@@ -369,16 +337,6 @@ class PurePFEstimator(_PFEstimatorCore):
                 },
             },
         }
-
-    def accepts_proposal_origin(self, origin: ProposalOrigin | str) -> bool:
-        """Return whether a proposal origin may alter this PF."""
-        try:
-            resolved = (
-                origin if isinstance(origin, ProposalOrigin) else ProposalOrigin(origin)
-            )
-        except ValueError:
-            return False
-        return resolved in self.allowed_proposal_origins
 
     def posterior_cardinality_distribution(self) -> dict[str, dict[int, float]]:
         """Return source-count posterior mass for every active isotope."""
@@ -434,9 +392,7 @@ class PurePFEstimator(_PFEstimatorCore):
             random_seed=self.random_seed,
             profile_capability_map=self.profile_capabilities.to_dict(),
             record_count=len(self.measurements),
-            structural_transition_provenance=(
-                self.structural_transition_diagnostics()
-            ),
+            structural_transition_provenance=(self.structural_transition_diagnostics()),
             structural_model_manifest=self.structural_model_manifest(),
         )
 
@@ -484,12 +440,6 @@ class PurePFEstimator(_PFEstimatorCore):
                         "positions": np.asarray(state.positions, dtype=float),
                         "strengths": np.asarray(state.strengths, dtype=float),
                         "background": float(state.background),
-                        "ages": state.ages,
-                        "support_scores": state.support_scores,
-                        "tentative_sources": state.tentative_sources,
-                        "verification_fail_streaks": (
-                            state.verification_fail_streaks
-                        ),
                     }
                 )
             isotope_payload[str(isotope)] = particles
@@ -528,7 +478,7 @@ class PurePFEstimator(_PFEstimatorCore):
                     int(measurement.pose_idx) for measurement in self.measurements
                 ],
                 "measurement_history_sha256": sha256_json(measurement_history),
-                "deferred_pose_update_active": bool(self._defer_resample_birth),
+                "deferred_pose_update_active": bool(self._defer_structural_moves),
                 "deferred_measurement_count": int(self._deferred_measurement_count),
                 "isotopes": isotope_payload,
             }

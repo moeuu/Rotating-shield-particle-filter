@@ -75,7 +75,13 @@ def test_estimator_can_start_without_active_detected_isotopes():
         candidate_sources=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
         shield_normals=np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float),
         mu_by_isotope={"Cs-137": 0.5, "Co-60": 0.4},
-        pf_config=RotatingShieldPFConfig(num_particles=8, max_sources=1, use_gpu=False),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=8,
+            max_sources=1,
+            birth_enable=False,
+            init_num_sources=(0, 0),
+            use_gpu=False,
+        ),
         shield_params=ShieldParams(),
     )
     est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
@@ -129,6 +135,7 @@ def test_update_pair_sequence_uses_parallel_isotope_workers(monkeypatch):
             num_particles=2,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             parallel_isotope_updates=True,
             parallel_isotope_workers=2,
@@ -178,6 +185,7 @@ def test_update_pair_sequence_records_stage_timings(monkeypatch):
             num_particles=2,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
         ),
@@ -226,6 +234,7 @@ def test_update_pair_sequence_passes_view_covariance(monkeypatch):
             num_particles=2,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
         ),
@@ -276,6 +285,7 @@ def test_update_pair_sequence_records_spectrum_payload(monkeypatch):
             num_particles=2,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
         ),
@@ -341,6 +351,7 @@ def test_update_pair_projects_isotope_covariance_to_pf_variance(monkeypatch):
             num_particles=2,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
         ),
@@ -397,6 +408,7 @@ def test_update_pair_updates_missing_configured_isotope_as_zero(monkeypatch):
             max_particles=1,
             max_sources=1,
             birth_enable=False,
+            init_num_sources=(0, 0),
             history_estimate_interval=0,
             use_gpu=False,
         ),
@@ -431,20 +443,20 @@ def test_update_pair_updates_missing_configured_isotope_as_zero(monkeypatch):
     np.testing.assert_allclose(co_data.observation_variances, [0.0])
 
 
-def test_estimator_uses_clustered_output_when_birth_is_enabled():
-    """Final PF estimates should honor the clustered-output configuration."""
+def test_estimator_uses_canonical_pf_posterior_projection():
+    """Runtime estimates should use the MAP-cardinality PF posterior stratum."""
     est = RotatingShieldPFEstimator(
         isotopes=["Cs-137"],
         candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-            min_particles=2,
-            max_particles=2,
+            num_particles=3,
+            min_particles=3,
+            max_particles=3,
             max_sources=2,
+            init_num_sources=(0, 2),
             birth_enable=True,
-            use_clustered_output=True,
             use_gpu=False,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -452,44 +464,58 @@ def test_estimator_uses_clustered_output_when_birth_is_enabled():
     est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
-
-    def _fake_clustered(self):
-        """Return a distinctive clustered estimate."""
-        return (
-            np.array([[1.0, 2.0, 3.0]], dtype=float),
-            np.array([42.0], dtype=float),
-        )
-
-    def _fake_mmse(self):
-        """Return a fallback estimate that should not be used."""
-        return (
-            np.array([[9.0, 9.0, 9.0]], dtype=float),
-            np.array([9.0], dtype=float),
-        )
-
-    filt.estimate_clustered = types.MethodType(_fake_clustered, filt)
-    filt.estimate = types.MethodType(_fake_mmse, filt)
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 1.0, 1.0]], dtype=float),
+                strengths=np.array([20.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.40)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=np.array([[0.0, 3.0, 1.0]], dtype=float),
+                strengths=np.array([40.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.35)),
+        ),
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=0,
+                positions=np.zeros((0, 3), dtype=float),
+                strengths=np.zeros(0, dtype=float),
+                background=0.0,
+            ),
+            log_weight=float(np.log(0.25)),
+        ),
+    ]
 
     positions, strengths = est.estimates()["Cs-137"]
 
-    assert positions == pytest.approx(np.array([[1.0, 2.0, 3.0]], dtype=float))
-    assert strengths == pytest.approx(np.array([42.0], dtype=float))
+    assert positions == pytest.approx(
+        np.array([[0.0, 1.9333333333333333, 1.0]], dtype=float)
+    )
+    assert strengths == pytest.approx(np.array([29.333333333333332], dtype=float))
 
 
 def test_step_diagnostics_can_skip_posterior_projection_recomputation():
-    """Per-step health logs should not require clustered PF projection."""
+    """Per-step health logs should optionally skip PF posterior projection."""
     est = RotatingShieldPFEstimator(
         isotopes=["Cs-137"],
         candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-            min_particles=2,
-            max_particles=2,
+            num_particles=3,
+            min_particles=3,
+            max_particles=3,
             max_sources=2,
+            init_num_sources=(0, 2),
             birth_enable=True,
-            use_clustered_output=True,
             use_gpu=False,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -498,11 +524,11 @@ def test_step_diagnostics_can_skip_posterior_projection_recomputation():
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
 
-    def _forbidden_clustered(self):
-        """Raise if diagnostics accidentally enter posterior clustering."""
-        raise AssertionError("clustered estimate should be skipped")
+    def _forbidden_estimate(self):
+        """Raise if diagnostics accidentally enter posterior projection."""
+        raise AssertionError("posterior estimate should be skipped")
 
-    filt.estimate_clustered = types.MethodType(_forbidden_clustered, filt)
+    filt.estimate = types.MethodType(_forbidden_estimate, filt)
 
     diagnostics = est.step_diagnostics(top_k=0, include_estimates=False)
 
@@ -529,7 +555,12 @@ def test_continuous_pair_expected_counts_supports_cpu_config():
     filt = IsotopeParticleFilter(
         "Cs-137",
         kernel=dummy_kernel,
-        config=PFConfig(num_particles=1, use_gpu=False),
+        config=PFConfig(
+            num_particles=1,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+        ),
     )
     filt.continuous_particles = [
         IsotopeParticle(
@@ -610,6 +641,7 @@ def test_deferred_pose_update_delays_structural_update(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=4,
             max_sources=1,
+            init_num_sources=(0, 1),
         ),
         shield_params=ShieldParams(),
     )
@@ -686,6 +718,7 @@ def test_deferred_pose_update_uses_full_structural_history(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=4,
             max_sources=1,
+            init_num_sources=(0, 1),
         ),
         shield_params=ShieldParams(),
     )
@@ -741,6 +774,8 @@ def test_deferred_pose_update_defers_posterior_history_recompute(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=4,
             max_sources=1,
+            birth_enable=False,
+            init_num_sources=(0, 0),
         ),
         shield_params=ShieldParams(),
     )
@@ -763,7 +798,11 @@ def test_deferred_pose_update_defers_posterior_history_recompute(monkeypatch):
 def test_posterior_history_interval_can_skip_exact_projection():
     """Posterior-history recording must not alter the PF state."""
     est = object.__new__(RotatingShieldPFEstimator)
-    est.pf_config = RotatingShieldPFConfig(history_estimate_interval=0)
+    est.pf_config = RotatingShieldPFConfig(
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        history_estimate_interval=0,
+    )
     est.history_estimates = []
 
     def _forbidden_estimates(self):
@@ -776,7 +815,11 @@ def test_posterior_history_interval_can_skip_exact_projection():
 
     assert est.history_estimates == []
 
-    est.pf_config = RotatingShieldPFConfig(history_estimate_interval=2)
+    est.pf_config = RotatingShieldPFConfig(
+        birth_enable=False,
+        init_num_sources=(0, 0),
+        history_estimate_interval=2,
+    )
     calls = []
 
     def _fake_estimates(self):
@@ -807,6 +850,8 @@ def test_candidate_response_cache_reuses_full_surface_grid(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=1,
             max_sources=1,
+            birth_enable=False,
+            init_num_sources=(0, 0),
             use_gpu=False,
             candidate_response_cache_max_entries=4,
         ),
@@ -878,8 +923,6 @@ def test_deferred_pose_update_runs_convergence_once_at_finalize(monkeypatch):
         lam_fn,
         z_obs,
         observation_count_variance=0.0,
-        disable_regularize_on_resample=None,
-        roughening_scale_on_resample=1.0,
     ):
         """Avoid expected-count evaluation while exercising deferred control flow."""
         _ = (
@@ -887,8 +930,6 @@ def test_deferred_pose_update_runs_convergence_once_at_finalize(monkeypatch):
             lam_fn,
             z_obs,
             observation_count_variance,
-            disable_regularize_on_resample,
-            roughening_scale_on_resample,
         )
         return 3.0, False
 
@@ -934,6 +975,8 @@ def test_deferred_pose_update_runs_convergence_once_at_finalize(monkeypatch):
         pf_config=RotatingShieldPFConfig(
             num_particles=4,
             max_sources=1,
+            birth_enable=False,
+            init_num_sources=(1, 1),
             use_tempering=True,
         ),
         shield_params=ShieldParams(),
@@ -972,6 +1015,8 @@ def test_tempered_update_batches_remainder_after_resample_cap():
         kernel=None,
         config=PFConfig(
             num_particles=2,
+            birth_enable=False,
+            init_num_sources=(0, 0),
             min_delta_beta=1.0e-3,
             target_ess_ratio=0.99,
             max_resamples_per_observation=0,
@@ -1003,7 +1048,7 @@ def test_tempered_update_batches_remainder_after_resample_cap():
 
 
 def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
-    """Deferred station updates should still allow intra-station resampling."""
+    """Deferred station updates should retain standard tempered resampling."""
     calls = []
 
     def _fake_gpu_enabled(self):
@@ -1015,17 +1060,10 @@ def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
         lam_fn,
         z_obs,
         observation_count_variance=0.0,
-        disable_regularize_on_resample=None,
-        roughening_scale_on_resample=1.0,
     ):
         """Record the deferred tempered-update request."""
         _ = lam_fn, z_obs, observation_count_variance
-        calls.append(
-            (
-                bool(disable_regularize_on_resample),
-                float(roughening_scale_on_resample),
-            )
-        )
+        calls.append(True)
         self.last_resample_ess = True
         self.last_ess_pre = 1.0
         self.last_ess_post = float(len(self.continuous_particles))
@@ -1046,7 +1084,12 @@ def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
     filt = IsotopeParticleFilter(
         "Cs-137",
         kernel=dummy_kernel,
-        config=PFConfig(num_particles=2, use_tempering=True),
+        config=PFConfig(
+            num_particles=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+            use_tempering=True,
+        ),
     )
 
     filt.update_continuous_pair(
@@ -1058,21 +1101,22 @@ def test_deferred_pair_update_still_uses_tempered_resampling(monkeypatch):
         defer_resample=True,
     )
 
-    assert calls == [(False, 0.15)]
+    assert calls == [True]
     assert filt._deferred_resampled_any
 
 
 def test_estimator_passes_obstacle_attenuation_to_filters():
     """PF filters should include active concrete obstacle attenuation in their kernels."""
     grid = ObstacleGrid(
-        origin=(0.0, -0.5),
+        origin=(0.0, 0.0),
         cell_size=1.0,
         grid_shape=(1, 1),
         blocked_cells=((0, 0),),
+        transport_boxes_m=((0.0, 0.0, 0.0, 1.0, 1.0, 2.0),),
     )
     est = RotatingShieldPFEstimator(
         isotopes=["Cs-137"],
-        candidate_sources=np.array([[-1.0, 0.0, 1.0]], dtype=float),
+        candidate_sources=np.array([[-1.0, 0.5, 1.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=RotatingShieldPFConfig(
@@ -1080,6 +1124,8 @@ def test_estimator_passes_obstacle_attenuation_to_filters():
             min_particles=1,
             max_particles=1,
             max_sources=1,
+            birth_enable=False,
+            init_num_sources=(1, 1),
             use_gpu=False,
         ),
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -1087,12 +1133,12 @@ def test_estimator_passes_obstacle_attenuation_to_filters():
         obstacle_height_m=2.0,
         obstacle_mu_by_isotope={"Cs-137": 0.01},
     )
-    est.add_measurement_pose(np.array([2.0, 0.0, 1.0], dtype=float))
+    est.add_measurement_pose(np.array([2.0, 0.5, 1.0], dtype=float))
     est._ensure_kernel_cache()
 
     filt = est.filters["Cs-137"]
-    source = np.array([-1.0, 0.0, 1.0], dtype=float)
-    detector = np.array([2.0, 0.0, 1.0], dtype=float)
+    source = np.array([-1.0, 0.5, 1.0], dtype=float)
+    detector = np.array([2.0, 0.5, 1.0], dtype=float)
     attenuated = filt.continuous_kernel.kernel_value_pair(
         "Cs-137", detector, source, 0, 0
     )
@@ -1100,22 +1146,20 @@ def test_estimator_passes_obstacle_attenuation_to_filters():
     np.testing.assert_allclose(attenuated, free * np.exp(-1.0), rtol=1e-12)
 
 
-def test_rotating_config_passes_initial_strength_and_label_parameters():
-    """Estimator config must preserve physical prior and label parameters."""
+def test_rotating_config_passes_physical_strength_prior():
+    """Estimator config must preserve the declared physical strength prior."""
     config = RotatingShieldPFConfig(
         num_particles=1,
         min_particles=1,
         max_particles=1,
+        max_sources=1,
+        birth_enable=False,
+        init_num_sources=(1, 1),
         init_strength_log_mean=2.5,
         init_strength_log_sigma=0.25,
         init_strength_prior="uniform",
         init_strength_min=300000.0,
         init_strength_max=2000000.0,
-        label_pos_weight=1.7,
-        label_strength_weight=0.4,
-        label_missing_cost=123.0,
-        label_pos_scale=2.0,
-        label_strength_scale=50.0,
     )
     est = RotatingShieldPFEstimator(
         isotopes=["Cs-137"],
@@ -1133,11 +1177,6 @@ def test_rotating_config_passes_initial_strength_and_label_parameters():
     assert pf_config.init_strength_prior == "uniform"
     assert pf_config.init_strength_min == pytest.approx(300000.0)
     assert pf_config.init_strength_max == pytest.approx(2000000.0)
-    assert pf_config.label_pos_weight == pytest.approx(1.7)
-    assert pf_config.label_strength_weight == pytest.approx(0.4)
-    assert pf_config.label_missing_cost == pytest.approx(123.0)
-    assert pf_config.label_pos_scale == pytest.approx(2.0)
-    assert pf_config.label_strength_scale == pytest.approx(50.0)
 
 
 def test_pf_configs_share_only_sequential_runtime_fields():

@@ -104,9 +104,10 @@ def _build_two_mode_estimator() -> RotatingShieldPFEstimator:
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
             planning_particles=2,
             planning_method="top_weight",
-            pseudo_source_min_distinct_views=2,
         ),
         shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
     )
@@ -140,13 +141,10 @@ def _build_two_mode_estimator() -> RotatingShieldPFEstimator:
                 positions=np.array([[2.0, 0.0, 0.0]], dtype=float),
                 strengths=np.array([70.0], dtype=float),
                 background=0.0,
-                tentative_sources=np.array([True], dtype=bool),
-                verification_fail_streaks=np.array([1], dtype=int),
             ),
             log_weight=float(np.log(0.45)),
         ),
     ]
-    filt.last_birth_residual_distinct_poses = 1
     return estimator
 
 
@@ -237,6 +235,8 @@ def test_remaining_measurement_flags_high_surface_ambiguity() -> None:
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
             max_sources=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
             planning_particles=2,
             planning_method="top_weight",
             position_max=(10.0, 10.0, 10.0),
@@ -383,7 +383,12 @@ def test_remaining_measurement_marks_observed_zero_source_isotope_unresolved() -
         candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
         shield_normals=np.eye(3, dtype=float),
         mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+        ),
         shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
     )
     estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
@@ -449,7 +454,12 @@ def test_remaining_measurement_ignores_low_snr_absent_isotope_counts() -> None:
         candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
         shield_normals=np.eye(3, dtype=float),
         mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+        ),
         shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
     )
     estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))
@@ -515,7 +525,12 @@ def test_remaining_measurement_uses_pf_cardinality_entropy_with_low_snr() -> Non
         candidate_sources=np.array([[5.0, 5.0, 10.0]], dtype=float),
         shield_normals=np.eye(3, dtype=float),
         mu_by_isotope={isotope: 0.0},
-        pf_config=RotatingShieldPFConfig(num_particles=2, max_sources=2),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+        ),
         shield_params=ShieldParams(thickness_fe_cm=0.0, thickness_pb_cm=0.0),
     )
     estimator.add_measurement_pose(np.array([5.0, 5.0, 0.5], dtype=float))

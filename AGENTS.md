@@ -67,9 +67,9 @@
   `mix9_multi_isotope_cardinality`:
   `proposed`, `baseline_passive_equal_time_no_shield`, `round_robin_shield`,
   and `eig_only_path`. The task uses `4 Cs-137 + 3 Co-60 + 2 Eu-154` sources.
-  Estimator-only ablations such as `no_residual_birth` and `no_verification`
-  should be run as logged replay unless the user explicitly requests extra
-  full simulations.
+  Deleted heuristic structural proposals and pseudo-source verification are not
+  supported estimator ablations and must not be restored in replay or full
+  simulation.
 - Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
   `results/ral_ablation/ral_paper_subset_manifest.csv` and
   `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.

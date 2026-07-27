@@ -46,22 +46,6 @@ def remaining_measurement_payload(
     return {}
 
 
-def has_birth_residual_evidence(
-    estimator: object,
-    *,
-    min_support: int,
-) -> bool:
-    """Return True when any isotope still has residual evidence for a new source."""
-    support_floor = max(1, int(min_support))
-    filters = getattr(estimator, "filters", {})
-    for filt in filters.values():
-        gate_passed = bool(getattr(filt, "last_birth_residual_gate_passed", False))
-        support = int(getattr(filt, "last_birth_residual_support", 0))
-        if gate_passed and support >= support_floor:
-            return True
-    return False
-
-
 def resolve_mission_max_steps(
     cli_max_steps: int | None,
     runtime_config: Mapping[str, Any],

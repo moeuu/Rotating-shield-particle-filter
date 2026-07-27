@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import matplotlib.axes
 import numpy as np
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from measurement.obstacles import ObstacleGrid
-from pf.parallel import Measurement, ParallelIsotopePF
+from pf.measurement import Measurement
 from pf.particle_filter import IsotopeParticle, PFConfig
 from pf.state import IsotopeState
 from visualization.realtime_viz import CUISplitPFVisualizer, PFFrame, build_frame_from_pf
@@ -205,12 +207,9 @@ def test_build_frame_from_pf_hides_inactive_particle_slots() -> None:
         num_particles=2,
         use_gpu=False,
         birth_enable=False,
-        use_clustered_output=False,
-        pseudo_source_fail_grace_stations=1,
-        source_prune_fail_grace_stations=1,
+        init_num_sources=(1, 1),
     )
-    pf = ParallelIsotopePF(isotope_names=["Cs-137"], config=config)
-    filt = pf.filters["Cs-137"]
+    filt = SimpleNamespace(config=config)
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
@@ -226,19 +225,19 @@ def test_build_frame_from_pf_hides_inactive_particle_slots() -> None:
         ),
         IsotopeParticle(
             state=IsotopeState(
-                num_sources=2,
+                num_sources=1,
                 positions=np.array(
                     [[2.0, 3.0, 4.0], [8.0, 8.0, 8.0]],
                     dtype=float,
                 ),
                 strengths=np.array([110.0, 10.0], dtype=float),
                 background=0.0,
-                tentative_sources=np.array([False, True], dtype=bool),
-                verification_fail_streaks=np.array([0, 1], dtype=int),
             ),
             log_weight=np.log(0.5),
         ),
     ]
+    filt.continuous_weights = np.array([0.5, 0.5], dtype=float)
+    pf = SimpleNamespace(filters={"Cs-137": filt})
 
     frame = build_frame_from_pf(
         pf,
@@ -251,6 +250,7 @@ def test_build_frame_from_pf_hides_inactive_particle_slots() -> None:
         ),
         step_index=0,
         time_sec=0.0,
+        estimated_override={},
     )
 
     displayed = frame.particle_positions["Cs-137"]

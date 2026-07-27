@@ -51,16 +51,10 @@ these mechanisms in one expensive run.
   elevation terms from DSS-PP. It tests whether ordinary information-driven
   planning is sufficient.
 
-Estimator-side ablations should be run as logged replay when the proposed
-measurement log is available:
-
-- `no_residual_birth`
-- `no_verification`
-
-These replay ablations isolate source-cardinality birth and causal
-tentative-source verification without paying for additional Geant4 closed-loop
-transport. Do not include them in the default full-simulation run script unless
-the user explicitly accepts the extra runtime.
+The exact reversible-jump particle filter is shared by every variant. Deleted
+heuristic structural proposals, pseudo-source verification, and particle
+injection are not estimator ablations and must not be restored as replay or
+full-simulation variants.
 
 ## Generated Files
 

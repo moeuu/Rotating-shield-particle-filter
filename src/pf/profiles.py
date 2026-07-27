@@ -13,19 +13,6 @@ class EstimatorProfile(StrEnum):
     PF_STRICT = "pf_strict"
 
 
-class ProposalOrigin(StrEnum):
-    """Record the origin of a sequential PF source proposal."""
-
-    PF_BIRTH = "pf_birth"
-    PF_RESIDUAL = "pf_residual"
-    PF_SPLIT = "pf_split"
-
-    @property
-    def is_pf_origin(self) -> bool:
-        """Return true because every supported proposal is PF-native."""
-        return True
-
-
 @dataclass(frozen=True)
 class EstimatorCapabilities:
     """Declare the positive capabilities of the pure PF runtime."""
@@ -95,51 +82,195 @@ _REMOVED_KEY_PREFIXES = (
     "weak_source_prune_",
 )
 
-_REMOVED_EXACT_KEYS = frozenset(
+_REMOVED_HEURISTIC_KEYS = frozenset(
     {
-        "birth_refit_residual_gate",
-        "birth_refit_residual_min_fraction",
-        "birth_existing_response_corr_max",
-        "birth_response_condition_max",
-        "birth_residual_acceptance_complexity_scale",
-        "birth_residual_always_try",
-        "birth_residual_forced_min_delta_ll",
-        "birth_residual_suppress_death",
-        "birth_window",
-        "death_delta_ll_threshold",
-        "death_low_q_streak",
-        "death_require_low_strength",
-        "death_strength_threshold",
-        "display_prune_refresh_every",
-        "display_pruned_estimates_every",
-        "final_absent_isotope_filter",
-        "mode_preserving_report_cardinality_extra_particles",
-        "mode_preserving_report_cardinality_strata",
-        "mission_stop_require_model_order_ready",
-        "mission_stop_soft_extension_require_report_progress",
-        "pseudo_source_quarantine_excludes_runtime",
-        "adaptive_cardinality_condition_max",
-        "adaptive_cardinality_min_bic_margin",
-        "adaptive_cardinality_min_candidate_count",
-        "refit_after_moves",
-        "refit_eps",
-        "refit_iters",
-        "report_pre_finalize_guard",
-        "report_exclude_unverified_sources",
-        "source_prune_refit_after_remove",
-        "source_strength_absorption_penalty_weight",
-        "source_strength_absorption_q_multiple",
-        "source_strength_observation_overshoot_min_visible_fraction",
-        "source_strength_observation_overshoot_min_visible_measurements",
-        "source_strength_observation_overshoot_penalty_weight",
-        "source_strength_observation_overshoot_quantile",
-        "source_strength_observation_overshoot_sigma",
-        "source_strength_prior_mean",
-        "source_strength_prior_rel_sigma",
-        "source_strength_prior_weight",
-        "split_residual_always_try",
-        "support_window",
+        "background_sigma",
+        "birth_alpha",
+        "birth_bic_penalty_params",
+        "birth_candidate_jitter_sigma",
+        "birth_candidate_support_fraction",
+        "birth_complexity_penalty",
+        "birth_count_distance_log_clip",
+        "birth_count_distance_prior_weight",
+        "birth_count_distance_strength_sigma",
+        "birth_count_distance_strength_weight",
+        "birth_delta_ll_threshold",
+        "birth_detector_min_sep_m",
+        "birth_jitter_topk_candidates",
+        "birth_matching_pursuit_max_new_sources",
+        "birth_matching_pursuit_topk_candidates",
+        "birth_max_per_update",
+        "birth_min_distinct_poses",
+        "birth_min_distinct_stations",
+        "birth_min_score",
+        "birth_min_sep_m",
+        "birth_num_local_jitter",
+        "birth_orthogonal_candidate_corr_max",
+        "birth_orthogonalize_residual_candidates",
+        "birth_q_max",
+        "birth_q_min",
+        "birth_residual_clip_quantile",
+        "birth_residual_expand_structural_particles",
+        "birth_residual_expanded_structural_topk_particles",
+        "birth_residual_gate_p_value",
+        "birth_residual_min_support",
+        "birth_residual_support_sigma",
+        "birth_softmax_temp",
+        "birth_stage_single_station_as_quarantine",
+        "birth_topk_particles",
+        "birth_use_shield_coded_residual",
+        "birth_use_weighted_topk",
+        "cardinality_preserving_min_stations",
+        "cardinality_preserving_require_confirmed_structure",
+        "cardinality_preserving_resample",
+        "converge_require_no_tentative",
+        "deferred_resample_roughening_scale",
+        "disable_regularize_on_temper_resample",
+        "init_grid_repeats",
+        "init_grid_spacing_m",
+        "init_joint_position_design",
+        "init_joint_position_retries",
+        "init_source_min_separation_m",
+        "label_alignment_iters",
+        "label_enable",
+        "label_missing_cost",
+        "label_pos_scale",
+        "label_pos_weight",
+        "label_strength_scale",
+        "label_strength_weight",
+        "max_sigma_pos",
+        "merge_delta_ll_threshold",
+        "merge_distance_max",
+        "merge_prob",
+        "merge_response_corr_min",
+        "merge_search_topk_pairs",
+        "min_age_to_split",
+        "min_sigma_pos",
+        "mode_preserving_cardinality_strata",
+        "mode_preserving_dynamic_cardinality_allocation",
+        "mode_preserving_dynamic_cardinality_entropy_min",
+        "mode_preserving_dynamic_cardinality_extra_particles",
+        "mode_preserving_dynamic_cardinality_min_mass",
+        "mode_preserving_dynamic_spatial_allocation",
+        "mode_preserving_dynamic_spatial_extra_particles",
+        "mode_preserving_dynamic_spatial_min_score_fraction",
+        "mode_preserving_height_bin_m",
+        "mode_preserving_high_surface_extra_particles",
+        "mode_preserving_high_surface_z_fraction",
+        "mode_preserving_max_modes",
+        "mode_preserving_min_particles_per_cardinality",
+        "mode_preserving_min_weight_fraction",
+        "mode_preserving_particles_per_mode",
+        "mode_preserving_radius_m",
+        "mode_preserving_resample",
+        "mode_preserving_residual_boost",
+        "mode_preserving_support_score_weight",
+        "mode_preserving_surface_strata",
+        "mode_preserving_tentative_boost",
+        "p_birth",
+        "p_kill",
+        "peak_suppression_enable",
+        "peak_suppression_factor",
+        "peak_suppression_min_source_fraction",
+        "position_sigma",
+        "pseudo_source_corr_max",
+        "pseudo_source_fail_grace_stations",
+        "pseudo_source_min_delta_ll",
+        "pseudo_source_min_distinct_views",
+        "pseudo_source_quarantine_on_suppress",
+        "pseudo_source_temporal_sep_min",
+        "pseudo_source_verification_enable",
+        "residual_decomposition_enable",
+        "residual_decomposition_max_layers",
+        "roughening_decay",
+        "roughening_k",
+        "roughening_min_mult",
+        "source_detector_exclusion_m",
+        "source_prune_bic_penalty_params",
+        "source_prune_delta_ll_threshold",
+        "source_prune_fail_grace_stations",
+        "source_prune_min_distinct_stations",
+        "source_prune_min_distinct_views",
+        "split_complexity_penalty",
+        "split_delta_ll_threshold",
+        "split_position_sigma",
+        "split_prob",
+        "split_residual_candidate_count",
+        "split_residual_guided",
+        "split_strength_max_frac",
+        "split_strength_min",
+        "split_strength_min_frac",
+        "strength_log_sigma",
+        "strength_sigma",
+        "structural_kernel_mode",
+        "structural_proposal_topk_particles",
+        "structural_trial_parallel_min_trials",
+        "structural_trial_workers",
+        "support_ema_alpha",
+        "surface_rejuvenation_enable",
     }
+)
+
+_REMOVED_EXACT_KEYS = (
+    frozenset(
+        {
+            "birth_refit_residual_gate",
+            "birth_refit_residual_min_fraction",
+            "birth_existing_response_corr_max",
+            "birth_response_condition_max",
+            "birth_residual_acceptance_complexity_scale",
+            "birth_residual_always_try",
+            "birth_residual_forced_min_delta_ll",
+            "birth_residual_suppress_death",
+            "birth_window",
+            "cluster_eps_m",
+            "cluster_exact_max_points",
+            "cluster_min_samples",
+            "cluster_report_max_points",
+            "converge_cluster_min_support_fraction",
+            "converge_cluster_spread_max_m",
+            "converge_freeze_updates",
+            "death_delta_ll_threshold",
+            "death_low_q_streak",
+            "death_require_low_strength",
+            "death_strength_threshold",
+            "display_prune_refresh_every",
+            "display_pruned_estimates_every",
+            "final_absent_isotope_filter",
+            "mode_preserving_report_cardinality_extra_particles",
+            "mode_preserving_report_cardinality_strata",
+            "mission_stop_require_model_order_ready",
+            "mission_stop_soft_extension_require_report_progress",
+            "pseudo_source_quarantine_excludes_runtime",
+            "adaptive_cardinality_condition_max",
+            "adaptive_cardinality_min_bic_margin",
+            "adaptive_cardinality_min_candidate_count",
+            "refit_after_moves",
+            "refit_eps",
+            "refit_iters",
+            "report_pre_finalize_guard",
+            "report_exclude_unverified_sources",
+            "source_prune_refit_after_remove",
+            "source_position_max",
+            "source_position_min",
+            "source_strength_absorption_penalty_weight",
+            "source_strength_absorption_q_multiple",
+            "source_strength_observation_overshoot_min_visible_fraction",
+            "source_strength_observation_overshoot_min_visible_measurements",
+            "source_strength_observation_overshoot_penalty_weight",
+            "source_strength_observation_overshoot_quantile",
+            "source_strength_observation_overshoot_sigma",
+            "source_strength_prior_mean",
+            "source_strength_prior_rel_sigma",
+            "source_strength_prior_weight",
+            "source_z_max_m",
+            "source_z_min_m",
+            "split_residual_always_try",
+            "support_window",
+            "use_clustered_output",
+        }
+    )
+    | _REMOVED_HEURISTIC_KEYS
 )
 
 _REMOVED_DSS_KEYS = frozenset(
@@ -173,19 +304,14 @@ def removed_estimator_config_keys(config: Mapping[str, Any]) -> tuple[str, ...]:
     removed = {
         str(key)
         for key in config
-        if str(key) in _REMOVED_EXACT_KEYS
-        or str(key).startswith(_REMOVED_KEY_PREFIXES)
+        if str(key) in _REMOVED_EXACT_KEYS or str(key).startswith(_REMOVED_KEY_PREFIXES)
     }
     dss_payload = config.get("dss_pp")
     if isinstance(dss_payload, Mapping):
         removed.update(
             f"dss_pp.{key}" for key in dss_payload if key in _REMOVED_DSS_KEYS
         )
-    removed.update(
-        f"dss_{key}"
-        for key in _REMOVED_DSS_KEYS
-        if f"dss_{key}" in config
-    )
+    removed.update(f"dss_{key}" for key in _REMOVED_DSS_KEYS if f"dss_{key}" in config)
     remaining_payload = config.get("remaining_measurement_estimate")
     if isinstance(remaining_payload, Mapping):
         removed.update(
@@ -207,8 +333,7 @@ def reject_removed_estimator_config(config: Mapping[str, Any]) -> None:
     if removed:
         joined = ", ".join(removed)
         raise ValueError(
-            "Removed non-PF estimator configuration is not supported: "
-            f"{joined}."
+            f"Removed non-PF estimator configuration is not supported: {joined}."
         )
 
 
@@ -254,12 +379,6 @@ def resolve_structural_transition_provenance(
     """Resolve truthful provenance for the configured PF structural kernel."""
     del capabilities
     structural_moves_enabled = bool(getattr(config, "birth_enable", False))
-    structural_kernel_mode = (
-        str(getattr(config, "structural_kernel_mode", "heuristic"))
-        .strip()
-        .lower()
-        .replace("-", "_")
-    )
     raw_initial_support = getattr(config, "init_num_sources", (0, 0))
     try:
         initial_lower, initial_upper = raw_initial_support
@@ -267,28 +386,16 @@ def resolve_structural_transition_provenance(
     except (TypeError, ValueError):
         fixed_initial_cardinality = True
 
-    if structural_moves_enabled and structural_kernel_mode == "rj_mh":
+    if structural_moves_enabled:
         kernel_family = "area_weighted_surface_birth_death_rj_mh"
         posterior_semantics = (
-            "sequential_particle_filter_with_"
-            "target_preserving_rj_mh_rejuvenation"
+            "sequential_particle_filter_with_target_preserving_rj_mh_rejuvenation"
         )
         target_preserving = True
         exact_rj = True
         reversible_jump_used = True
         data_conditioned_proposal = False
         data_conditioned_strength = False
-    elif structural_moves_enabled:
-        kernel_family = "likelihood_scored_residual_pf_structural_moves"
-        posterior_semantics = (
-            "approximate_sequential_particle_ensemble_with_"
-            "likelihood_scored_structural_moves"
-        )
-        target_preserving = False
-        exact_rj = False
-        reversible_jump_used = False
-        data_conditioned_proposal = True
-        data_conditioned_strength = True
     else:
         kernel_family = (
             "fixed_cardinality_no_structural_moves"
@@ -389,7 +496,6 @@ def enforce_pure_runtime_settings_in_place(
 __all__ = [
     "EstimatorCapabilities",
     "EstimatorProfile",
-    "ProposalOrigin",
     "StructuralTransitionProvenance",
     "apply_profile_to_config",
     "enforce_pure_runtime_settings",

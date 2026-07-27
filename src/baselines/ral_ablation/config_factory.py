@@ -320,29 +320,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         },
     ),
     AblationVariant(
-        name="no_residual_birth",
-        description="Disable residual-coded source birth while preserving PF capacity.",
-        overrides={
-            "birth_max_per_update": 0,
-            "split_prob": 0.0,
-            "split_residual_guided": False,
-            "birth_use_shield_coded_residual": False,
-            "birth_residual_expand_structural_particles": False,
-            "residual_decomposition_enable": False,
-            "peak_suppression_enable": False,
-        },
-    ),
-    AblationVariant(
-        name="no_verification",
-        description=(
-            "Disable causal tentative-source verification for a logged "
-            "estimator-side replay ablation."
-        ),
-        overrides={
-            "pseudo_source_verification_enable": False,
-        },
-    ),
-    AblationVariant(
         name="no_obstacle_signature",
         description="Keep obstacle attenuation in PF/Geant4 but remove obstacle terms from DSS-PP utility.",
         overrides={
@@ -834,7 +811,6 @@ def _trial_command(
         str(int(obstacle_seed)),
         "--source-config",
         source_path.as_posix(),
-        "--birth",
         "--measurement-time-s",
         f"{DEFAULT_MEASUREMENT_TIME_S:g}",
         "--output-tag",

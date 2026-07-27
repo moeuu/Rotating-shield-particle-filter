@@ -266,37 +266,100 @@ def _assert_validated_shield_view_ratio_likelihood(payload: dict[str, object]) -
     assert int(ratio["min_views"]) >= 2
 
 
-def _assert_pure_pf_estimator_boundary(payload: dict[str, object]) -> None:
-    """Assert that a runtime config cannot activate a second batch estimator."""
-    assert payload["estimator_profile"] == "pf_strict"
+def _assert_no_heuristic_pf_config(payload: dict[str, object]) -> None:
+    """Assert that removed heuristic PF controls are absent."""
     removed_prefixes = (
         "adaptive_strength_prior",
         "all_history_dictionary",
+        "birth_candidate_",
+        "birth_complexity_",
+        "birth_count_distance_",
+        "birth_detector_",
         "birth_global_rescue",
+        "birth_jitter_",
+        "birth_matching_",
+        "birth_max_per_update",
+        "birth_min_",
+        "birth_num_",
+        "birth_orthogonal_",
+        "birth_q_",
         "birth_refit_residual",
+        "birth_residual_",
+        "birth_softmax_",
+        "birth_stage_",
+        "birth_topk_",
+        "birth_use_",
+        "cardinality_preserving_",
         "candidate_verification",
         "conditional_strength",
         "high_strength_split",
         "final_absent_",
+        "label_",
+        "merge_",
+        "mode_preserving_",
         "mode_preserving_report_cardinality",
         "online_absent_",
+        "peak_suppression_",
+        "precision_diagnostic_birth_candidate_",
+        "pseudo_source_",
         "report_best_so_far",
         "report_cluster",
         "report_mle_rescue",
         "report_model_order",
         "report_strength",
         "report_surface_local_refine",
+        "residual_decomposition_",
         "runtime_report_rescue",
+        "source_prune_",
         "source_strength_absorption",
         "source_strength_observation_overshoot",
         "sparse_poisson",
+        "split_",
+        "structural_proposal_",
+        "structural_trial_",
         "surface_map",
         "weak_source_prune",
     )
-    assert not any(
-        key.startswith(removed_prefixes)
-        for key in payload
-    )
+    assert not any(key.startswith(removed_prefixes) for key in payload)
+    removed_fields = {
+        "background_sigma",
+        "birth_alpha",
+        "birth_bic_penalty_params",
+        "birth_delta_ll_threshold",
+        "converge_require_no_tentative",
+        "deferred_resample_roughening_scale",
+        "disable_regularize_on_temper_resample",
+        "init_grid_repeats",
+        "init_grid_spacing_m",
+        "init_joint_position_design",
+        "init_joint_position_retries",
+        "init_source_min_separation_m",
+        "max_sigma_pos",
+        "min_age_to_split",
+        "min_sigma_pos",
+        "p_birth",
+        "p_kill",
+        "pf_init_joint_position_design",
+        "pf_init_joint_position_retries",
+        "pf_init_source_min_separation_m",
+        "position_sigma",
+        "roughening_decay",
+        "roughening_k",
+        "roughening_min_mult",
+        "source_detector_exclusion_m",
+        "strength_log_sigma",
+        "strength_sigma",
+        "structural_kernel_mode",
+        "support_ema_alpha",
+        "surface_rejuvenation_enable",
+    }
+    assert removed_fields.isdisjoint(payload)
+
+
+def _assert_pure_pf_estimator_boundary(payload: dict[str, object]) -> None:
+    """Assert that runtime cannot activate a second estimator or heuristic PF."""
+    assert payload["estimator_profile"] == "pf_strict"
+    _assert_no_heuristic_pf_config(payload)
     for field in (
         "mission_stop_report_simple_enable",
         "mission_stop_soft_extension_require_report_progress",
@@ -381,6 +444,7 @@ def test_standard_runtime_configs_use_single_surface_pf_profile(
 
     assert payload["estimator_profile"] == "pf_strict"
     assert payload["source_surface_prior"] is True
+    _assert_no_heuristic_pf_config(payload)
 
 
 def test_guarded_full_simulation_config_forces_cpu_only_execution() -> None:
@@ -400,7 +464,7 @@ def test_guarded_full_simulation_config_forces_cpu_only_execution() -> None:
     assert int(payload["pose_selection_workers"]) == 16
     assert int(payload["ig_workers"]) == 16
     assert int(payload["parallel_isotope_workers"]) == 16
-    assert int(payload["structural_trial_workers"]) == 16
+    assert "structural_trial_workers" not in payload
     assert payload["source_rate_model"] == "detector_cps_1m"
     assert payload["spectrum_count_method"] == "response_poisson"
     assert payload["pf_obstacle_attenuation"] is True
@@ -456,32 +520,10 @@ def test_high_fidelity_external_config_uses_native_geometry() -> None:
     assert int(payload["pose_selection_workers"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
-    assert int(payload["structural_trial_workers"]) == 32
-    assert int(payload["structural_trial_parallel_min_trials"]) <= 8
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
-    assert int(payload["birth_min_distinct_stations"]) >= 2
-    assert int(payload["birth_min_distinct_poses"]) >= 5
-    assert "birth_existing_response_corr_max" not in payload
-    assert "birth_response_condition_max" not in payload
-    assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
     _assert_pure_pf_estimator_boundary(payload)
     assert float(payload["random_source_intensity_min_cps_1m"]) >= 3.0e5
     assert float(payload["random_source_intensity_max_cps_1m"]) >= 2.0e6
-    assert float(payload["birth_q_max"]) >= float(
-        payload["random_source_intensity_max_cps_1m"]
-    )
-    assert payload["cardinality_preserving_resample"] is True
-    assert int(payload["cardinality_preserving_min_stations"]) == 0
-    assert payload["cardinality_preserving_require_confirmed_structure"] is False
-    assert payload["mode_preserving_resample"] is True
-    assert int(payload["mode_preserving_max_modes"]) >= 12
-    assert int(payload["mode_preserving_particles_per_mode"]) >= 8
-    assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
-    assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
-    assert payload["mode_preserving_cardinality_strata"] is True
-    assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
-    assert payload["split_residual_guided"] is True
-    assert int(payload["split_residual_candidate_count"]) >= 8
     assert payload["remaining_measurement_estimate"]["enabled"] is True
     assert (
         float(
@@ -547,31 +589,15 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert int(payload["pose_selection_workers"]) == 32
     assert int(payload["ig_workers"]) == 32
     assert int(payload["parallel_isotope_workers"]) == 32
-    assert int(payload["structural_trial_workers"]) == 32
-    assert int(payload["structural_trial_parallel_min_trials"]) <= 8
     assert int(payload["dss_pp"]["program_eval_workers"]) == 32
-    assert int(payload["birth_min_distinct_stations"]) >= 2
-    assert int(payload["birth_min_distinct_poses"]) >= 5
-    assert "birth_existing_response_corr_max" not in payload
-    assert "birth_response_condition_max" not in payload
-    assert float(payload["pseudo_source_temporal_sep_min"]) > 0.0
     _assert_pure_pf_estimator_boundary(payload)
     assert float(payload["random_source_intensity_min_cps_1m"]) >= 3.0e5
     assert float(payload["random_source_intensity_max_cps_1m"]) >= 2.0e6
-    assert float(payload["birth_q_max"]) >= float(
-        payload["random_source_intensity_max_cps_1m"]
-    )
-    assert payload["structural_kernel_mode"] == "rj_mh"
     assert payload["birth_enable"] is True
     assert (
         float(payload["structural_rj_local_position_move_probability"])
         == 1.0
     )
-    assert payload["cardinality_preserving_resample"] is False
-    assert int(payload["cardinality_preserving_min_stations"]) == 0
-    assert payload["cardinality_preserving_require_confirmed_structure"] is False
-    assert payload["split_residual_guided"] is True
-    assert int(payload["split_residual_candidate_count"]) >= 8
     assert payload["remaining_measurement_estimate"]["enabled"] is True
     assert (
         float(
@@ -593,13 +619,6 @@ def test_variance_reduction_config_uses_unweighted_full_histories() -> None:
     assert float(payload["dss_pp"]["correlation_reduction_weight"]) > 0.0
     assert float(payload["dss_pp"]["isotope_balance_weight"]) > 0.0
     assert float(payload["dss_pp"]["coverage_weight"]) <= 2.0
-    assert payload["mode_preserving_resample"] is False
-    assert int(payload["mode_preserving_max_modes"]) >= 12
-    assert int(payload["mode_preserving_particles_per_mode"]) >= 8
-    assert float(payload["mode_preserving_min_weight_fraction"]) == pytest.approx(0.0)
-    assert int(payload["mode_preserving_high_surface_extra_particles"]) >= 1
-    assert payload["mode_preserving_cardinality_strata"] is True
-    assert int(payload["mode_preserving_min_particles_per_cardinality"]) >= 4
 
 
 def test_accelerated_config_is_an_explicit_standard_config_overlay() -> None:

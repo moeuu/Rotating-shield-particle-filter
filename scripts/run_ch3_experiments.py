@@ -54,15 +54,23 @@ class ExperimentScenario:
     live_time_s: float = 1.0
     num_particles: int = 200
     max_sources: int = 2
+    fixed_sources_per_isotope: int = 1
     resample_threshold: float = 0.5
 
 
 def _build_estimator(scn: ExperimentScenario) -> RotatingShieldPFEstimator:
-    """Create an estimator configured for one experiment scenario."""
+    """Create a fixed-cardinality pure PF for one experiment scenario."""
     isotopes = sorted(set(ts.isotope for ts in scn.true_sources))
+    fixed_sources = int(scn.fixed_sources_per_isotope)
+    if not 0 <= fixed_sources <= int(scn.max_sources):
+        raise ValueError(
+            "fixed_sources_per_isotope must be within zero through max_sources."
+        )
     cfg = RotatingShieldPFConfig(
         num_particles=scn.num_particles,
         max_sources=scn.max_sources,
+        init_num_sources=(fixed_sources, fixed_sources),
+        birth_enable=False,
         resample_threshold=scn.resample_threshold,
     )
     est = RotatingShieldPFEstimator(
@@ -339,6 +347,7 @@ def default_scenarios() -> List[ExperimentScenario]:
             live_time_s=scenario.live_time_s,
             num_particles=scenario.num_particles,
             max_sources=scenario.max_sources,
+            fixed_sources_per_isotope=scenario.fixed_sources_per_isotope,
             resample_threshold=scenario.resample_threshold,
         )
         for scenario in scenarios

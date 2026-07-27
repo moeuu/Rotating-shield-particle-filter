@@ -322,17 +322,24 @@ def test_main_default_selects_standard_geant4_full_simulation(monkeypatch) -> No
     assert captured["birth_enabled"] is True
     runtime_config = load_runtime_config(Path(str(captured["sim_config_path"])))
     assert runtime_config["birth_enable"] is True
-    assert runtime_config["structural_kernel_mode"] == "rj_mh"
     assert runtime_config["pf_max_sources"] == 5
     assert runtime_config["structural_cardinality_prior_probs"] == pytest.approx(
         [1.0 / 6.0] * 6
     )
-    assert runtime_config["surface_rejuvenation_enable"] is False
-    assert runtime_config["mode_preserving_resample"] is False
-    assert runtime_config["cardinality_preserving_resample"] is False
-    assert runtime_config["pseudo_source_verification_enable"] is False
-    assert float(runtime_config["split_prob"]) == 0.0
-    assert float(runtime_config["merge_prob"]) == 0.0
+    assert runtime_config["source_surface_prior"] is True
+    assert float(runtime_config["structural_rj_move_probability"]) > 0.0
+    assert float(runtime_config["structural_rj_birth_probability"]) > 0.0
+    assert float(runtime_config["structural_rj_death_probability"]) > 0.0
+    removed_keys = {
+        "structural_kernel_mode",
+        "surface_rejuvenation_enable",
+        "mode_preserving_resample",
+        "cardinality_preserving_resample",
+        "pseudo_source_verification_enable",
+        "split_prob",
+        "merge_prob",
+    }
+    assert removed_keys.isdisjoint(runtime_config)
 
 
 def test_main_backend_override_without_mode_keeps_matching_default_config(

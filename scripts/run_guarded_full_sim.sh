@@ -206,7 +206,6 @@ if [[ ${#MAIN_ARGS[@]} -eq 0 ]]; then
         --environment-mode random
         --obstacle-seed 2026061201
         --source-config "$DEFAULT_SOURCE_CONFIG"
-        --birth
         --measurement-time-s 30
         --output-tag "$DEFAULT_OUTPUT_TAG"
     )

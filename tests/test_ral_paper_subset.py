@@ -41,8 +41,6 @@ def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
         "baseline_passive_equal_time_no_shield",
         "round_robin_shield",
         "eig_only_path",
-        "no_residual_birth",
-        "no_verification",
         "no_shield",
     )
     rows = [_manifest_row(case, variant) for case in cases for variant in variants]
@@ -68,6 +66,4 @@ def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
         "eig_only_path",
     ) in selected_pairs
     assert all(case == "mix9_multi_isotope_cardinality" for case, _ in selected_pairs)
-    assert ("mix9_multi_isotope_cardinality", "no_residual_birth") not in selected_pairs
-    assert ("mix9_multi_isotope_cardinality", "no_verification") not in selected_pairs
     assert all(row["seed"] == DEFAULT_SEED for row in subset)

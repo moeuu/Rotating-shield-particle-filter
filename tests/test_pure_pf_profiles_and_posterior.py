@@ -18,7 +18,6 @@ from pf.particle_filter import IsotopeParticle
 from pf.posterior import posterior_point_estimate_from_states
 from pf.profiles import (
     EstimatorProfile,
-    ProposalOrigin,
     apply_profile_to_config,
     enforce_pure_runtime_settings,
     removed_estimator_config_keys,
@@ -35,18 +34,9 @@ def _exact_rj_config(**overrides: object) -> RotatingShieldPFConfig:
     """Build an exact finite-surface RJ-MH config for focused tests."""
     values: dict[str, object] = {
         "estimator_profile": "pf_strict",
-        "structural_kernel_mode": "rj_mh",
         "source_position_prior": "surface",
         "max_sources": 5,
         "init_num_sources": (0, 5),
-        "split_prob": 0.0,
-        "merge_prob": 0.0,
-        "surface_rejuvenation_enable": False,
-        "mode_preserving_resample": False,
-        "cardinality_preserving_resample": False,
-        "pseudo_source_verification_enable": False,
-        "source_detector_exclusion_m": 0.0,
-        "init_source_min_separation_m": 0.0,
     }
     values.update(overrides)
     return RotatingShieldPFConfig(**values)
@@ -105,6 +95,28 @@ def test_removed_profiles_fail_fast(profile: str) -> None:
             {"pseudo_source_quarantine_excludes_runtime": False},
             "pseudo_source_quarantine_excludes_runtime",
         ),
+        ({"structural_kernel_mode": "rj_mh"}, "structural_kernel_mode"),
+        ({"p_birth": 0.1}, "p_birth"),
+        ({"p_kill": 0.1}, "p_kill"),
+        ({"birth_residual_min_support": 1}, "birth_residual_min_support"),
+        (
+            {"pseudo_source_verification_enable": False},
+            "pseudo_source_verification_enable",
+        ),
+        ({"split_prob": 0.0}, "split_prob"),
+        ({"merge_prob": 0.0}, "merge_prob"),
+        ({"mode_preserving_resample": False}, "mode_preserving_resample"),
+        (
+            {"cardinality_preserving_resample": False},
+            "cardinality_preserving_resample",
+        ),
+        ({"roughening_k": 0.0}, "roughening_k"),
+        ({"init_grid_repeats": 1}, "init_grid_repeats"),
+        ({"init_joint_position_design": False}, "init_joint_position_design"),
+        ({"source_detector_exclusion_m": 0.0}, "source_detector_exclusion_m"),
+        ({"init_source_min_separation_m": 0.0}, "init_source_min_separation_m"),
+        ({"surface_rejuvenation_enable": False}, "surface_rejuvenation_enable"),
+        ({"structural_trial_workers": 1}, "structural_trial_workers"),
         ({"support_window": 0}, "support_window"),
         ({"birth_residual_always_try": False}, "birth_residual_always_try"),
         ({"split_residual_always_try": False}, "split_residual_always_try"),
@@ -121,6 +133,13 @@ def test_removed_profiles_fail_fast(profile: str) -> None:
             "adaptive_cardinality_min_bic_margin",
         ),
         ({"refit_after_moves": False}, "refit_after_moves"),
+        ({"use_clustered_output": False}, "use_clustered_output"),
+        ({"cluster_eps_m": 0.8}, "cluster_eps_m"),
+        ({"converge_freeze_updates": False}, "converge_freeze_updates"),
+        ({"source_position_min": [0.0, 0.0, 0.0]}, "source_position_min"),
+        ({"source_position_max": [1.0, 1.0, 1.0]}, "source_position_max"),
+        ({"source_z_min_m": 0.0}, "source_z_min_m"),
+        ({"source_z_max_m": 1.0}, "source_z_max_m"),
         (
             {"dss_pp": {"include_runtime_rescue_modes": False}},
             "dss_pp.include_runtime_rescue_modes",
@@ -172,6 +191,30 @@ def test_pf_config_physically_omits_removed_estimator_fields() -> None:
         "sparse_poisson_evidence_enable",
         "surface_map_reconstruction_enable",
         "pseudo_source_quarantine_excludes_runtime",
+        "structural_kernel_mode",
+        "p_birth",
+        "p_kill",
+        "birth_residual_min_support",
+        "pseudo_source_verification_enable",
+        "split_prob",
+        "merge_prob",
+        "mode_preserving_resample",
+        "cardinality_preserving_resample",
+        "roughening_k",
+        "init_grid_repeats",
+        "init_joint_position_design",
+        "source_detector_exclusion_m",
+        "init_source_min_separation_m",
+        "surface_rejuvenation_enable",
+        "structural_trial_workers",
+        "use_clustered_output",
+        "cluster_eps_m",
+        "cluster_min_samples",
+        "cluster_report_max_points",
+        "cluster_exact_max_points",
+        "converge_freeze_updates",
+        "converge_cluster_spread_max_m",
+        "converge_cluster_min_support_fraction",
     }
 
     assert config_fields.isdisjoint(removed_fields)
@@ -196,8 +239,8 @@ def test_strict_profile_requires_environment_surface_source_support() -> None:
         enforce_pure_runtime_settings({"source_position_prior": "volume"})
 
 
-def test_structural_provenance_distinguishes_fixed_k_from_scored_birth() -> None:
-    """Structural provenance must identify likelihood-scored PF moves truthfully."""
+def test_fixed_k_provenance_declares_target_preserving_no_move_kernel() -> None:
+    """Fixed-K provenance must declare a target-preserving no-move kernel."""
     fixed_config = RotatingShieldPFConfig(
         estimator_profile="pf_strict",
         init_num_sources=(3, 3),
@@ -221,55 +264,6 @@ def test_structural_provenance_distinguishes_fixed_k_from_scored_birth() -> None
     assert fixed["reversible_jump_mcmc_used"] is False
     assert fixed["data_conditioned_structural_proposal"] is False
     assert fixed["structural_evidence_uses_pf_likelihood"] is True
-
-    birth_config = RotatingShieldPFConfig(
-        estimator_profile="pf_strict",
-        init_num_sources=(0, 5),
-        birth_enable=True,
-    )
-    birth_capabilities = apply_profile_to_config(birth_config)
-    birth = resolve_structural_transition_provenance(
-        birth_config,
-        capabilities=birth_capabilities,
-    ).to_dict()
-
-    assert birth["posterior_semantics"] == (
-        "approximate_sequential_particle_ensemble_with_"
-        "likelihood_scored_structural_moves"
-    )
-    assert birth["structural_kernel_family"] == (
-        "likelihood_scored_residual_pf_structural_moves"
-    )
-    assert birth["structural_moves_enabled"] is True
-    assert birth["structural_kernel_target_preserving"] is False
-    assert birth["structural_kernel_exact_rj"] is False
-    assert birth["reversible_jump_mcmc_used"] is False
-    assert birth["data_conditioned_structural_proposal"] is True
-    assert birth["data_conditioned_strength_proposal"] is True
-    assert birth["data_conditioned_strength_proposal_importance_corrected"] is False
-    assert birth["structural_evidence_uses_pf_likelihood"] is True
-
-
-def test_static_cardinality_mixture_without_moves_is_target_preserving() -> None:
-    """A variable initial K support is distinct from heuristic K transitions."""
-    config = RotatingShieldPFConfig(
-        estimator_profile="pf_strict",
-        init_num_sources=(0, 5),
-        birth_enable=False,
-    )
-    capabilities = apply_profile_to_config(config)
-    provenance = resolve_structural_transition_provenance(
-        config,
-        capabilities=capabilities,
-    ).to_dict()
-
-    assert provenance["posterior_semantics"] == (
-        "static_cardinality_mixture_sequential_particle_filter"
-    )
-    assert provenance["structural_kernel_family"] == (
-        "static_cardinality_mixture_no_structural_moves"
-    )
-    assert provenance["structural_kernel_target_preserving"] is True
 
 
 def test_exact_rj_provenance_declares_target_preserving_pf_kernel() -> None:
@@ -300,35 +294,6 @@ def test_exact_rj_provenance_declares_target_preserving_pf_kernel() -> None:
 
 
 @pytest.mark.parametrize(
-    ("override", "invalid_field"),
-    [
-        ({"source_position_prior": "volume"}, "source_position_prior"),
-        ({"split_prob": 0.1}, "split_prob"),
-        ({"merge_prob": 0.1}, "merge_prob"),
-        ({"surface_rejuvenation_enable": True}, "surface_rejuvenation_enable"),
-        ({"mode_preserving_resample": True}, "mode_preserving_resample"),
-        (
-            {"cardinality_preserving_resample": True},
-            "cardinality_preserving_resample",
-        ),
-        (
-            {"pseudo_source_verification_enable": True},
-            "pseudo_source_verification_enable",
-        ),
-        ({"source_detector_exclusion_m": 0.25}, "source_detector_exclusion_m"),
-        ({"init_source_min_separation_m": 1.0}, "init_source_min_separation_m"),
-    ],
-)
-def test_exact_rj_rejects_target_changing_heuristics(
-    override: dict[str, object],
-    invalid_field: str,
-) -> None:
-    """Exact mode must fail fast when a legacy operation changes its target."""
-    with pytest.raises(ValueError, match=invalid_field):
-        _exact_rj_config(**override)
-
-
-@pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
         ("structural_rj_patch_spacing_m", 0.0),
@@ -356,7 +321,9 @@ def test_structural_cardinality_prior_is_positive_and_canonical() -> None:
         init_num_sources=(0, 2),
         structural_cardinality_prior_probs=[1.0, 2.0, 3.0]
     )
-    assert config.structural_cardinality_prior_probs == (1.0, 2.0, 3.0)
+    assert config.structural_cardinality_prior_probs == pytest.approx(
+        (1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0)
+    )
 
     with pytest.raises(ValueError, match="structural_cardinality_prior_probs"):
         _exact_rj_config(
@@ -479,7 +446,7 @@ def test_structural_model_manifest_resolves_priors_and_surface_dictionaries() ->
 
 
 def test_structural_history_prefers_view_covariance_over_unrecorded_spectrum() -> None:
-    """Legacy structural history must infer the covariance runtime route."""
+    """Recorded structural history must infer the covariance runtime route."""
     covariance = ((4.0, 1.5), (1.5, 9.0))
     common = {
         "z_k": {"Cs-137": 12.0},
@@ -563,21 +530,19 @@ def test_removed_estimator_methods_are_physically_absent() -> None:
     assert not hasattr(estimator, "batch_methods_invoked")
 
 
-def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
-    """DSS modes and proposal origins must come only from the PF ensemble."""
+def test_pure_planner_uses_only_pf_posterior() -> None:
+    """DSS modes must be derived only from the weighted PF ensemble."""
     _profile, capabilities = resolve_estimator_profile("pf_strict")
     state = SimpleNamespace(
         num_sources=2,
         positions=np.asarray([[0.5, 0.5, 0.4], [1.5, 1.5, 1.2]]),
         strengths=np.asarray([10.0, 5.0]),
-        tentative_sources=np.asarray([False, True]),
-        verification_fail_streaks=np.asarray([0, 0]),
     )
 
     estimator = SimpleNamespace(
         isotopes=("Cs-137",),
         profile_capabilities=capabilities,
-        planner_belief_sources=("pf_posterior", "pf_tentative"),
+        planner_belief_sources=("pf_posterior",),
         pf_config=SimpleNamespace(),
         planning_particles=lambda **_kwargs: {"Cs-137": ([state], np.asarray([1.0]))},
     )
@@ -586,22 +551,8 @@ def test_pure_planner_uses_only_pf_posterior_and_tentative_origins() -> None:
         mode_cluster_radius_m=0.1,
     )
     assert len(modes["Cs-137"]) == 2
-    assert estimator.planner_belief_sources == ("pf_posterior", "pf_tentative")
-
-    boundary = object.__new__(PurePFEstimator)
-    for origin in (
-        ProposalOrigin.PF_BIRTH,
-        ProposalOrigin.PF_RESIDUAL,
-        ProposalOrigin.PF_SPLIT,
-    ):
-        assert boundary.accepts_proposal_origin(origin)
-    assert set(ProposalOrigin) == {
-        ProposalOrigin.PF_BIRTH,
-        ProposalOrigin.PF_RESIDUAL,
-        ProposalOrigin.PF_SPLIT,
-    }
-    for origin in ("batch_sparse", "report_mle", "surface_map", "external_mle"):
-        assert not boundary.accepts_proposal_origin(origin)
+    assert estimator.planner_belief_sources == ("pf_posterior",)
+    assert PurePFEstimator.planner_belief_sources == ("pf_posterior",)
 
 
 @pytest.mark.parametrize(
@@ -686,31 +637,44 @@ def test_standard_runtime_configs_declare_strict_pf_boundary(
 
 
 def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
-    """The production Geant4 config must disable target-changing PF heuristics."""
+    """The production Geant4 config must select only exact surface RJ-MH."""
     root = Path(__file__).resolve().parents[1]
     payload = load_runtime_config(
         root
         / "configs/geant4/variance_reduction_external_no_isaac_32threads.json"
     )
 
-    assert payload["structural_kernel_mode"] == "rj_mh"
     assert payload["birth_enable"] is True
     assert float(payload["structural_rj_patch_spacing_m"]) > 0.0
+    assert float(payload["structural_rj_move_probability"]) > 0.0
+    assert float(payload["structural_rj_birth_probability"]) > 0.0
+    assert float(payload["structural_rj_death_probability"]) > 0.0
     assert (
         float(payload["structural_rj_local_position_move_probability"])
         == 1.0
     )
     assert payload["source_surface_prior"] is True
-    assert float(payload["split_prob"]) == 0.0
-    assert float(payload["merge_prob"]) == 0.0
-    assert payload["surface_rejuvenation_enable"] is False
-    assert payload["mode_preserving_resample"] is False
-    assert payload["cardinality_preserving_resample"] is False
-    assert payload["pseudo_source_verification_enable"] is False
-    assert float(payload["source_detector_exclusion_m"]) == 0.0
-    assert float(payload["pf_init_source_min_separation_m"]) == 0.0
-    assert float(payload["deferred_resample_roughening_scale"]) == 0.0
-    assert payload["disable_regularize_on_temper_resample"] is True
+    assert len(payload["structural_cardinality_prior_probs"]) == (
+        int(payload["pf_max_sources"]) + 1
+    )
+    heuristic_keys = (
+        "structural_kernel_mode",
+        "p_birth",
+        "p_kill",
+        "split_prob",
+        "merge_prob",
+        "surface_rejuvenation_enable",
+        "mode_preserving_resample",
+        "cardinality_preserving_resample",
+        "pseudo_source_verification_enable",
+        "source_detector_exclusion_m",
+        "pf_init_source_min_separation_m",
+        "deferred_resample_roughening_scale",
+        "disable_regularize_on_temper_resample",
+        "structural_trial_workers",
+        "structural_trial_parallel_min_trials",
+    )
+    assert set(payload).isdisjoint(heuristic_keys)
 
 
 @pytest.mark.parametrize(
@@ -724,18 +688,16 @@ def test_standard_geant4_config_selects_exact_surface_rj_kernel() -> None:
 def test_standard_runtime_configs_select_parallel_compute_paths(
     relative_path: str,
 ) -> None:
-    """Standard runtimes must select batched worker paths explicitly."""
+    """Standard runtimes must select parallel planning worker paths."""
     root = Path(__file__).resolve().parents[1]
     payload = load_runtime_config(root / relative_path)
 
     assert int(payload["python_worker_count"]) > 1
     assert int(payload["ig_workers"]) > 1
     assert int(payload["pose_selection_workers"]) > 1
-    assert int(payload["structural_trial_workers"]) > 1
-    assert int(payload["structural_trial_parallel_min_trials"]) >= 1
     assert int(payload["dss_pp"]["program_eval_workers"]) > 1
     # Per-isotope filters currently share NumPy's deterministic RNG stream.
-    # Parallel work therefore stays inside particles, candidates, and trials.
+    # Parallel work therefore stays inside batched PF and planner computations.
     assert payload["parallel_isotope_updates"] is False
 
 
@@ -788,6 +750,8 @@ def test_pure_posterior_projects_surface_particle_mean_to_surface() -> None:
         mu_by_isotope={"Cs-137": 0.0},
         pf_config=RotatingShieldPFConfig(
             num_particles=2,
+            birth_enable=False,
+            init_num_sources=(1, 1),
             use_gpu=False,
             position_min=(0.0, 0.0, 0.0),
             position_max=(2.0, 2.0, 2.0),

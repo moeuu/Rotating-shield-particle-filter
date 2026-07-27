@@ -444,36 +444,6 @@ def main() -> None:
         help="Particle count per isotope filter (default: 2000).",
     )
     parser.add_argument(
-        "--merge-prob",
-        type=float,
-        default=None,
-        help="Merge proposal probability when birth/death is enabled (default: 0.05).",
-    )
-    parser.add_argument(
-        "--merge-distance-max",
-        type=float,
-        default=None,
-        help="Max distance (m) to merge nearby sources (default: 0.5).",
-    )
-    parser.add_argument(
-        "--merge-delta-ll-threshold",
-        type=float,
-        default=None,
-        help="Log-likelihood threshold for merge acceptance (default: 0.0).",
-    )
-    parser.add_argument(
-        "--cluster-eps-m",
-        type=float,
-        default=None,
-        help="Clustering epsilon (m) for output estimates (default: 0.8).",
-    )
-    parser.add_argument(
-        "--birth-detector-min-sep-m",
-        type=float,
-        default=None,
-        help="Minimum distance (m) from measured detector poses for birth candidates.",
-    )
-    parser.add_argument(
         "--max-sources",
         type=int,
         default=DEFAULT_MAX_SOURCES_PER_ISOTOPE,
@@ -488,29 +458,6 @@ def main() -> None:
         type=int,
         default=2,
         help="Max resamples per observation during tempering (default: 2).",
-    )
-    parser.add_argument(
-        "--no-roughen-on-temper-resample",
-        action="store_true",
-        help="Disable roughening on resamples triggered inside tempering.",
-    )
-    parser.add_argument(
-        "--roughening-k",
-        type=float,
-        default=None,
-        help="Override roughening coefficient k (optional).",
-    )
-    parser.add_argument(
-        "--min-sigma-pos",
-        type=float,
-        default=None,
-        help="Override minimum roughening sigma (optional).",
-    )
-    parser.add_argument(
-        "--max-sigma-pos",
-        type=float,
-        default=None,
-        help="Override maximum roughening sigma (optional).",
     )
     parser.add_argument(
         "--converge",
@@ -800,24 +747,6 @@ def main() -> None:
         "max_sources": args.max_sources,
         "max_resamples_per_observation": args.temper_max_resamples,
     }
-    if args.merge_prob is not None:
-        pf_overrides["merge_prob"] = float(args.merge_prob)
-    if args.merge_distance_max is not None:
-        pf_overrides["merge_distance_max"] = float(args.merge_distance_max)
-    if args.merge_delta_ll_threshold is not None:
-        pf_overrides["merge_delta_ll_threshold"] = float(args.merge_delta_ll_threshold)
-    if args.cluster_eps_m is not None:
-        pf_overrides["cluster_eps_m"] = float(args.cluster_eps_m)
-    if args.birth_detector_min_sep_m is not None:
-        pf_overrides["birth_detector_min_sep_m"] = float(args.birth_detector_min_sep_m)
-    if args.no_roughen_on_temper_resample:
-        pf_overrides["disable_regularize_on_temper_resample"] = True
-    if args.roughening_k is not None:
-        pf_overrides["roughening_k"] = float(args.roughening_k)
-    if args.min_sigma_pos is not None:
-        pf_overrides["min_sigma_pos"] = float(args.min_sigma_pos)
-    if args.max_sigma_pos is not None:
-        pf_overrides["max_sigma_pos"] = float(args.max_sigma_pos)
     if args.rotations_per_pose is not None:
         pf_overrides["orientation_k"] = max(1, int(args.rotations_per_pose))
         pf_overrides["min_rotations_per_pose"] = max(1, int(args.rotations_per_pose))

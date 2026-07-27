@@ -243,7 +243,12 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
         candidate_sources=np.asarray([[1.0, 1.0, 0.0]], dtype=float),
         shield_normals=np.asarray([[1.0, 0.0, 0.0]], dtype=float),
         mu_by_isotope={"Cs-137": 0.5},
-        pf_config=RotatingShieldPFConfig(num_particles=3, use_gpu=False),
+        pf_config=RotatingShieldPFConfig(
+            num_particles=3,
+            birth_enable=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+        ),
     )
     estimator.add_measurement_pose(np.asarray([2.5, 2.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()

@@ -15,30 +15,10 @@ def reset_step_diagnostics(target: Any) -> None:
     target.last_resample_ess = False
     target.last_resample_count = 0
     target.last_birth_count = 0
-    target.last_kill_count = 0
+    target.last_death_count = 0
     target.last_n_after_adapt = None
     target.last_temper_steps = []
     target.last_temper_resample_count = 0
-    target.last_mode_preserved_count = 0
-    target.last_mode_preserving_strata_summary = {}
-    target.last_mode_preserving_selected_strata = []
-    target.last_mode_preserving_cardinality_summary = {}
-    target.last_mode_preserving_selected_cardinalities = []
-    target.last_birth_residual_chi2 = 0.0
-    target.last_birth_residual_p_value = 1.0
-    target.last_birth_residual_support = 0
-    target.last_birth_residual_distinct_poses = 0
-    target.last_birth_residual_distinct_stations = 0
-    target.last_birth_residual_gate_passed = False
-    target.last_birth_residual_layer = "none"
-    target.last_birth_residual_layer_count = 0
-    target.last_birth_structural_eligible = 0
-    target.last_pseudo_source_verified = 0
-    target.last_pseudo_source_failed = 0
-    target.last_pseudo_source_pruned = 0
-    target.last_pseudo_source_quarantined = 0
-    target.last_pseudo_source_quarantine_active = 0
-    target.last_pseudo_source_fail_reasons = {}
     target.last_source_event_diagnostics = []
     target.last_structural_timing_s = {}
     target._resample_count_in_observation = 0
@@ -64,16 +44,6 @@ def build_source_event_record(
         "source_index": idx,
         "position": [float(value) for value in state.positions[idx]],
         "strength": float(state.strengths[idx]),
-        "age": int(state.ages[idx]) if state.ages is not None else None,
-        "support_score": float(state.support_scores[idx])
-        if state.support_scores is not None
-        else None,
-        "tentative": bool(state.tentative_sources[idx])
-        if state.tentative_sources is not None
-        else None,
-        "verification_fail_streak": int(state.verification_fail_streaks[idx])
-        if state.verification_fail_streaks is not None
-        else None,
     }
     if extra:
         record.update(extra)

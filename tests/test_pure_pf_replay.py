@@ -327,7 +327,7 @@ def test_cpu_batched_count_kernel_matches_uncompressed_oracle_and_equation(
 
 
 def test_resolved_hash_binds_replay_candidate_grid_inputs(tmp_path: Path) -> None:
-    """Changing PF birth support must change resolved estimator provenance."""
+    """Changing the response-grid inputs must change estimator provenance."""
     log = load_measurement_log(
         make_measurement_log(tmp_path / "measurement-log", record_count=1)
     )
@@ -338,6 +338,37 @@ def test_resolved_hash_binds_replay_candidate_grid_inputs(tmp_path: Path) -> Non
     second = build_replay_estimator(log, second_config, profile="pf_strict", seed=3)
 
     assert first.resolved_config_hash != second.resolved_config_hash
+
+
+def test_replay_rejects_off_surface_response_candidates(tmp_path: Path) -> None:
+    """A strict replay must not retain a legacy volume candidate grid."""
+    log = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    )
+    config = {
+        **replay_config(),
+        "replay_candidate_sources_xyz": [[1.0, 1.0, 0.75]],
+    }
+
+    with pytest.raises(PFReplayError, match="environment surface"):
+        build_replay_estimator(log, config, profile="pf_strict", seed=3)
+
+
+def test_replay_uses_complete_logged_environment_bounds(tmp_path: Path) -> None:
+    """Replay configuration cannot shrink the PF surface search domain."""
+    log = load_measurement_log(
+        make_measurement_log(tmp_path / "measurement-log", record_count=1)
+    )
+    config = {
+        **replay_config(),
+        "position_min": [0.0, 0.0, 0.0],
+        "position_max": [1.0, 1.0, 1.0],
+    }
+
+    estimator = build_replay_estimator(log, config, profile="pf_strict", seed=3)
+
+    assert estimator.pf_config.position_min == (0.0, 0.0, 0.0)
+    assert estimator.pf_config.position_max == (2.0, 2.0, 1.5)
 
 
 def test_prefix_causality_matches_full_log_stopped_at_same_record(
@@ -421,7 +452,7 @@ def test_station_prefix_never_infers_completion_from_eof_or_future_rows(
         assert future_estimator.serialized_state() == exact_estimator.serialized_state()
         assert future_trace == exact_trace
         expected_deferred = delayed and record_count % 2 == 1
-        assert exact_estimator._defer_resample_birth is expected_deferred
+        assert exact_estimator._defer_structural_moves is expected_deferred
 
 
 def test_joint_replay_uses_only_explicit_station_markers(
@@ -629,7 +660,6 @@ def test_tiny_live_run_finalized_log_replays_to_identical_state(
         max_poses=1,
         obstacle_layout_path=None,
         candidate_grid_spacing=(5.0, 10.0, 5.0),
-        candidate_grid_margin=0.0,
         birth_enabled=False,
         num_particles=8,
         pf_config_overrides={
