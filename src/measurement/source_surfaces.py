@@ -17,7 +17,18 @@ SourceSurfaceKind = Literal[
     "wall",
     "obstacle_side",
     "obstacle_top",
+    "obstacle_bottom",
 ]
+
+SOURCE_SURFACE_KINDS: tuple[SourceSurfaceKind, ...] = (
+    "floor",
+    "ceiling",
+    "wall",
+    "obstacle_side",
+    "obstacle_top",
+    "obstacle_bottom",
+)
+SOURCE_SURFACE_REPORT_LABELS = (*SOURCE_SURFACE_KINDS, "off_surface")
 
 
 def _cell_bounds(
@@ -725,16 +736,8 @@ def source_surface_kind_counts(
         obstacle_height_m=obstacle_height_m,
         tolerance_m=tolerance_m,
     )
-    labels = [
-        "floor",
-        "ceiling",
-        "wall",
-        "obstacle_side",
-        "obstacle_top",
-        "off_surface",
-    ]
-    counts = {label: 0 for label in labels}
-    for label in labels[:-1]:
+    counts = {label: 0 for label in SOURCE_SURFACE_REPORT_LABELS}
+    for label in SOURCE_SURFACE_REPORT_LABELS[:-1]:
         counts[label] = int(np.count_nonzero(kinds == label))
     counts["off_surface"] = int(np.count_nonzero(np.equal(kinds, None)))
     return counts

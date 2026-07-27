@@ -19,9 +19,6 @@ from measurement.shielding import (
     generate_octant_orientations,
     resolve_mu_values,
 )
-from measurement.source_surfaces import (
-    project_positions_to_allowed_surfaces,
-)
 from measurement.surface_patches import (
     SurfacePatchDictionary,
     build_surface_patch_dictionary,
@@ -314,9 +311,11 @@ class IsotopeParticleFilter:
         )
         self._strength_prior = self._build_strength_prior()
         self._structural_rj_surface_patches: SurfacePatchDictionary | None = None
-        self._structural_rj_patch_key_to_index: dict[
-            tuple[float, float, float], int
-        ] = {}
+        self._structural_rj_sorted_patch_keys = np.zeros(
+            0,
+            dtype=np.dtype((np.void, 3 * np.dtype(np.float64).itemsize)),
+        )
+        self._structural_rj_sorted_patch_indices = np.zeros(0, dtype=np.int64)
         self._structural_rj_cardinality_prior_probs = (
             self._build_structural_cardinality_prior()
         )
@@ -392,11 +391,17 @@ class IsotopeParticleFilter:
         return probabilities / float(np.sum(probabilities))
 
     @staticmethod
-    def _surface_patch_key(position: NDArray[np.float64]) -> tuple[float, float, float]:
-        """Return a stable exact-mode lookup key for one patch center."""
-        values = np.asarray(position, dtype=float).reshape(3)
-        rounded = np.round(values, decimals=12)
-        return float(rounded[0]), float(rounded[1]), float(rounded[2])
+    def _surface_patch_key_rows(
+        positions: NDArray[np.float64],
+    ) -> NDArray[np.void]:
+        """Return batched binary keys for rounded finite surface positions."""
+        values = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+        if np.any(~np.isfinite(values)):
+            raise ValueError("Surface positions must contain only finite values.")
+        rounded = np.ascontiguousarray(np.round(values, decimals=12))
+        rounded[rounded == 0.0] = 0.0
+        row_dtype = np.dtype((np.void, rounded.dtype.itemsize * rounded.shape[1]))
+        return rounded.view(row_dtype).reshape(-1)
 
     def _initialize_structural_rj_surface_support(self) -> None:
         """Build complete area-aware surface support for exact structural moves."""
@@ -417,18 +422,18 @@ class IsotopeParticleFilter:
             raise ValueError(
                 "rj_mh surface dictionary must contain more patches than max_sources."
             )
-        keys = [
-            self._surface_patch_key(position)
-            for position in np.asarray(patches.centers_xyz, dtype=float)
-        ]
-        if len(set(keys)) != len(keys):
+        key_rows = self._surface_patch_key_rows(patches.centers_xyz)
+        if np.unique(key_rows).size != key_rows.size:
             raise ValueError(
                 "rj_mh surface dictionary contains duplicate patch centers."
             )
         self._structural_rj_surface_patches = patches
-        self._structural_rj_patch_key_to_index = {
-            key: int(index) for index, key in enumerate(keys)
-        }
+        key_order = np.argsort(key_rows, kind="stable")
+        self._structural_rj_sorted_patch_keys = key_rows[key_order]
+        self._structural_rj_sorted_patch_indices = np.asarray(
+            key_order,
+            dtype=np.int64,
+        )
         max_sources = int(self.config.max_sources or 0)
         self._structural_rj_surface_prior = SurfaceSetPrior(
             patches.areas_m2,
@@ -458,25 +463,63 @@ class IsotopeParticleFilter:
             raise ValueError("rj_mh state positions must match num_sources.")
         if source_count == 0:
             return np.zeros(0, dtype=np.int64)
-        try:
-            indices = np.asarray(
-                [
-                    self._structural_rj_patch_key_to_index[
-                        self._surface_patch_key(position)
-                    ]
-                    for position in positions
-                ],
-                dtype=np.int64,
-            )
-        except KeyError as exc:
-            raise ValueError(
-                "rj_mh state contains a position outside the finite surface dictionary."
-            ) from exc
+        indices = self.structural_surface_patch_indices(positions, strict=True)
         if np.unique(indices).size != indices.size:
             raise ValueError(
                 "rj_mh does not permit duplicate surface patches in one state."
             )
         return indices
+
+    def structural_surface_patch_indices(
+        self,
+        positions: NDArray[np.float64],
+        *,
+        strict: bool = True,
+    ) -> NDArray[np.int64]:
+        """Resolve finite-dictionary indices for a batch of surface positions."""
+        values = np.asarray(positions, dtype=np.float64)
+        if values.shape[-1:] != (3,):
+            raise ValueError("positions must have a final dimension of 3.")
+        original_shape = values.shape[:-1]
+        query_keys = self._surface_patch_key_rows(values)
+        if query_keys.size == 0:
+            return np.zeros(original_shape, dtype=np.int64)
+        sorted_keys = self._structural_rj_sorted_patch_keys
+        sorted_indices = self._structural_rj_sorted_patch_indices
+        if sorted_keys.size == 0 or sorted_indices.size != sorted_keys.size:
+            raise RuntimeError("The finite surface dictionary lookup is unavailable.")
+        insertion = np.searchsorted(sorted_keys, query_keys)
+        clipped = np.minimum(insertion, sorted_keys.size - 1)
+        matched = (insertion < sorted_keys.size) & (
+            sorted_keys[clipped] == query_keys
+        )
+        resolved = np.full(query_keys.size, -1, dtype=np.int64)
+        resolved[matched] = sorted_indices[clipped[matched]]
+        if strict and np.any(~matched):
+            raise ValueError(
+                "rj_mh state contains a position outside the finite surface dictionary."
+            )
+        return resolved.reshape(original_shape)
+
+    def structural_surface_kinds(
+        self,
+        positions: NDArray[np.float64],
+        *,
+        strict: bool = True,
+    ) -> NDArray[np.object_]:
+        """Return authoritative finite-dictionary kinds for surface positions."""
+        values = np.asarray(positions, dtype=np.float64)
+        indices = self.structural_surface_patch_indices(values, strict=strict)
+        flat_indices = indices.reshape(-1)
+        kinds = np.full(flat_indices.size, None, dtype=object)
+        patches = self._structural_rj_surface_patches
+        if patches is None:
+            raise RuntimeError("The finite surface dictionary is unavailable.")
+        matched = flat_indices >= 0
+        if np.any(matched):
+            dictionary_kinds = np.asarray(patches.kinds, dtype=object)
+            kinds[matched] = dictionary_kinds[flat_indices[matched]]
+        return kinds.reshape(indices.shape)
 
     def _canonicalize_structural_rj_state(
         self,
@@ -1315,20 +1358,25 @@ class IsotopeParticleFilter:
         self,
         positions: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Project source positions to the finite environment surface support."""
+        """Project at most ``max_sources`` report modes to exact patch centers."""
         arr = np.asarray(positions, dtype=float)
-        lo = np.zeros(3, dtype=float)
-        hi = np.array(self.config.position_max, dtype=float)
-        clipped = np.clip(arr, lo, hi)
-        if clipped.size == 0:
-            return clipped
-        projected = project_positions_to_allowed_surfaces(
-            clipped,
-            self._source_prior_environment(),
-            self.obstacle_grid,
-            obstacle_height_m=self.obstacle_height_m,
+        if arr.shape[-1:] != (3,):
+            raise ValueError("positions must have a final dimension of 3.")
+        if arr.size == 0:
+            return arr.copy()
+        if np.any(~np.isfinite(arr)):
+            raise ValueError("positions must contain only finite values.")
+        patches = self._structural_rj_surface_patches
+        if patches is None or patches.patch_count == 0:
+            raise RuntimeError("The finite surface dictionary is unavailable.")
+        points = arr.reshape(-1, 3)
+        centers = np.asarray(patches.centers_xyz, dtype=np.float64)
+        squared_distances = np.sum(
+            (points[:, None, :] - centers[None, :, :]) ** 2,
+            axis=2,
         )
-        return np.clip(projected, lo, hi)
+        nearest = np.argmin(squared_distances, axis=1)
+        return np.asarray(centers[nearest], dtype=float).reshape(arr.shape)
 
     def _sample_initial_strengths(
         self,

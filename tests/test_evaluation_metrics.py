@@ -256,10 +256,11 @@ def test_all_surface_labels_and_posterior_scores_are_reported() -> None:
                 "surface_posterior_available": True,
                 "surface_kind_posterior": {
                     "floor": 0.2,
-                    "wall": 0.0,
                     "ceiling": 0.0,
+                    "wall": 0.0,
                     "obstacle_side": 0.0,
                     "obstacle_top": 0.8,
+                    "obstacle_bottom": 0.0,
                     "off_surface": 0.0,
                 },
             }
@@ -280,6 +281,7 @@ def test_all_surface_labels_and_posterior_scores_are_reported() -> None:
         "ceiling",
         "obstacle_side",
         "obstacle_top",
+        "obstacle_bottom",
         "off_surface",
     }
     assert surface["confusion_matrix"]["obstacle_top"]["obstacle_top"] == 1

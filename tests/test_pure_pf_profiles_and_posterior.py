@@ -11,6 +11,7 @@ import pytest
 
 from mission_control import resolve_mission_max_poses, resolve_mission_max_steps
 from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kind
 from measurement.surface_patches import build_surface_patch_dictionary
 from pf.estimator import (
@@ -957,6 +958,124 @@ def test_pure_posterior_projects_surface_particle_mean_to_surface() -> None:
         is not None
     )
     assert source_surface_kind(reported_positions[0], environment) is not None
+    assert (
+        estimator.filters["Cs-137"].structural_surface_patch_indices(
+            reported_positions,
+            strict=True,
+        )[0]
+        >= 0
+    )
+
+
+def test_exact_surface_dictionary_drives_projection_and_surface_kinds() -> None:
+    """PF report projection and labels must use the exact transport-box dictionary."""
+    isotope = "Cs-137"
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=((1.2, 1.3, 0.4, 1.8, 1.9, 1.4),),
+    )
+    estimator = PurePFEstimator(
+        isotopes=(isotope,),
+        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+            structural_rj_patch_spacing_m=0.5,
+        ),
+        obstacle_grid=obstacle_grid,
+        measurement_log_sha256="b" * 64,
+    )
+    estimator.add_measurement_pose(np.asarray([0.5, 0.5, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    patches = filt._structural_rj_surface_patches
+    assert patches is not None
+
+    actual_kinds = filt.structural_surface_kinds(
+        patches.centers_xyz,
+        strict=True,
+    )
+    np.testing.assert_array_equal(
+        actual_kinds,
+        np.asarray(patches.kinds, dtype=object),
+    )
+    assert {
+        "floor",
+        "ceiling",
+        "wall",
+        "obstacle_side",
+        "obstacle_top",
+        "obstacle_bottom",
+    }.issubset(set(actual_kinds.tolist()))
+    bottom_indices = np.flatnonzero(actual_kinds == "obstacle_bottom")
+    np.testing.assert_allclose(
+        patches.normals_xyz[bottom_indices],
+        np.tile(np.asarray([0.0, 0.0, -1.0]), (bottom_indices.size, 1)),
+    )
+    assert all(patches.face_ids[index].endswith("_z0") for index in bottom_indices)
+    assert np.sum(patches.areas_m2[bottom_indices]) == pytest.approx(0.36)
+
+    representative_indices = np.asarray(
+        [
+            int(np.flatnonzero(actual_kinds == kind)[0])
+            for kind in sorted(set(actual_kinds.tolist()))
+        ],
+        dtype=np.int64,
+    )
+    representative_centers = patches.centers_xyz[representative_indices]
+    np.testing.assert_array_equal(
+        filt._project_positions_to_source_prior(patches.centers_xyz),
+        patches.centers_xyz,
+    )
+
+    query = np.asarray([[1.55, 1.61, 0.83]], dtype=float)
+    nearest_index = int(
+        np.argmin(
+            np.sum(
+                (patches.centers_xyz - query[0][None, :]) ** 2,
+                axis=1,
+            )
+        )
+    )
+    projected = filt._project_positions_to_source_prior(query)
+    np.testing.assert_array_equal(
+        projected,
+        patches.centers_xyz[[nearest_index]],
+    )
+    assert filt.structural_surface_patch_indices(projected, strict=True)[0] == (
+        nearest_index
+    )
+    signed_zero_floor = representative_centers[
+        np.flatnonzero(actual_kinds[representative_indices] == "floor")[0]
+    ].copy()
+    signed_zero_floor[2] = -0.0
+    assert (
+        filt.structural_surface_patch_indices(
+            signed_zero_floor[None, :],
+            strict=True,
+        )[0]
+        == representative_indices[
+            np.flatnonzero(actual_kinds[representative_indices] == "floor")[0]
+        ]
+    )
+    dictionary_outside = np.asarray([[0.0, 0.3, 0.3]], dtype=float)
+    assert filt.structural_surface_patch_indices(
+        dictionary_outside,
+        strict=False,
+    )[0] == -1
+    assert filt.structural_surface_kinds(
+        dictionary_outside,
+        strict=False,
+    )[0] is None
 
 
 def test_posterior_aligns_swapped_labels_and_reports_uncertainty() -> None:

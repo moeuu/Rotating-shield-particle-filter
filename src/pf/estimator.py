@@ -21,7 +21,10 @@ from measurement.model import EnvironmentConfig
 from measurement.shielding import octant_index_from_rotation
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
-from measurement.source_surfaces import source_surface_kinds
+from measurement.source_surfaces import (
+    SOURCE_SURFACE_REPORT_LABELS,
+    source_surface_kinds,
+)
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.likelihood import (
     CountLikelihoodSpec,
@@ -2517,7 +2520,7 @@ class RotatingShieldPFEstimator:
         )
         surface_counts = {
             str(kind): int(np.count_nonzero(surface_kinds == kind))
-            for kind in ("floor", "ceiling", "wall", "obstacle_side", "obstacle_top")
+            for kind in SOURCE_SURFACE_REPORT_LABELS[:-1]
         }
         surface_counts["off_surface"] = int(
             np.count_nonzero(np.equal(surface_kinds, None))
@@ -2633,6 +2636,22 @@ class RotatingShieldPFEstimator:
             )
         return estimates
 
+    def structural_surface_kinds(
+        self,
+        isotope: str,
+        positions: NDArray[np.float64],
+        *,
+        strict: bool = True,
+    ) -> NDArray[np.object_]:
+        """Return exact finite-dictionary surface kinds for one isotope."""
+        filt = self.filters.get(str(isotope))
+        if filt is None:
+            raise KeyError(f"Unknown PF isotope: {isotope}")
+        return filt.structural_surface_kinds(
+            np.asarray(positions, dtype=np.float64),
+            strict=strict,
+        )
+
     def posterior_source_uncertainty(
         self,
         reported_estimates: Mapping[
@@ -2695,12 +2714,19 @@ class RotatingShieldPFEstimator:
                 packed_positions = positions_tensor.detach().cpu().numpy()
                 packed_mask = mask_tensor.detach().cpu().numpy().astype(bool)
                 weights = np.asarray(filt.continuous_weights, dtype=float)
+            packed_surface_kinds = np.full(packed_mask.shape, None, dtype=object)
+            if np.any(packed_mask):
+                packed_surface_kinds[packed_mask] = filt.structural_surface_kinds(
+                    packed_positions[packed_mask],
+                    strict=True,
+                )
 
             diagnostics = posterior_mode_uncertainty_batched(
                 packed_positions,
                 packed_mask,
                 weights,
                 positions,
+                packed_surface_kinds=packed_surface_kinds,
                 environment=environment,
                 obstacle_grid=self.obstacle_grid,
                 obstacle_height_m=self.obstacle_height_m,

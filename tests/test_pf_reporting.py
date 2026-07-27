@@ -10,6 +10,7 @@ import pytest
 from scipy.stats import chi2
 
 from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import source_surface_kind
 from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
 from pf.particle_filter import IsotopeParticle
@@ -254,16 +255,26 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
     )
     estimator.add_measurement_pose(np.asarray([2.5, 2.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()
+    filt = estimator.filters["Cs-137"]
+    patches = filt._structural_rj_surface_patches
+    assert patches is not None
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
+    floor_center = patches.centers_xyz[
+        int(np.flatnonzero(patch_kinds == "floor")[0])
+    ]
+    ceiling_center = patches.centers_xyz[
+        int(np.flatnonzero(patch_kinds == "ceiling")[0])
+    ]
     particle_specs = (
         (
             0.2,
-            [[0.9, 1.0, 0.0], [4.1, 4.0, 10.0]],
+            [floor_center, ceiling_center],
             [12.0, 5.0],
         ),
-        (0.3, [[1.1, 1.0, 0.0]], [11.0]),
-        (0.5, [[3.9, 4.0, 10.0]], [6.0]),
+        (0.3, [floor_center], [11.0]),
+        (0.5, [ceiling_center], [6.0]),
     )
-    estimator.filters["Cs-137"].continuous_particles = [
+    filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
                 num_sources=len(strengths),
@@ -277,7 +288,7 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
     ]
     reported = {
         "Cs-137": (
-            np.asarray([[1.0, 1.0, 0.0], [4.0, 4.0, 10.0]], dtype=float),
+            np.asarray([floor_center, ceiling_center], dtype=float),
             np.asarray([11.5, 5.5], dtype=float),
         )
     }
@@ -307,6 +318,72 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
         assert mode["ellipsoid_90"]["available"] is True
         assert mode["ellipsoid_90"]["nominal_gaussian_probability_mass"] == 0.9
         assert np.allclose(orientation.T @ orientation, np.eye(3))
+    assert diagnostics["Cs-137"][0]["surface_kind_posterior"]["floor"] == 1.0
+    assert diagnostics["Cs-137"][1]["surface_kind_posterior"]["ceiling"] == 1.0
+
+
+def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
+    """Exact bottom patches must remain bottom in posterior uncertainty reports."""
+    isotope = "Cs-137"
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=((1.2, 1.3, 0.4, 1.8, 1.9, 1.4),),
+    )
+    estimator = PurePFEstimator(
+        isotopes=(isotope,),
+        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+            structural_rj_patch_spacing_m=0.5,
+        ),
+        obstacle_grid=obstacle_grid,
+        measurement_log_sha256="c" * 64,
+    )
+    estimator.add_measurement_pose(np.asarray([0.5, 0.5, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    patches = filt._structural_rj_surface_patches
+    assert patches is not None
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
+    bottom_center = patches.centers_xyz[
+        int(np.flatnonzero(patch_kinds == "obstacle_bottom")[0])
+    ]
+    filt.continuous_particles = [
+        IsotopeParticle(
+            state=IsotopeState(
+                num_sources=1,
+                positions=bottom_center[None, :],
+                strengths=np.asarray([100.0], dtype=float),
+                background=0.0,
+            ),
+            log_weight=0.0,
+        )
+    ]
+
+    diagnostics = estimator.posterior_source_uncertainty(
+        {
+            isotope: (
+                bottom_center[None, :],
+                np.asarray([100.0], dtype=float),
+            )
+        },
+        match_radius_m=0.2,
+    )[isotope][0]
+
+    assert diagnostics["surface_posterior_available"] is True
+    assert diagnostics["surface_kind_posterior"]["obstacle_bottom"] == 1.0
+    assert diagnostics["surface_kind_posterior"]["off_surface"] == 0.0
+    assert sum(diagnostics["surface_kind_posterior"].values()) == pytest.approx(1.0)
 
 
 def test_fixed_cardinality_pure_estimator_dispatches_state_mh_moves() -> None:

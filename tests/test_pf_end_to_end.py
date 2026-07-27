@@ -349,11 +349,36 @@ def test_estimator_uses_canonical_pf_posterior_projection():
     est.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
+    patches = filt._structural_rj_surface_patches
+    assert patches is not None
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
+    left_wall_indices = np.flatnonzero(
+        (patch_kinds == "wall")
+        & np.isclose(patches.centers_xyz[:, 0], 0.0)
+    )
+    state_positions = np.vstack(
+        [
+            patches.centers_xyz[
+                left_wall_indices[
+                    np.argmin(
+                        np.linalg.norm(
+                            patches.centers_xyz[left_wall_indices] - target,
+                            axis=1,
+                        )
+                    )
+                ]
+            ]
+            for target in (
+                np.asarray([0.0, 1.0, 1.0], dtype=float),
+                np.asarray([0.0, 3.0, 1.0], dtype=float),
+            )
+        ]
+    )
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
                 num_sources=1,
-                positions=np.array([[0.0, 1.0, 1.0]], dtype=float),
+                positions=state_positions[[0]],
                 strengths=np.array([20.0], dtype=float),
                 background=0.0,
             ),
@@ -362,7 +387,7 @@ def test_estimator_uses_canonical_pf_posterior_projection():
         IsotopeParticle(
             state=IsotopeState(
                 num_sources=1,
-                positions=np.array([[0.0, 3.0, 1.0]], dtype=float),
+                positions=state_positions[[1]],
                 strengths=np.array([40.0], dtype=float),
                 background=0.0,
             ),
@@ -381,8 +406,26 @@ def test_estimator_uses_canonical_pf_posterior_projection():
 
     positions, strengths = est.estimates()["Cs-137"]
 
-    assert positions == pytest.approx(
-        np.array([[0.0, 1.9333333333333333, 1.0]], dtype=float)
+    conditional_weights = np.asarray([0.40, 0.35], dtype=float)
+    conditional_weights /= np.sum(conditional_weights)
+    unprojected_mean = np.sum(
+        conditional_weights[:, None] * state_positions,
+        axis=0,
+    )
+    expected_patch_index = int(
+        np.argmin(
+            np.sum(
+                (patches.centers_xyz - unprojected_mean[None, :]) ** 2,
+                axis=1,
+            )
+        )
+    )
+    np.testing.assert_array_equal(
+        positions,
+        patches.centers_xyz[[expected_patch_index]],
+    )
+    assert filt.structural_surface_patch_indices(positions, strict=True)[0] == (
+        expected_patch_index
     )
     assert strengths == pytest.approx(np.array([29.333333333333332], dtype=float))
 

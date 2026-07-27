@@ -20,6 +20,7 @@ from pf.estimator import (
 )
 from pf.particle_filter import IsotopeParticle, MeasurementData
 from pf.profiles import resolve_estimator_profile
+from pf.pure_estimator import PurePFEstimator
 from pf.state import IsotopeState
 from realtime_demo import (
     ADAPTIVE_STEP_ID_STRIDE,
@@ -478,6 +479,77 @@ def test_surface_report_quality_gate_rejects_off_surface_estimate() -> None:
         )
 
 
+def test_surface_report_quality_gate_uses_exact_pf_dictionary() -> None:
+    """The runtime gate must accept exact bottoms and reject non-patch wall points."""
+    isotope = "Cs-137"
+    env = EnvironmentConfig(size_x=3.0, size_y=3.0, size_z=3.0)
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=((1.2, 1.3, 0.4, 1.8, 1.9, 1.4),),
+    )
+    estimator = PurePFEstimator(
+        isotopes=(isotope,),
+        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        shield_normals=None,
+        mu_by_isotope={isotope: 0.0},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=1,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            position_max=(3.0, 3.0, 3.0),
+            structural_rj_patch_spacing_m=0.5,
+        ),
+        obstacle_grid=obstacle_grid,
+        measurement_log_sha256="d" * 64,
+    )
+    estimator.add_measurement_pose(np.asarray([0.5, 0.5, 0.5], dtype=float))
+    estimator._ensure_kernel_cache()
+    patches = estimator.filters[isotope]._structural_rj_surface_patches
+    assert patches is not None
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
+    bottom_center = patches.centers_xyz[
+        int(np.flatnonzero(patch_kinds == "obstacle_bottom")[0])
+    ]
+    valid_estimate = {
+        isotope: (
+            bottom_center[None, :],
+            np.asarray([100.0], dtype=float),
+        )
+    }
+
+    _validate_surface_constrained_estimates(
+        valid_estimate,
+        env,
+        obstacle_grid,
+        obstacle_height_m=2.0,
+        tolerance_m=1.0e-5,
+        surface_prior_active=True,
+        estimator=estimator,
+    )
+
+    invalid_estimate = {
+        isotope: (
+            np.asarray([[0.0, 0.3, 0.3]], dtype=float),
+            np.asarray([100.0], dtype=float),
+        )
+    }
+    with pytest.raises(RuntimeError, match="off-surface positions"):
+        _validate_surface_constrained_estimates(
+            invalid_estimate,
+            env,
+            obstacle_grid,
+            obstacle_height_m=2.0,
+            tolerance_m=1.0e-5,
+            surface_prior_active=True,
+            estimator=estimator,
+        )
+
+
 def test_cli_max_poses_overrides_runtime_config_pose_cap() -> None:
     """An explicit CLI pose cap should not be overwritten by runtime config."""
     runtime_config = {"mission_stop_max_poses": 10}
@@ -715,6 +787,13 @@ def test_particle_surface_diagnostics_use_all_posterior_sources() -> None:
     """Final surface diagnostics should cover every PF posterior source slot."""
     isotope = "Cs-137"
     env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=((1.2, 1.3, 0.4, 1.8, 1.9, 1.4),),
+    )
     estimator = RotatingShieldPFEstimator(
         isotopes=[isotope],
         candidate_sources=np.array([[0.0, 0.0, 0.0]], dtype=float),
@@ -726,30 +805,42 @@ def test_particle_surface_diagnostics_use_all_posterior_sources() -> None:
             variable_cardinality=False,
             init_num_sources=(2, 2),
             use_gpu=False,
+            position_max=(4.0, 4.0, 3.0),
+            structural_rj_patch_spacing_m=0.5,
         ),
+        obstacle_grid=obstacle_grid,
     )
     estimator.add_measurement_pose(np.array([0.5, 0.0, 0.0], dtype=float))
     estimator._ensure_kernel_cache()
+    filt = estimator.filters[isotope]
+    patches = filt._structural_rj_surface_patches
+    assert patches is not None
+    patch_kinds = np.asarray(patches.kinds, dtype=object)
+    bottom_center = patches.centers_xyz[
+        int(np.flatnonzero(patch_kinds == "obstacle_bottom")[0])
+    ]
     state = IsotopeState(
         num_sources=2,
-        positions=np.array([[1.0, 1.0, 0.0], [2.0, 2.0, 1.0]], dtype=float),
+        positions=np.asarray([bottom_center, [2.0, 2.0, 1.0]], dtype=float),
         strengths=np.array([100.0, 50.0], dtype=float),
         background=0.0,
     )
-    estimator.filters[isotope].continuous_particles = [
+    filt.continuous_particles = [
         IsotopeParticle(state=state, log_weight=0.0)
     ]
 
     diagnostics = _particle_surface_diagnostics(
         estimator,
         env,
-        None,
+        obstacle_grid,
         obstacle_height_m=2.0,
     )[isotope]
 
     assert diagnostics["posterior_source_slots"] == 2
-    assert diagnostics["surface_counts"]["floor"] == 1
+    assert diagnostics["surface_counts"]["obstacle_bottom"] == 1
     assert diagnostics["off_surface_count"] == 1
+    assert diagnostics["weighted_surface_mass"]["obstacle_bottom"] == 1.0
+    assert diagnostics["weighted_surface_mass"]["off_surface"] == 1.0
 
 
 def test_intermediate_estimate_trace_reports_position_and_strength_error() -> None:

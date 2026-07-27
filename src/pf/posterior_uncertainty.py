@@ -10,16 +10,12 @@ from scipy.stats import chi2
 
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
-from measurement.source_surfaces import source_surface_kinds
-
-SURFACE_KINDS = (
-    "floor",
-    "ceiling",
-    "wall",
-    "obstacle_side",
-    "obstacle_top",
-    "off_surface",
+from measurement.source_surfaces import (
+    SOURCE_SURFACE_REPORT_LABELS,
+    source_surface_kinds,
 )
+
+SURFACE_KINDS = SOURCE_SURFACE_REPORT_LABELS
 ELLIPSOID_INTERPRETATION = "gaussian_equivalent_covariance_ellipsoid"
 ELLIPSOID_APPLICABILITY_REQUIREMENTS = (
     "approximately_unimodal_conditional_position_posterior",
@@ -135,6 +131,7 @@ def posterior_mode_uncertainty_batched(
     particle_weights: NDArray[np.float64],
     reported_positions: NDArray[np.float64],
     *,
+    packed_surface_kinds: NDArray[np.object_] | None = None,
     environment: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None = None,
     obstacle_height_m: float = 2.0,
@@ -155,6 +152,8 @@ def posterior_mode_uncertainty_batched(
     not an empirical highest-posterior-density region; its payload states the
     assumptions required to interpret the nominal 0.9 Gaussian mass.  Availability
     flags distinguish unsupported modes from valid zero-valued summaries.
+    When ``packed_surface_kinds`` is supplied, those authoritative labels are
+    propagated with the selected slots instead of reclassifying coordinates.
     """
     positions = np.asarray(packed_positions, dtype=float)
     mask = np.asarray(packed_mask, dtype=bool)
@@ -163,6 +162,14 @@ def posterior_mode_uncertainty_batched(
         raise ValueError("packed_positions must have shape (P, S, 3).")
     if mask.shape != positions.shape[:2]:
         raise ValueError("packed_mask must have shape (P, S).")
+    supplied_surface_kinds: NDArray[np.object_] | None = None
+    if packed_surface_kinds is not None:
+        supplied_surface_kinds = np.asarray(
+            packed_surface_kinds,
+            dtype=object,
+        )
+        if supplied_surface_kinds.shape != mask.shape:
+            raise ValueError("packed_surface_kinds must have shape (P, S).")
     if modes.ndim != 2 or modes.shape[1] != 3:
         raise ValueError("reported_positions must have shape (M, 3).")
     if np.any(~np.isfinite(modes)):
@@ -205,6 +212,17 @@ def posterior_mode_uncertainty_batched(
         selected_positions,
         0.0,
     )
+    selected_surface_kinds: NDArray[np.object_] | None = None
+    if supplied_surface_kinds is not None:
+        selected_surface_kinds = supplied_surface_kinds[
+            particle_indices,
+            selected_slots,
+        ]
+        selected_surface_kinds = np.where(
+            matched,
+            selected_surface_kinds,
+            None,
+        )
 
     existence_mass = np.einsum("p,pm->m", weights, matched, optimize=True)
     joint_weights = weights[:, None] * matched
@@ -246,13 +264,17 @@ def posterior_mode_uncertainty_batched(
     ellipsoid_scale = float(chi2.ppf(0.9, df=3))
     semi_axes = np.sqrt(np.maximum(eigenvalues, 0.0) * ellipsoid_scale)
 
-    kinds = source_surface_kinds(
-        selected_positions.reshape(-1, 3),
-        environment,
-        obstacle_grid,
-        obstacle_height_m=float(obstacle_height_m),
-        tolerance_m=tolerance,
-    ).reshape(num_particles, num_modes)
+    kinds = (
+        source_surface_kinds(
+            selected_positions.reshape(-1, 3),
+            environment,
+            obstacle_grid,
+            obstacle_height_m=float(obstacle_height_m),
+            tolerance_m=tolerance,
+        ).reshape(num_particles, num_modes)
+        if selected_surface_kinds is None
+        else selected_surface_kinds
+    )
     known_surface = np.stack(
         [kinds == kind for kind in SURFACE_KINDS[:-1]],
         axis=2,

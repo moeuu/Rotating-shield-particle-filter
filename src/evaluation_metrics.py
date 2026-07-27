@@ -10,15 +10,10 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment
 
+from measurement.source_surfaces import SOURCE_SURFACE_REPORT_LABELS
+
 POSITION_ERROR_TARGET_M = 0.5
-SURFACE_LABELS = (
-    "floor",
-    "wall",
-    "ceiling",
-    "obstacle_side",
-    "obstacle_top",
-    "off_surface",
-)
+SURFACE_LABELS = SOURCE_SURFACE_REPORT_LABELS
 ROOM_SURFACE_LABELS = ("floor", "wall", "ceiling")
 
 

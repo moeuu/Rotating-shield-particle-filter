@@ -502,9 +502,9 @@ from measurement.model import EnvironmentConfig, PointSource
 from measurement.obstacle_assets import obstacle_instances_to_dicts
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import (
+    SOURCE_SURFACE_REPORT_LABELS,
     build_surface_candidate_sources,
     generate_surface_sources,
-    source_surface_kind_counts,
     source_surface_kinds,
     surface_observable_fractions,
     surface_response_observability_diagnostics,
@@ -1127,30 +1127,40 @@ def _validate_surface_constrained_estimates(
     obstacle_height_m: float,
     tolerance_m: float,
     surface_prior_active: bool,
+    estimator: PurePFEstimator | None = None,
 ) -> None:
-    """Fail closed when a surface-prior report contains an off-surface point."""
+    """Fail closed when a surface-prior report leaves its authoritative support."""
     if not surface_prior_active:
         return
-    position_groups = [
-        np.asarray(estimate[0], dtype=float).reshape(-1, 3)
-        for estimate in estimates.values()
-        if np.asarray(estimate[0]).size
-    ]
-    if not position_groups:
-        return
-    positions = np.concatenate(position_groups, axis=0)
-    surface_kinds = source_surface_kinds(
-        positions,
-        environment,
-        obstacle_grid,
-        obstacle_height_m=obstacle_height_m,
-        tolerance_m=tolerance_m,
-    )
-    off_surface_count = int(np.count_nonzero(np.equal(surface_kinds, None)))
+    total_positions = 0
+    off_surface_count = 0
+    for isotope, estimate in estimates.items():
+        positions = np.asarray(estimate[0], dtype=float).reshape(-1, 3)
+        total_positions += int(positions.shape[0])
+        if positions.size == 0:
+            continue
+        surface_kinds = (
+            estimator.structural_surface_kinds(
+                str(isotope),
+                positions,
+                strict=False,
+            )
+            if estimator is not None
+            else source_surface_kinds(
+                positions,
+                environment,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                tolerance_m=tolerance_m,
+            )
+        )
+        off_surface_count += int(
+            np.count_nonzero(np.equal(surface_kinds, None))
+        )
     if off_surface_count:
         raise RuntimeError(
             "Surface-constrained PF report contains "
-            f"{off_surface_count}/{positions.shape[0]} off-surface positions."
+            f"{off_surface_count}/{total_positions} off-surface positions."
         )
 
 
@@ -1416,6 +1426,21 @@ def _pf_obstacle_grid_for_runtime(
     return None
 
 
+_SURFACE_REPORT_LABELS = SOURCE_SURFACE_REPORT_LABELS
+
+
+def _surface_kind_counts_from_array(
+    surface_kinds: NDArray[np.object_],
+) -> dict[str, int]:
+    """Return report counts from authoritative or legacy surface-kind labels."""
+    kinds = np.asarray(surface_kinds, dtype=object).reshape(-1)
+    counts = {label: 0 for label in _SURFACE_REPORT_LABELS}
+    for label in _SURFACE_REPORT_LABELS[:-1]:
+        counts[label] = int(np.count_nonzero(kinds == label))
+    counts["off_surface"] = int(np.count_nonzero(np.equal(kinds, None)))
+    return counts
+
+
 def _surface_count_payload(
     positions: NDArray[np.float64],
     env: EnvironmentConfig,
@@ -1423,16 +1448,24 @@ def _surface_count_payload(
     *,
     obstacle_height_m: float,
     tolerance_m: float = 1.0e-5,
+    surface_kinds: NDArray[np.object_] | None = None,
 ) -> dict[str, object]:
     """Return serializable surface-kind counts for source positions."""
     pos_arr = np.asarray(positions, dtype=float).reshape(-1, 3)
-    counts = source_surface_kind_counts(
-        pos_arr,
-        env,
-        obstacle_grid,
-        obstacle_height_m=obstacle_height_m,
-        tolerance_m=max(float(tolerance_m), 0.0),
+    resolved_kinds = (
+        source_surface_kinds(
+            pos_arr,
+            env,
+            obstacle_grid,
+            obstacle_height_m=obstacle_height_m,
+            tolerance_m=max(float(tolerance_m), 0.0),
+        )
+        if surface_kinds is None
+        else np.asarray(surface_kinds, dtype=object).reshape(-1)
     )
+    if resolved_kinds.size != pos_arr.shape[0]:
+        raise ValueError("surface_kinds must have one label per source position.")
+    counts = _surface_kind_counts_from_array(resolved_kinds)
     return {
         "total_sources": int(pos_arr.shape[0]),
         "surface_counts": counts,
@@ -1526,6 +1559,7 @@ def _estimate_surface_diagnostics(
     *,
     obstacle_height_m: float,
     tolerance_m: float = 1.0e-5,
+    estimator: PurePFEstimator | None = None,
 ) -> dict[str, dict[str, object]]:
     """Return per-isotope surface diagnostics for final reported estimates."""
     return {
@@ -1535,6 +1569,15 @@ def _estimate_surface_diagnostics(
             obstacle_grid,
             obstacle_height_m=obstacle_height_m,
             tolerance_m=tolerance_m,
+            surface_kinds=(
+                None
+                if estimator is None
+                else estimator.structural_surface_kinds(
+                    isotope,
+                    np.asarray(positions, dtype=float).reshape(-1, 3),
+                    strict=False,
+                )
+            ),
         )
         for isotope, (positions, _strengths) in estimates.items()
     }
@@ -1579,33 +1622,18 @@ def _particle_surface_diagnostics(
         if positions:
             pos_arr = np.vstack(positions)
             weight_arr = np.concatenate(weights)
-            kinds = source_surface_kinds(
+            kinds = filt.structural_surface_kinds(
                 pos_arr,
-                env,
-                obstacle_grid,
-                obstacle_height_m=obstacle_height_m,
-                tolerance_m=max(float(tolerance_m), 0.0),
+                strict=False,
             )
         else:
             pos_arr = np.zeros((0, 3), dtype=float)
             weight_arr = np.zeros(0, dtype=float)
             kinds = np.zeros(0, dtype=object)
-        counts = source_surface_kind_counts(
-            pos_arr,
-            env,
-            obstacle_grid,
-            obstacle_height_m=obstacle_height_m,
-            tolerance_m=max(float(tolerance_m), 0.0),
-        )
+        counts = _surface_kind_counts_from_array(kinds)
         weighted = {
             label: float(np.sum(weight_arr[kinds == label]))
-            for label in (
-                "floor",
-                "ceiling",
-                "wall",
-                "obstacle_side",
-                "obstacle_top",
-            )
+            for label in _SURFACE_REPORT_LABELS[:-1]
         }
         weighted["off_surface"] = float(np.sum(weight_arr[np.equal(kinds, None)]))
         diagnostics[isotope] = {
@@ -2569,6 +2597,7 @@ def _build_intermediate_estimate_trace_payload(
     *,
     obstacle_height_m: float,
     match_radius_m: float,
+    surface_kinds_by_isotope: Mapping[str, NDArray[np.object_]] | None = None,
 ) -> dict[str, object]:
     """Build a JSON-serializable intermediate estimate accuracy payload."""
     payload_records: list[dict[str, object]] = []
@@ -2605,13 +2634,26 @@ def _build_intermediate_estimate_trace_payload(
             isotope,
             true_positions.shape[0],
         )
-        surface_kinds = source_surface_kinds(
-            est_positions,
-            env,
-            obstacle_grid,
-            obstacle_height_m=obstacle_height_m,
-            tolerance_m=1.0e-5,
+        exact_kinds = (
+            None
+            if surface_kinds_by_isotope is None
+            else surface_kinds_by_isotope.get(isotope)
         )
+        surface_kinds = (
+            source_surface_kinds(
+                est_positions,
+                env,
+                obstacle_grid,
+                obstacle_height_m=obstacle_height_m,
+                tolerance_m=1.0e-5,
+            )
+            if exact_kinds is None
+            else np.asarray(exact_kinds, dtype=object).reshape(-1)
+        )
+        if surface_kinds.size != est_positions.shape[0]:
+            raise ValueError(
+                "surface_kinds_by_isotope must match estimated source counts."
+            )
         records, summary = _estimate_accuracy_records(
             isotope,
             est_positions,
@@ -2796,6 +2838,15 @@ def _emit_intermediate_estimate_trace(
         },
         estimate_source=estimate_source,
     )
+    trace_sources = dict(estimate_trace_frame["estimated_sources"])
+    surface_kinds_by_isotope = {
+        str(isotope): estimator.structural_surface_kinds(
+            str(isotope),
+            np.asarray(positions, dtype=float).reshape(-1, 3),
+            strict=False,
+        )
+        for isotope, positions in trace_sources.items()
+    }
     estimate_trace_payload = _build_intermediate_estimate_trace_payload(
         estimate_trace_frame,
         true_sources,
@@ -2804,6 +2855,7 @@ def _emit_intermediate_estimate_trace(
         obstacle_grid,
         obstacle_height_m=obstacle_height_m,
         match_radius_m=match_radius_m,
+        surface_kinds_by_isotope=surface_kinds_by_isotope,
     )
     if trace_path is not None:
         _append_estimate_trace_jsonl(trace_path, estimate_trace_payload)
@@ -3754,12 +3806,9 @@ def _log_current_map_prediction_residuals(
         residual = float(observed - predicted)
         whitened = residual / float(np.sqrt(max(variance, 1.0e-12)))
         rel_residual = residual / max(abs(predicted), 1.0e-12)
-        surface_kinds = source_surface_kinds(
+        surface_kinds = filt.structural_surface_kinds(
             positions,
-            env,
-            obstacle_grid,
-            obstacle_height_m=obstacle_height_m,
-            tolerance_m=1.0e-5,
+            strict=False,
         )
         print(
             f"[step {step_index}] map_prediction_residual[{isotope}] "
@@ -4111,12 +4160,9 @@ def _log_particle_cloud_diagnostics(
             weight_arr = np.asarray(slot_weights, dtype=float)
             mean_pos, std_pos = _weighted_mean_std(pos_arr, weight_arr)
             mean_q, std_q = _weighted_mean_std(strength_arr[:, None], weight_arr)
-            surfaces = source_surface_kinds(
+            surfaces = filt.structural_surface_kinds(
                 pos_arr,
-                env,
-                obstacle_grid,
-                obstacle_height_m=obstacle_height_m,
-                tolerance_m=1.0e-5,
+                strict=False,
             )
             surface_mass: dict[str, float] = {}
             for surface, weight in zip(surfaces, weight_arr):
@@ -4147,12 +4193,9 @@ def _log_particle_cloud_diagnostics(
             state = particle.state
             positions, strengths, background = _state_source_arrays(state)
             surfaces = (
-                source_surface_kinds(
+                filt.structural_surface_kinds(
                     positions,
-                    env,
-                    obstacle_grid,
-                    obstacle_height_m=obstacle_height_m,
-                    tolerance_m=1.0e-5,
+                    strict=False,
                 )
                 if positions.size
                 else []
@@ -12069,6 +12112,7 @@ def run_live_pf(
                     ),
                 ),
                 surface_prior_active=True,
+                estimator=estimator,
             )
             final_estimates_for_run = final_estimates
         final_posterior_projection_time_s += float(
@@ -12372,6 +12416,7 @@ def run_live_pf(
                 ),
             ),
             surface_prior_active=True,
+            estimator=estimator,
         )
     else:
         estimates = final_estimates_for_run
@@ -12386,12 +12431,10 @@ def run_live_pf(
     for iso, estimate in estimates.items():
         positions = np.asarray(estimate[0], dtype=float)
         strengths = np.asarray(estimate[1], dtype=float)
-        surface_kinds = source_surface_kinds(
+        surface_kinds = estimator.structural_surface_kinds(
+            iso,
             positions.reshape(-1, 3),
-            env,
-            obstacle_grid,
-            obstacle_height_m=surface_obstacle_height_m,
-            tolerance_m=posterior_surface_tolerance_m,
+            strict=False,
         )
         est_list: list[dict[str, Any]] = []
         for pos, strength, surface_kind in zip(
@@ -12449,6 +12492,7 @@ def run_live_pf(
             obstacle_grid,
             obstacle_height_m=surface_obstacle_height_m,
             tolerance_m=posterior_surface_tolerance_m,
+            estimator=estimator,
         ),
         "particles": _particle_surface_diagnostics(
             estimator,
