@@ -143,6 +143,14 @@
   crashes, logically inconsistent behavior, invalid configuration wiring, or
   physics/model mismatches that can be demonstrated independently of early
   accuracy metrics.
+- After a full simulation reaches its terminal state, stop before making
+  follow-up changes or launching another run. Verify the completed artifacts
+  and provide a detailed, evidence-based post-run analysis covering simulation
+  fidelity and completion, measurement geometry and shield-pair diversity, PF
+  posterior/cardinality and localization accuracy, failures or limitations,
+  and the exact artifact paths. End that run cycle after the analysis and wait
+  for explicit user direction before modifying the implementation or starting
+  another full simulation.
 - "Full simulation" means the standard no-GUI Geant4/PF runtime. Use
   `uv run python main.py --full-simulation` or `uv run python main.py` unless
   the user explicitly asks for another mode. This resolves to
