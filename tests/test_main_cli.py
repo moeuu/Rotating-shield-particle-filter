@@ -160,6 +160,77 @@ def test_main_default_max_poses_uses_runtime_config(monkeypatch) -> None:
     )
     assert captured["source_generation_mode"] == "surface_random"
     assert "max_sources" not in captured["pf_config_overrides"]
+    measurement_log_output = Path(str(captured["measurement_log_output"]))
+    assert measurement_log_output.parent == Path("results/measurement_logs")
+    assert measurement_log_output.name.startswith("full_simulation_")
+
+
+def test_main_explicit_measurement_log_output_is_forwarded(monkeypatch) -> None:
+    """An explicit MeasurementLog target should be forwarded unchanged."""
+    module = _load_main_module()
+    captured: dict[str, object] = {}
+
+    def _fake_run_live_pf(**kwargs: object) -> None:
+        """Capture CLI arguments without running the full simulation."""
+        captured.update(kwargs)
+
+    target = "logs/pure_pf/explicit_run"
+    monkeypatch.setattr(module, "run_live_pf", _fake_run_live_pf)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--measurement-log-output", target],
+    )
+
+    module.main()
+
+    assert captured["measurement_log_output"] == target
+
+
+def test_measurement_log_output_preserves_configured_target() -> None:
+    """Configured RAL-style targets should remain owned by the runtime config."""
+    module = _load_main_module()
+
+    resolved = module._resolve_measurement_log_output(
+        None,
+        {
+            "measurement_log_output_dir": (
+                "results/ral_ablation/measurement_logs/proposed"
+            )
+        },
+        output_tag="ignored",
+        repository_root=Path.cwd(),
+    )
+
+    assert resolved is None
+
+
+def test_measurement_log_output_is_unique_and_sanitizes_output_tag(
+    tmp_path: Path,
+) -> None:
+    """Automatic targets should be unique and contain one safe tag component."""
+    module = _load_main_module()
+
+    first = module._resolve_measurement_log_output(
+        None,
+        {},
+        output_tag="../../RAL run/α",
+        repository_root=tmp_path,
+    )
+    second = module._resolve_measurement_log_output(
+        None,
+        {},
+        output_tag="../../RAL run/α",
+        repository_root=tmp_path,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first != second
+    first_path = Path(first)
+    assert first_path.parent == Path("results/measurement_logs")
+    assert first_path.name.startswith("RAL_run_")
+    assert ".." not in first_path.parts
 
 
 def test_main_explicit_max_sources_overrides_runtime_config(monkeypatch) -> None:

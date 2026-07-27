@@ -4,8 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sys
+from typing import Any
+from uuid import uuid4
 
 # Ensure src/ is on sys.path for direct script execution.
 ROOT = Path(__file__).resolve().parent
@@ -29,6 +34,7 @@ from runtime_defaults import (
     DEFAULT_ROBOT_SPEED_M_S,
     DEFAULT_ROTATION_OVERHEAD_S,
 )
+from sim.runtime import load_runtime_config
 
 STANDARD_GEANT4_FULL_CONFIG = (
     ROOT
@@ -129,6 +135,39 @@ def _source_config_was_explicit(argv: list[str] | None = None) -> bool:
     """Return whether the CLI explicitly set --source-config."""
     raw_args = sys.argv[1:] if argv is None else argv
     return any(arg == "--source-config" or arg.startswith("--source-config=") for arg in raw_args)
+
+
+def _safe_path_component(value: str | None, *, fallback: str) -> str:
+    """Return an ASCII path component without separators or traversal tokens."""
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip())
+    sanitized = sanitized.strip("_-")
+    return sanitized or fallback
+
+
+def _resolve_measurement_log_output(
+    explicit_output: str | None,
+    runtime_config: Mapping[str, Any],
+    *,
+    output_tag: str | None,
+    repository_root: Path,
+) -> str | None:
+    """Resolve CLI log wiring while preserving configured output targets."""
+    if explicit_output not in (None, ""):
+        return str(explicit_output)
+    if runtime_config.get("measurement_log_output_dir") not in (None, ""):
+        return None
+
+    safe_tag = _safe_path_component(output_tag, fallback="full_simulation")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    relative_parent = Path("results") / "measurement_logs"
+    for _ in range(16):
+        unique_token = uuid4().hex[:12]
+        relative_target = (
+            relative_parent / f"{safe_tag}_{timestamp}_{unique_token}"
+        )
+        if not (repository_root / relative_target).exists():
+            return relative_target.as_posix()
+    raise RuntimeError("Failed to allocate a unique MeasurementLog output path.")
 
 
 def main() -> None:
@@ -248,6 +287,15 @@ def main() -> None:
         type=str,
         default=None,
         help="Optional tag appended to result output filenames (ex: ex5 -> result_pf_ex5.png).",
+    )
+    parser.add_argument(
+        "--measurement-log-output",
+        type=str,
+        default=None,
+        help=(
+            "Truth-free MeasurementLog output directory. When omitted, the "
+            "runtime config target is preserved or a unique target is generated."
+        ),
     )
     parser.add_argument(
         "--resume-measurement-stage",
@@ -699,6 +747,13 @@ def main() -> None:
         args,
         parser,
     )
+    runtime_config = load_runtime_config(sim_config_path)
+    measurement_log_output = _resolve_measurement_log_output(
+        args.measurement_log_output,
+        runtime_config,
+        output_tag=args.output_tag,
+        repository_root=ROOT,
+    )
     variable_cardinality = resolve_runtime_variable_cardinality(
         args.variable_cardinality,
         sim_config_path,
@@ -779,6 +834,7 @@ def main() -> None:
         num_particles=args.num_particles,
         pf_config_overrides=pf_overrides,
         output_tag=args.output_tag,
+        measurement_log_output=measurement_log_output,
         resume_measurement_stage=args.resume_measurement_stage,
         resume_compatible_code_paths=args.resume_compatible_code_path,
         resume_compatibility_basis=args.resume_compatibility_basis,
