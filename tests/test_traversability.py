@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from measurement.obstacles import ObstacleGrid
 from planning.traversability import (
@@ -38,6 +39,18 @@ class TransitionAwareMap:
     ) -> bool:
         """Reject exactly one undirected graph edge."""
         return frozenset((first_cell, second_cell)) != self.forbidden_edge
+
+
+def test_traversability_rejects_negative_robot_radius() -> None:
+    """A negative footprint must not become an uninflated obstacle map."""
+    with pytest.raises(ValueError, match="robot_radius_m"):
+        TraversabilityMap(
+            origin=(0.0, 0.0),
+            cell_size=1.0,
+            grid_shape=(2, 2),
+            traversable_cells=((0, 0),),
+            robot_radius_m=-0.1,
+        )
 
 
 def test_traversability_map_projects_obstacle_footprints() -> None:

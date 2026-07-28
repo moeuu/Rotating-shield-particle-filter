@@ -1,98 +1,227 @@
-"""Tests for exact finite-surface structural RJ-MH probability bookkeeping."""
+"""Probability-contract tests for continuous-surface exact RJ/MH moves."""
 
 from __future__ import annotations
 
-from itertools import combinations
+import math
 
 import numpy as np
 import pytest
 
 from pf.structural_rj import (
-    BIRTH_DEATH_LOG_ABS_JACOBIAN,
     BirthDeathMoveProbabilities,
     CardinalityPrior,
-    SurfaceAdjacency,
-    SurfaceSetPrior,
-    add_surface_indices,
-    birth_log_acceptance_ratio,
-    conditional_birth_surface_log_probability,
-    death_log_acceptance_ratio,
-    local_position_log_acceptance_ratio,
+    ContinuousStrengthProposal,
+    ContinuousSurfacePositionProposal,
+    SplitMergeMoveProbabilities,
+    continuous_birth_log_acceptance_ratio,
+    continuous_death_log_acceptance_ratio,
+    continuous_joint_position_strength_log_acceptance_ratio,
+    continuous_merge_log_acceptance_ratio,
+    continuous_position_log_acceptance_ratio,
+    continuous_split_log_acceptance_ratio,
     log_acceptance_probability,
-    log_elementary_symmetric_normalizers,
-    remove_surface_columns,
-    uniform_death_index_log_probability,
+    split_fraction_bounds,
 )
 
 
-def _enumerated_sets(
-    dictionary_size: int,
-    cardinality: int,
-) -> np.ndarray:
-    """Enumerate all canonical sets for one deliberately tiny dictionary."""
-    if cardinality == 0:
-        return np.empty((1, 0), dtype=np.int64)
-    return np.asarray(
-        list(combinations(range(dictionary_size), cardinality)),
-        dtype=np.int64,
+def test_continuous_strength_proposal_density_is_normalized_per_chart() -> None:
+    """Every chart-conditional prior/data mixture must integrate to one."""
+    proposal = ContinuousStrengthProposal(
+        minimum=1.0,
+        maximum=9.0,
+        data_locations_by_chart=np.asarray([1.1, 5.0, 8.9]),
+        data_sigma=0.7,
+        prior_component_probability=0.2,
     )
+    grid = np.linspace(1.0, 9.0, 100_001, dtype=np.float64)
 
-
-def test_elementary_symmetric_normalizers_match_full_enumeration() -> None:
-    """Dynamic normalizers and set masses must match a small brute-force oracle."""
-    areas = np.array([1.0, 2.0, 4.0, 3.0])
-    normalized = areas / np.sum(areas)
-    prior = SurfaceSetPrior(areas)
-    observed = log_elementary_symmetric_normalizers(areas)
-
-    expected = []
-    for cardinality in range(areas.size + 1):
-        sets = _enumerated_sets(areas.size, cardinality)
-        products = (
-            np.ones(1)
-            if cardinality == 0
-            else np.prod(normalized[sets], axis=1)
+    for chart_id in range(3):
+        density = np.exp(
+            proposal.log_density(
+                np.full(grid.size, chart_id, dtype=np.int64),
+                grid,
+            )
         )
-        expected.append(np.log(np.sum(products)))
-        assert np.sum(np.exp(prior.log_prob(sets))) == pytest.approx(
+        assert np.trapezoid(density, grid) == pytest.approx(
             1.0,
-            abs=1.0e-13,
+            abs=2.0e-8,
         )
-
-    np.testing.assert_allclose(observed, expected, atol=1.0e-14, rtol=0.0)
-    scaled = SurfaceSetPrior(areas * 7.3)
-    for cardinality in range(areas.size + 1):
-        sets = _enumerated_sets(areas.size, cardinality)
-        np.testing.assert_allclose(
-            prior.log_prob(sets),
-            scaled.log_prob(sets),
-            atol=1.0e-14,
-            rtol=0.0,
-        )
+        assert np.min(density) >= 0.2 / 8.0 - 1.0e-15
 
 
-def test_batched_rejection_sampler_matches_exact_set_histogram() -> None:
-    """The iid-then-reject sampler must reproduce area-product set masses."""
-    areas = np.array([1.0, 2.0, 3.0, 4.0])
-    prior = SurfaceSetPrior(areas, max_cardinality=2)
-    samples = prior.sample_rejection(
-        2,
-        60_000,
-        rng=np.random.default_rng(20260727),
-        proposal_batch_size=4096,
+def test_continuous_strength_proposal_sampling_has_full_prior_support() -> None:
+    """The positive prior component must keep every physical strength reachable."""
+    proposal = ContinuousStrengthProposal(
+        minimum=10.0,
+        maximum=20.0,
+        data_locations_by_chart=np.asarray([10.2, 19.8]),
+        data_sigma=0.25,
+        prior_component_probability=0.3,
     )
-    sets = _enumerated_sets(areas.size, 2)
-    expected = np.exp(prior.log_prob(sets))
+    chart_ids = np.tile(np.asarray([0, 1], dtype=np.int64), 50_000)
+    samples = proposal.sample(
+        chart_ids,
+        rng=np.random.default_rng(20260727),
+    )
 
-    unique, counts = np.unique(samples, axis=0, return_counts=True)
-    np.testing.assert_array_equal(unique, sets)
-    observed = counts / np.sum(counts)
-    np.testing.assert_allclose(observed, expected, atol=0.006, rtol=0.0)
-    assert np.all(np.diff(samples, axis=1) > 0)
+    assert np.all((samples >= 10.0) & (samples <= 20.0))
+    assert np.any(samples[chart_ids == 0] > 19.0)
+    assert np.any(samples[chart_ids == 1] < 11.0)
+    assert np.all(
+        np.isfinite(proposal.log_density(chart_ids, samples))
+    )
 
 
-def test_explicit_cardinality_prior_and_boundary_move_probabilities() -> None:
-    """Configured K mass and boundary renormalization must remain explicit."""
+def test_surface_position_proposal_mixture_preserves_full_support() -> None:
+    """The explicit area-prior component must protect every surface chart."""
+    proposal = ContinuousSurfacePositionProposal(
+        area_prior_probabilities=np.asarray([0.1, 0.2, 0.7]),
+        alignment_scores=np.asarray([0.0, 5.0, 0.0]),
+        prior_component_probability=0.25,
+    )
+
+    np.testing.assert_allclose(
+        proposal.chart_probabilities,
+        [0.025, 0.8, 0.175],
+        atol=1.0e-15,
+        rtol=0.0,
+    )
+    assert np.all(
+        proposal.chart_probabilities
+        >= 0.25 * proposal.area_prior_probabilities
+    )
+    assert proposal.data_informative is True
+    np.testing.assert_allclose(
+        proposal.log_density(np.asarray([0, 1, 2])),
+        np.log(proposal.chart_probabilities),
+    )
+
+
+@pytest.mark.parametrize(
+    ("alignment", "prior_weight"),
+    [
+        (np.zeros(3), 0.25),
+        (np.asarray([1.0, 8.0, 3.0]), 1.0),
+    ],
+)
+def test_surface_position_proposal_reverts_to_area_prior(
+    alignment: np.ndarray,
+    prior_weight: float,
+) -> None:
+    """No signal or an explicit prior-only component must recover the prior."""
+    prior = np.asarray([0.15, 0.25, 0.60])
+    proposal = ContinuousSurfacePositionProposal(
+        area_prior_probabilities=prior,
+        alignment_scores=alignment,
+        prior_component_probability=prior_weight,
+    )
+
+    np.testing.assert_allclose(
+        proposal.chart_probabilities,
+        prior,
+        atol=1.0e-15,
+        rtol=0.0,
+    )
+
+
+def test_fixed_mixture_density_is_reciprocal_across_exact_rj_moves() -> None:
+    """One frozen mixture must give matching forward/reverse MH-RJ densities."""
+    prior = np.asarray([0.2, 0.3, 0.5])
+    proposal = ContinuousSurfacePositionProposal(
+        area_prior_probabilities=prior,
+        alignment_scores=np.asarray([0.0, 1.0, 4.0]),
+        prior_component_probability=0.4,
+    )
+    old_chart = 0
+    new_chart = 2
+    old_prior = float(np.log(prior[old_chart]))
+    new_prior = float(np.log(prior[new_chart]))
+    old_proposal = float(proposal.log_density(old_chart))
+    new_proposal = float(proposal.log_density(new_chart))
+    cardinality_prior = CardinalityPrior([0.2, 0.5, 0.3])
+    birth_death = BirthDeathMoveProbabilities(
+        max_cardinality=2,
+        birth_weight=0.7,
+        death_weight=0.3,
+    )
+    birth = continuous_birth_log_acceptance_ratio(
+        current_cardinality=1,
+        log_likelihood_ratio=0.8,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=birth_death,
+        log_position_prior_density=new_prior,
+        log_strength_prior_density=-0.6,
+        log_forward_position_proposal=new_proposal,
+        log_forward_strength_proposal=-0.6,
+    )
+    death = continuous_death_log_acceptance_ratio(
+        current_cardinality=2,
+        log_likelihood_ratio=-0.8,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=birth_death,
+        log_removed_position_prior_density=new_prior,
+        log_removed_strength_prior_density=-0.6,
+        log_reverse_position_proposal=new_proposal,
+        log_reverse_strength_proposal=-0.6,
+    )
+    np.testing.assert_allclose(birth, -death, atol=1.0e-14)
+
+    forward_position = continuous_position_log_acceptance_ratio(
+        log_likelihood_ratio=0.35,
+        log_old_position_prior_density=old_prior,
+        log_new_position_prior_density=new_prior,
+        log_reverse_proposal_density=old_proposal,
+        log_forward_proposal_density=new_proposal,
+    )
+    reverse_position = continuous_position_log_acceptance_ratio(
+        log_likelihood_ratio=-0.35,
+        log_old_position_prior_density=new_prior,
+        log_new_position_prior_density=old_prior,
+        log_reverse_proposal_density=new_proposal,
+        log_forward_proposal_density=old_proposal,
+    )
+    np.testing.assert_allclose(
+        forward_position,
+        -reverse_position,
+        atol=1.0e-14,
+    )
+
+    split_merge = SplitMergeMoveProbabilities(
+        max_cardinality=2,
+        split_weight=0.6,
+        merge_weight=0.4,
+    )
+    split = continuous_split_log_acceptance_ratio(
+        current_cardinality=1,
+        total_strength=3.0,
+        log_likelihood_ratio=0.45,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=split_merge,
+        log_new_position_prior_density=new_prior,
+        log_old_strength_prior_density=-0.8,
+        log_retained_strength_prior_density=-0.5,
+        log_new_strength_prior_density=-0.7,
+        log_forward_position_proposal=new_proposal,
+        log_forward_fraction_proposal=0.2,
+    )
+    merge = continuous_merge_log_acceptance_ratio(
+        current_cardinality=2,
+        merged_strength=3.0,
+        log_likelihood_ratio=-0.45,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=split_merge,
+        log_deleted_position_prior_density=new_prior,
+        log_deleted_strength_prior_density=-0.7,
+        log_retained_strength_prior_density=-0.5,
+        log_merged_strength_prior_density=-0.8,
+        log_reverse_position_proposal=new_proposal,
+        log_reverse_fraction_proposal=0.2,
+    )
+    np.testing.assert_allclose(split, -merge, atol=1.0e-14)
+
+
+def test_cardinality_prior_and_boundary_move_probabilities_are_explicit() -> None:
+    """K masses and boundary-renormalized proposal probabilities must be exact."""
     cardinality_prior = CardinalityPrior([1.0, 2.0, 3.0, 4.0])
     np.testing.assert_allclose(
         np.exp(cardinality_prior.log_prob([0, 1, 2, 3])),
@@ -112,435 +241,423 @@ def test_explicit_cardinality_prior_and_boundary_move_probabilities() -> None:
     assert np.isneginf(moves.log_probability("death", 0))
     assert np.isneginf(moves.log_probability("birth", 3))
 
-    immobile = BirthDeathMoveProbabilities(max_cardinality=2, min_cardinality=2)
-    immobile_birth, immobile_death = immobile.probabilities(2)
-    assert immobile_birth == 0.0
-    assert immobile_death == 0.0
 
-
-def test_birth_and_reverse_death_log_ratios_are_antisymmetric() -> None:
-    """Paired birth/death bookkeeping must produce exactly opposite log ratios."""
-    surface_prior = SurfaceSetPrior(
-        [1.0, 2.0, 3.0, 4.0],
-        max_cardinality=3,
-    )
-    cardinality_prior = CardinalityPrior([0.15, 0.35, 0.30, 0.20])
+@pytest.mark.parametrize("current_cardinality", [0, 1, 2])
+def test_continuous_birth_and_reverse_death_are_reciprocal(
+    current_cardinality: int,
+) -> None:
+    """A paired birth/death proposal must have opposite raw MH log ratios."""
+    cardinality_prior = CardinalityPrior([0.19, 0.31, 0.29, 0.21])
     moves = BirthDeathMoveProbabilities(
         max_cardinality=3,
         birth_weight=1.7,
         death_weight=0.8,
     )
-    current = np.array([[0], [1], [2]], dtype=np.int64)
-    birth_indices = np.array([2, 3, 0], dtype=np.int64)
-    proposed = add_surface_indices(
-        current,
-        birth_indices,
-        dictionary_size=surface_prior.dictionary_size,
-    )
-    death_columns = np.argmax(
-        proposed == birth_indices[:, None],
-        axis=1,
-    )
+    likelihood_ratio = np.asarray([0.4, -0.7, 1.2])
+    position_prior = np.asarray([-2.1, -1.7, -3.2])
+    strength_prior = np.asarray([-0.2, -0.3, -0.5])
+    position_proposal = np.asarray([-2.4, -1.4, -3.0])
+    strength_proposal = np.asarray([-0.7, -0.1, -0.4])
+    log_jacobian = np.asarray([0.0, 0.3, -0.2])
 
-    likelihood_ratio = np.array([0.4, -0.7, 1.2])
-    strength_prior = np.array([-0.2, -0.3, -0.5])
-    strength_proposal = np.array([-0.7, -0.1, -0.4])
-    position_proposal = conditional_birth_surface_log_probability(
-        surface_prior,
-        current,
-        birth_indices,
-    )
-    death_index = uniform_death_index_log_probability(2)
-
-    birth_ratio = birth_log_acceptance_ratio(
-        current_surface_sets=current,
-        birth_surface_indices=birth_indices,
+    birth_ratio = continuous_birth_log_acceptance_ratio(
+        current_cardinality=current_cardinality,
         log_likelihood_ratio=likelihood_ratio,
-        surface_prior=surface_prior,
         cardinality_prior=cardinality_prior,
         move_probabilities=moves,
+        log_position_prior_density=position_prior,
         log_strength_prior_density=strength_prior,
         log_forward_position_proposal=position_proposal,
         log_forward_strength_proposal=strength_proposal,
-        log_reverse_death_index_probability=death_index,
+        log_abs_jacobian=log_jacobian,
     )
-    death_ratio = death_log_acceptance_ratio(
-        current_surface_sets=proposed,
-        death_columns=death_columns,
+    death_ratio = continuous_death_log_acceptance_ratio(
+        current_cardinality=current_cardinality + 1,
         log_likelihood_ratio=-likelihood_ratio,
-        surface_prior=surface_prior,
         cardinality_prior=cardinality_prior,
         move_probabilities=moves,
+        log_removed_position_prior_density=position_prior,
         log_removed_strength_prior_density=strength_prior,
-        log_forward_death_index_probability=death_index,
         log_reverse_position_proposal=position_proposal,
         log_reverse_strength_proposal=strength_proposal,
+        log_abs_reverse_jacobian=-log_jacobian,
     )
 
     np.testing.assert_allclose(birth_ratio, -death_ratio, atol=1.0e-14)
-    assert BIRTH_DEATH_LOG_ABS_JACOBIAN == 0.0
     np.testing.assert_allclose(
         log_acceptance_probability(birth_ratio),
         np.minimum(birth_ratio, 0.0),
     )
 
 
-def test_prior_only_birth_death_kernel_satisfies_detailed_balance() -> None:
-    """Every adjacent tiny-dictionary state pair must balance prior-only flux."""
-    areas = np.array([1.0, 2.0, 5.0, 3.0])
-    maximum = 3
-    surface_prior = SurfaceSetPrior(areas, max_cardinality=maximum)
-    cardinality_prior = CardinalityPrior([0.20, 0.35, 0.30, 0.15])
+@pytest.mark.parametrize("current_cardinality", [0, 1, 2])
+def test_continuous_birth_death_flux_includes_canonical_factorial_density(
+    current_cardinality: int,
+) -> None:
+    """Detailed balance must hold on the canonical unordered-state base measure."""
+    proposed_cardinality = current_cardinality + 1
+    cardinality_prior = CardinalityPrior([0.19, 0.31, 0.29, 0.21])
     moves = BirthDeathMoveProbabilities(
-        max_cardinality=maximum,
-        birth_weight=1.4,
-        death_weight=0.9,
+        max_cardinality=3,
+        birth_weight=1.7,
+        death_weight=0.8,
     )
-    log_strength_density = -np.log(2.0)
+    log_position_prior = -1.83
+    log_strength_prior = -0.47
+    log_position_proposal = -2.15
+    log_strength_proposal = -0.26
+    log_likelihood_current = -4.2
+    log_likelihood_proposed = -3.7
+    likelihood_ratio = log_likelihood_proposed - log_likelihood_current
 
-    for cardinality in range(maximum):
-        for current_tuple in combinations(range(areas.size), cardinality):
-            current = np.asarray(
-                [current_tuple],
-                dtype=np.int64,
-            ).reshape(1, cardinality)
-            unused = sorted(set(range(areas.size)) - set(current_tuple))
-            for birth_index in unused:
-                birth_indices = np.array([birth_index], dtype=np.int64)
-                proposed = add_surface_indices(
-                    current,
-                    birth_indices,
-                    dictionary_size=areas.size,
-                )
-                death_column = np.flatnonzero(
-                    proposed[0] == birth_index
-                ).astype(np.int64)
-                log_position = conditional_birth_surface_log_probability(
-                    surface_prior,
-                    current,
-                    birth_indices,
-                )
-                log_death_index = uniform_death_index_log_probability(
-                    cardinality + 1
-                )
+    birth_ratio = float(
+        continuous_birth_log_acceptance_ratio(
+            current_cardinality=current_cardinality,
+            log_likelihood_ratio=likelihood_ratio,
+            cardinality_prior=cardinality_prior,
+            move_probabilities=moves,
+            log_position_prior_density=log_position_prior,
+            log_strength_prior_density=log_strength_prior,
+            log_forward_position_proposal=log_position_proposal,
+            log_forward_strength_proposal=log_strength_proposal,
+        )[0]
+    )
+    death_ratio = float(
+        continuous_death_log_acceptance_ratio(
+            current_cardinality=proposed_cardinality,
+            log_likelihood_ratio=-likelihood_ratio,
+            cardinality_prior=cardinality_prior,
+            move_probabilities=moves,
+            log_removed_position_prior_density=log_position_prior,
+            log_removed_strength_prior_density=log_strength_prior,
+            log_reverse_position_proposal=log_position_proposal,
+            log_reverse_strength_proposal=log_strength_proposal,
+        )[0]
+    )
 
-                log_birth_ratio = float(
-                    birth_log_acceptance_ratio(
-                        current_surface_sets=current,
-                        birth_surface_indices=birth_indices,
-                        log_likelihood_ratio=0.0,
-                        surface_prior=surface_prior,
-                        cardinality_prior=cardinality_prior,
-                        move_probabilities=moves,
-                        log_strength_prior_density=log_strength_density,
-                        log_forward_position_proposal=log_position,
-                        log_forward_strength_proposal=log_strength_density,
-                        log_reverse_death_index_probability=log_death_index,
-                    )[0]
-                )
-                log_death_ratio = float(
-                    death_log_acceptance_ratio(
-                        current_surface_sets=proposed,
-                        death_columns=death_column,
-                        log_likelihood_ratio=0.0,
-                        surface_prior=surface_prior,
-                        cardinality_prior=cardinality_prior,
-                        move_probabilities=moves,
-                        log_removed_strength_prior_density=(
-                            log_strength_density
-                        ),
-                        log_forward_death_index_probability=log_death_index,
-                        log_reverse_position_proposal=log_position,
-                        log_reverse_strength_proposal=log_strength_density,
-                    )[0]
-                )
-
-                log_target_current = (
-                    float(cardinality_prior.log_prob(cardinality))
-                    + float(surface_prior.log_prob(current)[0])
-                    + cardinality * log_strength_density
-                )
-                log_target_proposed = (
-                    float(cardinality_prior.log_prob(cardinality + 1))
-                    + float(surface_prior.log_prob(proposed)[0])
-                    + (cardinality + 1) * log_strength_density
-                )
-                log_forward_transition = (
-                    float(moves.log_probability("birth", cardinality))
-                    + float(log_position[0])
-                    + log_strength_density
-                    + min(0.0, log_birth_ratio)
-                )
-                log_reverse_transition = (
-                    float(
-                        moves.log_probability(
-                            "death",
-                            cardinality + 1,
-                        )
-                    )
-                    + float(log_death_index)
-                    + min(0.0, log_death_ratio)
-                )
-                assert (
-                    log_target_current + log_forward_transition
-                ) == pytest.approx(
-                    log_target_proposed + log_reverse_transition,
-                    abs=2.0e-13,
-                )
+    # Canonically ordering K iid labeled sources changes the density by K!.
+    log_target_current = (
+        log_likelihood_current
+        + float(cardinality_prior.log_prob(current_cardinality))
+        + math.lgamma(current_cardinality + 1.0)
+        + current_cardinality * (log_position_prior + log_strength_prior)
+    )
+    log_target_proposed = (
+        log_likelihood_proposed
+        + float(cardinality_prior.log_prob(proposed_cardinality))
+        + math.lgamma(proposed_cardinality + 1.0)
+        + proposed_cardinality * (log_position_prior + log_strength_prior)
+    )
+    log_forward = (
+        float(moves.log_probability("birth", current_cardinality))
+        + log_position_proposal
+        + log_strength_proposal
+        + min(0.0, birth_ratio)
+    )
+    log_reverse = (
+        float(moves.log_probability("death", proposed_cardinality))
+        - math.log(proposed_cardinality)
+        + min(0.0, death_ratio)
+    )
+    assert log_target_current + log_forward == pytest.approx(
+        log_target_proposed + log_reverse,
+        abs=2.0e-13,
+    )
 
 
-def test_area_weighted_within_k_position_proposal_satisfies_detailed_balance() -> None:
-    """Runtime relocation proposal must cancel the area-weighted set prior."""
-    areas = np.asarray([1.0, 2.0, 5.0, 3.0], dtype=float)
-    cardinality = 2
-    prior = SurfaceSetPrior(areas, max_cardinality=cardinality)
-    sets = _enumerated_sets(areas.size, cardinality)
-    log_targets = {
-        tuple(surface_set): float(prior.log_prob(surface_set[None, :])[0])
-        for surface_set in sets
-    }
+def test_continuous_global_position_ratio_is_reciprocal() -> None:
+    """Swapping old/new target and proposal densities must negate the MH ratio."""
+    likelihood_ratio = np.asarray([0.7, -0.4, 0.2])
+    old_prior = np.asarray([-3.1, -2.2, -1.4])
+    new_prior = np.asarray([-1.8, -3.0, -2.3])
+    forward = np.asarray([-2.7, -1.9, -2.1])
+    reverse = np.asarray([-2.0, -2.5, -1.7])
+    jacobian = np.asarray([0.0, 0.2, -0.1])
 
-    for current_set in sets:
-        current = current_set[None, :]
-        for source_column in range(cardinality):
-            reduced = remove_surface_columns(
-                current,
-                np.asarray([source_column], dtype=np.int64),
-                dictionary_size=areas.size,
-            )
-            old_patch = int(current_set[source_column])
-            remaining = sorted(set(range(areas.size)) - set(reduced[0]))
-            for new_patch in remaining:
-                proposed = add_surface_indices(
-                    reduced,
-                    np.asarray([new_patch], dtype=np.int64),
-                    dictionary_size=areas.size,
-                )
-                new_column = int(
-                    np.flatnonzero(proposed[0] == new_patch)[0]
-                )
-                reverse_reduced = remove_surface_columns(
-                    proposed,
-                    np.asarray([new_column], dtype=np.int64),
-                    dictionary_size=areas.size,
-                )
-                np.testing.assert_array_equal(reverse_reduced, reduced)
-                log_forward = (
-                    -np.log(cardinality)
-                    + float(
-                        conditional_birth_surface_log_probability(
-                            prior,
-                            reduced,
-                            np.asarray([new_patch], dtype=np.int64),
-                        )[0]
-                    )
-                )
-                log_reverse = (
-                    -np.log(cardinality)
-                    + float(
-                        conditional_birth_surface_log_probability(
-                            prior,
-                            reduced,
-                            np.asarray([old_patch], dtype=np.int64),
-                        )[0]
-                    )
-                )
+    observed = continuous_position_log_acceptance_ratio(
+        log_likelihood_ratio=likelihood_ratio,
+        log_old_position_prior_density=old_prior,
+        log_new_position_prior_density=new_prior,
+        log_reverse_proposal_density=reverse,
+        log_forward_proposal_density=forward,
+        log_abs_jacobian=jacobian,
+    )
+    reversed_observed = continuous_position_log_acceptance_ratio(
+        log_likelihood_ratio=-likelihood_ratio,
+        log_old_position_prior_density=new_prior,
+        log_new_position_prior_density=old_prior,
+        log_reverse_proposal_density=forward,
+        log_forward_proposal_density=reverse,
+        log_abs_jacobian=-jacobian,
+    )
 
-                assert (
-                    log_targets[tuple(current_set)] + log_forward
-                ) == pytest.approx(
-                    log_targets[tuple(proposed[0])] + log_reverse,
-                    abs=1.0e-13,
-                )
+    np.testing.assert_allclose(observed, -reversed_observed, atol=1.0e-14)
 
 
-def test_invalid_duplicate_set_and_exhausted_birth_fail_fast() -> None:
-    """Duplicate canonical states and births from full sets must be rejected."""
-    prior = SurfaceSetPrior([1.0, 2.0, 3.0])
-    with pytest.raises(ValueError, match="duplicate"):
-        prior.log_prob(np.array([[0, 0]], dtype=np.int64))
-    with pytest.raises(ValueError, match="every surface index"):
-        conditional_birth_surface_log_probability(
-            prior,
-            np.array([[0, 1, 2]], dtype=np.int64),
-            np.array([0], dtype=np.int64),
-        )
-
-
-def _tiny_surface_adjacency() -> SurfaceAdjacency:
-    """Return a small graph with unequal degrees and one isolated patch."""
-    return SurfaceAdjacency(
-        dictionary_size=5,
-        edges=np.asarray(
-            [
-                [0, 1],
-                [0, 2],
-                [0, 3],
-                [1, 2],
-                [2, 3],
-            ],
-            dtype=np.int64,
+def test_continuous_joint_position_strength_ratio_is_reciprocal() -> None:
+    """Joint global moves must include and reverse both proposal densities."""
+    terms = {
+        "log_likelihood_ratio": np.asarray([0.8, -0.3, 0.1]),
+        "log_old_position_prior_density": np.asarray([-3.0, -2.4, -1.5]),
+        "log_new_position_prior_density": np.asarray([-1.7, -2.9, -2.2]),
+        "log_old_strength_prior_density": np.asarray([-6.2, -5.9, -6.0]),
+        "log_new_strength_prior_density": np.asarray([-5.8, -6.4, -5.7]),
+        "log_reverse_position_proposal_density": np.asarray(
+            [-2.1, -2.5, -1.8]
         ),
+        "log_forward_position_proposal_density": np.asarray(
+            [-2.8, -1.9, -2.0]
+        ),
+        "log_reverse_strength_proposal_density": np.asarray(
+            [-6.0, -6.3, -5.6]
+        ),
+        "log_forward_strength_proposal_density": np.asarray(
+            [-5.7, -6.1, -6.4]
+        ),
+        "log_abs_jacobian": np.asarray([0.0, 0.2, -0.1]),
+    }
+    observed = continuous_joint_position_strength_log_acceptance_ratio(
+        **terms
     )
-
-
-def test_local_position_sampler_is_batched_uniform_and_avoids_occupancy() -> None:
-    """Batched local draws must be uniform over only unoccupied neighbors."""
-    adjacency = _tiny_surface_adjacency()
-    repetitions = 40_000
-    surface_sets = np.repeat(
-        np.asarray([[0, 1], [0, 2]], dtype=np.int64),
-        repetitions,
-        axis=0,
-    )
-    source_columns = np.zeros(surface_sets.shape[0], dtype=np.int64)
-
-    proposed, degrees, movable = adjacency.sample_unoccupied_neighbors(
-        surface_sets,
-        source_columns,
-        rng=np.random.default_rng(20260727),
-    )
-
-    first = proposed[:repetitions]
-    second = proposed[repetitions:]
-    assert np.all(degrees == 2)
-    assert np.all(movable)
-    assert set(np.unique(first).tolist()) == {2, 3}
-    assert set(np.unique(second).tolist()) == {1, 3}
-    assert np.count_nonzero(first == 2) / repetitions == pytest.approx(
-        0.5,
-        abs=0.008,
-    )
-    assert np.count_nonzero(second == 1) / repetitions == pytest.approx(
-        0.5,
-        abs=0.008,
-    )
-
-
-def test_local_position_degrees_match_small_serial_oracle() -> None:
-    """Vectorized available degrees must equal direct set-based counting."""
-    adjacency = _tiny_surface_adjacency()
-    occupied = np.asarray(
-        [[1], [2], [0], [1], [0]],
-        dtype=np.int64,
-    )
-    centers = np.arange(5, dtype=np.int64)
-
-    observed = adjacency.available_neighbor_degrees(centers, occupied)
-    expected = np.asarray(
-        [
-            sum(
-                int(neighbor not in set(occupied[row].tolist()))
-                for neighbor in adjacency.neighbors[center]
-                if neighbor >= 0
-            )
-            for row, center in enumerate(centers.tolist())
-        ],
-        dtype=np.int64,
-    )
-
-    np.testing.assert_array_equal(observed, expected)
-
-
-def test_local_position_kernel_satisfies_prior_only_detailed_balance() -> None:
-    """Every admissible graph edge must balance the area-weighted set prior."""
-    areas = np.asarray([1.0, 2.0, 5.0, 3.0, 7.0], dtype=float)
-    cardinality = 2
-    prior = SurfaceSetPrior(areas, max_cardinality=cardinality)
-    adjacency = _tiny_surface_adjacency()
-
-    for current_tuple in combinations(range(areas.size), cardinality):
-        current = np.asarray([current_tuple], dtype=np.int64)
-        for source_column in range(cardinality):
-            old_patch = int(current[0, source_column])
-            reduced = remove_surface_columns(
-                current,
-                np.asarray([source_column], dtype=np.int64),
-                dictionary_size=areas.size,
-            )
-            occupied = set(reduced[0].tolist())
-            available = [
-                int(neighbor)
-                for neighbor in adjacency.neighbors[old_patch]
-                if neighbor >= 0 and int(neighbor) not in occupied
-            ]
-            for new_patch in available:
-                proposed = add_surface_indices(
-                    reduced,
-                    np.asarray([new_patch], dtype=np.int64),
-                    dictionary_size=areas.size,
-                )
-                forward_degree = len(available)
-                reverse_degree = int(
-                    adjacency.available_neighbor_degrees(
-                        np.asarray([new_patch], dtype=np.int64),
-                        reduced,
-                    )[0]
-                )
-                forward_ratio = float(
-                    local_position_log_acceptance_ratio(
-                        old_surface_indices=old_patch,
-                        new_surface_indices=new_patch,
-                        forward_available_degrees=forward_degree,
-                        reverse_available_degrees=reverse_degree,
-                        log_likelihood_ratio=0.0,
-                        surface_prior=prior,
-                    )[0]
-                )
-                reverse_ratio = float(
-                    local_position_log_acceptance_ratio(
-                        old_surface_indices=new_patch,
-                        new_surface_indices=old_patch,
-                        forward_available_degrees=reverse_degree,
-                        reverse_available_degrees=forward_degree,
-                        log_likelihood_ratio=0.0,
-                        surface_prior=prior,
-                    )[0]
-                )
-                assert reverse_ratio == pytest.approx(
-                    -forward_ratio,
-                    abs=1.0e-14,
-                )
-                log_forward_flux = (
-                    float(prior.log_prob(current)[0])
-                    - np.log(cardinality)
-                    - np.log(forward_degree)
-                    + min(0.0, forward_ratio)
-                )
-                log_reverse_flux = (
-                    float(prior.log_prob(proposed)[0])
-                    - np.log(cardinality)
-                    - np.log(reverse_degree)
-                    + min(0.0, reverse_ratio)
-                )
-                assert log_forward_flux == pytest.approx(
-                    log_reverse_flux,
-                    abs=2.0e-13,
-                )
-
-
-def test_local_position_sampler_stays_when_no_neighbor_is_available() -> None:
-    """Isolated and fully occupied adjacency rows must produce safe self moves."""
-    adjacency = _tiny_surface_adjacency()
-
-    isolated, isolated_degree, isolated_movable = (
-        adjacency.sample_unoccupied_neighbors(
-            np.asarray([[1, 4]], dtype=np.int64),
-            np.asarray([1], dtype=np.int64),
-            rng=np.random.default_rng(1),
-        )
-    )
-    occupied, occupied_degree, occupied_movable = (
-        adjacency.sample_unoccupied_neighbors(
-            np.asarray([[0, 1, 2, 3]], dtype=np.int64),
-            np.asarray([0], dtype=np.int64),
-            rng=np.random.default_rng(2),
+    reversed_observed = (
+        continuous_joint_position_strength_log_acceptance_ratio(
+            log_likelihood_ratio=-terms["log_likelihood_ratio"],
+            log_old_position_prior_density=terms[
+                "log_new_position_prior_density"
+            ],
+            log_new_position_prior_density=terms[
+                "log_old_position_prior_density"
+            ],
+            log_old_strength_prior_density=terms[
+                "log_new_strength_prior_density"
+            ],
+            log_new_strength_prior_density=terms[
+                "log_old_strength_prior_density"
+            ],
+            log_reverse_position_proposal_density=terms[
+                "log_forward_position_proposal_density"
+            ],
+            log_forward_position_proposal_density=terms[
+                "log_reverse_position_proposal_density"
+            ],
+            log_reverse_strength_proposal_density=terms[
+                "log_forward_strength_proposal_density"
+            ],
+            log_forward_strength_proposal_density=terms[
+                "log_reverse_strength_proposal_density"
+            ],
+            log_abs_jacobian=-terms["log_abs_jacobian"],
         )
     )
 
-    np.testing.assert_array_equal(isolated, [4])
-    np.testing.assert_array_equal(isolated_degree, [0])
-    np.testing.assert_array_equal(isolated_movable, [False])
-    np.testing.assert_array_equal(occupied, [0])
-    np.testing.assert_array_equal(occupied_degree, [0])
-    np.testing.assert_array_equal(occupied_movable, [False])
+    np.testing.assert_allclose(observed, -reversed_observed, atol=1.0e-14)
+
+
+def test_symmetric_local_position_ratio_reduces_to_likelihood_ratio() -> None:
+    """A same-chart symmetric tangent proposal must add no artificial evidence."""
+    likelihood_ratio = np.asarray([0.7, -0.4, 0.0])
+    chart_log_density = np.asarray([-3.1, -2.2, -1.4])
+    zeros = np.zeros(3)
+
+    observed = continuous_position_log_acceptance_ratio(
+        log_likelihood_ratio=likelihood_ratio,
+        log_old_position_prior_density=chart_log_density,
+        log_new_position_prior_density=chart_log_density,
+        log_reverse_proposal_density=zeros,
+        log_forward_proposal_density=zeros,
+    )
+
+    np.testing.assert_allclose(
+        observed,
+        likelihood_ratio,
+        atol=4.0e-16,
+        rtol=0.0,
+    )
+
+
+def test_split_fraction_bounds_enforce_both_strength_supports() -> None:
+    """Feasible split fractions must keep both child strengths inside support."""
+    totals = np.asarray([1.5, 2.0, 3.0, 5.0, 7.0])
+    lower, upper, feasible = split_fraction_bounds(
+        totals,
+        minimum_strength=1.0,
+        maximum_strength=3.0,
+    )
+
+    np.testing.assert_array_equal(feasible, [False, False, True, True, False])
+    for index in np.flatnonzero(feasible):
+        fractions = np.asarray([lower[index], upper[index]])
+        child = totals[index] * fractions
+        sibling = totals[index] - child
+        assert np.all(child >= 1.0 - 1.0e-14)
+        assert np.all(child <= 3.0 + 1.0e-14)
+        assert np.all(sibling >= 1.0 - 1.0e-14)
+        assert np.all(sibling <= 3.0 + 1.0e-14)
+
+
+@pytest.mark.parametrize("current_cardinality", [1, 2])
+def test_continuous_split_and_reverse_merge_are_reciprocal(
+    current_cardinality: int,
+) -> None:
+    """Matching split/merge bookkeeping must cancel including its Jacobian."""
+    cardinality_prior = CardinalityPrior([0.12, 0.27, 0.34, 0.27])
+    moves = SplitMergeMoveProbabilities(
+        max_cardinality=3,
+        split_weight=1.4,
+        merge_weight=0.6,
+    )
+    total_strength = np.asarray([2.7, 3.4, 4.1])
+    likelihood_ratio = np.asarray([0.5, -0.3, 1.1])
+    position_prior = np.asarray([-2.2, -1.7, -3.1])
+    old_strength_prior = np.asarray([-0.8, -0.9, -1.0])
+    retained_strength_prior = np.asarray([-0.4, -0.6, -0.7])
+    new_strength_prior = np.asarray([-0.5, -0.7, -0.8])
+    position_proposal = np.asarray([-2.0, -2.4, -2.7])
+    fraction_proposal = np.asarray([0.2, -0.1, 0.4])
+
+    split_ratio = continuous_split_log_acceptance_ratio(
+        current_cardinality=current_cardinality,
+        total_strength=total_strength,
+        log_likelihood_ratio=likelihood_ratio,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=moves,
+        log_new_position_prior_density=position_prior,
+        log_old_strength_prior_density=old_strength_prior,
+        log_retained_strength_prior_density=retained_strength_prior,
+        log_new_strength_prior_density=new_strength_prior,
+        log_forward_position_proposal=position_proposal,
+        log_forward_fraction_proposal=fraction_proposal,
+    )
+    merge_ratio = continuous_merge_log_acceptance_ratio(
+        current_cardinality=current_cardinality + 1,
+        merged_strength=total_strength,
+        log_likelihood_ratio=-likelihood_ratio,
+        cardinality_prior=cardinality_prior,
+        move_probabilities=moves,
+        log_deleted_position_prior_density=position_prior,
+        log_deleted_strength_prior_density=new_strength_prior,
+        log_retained_strength_prior_density=retained_strength_prior,
+        log_merged_strength_prior_density=old_strength_prior,
+        log_reverse_position_proposal=position_proposal,
+        log_reverse_fraction_proposal=fraction_proposal,
+    )
+
+    np.testing.assert_allclose(split_ratio, -merge_ratio, atol=1.0e-14)
+
+
+def test_split_merge_flux_includes_selection_density_and_jacobian() -> None:
+    """Canonical target, ordered merge choices, fraction density, and q Jacobian balance."""
+    current_cardinality = 2
+    proposed_cardinality = 3
+    cardinality_prior = CardinalityPrior([0.12, 0.27, 0.34, 0.27])
+    moves = SplitMergeMoveProbabilities(
+        max_cardinality=3,
+        split_weight=1.4,
+        merge_weight=0.6,
+    )
+    total_strength = 3.4
+    log_position_prior = -1.7
+    log_old_strength_prior = -0.9
+    log_retained_strength_prior = -0.6
+    log_new_strength_prior = -0.7
+    log_position_proposal = -2.4
+    log_fraction_proposal = -0.1
+    current_likelihood = -4.8
+    proposed_likelihood = -3.9
+    likelihood_ratio = proposed_likelihood - current_likelihood
+
+    split_ratio = float(
+        continuous_split_log_acceptance_ratio(
+            current_cardinality=current_cardinality,
+            total_strength=total_strength,
+            log_likelihood_ratio=likelihood_ratio,
+            cardinality_prior=cardinality_prior,
+            move_probabilities=moves,
+            log_new_position_prior_density=log_position_prior,
+            log_old_strength_prior_density=log_old_strength_prior,
+            log_retained_strength_prior_density=log_retained_strength_prior,
+            log_new_strength_prior_density=log_new_strength_prior,
+            log_forward_position_proposal=log_position_proposal,
+            log_forward_fraction_proposal=log_fraction_proposal,
+        )[0]
+    )
+    merge_ratio = float(
+        continuous_merge_log_acceptance_ratio(
+            current_cardinality=proposed_cardinality,
+            merged_strength=total_strength,
+            log_likelihood_ratio=-likelihood_ratio,
+            cardinality_prior=cardinality_prior,
+            move_probabilities=moves,
+            log_deleted_position_prior_density=log_position_prior,
+            log_deleted_strength_prior_density=log_new_strength_prior,
+            log_retained_strength_prior_density=log_retained_strength_prior,
+            log_merged_strength_prior_density=log_old_strength_prior,
+            log_reverse_position_proposal=log_position_proposal,
+            log_reverse_fraction_proposal=log_fraction_proposal,
+        )[0]
+    )
+
+    common_position_strength = -2.0
+    current_target = (
+        current_likelihood
+        + float(cardinality_prior.log_prob(current_cardinality))
+        + math.lgamma(current_cardinality + 1.0)
+        + common_position_strength
+        + log_old_strength_prior
+    )
+    proposed_target = (
+        proposed_likelihood
+        + float(cardinality_prior.log_prob(proposed_cardinality))
+        + math.lgamma(proposed_cardinality + 1.0)
+        + common_position_strength
+        + log_position_prior
+        + log_retained_strength_prior
+        + log_new_strength_prior
+    )
+    split_forward = (
+        float(moves.log_probability("split", current_cardinality))
+        - math.log(current_cardinality)
+        + log_position_proposal
+        + log_fraction_proposal
+        + min(0.0, split_ratio)
+    )
+    merge_reverse = (
+        float(moves.log_probability("merge", proposed_cardinality))
+        - math.log(proposed_cardinality * current_cardinality)
+        + min(0.0, merge_ratio)
+        + math.log(total_strength)
+    )
+    # Expressing reverse flux in the split auxiliary coordinate introduces the
+    # forward strength-map Jacobian d(q1, q2) / d(q, fraction) = q.
+    assert current_target + split_forward == pytest.approx(
+        proposed_target + merge_reverse,
+        abs=2.0e-13,
+    )
+
+
+def test_invalid_continuous_boundary_moves_fail_fast() -> None:
+    """Unavailable directions must raise instead of producing a bogus MH ratio."""
+    prior = CardinalityPrior([0.2, 0.3, 0.5])
+    moves = BirthDeathMoveProbabilities(max_cardinality=2)
+    with pytest.raises(ValueError, match="birth exceeds"):
+        continuous_birth_log_acceptance_ratio(
+            current_cardinality=2,
+            log_likelihood_ratio=0.0,
+            cardinality_prior=prior,
+            move_probabilities=moves,
+            log_position_prior_density=0.0,
+            log_strength_prior_density=0.0,
+            log_forward_position_proposal=0.0,
+            log_forward_strength_proposal=0.0,
+        )
+    with pytest.raises((TypeError, ValueError), match="positive"):
+        continuous_death_log_acceptance_ratio(
+            current_cardinality=0,
+            log_likelihood_ratio=0.0,
+            cardinality_prior=prior,
+            move_probabilities=moves,
+            log_removed_position_prior_density=0.0,
+            log_removed_strength_prior_density=0.0,
+            log_reverse_position_proposal=0.0,
+            log_reverse_strength_proposal=0.0,
+        )

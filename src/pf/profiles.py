@@ -7,6 +7,11 @@ from enum import StrEnum
 import math
 from typing import Any, Mapping
 
+from pf.structural_rj import (
+    TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    validate_cardinality_prior_policy,
+)
+
 
 PURE_PF_SCHEMA_VERSION = 1
 
@@ -59,7 +64,6 @@ _PURE_CAPABILITIES = EstimatorCapabilities()
 _PURE_PF_RUNTIME_KEYS = frozenset(
     {
         "pf_buildup",
-        "pf_count_likelihood",
         "pf_detector_aperture_radius_m",
         "pf_detector_aperture_samples",
         "pf_detector_aperture_sampling",
@@ -73,14 +77,10 @@ _PURE_PF_RUNTIME_KEYS = frozenset(
         "pf_obstacle_source_extent_samples",
         "pf_plot_save_every",
         "pf_random_seed",
-        "pf_shield_contrast_likelihood",
-        "pf_shield_view_ratio_likelihood",
         "pf_source_extent_radius_m",
         "pf_source_extent_samples",
         "pf_strength_prior_max_cps_1m",
         "pf_strength_prior_min_cps_1m",
-        "pf_transport_response_model",
-        "pf_transport_response_model_path",
         "pf_visual_estimate_cross_size_m",
         "pf_visual_estimate_cross_width_m",
         "pf_visual_estimate_radius_m",
@@ -94,63 +94,55 @@ _PURE_PF_RUNTIME_MAPPING_KEYS = frozenset(
     {
         "dss_pp",
         "pf_buildup",
-        "pf_count_likelihood",
         "pf_obstacle_mu_by_isotope",
-        "pf_shield_contrast_likelihood",
-        "pf_shield_view_ratio_likelihood",
-        "pf_transport_response_model",
-        "remaining_measurement_estimate",
     }
 )
 _PURE_PF_STRUCTURAL_RUNTIME_KEYS = frozenset(
     {
         "structural_cardinality_prior_probs",
+        "structural_cardinality_prior_mean",
+        "structural_cardinality_prior_policy",
         "structural_rj_birth_probability",
         "structural_rj_death_probability",
         "structural_rj_local_position_move_probability",
+        "structural_rj_local_position_sigma_m",
+        "structural_rj_merge_probability",
         "structural_rj_move_probability",
-        "structural_rj_patch_spacing_m",
         "structural_rj_position_move_probability",
+        "structural_rj_position_proposal_prior_weight",
+        "structural_rj_proposal_chart_batch_size",
+        "structural_rj_proposal_score_cache_max_bytes",
+        "structural_rj_strength_proposal_grid_size",
+        "structural_rj_strength_proposal_prior_weight",
+        "structural_rj_strength_proposal_sigma_fraction",
+        "structural_rj_split_merge_probability",
+        "structural_rj_split_probability",
         "structural_rj_strength_move_probability",
+        "structural_rj_surface_chart_max_edge_m",
     }
 )
 _DSS_PP_RUNTIME_KEYS = frozenset(
     {
         "augment_candidates",
-        "beam_width",
         "bearing_diversity_weight",
-        "candidate_preselect_enable",
-        "candidate_preselect_min",
-        "candidate_preselect_multiplier",
-        "correlation_reduction_weight",
-        "count_balance_weight",
-        "count_utility_saturation_counts",
-        "count_utility_weight",
-        "count_variance_floor",
         "coverage_floor_quantile",
         "coverage_floor_weight",
-        "coverage_grid_max_cells",
+        "coverage_surface_quadrature_max_points",
+        "coverage_surface_max_hausdorff_m",
         "coverage_radius_m",
         "coverage_weight",
         "detector_aperture_samples",
         "diagnostic_ranked_node_limit",
-        "differential_weight",
         "distance_weight",
-        "dose_weight",
-        "eig_candidate_limit",
         "eig_weight",
+        "exact_eig_action_limit",
+        "exact_eig_coverage_reserve",
+        "exact_eig_program_diversity_reserve",
         "elevation_angle_threshold_deg",
         "elevation_condition_weight",
         "elevation_pair_xy_scale_m",
         "elevation_pair_z_scale_m",
-        "elevation_signature_weight",
-        "enforce_min_observation",
-        "environment_contrast_threshold",
-        "environment_signature_score_clip",
-        "environment_signature_weight",
         "frontier_weight",
-        "horizon",
-        "isotope_balance_weight",
         "local_orbit_sigma_m",
         "local_orbit_weight",
         "max_augmented_candidates",
@@ -158,166 +150,36 @@ _DSS_PP_RUNTIME_KEYS = frozenset(
         "max_programs",
         "min_station_separation_m",
         "mode_cluster_radius_m",
-        "observation_weight",
-        "occlusion_boundary_step_m",
-        "occlusion_boundary_weight",
-        "one_step_guard_enable",
-        "one_step_guard_score_abs_margin",
-        "one_step_guard_score_rel_margin",
-        "one_step_guard_use_gpu",
         "planning_method",
         "planning_particles",
-        "program_eval_workers",
         "program_length",
-        "remaining_budget_guidance",
-        "remaining_budget_urgency_stations",
-        "remaining_route_backtrack_weight",
-        "remaining_route_coverage_weight",
-        "remaining_route_distance_weight",
-        "remaining_route_frontier_weight",
-        "remaining_route_revisit_weight",
-        "remaining_route_turn_weight",
-        "remaining_route_weight",
+        "proxy_eig_samples",
+        "proxy_memory_budget_bytes",
+        "proxy_planning_particles",
         "revisit_penalty_weight",
         "rotation_weight",
-        "signature_std_min_counts",
-        "signature_weight",
-        "station_condition_coherence_weight",
-        "station_condition_inverse_condition_weight",
-        "station_condition_min_singular_weight",
-        "station_condition_ridge",
-        "station_condition_weight",
-        "temporal_cover_beam_width",
-        "temporal_cover_programs",
-        "temporal_cover_weight",
-        "temporal_decorrelation_weight",
-        "temporal_logdet_ridge",
-        "temporal_logdet_weight",
-        "temporal_pair_contrast_threshold",
-        "temporal_separation_weight",
         "time_weight",
         "turn_smoothness_weight",
-        "vertical_environment_signature_weight",
-    }
-)
-_REMAINING_MEASUREMENT_RUNTIME_KEYS = frozenset(
-    {
-        "cardinality_weight",
-        "count_variance_floor",
-        "dss_information_gain_weight",
-        "enabled",
-        "eta_default",
-        "eta_max",
-        "eta_min",
-        "gain_epsilon",
-        "max_modes_per_isotope",
-        "max_particles",
-        "max_reported_stations",
-        "mode_cluster_radius_m",
-        "pairwise_separation_threshold",
-        "planning_method",
-        "range_scale",
-        "separation_weight",
-        "stop_budget",
-        "target_cardinality_confidence",
-        "target_position_spread_m",
-        "target_strength_cv",
-        "uncertainty_weight",
     }
 )
 _PURE_PF_NESTED_KEYS = {
     "dss_pp": _DSS_PP_RUNTIME_KEYS,
     "pf_buildup": frozenset({"fe_coeff", "pb_coeff", "obstacle_coeff"}),
-    "pf_count_likelihood": frozenset(
-        {
-            "count_likelihood_df",
-            "count_likelihood_model",
-            "low_count_abs_sigma",
-            "low_count_transition_counts",
-            "observation_count_variance_semantics",
-            "spectrum_count_abs_sigma",
-            "spectrum_count_rel_sigma",
-            "station_view_correlated_spectrum_fraction",
-            "station_view_covariance_enable",
-            "transport_model_abs_sigma",
-            "transport_model_rel_sigma",
-        }
-    ),
-    "pf_shield_contrast_likelihood": frozenset(
-        {
-            "df",
-            "enabled",
-            "log_sigma_ceiling",
-            "log_sigma_floor",
-            "min_count",
-            "min_views",
-            "weight",
-        }
-    ),
-    "pf_shield_view_ratio_likelihood": frozenset(
-        {
-            "concentration",
-            "enabled",
-            "min_total_count",
-            "min_views",
-            "weight",
-        }
-    ),
-    "remaining_measurement_estimate": _REMAINING_MEASUREMENT_RUNTIME_KEYS,
 }
-_TRANSPORT_MODEL_KEYS = frozenset(
-    {"by_isotope", "enabled", "feature_semantics", "model"}
-)
-_TRANSPORT_ISOTOPE_KEYS = frozenset(
-    {
-        "max_log_scale",
-        "min_log_scale",
-        "num_fit_records",
-        "scale",
-        "scale_by_pair",
-        "tau_coefficients",
-        "tau_feature_caps",
-    }
-)
-_TRANSPORT_TAU_KEYS = frozenset(
-    {
-        "distance",
-        "distance_fe",
-        "distance_obstacle",
-        "distance_pb",
-        "distance_shield",
-        "fe",
-        "fe_obstacle",
-        "fe_pb",
-        "fe_squared",
-        "obstacle",
-        "obstacle_squared",
-        "pb",
-        "pb_obstacle",
-        "pb_squared",
-        "shield",
-        "shield_obstacle",
-        "shield_squared",
-    }
-)
-_TRANSPORT_CAP_KEYS = frozenset(
-    {
-        "distance_fe",
-        "distance_obstacle",
-        "distance_pb",
-        "distance_shield",
-        "fe",
-        "obstacle",
-        "pb",
-        "shield",
-    }
-)
 _RETIRED_RUNTIME_KEYS = frozenset(
     {
         "adapt_cooldown_steps",
-        "adaptive_cardinality_condition_max",
+        "adaptive_allow_low_signal_stop",
+        "adaptive_cardinality_min_live_s",
         "adaptive_cardinality_min_bic_margin",
+        "adaptive_cardinality_condition_max",
         "adaptive_cardinality_min_candidate_count",
+        "adaptive_low_signal_count_fraction",
+        "adaptive_low_signal_min_live_s",
+        "adaptive_low_signal_projected_live_factor",
+        "adaptive_low_signal_upper_sigma",
+        "adaptive_ready_allow_informative_low",
+        "apply_incident_gamma_detector_response",
         "birth_enable",
         "birth_enabled",
         "converge_enable",
@@ -328,6 +190,13 @@ _RETIRED_RUNTIME_KEYS = frozenset(
         "converge_min_steps",
         "converge_require_all",
         "converge_window",
+        "continuous_surface_chart_max_edge_m",
+        "coverage_grid_max_cells",
+        "response_backscatter_fraction",
+        "response_continuum_to_peak",
+        "response_efficiency_model",
+        "calibration_count_method",
+        "count_likelihood_model",
         "ess_high",
         "ess_low",
         "fixed_cardinality_no_structural_moves",
@@ -347,15 +216,20 @@ _RETIRED_RUNTIME_KEYS = frozenset(
         "min_particles",
         "min_strength",
         "orientation_selection_mode",
+        "pf_count_likelihood",
         "position_min",
         "refit_after_moves",
+        "remaining_measurement_estimate",
         "short_time_s",
+        "spectrum_count_method",
         "source_position_prior",
         "source_prior_mode",
         "source_surface_prior",
         "response_poisson_global_diagnostic_variance_enable",
         "source_detector_exclusion_m",
         "spectrum_likelihood_bin_chunk",
+        "structural_rj_patch_spacing_m",
+        "structural_rj_surface_chart_spacing_m",
     }
 )
 _RETIRED_RUNTIME_PREFIXES = (
@@ -365,6 +239,8 @@ _RETIRED_RUNTIME_PREFIXES = (
     "birth_",
     "candidate_verification_",
     "cardinality_preserving_",
+    "contrast_",
+    "count_likelihood_",
     "conditional_strength_",
     "converge_cluster_",
     "death_",
@@ -403,6 +279,7 @@ _RETIRED_RUNTIME_PREFIXES = (
     "report_refit_",
     "report_strength_",
     "report_surface_",
+    "response_poisson_",
     "residual_birth_",
     "residual_decomposition_",
     "roughening_",
@@ -410,6 +287,8 @@ _RETIRED_RUNTIME_PREFIXES = (
     "soft_extension_",
     "source_prune_",
     "source_strength_",
+    "shield_contrast_",
+    "shield_view_ratio_",
     "sparse_poisson_",
     "spectrum_likelihood_",
     "split_",
@@ -420,6 +299,7 @@ _RETIRED_RUNTIME_PREFIXES = (
     "surface_rejuvenation_",
     "surface_map_",
     "verification_",
+    "view_ratio_",
     "weak_source_prune_",
 )
 
@@ -447,57 +327,6 @@ def _require_mapping(
     return value
 
 
-def _validate_transport_response_model(payload: Mapping[str, Any]) -> None:
-    """Validate the positive schema of an inline transport-response model."""
-    _validate_allowed_keys(
-        "pf_transport_response_model",
-        payload,
-        _TRANSPORT_MODEL_KEYS,
-    )
-    raw_by_isotope = payload.get("by_isotope")
-    if raw_by_isotope is None:
-        return
-    by_isotope = _require_mapping(
-        "pf_transport_response_model.by_isotope",
-        raw_by_isotope,
-    )
-    for isotope, raw_isotope_payload in by_isotope.items():
-        isotope_payload = _require_mapping(
-            f"pf_transport_response_model.by_isotope.{isotope}",
-            raw_isotope_payload,
-        )
-        _validate_allowed_keys(
-            f"pf_transport_response_model.by_isotope.{isotope}",
-            isotope_payload,
-            _TRANSPORT_ISOTOPE_KEYS,
-        )
-        for field_name, allowed in (
-            ("tau_coefficients", _TRANSPORT_TAU_KEYS),
-            ("tau_feature_caps", _TRANSPORT_CAP_KEYS),
-        ):
-            raw_nested = isotope_payload.get(field_name)
-            if raw_nested is None:
-                continue
-            nested = _require_mapping(
-                "pf_transport_response_model.by_isotope."
-                f"{isotope}.{field_name}",
-                raw_nested,
-            )
-            _validate_allowed_keys(
-                "pf_transport_response_model.by_isotope."
-                f"{isotope}.{field_name}",
-                nested,
-                allowed,
-            )
-        raw_scale_by_pair = isotope_payload.get("scale_by_pair")
-        if raw_scale_by_pair is not None:
-            _require_mapping(
-                "pf_transport_response_model.by_isotope."
-                f"{isotope}.scale_by_pair",
-                raw_scale_by_pair,
-            )
-
-
 def _validate_nested_runtime_settings(
     runtime_config: Mapping[str, Any],
 ) -> None:
@@ -523,18 +352,19 @@ def _validate_nested_runtime_settings(
                     "pf_obstacle_mu_by_isotope values must be finite "
                     f"nonnegative numbers; invalid value for {isotope!s}."
                 )
-    if "pf_transport_response_model" in runtime_config:
-        transport = _require_mapping(
-            "pf_transport_response_model",
-            runtime_config["pf_transport_response_model"],
-        )
-        _validate_transport_response_model(transport)
-
-
 def _validate_structural_runtime_values(
     runtime_config: Mapping[str, Any],
 ) -> None:
     """Validate pure-PF cardinality fields before runtime construction."""
+    validate_cardinality_prior_policy(
+        runtime_config.get(
+            "structural_cardinality_prior_policy",
+            TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+        ),
+        has_explicit_probabilities=(
+            runtime_config.get("structural_cardinality_prior_probs") is not None
+        ),
+    )
     if "variable_cardinality" in runtime_config and not isinstance(
         runtime_config["variable_cardinality"],
         bool,
@@ -582,7 +412,7 @@ def resolve_structural_transition_provenance(
     variable_cardinality = bool(getattr(config, "variable_cardinality", False))
 
     if variable_cardinality:
-        kernel_family = "area_weighted_surface_birth_death_rj_mh"
+        kernel_family = "continuous_surface_birth_death_split_merge_rj_mh"
         posterior_semantics = (
             "sequential_particle_filter_with_target_preserving_rj_mh_rejuvenation"
         )
@@ -666,6 +496,7 @@ def enforce_pure_runtime_settings(
         if (
             str(key).startswith("structural_rj_")
             or str(key).startswith("structural_cardinality_")
+            or str(key).startswith("continuous_surface_")
         )
         and str(key) not in _PURE_PF_STRUCTURAL_RUNTIME_KEYS
     )
@@ -697,6 +528,10 @@ def enforce_pure_runtime_settings(
             )
     result = dict(runtime_config)
     result["estimator_profile"] = configured_profile.value
+    result.setdefault(
+        "structural_cardinality_prior_policy",
+        TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    )
     return result
 
 

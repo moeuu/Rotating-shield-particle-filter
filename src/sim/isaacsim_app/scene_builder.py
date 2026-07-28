@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+import math
+from numbers import Real
 import re
 from typing import Any
 
 import numpy as np
 
 from measurement.model import PointSource
+from measurement.source_boundary import (
+    canonical_surface_source_runtime_payload,
+)
 from measurement.obstacle_assets import (
     KnownObstacleInstance,
     obstacle_instances_from_dicts,
@@ -31,6 +37,39 @@ class SourceDescription:
     isotope: str
     position_xyz: tuple[float, float, float]
     intensity_cps_1m: float
+    transport_position_xyz: tuple[float, float, float] | None = None
+    surface_chart_id: int | None = None
+    surface_uv: tuple[float, float] | None = None
+    surface_normal_xyz: tuple[float, float, float] | None = None
+    surface_emission_policy_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        """Fail fast when a declared surface-emission contract is inconsistent."""
+        point_source = self.to_point_source()
+        if point_source.surface_chart_id is None:
+            return
+        from measurement.source_boundary import (
+            SURFACE_EMISSION_EPSILON_M,
+            surface_emission_policy_sha256,
+        )
+
+        anchor = point_source.position_array()
+        transport = point_source.transport_position_array()
+        normal = np.asarray(point_source.surface_normal, dtype=np.float64)
+        if (
+            point_source.surface_emission_policy_sha256
+            != surface_emission_policy_sha256()
+            or not np.allclose(
+                transport - anchor,
+                SURFACE_EMISSION_EPSILON_M * normal,
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+        ):
+            raise ValueError(
+                "SourceDescription violates the shared surface-emission "
+                "position contract."
+            )
 
     def to_point_source(self) -> PointSource:
         """Convert the source description into the estimator model type."""
@@ -38,6 +77,13 @@ class SourceDescription:
             isotope=self.isotope,
             position=self.position_xyz,
             intensity_cps_1m=self.intensity_cps_1m,
+            surface_chart_id=self.surface_chart_id,
+            surface_uv=self.surface_uv,
+            surface_normal=self.surface_normal_xyz,
+            transport_position=self.transport_position_xyz,
+            surface_emission_policy_sha256=(
+                self.surface_emission_policy_sha256
+            ),
         )
 
 
@@ -77,6 +123,10 @@ class SceneDescription:
     transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
         default_factory=dict
     )
+    transport_line_compton_mu_by_isotope: dict[
+        str,
+        tuple[tuple[float, ...], ...],
+    ] = field(default_factory=dict)
     obstacle_instances: tuple[KnownObstacleInstance, ...] = ()
     author_obstacle_prims: bool = True
     author_room_boundary_prims: bool = False
@@ -101,7 +151,75 @@ def _as_float_tuple(
     """Validate and normalize a numeric tuple-like payload."""
     if not isinstance(values, (list, tuple)) or len(values) != expected_len:
         raise ValueError(f"{field_name} must be a {expected_len}-element list.")
-    return tuple(float(v) for v in values)
+    parsed: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"{field_name} must contain only real numbers.")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"{field_name} must contain only finite values.")
+        parsed.append(numeric)
+    return tuple(parsed)
+
+
+def _as_integer_tuple(
+    values: Any,
+    expected_len: int,
+    field_name: str,
+    *,
+    minimum: int = 0,
+) -> tuple[int, ...]:
+    """Validate and normalize a fixed-length JSON integer array."""
+    if not isinstance(values, (list, tuple)) or len(values) != expected_len:
+        raise ValueError(f"{field_name} must be a {expected_len}-element list.")
+    parsed: list[int] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field_name} must contain only JSON integers.")
+        if value < minimum:
+            raise ValueError(f"{field_name} entries must be at least {minimum}.")
+        parsed.append(value)
+    return tuple(parsed)
+
+
+def _json_boolean(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    """Return an exact JSON boolean without truthy coercion."""
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a JSON boolean.")
+    return value
+
+
+def _finite_number(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite JSON number in its physical domain."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a JSON number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{field_name} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _nonempty_string(value: object, *, field_name: str) -> str:
+    """Return a nonempty exact string."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a nonempty string.")
+    return value
 
 
 def _as_axis_aligned_boxes(
@@ -118,8 +236,10 @@ def _as_axis_aligned_boxes(
         box_array = np.asarray(box, dtype=float)
         if np.any(~np.isfinite(box_array)):
             raise ValueError(f"{field_name} entries must contain finite values.")
-        if np.any(box_array[3:] < box_array[:3]):
-            raise ValueError(f"{field_name} entries must be ordered lower-to-upper.")
+        if np.any(box_array[3:] <= box_array[:3]):
+            raise ValueError(
+                f"{field_name} entries must have positive ordered extents."
+            )
         boxes.append(
             (
                 float(box[0]),
@@ -153,7 +273,11 @@ def _as_transport_mu_by_isotope(
             raise ValueError(
                 "transport_mu_by_isotope entries must be finite and non-negative."
             )
-        result[str(isotope)] = tuple(float(value) for value in array)
+        isotope_name = _nonempty_string(
+            isotope,
+            field_name="transport_mu_by_isotope key",
+        )
+        result[isotope_name] = tuple(float(value) for value in array)
     return result
 
 
@@ -185,7 +309,11 @@ def _as_transport_line_mu_by_isotope(
                     "non-negative."
                 )
             rows.append(tuple(float(value) for value in array))
-        result[str(isotope)] = tuple(rows)
+        isotope_name = _nonempty_string(
+            isotope,
+            field_name="transport_line_mu_by_isotope key",
+        )
+        result[isotope_name] = tuple(rows)
     return result
 
 
@@ -202,48 +330,149 @@ def _sanitize_prim_token(value: str) -> str:
 
 def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
     """Build a rich scene description from a reset payload."""
+    if not isinstance(payload, Mapping):
+        raise TypeError("Scene reset payload must be a JSON object.")
     room_size = _as_float_tuple(
         payload.get("room_size_xyz", (10.0, 20.0, 10.0)), 3, "room_size_xyz"
     )
+    if any(value <= 0.0 for value in room_size):
+        raise ValueError("room_size_xyz entries must be positive.")
     obstacle_origin = _as_float_tuple(
         payload.get("obstacle_origin_xy", (0.0, 0.0)),
         2,
         "obstacle_origin_xy",
     )
-    obstacle_grid_shape = tuple(
-        int(v)
-        for v in _as_float_tuple(
-            payload.get("obstacle_grid_shape", (0, 0)),
-            2,
-            "obstacle_grid_shape",
-        )
+    obstacle_grid_shape = _as_integer_tuple(
+        payload.get("obstacle_grid_shape", (0, 0)),
+        2,
+        "obstacle_grid_shape",
     )
     sources_payload = payload.get("sources", [])
     if not isinstance(sources_payload, list):
         raise ValueError("sources must be a list.")
+    canonical_sources_payload = (
+        []
+        if not sources_payload
+        else canonical_surface_source_runtime_payload(sources_payload)
+    )
     sources: list[SourceDescription] = []
-    for idx, entry in enumerate(sources_payload):
-        if not isinstance(entry, dict):
-            raise ValueError(f"Source entry {idx} must be an object.")
+    for idx, entry in enumerate(canonical_sources_payload):
         position = _as_float_tuple(
-            entry.get("position", (0.0, 0.0, 0.0)), 3, "source position"
+            entry["position"], 3, "source position"
         )
+        transport_position_raw = entry["transport_position"]
+        surface_chart_id_raw = entry["surface_chart_id"]
+        surface_uv_raw = entry["surface_uv"]
+        surface_normal_raw = entry["surface_normal"]
+        policy_hash_raw = entry["surface_emission_policy_sha256"]
+        has_surface_metadata = any(
+            value is not None
+            for value in (
+                surface_chart_id_raw,
+                surface_uv_raw,
+                surface_normal_raw,
+                policy_hash_raw,
+                transport_position_raw,
+            )
+        )
+        if has_surface_metadata and any(
+            value is None
+            for value in (
+                surface_chart_id_raw,
+                surface_uv_raw,
+                surface_normal_raw,
+                policy_hash_raw,
+                transport_position_raw,
+            )
+        ):
+            raise ValueError(
+                "Source surface chart/UV/normal/policy metadata must be complete."
+            )
+        if has_surface_metadata and (
+            isinstance(surface_chart_id_raw, bool)
+            or not isinstance(surface_chart_id_raw, int)
+            or surface_chart_id_raw < 0
+        ):
+            raise ValueError(
+                "source surface_chart_id must be a nonnegative JSON integer."
+            )
         sources.append(
             SourceDescription(
-                isotope=str(entry.get("isotope", f"source_{idx}")),
+                isotope=_nonempty_string(
+                    entry["isotope"],
+                    field_name=f"sources[{idx}].isotope",
+                ),
                 position_xyz=(position[0], position[1], position[2]),
-                intensity_cps_1m=float(entry.get("intensity_cps_1m", 0.0)),
+                intensity_cps_1m=_finite_number(
+                    entry["intensity_cps_1m"],
+                    field_name=f"sources[{idx}].intensity_cps_1m",
+                    strictly_positive=True,
+                ),
+                transport_position_xyz=(
+                    None
+                    if transport_position_raw is None
+                    else _as_float_tuple(
+                        transport_position_raw,
+                        3,
+                        "source transport position",
+                    )
+                ),
+                surface_chart_id=(
+                    None
+                    if surface_chart_id_raw is None
+                    else int(surface_chart_id_raw)
+                ),
+                surface_uv=(
+                    None
+                    if surface_uv_raw is None
+                    else _as_float_tuple(
+                        surface_uv_raw,
+                        2,
+                        "source surface_uv",
+                    )
+                ),
+                surface_normal_xyz=(
+                    None
+                    if surface_normal_raw is None
+                    else _as_float_tuple(
+                        surface_normal_raw,
+                        3,
+                        "source surface_normal",
+                    )
+                ),
+                surface_emission_policy_sha256=(
+                    None if policy_hash_raw is None else policy_hash_raw
+                ),
             )
         )
     prim_paths_payload = payload.get("prim_paths", {})
-    if prim_paths_payload and not isinstance(prim_paths_payload, dict):
+    if not isinstance(prim_paths_payload, dict):
         raise ValueError("prim_paths must be a JSON object.")
+    for key, value in prim_paths_payload.items():
+        _nonempty_string(key, field_name="prim_paths key")
+        _nonempty_string(value, field_name=f"prim_paths.{key}")
     prim_paths = StagePrimPaths(
-        **{key: str(value) for key, value in prim_paths_payload.items()}
+        **dict(prim_paths_payload)
     )
+    obstacle_cells_payload = payload.get("obstacle_cells", [])
+    if not isinstance(obstacle_cells_payload, list):
+        raise ValueError("obstacle_cells must be a JSON array.")
     obstacle_cells = [
-        tuple(int(v) for v in cell) for cell in payload.get("obstacle_cells", [])
+        _as_integer_tuple(
+            cell,
+            2,
+            f"obstacle_cells[{index}]",
+        )
+        for index, cell in enumerate(obstacle_cells_payload)
     ]
+    if len(set(obstacle_cells)) != len(obstacle_cells):
+        raise ValueError("obstacle_cells must not contain duplicates.")
+    for cell in obstacle_cells:
+        if (
+            cell[0] >= obstacle_grid_shape[0]
+            or cell[1] >= obstacle_grid_shape[1]
+        ):
+            raise ValueError("obstacle_cells entry is outside obstacle_grid_shape.")
     collision_boxes = _as_axis_aligned_boxes(
         payload.get("collision_boxes_m", []),
         field_name="collision_boxes_m",
@@ -260,30 +489,58 @@ def build_scene_description(payload: dict[str, Any]) -> SceneDescription:
         payload.get("transport_line_mu_by_isotope", {}),
         box_count=len(transport_boxes),
     )
+    transport_line_compton_mu = _as_transport_line_mu_by_isotope(
+        payload.get("transport_line_compton_mu_by_isotope", {}),
+        box_count=len(transport_boxes),
+    )
     obstacle_instances = obstacle_instances_from_dicts(
         payload.get("obstacle_instances", [])
     )
+    obstacle_cell_size_m = _finite_number(
+        payload.get("obstacle_cell_size_m", 1.0),
+        field_name="obstacle_cell_size_m",
+        strictly_positive=True,
+    )
+    obstacle_material = _nonempty_string(
+        payload.get("obstacle_material", "concrete"),
+        field_name="obstacle_material",
+    )
+    author_obstacle_prims = _json_boolean(
+        payload,
+        "author_obstacle_prims",
+        default=True,
+    )
+    author_room_boundary_prims = _json_boolean(
+        payload,
+        "author_room_boundary_prims",
+        default=False,
+    )
+    use_config_usd_fallback = _json_boolean(
+        payload,
+        "use_config_usd_fallback",
+        default=True,
+    )
+    usd_path_raw = payload.get("usd_path")
+    if usd_path_raw is not None:
+        _nonempty_string(usd_path_raw, field_name="usd_path")
     return SceneDescription(
         room_size_xyz=(room_size[0], room_size[1], room_size[2]),
         obstacle_origin_xy=(obstacle_origin[0], obstacle_origin[1]),
-        obstacle_cell_size_m=float(payload.get("obstacle_cell_size_m", 1.0)),
+        obstacle_cell_size_m=obstacle_cell_size_m,
         obstacle_grid_shape=obstacle_grid_shape,
-        obstacle_material=str(payload.get("obstacle_material", "concrete")),
+        obstacle_material=obstacle_material,
         obstacle_cells=obstacle_cells,
         collision_boxes_m=collision_boxes,
         transport_boxes_m=transport_boxes,
         transport_mu_by_isotope=transport_mu,
         transport_line_mu_by_isotope=transport_line_mu,
+        transport_line_compton_mu_by_isotope=transport_line_compton_mu,
         obstacle_instances=obstacle_instances,
-        author_obstacle_prims=bool(payload.get("author_obstacle_prims", True)),
-        author_room_boundary_prims=bool(
-            payload.get("author_room_boundary_prims", False)
-        ),
+        author_obstacle_prims=author_obstacle_prims,
+        author_room_boundary_prims=author_room_boundary_prims,
         sources=sources,
-        usd_path=None
-        if payload.get("usd_path") in (None, "")
-        else str(payload["usd_path"]),
-        use_config_usd_fallback=bool(payload.get("use_config_usd_fallback", True)),
+        usd_path=usd_path_raw,
+        use_config_usd_fallback=use_config_usd_fallback,
         prim_paths=prim_paths,
     )
 
@@ -303,10 +560,30 @@ class SceneBuilder:
     ) -> None:
         """Store scene authoring defaults."""
         self.stage_backend = stage_backend
-        self.detector_height_m = float(detector_height_m)
-        self.obstacle_height_m = float(obstacle_height_m)
-        self.fe_shield_size_xyz = tuple(float(v) for v in fe_shield_size_xyz)
-        self.pb_shield_size_xyz = tuple(float(v) for v in pb_shield_size_xyz)
+        self.detector_height_m = _finite_number(
+            detector_height_m,
+            field_name="detector_height_m",
+            strictly_positive=True,
+        )
+        self.obstacle_height_m = _finite_number(
+            obstacle_height_m,
+            field_name="obstacle_height_m",
+            strictly_positive=True,
+        )
+        self.fe_shield_size_xyz = _as_float_tuple(
+            fe_shield_size_xyz,
+            3,
+            "fe_shield_size_xyz",
+        )
+        self.pb_shield_size_xyz = _as_float_tuple(
+            pb_shield_size_xyz,
+            3,
+            "pb_shield_size_xyz",
+        )
+        if any(value <= 0.0 for value in self.fe_shield_size_xyz):
+            raise ValueError("fe_shield_size_xyz entries must be positive.")
+        if any(value <= 0.0 for value in self.pb_shield_size_xyz):
+            raise ValueError("pb_shield_size_xyz entries must be positive.")
         self.shield_thickness = shield_thickness or resolve_shield_thickness_config()
 
     def load_scene(
@@ -405,7 +682,7 @@ class SceneBuilder:
         if not scene.author_room_boundary_prims:
             return
         size_x, size_y, size_z = (float(value) for value in scene.room_size_xyz)
-        wall_height = max(0.1, size_z)
+        wall_height = size_z
         wall_thickness = 0.1
         environment_root = "/World/Environment"
         wall_root = f"{environment_root}/Wall"
@@ -476,7 +753,7 @@ class SceneBuilder:
         )
         self.stage_backend.ensure_box(
             prim_paths.robot_mast_path,
-            size_xyz=(0.08, 0.08, max(self.detector_height_m, 0.1)),
+            size_xyz=(0.08, 0.08, self.detector_height_m),
             translation_xyz=(0.0, 0.0, 0.5 * self.detector_height_m),
             color_rgb=(0.18, 0.18, 0.18),
             material="steel",
@@ -506,38 +783,44 @@ class SceneBuilder:
             thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
             detector_outer_radius_cm=100.0 * detector_visual_radius_m,
         )
-        fe_points, fe_counts, fe_indices = _octant_shell_mesh(
-            inner_radius_m=fe_inner_cm / 100.0,
-            outer_radius_m=(fe_inner_cm + float(self.shield_thickness.thickness_fe_cm))
-            / 100.0,
-            theta_steps=8,
-            phi_steps=8,
-        )
-        self.stage_backend.ensure_mesh(
-            prim_paths.fe_shield_path,
-            points_xyz=fe_points,
-            face_vertex_counts=fe_counts,
-            face_vertex_indices=fe_indices,
-            translation_xyz=(0.0, 0.0, self.detector_height_m),
-            color_rgb=(0.9, 0.45, 0.05),
-            material="fe",
-        )
-        pb_points, pb_counts, pb_indices = _octant_shell_mesh(
-            inner_radius_m=pb_inner_cm / 100.0,
-            outer_radius_m=(pb_inner_cm + float(self.shield_thickness.thickness_pb_cm))
-            / 100.0,
-            theta_steps=8,
-            phi_steps=8,
-        )
-        self.stage_backend.ensure_mesh(
-            prim_paths.pb_shield_path,
-            points_xyz=pb_points,
-            face_vertex_counts=pb_counts,
-            face_vertex_indices=pb_indices,
-            translation_xyz=(0.0, 0.0, self.detector_height_m),
-            color_rgb=(0.35, 0.35, 0.65),
-            material="pb",
-        )
+        fe_thickness_cm = float(self.shield_thickness.thickness_fe_cm)
+        if fe_thickness_cm > 0.0:
+            fe_points, fe_counts, fe_indices = _octant_shell_mesh(
+                inner_radius_m=fe_inner_cm / 100.0,
+                outer_radius_m=(fe_inner_cm + fe_thickness_cm) / 100.0,
+                theta_steps=8,
+                phi_steps=8,
+            )
+            self.stage_backend.ensure_mesh(
+                prim_paths.fe_shield_path,
+                points_xyz=fe_points,
+                face_vertex_counts=fe_counts,
+                face_vertex_indices=fe_indices,
+                translation_xyz=(0.0, 0.0, self.detector_height_m),
+                color_rgb=(0.9, 0.45, 0.05),
+                material="fe",
+            )
+        else:
+            self.stage_backend.remove_prim(prim_paths.fe_shield_path)
+        pb_thickness_cm = float(self.shield_thickness.thickness_pb_cm)
+        if pb_thickness_cm > 0.0:
+            pb_points, pb_counts, pb_indices = _octant_shell_mesh(
+                inner_radius_m=pb_inner_cm / 100.0,
+                outer_radius_m=(pb_inner_cm + pb_thickness_cm) / 100.0,
+                theta_steps=8,
+                phi_steps=8,
+            )
+            self.stage_backend.ensure_mesh(
+                prim_paths.pb_shield_path,
+                points_xyz=pb_points,
+                face_vertex_counts=pb_counts,
+                face_vertex_indices=pb_indices,
+                translation_xyz=(0.0, 0.0, self.detector_height_m),
+                color_rgb=(0.35, 0.35, 0.65),
+                material="pb",
+            )
+        else:
+            self.stage_backend.remove_prim(prim_paths.pb_shield_path)
 
 
 def _octant_shell_mesh(
@@ -548,10 +831,32 @@ def _octant_shell_mesh(
     phi_steps: int,
 ) -> tuple[tuple[tuple[float, float, float], ...], tuple[int, ...], tuple[int, ...]]:
     """Build a local +X/+Y/+Z one-eighth spherical shell mesh."""
-    theta_count = max(int(theta_steps), 2)
-    phi_count = max(int(phi_steps), 2)
-    inner_radius = max(0.0, float(inner_radius_m))
-    outer_radius = max(inner_radius + 1.0e-6, float(outer_radius_m))
+    if (
+        isinstance(theta_steps, bool)
+        or not isinstance(theta_steps, int)
+        or theta_steps < 2
+    ):
+        raise ValueError("theta_steps must be a JSON integer of at least 2.")
+    if (
+        isinstance(phi_steps, bool)
+        or not isinstance(phi_steps, int)
+        or phi_steps < 2
+    ):
+        raise ValueError("phi_steps must be a JSON integer of at least 2.")
+    theta_count = theta_steps
+    phi_count = phi_steps
+    inner_radius = _finite_number(
+        inner_radius_m,
+        field_name="inner_radius_m",
+        minimum=0.0,
+    )
+    outer_radius = _finite_number(
+        outer_radius_m,
+        field_name="outer_radius_m",
+        strictly_positive=True,
+    )
+    if outer_radius <= inner_radius:
+        raise ValueError("outer_radius_m must exceed inner_radius_m.")
     theta_values = np.linspace(0.0, 0.5 * np.pi, theta_count + 1)
     phi_values = np.linspace(0.0, 0.5 * np.pi, phi_count + 1)
     points: list[tuple[float, float, float]] = []

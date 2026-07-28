@@ -1,1 +1,1 @@
-"""Subpackage collecting spectrum unfolding and radionuclide identification components."""
+"""Physical raw-spectrum response and joint generative-model components."""

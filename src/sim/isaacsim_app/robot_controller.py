@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 
+from measurement.continuous_kernels import validate_orientation_pair_indices
 from measurement.shielding import generate_octant_orientations
 from sim.isaacsim_app.scene_builder import StagePrimPaths
 from sim.isaacsim_app.stage_backend import (
@@ -286,6 +287,14 @@ class RobotController:
         pb_orientation_index: int,
     ) -> None:
         """Apply one grounded base pose and mast-height sample to the stage."""
+        fe_indices, pb_indices = validate_orientation_pair_indices(
+            np.asarray([fe_orientation_index]),
+            np.asarray([pb_orientation_index]),
+            orientation_count=len(self._shield_normals),
+            expected_count=1,
+        )
+        fe_index = int(fe_indices[0])
+        pb_index = int(pb_indices[0])
         detector_local_z_m = float(detector_world_z_m) - float(base_pose_xyz[2])
         fe_translation = (
             float(self.fe_offset_xyz[0]),
@@ -320,11 +329,11 @@ class RobotController:
         # PF octant indices describe the incoming source-to-detector direction.
         # The physical shell occupies the opposite detector-to-source side.
         fe_normal = -np.asarray(
-            self._shield_normals[fe_orientation_index % len(self._shield_normals)],
+            self._shield_normals[fe_index],
             dtype=float,
         )
         pb_normal = -np.asarray(
-            self._shield_normals[pb_orientation_index % len(self._shield_normals)],
+            self._shield_normals[pb_index],
             dtype=float,
         )
         local_octant_center = _normalize_vector((1.0, 1.0, 1.0))

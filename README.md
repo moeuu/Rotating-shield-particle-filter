@@ -26,9 +26,10 @@ uv run pytest
 
 ## Pure-PF replay
 
-The scientific runtime has one estimator profile, `pf_strict`: count-domain
-sequential PF localization on physical environment surfaces. Its public
-MeasurementLog replay and posterior reporting semantics are:
+The scientific runtime has one estimator profile, `pf_strict`: sequential
+joint-full-spectrum PF localization on continuous physical environment
+surfaces. Its public MeasurementLog replay and posterior reporting semantics
+are:
 
 ```bash
 uv run python -m pf.replay \
@@ -103,8 +104,9 @@ only print a short warning when `--notify` or `--notify-spectrum` was requested.
 The implementation sends only start, final, and failure events by default.
 Add `--notify-spectrum` to enable notifications and send per-measurement
 spectrum payloads that can be plotted by the Railway app. Spectrum events
-include bin energies, counts, isotope-wise extracted counts, pose, and
-shield-orientation indices.
+include the raw integer full-spectrum histogram, its energy-axis identity,
+the detector pose, and shield-orientation indices. They do not contain
+pre-fitted isotope counts.
 
 ```bash
 export PIPLUP_NOTIFY_TOKEN=...  # same token as piplup EVENT_API_TOKEN
@@ -130,11 +132,11 @@ Useful overrides:
 ```
 
 For longer Geant4 runs, the standard full-simulation config already uses the
-balanced Geant4 physics profile, 32 native/Python workers, response-Poisson
-spectrum counting, eight shield measurements per station, and the no-Isaac CUI
-runtime. `--num-particles` controls the PF ensemble size; source positions are
-initialized from the same finite physical-surface dictionary used by the
-target-preserving state and reversible-jump moves.
+balanced Geant4 physics profile, 32 native/Python workers, the joint
+full-spectrum observation model, eight shield measurements per station, and
+the no-Isaac CUI runtime. `--num-particles` controls the PF ensemble size;
+source positions use continuous coordinates on the same physical-surface
+atlas used by target-preserving within-cardinality and reversible-jump moves.
 
 The standard full-simulation config is
 `configs/geant4/variance_reduction_external_no_isaac_32threads.json`. It uses
@@ -407,38 +409,36 @@ sidecar uses detector-equivalent source sampling and Geant4 geometry for shield,
 obstacle, and stage attenuation. When Geant4 is built with multithreading
 support, `thread_count` selects the worker count.
 
-### Geant4 spectrum-count validation
+### Joint full-spectrum Geant4 validation
 
-The PF likelihood consumes isotope-wise source-equivalent counts extracted from
-measured spectra. Geant4 runtime configs use
-`spectrum_count_method: "response_poisson"`: a calibrated full-spectrum
-Poisson response regression extracts isotope counts and propagates count
-covariance to the PF likelihood. `photopeak_nnls` remains available only for
-diagnostic and calibration checks; `peak_window` and `response_matrix` are not
-runtime count-ingestion methods.
+The PF consumes each raw integer station histogram directly. The same
+authenticated joint full-spectrum generative model is used by live inference,
+replay, reversible-jump moves, and planning. There is no runtime isotope-count
+extraction, response-Poisson regression, photopeak NNLS, contrast likelihood,
+or view-ratio rescue path.
 
-Run the validation report after changing detector geometry, materials, transport
-settings, or peak-efficiency calibration:
+After changing detector geometry, materials, transport settings, or the
+full-spectrum response model, run the resumable predeclared all-64 training
+and independent-holdout workflow with:
 
 ```bash
-PYTHONPATH=src uv run python scripts/calibrate_geant4_net_response.py --dwell-time-s 30.0
+uv run python scripts/run_full_spectrum_all64_acceptance.py all \
+  --output-root results/full_spectrum_all64_acceptance
 ```
 
-The validation layout is `source_layouts/shield_validation.json`, and the
-validation config is `configs/geant4/shield_validation_scene.json`. The script
-writes diagnostics to `results/geant4_net_response_validation.csv` and a
-diagnostic count-extraction check under `results/`; runtime PF configs do not
-load a net-response calibration JSON.
+The command authenticates completed artifacts and fails closed if their
+training/holdout roles, shield-pair coverage, contracts, or production gates
+are inconsistent. Holdout artifacts are never used to fit model parameters.
 
 ## Structural PF smoke test
 
 Use these commands to exercise the two supported pure-PF modes:
 
 ```
-# Fixed-cardinality PF: the runtime default fixed cardinality is K=1.
+# Fixed-cardinality pure PF for an explicit diagnostic with K=1.
 uv run python main.py --fixed-cardinality --max-steps 20
 
-# Variable-cardinality PF with the exact finite-surface RJ-MH kernel.
+# Variable-cardinality PF with the exact continuous-surface RJ-MH kernel.
 uv run python main.py --variable-cardinality --max-sources 3 --max-steps 20
 
 ```

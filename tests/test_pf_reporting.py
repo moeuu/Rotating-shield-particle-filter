@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,8 +18,8 @@ from pf.posterior_uncertainty import (
     posterior_mode_uncertainty_batched,
 )
 from pf.pure_estimator import PurePFEstimator
-from pf.reporting import measurement_vector
 from pf.state import IsotopeState
+from pure_pf_test_support import approved_full_spectrum_model
 
 
 def _canonical_scalar_eigenvectors(eigenvectors: np.ndarray) -> np.ndarray:
@@ -115,18 +114,6 @@ def _scalar_mode_oracle(
             }
         )
     return output
-
-
-def test_measurement_vector_broadcasts_scalar() -> None:
-    """Scalar inputs should broadcast to the requested measurement count."""
-    vec = measurement_vector(2.5, 3, "background", min_value=0.0)
-    assert np.allclose(vec, [2.5, 2.5, 2.5])
-
-
-def test_measurement_vector_rejects_wrong_length() -> None:
-    """Vector inputs must match the requested measurement count."""
-    with pytest.raises(ValueError, match="one value per measurement"):
-        measurement_vector(np.asarray([1.0, 2.0]), 3, "z", allow_scalar=False)
 
 
 def test_posterior_mode_uncertainty_batch_matches_scalar_oracle() -> None:
@@ -239,11 +226,26 @@ def test_posterior_mode_uncertainty_marks_unsupported_payloads() -> None:
     assert ellipsoid["is_empirical_credible_region"] is False
 
 
+def test_posterior_existence_mass_clips_normalization_roundoff() -> None:
+    """A fully supported mode must report an exact unit-interval probability."""
+    particle_count = 2000
+    diagnostic = posterior_mode_uncertainty_batched(
+        np.zeros((particle_count, 1, 3), dtype=float),
+        np.ones((particle_count, 1), dtype=bool),
+        np.full(particle_count, 1.0 / particle_count, dtype=float),
+        np.zeros((1, 3), dtype=float),
+        environment=EnvironmentConfig(size_x=5.0, size_y=5.0, size_z=5.0),
+        match_radius_m=0.0,
+    )[0]
+
+    assert diagnostic["existence_mass"] == 1.0
+
+
 def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
     """Estimator diagnostics should expose conditional 3-D posterior summaries."""
     estimator = RotatingShieldPFEstimator(
         isotopes=("Cs-137",),
-        candidate_sources=np.asarray([[1.0, 1.0, 0.0]], dtype=float),
+        surface_diagnostic_points=np.asarray([[1.0, 1.0, 0.0]], dtype=float),
         shield_normals=np.asarray([[1.0, 0.0, 0.0]], dtype=float),
         mu_by_isotope={"Cs-137": 0.5},
         pf_config=RotatingShieldPFConfig(
@@ -252,18 +254,19 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
             init_num_sources=(1, 1),
             use_gpu=False,
         ),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     estimator.add_measurement_pose(np.asarray([2.5, 2.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()
     filt = estimator.filters["Cs-137"]
-    patches = filt._structural_rj_surface_patches
-    assert patches is not None
-    patch_kinds = np.asarray(patches.kinds, dtype=object)
-    floor_center = patches.centers_xyz[
-        int(np.flatnonzero(patch_kinds == "floor")[0])
+    chart_geometry = filt._structural_rj_surface_atlas.geometry
+    assert chart_geometry is not None
+    chart_kinds = np.asarray(chart_geometry.kinds, dtype=object)
+    floor_center = chart_geometry.centers_xyz[
+        int(np.flatnonzero(chart_kinds == "floor")[0])
     ]
-    ceiling_center = patches.centers_xyz[
-        int(np.flatnonzero(patch_kinds == "ceiling")[0])
+    ceiling_center = chart_geometry.centers_xyz[
+        int(np.flatnonzero(chart_kinds == "ceiling")[0])
     ]
     particle_specs = (
         (
@@ -278,13 +281,24 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
         IsotopeParticle(
             state=IsotopeState(
                 num_sources=len(strengths),
-                positions=np.asarray(positions, dtype=float),
                 strengths=np.asarray(strengths, dtype=float),
-                background=0.1,
+                surface_chart_ids=(
+                    filt.structural_surface_chart_coordinates(
+                        np.asarray(positions, dtype=float)
+                    )[0]
+                ),
+                surface_uv=(
+                    filt.structural_surface_chart_coordinates(
+                        np.asarray(positions, dtype=float)
+                    )[1]
+                ),
             ),
             log_weight=float(np.log(weight)),
+            joint_row_identity=filt.continuous_particles[
+                row
+            ].joint_row_identity,
         )
-        for weight, positions, strengths in particle_specs
+        for row, (weight, positions, strengths) in enumerate(particle_specs)
     ]
     reported = {
         "Cs-137": (
@@ -323,7 +337,7 @@ def test_estimator_posterior_source_uncertainty_is_json_serializable() -> None:
 
 
 def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
-    """Exact bottom patches must remain bottom in posterior uncertainty reports."""
+    """Exact bottom charts must remain bottom in posterior uncertainty reports."""
     isotope = "Cs-137"
     obstacle_grid = ObstacleGrid(
         origin=(0.0, 0.0),
@@ -334,7 +348,7 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
     )
     estimator = PurePFEstimator(
         isotopes=(isotope,),
-        candidate_sources=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+        surface_diagnostic_points=np.asarray([[0.0, 0.0, 0.0]], dtype=float),
         shield_normals=None,
         mu_by_isotope={isotope: 0.0},
         pf_config=RotatingShieldPFConfig(
@@ -344,29 +358,41 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
             init_num_sources=(1, 1),
             use_gpu=False,
             position_max=(3.0, 3.0, 3.0),
-            structural_rj_patch_spacing_m=0.5,
+            structural_rj_surface_chart_max_edge_m=0.5,
         ),
         obstacle_grid=obstacle_grid,
         measurement_log_sha256="c" * 64,
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     estimator.add_measurement_pose(np.asarray([0.5, 0.5, 0.5], dtype=float))
     estimator._ensure_kernel_cache()
     filt = estimator.filters[isotope]
-    patches = filt._structural_rj_surface_patches
-    assert patches is not None
-    patch_kinds = np.asarray(patches.kinds, dtype=object)
-    bottom_center = patches.centers_xyz[
-        int(np.flatnonzero(patch_kinds == "obstacle_bottom")[0])
-    ]
+    atlas = filt._structural_rj_surface_atlas
+    assert atlas is not None
+    chart_kinds = np.asarray(atlas.geometry.kinds, dtype=object)
+    bottom_chart_id = int(
+        np.flatnonzero(chart_kinds == "obstacle_bottom")[0]
+    )
+    bottom_uv = np.asarray([[0.5, 0.5]], dtype=float)
+    bottom_center = atlas.positions_xyz(
+        np.asarray([bottom_chart_id], dtype=np.int64),
+        bottom_uv,
+    )[0]
     filt.continuous_particles = [
         IsotopeParticle(
             state=IsotopeState(
                 num_sources=1,
-                positions=bottom_center[None, :],
-                strengths=np.asarray([100.0], dtype=float),
-                background=0.0,
+                strengths=np.asarray([300_000.0], dtype=float),
+                surface_chart_ids=np.asarray(
+                    [bottom_chart_id],
+                    dtype=np.int64,
+                ),
+                surface_uv=bottom_uv,
             ),
             log_weight=0.0,
+            joint_row_identity=(
+                filt.continuous_particles[0].joint_row_identity
+            ),
         )
     ]
 
@@ -374,7 +400,7 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
         {
             isotope: (
                 bottom_center[None, :],
-                np.asarray([100.0], dtype=float),
+                np.asarray([300_000.0], dtype=float),
             )
         },
         match_radius_m=0.2,
@@ -384,66 +410,3 @@ def test_estimator_uncertainty_reports_exact_obstacle_bottom_kind() -> None:
     assert diagnostics["surface_kind_posterior"]["obstacle_bottom"] == 1.0
     assert diagnostics["surface_kind_posterior"]["off_surface"] == 0.0
     assert sum(diagnostics["surface_kind_posterior"].values()) == pytest.approx(1.0)
-
-
-def test_fixed_cardinality_pure_estimator_dispatches_state_mh_moves() -> None:
-    """Fixed-K estimator updates must still dispatch exact within-K state MH."""
-    evidence = object()
-    dispatched: list[object] = []
-
-    def measurement_data_for_iso(
-        isotope: str,
-        window: int | None,
-    ) -> object:
-        """Return the sentinel history passed to the per-isotope kernel."""
-        assert isotope == "Cs-137"
-        assert window is None
-        return evidence
-
-    def apply_structural_moves(payload: object) -> None:
-        """Record the exact state-kernel dispatch."""
-        dispatched.append(payload)
-
-    estimator = object.__new__(PurePFEstimator)
-    estimator.pf_config = RotatingShieldPFConfig(
-        num_particles=3,
-        max_sources=1,
-        variable_cardinality=False,
-        init_num_sources=(1, 1),
-        parallel_isotope_updates=False,
-        use_gpu=False,
-    )
-    estimator.filters = {
-        "Cs-137": SimpleNamespace(
-            apply_structural_moves=apply_structural_moves,
-        )
-    }
-    estimator.isotopes = ("Cs-137",)
-    estimator._measurement_data_for_iso = measurement_data_for_iso
-    estimator.last_structural_update_workers = 0
-    estimator.last_structural_update_wall_s = 0.0
-
-    estimator._apply_structural_moves()
-
-    assert dispatched == [evidence]
-    assert estimator.last_structural_update_workers == 1
-    manifest = estimator.structural_model_manifest()
-    assert manifest["pure_pf_schema_version"] == 1
-    assert manifest["support_domain"] == "environment_surface"
-    assert manifest["structural_kernel_family"] == (
-        "fixed_cardinality_surface_position_strength_mh"
-    )
-    assert manifest["within_cardinality_kernel_exact_mh"] is True
-    assert manifest["structural_kernel_exact_rj"] is False
-    assert manifest["strength_prior"] == {
-        "kind": "bounded_uniform",
-        "minimum_cps_1m": 0.0,
-        "maximum_cps_1m": 2_000_000.0,
-        "units": "detector_cps_1m",
-        "unit_definition": "expected_net_detector_count_rate_at_1m",
-        "used_for_initialization": True,
-        "shared_by_initialization_and_state_moves": True,
-    }
-    assert manifest["rj_move_kernel"]["enabled"] is True
-    assert manifest["rj_move_kernel"]["birth_death_enabled"] is False
-    assert manifest["rj_move_kernel"]["within_cardinality_exact_mh"] is True

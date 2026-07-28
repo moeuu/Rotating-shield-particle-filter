@@ -86,18 +86,6 @@ def _write_summary(
         "output_paths": {
             "intermediate_estimate_trace_jsonl": trace_path.as_posix(),
         },
-        "remaining_measurement_estimates": [
-            {
-                "current_station_count": 1,
-                "estimated_remaining_stations": 2,
-                "isotope_details": {"Cs-137": {"map_source_count": 0}},
-            },
-            {
-                "current_station_count": 2,
-                "estimated_remaining_stations": 1,
-                "isotope_details": {"Cs-137": {"map_source_count": estimates}},
-            },
-        ],
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path

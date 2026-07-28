@@ -54,6 +54,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -115,6 +116,17 @@ struct SourceSpec {
     double y = 0.0;
     double z = 0.0;
     double intensity_cps_1m = 0.0;
+    double anchor_x = 0.0;
+    double anchor_y = 0.0;
+    double anchor_z = 0.0;
+    long surface_chart_id = -1;
+    double surface_u = -1.0;
+    double surface_v = -1.0;
+    double surface_normal_x = 0.0;
+    double surface_normal_y = 0.0;
+    double surface_normal_z = 0.0;
+    double surface_emission_epsilon_m = 0.0;
+    std::string surface_emission_policy_sha256;
 };
 
 struct DetectorSpec {
@@ -163,6 +175,56 @@ ShieldSpec DefaultPbShieldSpec() {
     return shield;
 }
 
+std::optional<ShieldSpec> ValidateParsedShield(
+    ShieldSpec shield,
+    const std::string& use_angle_attenuation
+) {
+    if (shield.kind != "fe" && shield.kind != "pb") {
+        throw std::runtime_error("SHIELD kind must be exactly fe or pb.");
+    }
+    if (shield.path.empty()) {
+        throw std::runtime_error("SHIELD path must be nonempty.");
+    }
+    if (shield.shape != "spherical_octant_shell") {
+        throw std::runtime_error(
+            "SHIELD shape must be exactly spherical_octant_shell."
+        );
+    }
+    if (use_angle_attenuation != "0") {
+        throw std::runtime_error(
+            "SHIELD use_angle_attenuation must be exactly 0."
+        );
+    }
+    if (
+        !std::isfinite(shield.inner_radius_m)
+        || shield.inner_radius_m < 0.0
+        || !std::isfinite(shield.outer_radius_m)
+        || !std::isfinite(shield.thickness_m)
+        || shield.thickness_m < 0.0
+    ) {
+        throw std::runtime_error(
+            "SHIELD radii and thickness must be finite and nonnegative."
+        );
+    }
+    const double expected_outer_radius_m =
+        shield.inner_radius_m + shield.thickness_m;
+    if (shield.outer_radius_m != expected_outer_radius_m) {
+        throw std::runtime_error(
+            "SHIELD outer_radius_m must equal inner_radius_m + thickness_m "
+            "exactly."
+        );
+    }
+    if (shield.thickness_m == 0.0) {
+        return std::nullopt;
+    }
+    if (shield.material.name.empty() && shield.material.preset_name.empty()) {
+        throw std::runtime_error(
+            "Positive-thickness SHIELD must declare a material."
+        );
+    }
+    return shield;
+}
+
 struct PoseSpec {
     double x = 0.0;
     double y = 0.0;
@@ -175,13 +237,14 @@ struct PoseSpec {
 
 struct SceneSpec {
     std::string scene_hash;
+    std::string surface_source_contract_sha256;
     std::string usd_path;
     double room_x = 10.0;
     double room_y = 20.0;
     double room_z = 10.0;
     DetectorSpec detector;
-    ShieldSpec fe_shield = DefaultFeShieldSpec();
-    ShieldSpec pb_shield = DefaultPbShieldSpec();
+    std::optional<ShieldSpec> fe_shield;
+    std::optional<ShieldSpec> pb_shield;
     std::vector<SourceSpec> sources;
     std::vector<VolumeSpec> volumes;
 };
@@ -211,22 +274,28 @@ struct TransportOptions {
     std::string source_rate_model = "detector_cps_1m";
     std::string source_bias_mode = "detector_cone";
     double source_bias_cone_half_angle_deg = 0.0;
-    double source_bias_isotropic_fraction = 0.1;
+    double source_bias_isotropic_fraction = 1.0;
     std::string detector_scoring_mode = "full_transport";
     std::string secondary_transport_mode = "full_transport";
     double primary_sampling_fraction = 1.0;
     long long target_sampled_primaries = 0;
-};
-
-struct EnergyDeposit {
-    double energy_keV = 0.0;
-    double weight = 1.0;
+    bool validation_entry_class_spectra = false;
+    bool sample_detector_response = false;
 };
 
 enum class DetectorEntryClass {
     kUncollidedPrimary = 0,
     kInteractedPrimary = 1,
     kSecondary = 2,
+};
+
+struct EnergyDeposit {
+    double energy_keV = 0.0;
+    double weight = 1.0;
+    DetectorEntryClass entry_class = DetectorEntryClass::kUncollidedPrimary;
+    std::string isotope;
+    std::string source_token;
+    std::string line_token;
 };
 
 struct WeightedEventDeposit {
@@ -285,6 +354,18 @@ std::string JoinSet(const std::set<std::string>& values, const std::string& sepa
 std::string SerializeDouble(const double value) {
     std::ostringstream stream;
     stream << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+    return stream.str();
+}
+
+std::string SerializeDoubleVector(const std::vector<double>& values) {
+    std::ostringstream stream;
+    stream << std::setprecision(std::numeric_limits<double>::max_digits10);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0) {
+            stream << ",";
+        }
+        stream << values[index];
+    }
     return stream.str();
 }
 
@@ -401,6 +482,232 @@ double SigmaEnergyKeV(const double energy_keV) {
     return std::max(0.5 * std::sqrt(std::max(0.0, energy_keV)) - 1.5, 0.5);
 }
 
+std::vector<std::vector<double>> BuildDetectorResponseCdfs(
+    const int num_bins,
+    const double bin_width_keV
+) {
+    constexpr double kElectronRestEnergyKeV = 511.0;
+    constexpr double kContinuumToPeak = 2.0;
+    constexpr double kBackscatterFraction = 0.03;
+    std::vector<std::vector<double>> cdfs(
+        static_cast<std::size_t>(num_bins),
+        std::vector<double>(static_cast<std::size_t>(num_bins), 0.0)
+    );
+    for (int input_index = 0; input_index < num_bins; ++input_index) {
+        const double incident_energy = static_cast<double>(input_index) * bin_width_keV;
+        auto& weights = cdfs[static_cast<std::size_t>(input_index)];
+        if (incident_energy <= 0.0) {
+            weights[0] = 1.0;
+            continue;
+        }
+        const double sigma = SigmaEnergyKeV(incident_energy);
+        const double compton_edge = incident_energy * (
+            1.0 - 1.0 / (
+                1.0 + 2.0 * incident_energy / kElectronRestEnergyKeV
+            )
+        );
+        const double continuum_tau = std::max(compton_edge / 3.0, 1.0e-12);
+        const double backscatter_energy = incident_energy / (
+            1.0 + 2.0 * incident_energy / kElectronRestEnergyKeV
+        );
+        const double backscatter_sigma = SigmaEnergyKeV(backscatter_energy);
+        double peak_sum = 0.0;
+        double continuum_sum = 0.0;
+        double backscatter_sum = 0.0;
+        std::vector<double> peak(weights.size(), 0.0);
+        std::vector<double> continuum(weights.size(), 0.0);
+        std::vector<double> backscatter(weights.size(), 0.0);
+        for (int output_index = 0; output_index < num_bins; ++output_index) {
+            const double energy = static_cast<double>(output_index) * bin_width_keV;
+            const double peak_value = std::exp(
+                -0.5 * std::pow((energy - incident_energy) / sigma, 2.0)
+            );
+            peak[static_cast<std::size_t>(output_index)] = peak_value;
+            peak_sum += peak_value;
+            if (energy <= compton_edge) {
+                const double continuum_value = std::exp(-energy / continuum_tau);
+                continuum[static_cast<std::size_t>(output_index)] = continuum_value;
+                continuum_sum += continuum_value;
+            }
+            const double backscatter_value = std::exp(
+                -0.5 * std::pow(
+                    (energy - backscatter_energy) / backscatter_sigma,
+                    2.0
+                )
+            );
+            backscatter[static_cast<std::size_t>(output_index)] = backscatter_value;
+            backscatter_sum += backscatter_value;
+        }
+        double cumulative = 0.0;
+        for (int output_index = 0; output_index < num_bins; ++output_index) {
+            double probability = peak[static_cast<std::size_t>(output_index)]
+                / std::max(peak_sum, 1.0e-300);
+            probability += kContinuumToPeak
+                * continuum[static_cast<std::size_t>(output_index)]
+                / std::max(continuum_sum, 1.0e-300);
+            probability += kBackscatterFraction
+                * backscatter[static_cast<std::size_t>(output_index)]
+                / std::max(backscatter_sum, 1.0e-300);
+            probability /= (
+                1.0 + kContinuumToPeak + kBackscatterFraction
+            );
+            cumulative += std::max(0.0, probability);
+            weights[static_cast<std::size_t>(output_index)] = cumulative;
+        }
+        if (!(cumulative > 0.0) || !std::isfinite(cumulative)) {
+            throw std::runtime_error("Detector response CDF is invalid");
+        }
+        for (double& value : weights) {
+            value /= cumulative;
+        }
+        weights.back() = 1.0;
+    }
+    return cdfs;
+}
+
+int SampleDetectorResponseBin(
+    const int raw_bin,
+    const std::vector<std::vector<double>>& cdfs,
+    std::mt19937_64& rng
+) {
+    if (raw_bin < 0 || raw_bin >= static_cast<int>(cdfs.size())) {
+        throw std::runtime_error("Raw detector-response bin is outside its axis");
+    }
+    const auto& cdf = cdfs[static_cast<std::size_t>(raw_bin)];
+    const double draw = std::generate_canonical<double, 53>(rng);
+    const auto iterator = std::lower_bound(cdf.begin(), cdf.end(), draw);
+    return static_cast<int>(
+        std::distance(
+            cdf.begin(),
+            iterator == cdf.end() ? std::prev(cdf.end()) : iterator
+        )
+    );
+}
+
+std::vector<long long> SampleUniformHistogramSubset(
+    const std::vector<long long>& histogram,
+    const long long subset_size,
+    std::mt19937_64& rng
+) {
+    const long long total = std::accumulate(
+        histogram.begin(),
+        histogram.end(),
+        0LL
+    );
+    if (subset_size < 0 || subset_size > total) {
+        throw std::runtime_error("Histogram subset size is invalid");
+    }
+    std::vector<long long> result(histogram.size(), 0LL);
+    if (subset_size == 0) {
+        return result;
+    }
+    if (subset_size == total) {
+        return histogram;
+    }
+    const bool draw_rejected = subset_size > total - subset_size;
+    const long long draw_count = draw_rejected
+        ? total - subset_size
+        : subset_size;
+    if (draw_rejected) {
+        result = histogram;
+    }
+    std::vector<long long> fenwick(histogram.size() + 1, 0LL);
+    for (std::size_t index = 0; index < histogram.size(); ++index) {
+        for (
+            std::size_t cursor = index + 1;
+            cursor < fenwick.size();
+            cursor += cursor & (~cursor + 1)
+        ) {
+            fenwick[cursor] += histogram[index];
+        }
+    }
+    long long remaining = total;
+    for (long long draw_index = 0; draw_index < draw_count; ++draw_index) {
+        std::uniform_int_distribution<long long> order_distribution(
+            0LL,
+            remaining - 1LL
+        );
+        const long long order = order_distribution(rng);
+        std::size_t index = 0;
+        long long prefix = 0;
+        std::size_t step = 1;
+        while ((step << 1U) < fenwick.size()) {
+            step <<= 1U;
+        }
+        for (; step > 0; step >>= 1U) {
+            const std::size_t next = index + step;
+            if (
+                next < fenwick.size()
+                && prefix + fenwick[next] <= order
+            ) {
+                index = next;
+                prefix += fenwick[next];
+            }
+        }
+        if (index >= histogram.size()) {
+            throw std::runtime_error(
+                "Histogram subset order statistic is outside its bins"
+            );
+        }
+        if (draw_rejected) {
+            --result[index];
+        } else {
+            ++result[index];
+        }
+        for (
+            std::size_t cursor = index + 1;
+            cursor < fenwick.size();
+            cursor += cursor & (~cursor + 1)
+        ) {
+            --fenwick[cursor];
+        }
+        --remaining;
+    }
+    return result;
+}
+
+long long SampleNonparalyzableAcceptedCount(
+    const long long incident_count,
+    const double live_time_s,
+    const double dead_time_tau_s,
+    std::mt19937_64& rng
+) {
+    if (
+        incident_count < 0
+        || !(live_time_s > 0.0)
+        || dead_time_tau_s < 0.0
+    ) {
+        throw std::runtime_error(
+            "Nonparalyzable event-time parameters are invalid"
+        );
+    }
+    if (incident_count == 0 || dead_time_tau_s == 0.0) {
+        return incident_count;
+    }
+    long long accepted = 0;
+    long long remaining = incident_count;
+    double arrival_time_s = 0.0;
+    double next_live_time_s = -std::numeric_limits<double>::infinity();
+    while (remaining > 0) {
+        const double uniform = std::max(
+            std::generate_canonical<double, 53>(rng),
+            std::numeric_limits<double>::min()
+        );
+        const double remaining_fraction = -std::expm1(
+            std::log(uniform) / static_cast<double>(remaining)
+        );
+        arrival_time_s += (
+            live_time_s - arrival_time_s
+        ) * remaining_fraction;
+        if (arrival_time_s >= next_live_time_s) {
+            ++accepted;
+            next_live_time_s = arrival_time_s + dead_time_tau_s;
+        }
+        --remaining;
+    }
+    return accepted;
+}
+
 double BackgroundShape(const double energy_keV) {
     const double low_energy_scatter = 0.62 * std::exp(-std::max(0.0, energy_keV) / 260.0);
     const double long_tail = 0.30 * std::exp(-std::max(0.0, energy_keV) / 1050.0);
@@ -438,7 +745,9 @@ void AddBackgroundSpectrum(
         const double sampled = static_cast<double>(distribution(rng));
         spectrum[index] += sampled;
         if (spectrum_variance != nullptr && index < spectrum_variance->size()) {
-            (*spectrum_variance)[index] += expected;
+            // Every sampled background pulse is an independent unit-weight
+            // entry, so its realized sumw2 contribution is the sampled count.
+            (*spectrum_variance)[index] += sampled;
         }
     }
 }
@@ -779,12 +1088,18 @@ double TheoryTvlTransmission(
     const RequestSpec& request
 ) {
     double exponent = 0.0;
-    if (ShieldBlocksSourceDirection(source, request.detector_pose, request.fe_pose)) {
-        const double thickness_cm = std::max(0.0, scene.fe_shield.thickness_m * 100.0);
+    if (
+        scene.fe_shield.has_value()
+        && ShieldBlocksSourceDirection(source, request.detector_pose, request.fe_pose)
+    ) {
+        const double thickness_cm = scene.fe_shield->thickness_m * 100.0;
         exponent += MuFromTvlMm(TvlMmForShield(source.isotope, "fe")) * thickness_cm;
     }
-    if (ShieldBlocksSourceDirection(source, request.detector_pose, request.pb_pose)) {
-        const double thickness_cm = std::max(0.0, scene.pb_shield.thickness_m * 100.0);
+    if (
+        scene.pb_shield.has_value()
+        && ShieldBlocksSourceDirection(source, request.detector_pose, request.pb_pose)
+    ) {
+        const double thickness_cm = scene.pb_shield->thickness_m * 100.0;
         exponent += MuFromTvlMm(TvlMmForShield(source.isotope, "pb")) * thickness_cm;
     }
     return std::exp(-exponent);
@@ -994,18 +1309,22 @@ void AddGeant4MaterialMuMetadata(SimulationResult& result, const SceneSpec& scen
     if (isotopes.empty()) {
         return;
     }
-    AddMaterialMuMetadata(
-        result,
-        "shield_fe",
-        ResolveAttenuationMaterial(scene.fe_shield.material, "iron"),
-        isotopes
-    );
-    AddMaterialMuMetadata(
-        result,
-        "shield_pb",
-        ResolveAttenuationMaterial(scene.pb_shield.material, "lead"),
-        isotopes
-    );
+    if (scene.fe_shield.has_value()) {
+        AddMaterialMuMetadata(
+            result,
+            "shield_fe",
+            ResolveAttenuationMaterial(scene.fe_shield->material, "iron"),
+            isotopes
+        );
+    }
+    if (scene.pb_shield.has_value()) {
+        AddMaterialMuMetadata(
+            result,
+            "shield_pb",
+            ResolveAttenuationMaterial(scene.pb_shield->material, "lead"),
+            isotopes
+        );
+    }
     std::set<std::string> emitted_materials;
     for (const auto& volume : scene.volumes) {
         if (volume.transport_mode != "geant4") {
@@ -1341,8 +1660,22 @@ public:
             );
         }
         if (place_shields_) {
-            fe_shield_physical_ = BuildShield(scene_->fe_shield, request_->fe_pose, world_logic, 1001);
-            pb_shield_physical_ = BuildShield(scene_->pb_shield, request_->pb_pose, world_logic, 1002);
+            if (scene_->fe_shield.has_value()) {
+                fe_shield_physical_ = BuildShield(
+                    *scene_->fe_shield,
+                    request_->fe_pose,
+                    world_logic,
+                    1001
+                );
+            }
+            if (scene_->pb_shield.has_value()) {
+                pb_shield_physical_ = BuildShield(
+                    *scene_->pb_shield,
+                    request_->pb_pose,
+                    world_logic,
+                    1002
+                );
+            }
         }
         BuildDetector(world_logic, nist);
         return world_physical;
@@ -1401,33 +1734,36 @@ private:
         G4LogicalVolume* parent_logic,
         int copy_number
     ) {
+        if (
+            shield.shape != "spherical_octant_shell"
+            || !std::isfinite(shield.inner_radius_m)
+            || shield.inner_radius_m < 0.0
+            || !std::isfinite(shield.thickness_m)
+            || shield.thickness_m <= 0.0
+            || !std::isfinite(shield.outer_radius_m)
+            || shield.outer_radius_m
+                != shield.inner_radius_m + shield.thickness_m
+        ) {
+            throw std::runtime_error(
+                "BuildShield requires a validated positive-thickness "
+                "spherical-octant shell."
+            );
+        }
         auto* material = ResolveMaterial(
             shield.material.name,
             shield.material.density_g_cm3,
             shield.material.composition_by_mass,
             shield.material.preset_name
         );
-        G4VSolid* solid = nullptr;
-        if (shield.shape == "spherical_octant_shell") {
-            const double inner_radius_m = std::max(0.0, shield.inner_radius_m);
-            const double outer_radius_m = std::max(inner_radius_m + 1.0e-6, shield.outer_radius_m);
-            solid = new G4Sphere(
-                shield.kind + "_ShieldSolid",
-                inner_radius_m * m,
-                outer_radius_m * m,
-                0.0 * deg,
-                90.0 * deg,
-                0.0 * deg,
-                90.0 * deg
-            );
-        } else {
-            solid = new G4Box(
-                shield.kind + "_ShieldSolid",
-                0.5 * shield.sx * m,
-                0.5 * shield.sy * m,
-                0.5 * shield.sz * m
-            );
-        }
+        auto* solid = new G4Sphere(
+            shield.kind + "_ShieldSolid",
+            shield.inner_radius_m * m,
+            shield.outer_radius_m * m,
+            0.0 * deg,
+            90.0 * deg,
+            0.0 * deg,
+            90.0 * deg
+        );
         auto* logic = new G4LogicalVolume(solid, material, shield.kind + "_ShieldLV");
         auto rotation = QuaternionToPlacementRotation(pose.qw, pose.qx, pose.qy, pose.qz);
         return new G4PVPlacement(
@@ -2081,6 +2417,7 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
     }
     SceneSpec scene;
     std::unordered_map<std::string, std::size_t> volume_index_by_path;
+    std::set<std::string> parsed_shield_kinds;
     std::string line;
     while (std::getline(input, line)) {
         if (line.empty()) {
@@ -2093,6 +2430,10 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
         const auto fields = ParseFields(tokens);
         if (tokens[0] == "SCENE") {
             scene.scene_hash = ParseString(fields, "scene_hash");
+            scene.surface_source_contract_sha256 = ParseString(
+                fields,
+                "surface_source_contract_sha256"
+            );
             scene.usd_path = ParseString(fields, "usd_path");
             scene.room_x = ParseDouble(fields, "room_x", 10.0);
             scene.room_y = ParseDouble(fields, "room_y", 20.0);
@@ -2117,7 +2458,38 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
             scene.detector.crystal_material = ParseString(fields, "crystal_material", "cebr3");
             scene.detector.housing_material = ParseString(fields, "housing_material", "aluminum");
         } else if (tokens[0] == "SHIELD") {
+            const std::array<std::string, 8> required_fields = {
+                "kind",
+                "path",
+                "shape",
+                "inner_radius_m",
+                "outer_radius_m",
+                "thickness_m",
+                "use_angle_attenuation",
+                "material_name",
+            };
+            for (const auto& required_field : required_fields) {
+                if (
+                    fields.find(required_field) == fields.end()
+                    || fields.at(required_field) == "-"
+                ) {
+                    throw std::runtime_error(
+                        "SHIELD is missing required field "
+                        + required_field + "."
+                    );
+                }
+            }
             const auto shield_kind = ParseString(fields, "kind");
+            if (shield_kind != "fe" && shield_kind != "pb") {
+                throw std::runtime_error(
+                    "SHIELD kind must be exactly fe or pb."
+                );
+            }
+            if (!parsed_shield_kinds.insert(shield_kind).second) {
+                throw std::runtime_error(
+                    "Scene contains a duplicate SHIELD kind " + shield_kind + "."
+                );
+            }
             ShieldSpec shield = shield_kind == "pb" ? DefaultPbShieldSpec() : DefaultFeShieldSpec();
             shield.kind = shield_kind;
             shield.path = ParseString(fields, "path");
@@ -2125,19 +2497,20 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
             shield.inner_radius_m = ParseDouble(fields, "inner_radius_m", shield.inner_radius_m);
             shield.outer_radius_m = ParseDouble(fields, "outer_radius_m", shield.outer_radius_m);
             shield.thickness_m = ParseDouble(fields, "thickness_m", shield.thickness_m);
-            if (shield.outer_radius_m <= shield.inner_radius_m && shield.thickness_m > 0.0) {
-                shield.outer_radius_m = shield.inner_radius_m + shield.thickness_m;
-            }
             shield.sx = ParseDouble(fields, "sx", 0.25);
             shield.sy = ParseDouble(fields, "sy", 0.08);
             shield.sz = ParseDouble(fields, "sz", 0.25);
             shield.material.name = ParseString(fields, "material_name");
             shield.material.density_g_cm3 = ParseDouble(fields, "density_g_cm3", -1.0);
             shield.material.preset_name = ParseString(fields, "preset_name");
-            if (shield.kind == "fe") {
-                scene.fe_shield = shield;
-            } else if (shield.kind == "pb") {
-                scene.pb_shield = shield;
+            auto validated_shield = ValidateParsedShield(
+                std::move(shield),
+                ParseString(fields, "use_angle_attenuation")
+            );
+            if (shield_kind == "fe") {
+                scene.fe_shield = std::move(validated_shield);
+            } else if (shield_kind == "pb") {
+                scene.pb_shield = std::move(validated_shield);
             }
         } else if (tokens[0] == "SOURCE") {
             SourceSpec source;
@@ -2146,6 +2519,24 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
             source.y = ParseDouble(fields, "y");
             source.z = ParseDouble(fields, "z");
             source.intensity_cps_1m = ParseDouble(fields, "intensity_cps_1m");
+            source.anchor_x = ParseDouble(fields, "anchor_x", source.x);
+            source.anchor_y = ParseDouble(fields, "anchor_y", source.y);
+            source.anchor_z = ParseDouble(fields, "anchor_z", source.z);
+            source.surface_chart_id = ParseLong(fields, "surface_chart_id", -1);
+            source.surface_u = ParseDouble(fields, "surface_u", -1.0);
+            source.surface_v = ParseDouble(fields, "surface_v", -1.0);
+            source.surface_normal_x = ParseDouble(fields, "surface_normal_x", 0.0);
+            source.surface_normal_y = ParseDouble(fields, "surface_normal_y", 0.0);
+            source.surface_normal_z = ParseDouble(fields, "surface_normal_z", 0.0);
+            source.surface_emission_epsilon_m = ParseDouble(
+                fields,
+                "surface_emission_epsilon_m",
+                0.0
+            );
+            source.surface_emission_policy_sha256 = ParseString(
+                fields,
+                "surface_emission_policy_sha256"
+            );
             scene.sources.push_back(source);
         } else if (tokens[0] == "VOLUME") {
             VolumeSpec volume;
@@ -2176,10 +2567,20 @@ SceneSpec ReadSceneFile(const std::string& scene_path) {
             const auto it = volume_index_by_path.find(path);
             if (it != volume_index_by_path.end()) {
                 scene.volumes[it->second].material.composition_by_mass[element] = fraction;
-            } else if (scene.fe_shield.path == path) {
-                scene.fe_shield.material.composition_by_mass[element] = fraction;
-            } else if (scene.pb_shield.path == path) {
-                scene.pb_shield.material.composition_by_mass[element] = fraction;
+            } else if (
+                scene.fe_shield.has_value()
+                && scene.fe_shield->path == path
+            ) {
+                scene.fe_shield->material.composition_by_mass[element] = fraction;
+            } else if (
+                scene.pb_shield.has_value()
+                && scene.pb_shield->path == path
+            ) {
+                scene.pb_shield->material.composition_by_mass[element] = fraction;
+            } else {
+                throw std::runtime_error(
+                    "COMP references an unknown or disabled material path."
+                );
             }
         } else if (tokens[0] == "TRI") {
             const auto path = ParseString(fields, "path");
@@ -2589,7 +2990,11 @@ public:
                     }
                     energy_deposits.push_back({
                         deposits[index].edep_mev * 1000.0,
-                        detected_weight
+                        detected_weight,
+                        deposits[index].entry_class,
+                        source.isotope,
+                        source_token,
+                        line_token
                     });
                 }
             }
@@ -2607,27 +3012,93 @@ public:
             );
         }
         constexpr double kBinWidthKeV = 2.0;
-        constexpr double kEnergyMaxKeV = 1500.0;
+        constexpr double kEnergyMaxKeV = 1700.0;
         const int num_bins = static_cast<int>(kEnergyMaxKeV / kBinWidthKeV) + 1;
         std::vector<double> spectrum(num_bins, 0.0);
         std::vector<double> spectrum_variance(num_bins, 0.0);
+        std::map<std::string, std::vector<double>> validation_entry_spectra;
         std::normal_distribution<double> gaussian(0.0, 1.0);
         const bool incident_gamma_scoring = detector_scoring_mode_ == "incident_gamma_energy";
+        if (options.sample_detector_response && !incident_gamma_scoring) {
+            throw std::runtime_error(
+                "sample_detector_response requires incident_gamma_energy scoring"
+            );
+        }
+        const auto detector_response_cdfs = options.sample_detector_response
+            ? BuildDetectorResponseCdfs(num_bins, kBinWidthKeV)
+            : std::vector<std::vector<double>>();
         for (const auto& deposit : energy_deposits) {
             const double energy_keV = deposit.energy_keV;
-            const double smeared = incident_gamma_scoring
-                ? energy_keV
-                : energy_keV + SigmaEnergyKeV(energy_keV) * gaussian(rng);
-            if (smeared < 0.0 || smeared > kEnergyMaxKeV) {
+            if (energy_keV < 0.0 || energy_keV > kEnergyMaxKeV) {
                 continue;
             }
-            const int index = static_cast<int>(std::floor(smeared / kBinWidthKeV));
+            const int raw_index = static_cast<int>(
+                std::floor(energy_keV / kBinWidthKeV)
+            );
+            if (raw_index < 0 || raw_index >= num_bins) {
+                continue;
+            }
+            if (options.validation_entry_class_spectra) {
+                const std::string entry_class = (
+                    deposit.entry_class == DetectorEntryClass::kUncollidedPrimary
+                        ? "uncollided_primary"
+                        : (
+                            deposit.entry_class == DetectorEntryClass::kInteractedPrimary
+                                ? "interacted_primary"
+                                : "secondary"
+                        )
+                );
+                const std::string key = deposit.line_token + "_" + entry_class;
+                auto& classified_spectrum = validation_entry_spectra[key];
+                if (classified_spectrum.empty()) {
+                    classified_spectrum.assign(num_bins, 0.0);
+                }
+                classified_spectrum[static_cast<std::size_t>(raw_index)]
+                    += deposit.weight;
+            }
+            int index = raw_index;
+            if (options.sample_detector_response) {
+                if (std::abs(deposit.weight - 1.0) > 1.0e-12) {
+                    throw std::runtime_error(
+                        "Detector-response marking requires unit-weight histories"
+                    );
+                }
+                index = SampleDetectorResponseBin(
+                    raw_index,
+                    detector_response_cdfs,
+                    rng
+                );
+            } else if (!incident_gamma_scoring) {
+                const double smeared = (
+                    energy_keV + SigmaEnergyKeV(energy_keV) * gaussian(rng)
+                );
+                if (smeared < 0.0 || smeared > kEnergyMaxKeV) {
+                    continue;
+                }
+                index = static_cast<int>(
+                    std::floor(smeared / kBinWidthKeV)
+                );
+            }
             if (index >= 0 && index < num_bins) {
                 spectrum[index] += deposit.weight;
                 spectrum_variance[index] += deposit.weight * deposit.weight;
             }
         }
+        const std::vector<double> source_only_spectrum = spectrum;
         AddBackgroundSpectrum(spectrum, &spectrum_variance, kBinWidthKeV, request.dwell_time_s, options, rng);
+        std::vector<double> validation_background_spectrum;
+        if (options.validation_entry_class_spectra) {
+            validation_background_spectrum.resize(
+                spectrum.size(),
+                0.0
+            );
+            for (std::size_t index = 0; index < spectrum.size(); ++index) {
+                validation_background_spectrum[index] = std::max(
+                    0.0,
+                    spectrum[index] - source_only_spectrum[index]
+                );
+            }
+        }
         const double total_counts = std::accumulate(spectrum.begin(), spectrum.end(), 0.0);
         const double pre_dead_time_total_variance = std::accumulate(
             spectrum_variance.begin(),
@@ -2636,10 +3107,84 @@ public:
         );
         const double dwell_time_s = std::max(1.0e-6, request.dwell_time_s);
         const double true_rate = total_counts / dwell_time_s;
-        const double observed_scale = 1.0 / (1.0 + std::max(0.0, true_rate * dead_time_tau_s));
-        for (std::size_t index = 0; index < spectrum.size(); ++index) {
-            spectrum[index] *= observed_scale;
-            spectrum_variance[index] *= observed_scale * observed_scale;
+        double observed_scale = 1.0 / (
+            1.0 + std::max(0.0, true_rate * dead_time_tau_s)
+        );
+        if (options.sample_detector_response) {
+            const auto integer_total = static_cast<long long>(
+                std::llround(total_counts)
+            );
+            std::vector<long long> incident_histogram(
+                spectrum.size(),
+                0LL
+            );
+            for (std::size_t index = 0; index < spectrum.size(); ++index) {
+                const double value = spectrum[index];
+                const auto integer_count = static_cast<long long>(
+                    std::llround(value)
+                );
+                if (
+                    integer_count < 0
+                    || std::abs(value - static_cast<double>(integer_count))
+                        > 1.0e-9
+                ) {
+                    throw std::runtime_error(
+                        "Detector-response marking produced noninteger counts"
+                    );
+                }
+                incident_histogram[index] = integer_count;
+            }
+            if (
+                std::accumulate(
+                    incident_histogram.begin(),
+                    incident_histogram.end(),
+                    0LL
+                ) != integer_total
+            ) {
+                throw std::runtime_error(
+                    "Detector-response pulse total disagrees with its histogram"
+                );
+            }
+            const long long accepted_count = (
+                SampleNonparalyzableAcceptedCount(
+                    integer_total,
+                    dwell_time_s,
+                    dead_time_tau_s,
+                    rng
+                )
+            );
+            const auto accepted_histogram = SampleUniformHistogramSubset(
+                incident_histogram,
+                accepted_count,
+                rng
+            );
+            for (std::size_t index = 0; index < spectrum.size(); ++index) {
+                spectrum[index] = static_cast<double>(
+                    accepted_histogram[index]
+                );
+                spectrum_variance[index] = spectrum[index];
+            }
+            observed_scale = total_counts > 0.0
+                ? static_cast<double>(accepted_count) / total_counts
+                : 1.0;
+        } else {
+            for (std::size_t index = 0; index < spectrum.size(); ++index) {
+                spectrum[index] *= observed_scale;
+                spectrum_variance[index] *= observed_scale * observed_scale;
+            }
+        }
+        if (
+            options.validation_entry_class_spectra
+            && !options.sample_detector_response
+        ) {
+            for (auto& item : validation_entry_spectra) {
+                for (double& value : item.second) {
+                    value *= observed_scale;
+                }
+            }
+            for (double& value : validation_background_spectrum) {
+                value *= observed_scale;
+            }
         }
         for (auto& item : transport_detected_counts) {
             item.second *= observed_scale;
@@ -2705,20 +3250,182 @@ public:
             ? "detector_equivalent_cone"
             : (source_bias_weighted_transport ? "weighted_isotropic" : "isotropic");
         result.metadata["source_rate_model"] = source_rate_model;
-        result.metadata["intensity_cps_1m_definition"] = "net_detector_count_rate_at_1m";
+        result.metadata["intensity_cps_1m_definition"] =
+            "pre_dead_time_detector_pulse_rate_at_1m";
         result.metadata["line_intensities_normalized"] = detector_cps_rate_model ? "true" : "false";
+        bool all_sources_surface_bound = !scene_.sources.empty();
+        std::string surface_emission_policy_sha256;
+        double surface_emission_epsilon_m = 0.0;
+        result.metadata["native_surface_source_count"] = std::to_string(
+            scene_.sources.size()
+        );
+        for (
+            std::size_t source_index = 0;
+            source_index < scene_.sources.size();
+            ++source_index
+        ) {
+            const auto& source = scene_.sources[source_index];
+            const bool has_contract = (
+                source.surface_chart_id >= 0
+                && source.surface_u >= 0.0
+                && source.surface_u <= 1.0
+                && source.surface_v >= 0.0
+                && source.surface_v <= 1.0
+                && !source.surface_emission_policy_sha256.empty()
+                && source.surface_emission_epsilon_m > 0.0
+            );
+            if (!has_contract) {
+                all_sources_surface_bound = false;
+                continue;
+            }
+            const double dx = source.x - source.anchor_x;
+            const double dy = source.y - source.anchor_y;
+            const double dz = source.z - source.anchor_z;
+            const double normal_norm = std::sqrt(
+                source.surface_normal_x * source.surface_normal_x
+                + source.surface_normal_y * source.surface_normal_y
+                + source.surface_normal_z * source.surface_normal_z
+            );
+            const double epsilon = source.surface_emission_epsilon_m;
+            const double contract_error = std::sqrt(
+                std::pow(dx - epsilon * source.surface_normal_x, 2)
+                + std::pow(dy - epsilon * source.surface_normal_y, 2)
+                + std::pow(dz - epsilon * source.surface_normal_z, 2)
+            );
+            if (
+                std::abs(normal_norm - 1.0) > 1.0e-12
+                || contract_error > 1.0e-12
+            ) {
+                throw std::runtime_error(
+                    "Native source emission XYZ violates the declared "
+                    "surface-anchor epsilon contract."
+                );
+            }
+            if (surface_emission_policy_sha256.empty()) {
+                surface_emission_policy_sha256 =
+                    source.surface_emission_policy_sha256;
+                surface_emission_epsilon_m = epsilon;
+            } else if (
+                surface_emission_policy_sha256
+                    != source.surface_emission_policy_sha256
+                || std::abs(surface_emission_epsilon_m - epsilon) > 1.0e-15
+            ) {
+                throw std::runtime_error(
+                    "Native sources declare inconsistent surface-emission "
+                    "contracts."
+                );
+            }
+            const std::string prefix = (
+                "native_surface_source_"
+                + std::to_string(source_index)
+                + "_"
+            );
+            result.metadata[prefix + "isotope"] = source.isotope;
+            result.metadata[prefix + "intensity_cps_1m"] = SerializeDouble(
+                source.intensity_cps_1m
+            );
+            result.metadata[prefix + "surface_chart_id"] = std::to_string(
+                source.surface_chart_id
+            );
+            result.metadata[prefix + "surface_emission_policy_sha256"] = (
+                source.surface_emission_policy_sha256
+            );
+            result.metadata[prefix + "anchor_x"] = SerializeDouble(
+                source.anchor_x
+            );
+            result.metadata[prefix + "anchor_y"] = SerializeDouble(
+                source.anchor_y
+            );
+            result.metadata[prefix + "anchor_z"] = SerializeDouble(
+                source.anchor_z
+            );
+            result.metadata[prefix + "transport_x"] = SerializeDouble(
+                source.x
+            );
+            result.metadata[prefix + "transport_y"] = SerializeDouble(
+                source.y
+            );
+            result.metadata[prefix + "transport_z"] = SerializeDouble(
+                source.z
+            );
+            result.metadata[prefix + "surface_u"] = SerializeDouble(
+                source.surface_u
+            );
+            result.metadata[prefix + "surface_v"] = SerializeDouble(
+                source.surface_v
+            );
+            result.metadata[prefix + "surface_normal_x"] = SerializeDouble(
+                source.surface_normal_x
+            );
+            result.metadata[prefix + "surface_normal_y"] = SerializeDouble(
+                source.surface_normal_y
+            );
+            result.metadata[prefix + "surface_normal_z"] = SerializeDouble(
+                source.surface_normal_z
+            );
+        }
+        result.metadata["source_position_semantics"] = (
+            "air_side_native_emission_xyz"
+        );
+        result.metadata["source_anchor_semantics"] = (
+            "exact_surface_chart_uv_evaluation_truth"
+        );
+        result.metadata["all_sources_surface_bound"] = (
+            all_sources_surface_bound ? "true" : "false"
+        );
+        result.metadata["surface_emission_policy_sha256"] = (
+            surface_emission_policy_sha256
+        );
+        result.metadata["surface_emission_epsilon_m"] = SerializeDouble(
+            surface_emission_epsilon_m
+        );
         result.metadata["physics_profile"] = physics_profile_;
         result.metadata["detector_scoring_mode"] = detector_scoring_mode_;
         result.metadata["detector_fast_scoring"] = detector_scoring_mode_ == "incident_gamma_energy" ? "true" : "false";
         result.metadata["detector_fast_scoring_volume"] = detector_scoring_mode_ == "incident_gamma_energy"
             ? "detector_assembly_entry"
             : "";
-        result.metadata["detector_response_applied_in_native"] = detector_scoring_mode_ == "incident_gamma_energy" ? "false" : "true";
+        result.metadata["detector_response_applied_in_native"] = (
+            detector_scoring_mode_ != "incident_gamma_energy"
+            || options.sample_detector_response
+        ) ? "true" : "false";
+        result.metadata["detector_response_sampling_mode"] = (
+            options.sample_detector_response
+                ? "multinomial_marking_with_nonparalyzable_event_time"
+                : "disabled"
+        );
+        result.metadata["detector_response_sampling_model"] = (
+            options.sample_detector_response
+                ? "native_incident_gamma_response_v1"
+                : ""
+        );
+        result.metadata[
+            "detector_response_sampling_contract_sha256"
+        ] = (
+            options.sample_detector_response
+                ? "0ab48601e0965c2c9ea973505523558bf4dd5d394129397c3d4079c143787ae5"
+                : ""
+        );
+        result.metadata["detector_response_sampling_seed"] = (
+            options.sample_detector_response
+                ? std::to_string(request.seed)
+                : ""
+        );
+        result.metadata["spectrum_energy_min_keV"] = "0";
+        result.metadata["spectrum_energy_max_keV"] = "1700";
+        result.metadata["spectrum_bin_width_keV"] = "2";
+        result.metadata["spectrum_bin_count"] = "851";
+        result.metadata["background_spectrum_model_id"] = (
+            "native_geant4_background_shape_v1_bin_centres"
+        );
         AddGeant4MaterialMuMetadata(result, scene_);
         result.metadata["secondary_transport_mode"] = secondary_transport_mode_;
         result.metadata["gamma_only_secondary_transport"] = secondary_transport_mode_ == "gamma_only" ? "true" : "false";
         result.metadata["theory_tvl_attenuation"] = use_theory_tvl_ ? "true" : "false";
         result.metadata["scene_hash"] = scene_.scene_hash;
+        result.metadata["surface_source_contract_sha256"] = (
+            scene_.surface_source_contract_sha256
+        );
         result.metadata["num_primaries"] = std::to_string(total_primaries);
         result.metadata["expected_primary_semantics"] = detector_cps_rate_model
             ? "detector_equivalent_histories"
@@ -2759,6 +3466,22 @@ public:
         result.metadata["detector_crystal_radius_m"] = std::to_string(scene_.detector.crystal_radius_m);
         result.metadata["detector_housing_thickness_m"] = std::to_string(scene_.detector.housing_thickness_m);
         result.metadata["detector_target_radius_m"] = std::to_string(DetectorTargetRadiusM(scene_.detector));
+        result.metadata["fe_shield_present"] = (
+            scene_.fe_shield.has_value() ? "true" : "false"
+        );
+        result.metadata["pb_shield_present"] = (
+            scene_.pb_shield.has_value() ? "true" : "false"
+        );
+        result.metadata["fe_shield_thickness_m"] = SerializeDouble(
+            scene_.fe_shield.has_value()
+                ? scene_.fe_shield->thickness_m
+                : 0.0
+        );
+        result.metadata["pb_shield_thickness_m"] = SerializeDouble(
+            scene_.pb_shield.has_value()
+                ? scene_.pb_shield->thickness_m
+                : 0.0
+        );
         const auto fe_shield_normal = ShieldNormalFromPose(request.fe_pose);
         const auto pb_shield_normal = ShieldNormalFromPose(request.pb_pose);
         result.metadata["fe_shield_normal_x"] = std::to_string(fe_shield_normal[0]);
@@ -2789,6 +3512,29 @@ public:
         result.metadata["multithreaded_run_manager"] = run_manager_multithreaded_ ? "true" : "false";
         result.metadata["background_cps"] = std::to_string(options.background_cps);
         result.metadata["poisson_background"] = "true";
+        result.metadata["validation_entry_class_spectra"] = (
+            options.validation_entry_class_spectra ? "true" : "false"
+        );
+        if (options.validation_entry_class_spectra) {
+            result.metadata["validation_entry_spectrum_space"] = (
+                options.sample_detector_response
+                    ? "pre_dead_time_raw_incident_gamma"
+                    : "observed_native_histogram"
+            );
+            result.metadata["validation_entry_spectrum_grouping"] = (
+                "source_token_initial_gamma_line_entry_class"
+            );
+            result.metadata[
+                options.sample_detector_response
+                    ? "validation_only_background_analysis_spectrum"
+                    : "validation_only_background_incident_spectrum"
+            ] = SerializeDoubleVector(validation_background_spectrum);
+            for (const auto& item : validation_entry_spectra) {
+                result.metadata[
+                    "validation_only_entry_spectrum_" + item.first
+                ] = SerializeDoubleVector(item.second);
+            }
+        }
         result.metadata["source_bias_weighted_transport"] = source_bias_weighted_transport
             ? "true"
             : "false";
@@ -2799,9 +3545,6 @@ public:
             source_bias_weighted_transport
                 ? std::clamp(options.source_bias_isotropic_fraction, 1.0e-6, 1.0)
                 : 1.0
-        );
-        result.metadata["source_bias_configured_cone_half_angle_deg"] = std::to_string(
-            std::max(0.0, options.source_bias_cone_half_angle_deg)
         );
         result.metadata["source_bias_cone_half_angle_deg"] = std::to_string(
             cone_sampled_transport && std::isfinite(effective_cone_max_deg) ? effective_cone_max_deg : 0.0
@@ -2817,9 +3560,20 @@ public:
         result.metadata["weighted_spectrum_sumw2"] = SerializeDouble(total_variance);
         result.metadata["weighted_spectrum_effective_entries"] = SerializeDouble(effective_spectrum_entries);
         result.metadata["spectrum_variance_semantics"] = (
-            "compound_poisson_sumw2_includes_counting"
+            options.sample_detector_response
+                ? "renewal_total_conditional_multinomial_marks"
+                : "compound_poisson_sumw2_includes_counting"
         );
-        result.metadata["spectrum_variance_dead_time_propagation"] = "fixed_observed_scale";
+        result.metadata["spectrum_variance_dead_time_propagation"] = (
+            options.sample_detector_response
+                ? "event_time_nonparalyzable_global_stream"
+                : "fixed_observed_scale"
+        );
+        result.metadata["dead_time_scale_semantics"] = (
+            options.sample_detector_response
+                ? "realized_global_acceptance_fraction"
+                : "fixed_scale_from_realized_pre_dead_time_rate"
+        );
         result.metadata["dead_time_tau_s"] = SerializeDouble(dead_time_tau_s);
         result.metadata["dead_time_observed_scale"] = SerializeDouble(observed_scale);
         result.metadata["dwell_time_s"] = SerializeDouble(dwell_time_s);
@@ -3080,6 +3834,10 @@ int main(int argc, char** argv) {
                         "--target-sampled-primaries requires a positive integer"
                     );
                 }
+            } else if (arg == "--validation-entry-class-spectra") {
+                transport_options.validation_entry_class_spectra = true;
+            } else if (arg == "--sample-detector-response") {
+                transport_options.sample_detector_response = true;
             } else if (arg == "--persistent") {
                 persistent = true;
             }
@@ -3139,7 +3897,8 @@ int main(int argc, char** argv) {
         if (scene_path.empty() || request_path.empty() || response_path.empty()) {
             throw std::runtime_error(
                 "Usage: geant4_sidecar --scene <path> --request <path> --response <path> "
-                "or geant4_sidecar --persistent"
+                "or geant4_sidecar --persistent "
+                "[--validation-entry-class-spectra]"
             );
         }
         const auto scene = ReadSceneFile(scene_path);

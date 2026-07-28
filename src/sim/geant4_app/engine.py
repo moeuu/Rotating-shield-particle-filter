@@ -13,6 +13,9 @@ from typing import Any
 
 import numpy as np
 
+from measurement.source_boundary import (
+    surface_source_runtime_contract_sha256,
+)
 from sim.geant4_app.io_format import (
     read_response_file,
     write_request_file,
@@ -23,7 +26,118 @@ from sim.radiation_visualization import (
     RadiationVisualizationConfig,
     build_visualization_metadata_from_scene,
 )
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.library import default_library
+
+
+def validate_native_scene_identity(
+    metadata: dict[str, Any],
+    scene: ExportedGeant4Scene,
+) -> None:
+    """Authenticate the exact scene and source payload parsed by native Geant4."""
+    expected_entries = [
+        {
+            "isotope": source.isotope,
+            "position": list(source.anchor_position_xyz),
+            "transport_position": list(source.position_xyz),
+            "intensity_cps_1m": source.intensity_cps_1m,
+            "surface_chart_id": source.surface_chart_id,
+            "surface_uv": list(source.surface_uv),
+            "surface_normal": list(source.surface_normal_xyz),
+            "surface_emission_policy_sha256": (
+                source.surface_emission_policy_sha256
+            ),
+        }
+        for source in scene.sources
+    ]
+    expected_source_hash = surface_source_runtime_contract_sha256(
+        expected_entries
+    )
+    expected = {
+        "backend": "geant4",
+        "engine_mode": "external",
+        "scene_hash": scene.scene_hash,
+        "surface_source_contract_sha256": expected_source_hash,
+    }
+    for key, expected_value in expected.items():
+        actual = metadata.get(key)
+        if actual != expected_value:
+            raise RuntimeError(
+                "Native Geant4 did not authenticate the exported scene "
+                f"identity for {key}: expected {expected_value!r}, "
+                f"got {actual!r}."
+            )
+    native_source_count = metadata.pop(
+        "native_surface_source_count",
+        None,
+    )
+    if (
+        isinstance(native_source_count, bool)
+        or not isinstance(native_source_count, int)
+        or native_source_count != len(expected_entries)
+    ):
+        raise RuntimeError(
+            "Native Geant4 did not report the exact parsed source count."
+        )
+    native_entries: list[dict[str, object]] = []
+    scalar_fields = (
+        "isotope",
+        "intensity_cps_1m",
+        "surface_chart_id",
+        "surface_emission_policy_sha256",
+    )
+    vector_fields = {
+        "position": ("anchor_x", "anchor_y", "anchor_z"),
+        "transport_position": (
+            "transport_x",
+            "transport_y",
+            "transport_z",
+        ),
+        "surface_uv": ("surface_u", "surface_v"),
+        "surface_normal": (
+            "surface_normal_x",
+            "surface_normal_y",
+            "surface_normal_z",
+        ),
+    }
+    for source_index in range(native_source_count):
+        prefix = f"native_surface_source_{source_index}_"
+        entry = {
+            field: metadata.pop(prefix + field, None)
+            for field in scalar_fields
+        }
+        entry.update(
+            {
+                field: [
+                    metadata.pop(prefix + component, None)
+                    for component in components
+                ]
+                for field, components in vector_fields.items()
+            }
+        )
+        native_entries.append(entry)
+    try:
+        native_source_hash = surface_source_runtime_contract_sha256(
+            native_entries
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Native Geant4 parsed-source identity payload is invalid."
+        ) from exc
+    unexpected_native_fields = sorted(
+        key
+        for key in metadata
+        if key.startswith("native_surface_source_")
+    )
+    if unexpected_native_fields:
+        raise RuntimeError(
+            "Native Geant4 parsed-source identity contains unexpected fields: "
+            f"{unexpected_native_fields}."
+        )
+    if native_source_hash != expected_source_hash:
+        raise RuntimeError(
+            "Native Geant4 parsed source strengths or transport positions "
+            "differ from the exported scene."
+        )
 
 
 @dataclass(frozen=True)
@@ -71,11 +185,14 @@ class Geant4EngineConfig:
     source_rate_model: str = "detector_cps_1m"
     source_bias_mode: str = "detector_cone"
     source_bias_cone_half_angle_deg: float = 0.0
-    source_bias_isotropic_fraction: float = 0.1
+    source_bias_isotropic_fraction: float = 1.0
     detector_scoring_mode: str = "full_transport"
     secondary_transport_mode: str = "full_transport"
     primary_sampling_fraction: float = 1.0
     target_sampled_primaries: int | None = None
+    background_cps: float = 0.0
+    sample_detector_response: bool = False
+    validation_entry_class_spectra: bool = False
     radiation_visualization: RadiationVisualizationConfig = field(
         default_factory=RadiationVisualizationConfig
     )
@@ -109,7 +226,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         self.config = config
         self.scene: ExportedGeant4Scene | None = None
         self._last_cache_hit = False
-        self.decomposer = SpectralDecomposer()
+        self.library = default_library()
         self._persistent_process: subprocess.Popen[str] | None = None
         self._persistent_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._persistent_scene_path: Path | None = None
@@ -133,18 +250,16 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             spectrum, metadata = self._simulate_persistent(request)
         else:
             spectrum, metadata = self._simulate_one_shot(request)
-        metadata.setdefault("backend", "geant4")
-        metadata.setdefault("engine_mode", "external")
-        metadata.setdefault("scene_hash", self.scene.scene_hash)
-        metadata.setdefault("cache_hit", self._last_cache_hit)
-        metadata.setdefault("seed", int(request.seed))
+        validate_native_scene_identity(metadata, self.scene)
+        metadata["cache_hit"] = bool(self._last_cache_hit)
+        metadata["seed"] = int(request.seed)
         metadata.update(
             build_visualization_metadata_from_scene(
                 self.scene,
                 request,
                 seed=int(request.seed),
                 config=self.config.radiation_visualization,
-                library=self.decomposer.library,
+                library=self.library,
                 mode="geant4-external-representative",
                 scatter_gain=self.config.scatter_gain,
             )
@@ -179,6 +294,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
                 "--dead-time-tau-s",
                 str(self.config.dead_time_tau_s),
                 *self._source_bias_args(),
+                *self._observation_args(),
                 *self.config.executable_args,
             ]
             result = subprocess.run(
@@ -269,6 +385,7 @@ class ExternalCommandGeant4Engine(Geant4Engine):
             "--dead-time-tau-s",
             str(self.config.dead_time_tau_s),
             *self._source_bias_args(),
+            *self._observation_args(),
             *self.config.executable_args,
         ]
         self._persistent_process = subprocess.Popen(
@@ -387,19 +504,28 @@ class ExternalCommandGeant4Engine(Geant4Engine):
         arguments = [
             "--source-rate-model",
             str(self.config.source_rate_model),
-            "--source-bias-mode",
-            str(self.config.source_bias_mode),
             "--source-bias-cone-half-angle-deg",
             str(float(self.config.source_bias_cone_half_angle_deg)),
-            "--source-bias-isotropic-fraction",
-            str(float(self.config.source_bias_isotropic_fraction)),
-            "--detector-scoring-mode",
+        ]
+        if str(self.config.source_rate_model) != "detector_cps_1m":
+            arguments.extend(
+                [
+                    "--source-bias-mode",
+                    str(self.config.source_bias_mode),
+                    "--source-bias-isotropic-fraction",
+                    str(float(self.config.source_bias_isotropic_fraction)),
+                ]
+            )
+        arguments.extend(
+            [
+                "--detector-scoring-mode",
             str(self.config.detector_scoring_mode),
             "--secondary-transport-mode",
             str(self.config.secondary_transport_mode),
             "--primary-sampling-fraction",
             str(float(self.config.primary_sampling_fraction)),
-        ]
+            ]
+        )
         if self.config.target_sampled_primaries is not None:
             arguments.extend(
                 [
@@ -407,6 +533,18 @@ class ExternalCommandGeant4Engine(Geant4Engine):
                     str(int(self.config.target_sampled_primaries)),
                 ]
             )
+        return arguments
+
+    def _observation_args(self) -> list[str]:
+        """Return native arguments for typed background and spectrum marking."""
+        arguments = [
+            "--background-cps",
+            str(float(self.config.background_cps)),
+        ]
+        if self.config.sample_detector_response:
+            arguments.append("--sample-detector-response")
+        if self.config.validation_entry_class_spectra:
+            arguments.append("--validation-entry-class-spectra")
         return arguments
 
 

@@ -1,6 +1,7 @@
-"""Tests for shield rotation and pose selection logic (Chapter 3.4)."""
+"""Tests for joint DSS planning and measurement geometry."""
 
 import inspect
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,26 +9,20 @@ import pytest
 
 import planning.candidate_generation as candidate_generation
 import planning.dss_pp as dss_pp
-import planning.shield_rotation as shield_rotation
 from measurement.kernels import ShieldParams
-from measurement.obstacles import ObstacleGrid
-from pf.estimator import RotatingShieldPFConfig, RotatingShieldPFEstimator
-from pf.likelihood import CountLikelihoodSpec
-from pf.state import IsotopeState
-from planning.pose_selection import (
-    estimate_lambda_cost,
-    minimum_observation_shortfall,
-    select_next_pose_from_candidates,
+from measurement.surface_charts import SurfaceChartGeometry
+from pf.estimator import (
+    RotatingShieldPFConfig,
+    RotatingShieldPFEstimator,
+    build_complete_surface_atlas_quadrature,
 )
+from pf.surface_atlas import ContinuousSurfaceAtlas
+from pf.state import IsotopeState
 from planning.dss_pp import (
     DSSPPConfig,
-    SignatureMode,
-    _count_balance_penalty,
     _continuous_kernel_for_estimator,
-    _saturated_count_utility,
-    _programs_for_pose,
-    _temporal_separation_score_from_signatures,
     build_shield_program_library,
+    estimate_lambda_cost,
     select_dss_pp_next_station,
 )
 from planning.candidate_generation import (
@@ -35,90 +30,177 @@ from planning.candidate_generation import (
     generate_candidate_poses,
     resolve_detector_height_actions,
 )
-from planning.shield_rotation import select_best_orientation
-from planning.shield_rotation import select_separation_orientations
 from planning.traversability import TraversabilityMap
 from pf.particle_filter import IsotopeParticle
 from measurement.shielding import generate_octant_rotation_matrices
+from pure_pf_test_support import approved_full_spectrum_model
 
 
-def test_fast_gpu_rollout_respects_disabled_gpu_override() -> None:
-    """Fast rollout falls back instead of raising when planning disables GPU."""
-    estimator = object.__new__(RotatingShieldPFEstimator)
-    estimator.pf_config = RotatingShieldPFConfig(
-        variable_cardinality=False,
-        init_num_sources=(1, 1),
-        use_gpu=False,
-        use_fast_gpu_rollout=True,
+def _state_on_filter(
+    particle_filter: object,
+    positions_xyz: np.ndarray,
+    strengths: np.ndarray,
+) -> IsotopeState:
+    """Build a continuous-surface state from physical test positions."""
+    positions = np.asarray(positions_xyz, dtype=float).reshape(-1, 3)
+    strength_values = np.asarray(strengths, dtype=float).reshape(-1)
+    chart_ids, surface_uv = (
+        particle_filter.structural_surface_chart_coordinates(  # type: ignore[attr-defined]
+            positions
+        )
+    )
+    return IsotopeState(
+        num_sources=int(strength_values.size),
+        strengths=strength_values,
+        surface_chart_ids=chart_ids,
+        surface_uv=surface_uv,
     )
 
-    result = estimator._expected_uncertainty_after_rotation_fast(
-        detector_pos=np.array([0.0, 0.0, 0.0], dtype=float),
-        live_time_per_rot_s=1.0,
-        tau_ig=1e-3,
-        tmax_s=1.0,
-        rollouts=1,
-        eig_samples=1,
-        alpha_by_isotope=None,
-        rollout_particles=None,
-        rollout_method=None,
-        use_mean_measurement=True,
-        rng=np.random.default_rng(0),
-        return_debug=False,
+
+def _encoded_surface_state(
+    positions_xyz: np.ndarray,
+    strengths: np.ndarray,
+) -> IsotopeState:
+    """Encode simple XYZ fixtures into chart IDs and unit-square coordinates."""
+    positions = np.asarray(positions_xyz, dtype=float).reshape(-1, 3)
+    if (
+        np.any(positions[:, 0] < 0.0)
+        or np.any(positions[:, 0] != np.floor(positions[:, 0]))
+        or np.any(positions[:, 1:] < 0.0)
+        or np.any(positions[:, 1:] > 1.0)
+    ):
+        raise ValueError("Encoded surface fixtures require integer x and unit yz.")
+    strength_values = np.asarray(strengths, dtype=float).reshape(-1)
+    return IsotopeState(
+        num_sources=int(strength_values.size),
+        strengths=strength_values,
+        surface_chart_ids=positions[:, 0].astype(np.int64),
+        surface_uv=positions[:, 1:],
     )
 
-    assert result is None
+
+def _decode_encoded_surface_state(state: IsotopeState) -> np.ndarray:
+    """Decode the unit-test chart encoding into XYZ positions."""
+    return np.column_stack(
+        (
+            np.asarray(state.surface_chart_ids, dtype=float),
+            np.asarray(state.surface_uv, dtype=float),
+        )
+    )
 
 
-def _build_simple_estimator() -> RotatingShieldPFEstimator:
-    """Build a minimal estimator with deterministic particle setup for tests."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
+def _build_simple_estimator(
+    *,
+    canonical_octants: bool = False,
+) -> RotatingShieldPFEstimator:
+    """Build a minimal estimator with deterministic particles."""
+    surface_diagnostic_points = np.array([[1.0, 0.0, 0.0]], dtype=float)
+    normals = (
+        np.asarray(
+            [
+                matrix[:, 2]
+                for matrix in generate_octant_rotation_matrices()
+            ],
+            dtype=float,
+        )
+        if canonical_octants
+        else np.array(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            dtype=float,
+        )
+    )
     config = RotatingShieldPFConfig(
         num_particles=2,
         max_sources=1,
         variable_cardinality=False,
         init_num_sources=(1, 1),
-        resample_threshold=0.5,
     )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
+    estimator = RotatingShieldPFEstimator(
+        isotopes=["Cs-137"],
+        surface_diagnostic_points=surface_diagnostic_points,
         shield_normals=normals,
-        mu_by_isotope=mu,
+        mu_by_isotope={"Cs-137": 0.5},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
-    est.add_measurement_pose(np.array([0.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    # Deterministic continuous particles for EIG tests (unblocked should dominate)
-    from pf.particle_filter import IsotopeParticle
-    from pf.state import IsotopeState
-
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
+    estimator.add_measurement_pose(np.array([0.0, 0.0, 0.0]))
+    estimator._ensure_kernel_cache()
+    particle_filter = estimator.filters["Cs-137"]
+    particle_filter.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([10.0]),
-                background=0.0,
+            state=_state_on_filter(
+                particle_filter,
+                np.array([[0.0, 0.0, 0.0]]),
+                np.array([10.0]),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=(
+                particle_filter.continuous_particles[0].joint_row_identity
+            ),
         ),
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([1.0]),
-                background=0.0,
+            state=_state_on_filter(
+                particle_filter,
+                np.array([[0.0, 0.0, 0.0]]),
+                np.array([1.0]),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=(
+                particle_filter.continuous_particles[1].joint_row_identity
+            ),
         ),
     ]
-    return est
+    return estimator
+
+
+def _build_full_spectrum_planning_estimator() -> RotatingShieldPFEstimator:
+    """Build a production-approved tiny estimator for DSS spectrum tests."""
+    isotope = "Cs-137"
+    model = approved_full_spectrum_model()
+    line_mu = tuple(
+        {
+            "energy_keV": float(line["energy_keV"]),
+            "weight": float(line["branching_weight"]),
+            "fe": float(line["mu_fe_cm_inv"]),
+            "pb": float(line["mu_pb_cm_inv"]),
+        }
+        for line in model.line_identity
+        if str(line["isotope"]) == isotope
+    )
+    estimator = RotatingShieldPFEstimator(
+        isotopes=(isotope,),
+        surface_diagnostic_points=np.array(
+            [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            dtype=float,
+        ),
+        shield_normals=np.asarray([[0.0, 0.0, 1.0]], dtype=float),
+        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
+        pf_config=RotatingShieldPFConfig(
+            num_particles=2,
+            max_sources=1,
+            variable_cardinality=False,
+            init_num_sources=(1, 1),
+            use_gpu=False,
+            planning_eig_samples=4,
+        ),
+        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
+        line_mu_by_isotope={isotope: line_mu},
+        full_spectrum_generative_model=model,
+        random_seed=9,
+    )
+    estimator.add_measurement_pose(np.array([1.0, 0.0, 0.0], dtype=float))
+    estimator._ensure_kernel_cache()
+    particles = estimator.filters[isotope].continuous_particles
+    particle_filter = estimator.filters[isotope]
+    for index, particle in enumerate(particles):
+        particle.state = _state_on_filter(
+            particle_filter,
+            np.array([[0.0, 0.0, 0.0]]),
+            np.array([float(10 + 10 * index)]),
+        )
+        particle.log_weight = float(np.log(0.5))
+    return estimator
 
 
 def test_dss_pp_uses_estimator_shared_continuous_kernel() -> None:
@@ -149,313 +231,327 @@ def test_dss_pp_default_aperture_samples_matches_pf_standard() -> None:
     assert DSSPPConfig().detector_aperture_samples == 121
 
 
-def test_select_best_orientation_prefers_unblocked_direction() -> None:
-    """Orientation with larger IG (unblocked) should be selected (Eqs. 3.40–3.45)."""
-    est = _build_simple_estimator()
-    mats = generate_octant_rotation_matrices()
-    from measurement.shielding import OctantShield, octant_index_from_rotation
+def test_dss_full_spectrum_components_and_eig_share_pf_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSS must sample and score the same source-resolved spectrum model."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    components = dss_pp._full_spectrum_joint_program_components(
+        estimator,
+        np.array([[1.0, 0.0, 0.0]], dtype=float),
+        [program],
+        joint,
+        live_time_s=3.0,
+        detector_aperture_samples=121,
+    )
+    model = estimator.full_spectrum_generative_model
+    mean = model.predict_mean_numpy(
+        components.total_pnvsl,
+        components.uncollided_pnvsl,
+        components.features_pnvslf,
+        components.live_times_v,
+    )
+    source_rate = np.sum(components.total_pnvsl, axis=(-2, -1))
 
-    oct_shield = OctantShield()
-    detector = np.array([1.0, 1.0, 1.0])
-    source = np.array([0.0, 0.0, 0.0])
-    blocked_mask = []
-    for R in mats:
-        idx = octant_index_from_rotation(R)
-        blocked_mask.append(
-            oct_shield.blocks_ray(
-                detector_position=detector, source_position=source, octant_index=idx
-            )
+    assert components.total_pnvsl.shape[:3] == (1, 2, 1)
+    assert np.all(
+        components.uncollided_pnvsl
+        <= components.total_pnvsl + 1.0e-12
+    )
+    node_rates = (
+        source_rate[..., None] * model._rate_scale_nodes_j
+        + float(model.background_rate_cps)
+    )
+    expected_totals = np.sum(
+        (
+            3.0
+            * node_rates
+            / (1.0 + node_rates * float(model.dead_time_tau_s))
         )
-
-    scores = []
-    for oid, (RFe, RPb) in enumerate(zip(mats, mats)):
-        score = select_best_orientation(
-            estimator=est,
-            pose_idx=0,
-            live_time_s=1.0,
-            RFe_candidates=[RFe],
-            RPb_candidates=[RPb],
-        )[1]
-        scores.append(score)
-    best_idx = int(np.argmax(scores))
-    # Ensure argmax is returned and scores are finite; we do not enforce a specific octant here.
-    assert scores[best_idx] == pytest.approx(max(scores))
-    assert np.all(np.isfinite(scores))
-
-
-def test_shield_selection_batch_grids_match_pairwise_scores() -> None:
-    """Batched shield-selection grids should match the pairwise score helpers."""
-    isotopes = ["Cs-137", "Co-60"]
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        init_num_sources=(1, 1),
-        use_gpu=False,
-        planning_particles=None,
-        planning_method="top_weight",
-        pose_min_observation_quantile=0.25,
+        * model._rate_scale_weights_j,
+        axis=-1,
     )
-    estimator = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=np.array([[1.0, 1.0, 0.5]], dtype=float),
-        shield_normals=None,
-        mu_by_isotope={"Cs-137": 0.4, "Co-60": 0.2},
-        pf_config=config,
-        shield_params=ShieldParams(),
+    np.testing.assert_allclose(
+        np.sum(mean, axis=-1),
+        expected_totals,
+        rtol=1.0e-10,
+        atol=1.0e-8,
     )
-    estimator.add_measurement_pose(np.array([4.0, 4.0, 0.5], dtype=float))
-    estimator._ensure_kernel_cache()
-    states_by_iso = {
-        "Cs-137": [
-            IsotopeState(
-                num_sources=1,
-                positions=np.array([[1.0, 2.0, 0.5]], dtype=float),
-                strengths=np.array([1000.0], dtype=float),
-                background=0.0,
-            ),
-            IsotopeState(
-                num_sources=1,
-                positions=np.array([[7.0, 2.0, 0.5]], dtype=float),
-                strengths=np.array([500.0], dtype=float),
-                background=0.0,
-            ),
-        ],
-        "Co-60": [
-            IsotopeState(
-                num_sources=1,
-                positions=np.array([[2.0, 8.0, 0.5]], dtype=float),
-                strengths=np.array([800.0], dtype=float),
-                background=0.0,
-            ),
-            IsotopeState(
-                num_sources=1,
-                positions=np.array([[8.0, 7.0, 0.5]], dtype=float),
-                strengths=np.array([300.0], dtype=float),
-                background=0.0,
-            ),
-        ],
-    }
-    for isotope, states in states_by_iso.items():
-        filt = estimator.filters[isotope]
-        filt.continuous_particles = [
-            IsotopeParticle(state=state, log_weight=np.log(weight))
-            for state, weight in zip(states, [0.7, 0.3])
-        ]
-    planning_particles = estimator.planning_particles()
-    signature_grid, count_grids = estimator.shield_selection_batch_grids(
-        pose_idx=0,
-        live_time_s=2.0,
-        particles_by_isotope=planning_particles,
-        alpha_by_isotope=None,
-        variance_floor=1.0,
-        include_count_quantiles=True,
+    cross_calls = 0
+    exact_cross_likelihood = model.cross_log_likelihood_numpy
+
+    def _record_exact_cross_likelihood(
+        *args: object,
+        **kwargs: object,
+    ) -> np.ndarray:
+        """Record use of the exact spectrum law while preserving its result."""
+        nonlocal cross_calls
+        cross_calls += 1
+        return exact_cross_likelihood(*args, **kwargs)
+
+    def _reject_mean_surrogate(*_args: object, **_kwargs: object) -> np.ndarray:
+        """Reject accidental replacement of the exact law by mean scoring."""
+        raise AssertionError("DSS EIG must not score a predictive-mean surrogate.")
+
+    monkeypatch.setattr(
+        model,
+        "cross_log_likelihood_numpy",
+        _record_exact_cross_likelihood,
     )
-
-    for fe_index in range(estimator.num_orientations):
-        for pb_index in range(estimator.num_orientations):
-            pairwise_signature = estimator.orientation_signature_separation_score(
-                pose_idx=0,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=2.0,
-                particles_by_isotope=planning_particles,
-                alpha_by_isotope=None,
-                variance_floor=1.0,
-            )
-            assert signature_grid[fe_index, pb_index] == pytest.approx(
-                pairwise_signature,
-                rel=1e-10,
-                abs=1e-10,
-            )
-            pairwise_counts = estimator.expected_observation_counts_by_isotope_at_pair(
-                pose_idx=0,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=2.0,
-                max_particles=None,
-            )
-            for isotope in isotopes:
-                assert count_grids[isotope][fe_index, pb_index] == pytest.approx(
-                    pairwise_counts[isotope],
-                    rel=1e-10,
-                    abs=1e-10,
-                )
-
-
-def test_multi_detector_all_pair_counts_match_serial_detector_calls() -> None:
-    """Batched detector responses must preserve the serial PF count model."""
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([matrix[:, 2] for matrix in normals], dtype=float)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[1.0, 1.0, 0.5]], dtype=float),
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.2, "pb": 0.3}},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=3,
-            max_sources=2,
-            variable_cardinality=False,
-            use_gpu=False,
-            init_num_sources=(0, 0),
-        ),
-        shield_params=ShieldParams(),
-    )
-    states = [
-        IsotopeState(
-            num_sources=2,
-            positions=np.array([[1.0, 2.0, 0.5], [4.0, 1.0, 1.5]]),
-            strengths=np.array([1200.0, 400.0]),
-            background=2.0,
-        ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[2.5, 3.0, 0.2]]),
-            strengths=np.array([750.0]),
-            background=4.0,
-        ),
-        IsotopeState(
-            num_sources=0,
-            positions=np.zeros((0, 3), dtype=float),
-            strengths=np.zeros(0, dtype=float),
-            background=3.0,
-        ),
-    ]
-    detectors = np.array([[5.0, 5.0, 0.5], [7.0, 2.0, 1.0]], dtype=float)
-
-    batched = estimator.expected_counts_all_pairs_for_states_at_detectors(
-        isotope="Cs-137",
-        detector_positions=detectors,
-        live_time_s=2.5,
-        states=states,
-    )
-    serial = np.stack(
-        [
-            estimator.expected_counts_all_pairs_for_states_at_detector(
-                isotope="Cs-137",
-                detector_pos=detector,
-                live_time_s=2.5,
-                states=states,
-            )
-            for detector in detectors
-        ],
-        axis=0,
-    )
-
-    assert batched.shape == (detectors.shape[0], 64, len(states))
-    assert np.all(np.isfinite(batched))
-    np.testing.assert_allclose(batched, serial, rtol=1.0e-12, atol=1.0e-12)
-
-
-def test_orientation_expected_information_gain_grid_cpu_fallback_matches_pairwise() -> (
-    None
-):
-    """All-pair EIG grid should preserve the pairwise CPU EIG calculation."""
-    estimator = _build_simple_estimator()
-    planning_particles = estimator.planning_particles()
-    mats = generate_octant_rotation_matrices()
-    grid = estimator.orientation_expected_information_gain_grid(
-        pose_idx=0,
-        live_time_s=1.0,
-        num_samples=0,
-        particles_by_isotope=planning_particles,
-    )
-    for fe_index, RFe in enumerate(mats[: estimator.num_orientations]):
-        for pb_index, RPb in enumerate(mats[: estimator.num_orientations]):
-            pairwise = estimator.orientation_expected_information_gain(
-                pose_idx=0,
-                RFe=RFe,
-                RPb=RPb,
-                live_time_s=1.0,
-                num_samples=0,
-                particles_by_isotope=planning_particles,
-            )
-            assert grid[fe_index, pb_index] == pytest.approx(pairwise)
-
-
-def test_planning_eig_numpy_torch_scoring_equivalence() -> None:
-    """NumPy and Torch EIG scoring should agree for fixed robust observations."""
-    torch = pytest.importorskip("torch")
-    lambdas = np.array(
-        [
-            [2.0, 12.0, 30.0],
-            [5.0, 20.0, 50.0],
-        ],
-        dtype=float,
-    )
-    weights = np.array([0.2, 0.3, 0.5], dtype=float)
-    observations = np.array(
-        [
-            [1.0, 8.0, 18.0, 32.0],
-            [3.0, 16.0, 35.0, 55.0],
-        ],
-        dtype=float,
-    )
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        transport_model_rel_sigma=0.2,
-        transport_model_abs_sigma=3.0,
-        spectrum_count_rel_sigma=0.1,
-        spectrum_count_abs_sigma=4.0,
-        low_count_abs_sigma=10.0,
-        low_count_transition_counts=80.0,
-        student_t_df=5.0,
-    )
-
-    expected = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
-        lambdas,
-        weights,
-        spec=spec,
-        num_samples=observations.shape[1],
+    monkeypatch.setattr(model, "predict_mean_numpy", _reject_mean_surrogate)
+    gains = dss_pp._full_spectrum_information_gain(
+        estimator,
+        components,
+        joint.weights_n,
+        sample_count=4,
         rng=np.random.default_rng(17),
-        observations_as=observations,
+        use_gpu=False,
+        gpu_device="cpu",
     )
-    actual = RotatingShieldPFEstimator._planning_eig_from_lambdas_torch(
-        torch.as_tensor(lambdas, dtype=torch.float64),
-        torch.as_tensor(weights, dtype=torch.float64),
-        spec=spec,
-        num_samples=observations.shape[1],
-        observations_as=torch.as_tensor(observations, dtype=torch.float64),
+    assert gains.shape == (1,)
+    assert np.all(np.isfinite(gains))
+    assert np.all(gains >= 0.0)
+    assert cross_calls == 1
+    pytest.importorskip("torch")
+    torch_gains = dss_pp._full_spectrum_information_gain(
+        estimator,
+        components,
+        joint.weights_n,
+        sample_count=4,
+        rng=np.random.default_rng(17),
+        use_gpu=True,
+        gpu_device="cpu",
+    )
+    np.testing.assert_allclose(
+        torch_gains,
+        gains,
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
+
+
+def test_dss_full_spectrum_proxy_matches_direct_reduced_eig() -> None:
+    """Proxy scheduling must preserve the exact joint spectrum calculation."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    detectors = np.asarray(
+        [[1.0, 0.0, 0.0], [1.5, 0.25, 0.0]],
+        dtype=np.float64,
+    )
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    config = DSSPPConfig(
+        max_programs=1,
+        program_length=1,
+        forced_program_pair_ids=(0,),
+        live_time_s=1.0,
+        detector_aperture_samples=121,
+        proxy_eig_samples=2,
+        exact_eig_coverage_reserve=0,
+        exact_eig_program_diversity_reserve=0,
+    )
+    proxy_diagnostics: dict[str, object] = {}
+    proxy_scores = dss_pp._program_information_proxy_for_poses(
+        estimator,
+        detectors,
+        [program],
+        config=config,
+        joint_particles=joint,
+        rng=np.random.default_rng(91),
+        eig_call_seed=1234,
+        diagnostics=proxy_diagnostics,
+    )
+    direct_scores = dss_pp._program_information_gains_for_poses(
+        estimator,
+        detectors,
+        [[program], [program]],
+        config=config,
+        joint_particles=joint,
+        rng=np.random.default_rng(123),
+        sample_count_override=2,
+        eig_call_seed=1234,
+        memory_budget_bytes_override=config.proxy_memory_budget_bytes,
+    )
+
+    assert proxy_scores.shape == (2, 1)
+    np.testing.assert_allclose(
+        proxy_scores,
+        np.vstack(direct_scores),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert proxy_diagnostics["backend"] == "numpy"
+
+
+def test_dss_exact_eig_is_action_batch_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical action RNG streams must remove batching-order dependence."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    detectors = np.asarray(
+        [[1.0, 0.0, 0.0], [1.25, 0.0, 0.0], [1.5, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    programs_by_pose = [[program] for _ in range(detectors.shape[0])]
+    config = DSSPPConfig(
+        max_programs=1,
+        program_length=1,
+        forced_program_pair_ids=(0,),
+        live_time_s=1.0,
+        exact_eig_coverage_reserve=0,
+        exact_eig_program_diversity_reserve=0,
+    )
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_dss_eig_action_batch_size",
+        lambda *_args, **_kwargs: 1,
+    )
+    scalar_batches = dss_pp._program_information_gains_for_poses(
+        estimator,
+        detectors,
+        programs_by_pose,
+        config=config,
+        rng=np.random.default_rng(991),
+        joint_particles=joint,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "_dss_eig_action_batch_size",
+        lambda *_args, **_kwargs: 3,
+    )
+    one_batch = dss_pp._program_information_gains_for_poses(
+        estimator,
+        detectors,
+        programs_by_pose,
+        config=config,
+        rng=np.random.default_rng(991),
+        joint_particles=joint,
     )
 
     np.testing.assert_allclose(
-        actual.detach().cpu().numpy(),
-        expected,
-        rtol=1.0e-12,
-        atol=1.0e-12,
+        np.concatenate(one_batch),
+        np.concatenate(scalar_batches),
+        rtol=0.0,
+        atol=0.0,
     )
 
 
-def test_planning_eig_decreases_with_declared_model_noise() -> None:
-    """Larger runtime model uncertainty should reduce Monte-Carlo action EIG."""
-    lambdas = np.array([[2.0, 25.0], [5.0, 60.0]], dtype=float)
-    weights = np.array([0.5, 0.5], dtype=float)
-    certain_spec = CountLikelihoodSpec(
-        model="student_t",
-        student_t_df=5.0,
+def test_dss_exact_eig_halves_and_retries_after_oom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recoverable action-batch OOM must preserve the exact EIG result."""
+    estimator = _build_full_spectrum_planning_estimator()
+    joint = estimator.planning_joint_particles()
+    detectors = np.asarray(
+        [[1.0, 0.0, 0.0], [1.25, 0.0, 0.0], [1.5, 0.0, 0.0]],
+        dtype=np.float64,
     )
-    uncertain_spec = CountLikelihoodSpec(
-        model="student_t",
-        spectrum_count_abs_sigma=100.0,
-        student_t_df=5.0,
+    program = dss_pp.ShieldProgram(
+        name="one_view",
+        pair_ids=(0,),
+        kind="test",
+    )
+    programs_by_pose = [[program] for _ in range(detectors.shape[0])]
+    config = DSSPPConfig(
+        max_programs=1,
+        program_length=1,
+        forced_program_pair_ids=(0,),
+        live_time_s=1.0,
+        exact_eig_coverage_reserve=0,
+        exact_eig_program_diversity_reserve=0,
+    )
+    exact_batch_size = dss_pp._dss_eig_action_batch_size
+    monkeypatch.setattr(
+        dss_pp,
+        "_dss_eig_action_batch_size",
+        lambda *_args, **_kwargs: 1,
+    )
+    expected = dss_pp._program_information_gains_for_poses(
+        estimator,
+        detectors,
+        programs_by_pose,
+        config=config,
+        rng=np.random.default_rng(773),
+        joint_particles=joint,
     )
 
-    certain = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
-        lambdas,
-        weights,
-        spec=certain_spec,
-        num_samples=8192,
-        rng=np.random.default_rng(29),
+    exact_information_gain = dss_pp._full_spectrum_information_gain
+    attempted_action_counts: list[int] = []
+    raised = False
+
+    def fail_first_multi_action_batch(
+        *args: object,
+        **kwargs: object,
+    ) -> np.ndarray:
+        """Raise once for a multi-action batch, then run the exact evaluator."""
+        nonlocal raised
+        components = args[1]
+        action_count = int(np.asarray(components.total_pnvsl).shape[0])
+        attempted_action_counts.append(action_count)
+        if action_count > 1 and not raised:
+            raised = True
+            raise MemoryError("synthetic DSS action-batch OOM")
+        return exact_information_gain(*args, **kwargs)
+
+    def three_action_batch(*args: object, **kwargs: object) -> int:
+        """Populate the real memory contract, then force one retry fixture."""
+        exact_batch_size(*args, **kwargs)
+        return 3
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_dss_eig_action_batch_size",
+        three_action_batch,
     )
-    uncertain = RotatingShieldPFEstimator._planning_eig_from_lambdas_np(
-        lambdas,
-        weights,
-        spec=uncertain_spec,
-        num_samples=8192,
-        rng=np.random.default_rng(29),
+    monkeypatch.setattr(
+        dss_pp,
+        "_full_spectrum_information_gain",
+        fail_first_multi_action_batch,
+    )
+    diagnostics: dict[str, object] = {}
+    actual = dss_pp._program_information_gains_for_poses(
+        estimator,
+        detectors,
+        programs_by_pose,
+        config=config,
+        rng=np.random.default_rng(773),
+        joint_particles=joint,
+        diagnostics=diagnostics,
     )
 
-    assert np.all(certain > uncertain)
+    assert attempted_action_counts[0] == 3
+    assert all(count == 1 for count in attempted_action_counts[1:])
+    assert diagnostics["oom_retry_count"] == 1
+    assert diagnostics["cpu_fallback_used"] is False
+    assert diagnostics["attempted_action_batch_sizes"] == [3, 1, 1, 1]
+    assert diagnostics["successful_action_batch_sizes"] == [1, 1, 1]
+    memory_contracts = diagnostics["memory_contracts"]
+    assert isinstance(memory_contracts, list)
+    assert len(memory_contracts) == 1
+    assert memory_contracts[0]["model_working_set_bytes"] > 0
+    assert memory_contracts[0]["persistent_per_action_bytes"] > 0
+    np.testing.assert_allclose(
+        np.concatenate(actual),
+        np.concatenate(expected),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() -> None:
@@ -482,6 +578,45 @@ def test_candidate_generation_adds_map_cells_when_random_sampling_is_sparse() ->
     )
 
     assert any(np.allclose(candidate, [8.5, 8.5, 0.5]) for candidate in candidates)
+
+
+def test_candidate_generation_rejects_missing_or_inverted_bounds() -> None:
+    """A hidden default cube or reordered bounds can exclude the true workspace."""
+    common = {
+        "current_pose_xyz": np.asarray([0.5, 0.5, 0.5], dtype=float),
+        "map_api": None,
+        "n_candidates": 4,
+        "rng": np.random.default_rng(7),
+    }
+    with pytest.raises(ValueError, match="explicit environment bounds"):
+        generate_candidate_poses(**common)
+    with pytest.raises(ValueError, match="finite ordered"):
+        generate_candidate_poses(
+            **common,
+            bounds_xyz=(
+                np.asarray([2.0, 0.0, 0.0], dtype=float),
+                np.asarray([1.0, 1.0, 1.0], dtype=float),
+            ),
+        )
+
+
+def test_candidate_generation_rejects_unknown_map_capabilities() -> None:
+    """Unknown maps must not silently mark obstacles or paths as free."""
+
+    class UnknownMap:
+        """Deliberately omit every free-space map contract."""
+
+    with pytest.raises(TypeError, match="is_free_batch"):
+        generate_candidate_poses(
+            current_pose_xyz=np.asarray([0.5, 0.5, 0.5], dtype=float),
+            map_api=UnknownMap(),
+            n_candidates=4,
+            bounds_xyz=(
+                np.zeros(3, dtype=float),
+                np.ones(3, dtype=float),
+            ),
+            rng=np.random.default_rng(7),
+        )
 
 
 def test_candidate_generation_replenishes_after_batch_reachability_filter() -> None:
@@ -573,7 +708,6 @@ def test_candidate_filter_prefers_batched_free_space_path() -> None:
         candidates,
         visited_poses_xyz=None,
         min_dist_from_visited=0.0,
-        is_free_fn=candidate_generation._resolve_free_space_checker(planning_map),
         is_free_batch_fn=(
             candidate_generation._resolve_free_space_batch_checker(planning_map)
         ),
@@ -608,64 +742,14 @@ def test_candidate_height_expansion_matches_scalar_oracle() -> None:
     assert np.allclose(expanded, expected)
 
 
-def test_candidate_generation_keeps_same_xy_alternate_height_action() -> None:
-    """A height partner should bypass horizontal station-spacing rejection."""
-    current = np.array([1.0, 1.0, 0.5], dtype=float)
-    candidates = generate_candidate_poses(
-        current_pose_xyz=current,
-        n_candidates=8,
-        strategy="free_space_sobol",
-        min_dist_from_visited=3.0,
-        visited_poses_xyz=current.reshape(1, 3),
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.5], dtype=float),
-            np.array([10.0, 10.0, 1.5], dtype=float),
-        ),
-        rng=np.random.default_rng(11),
-        detector_heights_m=[0.5, 1.5],
-        include_current_xy_height_actions=True,
-    )
-
-    assert any(np.allclose(candidate, [1.0, 1.0, 1.5]) for candidate in candidates)
-    assert not any(np.allclose(candidate, current) for candidate in candidates)
-
-
-def test_candidate_generation_adds_continuous_same_xy_height_anchors() -> None:
-    """Continuous planning should add useful same-xy anchors without a height list."""
-    current = np.array([1.0, 1.0, 0.5], dtype=float)
-    candidates = generate_candidate_poses(
-        current_pose_xyz=current,
-        n_candidates=24,
-        strategy="free_space_sobol",
-        min_dist_from_visited=3.0,
-        visited_poses_xyz=current.reshape(1, 3),
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.5], dtype=float),
-            np.array([10.0, 10.0, 1.5], dtype=float),
-        ),
-        rng=np.random.default_rng(23),
-        include_current_xy_height_actions=True,
-        continuous_height_anchor_count=16,
-        allow_height_partners=True,
-        height_partner_min_z_separation_m=0.4,
-    )
-
-    same_xy = np.linalg.norm(candidates[:, :2] - current[None, :2], axis=1) <= 1e-12
-    anchors = candidates[same_xy]
-    assert anchors.shape[0] > 1
-    assert np.all(np.abs(anchors[:, 2] - current[2]) >= 0.4)
-    assert np.all((anchors[:, 2] >= 0.5) & (anchors[:, 2] <= 1.5))
-    assert np.any(~np.isclose(anchors[:, 2], 1.5))
-
-
-def test_continuous_height_partner_requires_minimum_z_separation() -> None:
-    """Tiny continuous height jitter must not bypass station-spacing rejection."""
+def test_candidate_filter_uses_one_generic_3d_separation() -> None:
+    """Vertical and lateral actions must obey the same Euclidean spacing."""
     visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
     candidates = np.array(
         [
             [1.0, 1.0, 0.5001],
-            [1.0, 1.0, 1.1],
-            [5.0, 1.0, 0.5001],
+            [1.0, 1.0, 3.5],
+            [4.0, 1.0, 0.5],
         ],
         dtype=float,
     )
@@ -674,23 +758,23 @@ def test_continuous_height_partner_requires_minimum_z_separation() -> None:
         candidates,
         visited,
         3.0,
-        lambda _candidate: True,
-        allow_height_partners=True,
-        height_partner_min_z_separation_m=0.5,
+        is_free_batch_fn=lambda points: np.ones(
+            np.asarray(points).shape[0],
+            dtype=bool,
+        ),
     )
 
     assert np.allclose(filtered, candidates[1:])
 
 
-def test_dss_station_spacing_preserves_height_partner_only() -> None:
-    """DSS station filtering should preserve a distinct-height revisit."""
+def test_dss_station_spacing_uses_one_generic_3d_separation() -> None:
+    """DSS filtering and revisit penalties must use Euclidean XYZ distance."""
     visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
     candidates = np.array(
         [
             [1.0, 1.0, 0.5],
-            [1.0, 1.0, 1.5],
-            [1.5, 1.0, 0.5],
-            [5.0, 1.0, 0.5],
+            [1.0, 1.0, 3.5],
+            [4.0, 1.0, 0.5],
         ],
         dtype=float,
     )
@@ -706,150 +790,10 @@ def test_dss_station_spacing_preserves_height_partner_only() -> None:
         min_separation_m=3.0,
     )
 
-    assert removed == 2
-    assert np.allclose(filtered, [[1.0, 1.0, 1.5], [5.0, 1.0, 0.5]])
+    assert removed == 1
+    assert np.allclose(filtered, candidates[1:])
     assert penalties[1] == pytest.approx(0.0)
     assert penalties[0] > 0.0
-
-
-def test_height_partner_filter_rejects_already_visited_actions_and_uses_xy_spacing() -> (
-    None
-):
-    """Visited heights must not reopen duplicates or hide short horizontal moves."""
-    visited = np.array(
-        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
-        dtype=float,
-    )
-    candidates = np.array(
-        [
-            [1.0, 1.0, 0.5],
-            [1.0, 1.0, 1.5],
-            [1.0, 1.0, 2.5],
-            [3.9, 1.0, 2.5],
-            [4.1, 1.0, 1.5],
-        ],
-        dtype=float,
-    )
-
-    filtered = candidate_generation._filter_candidates(
-        candidates,
-        visited,
-        3.0,
-        lambda _candidate: True,
-        allow_height_partners=True,
-    )
-
-    assert np.allclose(
-        filtered,
-        [[1.0, 1.0, 2.5], [4.1, 1.0, 1.5]],
-    )
-
-
-def test_height_partner_filter_uses_current_station_and_shared_tolerance() -> None:
-    """Only the current station may reopen spacing for an alternate height."""
-    visited = np.array(
-        [[1.0, 1.0, 0.5], [5.0, 5.0, 0.5]],
-        dtype=float,
-    )
-    current = visited[-1]
-    candidates = np.array(
-        [
-            [1.0, 1.0, 1.5],
-            [5.0 + 5.0e-7, 5.0, 1.5],
-            [9.0, 9.0, 1.5],
-        ],
-        dtype=float,
-    )
-
-    filtered = candidate_generation._filter_candidates(
-        candidates,
-        visited,
-        3.0,
-        lambda _candidate: True,
-        allow_height_partners=True,
-        height_partner_reference_xyz=current,
-        height_partner_xy_tolerance_m=1.0e-6,
-    )
-
-    assert np.allclose(filtered, candidates[1:])
-
-
-def test_dss_height_partner_mask_uses_current_station_and_shared_tolerance() -> None:
-    """Planner pairing must match runtime xy tolerance at the current station."""
-    visited = np.array(
-        [[1.0, 1.0, 0.5], [5.0, 5.0, 0.5]],
-        dtype=float,
-    )
-    candidates = np.array(
-        [[1.0, 1.0, 1.5], [5.0 + 5.0e-7, 5.0, 1.5]],
-        dtype=float,
-    )
-
-    shared_tolerance_mask = dss_pp._height_partner_mask_batch(
-        candidates,
-        visited,
-        reference_pose_xyz=visited[-1],
-        xy_tolerance_m=1.0e-6,
-    )
-    strict_tolerance_mask = dss_pp._height_partner_mask_batch(
-        candidates,
-        visited,
-        reference_pose_xyz=visited[-1],
-        xy_tolerance_m=1.0e-9,
-    )
-
-    assert shared_tolerance_mask.tolist() == [False, True]
-    assert strict_tolerance_mask.tolist() == [False, False]
-
-
-def test_dss_height_partner_mask_requires_minimum_z_separation() -> None:
-    """DSS should not classify sub-threshold height jitter as a paired action."""
-    visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
-    candidates = np.array(
-        [[1.0, 1.0, 0.5001], [1.0, 1.0, 1.1]],
-        dtype=float,
-    )
-
-    mask = dss_pp._height_partner_mask_batch(
-        candidates,
-        visited,
-        min_z_separation_m=0.5,
-    )
-
-    assert mask.tolist() == [False, True]
-
-
-def test_dss_height_partner_requires_an_unvisited_height_action() -> None:
-    """DSS should waive revisit costs only for a genuinely new height action."""
-    visited = np.array(
-        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
-        dtype=float,
-    )
-    candidates = np.array(
-        [
-            [1.0, 1.0, 0.5],
-            [1.0, 1.0, 1.5],
-            [1.0, 1.0, 2.5],
-            [5.0, 1.0, 0.5],
-        ],
-        dtype=float,
-    )
-
-    filtered, removed = dss_pp._filter_station_separation(
-        candidates,
-        visited,
-        min_separation_m=3.0,
-    )
-    penalties = dss_pp._station_revisit_penalties_batch(
-        candidates,
-        visited,
-        min_separation_m=3.0,
-    )
-
-    assert removed == 2
-    assert np.allclose(filtered, [[1.0, 1.0, 2.5], [5.0, 1.0, 0.5]])
-    assert np.all(penalties[:2] > 0.0)
-    assert penalties[2] == pytest.approx(0.0)
 
 
 def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> None:
@@ -881,7 +825,7 @@ def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> N
         np.array([0.0, 0.0, 0.25], dtype=float),
         np.array([2.0, 2.0, 1.75], dtype=float),
     )
-    config = DSSPPConfig(max_augmented_candidates=16, rng_seed=17)
+    config = DSSPPConfig(max_augmented_candidates=16)
 
     continuous = dss_pp.augment_candidate_stations(
         base,
@@ -892,6 +836,7 @@ def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> N
         bounds_xyz=bounds,
         config=config,
         continuous_height_bounds_m=(0.25, 1.75),
+        rng=np.random.default_rng(17),
     )
     legacy = dss_pp.augment_candidate_stations(
         base,
@@ -901,6 +846,7 @@ def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> N
         map_api=planning_map,
         bounds_xyz=bounds,
         config=config,
+        rng=np.random.default_rng(17),
     )
 
     assert planning_map.batch_calls == 2
@@ -912,6 +858,184 @@ def test_dss_continuous_augmentation_preserves_base_and_uses_batch_filter() -> N
     )
     assert np.allclose(legacy[: base.shape[0]], base)
     assert np.allclose(legacy[base.shape[0] :, 2], current[2])
+
+
+def test_dss_augmented_geometry_matches_scalar_test_oracle() -> None:
+    """Batched ring and cross-bearing construction must preserve geometry."""
+    base = np.array([[9.0, 9.0, 0.5]], dtype=np.float64)
+    current = np.array([5.0, 5.0, 0.5], dtype=np.float64)
+    visited = np.array(
+        [[2.0, 0.0, 0.5], [0.0, 3.0, 1.0]],
+        dtype=np.float64,
+    )
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+            strength_cps_1m=100.0,
+            weight=0.7,
+            spread_m=0.2,
+        ),
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.array([4.0, 1.0, 1.0], dtype=np.float64),
+            strength_cps_1m=50.0,
+            weight=0.3,
+            spread_m=0.4,
+        ),
+    ]
+    config = DSSPPConfig(
+        ring_radii_m=(1.0, 2.0),
+        ring_angles=4,
+        max_augmented_candidates=512,
+    )
+
+    actual = dss_pp.augment_candidate_stations(
+        base,
+        modes_by_isotope={"Cs-137": modes},
+        current_pose_xyz=current,
+        visited_poses_xyz=visited,
+        map_api=None,
+        bounds_xyz=None,
+        config=config,
+        rng=np.random.default_rng(31),
+    )
+
+    scalar_points = [base[0].copy()]
+    angles = np.linspace(0.0, 2.0 * np.pi, 4, endpoint=False)
+    for mode in modes:
+        for radius in config.ring_radii_m:
+            for angle in angles:
+                scalar_points.append(
+                    np.array(
+                        [
+                            mode.position_xyz[0] + radius * np.cos(angle),
+                            mode.position_xyz[1] + radius * np.sin(angle),
+                            current[2],
+                        ],
+                        dtype=np.float64,
+                    )
+                )
+    for mode in modes:
+        for pose in visited:
+            delta = pose[:2] - mode.position_xyz[:2]
+            base_angle = float(np.arctan2(delta[1], delta[0]))
+            for offset in (0.5 * np.pi, -0.5 * np.pi, np.pi):
+                for radius in config.ring_radii_m:
+                    angle = base_angle + offset
+                    scalar_points.append(
+                        np.array(
+                            [
+                                mode.position_xyz[0] + radius * np.cos(angle),
+                                mode.position_xyz[1] + radius * np.sin(angle),
+                                current[2],
+                            ],
+                            dtype=np.float64,
+                        )
+                    )
+    expected = dss_pp._dedupe_points(np.vstack(scalar_points))
+
+    assert actual.shape == expected.shape
+    actual_order = np.lexsort((actual[:, 2], actual[:, 1], actual[:, 0]))
+    expected_order = np.lexsort(
+        (expected[:, 2], expected[:, 1], expected[:, 0])
+    )
+    assert np.allclose(actual[actual_order], expected[expected_order])
+
+
+def test_dss_grid_augmentation_uses_batched_cell_centers() -> None:
+    """Boundary and coverage candidates must avoid scalar cell callbacks."""
+
+    class BatchCellMap:
+        """Expose vectorized planning geometry and reject scalar callbacks."""
+
+        origin = (0.0, 0.0)
+        cell_size = 1.0
+        grid_shape = (3, 2)
+        traversable_cells = ((0, 0), (0, 1), (1, 0), (2, 1))
+
+        def __init__(self) -> None:
+            """Initialize callback accounting."""
+            self.center_batch_calls = 0
+
+        def cell_center(self, _cell: tuple[int, int]) -> tuple[float, float]:
+            """Reject accidental scalar center construction."""
+            raise AssertionError("scalar cell-center path must not be selected")
+
+        def cell_centers_batch(self, cells: np.ndarray) -> np.ndarray:
+            """Return all requested centers in one numerical batch."""
+            self.center_batch_calls += 1
+            return np.asarray(cells, dtype=np.float64) + 0.5
+
+        @staticmethod
+        def is_free_batch(points: np.ndarray) -> np.ndarray:
+            """Accept the fixture's candidate batch."""
+            return np.ones(np.asarray(points).shape[0], dtype=bool)
+
+    planning_map = BatchCellMap()
+    result = dss_pp.augment_candidate_stations(
+        np.array([[0.5, 0.5, 0.5]], dtype=np.float64),
+        modes_by_isotope={},
+        current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=np.float64),
+        visited_poses_xyz=None,
+        map_api=planning_map,
+        bounds_xyz=None,
+        config=DSSPPConfig(max_augmented_candidates=32),
+        rng=np.random.default_rng(37),
+    )
+
+    assert planning_map.center_batch_calls == 2
+    assert result.shape[1] == 3
+    assert any(np.allclose(row, [2.5, 1.5, 0.5]) for row in result)
+
+
+def test_batched_bearing_diversity_matches_scalar_test_oracle() -> None:
+    """Candidate-by-mode-by-visit bearings must match the scalar oracle."""
+    candidates = np.array(
+        [[1.0, 2.0, 0.5], [3.0, -1.0, 1.0], [5.0, 4.0, 2.0]],
+        dtype=np.float64,
+    )
+    visited = np.array(
+        [[-2.0, 1.0, 0.5], [4.0, 3.0, 1.5]],
+        dtype=np.float64,
+    )
+    modes_by_isotope = {
+        "Cs-137": [
+            dss_pp.SignatureMode(
+                isotope="Cs-137",
+                position_xyz=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+                strength_cps_1m=100.0,
+                weight=0.6,
+                spread_m=0.2,
+            ),
+            dss_pp.SignatureMode(
+                isotope="Cs-137",
+                position_xyz=np.array([4.0, 0.5, 1.0], dtype=np.float64),
+                strength_cps_1m=80.0,
+                weight=0.4,
+                spread_m=0.3,
+            ),
+        ]
+    }
+
+    actual = dss_pp._bearing_diversity_gains_batch(
+        candidates,
+        visited,
+        modes_by_isotope,
+    )
+    expected = np.asarray(
+        [
+            dss_pp._bearing_diversity_gain(
+                candidate,
+                visited,
+                modes_by_isotope,
+            )
+            for candidate in candidates
+        ],
+        dtype=np.float64,
+    )
+
+    assert np.allclose(actual, expected, rtol=0.0, atol=1.0e-12)
 
 
 def test_dss_path_cache_distinguishes_exact_xyz_inside_one_cell() -> None:
@@ -1085,28 +1209,22 @@ def test_dss_selection_uses_batch_lengths_for_filter_and_node_build() -> None:
 
     result = select_dss_pp_next_station(
         estimator=estimator,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([0.5, 0.5, 0.5], dtype=float),
         visited_poses_xyz=None,
         map_api=planning_map,
         config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
+            max_programs=4,
             program_length=1,
+            forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=1.0,
             lambda_rotation=0.0,
             lambda_coverage=0.0,
             eta_revisit=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
             min_station_separation_m=0.0,
-            signature_std_min_counts=0.0,
-            enforce_min_observation=False,
             augment_candidates=False,
         ),
     )
@@ -1124,474 +1242,166 @@ def test_estimate_lambda_cost_range_scales_motion() -> None:
     assert lam == pytest.approx(expected)
 
 
-def test_minimum_observation_shortfall_is_zero_only_when_all_isotopes_visible() -> None:
-    """Observation shortfall should penalize any isotope below the count target."""
-    assert minimum_observation_shortfall(
-        {"Cs-137": 5.0, "Co-60": 5.0},
-        min_counts=5.0,
-    ) == pytest.approx(0.0)
-    assert (
-        minimum_observation_shortfall(
-            {"Cs-137": 5.0, "Co-60": 0.0},
-            min_counts=5.0,
-        )
-        > 0.0
-    )
-
-
-def test_pose_selection_prefers_all_isotope_observability() -> None:
-    """Soft observability constraints should prevent single-isotope pose bias."""
-
-    class _FairnessEstimator:
-        """Minimal estimator exposing the pose-planning methods under test."""
-
-        pf_config = None
-
-        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
-            """Return identical uncertainty for every candidate."""
-            return 0.0
-
-        def expected_observation_counts_by_isotope_at_pose(
-            self,
-            pose_xyz: np.ndarray,
-            **kwargs: object,
-        ) -> dict[str, float]:
-            """Return candidate-dependent isotope observability."""
-            if float(pose_xyz[0]) < 0.5:
-                return {"Cs-137": 10.0, "Co-60": 0.0}
-            return {"Cs-137": 5.0, "Co-60": 5.0}
-
-    candidates = np.array([[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]], dtype=float)
-    selected = select_next_pose_from_candidates(
-        estimator=_FairnessEstimator(),
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        lambda_cost=0.0,
-        min_observation_counts=5.0,
-        min_observation_penalty_scale=1.0,
-        num_rollouts=1,
-    )
-
-    assert selected == 1
-
-
-def test_pose_selection_enforces_observability_when_feasible() -> None:
-    """Feasible all-isotope candidates should dominate even with zero penalty scale."""
-
-    class _FairnessEstimator:
-        """Minimal estimator exposing candidate-dependent predictions."""
-
-        pf_config = None
-
-        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
-            """Return a lower uncertainty for the infeasible candidate."""
-            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
-            return 0.0 if float(pose[0]) < 0.5 else 100.0
-
-        def expected_observation_counts_by_isotope_at_pose(
-            self,
-            pose_xyz: np.ndarray,
-            **kwargs: object,
-        ) -> dict[str, float]:
-            """Return one single-isotope-biased and one all-isotope-visible pose."""
-            if float(pose_xyz[0]) < 0.5:
-                return {"Cs-137": 100.0, "Co-60": 0.0}
-            return {"Cs-137": 5.0, "Co-60": 5.0}
-
-    selected = select_next_pose_from_candidates(
-        estimator=_FairnessEstimator(),
-        candidate_poses_xyz=np.array(
-            [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]],
-            dtype=float,
-        ),
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        lambda_cost=0.0,
-        min_observation_counts=5.0,
-        min_observation_penalty_scale=0.0,
-        num_rollouts=1,
-    )
-
-    assert selected == 1
-
-
-def test_pose_selection_uses_planning_particle_cap_for_observability() -> None:
-    """One-step observability scoring should use the configured planning subset."""
-
-    class _Config:
-        """Minimal PF config exposing the planning particle cap."""
-
-        lambda_cost = 0.0
-        ig_threshold = 0.0
-        max_dwell_time_s = 2.0
-        planning_rollout_particles = 7
-        planning_particles = None
-
-    class _Estimator:
-        """Minimal estimator recording observability kwargs."""
-
-        pf_config = _Config()
-
-        def __init__(self) -> None:
-            """Initialize call recording."""
-            self.max_particles_seen: list[int | None] = []
-
-        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
-            """Return identical uncertainty for every candidate."""
-            return 0.0
-
-        def expected_observation_counts_by_isotope_at_pose(
-            self,
-            pose_xyz: np.ndarray,
-            **kwargs: object,
-        ) -> dict[str, float]:
-            """Record the particle cap used for observability scoring."""
-            self.max_particles_seen.append(kwargs.get("max_particles"))
-            return {"Cs-137": 10.0}
-
-    estimator = _Estimator()
-    selected = select_next_pose_from_candidates(
-        estimator=estimator,
-        candidate_poses_xyz=np.array(
-            [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5]],
-            dtype=float,
-        ),
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        min_observation_counts=5.0,
-        num_rollouts=1,
-    )
-
-    assert selected == 0
-    assert estimator.max_particles_seen == [7, 7]
-
-
-def test_pose_selection_parallel_matches_serial_selection() -> None:
-    """Parallel one-step candidate evaluation should preserve serial scores."""
-
-    class _Config:
-        """Minimal PF config for deterministic one-step pose selection."""
-
-        lambda_cost = 0.0
-        ig_threshold = 0.0
-        max_dwell_time_s = 2.0
-        planning_rollout_particles = None
-        planning_particles = None
-        use_gpu = False
-        ig_workers = 4
-
-    class _Estimator:
-        """Deterministic estimator whose score depends only on the pose."""
-
-        pf_config = _Config()
-
-        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
-            """Return a smooth deterministic uncertainty surface."""
-            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
-            return float((pose[0] - 2.0) ** 2 + 0.1 * pose[1] ** 2)
-
-    candidates = np.array(
-        [
-            [0.0, 0.0, 0.5],
-            [1.5, 1.0, 0.5],
-            [2.0, 0.2, 0.5],
-            [3.0, 0.0, 0.5],
-        ],
-        dtype=float,
-    )
-    serial_idx = select_next_pose_from_candidates(
-        estimator=_Estimator(),
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        lambda_cost=0.0,
-        num_rollouts=1,
-        worker_count=1,
-        rng_seed=123,
-    )
-    parallel_idx = select_next_pose_from_candidates(
-        estimator=_Estimator(),
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        lambda_cost=0.0,
-        num_rollouts=1,
-        worker_count=3,
-        rng_seed=123,
-    )
-
-    assert parallel_idx == serial_idx == 2
-
-
-def test_pose_selection_gpu_override_allows_parallel_candidate_workers(
-    capsys,
-) -> None:
-    """Explicit CPU planning override should keep worker-parallel evaluation."""
-
-    class _Config:
-        """Minimal PF config that defaults to GPU-enabled planning."""
-
-        lambda_cost = 0.0
-        ig_threshold = 0.0
-        max_dwell_time_s = 2.0
-        planning_rollout_particles = None
-        planning_particles = None
-        use_gpu = True
-        gpu_device = "cuda"
-        gpu_dtype = "float32"
-        ig_workers = 4
-
-    class _Estimator:
-        """Deterministic estimator that records the active GPU flag."""
-
-        pf_config = _Config()
-
-        def __init__(self) -> None:
-            """Initialize the active GPU-state recorder."""
-            self.use_gpu_seen: list[bool] = []
-
-        def expected_uncertainty_after_rotation(self, **kwargs: object) -> float:
-            """Return a deterministic uncertainty and record GPU state."""
-            pose = np.asarray(kwargs["pose_xyz"], dtype=float)
-            self.use_gpu_seen.append(bool(self.pf_config.use_gpu))
-            return float((pose[0] - 2.0) ** 2 + 0.1 * pose[1] ** 2)
-
-    estimator = _Estimator()
-    candidates = np.array(
-        [
-            [0.0, 0.0, 0.5],
-            [2.0, 0.2, 0.5],
-            [3.0, 0.0, 0.5],
-        ],
-        dtype=float,
-    )
-    selected = select_next_pose_from_candidates(
-        estimator=estimator,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        lambda_cost=0.0,
-        num_rollouts=1,
-        worker_count=3,
-        rng_seed=123,
-        verbose=True,
-        use_gpu=False,
-        ig_breakdown_k=0,
-    )
-
-    output = capsys.readouterr().out
-    assert selected == 1
-    assert "Candidate evaluation mode: 3 workers." in output
-    assert estimator.use_gpu_seen == [False, False, False]
-    assert estimator.pf_config.use_gpu is True
-
-
-def test_orientation_expected_information_gain_positive_when_strengths_differ() -> None:
-    """Monte-Carlo EIG (Eq. 3.44) should be positive when particles predict different Λ."""
-    np.random.seed(0)
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.0]], dtype=float)
-    normals = np.array([[1.0, 0.0, 0.0]], dtype=float)
-    mu = {"Cs-137": 0.5}
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=normals,
-        mu_by_isotope=mu,
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([1.0, 0.0, 0.0]))
-    est._ensure_kernel_cache()
-    # Overwrite continuous particles with distinct strengths
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([10.0]),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.0]]),
-                strengths=np.array([1.0]),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-    RFe = np.diag([1.0, 1.0, 1.0])
-    RPb = np.diag([1.0, 1.0, 1.0])
-    ig = est.orientation_expected_information_gain(
-        pose_idx=0, RFe=RFe, RPb=RPb, live_time_s=1.0, num_samples=20
-    )
-    assert ig > 0.0
-
-
-def test_expected_uncertainty_after_rotation_stops_with_zero_time() -> None:
-    """No rotation time should return the current uncertainty."""
-    est = _build_simple_estimator()
-    u0 = est.global_uncertainty()
-    u_after = est.expected_uncertainty_after_rotation(
-        pose_xyz=np.array([0.0, 0.0, 0.0]),
-        live_time_per_rot_s=1.0,
-        tau_ig=1e-3,
-        tmax_s=0.0,
-        n_rollouts=0,
-    )
-    assert u_after == pytest.approx(u0)
-
-
-def test_planning_rollouts_do_not_advance_or_reseed_pf_numpy_stream() -> None:
-    """Planning-only Monte Carlo must be isolated from sequential PF randomness."""
-    est = _build_simple_estimator()
-    np.random.seed(20260717)
-    before = np.random.get_state()
-
-    est.expected_uncertainty_after_rotation(
-        pose_xyz=np.array([0.0, 0.0, 0.0]),
-        live_time_per_rot_s=1.0,
-        tau_ig=1e9,
-        tmax_s=1.0,
-        n_rollouts=0,
-    )
-    after = np.random.get_state()
-
-    assert before[0] == after[0]
-    np.testing.assert_array_equal(before[1], after[1])
-    assert before[2:] == after[2:]
-
-
-def test_expected_uncertainty_after_rotation_stops_with_large_tau() -> None:
-    """Large tau_ig should stop immediately and return current uncertainty."""
-    est = _build_simple_estimator()
-    u0 = est.global_uncertainty()
-    u_after = est.expected_uncertainty_after_rotation(
-        pose_xyz=np.array([0.0, 0.0, 0.0]),
-        live_time_per_rot_s=1.0,
-        tau_ig=1e9,
-        tmax_s=1.0,
-        n_rollouts=0,
-    )
-    assert u_after == pytest.approx(u0)
-
-
-def test_expected_uncertainty_after_rotation_one_step() -> None:
-    """When t_max_s == t_short_s and tau_ig == 0, exactly one rotation is simulated."""
-    est = _build_simple_estimator()
-    est.pf_config.eig_num_samples = 0
-    u_after, debug = est.expected_uncertainty_after_rotation(
-        pose_xyz=np.array([0.0, 0.0, 0.0]),
-        live_time_per_rot_s=1.0,
-        tau_ig=0.0,
-        tmax_s=1.0,
-        n_rollouts=0,
-        return_debug=True,
-    )
-    assert isinstance(u_after, float)
-    assert debug["rollouts"][0]["num_rotations"] == 1
-
-
-def test_dss_pp_program_library_contains_differential_primitives() -> None:
-    """DSS-PP should expose bearing, material, occlusion, and vertical programs."""
+def test_dss_pp_program_library_balances_every_shield_pair() -> None:
+    """Every canonical pair must be represented without within-station repeats."""
     mats = generate_octant_rotation_matrices()
     normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
-    programs = build_shield_program_library(normals, program_length=2, max_programs=40)
-    kinds = {program.kind for program in programs}
+    programs = build_shield_program_library(
+        normals,
+        program_length=8,
+        max_programs=48,
+    )
+    occurrences = np.bincount(
+        np.asarray(
+            [
+                pair_id
+                for program in programs
+                for pair_id in program.pair_ids
+            ],
+            dtype=np.int64,
+        ),
+        minlength=64,
+    )
 
-    assert "bearing_split" in kinds
-    assert "material_split" in kinds
-    assert "occlusion_test" in kinds
-    assert "vertical_split" in kinds
-    assert "vertical_material_split" in kinds
-    assert "elevation_bearing_split" in kinds
-    assert all(len(program.pair_ids) == 2 for program in programs)
-
-
-def test_dss_pp_program_library_can_build_separation_bursts() -> None:
-    """Shield programs should expand primitives into longer temporal bursts."""
-    mats = generate_octant_rotation_matrices()
-    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
-    programs = build_shield_program_library(normals, program_length=8, max_programs=8)
-
-    assert programs
+    assert len(programs) == 48
+    assert all(
+        program.kind == "all_pair_balanced_multi_partition"
+        for program in programs
+    )
     assert all(len(program.pair_ids) == 8 for program in programs)
+    assert all(len(set(program.pair_ids)) == 8 for program in programs)
+    assert set(np.flatnonzero(occurrences)) == set(range(64))
+    assert np.max(occurrences) == np.min(occurrences) == 6
+    companions = {pair_id: set() for pair_id in range(64)}
+    for program in programs:
+        for pair_id in program.pair_ids:
+            companions[pair_id].update(
+                other
+                for other in program.pair_ids
+                if other != pair_id
+            )
+    assert min(len(values) for values in companions.values()) >= 28
 
 
-def test_pairwise_cover_objective_uses_vertical_ambiguity() -> None:
-    """Greedy shield-program search should score height separation directly."""
-    config = DSSPPConfig(
-        lambda_temporal_separation=0.0,
-        lambda_elevation_signature=4.0,
+@pytest.mark.parametrize(
+    ("orientation_count", "program_length", "max_programs"),
+    ((8, 8, 48), (5, 3, 9)),
+)
+def test_shield_program_batch_schedule_matches_scalar_test_oracle(
+    orientation_count: int,
+    program_length: int,
+    max_programs: int,
+) -> None:
+    """Vectorized pair schedules must equal an independent scalar oracle."""
+    programs = build_shield_program_library(
+        np.zeros((orientation_count, 3), dtype=np.float64),
+        program_length=program_length,
+        max_programs=max_programs,
     )
-    objective = dss_pp._pairwise_cover_objective(
-        None,
-        np.asarray([0.0, 0.0], dtype=float),
-        np.asarray([0.1, 0.8], dtype=float),
-        config=config,
-    )
+    expected: list[tuple[str, tuple[int, ...]]] = []
+    if orientation_count == 8 and program_length == 8:
+        partitions: list[tuple[str, list[tuple[int, ...]]]] = []
+        for slope in range(orientation_count):
+            if math.gcd(slope, orientation_count) != 1:
+                continue
+            rows = []
+            for offset in range(orientation_count):
+                rows.append(
+                    tuple(
+                        fe_index * orientation_count
+                        + (slope * fe_index + offset) % orientation_count
+                        for fe_index in range(orientation_count)
+                    )
+                )
+            partitions.append((f"latin_slope_{slope}", rows))
+        partitions.append(
+            (
+                "fixed_fe",
+                [
+                    tuple(
+                        fe_index * orientation_count + pb_index
+                        for pb_index in range(orientation_count)
+                    )
+                    for fe_index in range(orientation_count)
+                ],
+            )
+        )
+        partitions.append(
+            (
+                "fixed_pb",
+                [
+                    tuple(
+                        fe_index * orientation_count + pb_index
+                        for fe_index in range(orientation_count)
+                    )
+                    for pb_index in range(orientation_count)
+                ],
+            )
+        )
+        expected = [
+            (f"{partition_name}_{index:02d}", row)
+            for partition_name, rows in partitions
+            for index, row in enumerate(rows)
+        ]
+    else:
+        ordered = tuple(
+            fe_index * orientation_count
+            + (fe_index + offset) % orientation_count
+            for offset in range(orientation_count)
+            for fe_index in range(orientation_count)
+        )
+        required = int(
+            np.ceil(
+                orientation_count
+                * orientation_count
+                / float(program_length)
+            )
+        )
+        for index in range(required):
+            start = index * program_length
+            selected = list(ordered[start : start + program_length])
+            selected.extend(ordered[: program_length - len(selected)])
+            expected.append(
+                (f"all_pair_balanced_{index:02d}", tuple(selected))
+            )
 
-    assert int(np.argmax(objective)) == 1
-    assert objective[1] > objective[0]
+    assert [
+        (program.name, program.pair_ids) for program in programs
+    ] == expected
 
 
-def test_temporal_separation_uses_response_shape_not_strength_scale() -> None:
-    """Temporal-code scoring should not reward amplitude-only differences."""
-    config = DSSPPConfig(
-        temporal_cover_weight=1.0,
-        temporal_logdet_weight=0.5,
-        temporal_decorrelation_weight=1.0,
-        temporal_pair_contrast_threshold=0.2,
-    )
-    collinear = [
-        np.array([1.0, 2.0, 3.0], dtype=float),
-        np.array([10.0, 20.0, 30.0], dtype=float),
-    ]
-    separated = [
-        np.array([12.0, 0.1, 0.1], dtype=float),
-        np.array([0.1, 12.0, 0.1], dtype=float),
-        np.array([0.1, 0.1, 12.0], dtype=float),
-    ]
+def test_dss_pp_program_library_rejects_insufficient_pair_capacity() -> None:
+    """A truncated library must not silently hide valid shield actions."""
+    mats = generate_octant_rotation_matrices()
+    normals = np.asarray([mat[:, 2] for mat in mats], dtype=float)
 
-    collinear_score = _temporal_separation_score_from_signatures(
-        collinear,
-        [0.5, 0.5],
-        config=config,
-    )
-    separated_score = _temporal_separation_score_from_signatures(
-        separated,
-        [1.0, 1.0, 1.0],
-        config=config,
-    )
-
-    assert collinear_score == pytest.approx(0.0, abs=1.0e-9)
-    assert separated_score > 1.0
+    with pytest.raises(ValueError, match="too small.*multi-partition"):
+        build_shield_program_library(
+            normals,
+            program_length=8,
+            max_programs=47,
+        )
 
 
 def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
     """Signature modes should preserve normalized PF posterior mass."""
     states = [
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[1.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([100.0], dtype=float),
-            background=0.0,
+        _encoded_surface_state(
+            np.array([[1.0, 0.0, 0.0]], dtype=float),
+            np.array([100.0], dtype=float),
         ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[5.0, 0.0, 0.0]], dtype=float),
-            strengths=np.array([100.0], dtype=float),
-            background=0.0,
+        _encoded_surface_state(
+            np.array([[5.0, 0.0, 0.0]], dtype=float),
+            np.array([100.0], dtype=float),
         ),
     ]
     estimator = SimpleNamespace(
         isotopes=("Cs-137",),
+        filters={
+            "Cs-137": SimpleNamespace(
+                continuous_state_positions=_decode_encoded_surface_state,
+            )
+        },
         planning_particles=lambda **_kwargs: {
             "Cs-137": (states, np.array([0.8, 0.2], dtype=float))
         },
@@ -1601,6 +1411,7 @@ def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
         estimator,
         mode_cluster_radius_m=0.1,
         max_modes_per_isotope=2,
+        rng=np.random.default_rng(1),
     )["Cs-137"]
 
     assert len(modes) == 2
@@ -1610,21 +1421,572 @@ def test_extract_signature_modes_uses_pf_posterior_weights() -> None:
     assert modes[0].weight > modes[1].weight
 
 
-def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:
-    """Every distinct active source in the PF posterior should remain visible."""
+def test_extract_signature_modes_preserves_k_zero_probability() -> None:
+    """A tiny K>0 tail must not become a certain planner source."""
     states = [
         IsotopeState(
-            num_sources=2,
-            positions=np.array(
-                [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
-                dtype=float,
-            ),
-            strengths=np.array([90.0, 10.0], dtype=float),
-            background=0.0,
+            num_sources=0,
+            strengths=np.zeros(0, dtype=float),
+            surface_chart_ids=np.zeros(0, dtype=np.int64),
+            surface_uv=np.zeros((0, 2), dtype=float),
+        ),
+        _encoded_surface_state(
+            np.array([[1.0, 0.0, 0.0]], dtype=float),
+            np.array([100.0], dtype=float),
         ),
     ]
     estimator = SimpleNamespace(
         isotopes=("Cs-137",),
+        filters={
+            "Cs-137": SimpleNamespace(
+                continuous_state_positions=_decode_encoded_surface_state,
+            )
+        },
+        planning_particles=lambda **_kwargs: {
+            "Cs-137": (states, np.array([0.99, 0.01], dtype=float))
+        },
+    )
+
+    modes = dss_pp.extract_signature_modes(
+        estimator,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=1,
+        rng=np.random.default_rng(1),
+    )["Cs-137"]
+
+    assert len(modes) == 1
+    assert modes[0].weight == pytest.approx(0.01)
+    assert modes[0].isotope_presence_probability == pytest.approx(0.01)
+
+
+def test_extract_signature_modes_preserves_all_marginal_mode_mass() -> None:
+    """Marginal multimodality may exceed Kmax and must never be truncated."""
+    states = [
+        _encoded_surface_state(
+            np.asarray([[position, 0.0, 0.0]], dtype=float),
+            np.asarray([100.0], dtype=float),
+        )
+        for position in (1.0, 5.0, 9.0)
+    ]
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        filters={
+            "Cs-137": SimpleNamespace(
+                continuous_state_positions=_decode_encoded_surface_state,
+            )
+        },
+        planning_particles=lambda **_kwargs: {
+            "Cs-137": (
+                states,
+                np.asarray([0.4, 0.35, 0.25], dtype=float),
+            )
+        },
+    )
+
+    modes = dss_pp.extract_signature_modes(
+        estimator,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=1,
+        rng=np.random.default_rng(2),
+    )["Cs-137"]
+
+    assert len(modes) == 3
+    assert sum(mode.weight for mode in modes) == pytest.approx(1.0)
+    assert all(
+        mode.isotope_presence_probability == pytest.approx(1.0)
+        for mode in modes
+    )
+
+
+def test_candidate_augmentation_interleaves_every_material_mode() -> None:
+    """A finite augmentation budget must represent every material mode once."""
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.asarray([position, 0.0, 0.0], dtype=float),
+            strength_cps_1m=300_000.0,
+            weight=weight,
+            spread_m=0.1,
+            isotope_presence_probability=1.0,
+        )
+        for position, weight in zip(
+            (1.0, 5.0, 9.0),
+            (0.8, 0.15, 0.05),
+            strict=True,
+        )
+    ]
+    config = DSSPPConfig(
+        max_modes_per_isotope=1,
+        max_augmented_candidates=3,
+        ring_radii_m=(1.0,),
+        ring_angles=4,
+    )
+
+    augmented = dss_pp.augment_candidate_stations(
+        np.zeros((0, 3), dtype=float),
+        modes_by_isotope={"Cs-137": modes},
+        current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
+        visited_poses_xyz=None,
+        map_api=None,
+        bounds_xyz=None,
+        config=config,
+        rng=np.random.default_rng(3),
+    )
+
+    np.testing.assert_allclose(
+        augmented,
+        np.asarray(
+            [
+                [2.0, 0.0, 1.0],
+                [6.0, 0.0, 1.0],
+                [10.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+
+def test_candidate_augmentation_fails_before_dropping_material_modes() -> None:
+    """An undersized explicit geometry budget must fail rather than truncate."""
+    modes = [
+        dss_pp.SignatureMode(
+            isotope="Cs-137",
+            position_xyz=np.asarray([float(index), 0.0, 0.0]),
+            strength_cps_1m=300_000.0,
+            weight=0.25,
+            spread_m=0.1,
+            isotope_presence_probability=1.0,
+        )
+        for index in range(4)
+    ]
+
+    with pytest.raises(ValueError, match="increase max_augmented_candidates"):
+        dss_pp.augment_candidate_stations(
+            np.zeros((0, 3), dtype=float),
+            modes_by_isotope={"Cs-137": modes},
+            current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
+            visited_poses_xyz=None,
+            map_api=None,
+            bounds_xyz=None,
+            config=DSSPPConfig(max_augmented_candidates=3),
+            rng=np.random.default_rng(4),
+        )
+
+
+def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:
+    """Packed aligned mode extraction must equal the state-object oracle."""
+    states = [
+        IsotopeState(
+            num_sources=0,
+            strengths=np.zeros(0, dtype=float),
+            surface_chart_ids=np.zeros(0, dtype=np.int64),
+            surface_uv=np.zeros((0, 2), dtype=float),
+        ),
+        _encoded_surface_state(
+            np.array([[1.0, 0.0, 0.0]], dtype=float),
+            np.array([100.0], dtype=float),
+        ),
+        _encoded_surface_state(
+            np.array(
+                [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            np.array([90.0, 30.0], dtype=float),
+        ),
+    ]
+    weights = np.array([0.1, 0.3, 0.6], dtype=float)
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        filters={
+            "Cs-137": SimpleNamespace(
+                continuous_state_positions=_decode_encoded_surface_state,
+            )
+        },
+        planning_particles=lambda **_kwargs: {
+            "Cs-137": (states, weights)
+        },
+    )
+    packed_positions = np.zeros((3, 2, 3), dtype=float)
+    packed_positions[1, 0] = np.array([1.0, 0.0, 0.0])
+    packed_positions[2] = np.array(
+        [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    packed_strengths = np.array(
+        [[0.0, 0.0], [100.0, 0.0], [90.0, 30.0]],
+        dtype=float,
+    )
+    packed_mask = packed_strengths > 0.0
+    joint = dss_pp.JointPlanningParticles(
+        isotope_order=("Cs-137",),
+        weights_n=weights,
+        positions_nk3_by_isotope={"Cs-137": packed_positions},
+        surface_chart_ids_nk_by_isotope={
+            "Cs-137": np.zeros((3, 2), dtype=np.int64)
+        },
+        surface_uv_nk2_by_isotope={
+            "Cs-137": np.zeros((3, 2, 2), dtype=float)
+        },
+        strengths_nk_by_isotope={"Cs-137": packed_strengths},
+        source_mask_nk_by_isotope={"Cs-137": packed_mask},
+        original_particle_indices=np.arange(3, dtype=np.int64),
+    )
+
+    oracle = dss_pp.extract_signature_modes(
+        estimator,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        rng=np.random.default_rng(1),
+    )["Cs-137"]
+    packed = dss_pp.extract_signature_modes(
+        estimator,
+        mode_cluster_radius_m=0.1,
+        max_modes_per_isotope=2,
+        rng=np.random.default_rng(1),
+        joint_particles=joint,
+    )["Cs-137"]
+
+    assert len(packed) == len(oracle) == 2
+    for packed_mode, oracle_mode in zip(packed, oracle):
+        assert packed_mode.position_xyz == pytest.approx(
+            oracle_mode.position_xyz
+        )
+        assert packed_mode.strength_cps_1m == pytest.approx(
+            oracle_mode.strength_cps_1m
+        )
+        assert packed_mode.weight == pytest.approx(oracle_mode.weight)
+        assert packed_mode.isotope_presence_probability == pytest.approx(
+            oracle_mode.isotope_presence_probability
+        )
+
+
+def test_surface_mode_representative_uses_intrinsic_medoid() -> None:
+    """A folded surface must use path distance rather than XYZ averaging."""
+    positions = np.array(
+        [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [10.0, 0.0, 0.0]],
+        dtype=float,
+    )
+    lookup = {
+        (0, 1): 100.0,
+        (1, 0): 100.0,
+        (0, 2): 1.0,
+        (2, 0): 1.0,
+        (1, 2): 1.0,
+        (2, 1): 1.0,
+    }
+
+    def surface_distance(
+        left: np.ndarray,
+        right: np.ndarray,
+    ) -> np.ndarray:
+        """Return a deterministic folded-surface path metric."""
+        left_ids = np.argmin(
+            np.linalg.norm(left[:, None, :] - positions[None, :, :], axis=2),
+            axis=1,
+        )
+        right_ids = np.argmin(
+            np.linalg.norm(right[:, None, :] - positions[None, :, :], axis=2),
+            axis=1,
+        )
+        return np.asarray(
+            [
+                0.0 if left_id == right_id else lookup[(left_id, right_id)]
+                for left_id, right_id in zip(left_ids, right_ids)
+            ],
+            dtype=float,
+        )
+
+    medoid = dss_pp._weighted_surface_medoid_index(
+        positions,
+        np.full(3, 1.0 / 3.0, dtype=float),
+        surface_path_distance=surface_distance,
+    )
+
+    assert medoid == 2
+
+
+def test_surface_mode_clustering_uses_authoritative_chart_coordinates() -> None:
+    """Coincident XYZ points on disconnected charts must remain distinct."""
+    positions = np.zeros((2, 3), dtype=float)
+    chart_ids = np.asarray([4, 9], dtype=np.int64)
+    surface_uv = np.asarray(
+        [[0.25, 0.75], [0.25, 0.75]],
+        dtype=float,
+    )
+
+    def coordinate_distance(
+        left_ids: np.ndarray,
+        left_uv: np.ndarray,
+        right_ids: np.ndarray,
+        right_uv: np.ndarray,
+    ) -> np.ndarray:
+        """Return zero within a chart and infinity across components."""
+        del left_uv, right_uv
+        left, right = np.broadcast_arrays(left_ids, right_ids)
+        return np.where(left == right, 0.0, np.inf)
+
+    modes = dss_pp._cluster_source_samples(
+        "Cs-137",
+        positions,
+        np.asarray([300_000.0, 500_000.0]),
+        np.asarray([0.4, 0.6]),
+        radius_m=1.0,
+        max_modes=2,
+        particle_ids=np.asarray([0, 1], dtype=np.int64),
+        isotope_presence_probability=1.0,
+        surface_chart_ids=chart_ids,
+        surface_uv=surface_uv,
+        surface_coordinate_path_distance=coordinate_distance,
+    )
+
+    assert len(modes) == 2
+    assert {mode.surface_chart_id for mode in modes} == {4, 9}
+    assert all(mode.surface_uv == pytest.approx((0.25, 0.75)) for mode in modes)
+
+
+def test_information_gain_cannot_resurrect_zero_mass_particles() -> None:
+    """A zero-prior particle must remain absent even at enormous likelihood."""
+    likelihood = np.asarray([[[0.0, 1_000.0]]], dtype=float)
+
+    gain = dss_pp._information_gain_from_log_likelihood(
+        likelihood,
+        np.asarray([1.0, 0.0], dtype=float),
+    )
+
+    assert gain == pytest.approx(np.asarray([0.0]))
+
+
+def test_dss_probability_consumers_reject_numeric_strings() -> None:
+    """Planner summaries must not cast textual scores into posterior mass."""
+    with pytest.raises(ValueError, match="real number"):
+        dss_pp._posterior_mode_weights(["0.5"])
+    hostile_mode = dss_pp.SignatureMode(
+        isotope="Cs-137",
+        position_xyz=np.zeros(3, dtype=np.float64),
+        strength_cps_1m=300_000.0,
+        weight=0.5,
+        spread_m=0.1,
+        isotope_presence_probability="0.5",  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="real number"):
+        dss_pp._isotope_presence_probability([hostile_mode])
+
+
+def test_information_gain_fails_if_positive_mass_has_no_support() -> None:
+    """An impossible predictive observation must not become a finite EIG."""
+    with pytest.raises(RuntimeError, match="outside every positive-mass"):
+        dss_pp._information_gain_from_log_likelihood(
+            np.full((1, 1, 2), -np.inf, dtype=float),
+            np.asarray([0.5, 0.5], dtype=float),
+        )
+
+
+def test_finite_sample_eig_bound_is_not_replaced_by_prior_entropy() -> None:
+    """A rare diagnostic draw may exceed entropy but not its support KL bound."""
+    weights = np.asarray([0.99, 0.01], dtype=np.float64)
+    likelihood = np.asarray([[[-1_000.0, 0.0]]], dtype=np.float64)
+
+    sampled_gain = float(
+        dss_pp._information_gain_from_log_likelihood(
+            likelihood,
+            weights,
+        )[0]
+    )
+    entropy = float(-np.sum(weights * np.log(weights)))
+    finite_sample_bound = dss_pp._finite_sample_information_gain_upper_bound(
+        weights
+    )
+
+    assert sampled_gain > entropy
+    assert sampled_gain <= finite_sample_bound + 1.0e-12
+    assert finite_sample_bound == pytest.approx(-np.log(0.01))
+
+
+def test_planner_configuration_does_not_silently_expand_ring_angles() -> None:
+    """Invalid ring diversity must fail instead of being clamped at runtime."""
+    with pytest.raises(ValueError, match="ring_angles"):
+        DSSPPConfig(ring_angles=3)
+
+
+def test_forced_pair_support_comes_from_estimator_orientation_count() -> None:
+    """A globally plausible pair ID must fail for a smaller shield state space."""
+    estimator = _build_simple_estimator()
+
+    with pytest.raises(ValueError, match="shield-pair support"):
+        select_dss_pp_next_station(
+            estimator=estimator,
+            rng=np.random.default_rng(7),
+            candidate_poses_xyz=np.asarray(
+                [[1.0, 0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            current_pose_xyz=np.zeros(3, dtype=np.float64),
+            config=DSSPPConfig(
+                lambda_eig=0.0,
+                lambda_distance=0.0,
+                augment_candidates=False,
+                min_station_separation_m=0.0,
+                forced_program_pair_ids=(63,),
+            ),
+        )
+
+
+def test_forced_program_must_contain_a_physical_view() -> None:
+    """An empty forced program must fail before it can skip all measurements."""
+    with pytest.raises(ValueError, match="at least one pair"):
+        DSSPPConfig(forced_program_pair_ids=())
+
+
+@pytest.mark.parametrize("current_pair_id", (-1, 4, True, 1.5))
+def test_current_pair_must_match_estimator_shield_support(
+    current_pair_id: object,
+) -> None:
+    """Rotation cost must not decode an invalid previous shield state."""
+    estimator = _build_simple_estimator()
+
+    with pytest.raises(ValueError, match="current_pair_id"):
+        select_dss_pp_next_station(
+            estimator=estimator,
+            rng=np.random.default_rng(7),
+            candidate_poses_xyz=np.asarray(
+                [[1.0, 0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            current_pose_xyz=np.zeros(3, dtype=np.float64),
+            current_pair_id=current_pair_id,  # type: ignore[arg-type]
+            config=DSSPPConfig(
+                lambda_eig=0.0,
+                lambda_distance=0.0,
+                augment_candidates=False,
+                min_station_separation_m=0.0,
+                forced_program_pair_ids=(0,),
+            ),
+        )
+
+
+def test_planner_geometry_modes_match_official_joint_map_projection() -> None:
+    """Planner cardinality and medoids must equal the official joint report."""
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137", "Co-60"),
+        joint_isotope_order=lambda: ("Cs-137", "Co-60"),
+        posterior_point_estimate=lambda: {
+            "Cs-137": SimpleNamespace(
+                map_cardinality=1,
+                cardinality_distribution={0: 0.3, 1: 0.7},
+                selected_stratum_mass=0.7,
+                modes=(
+                    SimpleNamespace(
+                        position_medoid_xyz=(2.0, 3.0, 4.0),
+                        strength_representative_cps_1m=400_000.0,
+                        posterior_mass=0.7,
+                        credible_surface_path_radius_95_m=0.6,
+                        credible_radius_95_m=0.4,
+                        surface_chart_id=3,
+                        surface_uv=(0.25, 0.75),
+                    ),
+                ),
+            ),
+            "Co-60": SimpleNamespace(
+                map_cardinality=0,
+                cardinality_distribution={0: 0.7, 1: 0.3},
+                selected_stratum_mass=0.7,
+                modes=(),
+            ),
+        },
+        posterior_joint_cardinality_distribution=lambda: {
+            (0, 1): 0.3,
+            (1, 0): 0.7,
+        },
+    )
+
+    modes, diagnostics = dss_pp._official_signature_modes(
+        estimator,
+        max_modes_per_isotope=5,
+    )
+
+    assert diagnostics["joint_map_cardinality_vector"] == [1, 0]
+    assert diagnostics["joint_map_stratum_mass"] == pytest.approx(0.7)
+    assert diagnostics["verified_against_joint_cardinality_distribution"] is True
+    assert diagnostics["medoids_by_isotope"]["Cs-137"] == [[2.0, 3.0, 4.0]]
+    assert modes["Co-60"] == []
+    assert len(modes["Cs-137"]) == 1
+    np.testing.assert_allclose(
+        modes["Cs-137"][0].position_xyz,
+        np.asarray([2.0, 3.0, 4.0]),
+    )
+    assert modes["Cs-137"][0].weight == pytest.approx(0.7)
+    assert (
+        modes["Cs-137"][0].isotope_presence_probability
+        == pytest.approx(0.7)
+    )
+
+
+def test_planner_rejects_geometry_modes_from_nonofficial_joint_map() -> None:
+    """A planner snapshot may not diverge from the official joint MAP tuple."""
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        posterior_point_estimate=lambda: {
+            "Cs-137": SimpleNamespace(
+                map_cardinality=1,
+                cardinality_distribution={0: 0.4, 1: 0.6},
+                selected_stratum_mass=0.6,
+                modes=(
+                    SimpleNamespace(
+                        position_medoid_xyz=(1.0, 0.0, 0.0),
+                        strength_representative_cps_1m=300_000.0,
+                        posterior_mass=0.6,
+                        credible_surface_path_radius_95_m=0.2,
+                        credible_radius_95_m=0.2,
+                        surface_chart_id=2,
+                        surface_uv=(0.4, 0.6),
+                    ),
+                ),
+            )
+        },
+        posterior_joint_cardinality_distribution=lambda: {
+            (0,): 0.7,
+            (1,): 0.3,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="official joint MAP"):
+        dss_pp._official_signature_modes(
+            estimator,
+            max_modes_per_isotope=5,
+        )
+
+
+def test_dss_rejects_mode_capacity_below_pf_cardinality() -> None:
+    """Planning cannot silently omit one state-supported source mode."""
+    estimator = _build_simple_estimator()
+    estimator.pf_config.max_sources = 2
+    with pytest.raises(ValueError, match="at least the PF max_sources"):
+        dss_pp._validate_mode_capacity(
+            estimator,
+            DSSPPConfig(max_modes_per_isotope=1),
+        )
+
+
+def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:
+    """Every distinct active source in the PF posterior should remain visible."""
+    states = [
+        _encoded_surface_state(
+            np.array(
+                [[1.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+                dtype=float,
+            ),
+            np.array([90.0, 10.0], dtype=float),
+        ),
+    ]
+    estimator = SimpleNamespace(
+        isotopes=("Cs-137",),
+        filters={
+            "Cs-137": SimpleNamespace(
+                continuous_state_positions=_decode_encoded_surface_state,
+            )
+        },
         planning_particles=lambda **_kwargs: {
             "Cs-137": (states, np.array([1.0], dtype=float))
         },
@@ -1634,13 +1996,15 @@ def test_extract_signature_modes_keeps_distinct_pf_posterior_sources() -> None:
         estimator,
         mode_cluster_radius_m=0.1,
         max_modes_per_isotope=2,
+        rng=np.random.default_rng(1),
     )["Cs-137"]
 
     assert len(modes) == 2
-    assert np.allclose(modes[0].position_xyz, np.array([1.0, 0.0, 0.0]))
-    assert np.allclose(modes[1].position_xyz, np.array([5.0, 0.0, 0.0]))
-    assert modes[0].weight == pytest.approx(0.9)
-    assert modes[1].weight == pytest.approx(0.1)
+    assert {
+        tuple(np.asarray(mode.position_xyz, dtype=float))
+        for mode in modes
+    } == {(1.0, 0.0, 0.0), (5.0, 0.0, 0.0)}
+    assert [mode.weight for mode in modes] == pytest.approx([1.0, 1.0])
 
 
 def test_dss_pp_has_no_external_or_tentative_mode_boundary() -> None:
@@ -1656,795 +2020,246 @@ def test_dss_pp_has_no_external_or_tentative_mode_boundary() -> None:
     assert not hasattr(dss_pp, "_preserve_external_modes")
 
 
-def test_dss_pp_adds_pairwise_contrast_cover_program() -> None:
-    """Temporal separation should add a pose-specific pairwise cover program."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
+def test_dss_pp_requires_one_persistent_rng() -> None:
+    """Planning must not recreate an identical fixed-seed stream per call."""
+    estimator = _build_simple_estimator()
+    with pytest.raises(TypeError, match="persistent explicit rng"):
+        select_dss_pp_next_station(
+            estimator=estimator,
+            candidate_poses_xyz=np.array([[1.0, 0.0, 0.0]], dtype=float),
+            current_pose_xyz=np.zeros(3, dtype=float),
+            config=DSSPPConfig(
+                lambda_eig=0.0,
+                augment_candidates=False,
+                min_station_separation_m=0.0,
             ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-        ]
-    }
-    dss_config = DSSPPConfig(
-        program_length=3,
-        lambda_temporal_separation=1.0,
-        temporal_cover_programs=1,
-    )
-    base_programs = build_shield_program_library(
-        est.normals,
-        program_length=3,
-        max_programs=4,
-    )
-
-    programs = _programs_for_pose(
-        estimator=est,
-        kernel=_continuous_kernel_for_estimator(est),
-        modes_by_isotope=modes,
-        pose_xyz=np.array([2.0, 1.0, 0.5], dtype=float),
-        base_programs=base_programs,
-        config=dss_config,
-    )
-
-    assert any(program.kind == "pairwise_contrast_cover" for program in programs)
+        )
 
 
-def test_dss_pp_batched_program_scores_match_scalar_oracle() -> None:
-    """Batched DSS-PP program scoring should match the scalar program oracle."""
-    isotopes = ["Cs-137", "Co-60"]
-    candidate_sources = np.array(
-        [[0.0, 0.0, 0.5], [4.0, 0.0, 0.5], [2.0, 3.0, 0.5]],
+def test_dss_evaluates_every_action_below_shortlist_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small action set must remain an exhaustive exact-EIG evaluation."""
+    estimator = _build_simple_estimator()
+    candidates = np.array(
+        [[1.0, 0.0, 0.0], [2.0, 0.0, 0.5], [3.0, 0.0, 1.0]],
         dtype=float,
     )
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-        alpha_weights={"Cs-137": 0.6, "Co-60": 0.4},
+    evaluated: list[np.ndarray] = []
+
+    def fake_validate(*_args: object, **_kwargs: object) -> None:
+        """Bypass the generative-model fixture in this routing-only test."""
+
+    def fake_eig(
+        _estimator: object,
+        detector_positions: np.ndarray,
+        programs_by_pose: list[list[object]],
+        **_kwargs: object,
+    ) -> list[np.ndarray]:
+        """Record all actions and return one finite value per program."""
+        evaluated.append(np.asarray(detector_positions, dtype=float).copy())
+        return [
+            np.zeros(len(programs), dtype=float)
+            for programs in programs_by_pose
+        ]
+
+    monkeypatch.setattr(dss_pp, "_validate_eig_likelihood_contract", fake_validate)
+    monkeypatch.setattr(dss_pp, "_program_information_gains_for_poses", fake_eig)
+    result = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(123),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.zeros(3, dtype=float),
+        config=DSSPPConfig(
+            lambda_eig=1.0,
+            lambda_distance=0.0,
+            lambda_rotation=0.0,
+            max_programs=4,
+            program_length=1,
+            forced_program_pair_ids=(0,),
+            augment_candidates=False,
+            min_station_separation_m=0.0,
+        ),
     )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={
-            "Cs-137": {"fe": 0.5, "pb": 1.0},
-            "Co-60": {"fe": 0.3, "pb": 0.8},
-        },
-        pf_config=config,
-        shield_params=ShieldParams(),
+
+    assert len(evaluated) == 1
+    np.testing.assert_allclose(evaluated[0], candidates)
+    diagnostics = result.diagnostics["planning_eig_shortlist"]
+    assert diagnostics["total_action_count"] == 3
+    assert diagnostics["proxy_action_count"] == 0
+    assert diagnostics["exact_action_count"] == 3
+    assert diagnostics["proxy_wall_s"] == 0.0
+    assert diagnostics["exact_eig_wall_s"] >= 0.0
+
+
+def test_dss_adaptive_exact_eig_recovers_proxy_missed_optimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertified proxy shortlist must expand until it finds the optimum."""
+    estimator = _build_simple_estimator()
+    candidates = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
     )
-    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.7,
-                spread_m=0.1,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1200.0,
-                weight=0.3,
-                spread_m=0.1,
-            ),
-        ],
-        "Co-60": [
-            dss_pp.SignatureMode(
-                isotope="Co-60",
-                position_xyz=np.array([1.0, 3.0, 0.5], dtype=float),
-                strength_cps_1m=900.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Co-60",
-                position_xyz=np.array([3.0, 3.0, 0.5], dtype=float),
-                strength_cps_1m=1500.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-        ],
+    exact_by_x = {
+        1.0: 0.10,
+        2.0: float(np.log(2.0)),
+        3.0: 0.20,
+        4.0: 0.30,
     }
-    dss_config = DSSPPConfig(
-        program_length=4,
-        live_time_s=2.0,
-        lambda_temporal_separation=1.0,
-        temporal_cover_programs=1,
-        temporal_cover_weight=1.0,
-        temporal_logdet_weight=0.25,
-        temporal_decorrelation_weight=0.5,
-        min_observation_counts=5.0,
-        count_utility_saturation_counts=50.0,
-    )
-    programs = build_shield_program_library(
-        est.normals,
-        program_length=4,
-        max_programs=6,
-    ) + [
-        dss_pp.ShieldProgram(
-            name="manual",
-            pair_ids=(0, 7, 12, 31),
-            kind="manual",
-        )
-    ]
-    kernel = _continuous_kernel_for_estimator(est)
-    pair_cache = dss_pp._build_pair_signature_cache(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes,
-        pose_xyz=np.array([2.0, 1.0, 0.5], dtype=float),
-        config=dss_config,
-    )
 
-    batched = dss_pp._score_programs_from_pair_cache(
-        estimator=est,
-        pair_cache=pair_cache,
-        programs=programs,
-        config=dss_config,
-    )
-    scalar_rows = [
-        dss_pp._score_program_from_pair_cache(
-            estimator=est,
-            pair_cache=pair_cache,
-            program=program,
-            config=dss_config,
-        )
-        for program in programs
-    ]
-
-    for term_idx, term_values in enumerate(batched):
-        expected = np.asarray([row[term_idx] for row in scalar_rows], dtype=float)
-        assert np.allclose(term_values, expected, rtol=1.0e-10, atol=1.0e-10)
-    temporal_only = dss_pp._temporal_scores_programs_from_pair_cache(
-        estimator=est,
-        pair_cache=pair_cache,
-        programs=programs,
-        config=dss_config,
-    )
-    assert np.allclose(temporal_only, batched[1], rtol=1.0e-10, atol=1.0e-10)
-
-
-def test_dss_pp_pair_signature_cache_uses_pair_response_scales() -> None:
-    """Batched DSS-PP signatures should honor pair-specific PF response scales."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-        measurement_scale_by_isotope={"Cs-137": 1.25},
-        measurement_scale_by_isotope_and_pair={"Cs-137": {0: 2.0, 7: 0.5}},
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=1.0,
-                spread_m=0.1,
+    def fake_exact_eig(
+        _estimator: object,
+        detector_positions: np.ndarray,
+        programs_by_pose: list[list[object]],
+        **_kwargs: object,
+    ) -> list[np.ndarray]:
+        """Return deterministic exact values for requested actions only."""
+        return [
+            np.full(
+                len(programs),
+                exact_by_x[float(position[0])],
+                dtype=np.float64,
+            )
+            for position, programs in zip(
+                np.asarray(detector_positions, dtype=np.float64),
+                programs_by_pose,
+                strict=True,
             )
         ]
+
+    def fake_proxy(
+        _estimator: object,
+        detector_positions: np.ndarray,
+        programs: list[object],
+        **_kwargs: object,
+    ) -> np.ndarray:
+        """Deliberately rank the exact optimum last."""
+        proxy_by_x = {
+            1.0: 0.40,
+            2.0: 0.01,
+            3.0: 0.30,
+            4.0: 0.20,
+        }
+        return np.asarray(
+            [
+                [
+                    proxy_by_x[float(position[0])]
+                    for _program in programs
+                ]
+                for position in np.asarray(
+                    detector_positions,
+                    dtype=np.float64,
+                )
+            ],
+            dtype=np.float64,
+        )
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_program_information_gains_for_poses",
+        fake_exact_eig,
+    )
+    monkeypatch.setattr(
+        dss_pp,
+        "_program_information_proxy_for_poses",
+        fake_proxy,
+    )
+    common_config = {
+        "lambda_eig": 1.0,
+        "lambda_distance": 0.0,
+        "lambda_time": 0.0,
+        "lambda_rotation": 0.0,
+        "max_programs": 1,
+        "program_length": 1,
+        "forced_program_pair_ids": (0,),
+        "augment_candidates": False,
+        "min_station_separation_m": 0.0,
+        "exact_eig_coverage_reserve": 0,
+        "exact_eig_program_diversity_reserve": 0,
     }
-    dss_config = DSSPPConfig(program_length=2, live_time_s=2.0)
-    pose = np.array([2.0, 1.0, 0.5], dtype=float)
-    kernel = _continuous_kernel_for_estimator(est)
-    program = dss_pp.ShieldProgram(
-        name="scaled_pairs",
-        pair_ids=(0, 7, 8),
-        kind="manual",
-    )
-
-    pair_cache = dss_pp._build_pair_signature_cache(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes,
-        pose_xyz=pose,
-        config=dss_config,
-    )
-    signature = dss_pp._expected_signature(
-        kernel=kernel,
-        estimator=est,
-        mode=modes["Cs-137"][0],
-        pose_xyz=pose,
-        program=program,
-        num_orients=int(est.num_orientations),
-        live_time_s=float(dss_config.live_time_s),
-    )
-    matrix, _weights = pair_cache["Cs-137"]
-
-    assert matrix[program.pair_ids, 0] == pytest.approx(signature)
-    mode = modes["Cs-137"][0]
-    assert matrix[0, 0] / matrix[8, 0] == pytest.approx(
-        (
-            kernel.kernel_value_pair(
-                "Cs-137",
-                pose,
-                mode.position_xyz,
-                0,
-                0,
-            )
-            * 2.0
-        )
-        / (
-            kernel.kernel_value_pair(
-                "Cs-137",
-                pose,
-                mode.position_xyz,
-                1,
-                0,
-            )
-            * 1.25
-        )
-    )
-
-    pose_caches = dss_pp._build_pair_signature_caches_for_poses(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes,
-        poses_xyz=np.vstack([pose, pose + np.array([0.5, 0.0, 0.0])]),
-        config=dss_config,
-    )
-    pose_matrix, _pose_weights = pose_caches[0]["Cs-137"]
-    assert pose_matrix[program.pair_ids, 0] == pytest.approx(signature)
-
-
-def test_dss_pp_station_response_uses_transport_kernel_and_pair_scales() -> None:
-    """Station preselection responses should match shared PF expected counts."""
-    isotopes = ["Cs-137"]
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-        measurement_scale_by_isotope={"Cs-137": 1.25},
-        measurement_scale_by_isotope_and_pair={"Cs-137": {0: 2.0, 7: 0.5}},
-    )
-    transport_model = {
-        "enabled": True,
-        "by_isotope": {
-            "Cs-137": {
-                "scale": 1.0,
-                "tau_coefficients": {"distance": -0.15},
-                "min_log_scale": -10.0,
-                "max_log_scale": 10.0,
-            }
-        },
-    }
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-        transport_response_model=transport_model,
-    )
-    base_est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.6,
-            spread_m=0.1,
+    exhaustive = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(17),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            **common_config,
+            exact_eig_action_limit=4,
         ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
-            strength_cps_1m=800.0,
-            weight=0.4,
-            spread_m=0.1,
+    )
+    shortlisted = select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(17),
+        candidate_poses_xyz=candidates,
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            **common_config,
+            exact_eig_action_limit=2,
         ),
-    ]
-    poses = np.array([[2.0, 1.0, 0.5], [3.0, 2.0, 0.5]], dtype=float)
-    live_time_s = 2.0
-    kernel = _continuous_kernel_for_estimator(est)
-    matrix = dss_pp._station_response_matrix(
-        poses,
-        modes,
-        live_time_s=live_time_s,
-        kernel=kernel,
-        estimator=est,
-        isotope="Cs-137",
-    )
-    mode_positions = np.vstack([mode.position_xyz for mode in modes])
-    mode_strengths = np.asarray(
-        [mode.strength_cps_1m for mode in modes],
-        dtype=float,
-    )
-    num_orients = int(est.num_orientations)
-    pair_scales = dss_pp._response_scales_for_all_pairs(est, "Cs-137", num_orients)
-    expected = (
-        live_time_s
-        * np.mean(
-            kernel.kernel_values_all_pairs_for_detectors(
-                isotope="Cs-137",
-                detector_positions=poses,
-                sources=mode_positions,
-            )
-            * pair_scales.reshape(1, -1, 1),
-            axis=1,
-        )
-        * mode_strengths.reshape(1, -1)
-    )
-    base_kernel = _continuous_kernel_for_estimator(base_est)
-    without_transport = (
-        live_time_s
-        * np.mean(
-            base_kernel.kernel_values_all_pairs_for_detectors(
-                isotope="Cs-137",
-                detector_positions=poses,
-                sources=mode_positions,
-            )
-            * pair_scales.reshape(1, -1, 1),
-            axis=1,
-        )
-        * mode_strengths.reshape(1, -1)
     )
 
-    assert np.allclose(matrix, expected, rtol=1.0e-12, atol=1.0e-12)
-    assert not np.allclose(matrix, without_transport, rtol=1.0e-6, atol=1.0e-6)
-
-
-def test_dss_pp_station_response_uses_obstacle_attenuation_kernel() -> None:
-    """Station preselection responses should include shared obstacle attenuation."""
-    isotopes = ["Cs-137"]
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
+    np.testing.assert_allclose(
+        shortlisted.next_pose,
+        exhaustive.next_pose,
+        rtol=0.0,
+        atol=0.0,
     )
-    obstacle_grid = ObstacleGrid(
-        origin=(-1.0, -1.0),
-        cell_size=1.0,
-        grid_shape=(6, 2),
-        blocked_cells=(),
-        transport_boxes_m=((1.0, -0.25, 0.0, 3.0, 0.25, 1.0),),
-        transport_mu_by_isotope={"Cs-137": (0.02,)},
+    assert shortlisted.next_pose[0] == pytest.approx(2.0)
+    diagnostics = shortlisted.diagnostics["planning_eig_shortlist"]
+    assert diagnostics["total_action_count"] == 4
+    assert diagnostics["proxy_action_count"] == 4
+    assert diagnostics["exact_action_count"] == 4
+    assert diagnostics["adaptive_exact_eig_exhausted_all_actions"] is True
+    assert diagnostics["adaptive_exact_eig_round_count"] == 2
+    assert diagnostics["proxy_wall_s"] >= 0.0
+    assert diagnostics["exact_eig_wall_s"] >= 0.0
+    assert (
+        diagnostics["shortlisted_exact_bin_state_operations"]
+        == diagnostics["legacy_all_exact_bin_state_operations"]
     )
-    candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-        obstacle_grid=obstacle_grid,
-    )
-    free_est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-    )
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=1.0,
-            spread_m=0.1,
-        )
-    ]
-    poses = np.array([[4.0, 0.0, 0.5]], dtype=float)
-    live_time_s = 2.0
-    kernel = _continuous_kernel_for_estimator(est)
-    free_kernel = _continuous_kernel_for_estimator(free_est)
-
-    matrix = dss_pp._station_response_matrix(
-        poses,
-        modes,
-        live_time_s=live_time_s,
-        kernel=kernel,
-        estimator=est,
-        isotope="Cs-137",
-    )
-    free_matrix = dss_pp._station_response_matrix(
-        poses,
-        modes,
-        live_time_s=live_time_s,
-        kernel=free_kernel,
-        estimator=free_est,
-        isotope="Cs-137",
-    )
-    expected = (
-        live_time_s
-        * np.mean(
-            kernel.kernel_values_all_pairs_for_detectors(
-                isotope="Cs-137",
-                detector_positions=poses,
-                sources=candidate_sources,
-            ),
-            axis=1,
-        )
-        * modes[0].strength_cps_1m
-    )
-
-    assert np.allclose(matrix, expected, rtol=1.0e-12, atol=1.0e-12)
-    assert matrix[0, 0] < 0.05 * free_matrix[0, 0]
-
-
-def test_dss_pp_batched_pairwise_cover_matches_scalar_oracle() -> None:
-    """Batched pairwise-cover selection should choose the scalar greedy program."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([4.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.1,
-            ),
+    assert diagnostics["shortlist_selected_proxy_rank"] == 4
+    assert (
+        diagnostics[
+            "shortlist_mc_winner_exceeds_universal_excluded_bound"
         ]
-    }
-    dss_config = DSSPPConfig(
-        program_length=4,
-        lambda_temporal_separation=1.0,
-        temporal_cover_programs=1,
+        is True
     )
-    pose = np.array([2.0, 1.0, 0.5], dtype=float)
-    kernel = _continuous_kernel_for_estimator(est)
-    pair_cache = dss_pp._build_pair_signature_cache(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes,
-        pose_xyz=pose,
-        config=dss_config,
-    )
-
-    scalar = dss_pp._greedy_pairwise_contrast_program(
-        estimator=est,
-        kernel=kernel,
-        modes_by_isotope=modes,
-        pose_xyz=pose,
-        config=dss_config,
-        pair_cache=None,
-    )
-    batched = dss_pp._greedy_pairwise_contrast_program(
-        estimator=est,
-        kernel=kernel,
-        modes_by_isotope=modes,
-        pose_xyz=pose,
-        config=dss_config,
-        pair_cache=pair_cache,
-    )
-
-    assert scalar is not None
-    assert batched is not None
-    assert batched.pair_ids == scalar.pair_ids
+    assert diagnostics["shortlist_formal_recall_certificate_available"] is True
+    assert "joint_full_spectrum" in diagnostics["proxy_contract"]
 
 
-def test_select_separation_orientations_returns_fe_pb_pairs() -> None:
-    """Standalone temporal shield selection should return Fe/Pb pair tuples."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=2,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([2.0, 1.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-
-    pairs = select_separation_orientations(
-        est,
-        pose_idx=0,
-        candidate_positions=candidate_sources,
-        k=6,
-        isotope="Cs-137",
-    )
-
-    assert len(pairs) == 6
-    assert all(0 <= fe < est.num_orientations for fe, _ in pairs)
-    assert all(0 <= pb < est.num_orientations for _, pb in pairs)
-
-
-def test_select_best_orientation_preselect_supports_cpu_config() -> None:
-    """Orientation preselection should fall back to CPU when GPU is disabled."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float)
-    rot_mats = generate_octant_rotation_matrices()[:2]
-    shield_normals = np.asarray([mat[:, 2] for mat in rot_mats], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-        preselect_orientations=True,
-        eig_num_samples=1,
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-    )
-    est.add_measurement_pose(np.array([2.0, 1.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-
-    best_idx, score = select_best_orientation(
-        est,
-        pose_idx=0,
-        RFe_candidates=rot_mats,
-        RPb_candidates=rot_mats,
-        eig_samples=1,
-    )
-
-    assert 0 <= best_idx < 4
-    assert np.isfinite(score)
-
-
-def test_shield_rotation_gpu_surrogate_maps_reordered_candidates_to_octants() -> None:
-    """GPU surrogate scoring should use octant ids, not candidate array positions."""
-    torch = pytest.importorskip("torch")
-    from pf import gpu_utils
-
-    mats = generate_octant_rotation_matrices()
-    rfe_candidates = np.asarray([mats[3], mats[0], mats[6]], dtype=float)
-    rpb_candidates = np.asarray([mats[5], mats[1]], dtype=float)
-    estimator = RotatingShieldPFEstimator(
-        isotopes=["Cs-137"],
-        candidate_sources=np.array([[0.0, 0.0, 0.5], [4.0, 0.0, 0.5]], dtype=float),
-        shield_normals=np.asarray([mat[:, 2] for mat in mats], dtype=float),
-        mu_by_isotope={"Cs-137": {"fe": 0.4, "pb": 0.9}},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-        ),
-        shield_params=ShieldParams(thickness_fe_cm=1.0, thickness_pb_cm=0.5),
-    )
-    estimator.add_measurement_pose(np.array([2.0, 1.0, 0.5], dtype=float))
-    estimator._ensure_kernel_cache()
-    states = [
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-            strengths=np.array([1000.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-            strengths=np.array([700.0], dtype=float),
-            background=0.0,
-        ),
-    ]
-    particles_by_isotope = {"Cs-137": (states, np.array([0.4, 0.6], dtype=float))}
-
-    cpu_scores = shield_rotation._surrogate_scores_cpu(
+def test_dss_canonical_program_diagnostics_cover_all_pairs_at_horizon_one() -> None:
+    """The runtime library must expose all 64 pairs in a one-step policy."""
+    estimator = _build_simple_estimator(canonical_octants=True)
+    result = select_dss_pp_next_station(
         estimator=estimator,
-        pose_idx=0,
-        live_time_s=1.0,
-        particles_by_isotope=particles_by_isotope,
-        RFe_candidates=rfe_candidates,
-        RPb_candidates=rpb_candidates,
-        alphas={"Cs-137": 1.0},
-        allowed_indices=None,
-        metric="var_lambda",
-        eps=1.0e-12,
-    )
-    gpu_scores = shield_rotation._surrogate_scores_gpu(
-        estimator=estimator,
-        pose_idx=0,
-        live_time_s=1.0,
-        particles_by_isotope=particles_by_isotope,
-        RFe_candidates=rfe_candidates,
-        RPb_candidates=rpb_candidates,
-        alphas={"Cs-137": 1.0},
-        allowed_indices=None,
-        metric="var_lambda",
-        gpu_ctx=(torch, gpu_utils, torch.device("cpu"), torch.float64),
-        eps=1.0e-12,
-    )
-
-    assert gpu_scores.keys() == cpu_scores.keys()
-    for candidate_id, cpu_score in cpu_scores.items():
-        assert gpu_scores[candidate_id] == pytest.approx(cpu_score)
-
-
-def test_shield_rotation_gpu_eig_maps_reordered_candidates_to_octants() -> None:
-    """GPU EIG scoring should pass candidate octant ids into the shared kernel."""
-    torch = pytest.importorskip("torch")
-    from pf import gpu_utils
-
-    mats = generate_octant_rotation_matrices()
-    rfe_candidates = np.asarray([mats[3], mats[0]], dtype=float)
-    rpb_candidates = np.asarray([mats[5], mats[1]], dtype=float)
-    recorded_pairs: list[tuple[int, int]] = []
-
-    class RecordingKernel:
-        """Minimal kernel that records requested Fe/Pb octant indices."""
-
-        def expected_counts_pair_for_packed_states_torch(
-            self,
-            *,
-            isotope: str,
-            detector_pos: np.ndarray,
-            positions: object,
-            strengths: object,
-            backgrounds: object,
-            mask: object,
-            fe_index: int,
-            pb_index: int,
-            live_time_s: float,
-            source_scale: float,
-            device: object,
-            dtype: object,
-        ) -> object:
-            """Return finite expected counts while recording the pair ids."""
-            del isotope, detector_pos, strengths, backgrounds, mask
-            del live_time_s, source_scale
-            recorded_pairs.append((int(fe_index), int(pb_index)))
-            return torch.ones(positions.shape[0], device=device, dtype=dtype)
-
-    states = [
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-            strengths=np.array([1000.0], dtype=float),
-            background=0.0,
-        ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-            strengths=np.array([700.0], dtype=float),
-            background=0.0,
-        ),
-    ]
-    estimator = SimpleNamespace(
-        poses=[np.array([2.0, 1.0, 0.5], dtype=float)],
-        pf_config=RotatingShieldPFConfig(
-            variable_cardinality=False,
-            init_num_sources=(1, 1),
-            eig_num_samples=0,
-        ),
-        continuous_kernel=lambda: RecordingKernel(),
-        response_scale_for_isotope=lambda isotope, fe_index, pb_index: 1.0,
-        count_likelihood_spec_for_isotope=lambda isotope: CountLikelihoodSpec(
-            model="poisson"
+        rng=np.random.default_rng(31),
+        candidate_poses_xyz=np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        current_pose_xyz=np.zeros(3, dtype=np.float64),
+        config=DSSPPConfig(
+            max_programs=48,
+            program_length=8,
+            lambda_eig=0.0,
+            lambda_distance=0.0,
+            lambda_time=0.0,
+            lambda_rotation=0.0,
+            augment_candidates=False,
+            min_station_separation_m=0.0,
         ),
     )
 
-    shield_rotation._eig_scores_gpu(
-        estimator=estimator,
-        pose_idx=0,
-        live_time_s=1.0,
-        candidate_ids=[0, 1, 2, 3],
-        RFe_candidates=rfe_candidates,
-        RPb_candidates=rpb_candidates,
-        alpha_by_isotope={"Cs-137": 1.0},
-        particles_by_isotope={
-            "Cs-137": (states, np.array([0.5, 0.5], dtype=float)),
-        },
-        num_samples=0,
-        gpu_ctx=(torch, gpu_utils, torch.device("cpu"), torch.float64),
-    )
-
-    assert recorded_pairs == [(3, 5), (3, 1), (0, 5), (0, 1)]
+    assert result.diagnostics["planning_policy"] == "one_step_joint_eig"
+    assert len(result.sequence) == 1
+    assert result.diagnostics["program_count"] == 48
+    assert result.diagnostics["program_library_unique_pair_count"] == 64
+    assert result.diagnostics["program_library_pair_occurrence_min"] == 6
+    assert result.diagnostics["program_library_pair_occurrence_max"] == 6
 
 
 def test_dss_pp_selects_station_and_shield_program() -> None:
@@ -2463,33 +2278,38 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
-        candidate_sources=candidate_sources,
+        surface_diagnostic_points=candidate_sources,
         shield_normals=shield_normals,
         mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
     filt.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[0.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                0
+            ].joint_row_identity,
         ),
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[4.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                1
+            ].joint_row_identity,
         ),
     ]
     candidates = np.array(
@@ -2498,19 +2318,15 @@ def test_dss_pp_selects_station_and_shield_program() -> None:
     )
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            horizon=2,
-            beam_width=2,
-            max_programs=8,
+            max_programs=32,
             program_length=2,
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=1.0,
             lambda_distance=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
             lambda_rotation=0.0,
             augment_candidates=False,
         ),
@@ -2546,53 +2362,53 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
-        candidate_sources=candidate_sources,
+        surface_diagnostic_points=candidate_sources,
         shield_normals=shield_normals,
         mu_by_isotope={"Cs-137": {"fe": 0.5, "pb": 1.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
     filt.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[0.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                0
+            ].joint_row_identity,
         ),
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[4.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                1
+            ].joint_row_identity,
         ),
     ]
     forced_pairs = (7, 8, 9, 10)
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=np.array([[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]]),
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=8,
+            max_programs=32,
             program_length=4,
             forced_program_pair_ids=forced_pairs,
-            temporal_cover_programs=4,
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=1.0,
             lambda_distance=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
             lambda_rotation=0.0,
             augment_candidates=False,
         ),
@@ -2604,764 +2420,6 @@ def test_dss_pp_forced_program_scores_only_baseline_pairs() -> None:
     assert {tuple(node["pair_ids"]) for node in result.diagnostics["ranked_nodes"]} == {
         forced_pairs
     }
-    pair_diag = result.diagnostics["selected_pairwise_ambiguity"]["Cs-137"]
-    assert pair_diag["mode_count"] == 2
-    assert pair_diag["program_measurements"] == len(result.shield_program.pair_ids)
-    assert pair_diag["bottleneck_pairs"]
-
-
-def test_joint_program_eig_uses_program_views_and_pf_likelihood() -> None:
-    """Joint program EIG should distinguish views and inherit robust PF noise."""
-    lambdas = np.array(
-        [
-            [[2.0, 18.0], [2.0, 18.0]],
-            [[10.0, 10.0], [10.0, 10.0]],
-        ],
-        dtype=float,
-    )
-    weights = np.array([0.5, 0.5], dtype=float)
-    mask = np.ones((2, 2), dtype=bool)
-    poisson = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        weights,
-        mask,
-        spec=CountLikelihoodSpec(model="poisson"),
-        num_samples=512,
-        rng=np.random.default_rng(31),
-    )
-    robust = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        weights,
-        mask,
-        spec=CountLikelihoodSpec(
-            model="student_t",
-            spectrum_count_abs_sigma=100.0,
-            student_t_df=5.0,
-        ),
-        num_samples=512,
-        rng=np.random.default_rng(31),
-    )
-    repeated = dss_pp._program_information_gain_from_lambdas(
-        lambdas[:1],
-        weights,
-        np.array([[True, True]], dtype=bool),
-        spec=CountLikelihoodSpec(model="poisson"),
-        num_samples=512,
-        rng=np.random.default_rng(31),
-    )
-    single = dss_pp._program_information_gain_from_lambdas(
-        lambdas[:1],
-        weights,
-        np.array([[True, False]], dtype=bool),
-        spec=CountLikelihoodSpec(model="poisson"),
-        num_samples=512,
-        rng=np.random.default_rng(31),
-    )
-    deterministic = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        weights,
-        mask,
-        spec=CountLikelihoodSpec(model="poisson"),
-        num_samples=512,
-        rng=np.random.default_rng(31),
-    )
-
-    assert poisson[0] > poisson[1]
-    assert robust[0] < poisson[0]
-    assert repeated[0] > single[0]
-    assert deterministic == pytest.approx(poisson)
-
-
-def test_signature_separation_uses_predictive_pf_variance() -> None:
-    """DSS signature separation should shrink under declared PF model noise."""
-    raw = np.array([[[2.0, 18.0], [3.0, 17.0]]], dtype=float)
-    poisson_spec = CountLikelihoodSpec(model="poisson")
-    robust_spec = CountLikelihoodSpec(
-        model="student_t",
-        spectrum_count_abs_sigma=100.0,
-        student_t_df=5.0,
-    )
-    poisson = dss_pp._batched_signature_separation_scores(
-        raw,
-        variance_floor=1.0,
-        likelihood_spec=poisson_spec,
-    )
-    robust = dss_pp._batched_signature_separation_scores(
-        raw,
-        variance_floor=1.0,
-        likelihood_spec=robust_spec,
-    )
-    scalar = dss_pp._signature_separation_score(
-        [raw[0, :, 0], raw[0, :, 1]],
-        variance_floor=1.0,
-        likelihood_spec=robust_spec,
-    )
-
-    assert robust[0] < poisson[0]
-    assert robust[0] == pytest.approx(scalar)
-
-
-def test_weighted_future_variance_is_batched_and_likelihood_matched() -> None:
-    """Weighted DSS variance should match compound-Poisson sum-w2 in one batch."""
-    mean = np.array([[2.0, 18.0], [4.0, 9.0]], dtype=float)
-    complete_spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    additional_spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="additional",
-        student_t_df=5.0,
-    )
-
-    complete = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=complete_spec,
-        primary_history_weight=50.0,
-    )
-    additional = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=additional_spec,
-        primary_history_weight=50.0,
-    )
-    complete_with_floor = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=CountLikelihoodSpec(
-            model="student_t",
-            observation_count_variance_semantics="complete_statistical",
-            transport_model_abs_sigma=3.0,
-            student_t_df=5.0,
-        ),
-        primary_history_weight=50.0,
-    )
-    inclusive_spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="counting_noise_inclusive",
-        transport_model_abs_sigma=3.0,
-        student_t_df=5.0,
-    )
-    unit_weight = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=inclusive_spec,
-        primary_history_weight=1.0,
-    )
-    legacy_unit_weight = dss_pp.predictive_count_likelihood_variance(
-        mean,
-        spec=inclusive_spec,
-    )
-    pure_background = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=complete_spec,
-        primary_history_weight=50.0,
-        background_counts=mean,
-    )
-    mixed_background = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=complete_spec,
-        primary_history_weight=50.0,
-        background_counts=0.25 * mean,
-    )
-    additional_background = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=additional_spec,
-        primary_history_weight=50.0,
-        background_counts=mean,
-    )
-
-    np.testing.assert_allclose(complete, mean * 50.0)
-    np.testing.assert_allclose(additional, mean * 50.0)
-    np.testing.assert_allclose(complete_with_floor, mean * 50.0 + 9.0)
-    np.testing.assert_allclose(unit_weight, legacy_unit_weight)
-    np.testing.assert_allclose(pure_background, mean)
-    np.testing.assert_allclose(mixed_background, 0.75 * mean * 50.0 + 0.25 * mean)
-    np.testing.assert_allclose(additional_background, mean)
-    with pytest.raises(ValueError, match="Weighted-history future observations"):
-        dss_pp._future_predictive_count_variance(
-            mean,
-            spec=CountLikelihoodSpec(model="poisson"),
-            primary_history_weight=50.0,
-        )
-
-
-def test_detector_equivalent_primary_budget_matches_scalar_geometry() -> None:
-    """Batched primary demand should match the native finite-sphere equation."""
-    detectors = np.array(
-        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    states = [
-        IsotopeState(
-            num_sources=2,
-            positions=np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]),
-            strengths=np.array([10.0, 20.0]),
-            background=1.0e9,
-        ),
-        IsotopeState(
-            num_sources=1,
-            positions=np.array([[3.0, 0.0, 0.0]]),
-            strengths=np.array([40.0]),
-            background=2.0e9,
-        ),
-    ]
-    radius = 0.038
-    live_time = 3.0
-
-    batched = dss_pp._expected_detector_equivalent_primaries_for_states_at_detectors(
-        detectors,
-        states,
-        detector_radius_m=radius,
-        live_time_s=live_time,
-    )
-
-    def _scalar_geometry(detector: np.ndarray, source: np.ndarray) -> float:
-        """Return the native detector-cps finite-sphere geometric scale."""
-        distance = float(np.linalg.norm(detector - source))
-        if distance <= 1.0e-12:
-            return 0.0
-
-        def _fraction(distance_m: float) -> float:
-            """Return the solid-angle fraction of the active sphere."""
-            if distance_m <= radius:
-                return 0.5
-            ratio = min(radius / max(distance_m, 1.0e-12), 1.0)
-            return 0.5 * (1.0 - np.sqrt(max(1.0 - ratio * ratio, 0.0)))
-
-        return _fraction(max(distance, radius)) / max(
-            _fraction(max(1.0, radius)),
-            1.0e-12,
-        )
-
-    scalar = np.zeros_like(batched)
-    for detector_index, detector in enumerate(detectors):
-        for state_index, state in enumerate(states):
-            scalar[detector_index, state_index] = live_time * sum(
-                float(strength) * _scalar_geometry(detector, source)
-                for source, strength in zip(state.positions, state.strengths)
-            )
-    np.testing.assert_allclose(batched, scalar, rtol=1.0e-12, atol=1.0e-12)
-
-
-def test_transport_budget_radius_and_zero_radius_threshold_match_native() -> None:
-    """Budget geometry must use its physical radius and native near-zero cutoff."""
-    estimator = SimpleNamespace(detector_radius_m=0.25)
-    physical_config = DSSPPConfig(transport_detector_radius_m=0.038)
-    fallback_config = DSSPPConfig()
-
-    assert dss_pp._transport_detector_radius_m(
-        estimator,
-        config=physical_config,
-    ) == pytest.approx(0.038)
-    assert dss_pp._transport_detector_radius_m(
-        estimator,
-        config=fallback_config,
-    ) == pytest.approx(0.25)
-    zero_radius = dss_pp._finite_sphere_geometric_terms_batched(
-        np.array([[0.0, 0.0, 0.0]], dtype=float),
-        np.array([[0.5e-6, 0.0, 0.0], [2.0e-6, 0.0, 0.0]], dtype=float),
-        detector_radius_m=0.0,
-    )
-    np.testing.assert_allclose(zero_radius[0, 0], 0.0)
-    np.testing.assert_allclose(zero_radius[0, 1], 1.0 / (2.0e-6) ** 2)
-    with pytest.raises(ValueError, match="transport_detector_radius_m"):
-        DSSPPConfig(transport_detector_radius_m=-1.0)
-
-
-def test_effective_primary_history_weight_uses_target_budget() -> None:
-    """Candidate weights should use the max fraction until the budget binds."""
-    expected = np.array([0.0, 1.0e6, 3.0e6, 15.0e6], dtype=float)
-    dynamic = dss_pp._effective_primary_history_weights(
-        expected,
-        minimum_history_weight=1.0,
-        target_sampled_primaries=1.5e6,
-    )
-    fixed = dss_pp._effective_primary_history_weights(
-        expected,
-        minimum_history_weight=1.0,
-        target_sampled_primaries=None,
-    )
-
-    np.testing.assert_allclose(dynamic, np.array([1.0, 1.0, 2.0, 10.0]))
-    np.testing.assert_allclose(fixed, 1.0)
-
-
-def test_candidate_history_weights_include_other_isotope_posterior_mean() -> None:
-    """Budget demand should combine each state with other-isotope mean demand."""
-    states_cs = [
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([5.0e6]), 0.0),
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([10.0e6]), 0.0),
-    ]
-    states_co = [
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([4.0e6]), 0.0),
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([8.0e6]), 0.0),
-    ]
-    estimator = SimpleNamespace(detector_radius_m=0.0)
-    config = DSSPPConfig(
-        live_time_s=1.0,
-        primary_history_weight=1.0,
-        target_sampled_primaries=1.5e6,
-    )
-
-    values = dss_pp._candidate_primary_history_weights_by_isotope(
-        estimator,
-        np.array([[0.0, 0.0, 0.0]], dtype=float),
-        {
-            "Cs-137": (states_cs, np.array([0.5, 0.5])),
-            "Co-60": (states_co, np.array([0.25, 0.75])),
-        },
-        config=config,
-    )
-
-    # Co mean demand is 7e6; Cs mean demand is 7.5e6.
-    np.testing.assert_allclose(values["Cs-137"], [[8.0, 17.0 / 1.5]])
-    np.testing.assert_allclose(values["Co-60"], [[11.5 / 1.5, 15.5 / 1.5]])
-
-
-def test_primary_history_budget_diagnostics_report_selected_pose_range() -> None:
-    """Selected-pose diagnostics should expose dynamic weight ranges."""
-    states = [
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([1.0e6]), 0.0),
-        IsotopeState(1, np.array([[1.0, 0.0, 0.0]]), np.array([6.0e6]), 0.0),
-    ]
-
-    class _Estimator:
-        """Provide deterministic planning particles for budget diagnostics."""
-
-        detector_radius_m = 0.0
-
-        def planning_particles(self, **_kwargs):
-            """Return the fixed two-particle posterior subset."""
-            return {"Cs-137": (states, np.array([0.5, 0.5]))}
-
-    diagnostics = dss_pp._primary_history_weight_diagnostics_at_pose(
-        _Estimator(),
-        np.array([0.0, 0.0, 0.0]),
-        config=DSSPPConfig(
-            live_time_s=1.0,
-            primary_history_weight=1.0,
-            target_sampled_primaries=1.5e6,
-        ),
-    )
-
-    assert diagnostics["mode"] == "candidate_particle_budget"
-    assert diagnostics["minimum"] == pytest.approx(1.0)
-    assert diagnostics["median"] == pytest.approx(2.5)
-    assert diagnostics["maximum"] == pytest.approx(4.0)
-    assert diagnostics["target_sampled_primaries"] == pytest.approx(1.5e6)
-    assert diagnostics["by_isotope"]["Cs-137"]["maximum"] == pytest.approx(4.0)
-    with pytest.raises(ValueError, match="target_sampled_primaries"):
-        DSSPPConfig(target_sampled_primaries=0.0)
-
-
-def test_array_history_weight_matches_scalar_and_changes_each_particle() -> None:
-    """Vector history weights should preserve scalar semantics elementwise."""
-    mean = np.array([[2.0, 18.0], [4.0, 9.0]], dtype=float)
-    history_weight = np.array([[5.0, 10.0], [20.0, 40.0]], dtype=float)
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    batched = dss_pp._future_predictive_count_variance(
-        mean,
-        spec=spec,
-        primary_history_weight=history_weight,
-    )
-    scalar = np.empty_like(mean)
-    for index in np.ndindex(mean.shape):
-        scalar[index] = dss_pp._future_predictive_count_variance(
-            np.asarray(mean[index]),
-            spec=spec,
-            primary_history_weight=float(history_weight[index]),
-        )
-    np.testing.assert_allclose(batched, scalar)
-    np.testing.assert_allclose(batched, mean * history_weight)
-
-
-def test_weighted_signature_separation_scalar_batch_equivalence() -> None:
-    """Batched weighted signature separation should match its scalar oracle."""
-    raw = np.array([[[2.0, 18.0], [3.0, 17.0]]], dtype=float)
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    batched = dss_pp._batched_signature_separation_scores(
-        raw,
-        variance_floor=1.0,
-        likelihood_spec=spec,
-        primary_history_weight=50.0,
-    )
-    scalar = dss_pp._signature_separation_score(
-        [raw[0, :, 0], raw[0, :, 1]],
-        variance_floor=1.0,
-        likelihood_spec=spec,
-        primary_history_weight=50.0,
-    )
-    unit_weight = dss_pp._batched_signature_separation_scores(
-        raw,
-        variance_floor=1.0,
-        likelihood_spec=spec,
-        primary_history_weight=1.0,
-    )
-
-    assert batched[0] == pytest.approx(scalar)
-    assert batched[0] == pytest.approx(unit_weight[0] / 50.0)
-
-
-def test_signature_preselection_ranking_uses_dynamic_weight_and_background() -> None:
-    """Cheap signature ranking should see pose weights and Poisson background."""
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    estimator = SimpleNamespace(
-        isotopes=["Cs-137"],
-        pf_config=SimpleNamespace(
-            alpha_weights={"Cs-137": 1.0},
-            position_max=(10.0, 10.0, 10.0),
-        ),
-        filters={
-            "Cs-137": SimpleNamespace(count_likelihood_spec=lambda: spec),
-        },
-    )
-    pair_cache = {
-        "Cs-137": (np.array([[10.0, 20.0]], dtype=float), [0.5, 0.5]),
-    }
-    statistics = dss_pp._SignatureFutureStatisticsBatch(
-        primary_history_weights_by_isotope={
-            "Cs-137": np.array([[1.0, 1.0], [10.0, 10.0], [1.0, 1.0]]),
-        },
-        background_counts_by_isotope={
-            "Cs-137": np.array([0.0, 0.0, 100.0]),
-        },
-    )
-    program = dss_pp.ShieldProgram("probe", (0,), "probe")
-    config = DSSPPConfig(count_variance_floor=1.0)
-
-    scores = np.asarray(
-        [
-            dss_pp._score_programs_from_pair_cache(
-                estimator=estimator,
-                pair_cache=pair_cache,
-                programs=[program],
-                config=config,
-                future_statistics=statistics,
-                pose_index=pose_index,
-            )[0][0]
-            for pose_index in range(3)
-        ],
-        dtype=float,
-    )
-
-    assert scores[0] == pytest.approx(100.0 / 30.0)
-    assert scores[1] == pytest.approx(100.0 / 300.0)
-    assert scores[2] == pytest.approx(100.0 / 230.0)
-    assert int(np.argmax(scores)) == 0
-
-
-def test_signature_future_statistics_batch_matches_budget_and_background() -> None:
-    """Signature statistics should batch candidate demand and mean background."""
-    states = [
-        IsotopeState(
-            1,
-            np.array([[1.0, 0.0, 0.0]]),
-            np.array([3.0e6]),
-            2.0,
-        ),
-        IsotopeState(
-            1,
-            np.array([[1.0, 0.0, 0.0]]),
-            np.array([9.0e6]),
-            4.0,
-        ),
-    ]
-    modes = {
-        "Cs-137": [
-            SignatureMode(
-                "Cs-137",
-                np.array([1.0, 0.0, 0.0]),
-                3.0e6,
-                0.5,
-                0.0,
-            ),
-            SignatureMode(
-                "Cs-137",
-                np.array([1.0, 0.0, 0.0]),
-                9.0e6,
-                0.5,
-                0.0,
-            ),
-        ]
-    }
-    estimator = SimpleNamespace(isotopes=["Cs-137"], detector_radius_m=0.0)
-
-    statistics = dss_pp._signature_future_statistics_for_poses(
-        estimator,
-        np.array([[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
-        modes,
-        {"Cs-137": (states, np.array([0.5, 0.5]))},
-        config=DSSPPConfig(
-            live_time_s=2.0,
-            primary_history_weight=1.0,
-            target_sampled_primaries=1.5e6,
-        ),
-    )
-
-    np.testing.assert_allclose(
-        statistics.primary_history_weights_by_isotope["Cs-137"],
-        np.array([[4.0, 12.0], [1.0, 3.0]]),
-    )
-    np.testing.assert_allclose(
-        statistics.background_counts_by_isotope["Cs-137"],
-        np.array([6.0, 6.0]),
-    )
-
-
-def test_signature_preselection_fixed_statistics_preserve_legacy_score() -> None:
-    """Explicit fixed statistics should equal the fixed-mode fallback exactly."""
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    estimator = SimpleNamespace(
-        isotopes=["Cs-137"],
-        pf_config=SimpleNamespace(alpha_weights=None, position_max=(1.0, 1.0, 1.0)),
-        filters={
-            "Cs-137": SimpleNamespace(count_likelihood_spec=lambda: spec),
-        },
-    )
-    pair_cache = {
-        "Cs-137": (
-            np.array([[2.0, 18.0], [3.0, 17.0]], dtype=float),
-            [0.5, 0.5],
-        ),
-    }
-    programs = [dss_pp.ShieldProgram("probe", (0, 1), "probe")]
-    config = DSSPPConfig(primary_history_weight=5.0, count_variance_floor=1.0)
-    explicit = dss_pp._SignatureFutureStatisticsBatch(
-        primary_history_weights_by_isotope={
-            "Cs-137": np.full((1, 2), 5.0, dtype=float),
-        },
-        background_counts_by_isotope={"Cs-137": np.zeros(1, dtype=float)},
-    )
-
-    fallback_rows = dss_pp._score_programs_from_pair_cache(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        programs=programs,
-        config=config,
-    )
-    explicit_rows = dss_pp._score_programs_from_pair_cache(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        programs=programs,
-        config=config,
-        future_statistics=explicit,
-        pose_index=0,
-    )
-
-    for fallback, resolved in zip(fallback_rows, explicit_rows):
-        np.testing.assert_allclose(resolved, fallback, rtol=0.0, atol=0.0)
-
-
-def test_weighted_joint_program_eig_uses_candidate_sumw2() -> None:
-    """DSS EIG should use weighted sum-w2 for draws and candidate likelihoods."""
-    lambdas = np.array([[[2.0, 18.0], [2.0, 18.0]]], dtype=float)
-    weights = np.array([0.5, 0.5], dtype=float)
-    mask = np.ones((1, 2), dtype=bool)
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    unit_weight = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        weights,
-        mask,
-        spec=spec,
-        num_samples=4096,
-        rng=np.random.default_rng(71),
-        primary_history_weight=1.0,
-    )
-    weighted = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        weights,
-        mask,
-        spec=spec,
-        num_samples=4096,
-        rng=np.random.default_rng(71),
-        primary_history_weight=50.0,
-    )
-
-    assert weighted[0] < unit_weight[0]
-
-
-def test_joint_program_eig_array_weight_matches_fixed_scalar() -> None:
-    """A constant particle-weight vector should exactly preserve fixed EIG."""
-    lambdas = np.array([[[2.0, 18.0], [2.0, 18.0]]], dtype=float)
-    particle_weights = np.array([0.5, 0.5], dtype=float)
-    mask = np.ones((1, 2), dtype=bool)
-    spec = CountLikelihoodSpec(
-        model="student_t",
-        observation_count_variance_semantics="complete_statistical",
-        student_t_df=5.0,
-    )
-    scalar = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        particle_weights,
-        mask,
-        spec=spec,
-        num_samples=1024,
-        rng=np.random.default_rng(172),
-        primary_history_weight=5.0,
-    )
-    vector = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        particle_weights,
-        mask,
-        spec=spec,
-        num_samples=1024,
-        rng=np.random.default_rng(172),
-        primary_history_weight=np.array([5.0, 5.0]),
-    )
-    np.testing.assert_allclose(vector, scalar, rtol=0.0, atol=0.0)
-
-
-@pytest.mark.parametrize("model", ["gaussian", "student_t"])
-@pytest.mark.parametrize(
-    "semantics",
-    ["additional", "counting_noise_inclusive", "complete_statistical"],
-)
-def test_joint_program_eig_does_not_infer_candidate_from_supplied_covariance(
-    model: str,
-    semantics: str,
-) -> None:
-    """Equal candidate means must not separate through transport covariance."""
-    lambdas = np.array([[[10.0, 10.0], [10.0, 10.0]]], dtype=float)
-    particle_weights = np.array([0.25, 0.75], dtype=float)
-    mask = np.ones((1, 2), dtype=bool)
-    spec = CountLikelihoodSpec(
-        model=model,
-        observation_count_variance_semantics=semantics,
-        student_t_df=5.0,
-    )
-
-    information_gain = dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        particle_weights,
-        mask,
-        spec=spec,
-        num_samples=2048,
-        rng=np.random.default_rng(844),
-        primary_history_weight=np.array([2.0, 20.0]),
-        background_counts_n=np.array([2.0, 8.0]),
-    )
-
-    np.testing.assert_allclose(information_gain, 0.0, atol=1.0e-12, rtol=0.0)
-
-
-@pytest.mark.parametrize(
-    ("semantics", "expected_low", "expected_high"),
-    [
-        ("additional", 9.0, 64.0),
-        ("counting_noise_inclusive", 19.0, 84.0),
-        ("complete_statistical", 19.0, 84.0),
-    ],
-)
-def test_joint_program_eig_broadcasts_truth_transport_covariance(
-    monkeypatch: pytest.MonkeyPatch,
-    semantics: str,
-    expected_low: float,
-    expected_high: float,
-) -> None:
-    """Truth weights should drive draws while supplied covariance stays fixed."""
-    lambdas = np.array([[[10.0, 20.0]]], dtype=float)
-    spec = CountLikelihoodSpec(
-        model="gaussian",
-        observation_count_variance_semantics=semantics,
-    )
-    captured_truth: list[np.ndarray] = []
-    captured_predictive: list[np.ndarray] = []
-    captured_supplied: list[np.ndarray] = []
-    original_terms = dss_pp.count_log_likelihood_terms_np
-
-    def _capture_draws(
-        truth_lambdas_pvs: np.ndarray,
-        predictive_variance_pvs: np.ndarray,
-        *,
-        spec: CountLikelihoodSpec,
-        rng: np.random.Generator,
-    ) -> np.ndarray:
-        """Capture generative variances and return deterministic mean draws."""
-        del spec, rng
-        captured_truth.append(np.asarray(truth_lambdas_pvs, dtype=float).copy())
-        captured_predictive.append(
-            np.asarray(predictive_variance_pvs, dtype=float).copy()
-        )
-        return np.asarray(truth_lambdas_pvs, dtype=float).copy()
-
-    def _capture_terms(
-        z_k: np.ndarray,
-        lambda_k: np.ndarray,
-        *,
-        spec: CountLikelihoodSpec,
-        observation_count_variance: float | np.ndarray = 0.0,
-        epsilon: float = 1.0e-12,
-    ) -> np.ndarray:
-        """Capture the covariance tensor supplied to all candidate particles."""
-        captured_supplied.append(
-            np.asarray(observation_count_variance, dtype=float).copy()
-        )
-        return original_terms(
-            z_k,
-            lambda_k,
-            spec=spec,
-            observation_count_variance=observation_count_variance,
-            epsilon=epsilon,
-        )
-
-    monkeypatch.setattr(dss_pp, "_draw_program_future_counts", _capture_draws)
-    monkeypatch.setattr(dss_pp, "count_log_likelihood_terms_np", _capture_terms)
-
-    dss_pp._program_information_gain_from_lambdas(
-        lambdas,
-        np.array([0.5, 0.5]),
-        np.ones((1, 1), dtype=bool),
-        spec=spec,
-        num_samples=256,
-        rng=np.random.default_rng(923),
-        primary_history_weight=np.array([2.0, 5.0]),
-        background_counts_n=np.array([1.0, 4.0]),
-    )
-
-    truth = captured_truth[0]
-    predictive = captured_predictive[0]
-    supplied = captured_supplied[0]
-    expected_predictive = np.where(truth == 10.0, 19.0, 84.0)
-    expected_supplied = np.where(truth == 10.0, expected_low, expected_high)
-    np.testing.assert_allclose(predictive, expected_predictive)
-    assert supplied.shape == truth.shape + (2,)
-    np.testing.assert_allclose(supplied[..., 0], expected_supplied)
-    np.testing.assert_allclose(supplied[..., 1], expected_supplied)
-
-
-def test_height_partner_mask_excludes_visited_exact_action() -> None:
-    """A previously sampled height must not qualify via another sampled height."""
-    candidates = np.array(
-        [[2.0, 2.0, 0.5], [2.0, 2.0, 1.5], [2.0, 2.0, 2.5]],
-        dtype=float,
-    )
-    visited = np.array(
-        [[2.0, 2.0, 0.5], [2.0, 2.0, 1.5]],
-        dtype=float,
-    )
-
-    mask = dss_pp._height_partner_mask_batch(candidates, visited)
-
-    assert mask.tolist() == [False, False, True]
 
 
 def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
@@ -3380,50 +2438,51 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
-        candidate_sources=candidate_sources,
+        surface_diagnostic_points=candidate_sources,
         shield_normals=shield_normals,
         mu_by_isotope={"Cs-137": 0.08},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 2.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
     filt = est.filters["Cs-137"]
     filt.continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[0.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                0
+            ].joint_row_identity,
         ),
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                filt,
+                np.array([[4.0, 0.0, 0.5]], dtype=float),
+                np.array([2000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=filt.continuous_particles[
+                1
+            ].joint_row_identity,
         ),
     ]
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=np.array([[2.0, 0.5, 0.5], [2.0, 6.0, 0.5]]),
         current_pose_xyz=np.array([2.0, 2.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=8,
+            max_programs=32,
             program_length=2,
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=1.0,
             lambda_distance=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
             lambda_rotation=0.0,
             augment_candidates=False,
             diagnostic_ranked_node_limit=0,
@@ -3435,860 +2494,6 @@ def test_dss_pp_ranked_node_limit_zero_disables_ranked_payload() -> None:
     assert result.diagnostics["diagnostic_ranked_node_limit"] == 0
     assert result.diagnostics["ranked_nodes"] == []
     assert result.sequence
-
-
-def _scalar_remaining_route_terms(
-    candidates: np.ndarray,
-    current_pose: np.ndarray,
-    visited: np.ndarray,
-    path_lengths: np.ndarray,
-    coverage_norm: np.ndarray,
-    revisit_penalties: np.ndarray,
-    frontier_gains: np.ndarray,
-    turn_penalties: np.ndarray,
-    config: DSSPPConfig,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Return a serial oracle for remaining-budget route terms."""
-    pressure = dss_pp._remaining_budget_pressure(config)
-    if pressure <= 0.0:
-        return pressure, np.zeros(candidates.shape[0]), np.zeros(candidates.shape[0])
-    nominal_step = max(
-        float(config.min_station_separation_m),
-        float(config.coverage_radius_m),
-        1.0,
-    )
-    remaining = max(1, int(config.remaining_station_estimate or 1))
-    current_xy = np.asarray(current_pose[:2], dtype=float)
-    older = []
-    radius = 2.0 * nominal_step
-    for pose in visited:
-        if float(np.linalg.norm(pose[:2] - current_xy)) > max(0.25 * radius, 1.0e-6):
-            older.append(pose)
-    penalties = []
-    gains = []
-    for idx, candidate in enumerate(candidates):
-        if np.isfinite(path_lengths[idx]):
-            distance_penalty = min(
-                max(float(path_lengths[idx]) / (nominal_step * float(remaining)), 0.0),
-                2.0,
-            )
-        else:
-            distance_penalty = float("inf")
-        backtrack_penalty = 0.0
-        if older:
-            nearest = min(
-                float(np.linalg.norm(candidate[:2] - pose[:2])) for pose in older
-            )
-            if nearest < radius:
-                shortfall = 1.0 - nearest / radius
-                backtrack_penalty = shortfall * shortfall
-        coverage = min(max(float(coverage_norm[idx]), 0.0), 1.0)
-        penalty = (
-            float(config.remaining_route_distance_weight) * distance_penalty
-            + float(config.remaining_route_revisit_weight) * revisit_penalties[idx]
-            + float(config.remaining_route_turn_weight) * turn_penalties[idx]
-            + float(config.remaining_route_backtrack_weight) * backtrack_penalty
-            + float(config.remaining_route_coverage_weight) * (1.0 - coverage)
-        )
-        gain = (
-            float(config.remaining_route_coverage_weight) * coverage
-            + float(config.remaining_route_frontier_weight) * frontier_gains[idx]
-        )
-        penalties.append(max(float(penalty), 0.0))
-        gains.append(max(float(gain), 0.0))
-    return pressure, np.asarray(penalties), np.asarray(gains)
-
-
-def test_remaining_route_terms_batch_match_scalar_oracle() -> None:
-    """Remaining-budget route terms should match a serial route oracle."""
-    candidates = np.array(
-        [[1.0, 0.0, 0.5], [6.0, 0.0, 0.5], [4.0, 2.0, 0.5]],
-        dtype=float,
-    )
-    current = np.array([4.0, 0.0, 0.5], dtype=float)
-    visited = np.array([[0.0, 0.0, 0.5], [2.0, 0.0, 0.5], [4.0, 0.0, 0.5]])
-    path_lengths = np.array([3.0, 2.0, 2.0], dtype=float)
-    coverage_norm = np.array([0.0, 0.8, 0.4], dtype=float)
-    revisit_penalties = np.array([0.5, 0.0, 0.1], dtype=float)
-    frontier_gains = np.array([0.2, 0.7, 0.5], dtype=float)
-    turn_penalties = np.array([1.0, 0.0, 0.5], dtype=float)
-    config = DSSPPConfig(
-        remaining_budget_guidance=True,
-        remaining_station_estimate=2,
-        remaining_budget_urgency_stations=4,
-        remaining_route_weight=2.0,
-        min_station_separation_m=2.0,
-        coverage_radius_m=1.0,
-    )
-
-    expected = _scalar_remaining_route_terms(
-        candidates,
-        current,
-        visited,
-        path_lengths,
-        coverage_norm,
-        revisit_penalties,
-        frontier_gains,
-        turn_penalties,
-        config,
-    )
-    actual = dss_pp._remaining_route_terms_batch(
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        path_lengths=path_lengths,
-        coverage_norm=coverage_norm,
-        revisit_penalties=revisit_penalties,
-        frontier_gains=frontier_gains,
-        turn_penalties=turn_penalties,
-        config=config,
-    )
-
-    assert actual[0] == pytest.approx(expected[0])
-    assert np.allclose(actual[1], expected[1])
-    assert np.allclose(actual[2], expected[2])
-
-
-def test_dss_pp_remaining_budget_guidance_avoids_backtracking() -> None:
-    """Low remaining station budgets should penalize route regression."""
-    est = _build_simple_estimator()
-    candidates = np.array(
-        [[1.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
-        dtype=float,
-    )
-    current = np.array([4.0, 0.0, 0.0], dtype=float)
-    visited = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], current], dtype=float)
-
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
-            program_length=1,
-            live_time_s=1.0,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
-            lambda_rotation=0.0,
-            augment_candidates=False,
-            min_station_separation_m=0.0,
-            coverage_radius_m=1.0,
-            remaining_budget_guidance=True,
-            remaining_station_estimate=1,
-            remaining_budget_urgency_stations=4,
-            remaining_route_weight=5.0,
-            remaining_route_distance_weight=0.2,
-            remaining_route_revisit_weight=1.0,
-            remaining_route_turn_weight=1.0,
-            remaining_route_backtrack_weight=1.0,
-            remaining_route_coverage_weight=0.0,
-            remaining_route_frontier_weight=0.0,
-        ),
-    )
-
-    assert result.next_pose_index == 1
-    assert np.allclose(result.next_pose, candidates[1])
-    assert result.diagnostics["remaining_route_pressure"] > 0.0
-
-
-def test_dss_pp_environment_signature_prefers_obstacle_contrast() -> None:
-    """DSS-PP should prefer stations where known obstacles separate modes."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array(
-        [[-1.0, 0.0, 1.0], [-1.0, 2.0, 1.0]],
-        dtype=float,
-    )
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    grid = ObstacleGrid(
-        origin=(0.0, -0.5),
-        cell_size=1.0,
-        grid_shape=(1, 1),
-        blocked_cells=((0, 0),),
-        transport_boxes_m=((0.0, -0.5, 0.0, 1.0, 0.5, 2.0),),
-    )
-    config = RotatingShieldPFConfig(
-        num_particles=2,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        planning_particles=None,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-        obstacle_grid=grid,
-        obstacle_height_m=2.0,
-        obstacle_mu_by_isotope={"Cs-137": 0.01},
-    )
-    est.add_measurement_pose(np.array([2.0, 2.0, 1.0], dtype=float))
-    est._ensure_kernel_cache()
-    filt = est.filters["Cs-137"]
-    filt.continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[-1.0, 0.0, 1.0]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[-1.0, 2.0, 1.0]], dtype=float),
-                strengths=np.array([2000.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=np.log(0.5),
-        ),
-    ]
-    candidates = np.array(
-        [[2.0, 0.0, 1.0], [2.0, 4.0, 1.0]],
-        dtype=float,
-    )
-
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([2.0, 2.0, 1.0], dtype=float),
-        config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
-            program_length=1,
-            live_time_s=1.0,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_temporal_separation=0.0,
-            lambda_environment_signature=10.0,
-            lambda_distance=0.0,
-            lambda_rotation=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
-            enforce_min_observation=False,
-            augment_candidates=False,
-            environment_contrast_threshold=0.25,
-        ),
-    )
-
-    assert result.next_pose_index == 0
-    assert result.diagnostics["first_environment_signature_score"] > 0.0
-    assert 0.0 <= result.diagnostics["first_environment_signature_norm"] <= 1.0
-
-
-def test_dss_pp_environment_signature_score_is_bounded() -> None:
-    """Obstacle signature should act as a bounded weak planner term."""
-    config = DSSPPConfig(environment_signature_score_clip=3.0)
-
-    low = dss_pp._normalized_environment_signature_score(0.0, config=config)
-    high = dss_pp._normalized_environment_signature_score(1.0e6, config=config)
-    arr = dss_pp._normalized_environment_signature_score(
-        np.array([0.0, 3.0, 1.0e6], dtype=float),
-        config=config,
-    )
-
-    assert low == 0.0
-    assert high == 1.0
-    assert np.all(arr >= 0.0)
-    assert np.all(arr <= 1.0)
-    assert np.isclose(arr[-1], 1.0)
-
-
-def test_dss_pp_elevation_signature_scores_vertical_mode_pairs() -> None:
-    """Height-separated posterior modes should add an elevation signature score."""
-    modes = [
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([2.0, 0.0, 0.5], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.5,
-            spread_m=0.2,
-        ),
-        dss_pp.SignatureMode(
-            isotope="Cs-137",
-            position_xyz=np.array([2.0, 0.0, 6.5], dtype=float),
-            strength_cps_1m=1000.0,
-            weight=0.5,
-            spread_m=0.2,
-        ),
-    ]
-    config = DSSPPConfig(
-        temporal_pair_contrast_threshold=0.1,
-        elevation_pair_z_scale_m=1.0,
-        elevation_pair_xy_scale_m=4.0,
-    )
-    responses = np.array(
-        [
-            [[10.0, 10.0], [2.0, 10.0]],
-            [[10.0, 10.0], [10.0, 10.0]],
-        ],
-        dtype=float,
-    )
-
-    scores = dss_pp._batched_elevation_signature_scores(
-        responses,
-        np.array([0.5, 0.5], dtype=float),
-        modes,
-        config=config,
-    )
-
-    assert scores[0] > 0.0
-    assert scores[1] == 0.0
-
-
-def test_dss_pp_elevation_condition_prefers_elevation_separating_view() -> None:
-    """Candidate views with different elevation angles should score higher."""
-    modes = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([2.0, 0.0, 0.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.2,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([2.0, 0.0, 6.5], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.2,
-            ),
-        ],
-    }
-    candidates = np.array(
-        [
-            [0.0, 0.0, 0.5],
-            [20.0, 0.0, 0.5],
-        ],
-        dtype=float,
-    )
-
-    gains = dss_pp._elevation_condition_gains_batch(
-        candidates,
-        modes,
-        config=DSSPPConfig(elevation_angle_threshold_deg=45.0),
-    )
-
-    assert gains[0] > gains[1]
-    assert gains[0] > 0.0
-
-
-def test_dss_pp_batched_environment_features_match_scalar_oracle() -> None:
-    """Batched obstacle-signature features should match scalar ray-box scoring."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array(
-        [[-1.0, 0.0, 1.0], [-1.0, 2.0, 1.0], [-1.0, 4.0, 1.0]],
-        dtype=float,
-    )
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    grid = ObstacleGrid(
-        origin=(0.0, -0.5),
-        cell_size=1.0,
-        grid_shape=(2, 3),
-        blocked_cells=((0, 0), (1, 1), (0, 2)),
-        transport_boxes_m=(
-            (0.0, -0.5, 0.0, 1.0, 0.5, 2.0),
-            (1.0, 0.5, 0.0, 2.0, 1.5, 2.0),
-            (0.0, 1.5, 0.0, 1.0, 2.5, 2.0),
-        ),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=RotatingShieldPFConfig(
-            num_particles=3,
-            max_sources=1,
-            variable_cardinality=False,
-            use_gpu=False,
-            planning_particles=None,
-            init_num_sources=(1, 1),
-        ),
-        shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
-        obstacle_grid=grid,
-        obstacle_height_m=2.0,
-        obstacle_mu_by_isotope={"Cs-137": 0.015},
-    )
-    est.add_measurement_pose(np.array([2.0, 2.0, 1.0], dtype=float))
-    est._ensure_kernel_cache()
-    modes_by_isotope = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([-1.0, 0.0, 1.0], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.2,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([-1.0, 2.0, 1.0], dtype=float),
-                strength_cps_1m=800.0,
-                weight=0.3,
-                spread_m=0.2,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([-1.0, 4.0, 1.0], dtype=float),
-                strength_cps_1m=600.0,
-                weight=0.2,
-                spread_m=0.2,
-            ),
-        ]
-    }
-    poses = np.array(
-        [[2.0, 0.0, 1.0], [2.0, 2.0, 1.0], [2.0, 4.0, 1.0]],
-        dtype=float,
-    )
-    config = DSSPPConfig(
-        environment_contrast_threshold=0.2,
-        occlusion_boundary_step_m=0.25,
-    )
-    kernel = _continuous_kernel_for_estimator(est, detector_aperture_samples=1)
-
-    batched_env = dss_pp._environment_signature_scores_batch(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes_by_isotope,
-        poses_xyz=poses,
-        config=config,
-    )
-    scalar_env = np.asarray(
-        [
-            dss_pp._environment_signature_score(
-                kernel=kernel,
-                estimator=est,
-                modes_by_isotope=modes_by_isotope,
-                pose_xyz=pose,
-                config=config,
-            )
-            for pose in poses
-        ],
-        dtype=float,
-    )
-    batched_boundary = dss_pp._occlusion_boundary_gains_batch(
-        kernel=kernel,
-        estimator=est,
-        modes_by_isotope=modes_by_isotope,
-        poses_xyz=poses,
-        config=config,
-    )
-    scalar_boundary = np.asarray(
-        [
-            dss_pp._occlusion_boundary_gain(
-                kernel=kernel,
-                estimator=est,
-                modes_by_isotope=modes_by_isotope,
-                pose_xyz=pose,
-                config=config,
-            )
-            for pose in poses
-        ],
-        dtype=float,
-    )
-
-    assert np.allclose(batched_env, scalar_env)
-    assert np.allclose(batched_boundary, scalar_boundary)
-
-
-def test_dss_pp_batched_station_features_match_scalar_oracle() -> None:
-    """Batched station preselection features should match scalar helper scores."""
-    modes_by_isotope = {
-        "Cs-137": [
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([2.0, 2.0, 1.0], dtype=float),
-                strength_cps_1m=1200.0,
-                weight=0.6,
-                spread_m=0.2,
-            ),
-            dss_pp.SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([7.0, 5.0, 1.0], dtype=float),
-                strength_cps_1m=900.0,
-                weight=0.4,
-                spread_m=0.2,
-            ),
-        ],
-        "Co-60": [
-            dss_pp.SignatureMode(
-                isotope="Co-60",
-                position_xyz=np.array([4.0, 8.0, 1.0], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=1.0,
-                spread_m=0.2,
-            )
-        ],
-    }
-    candidates = np.array(
-        [[1.0, 1.0, 1.0], [4.0, 2.0, 1.0], [8.0, 8.0, 1.0]],
-        dtype=float,
-    )
-    visited = np.array([[0.0, 0.0, 1.0], [2.0, 6.0, 1.0]], dtype=float)
-    centers = np.array(
-        [
-            [x, y, 1.0]
-            for x in np.linspace(0.5, 8.5, 4)
-            for y in np.linspace(0.5, 8.5, 4)
-        ],
-        dtype=float,
-    )
-    config = DSSPPConfig(
-        ring_radii_m=(2.0, 4.0),
-        local_orbit_sigma_m=0.8,
-        live_time_s=3.0,
-        count_utility_saturation_counts=100.0,
-    )
-
-    scalar_coverage = np.asarray(
-        [
-            dss_pp._coverage_gain_fraction(
-                cell_centers_xyz=centers,
-                candidate_pose_xyz=pose,
-                visited_poses_xyz=visited,
-                radius_m=2.5,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_revisit = np.asarray(
-        [
-            dss_pp._station_revisit_penalty(
-                pose,
-                visited,
-                min_separation_m=3.0,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_bearing = np.asarray(
-        [
-            dss_pp._bearing_diversity_gain(
-                pose,
-                visited,
-                modes_by_isotope,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_frontier = np.asarray(
-        [
-            dss_pp._frontier_band_gain(
-                pose,
-                visited,
-                target_radius_m=3.0,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_turn = np.asarray(
-        [
-            dss_pp._route_turn_penalty(
-                pose,
-                np.array([3.0, 6.0, 1.0], dtype=float),
-                visited,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_orbit = np.asarray(
-        [
-            dss_pp._local_orbit_gain(
-                pose,
-                modes_by_isotope,
-                config=config,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_condition = np.asarray(
-        [
-            dss_pp._station_condition_gain(
-                pose,
-                visited,
-                modes_by_isotope,
-                config=config,
-            )
-            for pose in candidates
-        ],
-        dtype=float,
-    )
-    scalar_correlation = []
-    scalar_balance = []
-    for pose in candidates:
-        corr_rows = []
-        corr_weights = []
-        balance_rows = []
-        for modes in modes_by_isotope.values():
-            active = [mode for mode in modes if float(mode.weight) > 0.0]
-            if len(active) >= 2:
-                before = dss_pp._station_response_matrix(
-                    visited,
-                    active,
-                    live_time_s=float(config.live_time_s),
-                )
-                candidate_row = dss_pp._station_response_matrix(
-                    pose.reshape(1, 3),
-                    active,
-                    live_time_s=float(config.live_time_s),
-                )
-                before_corr = dss_pp._max_column_correlation_from_design(before)
-                after_corr = dss_pp._max_column_correlation_after_candidate_batch(
-                    before_matrix=before,
-                    candidate_rows=candidate_row,
-                )[0]
-                corr_rows.append(max(float(before_corr - after_corr), 0.0))
-                corr_weights.append(float(sum(mode.weight for mode in active)))
-            if active:
-                response = dss_pp._station_response_matrix(
-                    pose.reshape(1, 3),
-                    active,
-                    live_time_s=float(config.live_time_s),
-                )
-                weights = dss_pp._normalise_weights(
-                    np.asarray([float(mode.weight) for mode in active], dtype=float)
-                )
-                expected = float(np.sum(response[0] * weights))
-                saturation = max(float(config.count_utility_saturation_counts), 1e-12)
-                balance_rows.append(1.0 - np.exp(-max(expected, 0.0) / saturation))
-        if corr_rows:
-            corr_weight_arr = dss_pp._normalise_weights(np.asarray(corr_weights))
-            scalar_correlation.append(float(np.sum(corr_weight_arr * corr_rows)))
-        else:
-            scalar_correlation.append(0.0)
-        if balance_rows:
-            balance = np.asarray(balance_rows, dtype=float)
-            scalar_balance.append(
-                float(0.75 * np.min(balance) + 0.25 * np.mean(balance))
-            )
-        else:
-            scalar_balance.append(0.0)
-    scalar_correlation = np.asarray(scalar_correlation, dtype=float)
-    scalar_balance = np.asarray(scalar_balance, dtype=float)
-
-    assert np.allclose(
-        dss_pp._coverage_gain_fractions_batch(
-            cell_centers_xyz=centers,
-            candidate_poses_xyz=candidates,
-            visited_poses_xyz=visited,
-            radius_m=2.5,
-        ),
-        scalar_coverage,
-    )
-    assert np.allclose(
-        dss_pp._station_revisit_penalties_batch(
-            candidates,
-            visited,
-            min_separation_m=3.0,
-        ),
-        scalar_revisit,
-    )
-    assert np.allclose(
-        dss_pp._bearing_diversity_gains_batch(
-            candidates,
-            visited,
-            modes_by_isotope,
-        ),
-        scalar_bearing,
-    )
-    assert np.allclose(
-        dss_pp._frontier_band_gains_batch(
-            candidates,
-            visited,
-            target_radius_m=3.0,
-        ),
-        scalar_frontier,
-    )
-    assert np.allclose(
-        dss_pp._route_turn_penalties_batch(
-            candidates,
-            np.array([3.0, 6.0, 1.0], dtype=float),
-            visited,
-        ),
-        scalar_turn,
-    )
-    assert np.allclose(
-        dss_pp._local_orbit_gains_batch(
-            candidates,
-            modes_by_isotope,
-            config=config,
-        ),
-        scalar_orbit,
-    )
-    assert np.allclose(
-        dss_pp._station_condition_gains_batch(
-            candidates,
-            visited,
-            modes_by_isotope,
-            config=config,
-        ),
-        scalar_condition,
-    )
-    assert np.allclose(
-        dss_pp._station_correlation_reduction_gains_batch(
-            candidates,
-            visited,
-            modes_by_isotope,
-            config=config,
-        ),
-        scalar_correlation,
-    )
-    assert np.allclose(
-        dss_pp._isotope_balance_gains_batch(
-            candidates,
-            modes_by_isotope,
-            config=config,
-        ),
-        scalar_balance,
-    )
-
-
-def test_station_condition_composite_batch_matches_scalar() -> None:
-    """Composite Fisher conditioning terms should match scalar evaluation."""
-    candidates = np.array(
-        [[1.0, 2.0, 1.0], [6.0, 4.0, 1.0], [9.0, 8.0, 1.0]],
-        dtype=float,
-    )
-    visited = np.array([[2.0, 8.0, 1.0], [8.0, 2.0, 1.0]], dtype=float)
-    modes_by_isotope = {
-        "Cs-137": [
-            SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([0.0, 0.0, 0.0], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.5,
-            ),
-            SignatureMode(
-                isotope="Cs-137",
-                position_xyz=np.array([10.0, 10.0, 0.0], dtype=float),
-                strength_cps_1m=1000.0,
-                weight=0.5,
-                spread_m=0.5,
-            ),
-        ]
-    }
-    config = DSSPPConfig(
-        station_condition_min_singular_weight=1.0,
-        station_condition_inverse_condition_weight=1.0,
-        station_condition_coherence_weight=0.5,
-    )
-
-    scalar = np.asarray(
-        [
-            dss_pp._station_condition_gain(  # noqa: SLF001
-                candidate,
-                visited,
-                modes_by_isotope,
-                config=config,
-            )
-            for candidate in candidates
-        ],
-        dtype=float,
-    )
-    batched = dss_pp._station_condition_gains_batch(  # noqa: SLF001
-        candidates,
-        visited,
-        modes_by_isotope,
-        config=config,
-    )
-
-    assert np.allclose(batched, scalar)
-
-
-def test_dss_pp_enforces_all_isotope_observability_when_feasible() -> None:
-    """DSS-PP should filter station-program nodes that miss an isotope."""
-    isotopes = ["Cs-137", "Co-60"]
-    candidate_sources = np.array(
-        [[0.0, 0.0, 0.5], [10.0, 0.0, 0.5]],
-        dtype=float,
-    )
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={
-            "Cs-137": {"fe": 0.0, "pb": 0.0},
-            "Co-60": {"fe": 0.0, "pb": 0.0},
-        },
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([0.0, 5.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    for isotope, position in zip(isotopes, candidate_sources):
-        est.filters[isotope].continuous_particles = [
-            IsotopeParticle(
-                state=IsotopeState(
-                    num_sources=1,
-                    positions=position.reshape(1, 3),
-                    strengths=np.array([1000.0], dtype=float),
-                    background=0.0,
-                ),
-                log_weight=0.0,
-            )
-        ]
-    candidates = np.array(
-        [[0.5, 0.0, 0.5], [5.0, 0.0, 0.5]],
-        dtype=float,
-    )
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 5.0, 0.5], dtype=float),
-        config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=4,
-            program_length=1,
-            live_time_s=1.0,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_rotation=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            min_observation_counts=30.0,
-            signature_std_min_counts=0.0,
-            augment_candidates=False,
-        ),
-    )
-
-    assert result.next_pose_index == 1
-    assert np.allclose(result.next_pose, candidates[1])
 
 
 def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
@@ -4306,23 +2511,26 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
-        candidate_sources=candidate_sources,
+        surface_diagnostic_points=candidate_sources,
         shield_normals=shield_normals,
         mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([1.0, 1.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
     est.filters["Cs-137"].continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                est.filters["Cs-137"],
+                np.array([[0.0, 0.0, 0.5]], dtype=float),
+                np.array([100.0], dtype=float),
             ),
             log_weight=0.0,
+            joint_row_identity=est.filters[
+                "Cs-137"
+            ].continuous_particles[0].joint_row_identity,
         )
     ]
     traversable = TraversabilityMap(
@@ -4338,28 +2546,23 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
         map_api=traversable,
         config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
+            max_programs=4,
             program_length=1,
+            forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_rotation=0.0,
             lambda_coverage=1.0,
             eta_revisit=1.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
             min_station_separation_m=3.0,
             coverage_radius_m=2.0,
-            signature_std_min_counts=0.0,
             augment_candidates=False,
         ),
     )
@@ -4368,9 +2571,27 @@ def test_dss_pp_coverage_term_prefers_unvisited_free_space() -> None:
     assert np.allclose(result.next_pose, candidates[1])
 
 
-def test_dss_pp_coverage_floor_rejects_low_coverage_candidates() -> None:
-    """Coverage-floor scoring should keep exploration from collapsing locally."""
+def test_dss_pp_coverage_floor_rejects_low_coverage_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coverage-floor scoring should keep surface exploration from collapsing."""
     est = _build_simple_estimator()
+    quadrature = SimpleNamespace(
+        positions_s3=np.array(
+            [[8.5, 8.5, 0.5]],
+            dtype=float,
+        ),
+        area_weights_m2_s=np.ones(1, dtype=float),
+        diagnostics=lambda: {
+            "complete_chart_coverage": True,
+            "chart_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        est,
+        "surface_atlas_area_quadrature",
+        lambda **_kwargs: quadrature,
+    )
     traversable = TraversabilityMap(
         origin=(0.0, 0.0),
         cell_size=1.0,
@@ -4384,30 +2605,24 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([1.0, 1.0, 0.5], dtype=float),
         visited_poses_xyz=np.array([[1.0, 1.0, 0.5]], dtype=float),
         map_api=traversable,
         config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
+            max_programs=4,
             program_length=1,
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_rotation=0.0,
             lambda_coverage=0.0,
             coverage_floor_quantile=1.0,
             coverage_floor_weight=100.0,
             eta_revisit=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
             min_station_separation_m=0.0,
             coverage_radius_m=2.0,
-            signature_std_min_counts=0.0,
             augment_candidates=False,
         ),
     )
@@ -4415,8 +2630,8 @@ def test_dss_pp_coverage_floor_rejects_low_coverage_candidates() -> None:
     assert np.allclose(result.next_pose, candidates[1])
 
 
-def test_dss_pp_falls_back_to_reachable_base_candidates() -> None:
-    """DSS-PP should not fail when augmented candidates are disconnected."""
+def test_dss_pp_fails_when_generic_separation_removes_every_candidate() -> None:
+    """DSS must not bypass the one generic 3-D station-separation rule."""
     est = _build_simple_estimator()
     traversable = TraversabilityMap(
         origin=(0.0, 0.0),
@@ -4427,225 +2642,31 @@ def test_dss_pp_falls_back_to_reachable_base_candidates() -> None:
     current = np.array([0.5, 0.5, 0.0], dtype=float)
     candidates = np.array([[1.5, 0.5, 0.0]], dtype=float)
 
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=current,
-        visited_poses_xyz=np.array([current], dtype=float),
-        map_api=traversable,
-        config=DSSPPConfig(
-            horizon=1,
-            max_programs=1,
-            program_length=1,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_rotation=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
-            min_station_separation_m=2.0,
-            signature_std_min_counts=0.0,
-            augment_candidates=True,
-            max_augmented_candidates=8,
-        ),
-    )
-
-    assert np.allclose(result.next_pose, candidates[0])
-    assert result.diagnostics["path_fallback_used"] == 1
-    assert result.diagnostics["path_filtered_candidates"] > 0
-
-
-def test_dss_pp_limits_expensive_eig_candidate_evaluation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DSS-PP should only run EIG rollouts on the configured top candidates."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-        observation_count_variance_semantics="counting_noise_inclusive",
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([0.0, 0.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    est.filters["Cs-137"].continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
+    with pytest.raises(ValueError, match="generic 3-D station-separation"):
+        select_dss_pp_next_station(
+            estimator=est,
+            rng=np.random.default_rng(123),
+            candidate_poses_xyz=candidates,
+            current_pose_xyz=current,
+            visited_poses_xyz=np.array([current], dtype=float),
+            map_api=traversable,
+            config=DSSPPConfig(
+                max_programs=4,
+                program_length=1,
+                lambda_eig=0.0,
+                lambda_distance=0.0,
+                lambda_rotation=0.0,
+                min_station_separation_m=2.0,
+                augment_candidates=True,
+                max_augmented_candidates=8,
             ),
-            log_weight=0.0,
         )
-    ]
-    calls: list[np.ndarray] = []
-
-    def _fake_information_gains(
-        estimator: RotatingShieldPFEstimator,
-        pose_xyz: np.ndarray,
-        programs: list[list[dss_pp.ShieldProgram]],
-        *,
-        config: DSSPPConfig,
-        rng_seed: int | None,
-    ) -> list[np.ndarray]:
-        """Record one batched EIG call and return deterministic values."""
-        del estimator, config, rng_seed
-        calls.append(np.asarray(pose_xyz, dtype=float).copy())
-        return [np.ones(len(pose_programs), dtype=float) for pose_programs in programs]
-
-    monkeypatch.setattr(
-        dss_pp,
-        "_program_information_gains_for_poses",
-        _fake_information_gains,
-    )
-    candidates = np.array(
-        [
-            [1.0, 0.0, 0.5],
-            [2.0, 0.0, 0.5],
-            [3.0, 0.0, 0.5],
-            [4.0, 0.0, 0.5],
-        ],
-        dtype=float,
-    )
-
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        config=DSSPPConfig(
-            horizon=1,
-            beam_width=2,
-            max_programs=1,
-            program_length=1,
-            live_time_s=1.0,
-            lambda_eig=1.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_rotation=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
-            signature_std_min_counts=0.0,
-            eig_candidate_limit=2,
-            augment_candidates=False,
-        ),
-    )
-
-    assert result.next_pose.shape == (3,)
-    assert len(calls) == 1
-    assert calls[0].shape == (2, 3)
-    assert result.diagnostics["planning_eig_joint_program_views"] is True
-    assert result.diagnostics["planning_eig_likelihood_models"] == {"Cs-137": "poisson"}
-    assert result.diagnostics[
-        "planning_eig_observation_count_variance_semantics"
-    ] == {"Cs-137": "counting_noise_inclusive"}
 
 
-def test_dss_pp_preselects_candidates_before_program_scoring(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DSS-PP should shortlist evidence-backed candidates before program scoring."""
-    isotopes = ["Cs-137"]
-    candidate_sources = np.array([[0.0, 0.0, 0.5]], dtype=float)
-    normals = generate_octant_rotation_matrices()
-    shield_normals = np.asarray([mat[:, 2] for mat in normals], dtype=float)
-    config = RotatingShieldPFConfig(
-        num_particles=1,
-        max_sources=1,
-        variable_cardinality=False,
-        use_gpu=False,
-        init_num_sources=(1, 1),
-    )
-    est = RotatingShieldPFEstimator(
-        isotopes=isotopes,
-        candidate_sources=candidate_sources,
-        shield_normals=shield_normals,
-        mu_by_isotope={"Cs-137": {"fe": 0.0, "pb": 0.0}},
-        pf_config=config,
-        shield_params=ShieldParams(),
-    )
-    est.add_measurement_pose(np.array([0.0, 0.0, 0.5], dtype=float))
-    est._ensure_kernel_cache()
-    est.filters["Cs-137"].continuous_particles = [
-        IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([100.0], dtype=float),
-                background=0.0,
-            ),
-            log_weight=0.0,
-        )
-    ]
-    original = dss_pp._build_pair_signature_caches_for_poses
-    seen_counts: list[int] = []
-
-    def _wrapped_pair_cache(*args: object, **kwargs: object) -> object:
-        """Record how many candidates reach expensive pair-cache construction."""
-        poses = np.asarray(kwargs["poses_xyz"], dtype=float)
-        seen_counts.append(int(poses.shape[0]))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        dss_pp,
-        "_build_pair_signature_caches_for_poses",
-        _wrapped_pair_cache,
-    )
-    candidates = np.array(
-        [[float(idx), 0.0, 0.5] for idx in range(8)],
-        dtype=float,
-    )
-
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=np.array([0.0, 0.0, 0.5], dtype=float),
-        config=DSSPPConfig(
-            horizon=1,
-            beam_width=1,
-            max_programs=1,
-            program_length=1,
-            live_time_s=1.0,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_rotation=0.0,
-            eta_observation=0.0,
-            eta_differential=0.0,
-            eta_count_balance=0.0,
-            signature_std_min_counts=0.0,
-            eig_candidate_limit=None,
-            augment_candidates=False,
-            candidate_preselect_enable=True,
-            candidate_preselect_min=3,
-            candidate_preselect_multiplier=1,
-        ),
-    )
-
-    assert result.next_pose.shape == (3,)
-    assert seen_counts == [3]
-    assert result.diagnostics["evaluated_candidate_count"] == 3
-
-
-def test_dss_pp_uses_bounds_coverage_without_map() -> None:
-    """Bounds-based coverage should drive exploration when no map is active."""
+def test_dss_pp_production_estimator_requires_continuous_surface_atlas() -> None:
+    """Production coverage must never fall back to an XY/free-cell grid."""
     est = _build_simple_estimator()
+    est.surface_atlas_area_quadrature = None  # type: ignore[method-assign]
     current = np.array([1.0, 1.0, 0.5], dtype=float)
     visited = np.array([[1.0, 1.0, 0.5]], dtype=float)
     candidates = np.array(
@@ -4656,33 +2677,319 @@ def test_dss_pp_uses_bounds_coverage_without_map() -> None:
         dtype=float,
     )
 
-    result = select_dss_pp_next_station(
-        estimator=est,
-        candidate_poses_xyz=candidates,
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        bounds_xyz=(
-            np.array([0.0, 0.0, 0.0], dtype=float),
-            np.array([10.0, 20.0, 1.0], dtype=float),
+    with pytest.raises(RuntimeError, match="continuous physical surface atlas"):
+        select_dss_pp_next_station(
+            estimator=est,
+            rng=np.random.default_rng(123),
+            candidate_poses_xyz=candidates,
+            current_pose_xyz=current,
+            visited_poses_xyz=visited,
+            bounds_xyz=(
+                np.array([0.0, 0.0, 0.0], dtype=float),
+                np.array([10.0, 20.0, 1.0], dtype=float),
+            ),
+            config=DSSPPConfig(
+                augment_candidates=False,
+                max_programs=2,
+                forced_program_pair_ids=(0, 1),
+                lambda_eig=0.0,
+                lambda_distance=0.0,
+                lambda_coverage=10.0,
+                coverage_radius_m=3.0,
+                min_station_separation_m=0.0,
+            ),
+        )
+
+
+def test_dss_coverage_uses_full_surface_atlas_without_pf_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """High walls and ceilings must remain coverage targets before detection."""
+    estimator = _build_simple_estimator()
+    atlas_points = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 3.0, 5.0],
+            [4.0, 3.0, 10.0],
+        ],
+        dtype=float,
+    )
+    observed: list[np.ndarray] = []
+
+    def fake_surface_quadrature(
+        *,
+        max_points: int,
+        maximum_hausdorff_bound_m: float,
+    ) -> object:
+        """Return a complete weighted surface fixture."""
+        assert max_points == 3
+        assert maximum_hausdorff_bound_m == pytest.approx(1.0)
+        return SimpleNamespace(
+            positions_s3=atlas_points,
+            area_weights_m2_s=np.asarray([1.0, 2.0, 3.0]),
+            diagnostics=lambda: {
+                "sample_count": 3,
+                "every_chart_represented": True,
+                "area_weighted": True,
+            },
+        )
+
+    estimator.surface_atlas_area_quadrature = (  # type: ignore[method-assign]
+        fake_surface_quadrature
+    )
+
+    def fake_coverage(**kwargs: object) -> np.ndarray:
+        """Record the atlas support passed to the response coverage kernel."""
+        observed.append(
+            np.asarray(kwargs["surface_points_xyz"], dtype=float).copy()
+        )
+        candidates = np.asarray(kwargs["candidate_poses_xyz"], dtype=float)
+        return np.zeros(candidates.shape[0], dtype=float)
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_response_equivalent_surface_coverage_gains",
+        fake_coverage,
+    )
+    select_dss_pp_next_station(
+        estimator=estimator,
+        rng=np.random.default_rng(123),
+        candidate_poses_xyz=np.array(
+            [[1.0, 0.0, 0.5], [2.0, 0.0, 1.5]],
+            dtype=float,
         ),
+        current_pose_xyz=np.zeros(3, dtype=float),
         config=DSSPPConfig(
-            augment_candidates=False,
-            horizon=1,
-            max_programs=1,
             lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_coverage=10.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
-            coverage_radius_m=3.0,
+            augment_candidates=False,
             min_station_separation_m=0.0,
+            coverage_surface_quadrature_max_points=3,
+            coverage_surface_max_hausdorff_m=1.0,
         ),
     )
 
-    assert np.allclose(result.next_pose, candidates[1])
+    assert len(observed) == 1
+    np.testing.assert_allclose(observed[0], atlas_points)
+    assert float(np.max(observed[0][:, 2])) == pytest.approx(10.0)
+
+
+def test_complete_surface_quadrature_includes_every_physical_face() -> None:
+    """Tiny, high-wall, ceiling, and obstacle charts must all be represented."""
+    vertices = np.asarray(
+        [
+            [
+                [0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0],
+                [0.1, 0.1, 0.0],
+                [0.0, 0.1, 0.0],
+            ],
+            [
+                [0.0, 0.0, 8.0],
+                [0.0, 0.5, 8.0],
+                [0.0, 0.5, 9.0],
+                [0.0, 0.0, 9.0],
+            ],
+            [
+                [1.0, 1.0, 10.0],
+                [2.0, 1.0, 10.0],
+                [2.0, 2.0, 10.0],
+                [1.0, 2.0, 10.0],
+            ],
+            [
+                [2.0, 2.0, 0.0],
+                [2.0, 2.2, 0.0],
+                [2.0, 2.2, 0.2],
+                [2.0, 2.0, 0.2],
+            ],
+        ],
+        dtype=np.float64,
+    )
+    areas = np.linalg.norm(
+        np.cross(
+            vertices[:, 1] - vertices[:, 0],
+            vertices[:, 3] - vertices[:, 0],
+        ),
+        axis=1,
+    )
+    geometry = SurfaceChartGeometry(
+        centers_xyz=np.mean(vertices, axis=1),
+        areas_m2=areas,
+        kinds=("floor", "wall", "ceiling", "obstacle_side"),
+        face_ids=(
+            "tiny_floor",
+            "high_wall",
+            "ceiling",
+            "obstacle_boundary",
+        ),
+        normals_xyz=np.asarray(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        local_uv_m=np.zeros((4, 2), dtype=np.float64),
+        vertices_xyz=vertices,
+        adjacency_edges=np.zeros((0, 2), dtype=np.int64),
+        shared_edge_lengths_m=np.zeros(0, dtype=np.float64),
+        obstacle_geometry_source="test",
+        obstacle_surfaces_available=True,
+        obstacle_component_count=1,
+    )
+    quadrature = build_complete_surface_atlas_quadrature(
+        ContinuousSurfaceAtlas(geometry),
+        max_points=4,
+        maximum_hausdorff_bound_m=0.75,
+    )
+
+    np.testing.assert_allclose(quadrature.positions_s3, geometry.centers_xyz)
+    np.testing.assert_allclose(quadrature.area_weights_m2_s, areas)
+    assert set(quadrature.face_ids) == {
+        "tiny_floor",
+        "high_wall",
+        "ceiling",
+        "obstacle_boundary",
+    }
+    assert quadrature.area_weights_m2_s[0] == pytest.approx(0.01)
+    assert float(np.max(quadrature.positions_s3[:, 2])) == pytest.approx(10.0)
+    diagnostics = quadrature.diagnostics()
+    assert diagnostics["every_chart_represented"] is True
+    assert diagnostics["area_weighted"] is True
+    assert diagnostics["physical_face_count"] == 4
+
+    with pytest.raises(RuntimeError, match="cannot represent every chart"):
+        build_complete_surface_atlas_quadrature(
+            ContinuousSurfaceAtlas(geometry),
+            max_points=3,
+            maximum_hausdorff_bound_m=0.75,
+        )
+    with pytest.raises(RuntimeError, match="Hausdorff bound"):
+        build_complete_surface_atlas_quadrature(
+            ContinuousSurfaceAtlas(geometry),
+            max_points=4,
+            maximum_hausdorff_bound_m=0.1,
+        )
+
+
+def test_surface_coverage_gain_uses_physical_area_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coverage gain must not give tiny and large charts equal mass."""
+    candidate_masks = np.asarray(
+        [[True, False], [False, True]],
+        dtype=bool,
+    )
+
+    def fake_masks(**_kwargs: object) -> tuple[np.ndarray, np.ndarray]:
+        """Return deterministic candidate and acquired coverage masks."""
+        return candidate_masks, np.zeros(2, dtype=bool)
+
+    monkeypatch.setattr(
+        dss_pp,
+        "_response_equivalent_surface_coverage_masks",
+        fake_masks,
+    )
+    gains = dss_pp._response_equivalent_surface_coverage_gains(
+        kernel=object(),
+        estimator=object(),
+        surface_points_xyz=np.zeros((2, 3), dtype=np.float64),
+        surface_area_weights_m2=np.asarray([1.0, 9.0], dtype=np.float64),
+        candidate_poses_xyz=np.zeros((2, 3), dtype=np.float64),
+        reference_radius_m=3.0,
+    )
+
+    np.testing.assert_allclose(gains, np.asarray([0.1, 0.9]))
+
+
+def test_sparse_surface_observability_matches_dense_physics_oracle() -> None:
+    """Sparse station coverage must preserve its dense unshielded response test."""
+    estimator = _build_simple_estimator()
+    estimator.measurements.append(
+        SimpleNamespace(
+            detector_position_xyz_m=(0.0, 0.0, 1.0),
+            fe_index=0,
+            pb_index=1,
+        )
+    )
+    kernel = dss_pp._continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=1,
+    )
+    surfaces = np.asarray(
+        [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    candidates = np.asarray(
+        [[0.0, 0.0, 1.0], [4.0, 0.0, 1.0], [8.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    radius = 2.0
+
+    sparse_candidate, sparse_acquired = (
+        dss_pp._response_equivalent_surface_coverage_masks(
+            kernel=kernel,
+            estimator=estimator,
+            surface_points_xyz=surfaces,
+            candidate_poses_xyz=candidates,
+            reference_radius_m=radius,
+        )
+    )
+    reference = float(
+        dss_pp._finite_sphere_geometric_terms_batched(
+            np.zeros((1, 3), dtype=float),
+            np.asarray([[radius, 0.0, 0.0]], dtype=float),
+            detector_radius_m=float(kernel.detector_radius_m),
+        )[0, 0]
+    )
+    dense_candidate = (
+        kernel.kernel_values_unshielded_for_detectors(
+            isotope="Cs-137",
+            detector_positions=candidates,
+            sources=surfaces,
+        )
+        >= reference
+    )
+    dense_acquired_response = kernel.kernel_values_unshielded_for_detectors(
+        isotope="Cs-137",
+        detector_positions=np.asarray([[0.0, 0.0, 1.0]], dtype=float),
+        sources=surfaces,
+    )
+    dense_acquired = np.max(dense_acquired_response, axis=0) >= reference
+
+    np.testing.assert_array_equal(sparse_candidate, dense_candidate)
+    np.testing.assert_array_equal(sparse_acquired, dense_acquired)
+
+
+def test_surface_observability_resolves_horizontal_and_vertical_actions() -> None:
+    """Atlas coverage must score horizontal and vertical geometry in full 3-D."""
+    estimator = _build_simple_estimator()
+    kernel = dss_pp._continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=1,
+    )
+    surfaces = np.asarray(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 8.0], [8.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    candidates = np.asarray(
+        [[0.0, 0.5, 0.0], [0.0, 0.5, 8.0], [8.0, 0.5, 0.0]],
+        dtype=np.float64,
+    )
+
+    candidate_masks, acquired = (
+        dss_pp._response_equivalent_surface_coverage_masks(
+            kernel=kernel,
+            estimator=estimator,
+            surface_points_xyz=surfaces,
+            candidate_poses_xyz=candidates,
+            reference_radius_m=1.0,
+        )
+    )
+
+    np.testing.assert_array_equal(candidate_masks, np.eye(3, dtype=bool))
+    np.testing.assert_array_equal(acquired, np.zeros(3, dtype=bool))
 
 
 def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
@@ -4700,6 +3007,7 @@ def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=current,
         visited_poses_xyz=visited,
@@ -4709,16 +3017,11 @@ def test_dss_pp_filters_near_revisit_when_alternatives_exist() -> None:
         ),
         config=DSSPPConfig(
             augment_candidates=False,
-            horizon=1,
-            max_programs=1,
+            max_programs=2,
+            forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_coverage=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
             min_station_separation_m=3.0,
         ),
     )
@@ -4736,6 +3039,7 @@ def test_dss_pp_augments_with_global_unvisited_coverage_candidates() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=current,
         visited_poses_xyz=visited,
@@ -4746,112 +3050,19 @@ def test_dss_pp_augments_with_global_unvisited_coverage_candidates() -> None:
         config=DSSPPConfig(
             augment_candidates=True,
             max_augmented_candidates=32,
-            horizon=1,
-            max_programs=1,
+            max_programs=2,
+            forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_coverage=10.0,
             lambda_rotation=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
             min_station_separation_m=3.0,
             coverage_radius_m=2.0,
-            signature_std_min_counts=0.0,
         ),
     )
 
     assert not np.allclose(result.next_pose, candidates[0])
     assert result.diagnostics["candidate_count"] > 1
-
-
-def test_dss_pp_filters_augmented_height_action_when_first_action_is_locked(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """DSS augmentation must not restore a caller-disallowed height action."""
-    estimator = _build_simple_estimator()
-    current = np.array([1.0, 1.0, 1.5], dtype=float)
-    visited = np.array(
-        [[1.0, 1.0, 0.5], [1.0, 1.0, 1.5]],
-        dtype=float,
-    )
-    lateral = np.array([5.0, 1.0, 1.5], dtype=float)
-    augmented_height = np.array([1.0, 1.0, 2.5], dtype=float)
-
-    def _fake_augment_candidate_stations(
-        _candidate_poses_xyz: np.ndarray,
-        **_kwargs: object,
-    ) -> np.ndarray:
-        """Return one legal lateral action and one augmented height action."""
-        return np.vstack([lateral, augmented_height])
-
-    monkeypatch.setattr(
-        dss_pp,
-        "augment_candidate_stations",
-        _fake_augment_candidate_stations,
-    )
-    result = select_dss_pp_next_station(
-        estimator=estimator,
-        candidate_poses_xyz=lateral.reshape(1, 3),
-        current_pose_xyz=current,
-        visited_poses_xyz=visited,
-        continuous_height_bounds_m=(0.5, 2.5),
-        config=DSSPPConfig(
-            augment_candidates=True,
-            horizon=1,
-            max_programs=1,
-            lambda_eig=0.0,
-            lambda_signature=0.0,
-            lambda_distance=0.0,
-            lambda_coverage=0.0,
-            lambda_rotation=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
-            min_station_separation_m=0.0,
-            signature_std_min_counts=0.0,
-        ),
-        allow_height_partner_first_action=False,
-    )
-
-    assert np.allclose(result.next_pose, lateral)
-    assert result.diagnostics["allow_height_partner_first_action"] is False
-    assert result.diagnostics["disallowed_height_partner_candidates"] == 1
-
-
-def test_dss_pp_count_balance_penalty_is_isotope_agnostic() -> None:
-    """DSS-PP balance penalty should reject any single-isotope dominated program."""
-    balanced = {"Cs-137": 12.0, "Co-60": 12.0, "Eu-154": 12.0}
-    co_dominated = {"Cs-137": 1.0, "Co-60": 98.0, "Eu-154": 1.0}
-    eu_dominated = {"Cs-137": 1.0, "Co-60": 1.0, "Eu-154": 98.0}
-
-    assert _count_balance_penalty(balanced) == pytest.approx(0.0)
-    assert _count_balance_penalty(co_dominated) == pytest.approx(
-        _count_balance_penalty(eu_dominated)
-    )
-    assert _count_balance_penalty(co_dominated) > 0.5
-
-
-def test_dss_pp_count_utility_saturates_high_counts() -> None:
-    """Count utility should reward usability without unbounded proximity bias."""
-    low = _saturated_count_utility(
-        {"Cs-137": 10.0, "Co-60": 10.0},
-        saturation_counts=100.0,
-    )
-    useful = _saturated_count_utility(
-        {"Cs-137": 100.0, "Co-60": 100.0},
-        saturation_counts=100.0,
-    )
-    extreme = _saturated_count_utility(
-        {"Cs-137": 10000.0, "Co-60": 10000.0},
-        saturation_counts=100.0,
-    )
-
-    assert 0.0 < low < useful < extreme <= 1.0
-    assert extreme == pytest.approx(1.0)
 
 
 def test_dss_pp_local_orbit_prefers_informative_annulus() -> None:
@@ -4867,26 +3078,20 @@ def test_dss_pp_local_orbit_prefers_informative_annulus() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([5.0, 5.0, 0.0], dtype=float),
         config=DSSPPConfig(
-            horizon=1,
-            max_programs=1,
+            max_programs=4,
             program_length=1,
+            forced_program_pair_ids=(0,),
             live_time_s=1.0,
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_rotation=0.0,
-            lambda_count_utility=0.0,
             lambda_local_orbit=10.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
             ring_radii_m=(3.0,),
             local_orbit_sigma_m=0.5,
-            signature_std_min_counts=0.0,
             augment_candidates=False,
         ),
     )
@@ -4910,32 +3115,37 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
     )
     est = RotatingShieldPFEstimator(
         isotopes=isotopes,
-        candidate_sources=candidate_sources,
+        surface_diagnostic_points=candidate_sources,
         shield_normals=shield_normals,
         mu_by_isotope={"Co-60": {"fe": 0.0, "pb": 0.0}},
         pf_config=config,
         shield_params=ShieldParams(),
+        full_spectrum_generative_model=approved_full_spectrum_model(),
     )
     est.add_measurement_pose(np.array([2.0, 3.0, 0.5], dtype=float))
     est._ensure_kernel_cache()
     est.filters["Co-60"].continuous_particles = [
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[0.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([1000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                est.filters["Co-60"],
+                np.array([[0.0, 0.0, 0.5]], dtype=float),
+                np.array([1000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=est.filters[
+                "Co-60"
+            ].continuous_particles[0].joint_row_identity,
         ),
         IsotopeParticle(
-            state=IsotopeState(
-                num_sources=1,
-                positions=np.array([[4.0, 0.0, 0.5]], dtype=float),
-                strengths=np.array([1000.0], dtype=float),
-                background=0.0,
+            state=_state_on_filter(
+                est.filters["Co-60"],
+                np.array([[4.0, 0.0, 0.5]], dtype=float),
+                np.array([1000.0], dtype=float),
             ),
             log_weight=np.log(0.5),
+            joint_row_identity=est.filters[
+                "Co-60"
+            ].continuous_particles[1].joint_row_identity,
         ),
     ]
     candidates = np.array(
@@ -4945,22 +3155,17 @@ def test_dss_pp_bearing_diversity_is_isotope_agnostic() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=np.array([2.0, 3.0, 0.5], dtype=float),
         config=DSSPPConfig(
-            horizon=1,
-            max_programs=1,
+            max_programs=32,
+            forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_coverage=0.0,
             lambda_bearing_diversity=10.0,
             lambda_rotation=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
-            signature_std_min_counts=0.0,
             augment_candidates=False,
         ),
     )
@@ -4984,27 +3189,54 @@ def test_dss_pp_turn_smoothness_discourages_backtracking() -> None:
 
     result = select_dss_pp_next_station(
         estimator=est,
+        rng=np.random.default_rng(123),
         candidate_poses_xyz=candidates,
         current_pose_xyz=current,
         visited_poses_xyz=visited,
         config=DSSPPConfig(
-            horizon=1,
-            max_programs=1,
+            max_programs=2,
+            forced_program_pair_ids=(0, 1),
             lambda_eig=0.0,
-            lambda_signature=0.0,
             lambda_distance=0.0,
             lambda_coverage=0.0,
             lambda_turn_smoothness=5.0,
             lambda_rotation=0.0,
-            eta_count_balance=0.0,
-            eta_differential=0.0,
-            eta_observation=0.0,
-            enforce_min_observation=False,
             min_station_separation_m=0.0,
-            signature_std_min_counts=0.0,
             augment_candidates=False,
         ),
     )
 
     assert np.allclose(result.next_pose, candidates[1])
     assert result.diagnostics["first_turn_penalty"] == pytest.approx(0.0)
+
+
+def test_route_turn_batch_handles_second_three_dimensional_station() -> None:
+    """The second planning call must evaluate full 3-D turn vectors."""
+    current = np.array([1.0, 2.0, 1.5], dtype=float)
+    visited = np.array(
+        [[0.0, 0.0, 0.5], current],
+        dtype=float,
+    )
+    candidates = np.array(
+        [
+            [2.0, 4.0, 2.5],
+            [0.0, 0.0, 0.5],
+            [1.0, 2.0, 3.5],
+        ],
+        dtype=float,
+    )
+
+    batched = dss_pp._route_turn_penalties_batch(
+        candidates,
+        current,
+        visited,
+    )
+    scalar = np.asarray(
+        [
+            dss_pp._route_turn_penalty(candidate, current, visited)
+            for candidate in candidates
+        ],
+        dtype=float,
+    )
+
+    np.testing.assert_allclose(batched, scalar, rtol=0.0, atol=1.0e-12)

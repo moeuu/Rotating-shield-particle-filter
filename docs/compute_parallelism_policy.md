@@ -15,7 +15,8 @@ or process-parallel evaluation when it operates over any of these dimensions:
 - Candidate source locations.
 - Measurement stations or shield postures.
 - Fe/Pb orientation programs.
-- Spectrum bins, response-matrix columns, or isotope count channels.
+- Continuous surface charts and proposal-strength grids.
+- Gamma lines, spectrum bins, detector-response columns, or predictive samples.
 - Obstacle ray/segment/material components.
 
 The first implementation should not be a scalar Python loop that is later
@@ -26,9 +27,12 @@ runtime path.
 ## Acceptable Parallel Forms
 
 - Geant4 native multithreading for transport histories.
-- Batched GPU kernels for PF expected counts, EIG, obstacle attenuation, and
+- Batched GPU kernels for source-resolved spectrum prediction, joint
+  likelihood, exact-RJ candidate scoring, EIG, obstacle attenuation, and
   candidate scoring.
 - Batched NumPy linear algebra for per-particle fixed-geometry solves.
+- Distributionally exact aggregate sampling for large renewal-event streams
+  when it avoids materializing or sorting individual pulses.
 - Process-level parallelism for independent CPU-bound candidate or baseline
   evaluations when GPU batching is not available.
 - Thread-level parallelism only for I/O-bound work or code that releases the

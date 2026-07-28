@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "build_ral_paper_subset.py"
 )
@@ -26,7 +28,13 @@ def _manifest_row(case: str, variant: str, seed: str = DEFAULT_SEED) -> dict[str
         "seed": seed,
         "config_path": f"results/ral_ablation/configs/{tag}.json",
         "source_path": f"results/ral_ablation/sources/{case}_seed_{seed}.json",
-        "command": f"uv run python main.py --output-tag {tag}",
+        "command": (
+            "uv run python main.py --full-simulation "
+            f"--sim-config results/ral_ablation/configs/{tag}.json "
+            "--source-config "
+            f"results/ral_ablation/sources/{case}_seed_{seed}.json "
+            f"--output-tag {tag}"
+        ),
     }
 
 
@@ -67,3 +75,29 @@ def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
     ) in selected_pairs
     assert all(case == "mix9_multi_isotope_cardinality" for case, _ in selected_pairs)
     assert all(row["seed"] == DEFAULT_SEED for row in subset)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "--python-cui",
+        "--full-simulation --sim-backend analytic",
+        "--mode python-cui",
+        "",
+    ],
+)
+def test_select_paper_subset_rejects_non_geant4_commands(
+    replacement: str,
+) -> None:
+    """A modified manifest cannot relabel an analytic run as a paper trial."""
+    rows = [
+        _manifest_row("mix9_multi_isotope_cardinality", variant)
+        for variant in MODULE.CORE_VARIANTS
+    ]
+    rows[0]["command"] = rows[0]["command"].replace(
+        "--full-simulation",
+        replacement,
+    )
+
+    with pytest.raises(ValueError, match="full-simulation|conflicting"):
+        select_paper_subset(rows)

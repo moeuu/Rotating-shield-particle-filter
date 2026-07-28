@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Tuple
-
-import numpy as np
-
-from pf.state import IsotopeState
+from functools import lru_cache
 
 try:
     import torch
@@ -59,32 +55,49 @@ def resolve_dtype(dtype: str) -> "torch.dtype":
     raise ValueError(f"Unsupported torch dtype: {dtype}")
 
 
-def pack_states(
-    states: Iterable[IsotopeState],
-    device: "torch.device",
-    dtype: "torch.dtype",
-) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
-    """
-    Pack IsotopeState list into padded tensors.
-
-    Returns (positions, strengths, backgrounds, mask).
-    """
-    states_list = list(states)
-    num_particles = len(states_list)
-    max_r = max((st.num_sources for st in states_list), default=0)
-    positions = np.zeros((num_particles, max_r, 3), dtype=float)
-    strengths = np.zeros((num_particles, max_r), dtype=float)
-    mask = np.zeros((num_particles, max_r), dtype=float)
-    backgrounds = np.zeros(num_particles, dtype=float)
-    for i, st in enumerate(states_list):
-        r = st.num_sources
-        if r > 0:
-            positions[i, :r] = st.positions
-            strengths[i, :r] = st.strengths
-            mask[i, :r] = 1.0
-        backgrounds[i] = st.background
-    pos_t = torch.as_tensor(positions, device=device, dtype=dtype)
-    str_t = torch.as_tensor(strengths, device=device, dtype=dtype)
-    mask_t = torch.as_tensor(mask, device=device, dtype=dtype)
-    bg_t = torch.as_tensor(backgrounds, device=device, dtype=dtype)
-    return pos_t, str_t, bg_t, mask_t
+@lru_cache(maxsize=None)
+def require_torch_compute_device(
+    device: str,
+    dtype: str = "float64",
+) -> None:
+    """Fail unless a finite tensor operation runs on the requested device."""
+    device_name = str(device).strip()
+    dtype_name = str(dtype).strip().lower()
+    if not device_name:
+        raise RuntimeError("The requested torch compute device is empty.")
+    if dtype_name != "float64":
+        raise RuntimeError(
+            "Pure PF compute requires torch float64; lower precision is "
+            "not an allowed runtime fallback."
+        )
+    if torch is None:
+        raise RuntimeError(
+            "Pure PF use_gpu=true requires torch before simulation starts."
+        )
+    try:
+        resolved_device = resolve_device(device_name)
+        resolved_dtype = resolve_dtype(dtype_name)
+        probe = torch.tensor(
+            [1.0, 2.0],
+            device=resolved_device,
+            dtype=resolved_dtype,
+        )
+        result = torch.sum(probe * probe)
+        if resolved_device.type == "cuda":
+            torch.cuda.synchronize(resolved_device)
+        if result.dtype != torch.float64 or not bool(
+            torch.isfinite(result).detach().cpu().item()
+        ):
+            raise RuntimeError(
+                "The requested torch device did not preserve finite float64 "
+                "arithmetic."
+            )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith(
+            "The requested torch device did not preserve"
+        ):
+            raise
+        raise RuntimeError(
+            "Pure PF use_gpu=true could not execute float64 torch arithmetic "
+            f"on device {device_name!r}."
+        ) from exc

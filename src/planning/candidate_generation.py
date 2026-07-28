@@ -13,35 +13,27 @@ def _resolve_bounds(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return (lo, hi) bounds for candidate generation."""
     if bounds_xyz is None:
-        lo = np.array([0.0, 0.0, 0.0], dtype=float)
-        hi = np.array([10.0, 10.0, 10.0], dtype=float)
-    else:
-        lo = np.asarray(bounds_xyz[0], dtype=float)
-        hi = np.asarray(bounds_xyz[1], dtype=float)
-    if lo.shape != (3,) or hi.shape != (3,):
-        raise ValueError("bounds_xyz must contain two (3,) arrays.")
-    hi = np.maximum(hi, lo)
+        raise ValueError(
+            "Candidate generation requires explicit environment bounds."
+        )
+    lo = np.asarray(bounds_xyz[0], dtype=float)
+    hi = np.asarray(bounds_xyz[1], dtype=float)
+    if (
+        lo.shape != (3,)
+        or hi.shape != (3,)
+        or np.any(~np.isfinite(lo))
+        or np.any(~np.isfinite(hi))
+        or np.any(hi < lo)
+    ):
+        raise ValueError(
+            "bounds_xyz must contain finite ordered (3,) arrays."
+        )
     return lo, hi
-
-
-def _resolve_free_space_checker(
-    map_api: object | None,
-) -> Callable[[NDArray[np.float64]], bool]:
-    """Return the scalar compatibility checker for a planning map."""
-    if map_api is None:
-        return lambda _: True
-    if callable(map_api):
-        return map_api
-    for attr in ("is_free", "is_free_space", "is_free_cell"):
-        fn = getattr(map_api, attr, None)
-        if callable(fn):
-            return fn
-    return lambda _: True
 
 
 def _resolve_free_space_batch_checker(
     map_api: object | None,
-) -> Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None:
+) -> Callable[[NDArray[np.float64]], NDArray[np.bool_]]:
     """Return a standard batched free-space checker when the map provides one."""
     if map_api is None:
         return lambda points: np.ones(np.asarray(points).shape[0], dtype=bool)
@@ -49,28 +41,9 @@ def _resolve_free_space_batch_checker(
         function = getattr(map_api, attr, None)
         if callable(function):
             return function
-    return None
-
-
-def _cell_center_from_map(
-    map_api: object,
-    cell: tuple[int, int],
-    z_value: float,
-) -> NDArray[np.float64]:
-    """Return a 3D cell-center point for a map cell."""
-    center_fn = getattr(map_api, "cell_center", None)
-    if callable(center_fn):
-        x_value, y_value = center_fn(cell)
-        return np.array([float(x_value), float(y_value), float(z_value)], dtype=float)
-    origin = getattr(map_api, "origin", (0.0, 0.0))
-    cell_size = float(getattr(map_api, "cell_size", 1.0))
-    return np.array(
-        [
-            float(origin[0]) + (float(cell[0]) + 0.5) * cell_size,
-            float(origin[1]) + (float(cell[1]) + 0.5) * cell_size,
-            float(z_value),
-        ],
-        dtype=float,
+    raise TypeError(
+        "Production candidate generation requires is_free_batch or "
+        "is_free_space_batch."
     )
 
 
@@ -79,109 +52,124 @@ def _map_free_cell_centers(
     *,
     z_value: float,
 ) -> NDArray[np.float64]:
-    """Return deterministic free-cell centers from the planning map."""
+    """Return deterministic free-cell centers without scalar cell callbacks."""
     if map_api is None:
         return np.zeros((0, 3), dtype=float)
-    grid_shape = getattr(map_api, "grid_shape", None)
-    if grid_shape is None:
-        return np.zeros((0, 3), dtype=float)
     traversable_cells = getattr(map_api, "traversable_cells", None)
-    if traversable_cells is not None:
-        cells = [tuple(cell) for cell in traversable_cells]
-    else:
-        is_free_cell = getattr(map_api, "is_free_cell", None)
-        if not callable(is_free_cell):
-            is_free_cell = getattr(map_api, "is_cell_free", None)
-        if not callable(is_free_cell):
-            return np.zeros((0, 3), dtype=float)
-        cells = [
-            (ix, iy)
-            for ix in range(int(grid_shape[0]))
-            for iy in range(int(grid_shape[1]))
-            if bool(is_free_cell((ix, iy)))
-        ]
-    if not cells:
+    if traversable_cells is None:
         return np.zeros((0, 3), dtype=float)
-    return np.vstack(
-        [_cell_center_from_map(map_api, tuple(cell), z_value) for cell in cells]
-    ).astype(float)
+    raw_cells = np.asarray(tuple(traversable_cells))
+    if raw_cells.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    if (
+        raw_cells.ndim != 2
+        or raw_cells.shape[1] != 2
+        or not np.issubdtype(raw_cells.dtype, np.integer)
+        or np.any(raw_cells < 0)
+    ):
+        raise ValueError(
+            "traversable_cells must be a finite N x 2 integer array."
+        )
+    cells = raw_cells.astype(np.int64, copy=False)
+    center_batch = getattr(map_api, "cell_centers_batch", None)
+    if callable(center_batch):
+        xy_centers = np.asarray(center_batch(cells), dtype=np.float64)
+        if (
+            xy_centers.shape != (cells.shape[0], 2)
+            or np.any(~np.isfinite(xy_centers))
+        ):
+            raise ValueError(
+                "cell_centers_batch must return one finite xy center per cell."
+            )
+    else:
+        if not hasattr(map_api, "origin") or not hasattr(map_api, "cell_size"):
+            raise TypeError(
+                "A planning grid without cell_centers_batch must define "
+                "origin and cell_size for vectorized center construction."
+            )
+        origin = np.asarray(map_api.origin, dtype=np.float64)
+        cell_size = getattr(map_api, "cell_size")
+        if (
+            origin.shape != (2,)
+            or np.any(~np.isfinite(origin))
+            or isinstance(cell_size, (bool, np.bool_))
+            or not isinstance(
+                cell_size,
+                (int, float, np.integer, np.floating),
+            )
+            or not np.isfinite(float(cell_size))
+            or float(cell_size) <= 0.0
+        ):
+            raise ValueError("Map cell-center geometry is invalid.")
+        xy_centers = (
+            origin[None, :]
+            + (cells.astype(np.float64) + 0.5) * float(cell_size)
+        )
+    if (
+        isinstance(z_value, (bool, np.bool_))
+        or not isinstance(z_value, (int, float, np.integer, np.floating))
+        or not np.isfinite(float(z_value))
+    ):
+        raise ValueError("Map cell-center height must be finite.")
+    return np.column_stack(
+        (
+            xy_centers,
+            np.full(cells.shape[0], float(z_value), dtype=np.float64),
+        )
+    )
 
 
 def _filter_candidates(
     candidates: NDArray[np.float64],
     visited_poses_xyz: NDArray[np.float64] | None,
     min_dist_from_visited: float,
-    is_free_fn: Callable[[NDArray[np.float64]], bool],
     *,
-    is_free_batch_fn: (
-        Callable[[NDArray[np.float64]], NDArray[np.bool_]] | None
-    ) = None,
-    allow_height_partners: bool = False,
-    height_partner_reference_xyz: NDArray[np.float64] | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
+    is_free_batch_fn: Callable[
+        [NDArray[np.float64]],
+        NDArray[np.bool_],
+    ],
 ) -> NDArray[np.float64]:
-    """Filter candidates while allowing only the current station's height mate."""
+    """Filter candidates with batched free-space and 3-D separation checks."""
     if candidates.size == 0:
         return candidates
+    if (
+        candidates.ndim != 2
+        or candidates.shape[1] != 3
+        or np.any(~np.isfinite(candidates))
+    ):
+        raise ValueError("candidates must be finite and shaped (N, 3).")
+    minimum_distance = float(min_dist_from_visited)
+    if not np.isfinite(minimum_distance) or minimum_distance < 0.0:
+        raise ValueError(
+            "min_dist_from_visited must be finite and nonnegative."
+        )
     mask = np.ones(candidates.shape[0], dtype=bool)
     if visited_poses_xyz is not None and visited_poses_xyz.size:
         visited = np.asarray(visited_poses_xyz, dtype=float).reshape(-1, 3)
-        diffs = candidates[:, None, :] - visited[None, :, :]
-        if allow_height_partners:
-            xy_dist = np.linalg.norm(diffs[:, :, :2], axis=2)
-            z_dist = np.abs(diffs[:, :, 2])
-            xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
-            z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
-            min_z_separation = max(
-                float(height_partner_min_z_separation_m),
-                0.0,
-            )
-            exact_action_visited = np.any(
-                (xy_dist <= xy_tolerance) & (z_dist <= z_tolerance),
-                axis=1,
-            )
-            reference = (
-                visited[-1]
-                if height_partner_reference_xyz is None
-                else np.asarray(height_partner_reference_xyz, dtype=float).reshape(3)
-            )
-            reference_xy_dist = np.linalg.norm(
-                candidates[:, :2] - reference[None, :2],
-                axis=1,
-            )
-            reference_z_dist = np.abs(candidates[:, 2] - reference[2])
-            height_partner = (
-                (reference_xy_dist <= xy_tolerance)
-                & (reference_z_dist > z_tolerance)
-                & (reference_z_dist >= min_z_separation)
-                & ~exact_action_visited
-            )
-            separated = ~exact_action_visited
-            if min_dist_from_visited > 0.0:
-                separated &= (
-                    np.all(xy_dist >= min_dist_from_visited, axis=1) | height_partner
-                )
-        else:
-            distances = np.linalg.norm(diffs, axis=2)
-            separated = np.all(
-                distances >= max(float(min_dist_from_visited), 0.0),
-                axis=1,
-            )
-        mask &= separated
-    if is_free_batch_fn is not None:
-        free_mask = np.asarray(is_free_batch_fn(candidates), dtype=bool).reshape(-1)
-        if free_mask.size != candidates.shape[0]:
-            raise ValueError("Batched free-space checker returned the wrong length.")
-        mask &= free_mask
-    elif is_free_fn is not None:
-        # Compatibility fallback for third-party map APIs without a batch method.
-        mask &= np.fromiter(
-            (bool(is_free_fn(point)) for point in candidates),
-            dtype=bool,
-            count=candidates.shape[0],
+        if np.any(~np.isfinite(visited)):
+            raise ValueError("visited_poses_xyz must contain finite values.")
+        distances = np.linalg.norm(
+            candidates[:, None, :] - visited[None, :, :],
+            axis=2,
         )
+        separated = np.all(
+            distances >= minimum_distance,
+            axis=1,
+        )
+        mask &= separated
+    if not callable(is_free_batch_fn):
+        raise TypeError(
+            "Candidate filtering requires a batched free-space checker."
+        )
+    free_mask = np.asarray(is_free_batch_fn(candidates))
+    if free_mask.dtype != np.bool_ or free_mask.shape != (
+        candidates.shape[0],
+    ):
+        raise ValueError(
+            "Batched free-space checker must return one exact boolean "
+            "per candidate."
+        )
+    mask &= free_mask
     return candidates[mask]
 
 
@@ -198,14 +186,17 @@ def _filter_motion_reachable_candidates(
         return candidates
     checker = getattr(map_api, "is_motion_reachable_batch", None)
     if not callable(checker):
-        return candidates
-    reachable = np.asarray(
-        checker(current_pose_xyz, candidates),
-        dtype=bool,
-    ).reshape(-1)
-    if reachable.size != candidates.shape[0]:
+        raise TypeError(
+            "Motion-reachable candidate generation requires "
+            "is_motion_reachable_batch."
+        )
+    reachable = np.asarray(checker(current_pose_xyz, candidates))
+    if reachable.dtype != np.bool_ or reachable.shape != (
+        candidates.shape[0],
+    ):
         raise ValueError(
-            "is_motion_reachable_batch returned the wrong number of flags."
+            "is_motion_reachable_batch must return one exact boolean per "
+            "candidate."
         )
     return candidates[reachable]
 
@@ -273,7 +264,14 @@ def _sample_uniform(
     n_samples: int,
 ) -> NDArray[np.float64]:
     """Sample points uniformly within bounds."""
-    if n_samples <= 0:
+    if (
+        isinstance(n_samples, bool)
+        or not isinstance(n_samples, (int, np.integer))
+    ):
+        raise TypeError("n_samples must be an integer.")
+    if int(n_samples) < 0:
+        raise ValueError("n_samples must be nonnegative.")
+    if int(n_samples) == 0:
         return np.zeros((0, 3), dtype=float)
     span = hi - lo
     return lo + rng.random((n_samples, 3)) * span
@@ -286,22 +284,31 @@ def _sample_sobol(
     n_samples: int,
 ) -> NDArray[np.float64]:
     """
-    Sample points using a Sobol sequence; fall back to uniform if unavailable.
+    Sample points using the required scrambled Sobol implementation.
 
     Degenerate dimensions (lo == hi) are kept fixed at their bound value.
     """
-    if n_samples <= 0:
+    if (
+        isinstance(n_samples, bool)
+        or not isinstance(n_samples, (int, np.integer))
+    ):
+        raise TypeError("n_samples must be an integer.")
+    if int(n_samples) < 0:
+        raise ValueError("n_samples must be nonnegative.")
+    if int(n_samples) == 0:
         return np.zeros((0, 3), dtype=float)
     try:
         from scipy.stats import qmc
-    except ImportError:
-        return _sample_uniform(rng, lo, hi, n_samples)
+    except ImportError as error:
+        raise RuntimeError(
+            "Sobol candidate generation requires scipy.stats.qmc."
+        ) from error
     active_dims = hi > lo
     if not np.any(active_dims):
         return np.repeat(lo[None, :], n_samples, axis=0)
     seed = int(rng.integers(0, 2**32 - 1))
     sampler = qmc.Sobol(d=int(np.sum(active_dims)), scramble=True, seed=seed)
-    m = int(np.ceil(np.log2(max(n_samples, 1))))
+    m = int(np.ceil(np.log2(int(n_samples))))
     sample = sampler.random_base2(m)
     sample = sample[:n_samples]
     scaled = qmc.scale(sample, lo[active_dims], hi[active_dims])
@@ -322,30 +329,18 @@ def sample_low_discrepancy_heights(
         raise ValueError("bounds_z must contain finite values.")
     if upper < lower:
         raise ValueError("bounds_z upper bound must be >= lower bound.")
-    if int(n_samples) <= 0:
+    if (
+        isinstance(n_samples, bool)
+        or not isinstance(n_samples, (int, np.integer))
+    ):
+        raise TypeError("n_samples must be an integer.")
+    if int(n_samples) < 0:
+        raise ValueError("n_samples must be nonnegative.")
+    if int(n_samples) == 0:
         return np.zeros(0, dtype=float)
     lo = np.array([0.0, 0.0, lower], dtype=float)
     hi = np.array([0.0, 0.0, upper], dtype=float)
     return _sample_sobol(rng, lo, hi, int(n_samples))[:, 2]
-
-
-def _sample_current_xy_height_anchors(
-    rng: np.random.Generator,
-    current_pose_xyz: NDArray[np.float64],
-    bounds_z: tuple[float, float],
-    n_samples: int,
-) -> NDArray[np.float64]:
-    """Return batched low-discrepancy height anchors at the current xy station."""
-    heights = sample_low_discrepancy_heights(rng, bounds_z, n_samples)
-    if heights.size == 0:
-        return np.zeros((0, 3), dtype=float)
-    anchors = np.repeat(
-        np.asarray(current_pose_xyz, dtype=float).reshape(1, 3),
-        heights.size,
-        axis=0,
-    )
-    anchors[:, 2] = heights
-    return anchors
 
 
 def _generate_ring_candidates(
@@ -356,28 +351,40 @@ def _generate_ring_candidates(
     min_dist_from_visited: float,
 ) -> NDArray[np.float64]:
     """Generate candidates on concentric rings around the current pose."""
-    if n_candidates <= 0:
+    if (
+        isinstance(n_candidates, bool)
+        or not isinstance(n_candidates, (int, np.integer))
+    ):
+        raise TypeError("n_candidates must be an integer.")
+    if int(n_candidates) < 0:
+        raise ValueError("n_candidates must be nonnegative.")
+    if int(n_candidates) == 0:
         return np.zeros((0, 3), dtype=float)
+    minimum_distance = float(min_dist_from_visited)
+    if not np.isfinite(minimum_distance) or minimum_distance < 0.0:
+        raise ValueError(
+            "min_dist_from_visited must be finite and nonnegative."
+        )
     max_dx = min(current_pose_xyz[0] - lo[0], hi[0] - current_pose_xyz[0])
     max_dy = min(current_pose_xyz[1] - lo[1], hi[1] - current_pose_xyz[1])
     max_radius = max(0.0, min(max_dx, max_dy))
-    min_radius = max(0.1, min_dist_from_visited)
+    min_radius = max(0.1, minimum_distance)
     if max_radius < min_radius:
         max_radius = min_radius
     num_rings = max(1, int(np.sqrt(n_candidates)))
     num_angles = max(4, int(np.ceil(n_candidates / num_rings)))
     radii = np.linspace(min_radius, max_radius, num=num_rings)
     angles = np.linspace(0.0, 2.0 * np.pi, num=num_angles, endpoint=False)
-    points = []
-    for r in radii:
-        for theta in angles:
-            x = current_pose_xyz[0] + r * np.cos(theta)
-            y = current_pose_xyz[1] + r * np.sin(theta)
-            z = current_pose_xyz[2]
-            points.append([x, y, z])
-    points_arr = np.array(points, dtype=float)
-    points_arr = points_arr[:n_candidates]
-    return points_arr
+    radius_grid, angle_grid = np.meshgrid(radii, angles, indexing="ij")
+    return np.column_stack(
+        (
+            current_pose_xyz[0]
+            + radius_grid.ravel() * np.cos(angle_grid.ravel()),
+            current_pose_xyz[1]
+            + radius_grid.ravel() * np.sin(angle_grid.ravel()),
+            np.full(radius_grid.size, current_pose_xyz[2], dtype=float),
+        )
+    )[: int(n_candidates)]
 
 
 def generate_candidate_poses(
@@ -390,42 +397,56 @@ def generate_candidate_poses(
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     rng: np.random.Generator | None = None,
     detector_heights_m: Sequence[float] | None = None,
-    include_current_xy_height_actions: bool = False,
-    continuous_height_anchor_count: int = 8,
-    allow_height_partners: bool | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
     require_motion_reachable: bool = False,
 ) -> NDArray[np.float64]:
     """Return (L, 3) candidate poses in free space for the given strategy.
 
     When ``detector_heights_m`` is supplied, xy stations are sampled once and
-    expanded over the discrete height actions. Continuous z values are never
-    sampled in that mode. Without discrete actions, requesting current-xy
-    height actions adds low-discrepancy continuous anchors over the z bounds.
-    When requested, every generated batch is reachability-filtered before
-    deterministic map-center replenishment decides whether more poses are needed.
+    expanded over the discrete height actions. Continuous z values are sampled
+    globally when discrete detector actions are not configured. Every generated
+    batch uses the same 3-D separation and reachability contract.
     """
-    rng = np.random.default_rng() if rng is None else rng
+    if rng is None:
+        raise ValueError("Candidate generation requires an explicit RNG.")
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be a numpy.random.Generator.")
+    if (
+        isinstance(n_candidates, bool)
+        or not isinstance(n_candidates, (int, np.integer))
+        or int(n_candidates) <= 0
+    ):
+        raise ValueError("n_candidates must be a positive integer.")
+    requested_count = int(n_candidates)
+    minimum_distance = float(min_dist_from_visited)
+    if not np.isfinite(minimum_distance) or minimum_distance < 0.0:
+        raise ValueError(
+            "min_dist_from_visited must be finite and nonnegative."
+        )
+    if not isinstance(require_motion_reachable, bool):
+        raise TypeError("require_motion_reachable must be a boolean.")
     current_pose_xyz = np.asarray(current_pose_xyz, dtype=float)
-    if current_pose_xyz.shape != (3,):
-        raise ValueError("current_pose_xyz must be shape (3,).")
+    if current_pose_xyz.shape != (3,) or np.any(~np.isfinite(current_pose_xyz)):
+        raise ValueError("current_pose_xyz must be finite and shape (3,).")
     visited = None
     if visited_poses_xyz is not None:
         visited = np.asarray(visited_poses_xyz, dtype=float)
         if visited.ndim == 1 and visited.size == 3:
             visited = visited.reshape(1, 3)
-        if visited.ndim != 2 or visited.shape[1] != 3:
-            raise ValueError("visited_poses_xyz must be shape (N, 3).")
+        if (
+            visited.ndim != 2
+            or visited.shape[1] != 3
+            or np.any(~np.isfinite(visited))
+        ):
+            raise ValueError(
+                "visited_poses_xyz must be finite and shape (N, 3)."
+            )
 
     lo, hi = _resolve_bounds(bounds_xyz)
-    is_free_fn = _resolve_free_space_checker(map_api)
     is_free_batch_fn = _resolve_free_space_batch_checker(map_api)
     height_actions: NDArray[np.float64] | None = None
     sample_lo = lo.copy()
     sample_hi = hi.copy()
-    base_candidate_count = max(int(n_candidates), 1)
+    base_candidate_count = requested_count
     if detector_heights_m is not None:
         height_actions = resolve_detector_height_actions(
             detector_heights_m,
@@ -435,7 +456,7 @@ def generate_candidate_poses(
         sample_lo[2] = float(current_pose_xyz[2])
         sample_hi[2] = float(current_pose_xyz[2])
         base_candidate_count = max(
-            int(np.ceil(max(int(n_candidates), 1) / height_actions.size)),
+            int(np.ceil(requested_count / height_actions.size)),
             1,
         )
 
@@ -445,7 +466,7 @@ def generate_candidate_poses(
             lo=sample_lo,
             hi=sample_hi,
             n_candidates=base_candidate_count,
-            min_dist_from_visited=min_dist_from_visited,
+            min_dist_from_visited=minimum_distance,
         )
     elif strategy == "free_space_sobol":
         raw = _sample_sobol(
@@ -467,47 +488,20 @@ def generate_candidate_poses(
 
     if height_actions is not None:
         raw = expand_candidate_height_actions(raw, height_actions)
-        if include_current_xy_height_actions:
-            current_height_actions = expand_candidate_height_actions(
-                current_pose_xyz.reshape(1, 3),
-                height_actions,
-            )
-            raw = np.vstack([current_height_actions, raw])
-    elif include_current_xy_height_actions:
-        current_height_anchors = _sample_current_xy_height_anchors(
-            rng,
-            current_pose_xyz,
-            (float(lo[2]), float(hi[2])),
-            max(int(continuous_height_anchor_count), 0),
-        )
-        if current_height_anchors.size:
-            raw = np.vstack([current_height_anchors, raw])
-
-    height_partners_enabled = (
-        height_actions is not None
-        if allow_height_partners is None
-        else bool(allow_height_partners)
-    )
 
     filtered = _filter_candidates(
         raw,
         visited,
-        min_dist_from_visited,
-        is_free_fn,
+        minimum_distance,
         is_free_batch_fn=is_free_batch_fn,
-        allow_height_partners=height_partners_enabled,
-        height_partner_reference_xyz=current_pose_xyz,
-        height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
-        height_partner_z_tolerance_m=height_partner_z_tolerance_m,
-        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     filtered = _filter_motion_reachable_candidates(
         filtered,
         current_pose_xyz=current_pose_xyz,
         map_api=map_api,
-        enabled=bool(require_motion_reachable),
+        enabled=require_motion_reachable,
     )
-    if filtered.shape[0] < n_candidates:
+    if filtered.shape[0] < requested_count:
         map_centers = _map_free_cell_centers(
             map_api,
             z_value=float(current_pose_xyz[2]),
@@ -520,7 +514,7 @@ def generate_candidate_poses(
                 )
             if visited is not None and visited.size:
                 distances = np.linalg.norm(
-                    map_centers[:, None, :2] - visited[None, :, :2],
+                    map_centers[:, None, :] - visited[None, :, :],
                     axis=2,
                 )
                 order = np.argsort(np.min(distances, axis=1))[::-1]
@@ -528,24 +522,18 @@ def generate_candidate_poses(
             map_centers = _filter_candidates(
                 map_centers,
                 visited,
-                min_dist_from_visited,
-                is_free_fn,
+                minimum_distance,
                 is_free_batch_fn=is_free_batch_fn,
-                allow_height_partners=height_partners_enabled,
-                height_partner_reference_xyz=current_pose_xyz,
-                height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
-                height_partner_z_tolerance_m=height_partner_z_tolerance_m,
-                height_partner_min_z_separation_m=height_partner_min_z_separation_m,
             )
             map_centers = _filter_motion_reachable_candidates(
                 map_centers,
                 current_pose_xyz=current_pose_xyz,
                 map_api=map_api,
-                enabled=bool(require_motion_reachable),
+                enabled=require_motion_reachable,
             )
             if map_centers.size:
                 filtered = np.vstack([filtered, map_centers])
-    if filtered.shape[0] < n_candidates:
+    if filtered.shape[0] < requested_count:
         extra = _sample_uniform(
             rng,
             sample_lo,
@@ -557,21 +545,15 @@ def generate_candidate_poses(
         extra = _filter_candidates(
             extra,
             visited,
-            min_dist_from_visited,
-            is_free_fn,
+            minimum_distance,
             is_free_batch_fn=is_free_batch_fn,
-            allow_height_partners=height_partners_enabled,
-            height_partner_reference_xyz=current_pose_xyz,
-            height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
-            height_partner_z_tolerance_m=height_partner_z_tolerance_m,
-            height_partner_min_z_separation_m=height_partner_min_z_separation_m,
         )
         extra = _filter_motion_reachable_candidates(
             extra,
             current_pose_xyz=current_pose_xyz,
             map_api=map_api,
-            enabled=bool(require_motion_reachable),
+            enabled=require_motion_reachable,
         )
         if extra.size:
             filtered = np.vstack([filtered, extra])
-    return _stable_unique_candidates(filtered)[:n_candidates]
+    return _stable_unique_candidates(filtered)[:requested_count]

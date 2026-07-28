@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
-from typing import Any, Mapping
+from numbers import Real
+from typing import Any
 
 import numpy as np
 
@@ -18,7 +20,6 @@ from measurement.shielding import (
     DEFAULT_FE_SHIELD_INNER_RADIUS_CM,
     DEFAULT_PB_SHIELD_INNER_RADIUS_CM,
     DEFAULT_SHIELD_CONTACT_RADIUS_CM,
-    path_length_cm,
     spherical_shell_path_length_cm,
 )
 from sim.isaacsim_app.geometry import quaternion_wxyz_to_matrix
@@ -44,14 +45,43 @@ PB_SHIELD_THICKNESS_M = PB_SHIELD_THICKNESS_CM / 100.0
 PB_SHIELD_OUTER_RADIUS_M = PB_SHIELD_INNER_RADIUS_M + PB_SHIELD_THICKNESS_M
 
 
+def require_no_angle_attenuation(value: object) -> bool:
+    """Require the production spherical-shell angle contract to be false."""
+    if not isinstance(value, bool):
+        raise TypeError("use_angle_attenuation must be a JSON boolean.")
+    if value:
+        raise ValueError(
+            "use_angle_attenuation=true is incompatible with the production "
+            "spherical-octant shell model."
+        )
+    return False
+
+
+def _nonnegative_finite_real(value: object, *, field_name: str) -> float:
+    """Return a strict nonnegative finite real geometry value."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{field_name} must be a real number.")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{field_name} must be finite and nonnegative.")
+    return parsed
+
+
 def nested_shield_inner_radii_cm(
     *,
     thickness_fe_cm: float = FE_SHIELD_THICKNESS_CM,
     detector_outer_radius_cm: float = DEFAULT_SHIELD_CONTACT_RADIUS_CM,
 ) -> tuple[float, float]:
     """Return nested Fe/Pb inner radii with Fe touching the detector housing."""
-    fe_inner_cm = max(0.0, float(detector_outer_radius_cm))
-    pb_inner_cm = fe_inner_cm + max(0.0, float(thickness_fe_cm))
+    fe_inner_cm = _nonnegative_finite_real(
+        detector_outer_radius_cm,
+        field_name="detector_outer_radius_cm",
+    )
+    fe_thickness_cm = _nonnegative_finite_real(
+        thickness_fe_cm,
+        field_name="thickness_fe_cm",
+    )
+    pb_inner_cm = fe_inner_cm + fe_thickness_cm
     return fe_inner_cm, pb_inner_cm
 
 
@@ -67,8 +97,13 @@ class ShieldThicknessConfig:
 
 def shield_thickness_scale_for_transmission(transmission_target: float) -> float:
     """Return the one-TVL thickness scale for a target single-shell transmission."""
+    if isinstance(transmission_target, bool) or not isinstance(
+        transmission_target,
+        Real,
+    ):
+        raise TypeError("shield_transmission_target must be a real number.")
     transmission = float(transmission_target)
-    if not 0.0 < transmission <= 1.0:
+    if not math.isfinite(transmission) or not 0.0 < transmission <= 1.0:
         raise ValueError("shield_transmission_target must be in (0, 1].")
     if transmission == 1.0:
         return 0.0
@@ -79,32 +114,50 @@ def resolve_shield_thickness_config(
     payload: Mapping[str, Any] | None = None,
 ) -> ShieldThicknessConfig:
     """Resolve shared shield thickness settings from a runtime config payload."""
-    config = {} if payload is None else dict(payload)
+    if payload is None:
+        config: Mapping[str, Any] = {}
+    elif isinstance(payload, Mapping):
+        config = payload
+    else:
+        raise TypeError("shield thickness configuration must be a mapping or None.")
     target_raw = config.get("shield_transmission_target")
     has_override = any(
-        config.get(key) not in (None, "")
+        key in config and config[key] is not None
         for key in (
             "shield_thickness_scale",
             "fe_shield_thickness_cm",
             "pb_shield_thickness_cm",
         )
     )
-    if target_raw in (None, "") and not has_override:
+    if target_raw is None and not has_override:
         transmission_target = DEFAULT_SHIELD_TRANSMISSION_TARGET
         default_scale = DEFAULT_SHIELD_TVL_SCALE
-    elif target_raw in (None, ""):
+    elif target_raw is None:
         transmission_target = None
         default_scale = 1.0
     else:
+        if isinstance(target_raw, bool) or not isinstance(target_raw, Real):
+            raise TypeError("shield_transmission_target must be a real number.")
         transmission_target = float(target_raw)
         default_scale = shield_thickness_scale_for_transmission(transmission_target)
-    scale = float(config.get("shield_thickness_scale", default_scale))
-    if scale < 0.0:
-        raise ValueError("shield_thickness_scale must be non-negative.")
-    thickness_fe_cm = float(config.get("fe_shield_thickness_cm", FE_SHIELD_TVL_THICKNESS_CM * scale))
-    thickness_pb_cm = float(config.get("pb_shield_thickness_cm", PB_SHIELD_TVL_THICKNESS_CM * scale))
-    if thickness_fe_cm < 0.0 or thickness_pb_cm < 0.0:
-        raise ValueError("shield thickness values must be non-negative.")
+    scale = _nonnegative_finite_real(
+        config.get("shield_thickness_scale", default_scale),
+        field_name="shield_thickness_scale",
+    )
+    thickness_fe_cm = _nonnegative_finite_real(
+        config.get(
+            "fe_shield_thickness_cm",
+            FE_SHIELD_TVL_THICKNESS_CM * scale,
+        ),
+        field_name="fe_shield_thickness_cm",
+    )
+    thickness_pb_cm = _nonnegative_finite_real(
+        config.get(
+            "pb_shield_thickness_cm",
+            PB_SHIELD_TVL_THICKNESS_CM * scale,
+        ),
+        field_name="pb_shield_thickness_cm",
+    )
     return ShieldThicknessConfig(
         thickness_fe_cm=thickness_fe_cm,
         thickness_pb_cm=thickness_pb_cm,
@@ -136,6 +189,7 @@ def spherical_octant_path_length_cm(
     use_angle_attenuation: bool = False,
 ) -> float:
     """Return the path length for a rotated local +X/+Y/+Z spherical-octant shell."""
+    require_no_angle_attenuation(use_angle_attenuation)
     direction = np.asarray(source_xyz, dtype=float) - np.asarray(detector_xyz, dtype=float)
     direction_norm = float(np.linalg.norm(direction))
     if direction_norm <= 1.0e-12:
@@ -143,18 +197,9 @@ def spherical_octant_path_length_cm(
     rotation = quaternion_wxyz_to_matrix(shield_quat_wxyz)
     local_direction = rotation.T @ (direction / direction_norm)
     blocked = bool(np.all(local_direction >= -1.0e-9))
-    shield_normal = np.asarray(shield_normal_from_quaternion_wxyz(shield_quat_wxyz), dtype=float)
-    if not use_angle_attenuation:
-        return spherical_shell_path_length_cm(
-            direction_m=direction,
-            inner_radius_cm=float(inner_radius_cm),
-            outer_radius_cm=float(inner_radius_cm) + float(thickness_cm),
-            blocked=blocked,
-        )
-    return path_length_cm(
-        direction,
-        shield_normal,
-        float(thickness_cm),
+    return spherical_shell_path_length_cm(
+        direction_m=direction,
+        inner_radius_cm=float(inner_radius_cm),
+        outer_radius_cm=float(inner_radius_cm) + float(thickness_cm),
         blocked=blocked,
-        use_angle_attenuation=bool(use_angle_attenuation),
     )

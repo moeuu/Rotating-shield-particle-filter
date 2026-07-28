@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+import math
+from numbers import Real
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
+from measurement.source_boundary import (
+    SURFACE_EMISSION_EPSILON_M,
+    surface_emission_policy_sha256,
+    surface_source_runtime_contract_sha256,
+)
 from sim.geant4_app.engine import (
     Geant4EngineConfig,
     Geant4StepRequest,
@@ -30,11 +39,19 @@ from sim.isaacsim_app.stage_backend import (
 from sim.protocol import SimulationCommand, SimulationObservation
 from sim.radiation_visualization import RadiationVisualizationConfig
 from sim.shield_geometry import ShieldThicknessConfig, resolve_shield_thickness_config
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_BACKGROUND_MODEL_ID,
+    NATIVE_GEANT4_BIN_COUNT,
+    NATIVE_GEANT4_BIN_WIDTH_KEV,
+    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+    NATIVE_GEANT4_ENERGY_MAX_KEV,
+    NATIVE_GEANT4_ENERGY_MIN_KEV,
+)
 
 
 _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
     {
+        "--background-cps",
         "--dead-time-tau-s",
         "--detector-scoring-mode",
         "--physics-profile",
@@ -43,6 +60,7 @@ _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
         "--target-sampled-primaries",
         "--request",
         "--response",
+        "--sample-detector-response",
         "--scene",
         "--secondary-transport-mode",
         "--source-bias-cone-half-angle-deg",
@@ -50,6 +68,7 @@ _MANAGED_GEANT4_EXECUTABLE_OPTIONS = frozenset(
         "--source-bias-mode",
         "--source-rate-model",
         "--threads",
+        "--validation-entry-class-spectra",
     }
 )
 
@@ -63,6 +82,12 @@ def require_primary_sampling_fraction(
     target_sampled_primaries: int | None = None,
 ) -> float:
     """Validate primary sampling and require an explicit weighted-mode opt-in."""
+    if not isinstance(accelerated_weighted_transport_enable, bool):
+        raise ValueError(
+            "accelerated_weighted_transport_enable must be a JSON boolean."
+        )
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError("primary_sampling_fraction must be a JSON number.")
     fraction = float(value)
     if (
         not np.isfinite(fraction)
@@ -148,49 +173,57 @@ def validate_geant4_executable_args(values: tuple[str, ...]) -> tuple[str, ...]:
     return values
 
 
-def geant4_executable_float_option(
-    values: tuple[str, ...],
-    option: str,
-    *,
-    default: float,
-) -> float:
-    """Return the last numeric value supplied for one native option."""
-    result = float(default)
-    for index, value in enumerate(values):
-        token = str(value)
-        if token == option:
-            if index + 1 >= len(values):
-                raise ValueError(f"{option} requires a numeric value.")
-            try:
-                result = float(values[index + 1])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{option} requires a numeric value.") from exc
-        elif token.startswith(f"{option}="):
-            try:
-                result = float(token.split("=", maxsplit=1)[1])
-            except ValueError as exc:
-                raise ValueError(f"{option} requires a numeric value.") from exc
-    if not np.isfinite(result):
-        raise ValueError(f"{option} requires a finite numeric value.")
-    return result
-
-
 def _required_metadata_bool(metadata: dict[str, Any], key: str) -> bool:
     """Return a strict boolean provenance value or fail closed."""
     if key not in metadata:
         raise RuntimeError(f"Native Geant4 response is missing {key} provenance.")
     value = metadata[key]
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized == "true":
-            return True
-        if normalized == "false":
-            return False
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
-    raise RuntimeError(f"Native Geant4 response has invalid boolean {key}={value!r}.")
+    if not isinstance(value, bool):
+        raise RuntimeError(
+            f"Native Geant4 response has invalid boolean {key}={value!r}."
+        )
+    return value
+
+
+def _required_metadata_integer(metadata: dict[str, Any], key: str) -> int:
+    """Return an exact JSON integer provenance value or fail closed."""
+    if key not in metadata:
+        raise RuntimeError(f"Native Geant4 response is missing {key} provenance.")
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(
+            f"Native Geant4 response has invalid integer {key}={value!r}."
+        )
+    return value
+
+
+def _required_metadata_number(metadata: dict[str, Any], key: str) -> float:
+    """Return one finite exact JSON number provenance value."""
+    if key not in metadata:
+        raise RuntimeError(f"Native Geant4 response is missing {key} provenance.")
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(
+            f"Native Geant4 response has invalid numeric {key}={value!r}."
+        )
+    parsed = float(value)
+    if not np.isfinite(parsed):
+        raise RuntimeError(
+            f"Native Geant4 response has non-finite numeric {key}={value!r}."
+        )
+    return parsed
+
+
+def _required_metadata_string(metadata: dict[str, Any], key: str) -> str:
+    """Return one exact JSON string provenance value."""
+    if key not in metadata:
+        raise RuntimeError(f"Native Geant4 response is missing {key} provenance.")
+    value = metadata[key]
+    if not isinstance(value, str):
+        raise RuntimeError(
+            f"Native Geant4 response has invalid string {key}={value!r}."
+        )
+    return value
 
 
 def _validate_native_weighted_response(
@@ -286,6 +319,66 @@ def _validate_native_weighted_response(
             )
 
 
+def _validate_native_sampled_event_response(
+    spectrum_counts: object,
+    metadata: dict[str, Any],
+) -> NDArray[np.int64]:
+    """Return exact native sampled-event counts after provenance checks."""
+    raw_spectrum = np.asarray(spectrum_counts)
+    if raw_spectrum.dtype.kind not in {"i", "u", "f"}:
+        raise RuntimeError(
+            "Native Geant4 sampled-event spectrum must contain exact JSON "
+            "numbers without string or boolean coercion."
+        )
+    spectrum = np.asarray(raw_spectrum, dtype=np.float64)
+    if spectrum.ndim != 1 or spectrum.size == 0:
+        raise RuntimeError(
+            "Native Geant4 sampled-event spectrum must be a nonempty "
+            "one-dimensional array."
+        )
+    if (
+        np.any(~np.isfinite(spectrum))
+        or np.any(spectrum < 0.0)
+        or np.any(spectrum != np.rint(spectrum))
+        or np.any(spectrum > float(2**53))
+    ):
+        raise RuntimeError(
+            "Native Geant4 sampled detector response must contain exact "
+            "nonnegative unit-weight integer event counts."
+        )
+    event_counts = np.ascontiguousarray(spectrum, dtype=np.int64)
+    event_total = int(np.sum(event_counts, dtype=np.int64))
+    reported_total = _required_metadata_number(
+        metadata,
+        "total_spectrum_counts",
+    )
+    reported_sumw2 = _required_metadata_number(
+        metadata,
+        "weighted_spectrum_sumw2",
+    )
+    if (
+        not np.isfinite(reported_total)
+        or not np.isfinite(reported_sumw2)
+        or not np.isclose(
+            reported_total,
+            float(event_total),
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+        or not np.isclose(
+            reported_sumw2,
+            float(event_total),
+            rtol=0.0,
+            atol=1.0e-9,
+        )
+    ):
+        raise RuntimeError(
+            "Native Geant4 sampled-event spectrum disagrees with its total "
+            "count or unit-weight sum-w2 provenance."
+        )
+    return event_counts
+
+
 def validate_transport_metadata(
     metadata: dict[str, Any],
     *,
@@ -300,8 +393,23 @@ def validate_transport_metadata(
     expected_source_bias_mode: str | None = None,
     expected_background_cps: float | None = None,
     expected_dead_time_tau_s: float | None = None,
+    expected_detector_response_sampling: bool = False,
+    expected_surface_source_contract_sha256: str | None = None,
+    expected_scene_hash: str | None = None,
 ) -> None:
     """Fail when native transport provenance disagrees with configured semantics."""
+    if not isinstance(expected_detector_response_sampling, bool):
+        raise ValueError(
+            "expected_detector_response_sampling must be a JSON boolean."
+        )
+    if expected_thread_count is not None and (
+        isinstance(expected_thread_count, bool)
+        or not isinstance(expected_thread_count, int)
+        or expected_thread_count <= 0
+    ):
+        raise ValueError(
+            "expected_thread_count must be a positive JSON integer."
+        )
     configured_fraction = require_primary_sampling_fraction(
         expected_primary_sampling_fraction,
         accelerated_weighted_transport_enable=(accelerated_weighted_transport_enable),
@@ -315,13 +423,14 @@ def validate_transport_metadata(
             "expected_target_sampled_primaries requires "
             "accelerated_weighted_transport_enable=true."
         )
-    try:
-        observed_fraction = float(metadata["primary_sampling_fraction"])
-        observed_history_weight = float(metadata["primary_history_weight"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Native Geant4 response is missing sampling-fraction provenance."
-        ) from exc
+    observed_fraction = _required_metadata_number(
+        metadata,
+        "primary_sampling_fraction",
+    )
+    observed_history_weight = _required_metadata_number(
+        metadata,
+        "primary_history_weight",
+    )
     if (
         not np.isfinite(observed_fraction)
         or observed_fraction < _MIN_PRIMARY_SAMPLING_FRACTION
@@ -357,14 +466,18 @@ def validate_transport_metadata(
             "invalid or inconsistent."
         )
 
-    if str(metadata.get("backend", "")) != "geant4":
+    if _required_metadata_string(metadata, "backend") != "geant4":
         raise RuntimeError("Native Geant4 response has invalid backend provenance.")
-    if str(metadata.get("engine_mode", "")) != "external":
+    if _required_metadata_string(metadata, "engine_mode") != "external":
         raise RuntimeError("Native Geant4 response has invalid engine_mode provenance.")
 
-    source_rate_model = str(metadata.get("source_rate_model", ""))
-    if expected_source_rate_model is not None and source_rate_model != str(
-        expected_source_rate_model
+    source_rate_model = _required_metadata_string(
+        metadata,
+        "source_rate_model",
+    )
+    if (
+        expected_source_rate_model is not None
+        and source_rate_model != expected_source_rate_model
     ):
         raise RuntimeError(
             "Native Geant4 source-rate semantics disagree with runtime config: "
@@ -383,24 +496,90 @@ def validate_transport_metadata(
             "Accelerated weighted history thinning is currently restricted to "
             "source_rate_model=detector_cps_1m."
         )
-    if str(metadata.get("intensity_cps_1m_definition", "")) != (
-        "net_detector_count_rate_at_1m"
+    if _required_metadata_string(
+        metadata,
+        "intensity_cps_1m_definition",
+    ) != (
+        "pre_dead_time_detector_pulse_rate_at_1m"
     ):
         raise RuntimeError(
             "Native Geant4 response has invalid intensity_cps_1m semantics."
         )
+    if (
+        _required_metadata_string(metadata, "source_position_semantics")
+        != "air_side_native_emission_xyz"
+        or _required_metadata_string(metadata, "source_anchor_semantics")
+        != "exact_surface_chart_uv_evaluation_truth"
+        or not _required_metadata_bool(
+            metadata,
+            "all_sources_surface_bound",
+        )
+        or _required_metadata_string(
+            metadata,
+            "surface_emission_policy_sha256",
+        )
+        != surface_emission_policy_sha256()
+    ):
+        raise RuntimeError(
+            "Native Geant4 source positions do not satisfy the shared "
+            "surface-anchor emission contract."
+        )
+    source_emission_epsilon_m = _required_metadata_number(
+        metadata,
+        "surface_emission_epsilon_m",
+    )
+    if not np.isclose(
+        source_emission_epsilon_m,
+        SURFACE_EMISSION_EPSILON_M,
+        rtol=0.0,
+        atol=1.0e-15,
+    ):
+        raise RuntimeError(
+            "Native Geant4 surface-emission epsilon differs from the PF model."
+        )
+    for key, expected_hash in (
+        (
+            "surface_source_contract_sha256",
+            expected_surface_source_contract_sha256,
+        ),
+        ("scene_hash", expected_scene_hash),
+    ):
+        actual_hash = metadata.get(key)
+        if (
+            not isinstance(actual_hash, str)
+            or len(actual_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in actual_hash
+            )
+            or (
+                expected_hash is not None
+                and actual_hash != str(expected_hash)
+            )
+        ):
+            raise RuntimeError(
+                f"Native Geant4 {key} is missing, invalid, or stale."
+            )
 
-    physics_profile = str(metadata.get("physics_profile", ""))
-    if expected_physics_profile is not None and physics_profile != str(
-        expected_physics_profile
+    physics_profile = _required_metadata_string(
+        metadata,
+        "physics_profile",
+    )
+    if (
+        expected_physics_profile is not None
+        and physics_profile != expected_physics_profile
     ):
         raise RuntimeError(
             "Native Geant4 physics profile disagrees with runtime config: "
             f"expected {expected_physics_profile}, got {physics_profile or 'missing'}."
         )
-    detector_scoring_mode = str(metadata.get("detector_scoring_mode", ""))
-    if expected_detector_scoring_mode is not None and detector_scoring_mode != str(
-        expected_detector_scoring_mode
+    detector_scoring_mode = _required_metadata_string(
+        metadata,
+        "detector_scoring_mode",
+    )
+    if (
+        expected_detector_scoring_mode is not None
+        and detector_scoring_mode != expected_detector_scoring_mode
     ):
         raise RuntimeError(
             "Native Geant4 detector scoring disagrees with runtime config: "
@@ -411,16 +590,107 @@ def validate_transport_metadata(
         metadata,
         "detector_response_applied_in_native",
     )
-    if detector_response_applied != (detector_scoring_mode != "incident_gamma_energy"):
+    response_sampling_mode = _required_metadata_string(
+        metadata,
+        "detector_response_sampling_mode",
+    )
+    response_sampling_enabled = (
+        response_sampling_mode
+        == "multinomial_marking_with_nonparalyzable_event_time"
+    )
+    if response_sampling_enabled != bool(
+        expected_detector_response_sampling
+    ):
+        raise RuntimeError(
+            "Native Geant4 detector-response sampling disagrees with runtime "
+            "configuration."
+        )
+    if response_sampling_enabled and detector_scoring_mode != (
+        "incident_gamma_energy"
+    ):
+        raise RuntimeError(
+            "Native detector-response marking requires incident-gamma scoring."
+        )
+    if response_sampling_enabled and _required_metadata_string(
+        metadata,
+        "detector_response_sampling_contract_sha256",
+    ) != NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256:
+        raise RuntimeError(
+            "Native detector-response sampling contract differs from the "
+            "shared full-spectrum model."
+        )
+    if detector_response_applied != (
+        detector_scoring_mode != "incident_gamma_energy"
+        or response_sampling_enabled
+    ):
         raise RuntimeError(
             "Native Geant4 detector-response provenance is inconsistent with "
             "detector_scoring_mode."
         )
+    energy_min_keV = _required_metadata_number(
+        metadata,
+        "spectrum_energy_min_keV",
+    )
+    energy_max_keV = _required_metadata_number(
+        metadata,
+        "spectrum_energy_max_keV",
+    )
+    bin_width_keV = _required_metadata_number(
+        metadata,
+        "spectrum_bin_width_keV",
+    )
+    bin_count = _required_metadata_integer(metadata, "spectrum_bin_count")
+    axis_values = (
+        energy_min_keV,
+        energy_max_keV,
+        bin_width_keV,
+    )
+    if not all(np.isfinite(value) for value in axis_values):
+        raise RuntimeError(
+            "Native Geant4 spectrum-axis provenance must be finite."
+        )
+    if (
+        not np.isclose(
+            energy_min_keV,
+            NATIVE_GEANT4_ENERGY_MIN_KEV,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        or not np.isclose(
+            energy_max_keV,
+            NATIVE_GEANT4_ENERGY_MAX_KEV,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        or not np.isclose(
+            bin_width_keV,
+            NATIVE_GEANT4_BIN_WIDTH_KEV,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        or bin_count != NATIVE_GEANT4_BIN_COUNT
+    ):
+        raise RuntimeError(
+            "Native Geant4 spectrum axis differs from the fixed production "
+            "contract."
+        )
+    if _required_metadata_string(
+        metadata,
+        "background_spectrum_model_id",
+    ) != (
+        NATIVE_GEANT4_BACKGROUND_MODEL_ID
+    ):
+        raise RuntimeError(
+            "Native Geant4 background-spectrum model provenance is invalid."
+        )
 
-    secondary_transport_mode = str(metadata.get("secondary_transport_mode", ""))
+    secondary_transport_mode = _required_metadata_string(
+        metadata,
+        "secondary_transport_mode",
+    )
     if (
         expected_secondary_transport_mode is not None
-        and secondary_transport_mode != str(expected_secondary_transport_mode)
+        and secondary_transport_mode != expected_secondary_transport_mode
     ):
         raise RuntimeError(
             "Native Geant4 secondary transport disagrees with runtime config: "
@@ -442,12 +712,7 @@ def validate_transport_metadata(
         raise RuntimeError(
             "Native Geant4 runtime must use Poisson background sampling."
         )
-    try:
-        background_cps = float(metadata["background_cps"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Native Geant4 response is missing valid background_cps provenance."
-        ) from exc
+    background_cps = _required_metadata_number(metadata, "background_cps")
     if not np.isfinite(background_cps) or background_cps < 0.0:
         raise RuntimeError("Native Geant4 background_cps provenance is invalid.")
     if expected_background_cps is not None and not np.isclose(
@@ -461,14 +726,13 @@ def validate_transport_metadata(
             f"expected {expected_background_cps}, got {background_cps}."
         )
 
-    try:
-        requested_threads = int(metadata["requested_threads"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Native Geant4 response is missing requested_threads provenance."
-        ) from exc
-    if expected_thread_count is not None and requested_threads != int(
-        expected_thread_count
+    requested_threads = _required_metadata_integer(
+        metadata,
+        "requested_threads",
+    )
+    if (
+        expected_thread_count is not None
+        and requested_threads != expected_thread_count
     ):
         raise RuntimeError(
             "Native Geant4 thread count disagrees with runtime config: "
@@ -494,26 +758,30 @@ def validate_transport_metadata(
     else:
         expected_key = "expected_physical_primaries"
         expected_semantics = "isotropic_physical_histories"
-        resolved_source_bias_mode = str(
+        resolved_source_bias_mode = (
             expected_source_bias_mode
             if expected_source_bias_mode is not None
-            else metadata.get("source_bias_mode", "")
+            else _required_metadata_string(metadata, "source_bias_mode")
         )
         expected_source_bias_weighting = resolved_source_bias_mode == "detector_cone"
         expected_emission_model = (
             "weighted_isotropic" if expected_source_bias_weighting else "isotropic"
         )
         expected_line_normalization = False
-    if (
-        expected_source_bias_mode is not None
-        and str(metadata.get("source_bias_mode", "")) != resolved_source_bias_mode
-    ):
+    reported_source_bias_mode = _required_metadata_string(
+        metadata,
+        "source_bias_mode",
+    )
+    if reported_source_bias_mode != resolved_source_bias_mode:
         raise RuntimeError(
             "Native Geant4 source bias disagrees with runtime config: "
             f"expected {resolved_source_bias_mode}, "
-            f"got {metadata.get('source_bias_mode', 'missing')}."
+            f"got {reported_source_bias_mode}."
         )
-    if str(metadata.get("emission_model", "")) != expected_emission_model:
+    if (
+        _required_metadata_string(metadata, "emission_model")
+        != expected_emission_model
+    ):
         raise RuntimeError(
             "Native Geant4 emission-model provenance disagrees with source-rate "
             "semantics."
@@ -576,34 +844,60 @@ def validate_transport_metadata(
     expected_history_mode = (
         "weighted_thinning" if history_thinning_enabled else "full_unit_weight"
     )
-    if str(metadata.get("transport_history_mode", "")) != expected_history_mode:
+    if (
+        _required_metadata_string(metadata, "transport_history_mode")
+        != expected_history_mode
+    ):
         raise RuntimeError(
             "Native Geant4 transport_history_mode disagrees with configured "
             f"transport semantics: expected {expected_history_mode}."
         )
-    if str(metadata.get("spectrum_variance_semantics", "")) != (
-        "compound_poisson_sumw2_includes_counting"
+    expected_variance_semantics = (
+        "renewal_total_conditional_multinomial_marks"
+        if response_sampling_enabled
+        else "compound_poisson_sumw2_includes_counting"
+    )
+    if _required_metadata_string(
+        metadata,
+        "spectrum_variance_semantics",
+    ) != (
+        expected_variance_semantics
     ):
         raise RuntimeError(
             "Native Geant4 response is missing weighted sumw2 variance semantics."
         )
-    if str(metadata.get("spectrum_variance_dead_time_propagation", "")) != (
-        "fixed_observed_scale"
+    expected_dead_time_semantics = (
+        "event_time_nonparalyzable_global_stream"
+        if response_sampling_enabled
+        else "fixed_observed_scale"
+    )
+    if _required_metadata_string(
+        metadata,
+        "spectrum_variance_dead_time_propagation",
+    ) != (
+        expected_dead_time_semantics
     ):
         raise RuntimeError(
             "Native Geant4 response has invalid dead-time variance provenance."
         )
-    try:
-        dead_time_tau_s = float(metadata["dead_time_tau_s"])
-        dead_time_observed_scale = float(metadata["dead_time_observed_scale"])
-        dwell_time_s = float(metadata["dwell_time_s"])
-        pre_dead_time_counts = float(metadata["pre_dead_time_total_spectrum_counts"])
-        pre_dead_time_sumw2 = float(metadata["pre_dead_time_weighted_spectrum_sumw2"])
-        post_dead_time_sumw2 = float(metadata["weighted_spectrum_sumw2"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Native Geant4 response is missing valid dead-time variance provenance."
-        ) from exc
+    dead_time_tau_s = _required_metadata_number(metadata, "dead_time_tau_s")
+    dead_time_observed_scale = _required_metadata_number(
+        metadata,
+        "dead_time_observed_scale",
+    )
+    dwell_time_s = _required_metadata_number(metadata, "dwell_time_s")
+    pre_dead_time_counts = _required_metadata_number(
+        metadata,
+        "pre_dead_time_total_spectrum_counts",
+    )
+    pre_dead_time_sumw2 = _required_metadata_number(
+        metadata,
+        "pre_dead_time_weighted_spectrum_sumw2",
+    )
+    post_dead_time_sumw2 = _required_metadata_number(
+        metadata,
+        "weighted_spectrum_sumw2",
+    )
     dead_time_values = (
         dead_time_tau_s,
         dead_time_observed_scale,
@@ -634,37 +928,80 @@ def validate_transport_metadata(
             "Native Geant4 dead-time constant disagrees with runtime config: "
             f"expected {expected_dead_time_tau_s}, got {dead_time_tau_s}."
         )
-    expected_dead_time_scale = 1.0 / (
-        1.0 + pre_dead_time_counts * dead_time_tau_s / dwell_time_s
+    if response_sampling_enabled:
+        if _required_metadata_string(
+            metadata,
+            "dead_time_scale_semantics",
+        ) != (
+            "realized_global_acceptance_fraction"
+        ):
+            raise RuntimeError(
+                "Native event-time dead-time acceptance provenance is invalid."
+            )
+        expected_realized_scale = (
+            post_dead_time_sumw2 / pre_dead_time_counts
+            if pre_dead_time_counts > 0.0
+            else 1.0
+        )
+        if (
+            not np.isclose(
+                dead_time_observed_scale,
+                expected_realized_scale,
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+            or
+            not np.isclose(
+                pre_dead_time_sumw2,
+                pre_dead_time_counts,
+                rtol=0.0,
+                atol=1.0e-9,
+            )
+            or post_dead_time_sumw2 > pre_dead_time_counts + 1.0e-9
+            or not np.isclose(
+                post_dead_time_sumw2,
+                round(post_dead_time_sumw2),
+                rtol=0.0,
+                atol=1.0e-9,
+            )
+        ):
+            raise RuntimeError(
+                "Native marked-Poisson dead-time provenance is inconsistent "
+                "with unit histories and stochastic thinning."
+            )
+    else:
+        expected_dead_time_scale = 1.0 / (
+            1.0 + pre_dead_time_counts * dead_time_tau_s / dwell_time_s
+        )
+        if not np.isclose(
+            dead_time_observed_scale,
+            expected_dead_time_scale,
+            rtol=1.0e-12,
+            atol=1.0e-15,
+        ):
+            raise RuntimeError(
+                "Native Geant4 dead-time scale is inconsistent with its "
+                "count-rate provenance."
+            )
+        if not np.isclose(
+            post_dead_time_sumw2,
+            pre_dead_time_sumw2 * dead_time_observed_scale**2,
+            rtol=1.0e-12,
+            atol=1.0e-9,
+        ):
+            raise RuntimeError(
+                "Native Geant4 post-dead-time sumw2 is inconsistent with its raw "
+                "variance provenance."
+            )
+    expected_primaries = _required_metadata_number(metadata, expected_key)
+    expected_unthinned_primaries = _required_metadata_number(
+        metadata,
+        "expected_unthinned_primaries",
     )
-    if not np.isclose(
-        dead_time_observed_scale,
-        expected_dead_time_scale,
-        rtol=1.0e-12,
-        atol=1.0e-15,
-    ):
-        raise RuntimeError(
-            "Native Geant4 dead-time scale is inconsistent with its count-rate "
-            "provenance."
-        )
-    if not np.isclose(
-        post_dead_time_sumw2,
-        pre_dead_time_sumw2 * dead_time_observed_scale**2,
-        rtol=1.0e-12,
-        atol=1.0e-9,
-    ):
-        raise RuntimeError(
-            "Native Geant4 post-dead-time sumw2 is inconsistent with its raw "
-            "variance provenance."
-        )
-    try:
-        expected_primaries = float(metadata[expected_key])
-        expected_unthinned_primaries = float(metadata["expected_unthinned_primaries"])
-        sampled_primaries = float(metadata["expected_sampled_primaries"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            "Native Geant4 response is missing expected-primary provenance."
-        ) from exc
+    sampled_primaries = _required_metadata_number(
+        metadata,
+        "expected_sampled_primaries",
+    )
     if (
         not np.isfinite(expected_primaries)
         or not np.isfinite(expected_unthinned_primaries)
@@ -707,27 +1044,18 @@ def validate_transport_metadata(
         )
     )
     if expected_target is not None or budget_keys_present:
-        try:
-            reported_requested_fraction = float(
-                metadata["requested_primary_sampling_fraction"]
-            )
-            reported_target_raw = metadata["target_sampled_primaries"]
-            if isinstance(reported_target_raw, bool):
-                raise ValueError("boolean target")
-            reported_target_value = float(reported_target_raw)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "Native Geant4 response is missing primary-budget provenance."
-            ) from exc
-        if (
-            not np.isfinite(reported_target_value)
-            or reported_target_value < 0.0
-            or not reported_target_value.is_integer()
-        ):
+        reported_requested_fraction = _required_metadata_number(
+            metadata,
+            "requested_primary_sampling_fraction",
+        )
+        reported_target = _required_metadata_integer(
+            metadata,
+            "target_sampled_primaries",
+        )
+        if reported_target < 0:
             raise RuntimeError(
                 "Native Geant4 target sampled-primary provenance is invalid."
             )
-        reported_target = int(reported_target_value)
         if not np.isclose(
             reported_requested_fraction,
             configured_fraction,
@@ -752,7 +1080,10 @@ def validate_transport_metadata(
                 "Native Geant4 primary-budget enable provenance disagrees with "
                 "runtime configuration."
             )
-        if str(metadata.get("primary_sampling_fraction_resolution", "")) != (
+        if _required_metadata_string(
+            metadata,
+            "primary_sampling_fraction_resolution",
+        ) != (
             expected_resolution
         ):
             raise RuntimeError(
@@ -770,7 +1101,10 @@ def validate_transport_metadata(
             "Native Geant4 sampled-primary expectation does not match the "
             "configured sampling fraction."
         )
-    semantics = str(metadata.get("expected_primary_semantics", ""))
+    semantics = _required_metadata_string(
+        metadata,
+        "expected_primary_semantics",
+    )
     if semantics != expected_semantics:
         raise RuntimeError(
             "Native Geant4 expected-primary semantics disagree with source-rate "
@@ -796,6 +1130,9 @@ def validate_full_history_transport_metadata(
     expected_source_bias_mode: str | None = None,
     expected_background_cps: float | None = None,
     expected_dead_time_tau_s: float | None = None,
+    expected_detector_response_sampling: bool = False,
+    expected_surface_source_contract_sha256: str | None = None,
+    expected_scene_hash: str | None = None,
 ) -> None:
     """Validate standard full-history native transport provenance."""
     validate_transport_metadata(
@@ -810,7 +1147,113 @@ def validate_full_history_transport_metadata(
         expected_source_bias_mode=expected_source_bias_mode,
         expected_background_cps=expected_background_cps,
         expected_dead_time_tau_s=expected_dead_time_tau_s,
+        expected_detector_response_sampling=(
+            expected_detector_response_sampling
+        ),
+        expected_surface_source_contract_sha256=(
+            expected_surface_source_contract_sha256
+        ),
+        expected_scene_hash=expected_scene_hash,
     )
+
+
+def _json_boolean(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool | None,
+) -> bool | None:
+    """Return an exact JSON boolean or optional null without truthy coercion."""
+    value = payload.get(key, default)
+    if value is None and default is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a JSON boolean.")
+    return value
+
+
+def _json_integer(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: int,
+    minimum: int | None = None,
+) -> int:
+    """Return an exact JSON integer satisfying an optional lower bound."""
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be a JSON integer.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{key} must be at least {minimum}.")
+    return value
+
+
+def _json_number(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: float,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite JSON number satisfying its physical domain."""
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{key} must be a JSON number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{key} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{key} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{key} must be at least {minimum}.")
+    return parsed
+
+
+def _json_string(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: str,
+    choices: frozenset[str] | None = None,
+) -> str:
+    """Return an exact nonempty JSON string from an optional enum."""
+    value = payload.get(key, default)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{key} must be a nonempty JSON string.")
+    if choices is not None and value not in choices:
+        raise ValueError(
+            f"{key} must be one of {sorted(choices)}, got {value!r}."
+        )
+    return value
+
+
+def _json_vector3(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Return a positive finite three-number JSON array."""
+    value = payload.get(key, default)
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{key} must be a three-element JSON array.")
+    parsed: list[float] = []
+    for component in value:
+        if isinstance(component, bool) or not isinstance(component, Real):
+            raise ValueError(f"{key} must contain only JSON numbers.")
+        numeric = float(component)
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            raise ValueError(f"{key} entries must be finite and positive.")
+        parsed.append(numeric)
+    return parsed[0], parsed[1], parsed[2]
+
+
+def _nonempty_string(value: object, *, field_name: str) -> str:
+    """Return an exact nonempty string."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a nonempty string.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -842,13 +1285,15 @@ class Geant4AppConfig:
     source_rate_model: str = "detector_cps_1m"
     source_bias_mode: str = "detector_cone"
     source_bias_cone_half_angle_deg: float = 0.0
-    source_bias_isotropic_fraction: float = 0.1
+    source_bias_isotropic_fraction: float = 1.0
     detector_scoring_mode: str = "full_transport"
     secondary_transport_mode: str = "full_transport"
     primary_sampling_fraction: float = 1.0
     target_sampled_primaries: int | None = None
     accelerated_weighted_transport_enable: bool = False
     background_cps: float = 0.0
+    sample_detector_response: bool = False
+    validation_entry_class_spectra: bool = False
     detector_model: ExportedDetectorModel = field(default_factory=ExportedDetectorModel)
     shield_thickness: ShieldThicknessConfig = field(
         default_factory=resolve_shield_thickness_config
@@ -862,28 +1307,91 @@ class Geant4AppConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "Geant4AppConfig":
         """Normalize a JSON config payload into a strongly typed object."""
-        payload = {} if data is None else dict(data)
+        if data is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(data, Mapping):
+            payload = dict(data)
+        else:
+            raise TypeError("Geant4 app config must be a mapping or None.")
         stage_material_rules_payload = payload.get("stage_material_rules", ())
         if not isinstance(stage_material_rules_payload, (list, tuple)):
             raise ValueError("stage_material_rules must be a list of objects.")
+        stage_material_rules: list[StageMaterialRule] = []
+        seen_material_prefixes: set[str] = set()
+        for index, entry in enumerate(stage_material_rules_payload):
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "path_prefix",
+                "material",
+            }:
+                raise ValueError(
+                    f"stage_material_rules[{index}] must contain exactly "
+                    "path_prefix and material."
+                )
+            path_prefix = _nonempty_string(
+                entry["path_prefix"],
+                field_name=f"stage_material_rules[{index}].path_prefix",
+            )
+            material = _nonempty_string(
+                entry["material"],
+                field_name=f"stage_material_rules[{index}].material",
+            )
+            if path_prefix in seen_material_prefixes:
+                raise ValueError("stage_material_rules path prefixes must be unique.")
+            seen_material_prefixes.add(path_prefix)
+            stage_material_rules.append(
+                StageMaterialRule(
+                    path_prefix=path_prefix,
+                    material=material,
+                )
+            )
         detector_payload = payload.get("detector_model", {})
-        if not isinstance(detector_payload, dict):
+        if not isinstance(detector_payload, Mapping):
             raise ValueError("detector_model must be a JSON object.")
+        detector_keys = {
+            "crystal_radius_m",
+            "crystal_length_m",
+            "housing_thickness_m",
+            "crystal_shape",
+            "crystal_material",
+            "housing_material",
+        }
+        unknown_detector_keys = sorted(set(detector_payload) - detector_keys)
+        if unknown_detector_keys:
+            raise ValueError(
+                "Unsupported detector_model settings: "
+                + ", ".join(str(key) for key in unknown_detector_keys)
+            )
         visualization_payload = payload.get("radiation_visualization", {})
         if not isinstance(visualization_payload, dict):
             raise ValueError("radiation_visualization must be a JSON object.")
         executable_args = payload.get("executable_args", ())
         if not isinstance(executable_args, (list, tuple)):
             raise ValueError("executable_args must be a list of strings.")
+        if any(not isinstance(value, str) or not value for value in executable_args):
+            raise ValueError("executable_args entries must be nonempty strings.")
         normalized_executable_args = validate_geant4_executable_args(
-            tuple(str(value) for value in executable_args)
+            tuple(executable_args)
         )
         absorbing_transport_groups = payload.get("absorbing_transport_groups", ())
         if not isinstance(absorbing_transport_groups, (list, tuple)):
             raise ValueError("absorbing_transport_groups must be a list of strings.")
+        if any(
+            not isinstance(value, str) or not value
+            for value in absorbing_transport_groups
+        ):
+            raise ValueError(
+                "absorbing_transport_groups entries must be nonempty strings."
+            )
         absorbing_path_prefixes = payload.get("absorbing_path_prefixes", ())
         if not isinstance(absorbing_path_prefixes, (list, tuple)):
             raise ValueError("absorbing_path_prefixes must be a list of strings.")
+        if any(
+            not isinstance(value, str) or not value
+            for value in absorbing_path_prefixes
+        ):
+            raise ValueError(
+                "absorbing_path_prefixes entries must be nonempty strings."
+            )
         accelerated_weighted_transport_enable = payload.get(
             "accelerated_weighted_transport_enable",
             False,
@@ -892,6 +1400,47 @@ class Geant4AppConfig:
             raise ValueError(
                 "accelerated_weighted_transport_enable must be a JSON boolean."
             )
+        sample_detector_response = payload.get(
+            "sample_detector_response",
+            False,
+        )
+        validation_entry_class_spectra = payload.get(
+            "validation_entry_class_spectra",
+            False,
+        )
+        if not isinstance(sample_detector_response, bool):
+            raise ValueError(
+                "sample_detector_response must be a JSON boolean."
+            )
+        if not isinstance(validation_entry_class_spectra, bool):
+            raise ValueError(
+                "validation_entry_class_spectra must be a JSON boolean."
+            )
+        use_mock_stage = _json_boolean(
+            payload,
+            "use_mock_stage",
+            default=True,
+        )
+        headless = _json_boolean(
+            payload,
+            "headless",
+            default=True,
+        )
+        author_obstacle_prims = _json_boolean(
+            payload,
+            "author_obstacle_prims",
+            default=None,
+        )
+        author_room_boundary_prims = _json_boolean(
+            payload,
+            "author_room_boundary_prims",
+            default=None,
+        )
+        persistent_process = _json_boolean(
+            payload,
+            "persistent_process",
+            default=False,
+        )
         target_sampled_primaries = require_target_sampled_primaries(
             payload.get("target_sampled_primaries")
         )
@@ -903,7 +1452,55 @@ class Geant4AppConfig:
                 "target_sampled_primaries requires "
                 "accelerated_weighted_transport_enable=true."
             )
-        source_rate_model = str(payload.get("source_rate_model", "detector_cps_1m"))
+        source_rate_model = _json_string(
+            payload,
+            "source_rate_model",
+            default="detector_cps_1m",
+            choices=frozenset(
+                {"detector_cps_1m", "isotropic_emission_equivalent"}
+            ),
+        )
+        source_bias_mode = _json_string(
+            payload,
+            "source_bias_mode",
+            default="detector_cone",
+            choices=frozenset(
+                {"analog", "detector_cone", "mixture_cone_isotropic"}
+            ),
+        )
+        source_bias_cone_half_angle_deg = _json_number(
+            payload,
+            "source_bias_cone_half_angle_deg",
+            default=0.0,
+            minimum=0.0,
+        )
+        if source_bias_cone_half_angle_deg > 180.0:
+            raise ValueError(
+                "source_bias_cone_half_angle_deg must not exceed 180."
+            )
+        source_bias_isotropic_fraction = _json_number(
+            payload,
+            "source_bias_isotropic_fraction",
+            default=1.0,
+            strictly_positive=True,
+        )
+        if source_bias_isotropic_fraction > 1.0:
+            raise ValueError(
+                "source_bias_isotropic_fraction must lie in (0, 1]."
+            )
+        if source_rate_model == "detector_cps_1m":
+            if source_bias_mode != "detector_cone":
+                raise ValueError(
+                    "source_rate_model=detector_cps_1m has the fixed effective "
+                    "source_bias_mode=detector_cone."
+                )
+            if not np.isclose(source_bias_isotropic_fraction, 1.0):
+                raise ValueError(
+                    "source_rate_model=detector_cps_1m has the fixed effective "
+                    "source_bias_isotropic_fraction=1.0."
+                )
+            source_bias_mode = "detector_cone"
+            source_bias_isotropic_fraction = 1.0
         primary_sampling_fraction = require_primary_sampling_fraction(
             payload.get("primary_sampling_fraction", 1.0),
             accelerated_weighted_transport_enable=(
@@ -919,108 +1516,194 @@ class Geant4AppConfig:
                 "Accelerated weighted history thinning currently requires "
                 "source_rate_model=detector_cps_1m."
             )
+        detector_scoring_mode = _json_string(
+            payload,
+            "detector_scoring_mode",
+            default="full_transport",
+            choices=frozenset({"full_transport", "incident_gamma_energy"}),
+        )
+        secondary_transport_mode = _json_string(
+            payload,
+            "secondary_transport_mode",
+            default="full_transport",
+            choices=frozenset({"full_transport", "gamma_only"}),
+        )
+        if sample_detector_response != (
+            detector_scoring_mode == "incident_gamma_energy"
+        ):
+            raise ValueError(
+                "sample_detector_response must be true exactly when "
+                "detector_scoring_mode=incident_gamma_energy."
+            )
+        background_cps = _json_number(
+            payload,
+            "background_cps",
+            default=0.0,
+            minimum=0.0,
+        )
+        renderer = _json_string(
+            payload,
+            "renderer",
+            default="RayTracedLighting",
+        )
+        usd_path = payload.get("usd_path")
+        if usd_path is not None:
+            usd_path = _nonempty_string(usd_path, field_name="usd_path")
+        engine_mode = _json_string(
+            payload,
+            "engine_mode",
+            default="external",
+            choices=frozenset({"external"}),
+        )
+        physics_profile = _json_string(
+            payload,
+            "physics_profile",
+            default="balanced",
+            choices=frozenset({"balanced"}),
+        )
+        executable_path_raw = payload.get(
+            "executable_path",
+            "build/geant4_sidecar",
+        )
+        executable_path = _nonempty_string(
+            executable_path_raw,
+            field_name="executable_path",
+        )
+        scatter_gain = _json_number(
+            payload,
+            "scatter_gain",
+            default=0.0,
+            minimum=0.0,
+        )
+        if scatter_gain != 0.0:
+            raise ValueError(
+                "scatter_gain is not a native Geant4 runtime option and must "
+                "be 0.0."
+            )
+        crystal_shape = _nonempty_string(
+            detector_payload.get("crystal_shape", "sphere"),
+            field_name="detector_model.crystal_shape",
+        )
+        if crystal_shape != "sphere":
+            raise ValueError(
+                "detector_model.crystal_shape must be 'sphere'; native Geant4 "
+                "constructs a spherical detector."
+            )
+        crystal_material = _nonempty_string(
+            detector_payload.get("crystal_material", "cebr3"),
+            field_name="detector_model.crystal_material",
+        )
+        housing_material = _nonempty_string(
+            detector_payload.get("housing_material", "aluminum"),
+            field_name="detector_model.housing_material",
+        )
         return cls(
-            use_mock_stage=bool(payload.get("use_mock_stage", True)),
-            headless=bool(payload.get("headless", True)),
-            renderer=str(payload.get("renderer", "RayTracedLighting")),
-            usd_path=None
-            if payload.get("usd_path") in (None, "")
-            else str(payload["usd_path"]),
-            detector_height_m=float(payload.get("detector_height_m", 0.5)),
-            robot_ground_z_m=float(payload.get("robot_ground_z_m", 0.0)),
-            obstacle_height_m=float(payload.get("obstacle_height_m", 2.0)),
-            author_obstacle_prims=(
-                None
-                if payload.get("author_obstacle_prims") is None
-                else bool(payload.get("author_obstacle_prims"))
+            use_mock_stage=use_mock_stage,
+            headless=headless,
+            renderer=renderer,
+            usd_path=usd_path,
+            detector_height_m=_json_number(
+                payload,
+                "detector_height_m",
+                default=0.5,
+                strictly_positive=True,
             ),
-            author_room_boundary_prims=(
-                None
-                if payload.get("author_room_boundary_prims") is None
-                else bool(payload.get("author_room_boundary_prims"))
+            robot_ground_z_m=_json_number(
+                payload,
+                "robot_ground_z_m",
+                default=0.0,
             ),
-            fe_shield_size_xyz=tuple(
-                float(v) for v in payload.get("fe_shield_size_xyz", (0.25, 0.08, 0.25))
+            obstacle_height_m=_json_number(
+                payload,
+                "obstacle_height_m",
+                default=2.0,
+                strictly_positive=True,
             ),
-            pb_shield_size_xyz=tuple(
-                float(v) for v in payload.get("pb_shield_size_xyz", (0.25, 0.08, 0.25))
+            author_obstacle_prims=author_obstacle_prims,
+            author_room_boundary_prims=author_room_boundary_prims,
+            fe_shield_size_xyz=_json_vector3(
+                payload,
+                "fe_shield_size_xyz",
+                default=(0.25, 0.08, 0.25),
             ),
-            stage_material_rules=tuple(
-                StageMaterialRule(
-                    path_prefix=str(entry["path_prefix"]),
-                    material=str(entry["material"]),
-                )
-                for entry in stage_material_rules_payload
+            pb_shield_size_xyz=_json_vector3(
+                payload,
+                "pb_shield_size_xyz",
+                default=(0.25, 0.08, 0.25),
             ),
-            engine_mode=str(payload.get("engine_mode", "external")),
-            physics_profile=str(payload.get("physics_profile", "balanced")),
-            thread_count=int(payload.get("thread_count", 1)),
-            random_seed_base=int(payload.get("random_seed_base", 123)),
-            dead_time_tau_s=float(payload.get("dead_time_tau_s", 5.813e-9)),
-            scatter_gain=float(payload.get("scatter_gain", 0.0)),
-            executable_path=(
-                "build/geant4_sidecar"
-                if payload.get("executable_path") in (None, "")
-                else str(payload.get("executable_path"))
+            stage_material_rules=tuple(stage_material_rules),
+            engine_mode=engine_mode,
+            physics_profile=physics_profile,
+            thread_count=_json_integer(
+                payload,
+                "thread_count",
+                default=1,
+                minimum=1,
             ),
+            random_seed_base=_json_integer(
+                payload,
+                "random_seed_base",
+                default=123,
+                minimum=0,
+            ),
+            dead_time_tau_s=_json_number(
+                payload,
+                "dead_time_tau_s",
+                default=5.813e-9,
+                minimum=0.0,
+            ),
+            scatter_gain=scatter_gain,
+            executable_path=executable_path,
             executable_args=normalized_executable_args,
-            timeout_s=float(payload.get("timeout_s", 120.0)),
-            persistent_process=bool(payload.get("persistent_process", False)),
+            timeout_s=_json_number(
+                payload,
+                "timeout_s",
+                default=120.0,
+                strictly_positive=True,
+            ),
+            persistent_process=persistent_process,
             source_rate_model=source_rate_model,
-            source_bias_mode=str(payload.get("source_bias_mode", "detector_cone")),
-            source_bias_cone_half_angle_deg=float(
-                payload.get("source_bias_cone_half_angle_deg", 0.0)
-            ),
-            source_bias_isotropic_fraction=float(
-                payload.get("source_bias_isotropic_fraction", 0.1)
-            ),
-            detector_scoring_mode=str(
-                payload.get("detector_scoring_mode", "full_transport")
-            ),
-            secondary_transport_mode=str(
-                payload.get("secondary_transport_mode", "full_transport")
-            ),
+            source_bias_mode=source_bias_mode,
+            source_bias_cone_half_angle_deg=source_bias_cone_half_angle_deg,
+            source_bias_isotropic_fraction=source_bias_isotropic_fraction,
+            detector_scoring_mode=detector_scoring_mode,
+            secondary_transport_mode=secondary_transport_mode,
             primary_sampling_fraction=primary_sampling_fraction,
             target_sampled_primaries=target_sampled_primaries,
             accelerated_weighted_transport_enable=(
                 accelerated_weighted_transport_enable
             ),
-            background_cps=max(
-                geant4_executable_float_option(
-                    normalized_executable_args,
-                    "--background-cps",
-                    default=0.0,
-                ),
-                0.0,
+            background_cps=background_cps,
+            sample_detector_response=sample_detector_response,
+            validation_entry_class_spectra=(
+                validation_entry_class_spectra
             ),
             detector_model=ExportedDetectorModel(
-                crystal_radius_m=float(
-                    detector_payload.get(
-                        "crystal_radius_m", DEFAULT_DETECTOR_CRYSTAL_RADIUS_M
-                    )
+                crystal_radius_m=_json_number(
+                    detector_payload,
+                    "crystal_radius_m",
+                    default=DEFAULT_DETECTOR_CRYSTAL_RADIUS_M,
+                    strictly_positive=True,
                 ),
-                crystal_length_m=float(
-                    detector_payload.get(
-                        "crystal_length_m", DEFAULT_DETECTOR_CRYSTAL_LENGTH_M
-                    )
+                crystal_length_m=_json_number(
+                    detector_payload,
+                    "crystal_length_m",
+                    default=DEFAULT_DETECTOR_CRYSTAL_LENGTH_M,
+                    strictly_positive=True,
                 ),
-                housing_thickness_m=float(
-                    detector_payload.get(
-                        "housing_thickness_m",
-                        DEFAULT_DETECTOR_HOUSING_THICKNESS_M,
-                    )
+                housing_thickness_m=_json_number(
+                    detector_payload,
+                    "housing_thickness_m",
+                    default=DEFAULT_DETECTOR_HOUSING_THICKNESS_M,
+                    minimum=0.0,
                 ),
-                crystal_shape=str(detector_payload.get("crystal_shape", "sphere")),
-                crystal_material=str(detector_payload.get("crystal_material", "cebr3")),
-                housing_material=str(
-                    detector_payload.get("housing_material", "aluminum")
-                ),
+                crystal_shape=crystal_shape,
+                crystal_material=crystal_material,
+                housing_material=housing_material,
             ),
             shield_thickness=resolve_shield_thickness_config(payload),
-            absorbing_transport_groups=tuple(
-                str(v) for v in absorbing_transport_groups
-            ),
-            absorbing_path_prefixes=tuple(str(v) for v in absorbing_path_prefixes),
+            absorbing_transport_groups=tuple(absorbing_transport_groups),
+            absorbing_path_prefixes=tuple(absorbing_path_prefixes),
             radiation_visualization=RadiationVisualizationConfig.from_dict(
                 visualization_payload
             ),
@@ -1096,12 +1779,18 @@ class Geant4Application:
                 secondary_transport_mode=self.config.secondary_transport_mode,
                 primary_sampling_fraction=self.config.primary_sampling_fraction,
                 target_sampled_primaries=self.config.target_sampled_primaries,
+                background_cps=self.config.background_cps,
+                sample_detector_response=(
+                    self.config.sample_detector_response
+                ),
+                validation_entry_class_spectra=(
+                    self.config.validation_entry_class_spectra
+                ),
                 radiation_visualization=self.config.radiation_visualization,
             ),
             engine_mode=self.config.engine_mode,
         )
         self._last_cache_hit = False
-        self._decomposer = SpectralDecomposer()
 
     def reset(self, scene: SceneDescription) -> None:
         """Load a new scene description and rebuild or reuse the Geant4 world."""
@@ -1142,6 +1831,52 @@ class Geant4Application:
         """Return configured transport semantics for TCP reset handshakes."""
         weighted = bool(self.config.accelerated_weighted_transport_enable)
         budget_enabled = self.config.target_sampled_primaries is not None
+        expected_policy_hash = surface_emission_policy_sha256()
+        active_scene = getattr(self, "scene", None)
+        scene_sources = (
+            ()
+            if active_scene is None
+            else tuple(active_scene.sources)
+        )
+        all_sources_surface_bound = bool(scene_sources) and all(
+            source.transport_position_xyz is not None
+            and source.surface_chart_id is not None
+            and source.surface_uv is not None
+            and source.surface_normal_xyz is not None
+            and source.surface_emission_policy_sha256 == expected_policy_hash
+            for source in scene_sources
+        )
+        source_contract_sha256 = ""
+        if all_sources_surface_bound:
+            source_contract_sha256 = surface_source_runtime_contract_sha256(
+                [
+                    {
+                        "isotope": source.isotope,
+                        "position": list(source.position_xyz),
+                        "transport_position": list(
+                            source.transport_position_xyz
+                        ),
+                        "intensity_cps_1m": float(
+                            source.intensity_cps_1m
+                        ),
+                        "surface_chart_id": source.surface_chart_id,
+                        "surface_uv": list(source.surface_uv),
+                        "surface_normal": list(
+                            source.surface_normal_xyz
+                        ),
+                        "surface_emission_policy_sha256": (
+                            source.surface_emission_policy_sha256
+                        ),
+                    }
+                    for source in scene_sources
+                ]
+            )
+        engine_scene = getattr(getattr(self, "engine", None), "scene", None)
+        scene_hash = (
+            ""
+            if engine_scene is None
+            else str(getattr(engine_scene, "scene_hash", ""))
+        )
         metadata: dict[str, object] = {
             "primary_sampling_fraction": float(self.config.primary_sampling_fraction),
             "primary_history_weight": float(
@@ -1158,12 +1893,48 @@ class Geant4Application:
             ),
             "dead_time_tau_s": float(self.config.dead_time_tau_s),
             "source_rate_model": str(self.config.source_rate_model),
+            "intensity_cps_1m_definition": (
+                "pre_dead_time_detector_pulse_rate_at_1m"
+            ),
             "requested_threads": int(self.config.thread_count),
             "physics_profile": str(self.config.physics_profile),
             "detector_scoring_mode": str(self.config.detector_scoring_mode),
             "secondary_transport_mode": str(self.config.secondary_transport_mode),
             "source_bias_mode": str(self.config.source_bias_mode),
+            "source_bias_isotropic_fraction": float(
+                self.config.source_bias_isotropic_fraction
+            ),
             "background_cps": float(self.config.background_cps),
+            "sample_detector_response": bool(
+                self.config.sample_detector_response
+            ),
+            "detector_response_sampling_contract_sha256": (
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+            ),
+            "spectrum_energy_min_keV": float(
+                NATIVE_GEANT4_ENERGY_MIN_KEV
+            ),
+            "spectrum_energy_max_keV": float(
+                NATIVE_GEANT4_ENERGY_MAX_KEV
+            ),
+            "spectrum_bin_width_keV": float(
+                NATIVE_GEANT4_BIN_WIDTH_KEV
+            ),
+            "spectrum_bin_count": int(NATIVE_GEANT4_BIN_COUNT),
+            "background_spectrum_model_id": (
+                NATIVE_GEANT4_BACKGROUND_MODEL_ID
+            ),
+            "source_position_semantics": "air_side_native_emission_xyz",
+            "source_anchor_semantics": (
+                "exact_surface_chart_uv_evaluation_truth"
+            ),
+            "all_sources_surface_bound": all_sources_surface_bound,
+            "surface_emission_epsilon_m": SURFACE_EMISSION_EPSILON_M,
+            "surface_emission_policy_sha256": (
+                expected_policy_hash if all_sources_surface_bound else ""
+            ),
+            "surface_source_contract_sha256": source_contract_sha256,
+            "scene_hash": scene_hash,
         }
         if budget_enabled:
             metadata["history_thinning_resolution"] = "per_observation_pending"
@@ -1214,9 +1985,26 @@ class Geant4Application:
             expected_source_bias_mode=self.config.source_bias_mode,
             expected_background_cps=self.config.background_cps,
             expected_dead_time_tau_s=self.config.dead_time_tau_s,
+            expected_detector_response_sampling=(
+                self.config.sample_detector_response
+            ),
         )
         if self.config.accelerated_weighted_transport_enable:
             _validate_native_weighted_response(spectrum, metadata)
+            canonical_spectrum: list[int | float] = np.asarray(
+                spectrum,
+                dtype=np.float64,
+            ).tolist()
+        elif self.config.sample_detector_response:
+            canonical_spectrum = _validate_native_sampled_event_response(
+                spectrum,
+                metadata,
+            ).tolist()
+        else:
+            canonical_spectrum = np.asarray(
+                spectrum,
+                dtype=np.float64,
+            ).tolist()
         metadata["accelerated_weighted_transport_enable"] = bool(
             self.config.accelerated_weighted_transport_enable
         )
@@ -1240,8 +2028,11 @@ class Geant4Application:
             "shield_thickness_pb_cm",
             float(self.config.shield_thickness.thickness_pb_cm),
         )
-        energy = self._decomposer.energy_axis
-        bin_width_keV = float(self._decomposer.config.bin_width_keV)
+        energy = (
+            np.arange(NATIVE_GEANT4_BIN_COUNT, dtype=np.float64)
+            * float(NATIVE_GEANT4_BIN_WIDTH_KEV)
+        )
+        bin_width_keV = float(NATIVE_GEANT4_BIN_WIDTH_KEV)
         edges = list(energy) + [float(energy[-1] + bin_width_keV)]
         return SimulationObservation(
             step_id=command.step_id,
@@ -1249,7 +2040,7 @@ class Geant4Application:
             detector_quat_wxyz=detector_pose.orientation_wxyz,
             fe_orientation_index=command.fe_orientation_index,
             pb_orientation_index=command.pb_orientation_index,
-            spectrum_counts=np.asarray(spectrum, dtype=float).tolist(),
+            spectrum_counts=canonical_spectrum,
             energy_bin_edges_keV=[float(v) for v in edges],
             metadata=metadata,
         )

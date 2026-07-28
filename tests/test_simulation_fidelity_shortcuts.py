@@ -1,1036 +1,198 @@
-"""Regression tests for simulation fidelity shortcuts."""
+"""Guard the standard runtime against removed simulation shortcuts."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 
-from realtime_demo import run_live_pf
-from spectrum.pipeline import SpectralDecomposer, SpectrumConfig
-from spectrum.runtime_config import spectrum_config_from_runtime_config
-from spectrum.runtime_counts import RuntimeCountExtractor
+from pf.profiles import enforce_pure_runtime_settings
+from sim.runtime import load_runtime_config
 
 
-def test_codex_instructions_define_simulation_fidelity_guardrails() -> None:
-    """Codex project instructions should forbid low-fidelity runtime shortcuts."""
-    root = Path(__file__).resolve().parents[1]
-    agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
-    policy_text = (root / "docs" / "simulation_fidelity_policy.md").read_text(
-        encoding="utf-8"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STANDARD_CONFIG = (
+    PROJECT_ROOT
+    / "configs"
+    / "geant4"
+    / "variance_reduction_external_no_isaac_32threads.json"
+)
+
+
+def _runtime_config_paths() -> tuple[Path, ...]:
+    """Return every checked-in simulation runtime JSON configuration."""
+    config_root = PROJECT_ROOT / "configs"
+    roots = (
+        config_root / "geant4",
+        config_root / "python",
+        config_root / "isaacsim",
     )
-    normalized_agents_text = " ".join(agents_text.split())
-    required_phrases = (
-        "Simulation fidelity policy",
-        "Runtime simulation fidelity must take priority over speed shortcuts.",
-        "CUI mode means \"run without the Isaac Sim GUI.\"",
-        "surrogate transport",
-        "expected-count observations",
-        "weighted or capped Geant4 histories",
-        "peak-window or full-spectrum-continuum runtime count extraction",
-        "Full simulation",
-        "uv run python main.py --full-simulation",
-    )
-
-    for phrase in required_phrases:
-        assert phrase in normalized_agents_text
-    assert "Prohibited Runtime Shortcuts" in policy_text
-    assert "Allowed Performance Work" in policy_text
-
-
-def test_codex_instructions_require_parallel_first_heavy_runtime_work() -> None:
-    """Codex project instructions should require parallel-first heavy code."""
-    root = Path(__file__).resolve().parents[1]
-    agents_text = (root / "AGENTS.md").read_text(encoding="utf-8")
-    parallel_policy = (root / "docs" / "compute_parallelism_policy.md").read_text(
-        encoding="utf-8"
-    )
-    fidelity_policy = (root / "docs" / "simulation_fidelity_policy.md").read_text(
-        encoding="utf-8"
-    )
-    combined = " ".join((agents_text + "\n" + parallel_policy).split())
-    required_phrases = (
-        "Compute parallelism policy",
-        "batched, GPU, Geant4-threaded, or process-parallel",
-        "Do not add scalar Python runtime loops over particles",
-        "Parallelization must preserve the same physics",
-        "serial-vs-parallel equivalence test",
-    )
-
-    for phrase in required_phrases:
-        assert phrase in combined
-    assert "docs/compute_parallelism_policy.md" in fidelity_policy
-
-
-def test_demo_entrypoints_do_not_expose_expected_count_bypasses() -> None:
-    """Demo entrypoints should feed PF updates from spectra, not expected counts."""
-    root = Path(__file__).resolve().parents[1]
-    checked_paths = (
-        root / "main.py",
-        root / "src" / "realtime_demo.py",
-    )
-    forbidden_tokens = (
-        "--count",
-        "count_mode",
-        "_detect_isotopes_from_expected",
-        "def _expected_counts(",
-    )
-
-    for path in checked_paths:
-        source = path.read_text(encoding="utf-8")
-        for token in forbidden_tokens:
-            assert token not in source
-
-
-def test_runtime_count_extraction_defaults_to_response_poisson() -> None:
-    """Runtime count extraction should standardize on response_poisson."""
-    assert RuntimeCountExtractor.STANDARD_METHOD == "response_poisson"
-    assert RuntimeCountExtractor.validate_count_method("response_poisson") == (
-        "response_poisson"
+    return tuple(
+        path
+        for root in roots
+        for path in sorted(root.rglob("*.json"))
+        if "calibration" not in path.parts
     )
 
 
-def test_runtime_count_extraction_preserves_isotope_count_covariance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime count extraction should keep response-Poisson count covariance."""
-    decomposer = SpectralDecomposer()
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
+def test_standard_runtime_uses_unit_weight_external_geant4() -> None:
+    """The standard full simulation must retain its native fidelity contract."""
+    payload = load_runtime_config(STANDARD_CONFIG)
 
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return correlated isotope counts from a response-Poisson fit."""
-        self.last_count_variances = {"Cs-137": 25.0, "Co-60": 100.0}
-        self.last_count_covariance = {
-            "Cs-137": {"Cs-137": 25.0, "Co-60": -25.0},
-            "Co-60": {"Cs-137": -25.0, "Co-60": 100.0},
-        }
-        self.last_response_poisson_diagnostics = {"status": "ok"}
-        return {"Cs-137": 50.0, "Co-60": 20.0}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=10.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.covariance is not None
-    assert result.covariance["Cs-137"]["Cs-137"] == pytest.approx(
-        result.variances["Cs-137"]
-    )
-    assert result.covariance["Co-60"]["Co-60"] == pytest.approx(
-        result.variances["Co-60"]
-    )
-    corr = result.covariance["Cs-137"]["Co-60"] / np.sqrt(
-        result.variances["Cs-137"] * result.variances["Co-60"]
-    )
-    assert corr == pytest.approx(-0.5)
+    assert payload.get("engine_mode", "external") == "external"
+    assert payload["persistent_process"] is True
+    assert payload["source_rate_model"] == "detector_cps_1m"
+    assert payload["primary_sampling_fraction"] == pytest.approx(1.0)
+    assert payload.get("accelerated_weighted_transport_enable", False) is False
+    assert int(payload.get("target_sampled_primaries", 0)) == 0
+    assert payload["sample_detector_response"] is True
+    assert payload["secondary_transport_mode"] == "full_transport"
+    assert payload.get("theory_tvl_attenuation", False) is False
+    assert str(payload.get("physics_profile", "balanced")).lower() != "theory_tvl"
 
 
-def test_runtime_count_extraction_symmetrizes_reciprocal_covariance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime covariance must remain exactly symmetric after numerical drift."""
-    decomposer = SpectralDecomposer()
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a covariance with realistic reciprocal roundoff drift."""
-        self.last_count_variances = {"Cs-137": 25.0, "Co-60": 100.0}
-        self.last_count_covariance = {
-            "Cs-137": {"Cs-137": 25.0, "Co-60": -25.0},
-            "Co-60": {"Cs-137": -25.0001, "Co-60": 100.0},
-        }
-        self.last_response_poisson_diagnostics = {"status": "ok"}
-        return {"Cs-137": 50.0, "Co-60": 20.0}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=10.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.covariance is not None
-    forward = result.covariance["Cs-137"]["Co-60"]
-    reverse = result.covariance["Co-60"]["Cs-137"]
-    assert forward == reverse
-    assert forward == pytest.approx(-25.00005)
-
-
-def test_runtime_covariance_does_not_rescale_formal_correlation_to_added_floors(
-) -> None:
-    """Independent runtime floors must not inflate formal cross-covariance."""
-    decomposer = SpectralDecomposer()
-    decomposer.last_count_covariance = {
-        "Cs-137": {"Cs-137": 25.0, "Co-60": -25.0},
-        "Co-60": {"Cs-137": -25.0, "Co-60": 100.0},
+def test_standard_runtime_has_one_joint_spectrum_observation_contract() -> None:
+    """Removed count and duplicate-likelihood keys must not re-enter runtime."""
+    payload = load_runtime_config(STANDARD_CONFIG)
+    retired_exact = {
+        "calibration_count_method",
+        "pf_count_likelihood",
+        "pf_shield_contrast_likelihood",
+        "pf_shield_view_ratio_likelihood",
+        "spectrum_count_method",
     }
-    covariance = RuntimeCountExtractor(
-        decomposer
-    )._count_covariance_with_runtime_variances(
-        {"Cs-137": 100.0, "Co-60": 100.0},
-        {"Cs-137": 10000.0, "Co-60": 40000.0},
+    retired_prefixes = (
+        "contrast_",
+        "count_likelihood_",
+        "response_poisson_",
+        "shield_contrast_",
+        "shield_view_ratio_",
+        "view_ratio_",
     )
 
-    assert covariance["Cs-137"]["Cs-137"] == pytest.approx(10000.0)
-    assert covariance["Co-60"]["Co-60"] == pytest.approx(40000.0)
-    assert covariance["Cs-137"]["Co-60"] == pytest.approx(-25.0)
-    assert covariance["Co-60"]["Cs-137"] == pytest.approx(-25.0)
+    assert retired_exact.isdisjoint(payload)
+    assert not any(str(key).startswith(retired_prefixes) for key in payload)
 
 
-def test_runtime_covariance_ceiling_scales_complete_formal_covariance(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("config_path", _runtime_config_paths())
+def test_pure_runtime_strength_prior_matches_random_truth_contract(
+    config_path: Path,
 ) -> None:
-    """Capping formal diagonals must preserve their fitted correlation."""
-    decomposer = SpectralDecomposer(
-        SpectrumConfig(
-            response_poisson_count_variance_ceiling_enable=True,
-            response_poisson_count_variance_max_rel_sigma=0.15,
-            response_poisson_count_variance_max_abs_sigma=0.0,
-        )
+    """Every pure runtime must use the predeclared Uniform[300k, 2M] support."""
+    payload = load_runtime_config(config_path)
+    if payload.get("pure_pf_schema_version") != 1:
+        return
+
+    prior_minimum = payload["pf_strength_prior_min_cps_1m"]
+    prior_maximum = payload["pf_strength_prior_max_cps_1m"]
+    assert (
+        isinstance(prior_minimum, (int, float))
+        and not isinstance(prior_minimum, bool)
     )
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a high-variance correlated formal regression result."""
-        del spectrum, live_time_s, kwargs
-        self.last_count_variances = {"Cs-137": 1.0e9, "Co-60": 4.0e9}
-        self.last_count_covariance = {
-            "Cs-137": {"Cs-137": 1.0e9, "Co-60": -1.0e9},
-            "Co-60": {"Cs-137": -1.0e9, "Co-60": 4.0e9},
-        }
-        self.last_response_poisson_diagnostics = {"status": "ok"}
-        return {"Cs-137": 1000.0, "Co-60": 2000.0}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
+    assert (
+        isinstance(prior_maximum, (int, float))
+        and not isinstance(prior_maximum, bool)
     )
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=10.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
+    assert float(prior_minimum) == pytest.approx(300_000.0)
+    assert float(prior_maximum) == pytest.approx(2_000_000.0)
+    assert 0.0 < float(prior_minimum) < float(prior_maximum)
+
+    truth_minimum = payload.get("random_source_intensity_min_cps_1m")
+    truth_maximum = payload.get("random_source_intensity_max_cps_1m")
+    if truth_minimum is None and truth_maximum is None:
+        return
+    assert (
+        isinstance(truth_minimum, (int, float))
+        and not isinstance(truth_minimum, bool)
     )
-
-    assert result.covariance is not None
-    row_var = result.covariance["Cs-137"]["Cs-137"]
-    col_var = result.covariance["Co-60"]["Co-60"]
-    correlation = result.covariance["Cs-137"]["Co-60"] / np.sqrt(
-        row_var * col_var
+    assert (
+        isinstance(truth_maximum, (int, float))
+        and not isinstance(truth_maximum, bool)
     )
-    assert row_var == pytest.approx((0.15 * 1000.0) ** 2)
-    assert col_var == pytest.approx((0.15 * 2000.0) ** 2)
-    assert correlation == pytest.approx(-0.5)
+    assert float(truth_minimum) == pytest.approx(float(prior_minimum))
+    assert float(truth_maximum) == pytest.approx(float(prior_maximum))
 
 
-def test_global_response_chi2_does_not_inflate_every_isotope_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Full-spectrum fit residuals are not isotope-count error calibration."""
-    decomposer = SpectralDecomposer(
-        SpectrumConfig(
-            response_poisson_diagnostic_variance_enable=True,
-        )
-    )
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return stable isotope counts with only a poor global fit statistic."""
-        self.last_count_variances = {"Cs-137": 25.0, "Co-60": 36.0}
-        self.last_count_covariance = {}
-        self.last_response_poisson_diagnostics = {
-            "reduced_chi2": 500.0,
-            "design_condition_number": 1.0,
-            "fisher_condition_number": 1.0,
-        }
-        return {"Cs-137": 1000.0, "Co-60": 800.0}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
+def test_removed_count_and_rescue_paths_stay_deleted() -> None:
+    """Legacy estimator, calibration, and shortcut paths must remain absent."""
+    removed_paths = (
+        (
+            "configs/geant4/"
+            "accelerated_weighted_external_no_isaac_32threads.json"
+        ),
+        (
+            "configs/geant4/calibration/"
+            "pf_transport_response_model_combined_random64_uniform_"
+            "v3_distance_material_20260609.json"
+        ),
+        (
+            "configs/geant4/calibration/"
+            "pf_transport_response_model_dominanceguard_transport_"
+            "20260608.json"
+        ),
+        "scripts/analyze_pf_run_metrics.py",
+        "scripts/analyze_weighted_transport_acceptance.py",
+        "scripts/calibrate_geant4_net_response.py",
+        "scripts/replay_photopeak_channel_counts.py",
+        "scripts/replay_response_poisson_guard.py",
+        "scripts/validate_eu154_count_model.py",
+        "scripts/validate_geant4_spectrum_decomposition.py",
+        "src/counts/__init__.py",
+        "src/counts/isotope_sequence.py",
+        "src/measurement/surface_patches.py",
+        "src/pf/forward_response_conformance.py",
+        "src/pf/likelihood.py",
+        "src/pf/measurement.py",
+        "src/pf/reporting.py",
+        "src/pf/runtime_route.py",
+        "src/planning/pose_selection.py",
+        "src/planning/remaining_measurements.py",
+        "src/planning/shield_rotation.py",
+        "src/spectrum/activity_estimation.py",
+        "src/spectrum/baseline.py",
+        "src/spectrum/dead_time.py",
+        "src/spectrum/decomposition.py",
+        "src/spectrum/net_response.py",
+        "src/spectrum/nnls.py",
+        "src/spectrum/peak_detection.py",
+        "src/spectrum/pipeline.py",
+        "src/spectrum/response_truth_calibration.py",
+        "src/spectrum/runtime_config.py",
+        "src/spectrum/runtime_counts.py",
+        "src/spectrum/smoothing.py",
+        "src/spectrum/tuning.py",
     )
 
-    assert result.variances == pytest.approx({"Cs-137": 25.0, "Co-60": 36.0})
-    components = decomposer.last_response_poisson_diagnostics[
-        "runtime_variance_components"
+    assert not [
+        relative_path
+        for relative_path in removed_paths
+        if (PROJECT_ROOT / relative_path).exists()
     ]
-    assert components["Cs-137"]["final_variance"] == pytest.approx(25.0)
-    assert components["Co-60"]["final_variance"] == pytest.approx(36.0)
 
-def test_response_diagnostics_inflate_runtime_count_variance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unreliable response-regression diagnostics should soften PF observations."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=True,
-        response_poisson_diagnostic_reduced_chi2_threshold=2.0,
-        response_poisson_diagnostic_reduced_chi2_scale=0.5,
-        response_poisson_crosstalk_corr_threshold=0.85,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
 
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return counts with diagnostics resembling crosstalk-prone unfolding."""
-        self.last_count_variances = {"Cs-137": 1.0, "Co-60": 1.0}
-        self.last_response_poisson_diagnostics = {
-            "reduced_chi2": 10.0,
-            "design_condition_number": 1.0,
-            "fisher_condition_number": 1.0,
-            "coefficient_correlation_by_isotope": {
-                "Cs-137": 0.95,
-                "Co-60": 0.1,
-            },
-            "low_snr_photopeak_suppression": {
-                "Co-60": {"reason": "retained_poisson"},
-            },
-        }
-        return {"Cs-137": 100.0, "Co-60": 0.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.counts["Cs-137"] == pytest.approx(100.0)
-    assert result.variances["Cs-137"] > 1000.0
-    assert result.variances["Co-60"] == pytest.approx(1.0)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    assert "runtime_diagnostic_variance_floor" in diagnostics
-    assert "transport_detected_counts_Cs-137" not in diagnostics
-
-
-def test_crosstalk_guard_disagreement_inflates_runtime_count_variance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Photopeak/response disagreement should become PF observation covariance."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=True,
-        response_poisson_crosstalk_min_rel_sigma=0.25,
-        response_poisson_crosstalk_variance_scale=1.0,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return counts with an unresolved crosstalk guard diagnostic."""
-        self.last_count_variances = {"Cs-137": 1.0, "Co-60": 1.0}
-        self.last_response_poisson_diagnostics = {
-            "reduced_chi2": 1.0,
-            "design_condition_number": 1.0,
-            "fisher_condition_number": 1.0,
-            "crosstalk_count_guard": {
-                "Cs-137": {
-                    "reason": "combined_crosstalk_photopeak_log_blend",
-                    "adjust_count": False,
-                    "poisson_count": 100.0,
-                    "photopeak_count": 25.0,
-                    "disagreement_fraction": 0.75,
-                    "combined_crosstalk_weight": 0.8,
-                    "blend_weight": 0.0,
-                }
-            },
-        }
-        return {"Cs-137": 100.0, "Co-60": 1000.0}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.counts["Cs-137"] == pytest.approx(100.0)
-    assert result.variances["Cs-137"] > 1000.0
-    assert result.variances["Co-60"] == pytest.approx(1.0)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    assert diagnostics["runtime_diagnostic_variance_floor"]["Cs-137"] > 1000.0
-
-
-def test_opt_in_diagnostic_variance_uses_own_isotope_scale(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A dominant isotope must not set a weak isotope's diagnostic scale."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=True,
-        response_poisson_crosstalk_min_rel_sigma=0.25,
-        response_poisson_crosstalk_variance_scale=1.0,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return one weak guarded isotope beside a dominant channel."""
-        self.last_count_variances = {"Cs-137": 1.0, "Co-60": 1.0}
-        self.last_response_poisson_diagnostics = {
-            "crosstalk_count_guard": {
-                "Cs-137": {
-                    "reason": "combined_crosstalk_photopeak_log_blend",
-                    "adjust_count": False,
-                    "poisson_count": 100.0,
-                    "photopeak_count": 25.0,
-                    "disagreement_fraction": 0.75,
-                    "combined_crosstalk_weight": 0.8,
-                }
-            }
-        }
-        return {"Cs-137": 100.0, "Co-60": 1.0e9}, {"Cs-137", "Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    expected_guard_sigma = 0.75 * 0.8 * 100.0
-    assert result.variances["Cs-137"] == pytest.approx(expected_guard_sigma**2)
-
-
-def test_diagnostic_variance_is_opt_in_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Default runtime covariance should ignore heuristic diagnostic flags."""
-    decomposer = SpectralDecomposer(SpectrumConfig())
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a large guard disagreement with a formal unit variance."""
-        self.last_count_variances = {"Cs-137": 1.0}
-        self.last_response_poisson_diagnostics = {
-            "crosstalk_count_guard": {
-                "Cs-137": {
-                    "reason": "combined_crosstalk_photopeak_log_blend",
-                    "adjust_count": False,
-                    "poisson_count": 100.0,
-                    "photopeak_count": 1.0,
-                    "disagreement_fraction": 0.99,
-                    "combined_crosstalk_weight": 1.0,
-                }
-            }
-        }
-        return {"Cs-137": 100.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.variances["Cs-137"] == pytest.approx(1.0)
-    assert "runtime_diagnostic_variance_floor" not in (
-        decomposer.last_response_poisson_diagnostics
-    )
-
-
-def test_guard_variance_preservation_is_opt_in_by_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Embedded heuristic guard variance must not bypass the formal ceiling."""
-    decomposer = SpectralDecomposer(SpectrumConfig())
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a large formal variance and a heuristic guard payload."""
-        self.last_count_variances = {"Cs-137": 1.0e9}
-        self.last_response_poisson_diagnostics = {
-            "crosstalk_count_guard": {
-                "Cs-137": {
-                    "reason": "combined_crosstalk_photopeak_log_blend",
-                    "poisson_count": 100.0,
-                    "photopeak_count": 1.0,
-                    "guarded_variance": 1.0e8,
-                }
-            }
-        }
-        return {"Cs-137": 100.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.variances["Cs-137"] == pytest.approx(40.0**2)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    assert "runtime_variance_ceiling_preserved" not in diagnostics
-
-
-def test_diagnostic_variance_floor_is_recorded_after_formal_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Guard disagreement should be a stage after the formal covariance cap."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=True,
-        response_poisson_count_variance_ceiling_enable=True,
-        response_poisson_count_variance_max_rel_sigma=0.15,
-        response_poisson_count_variance_max_abs_sigma=40.0,
-        response_poisson_count_variance_preserve_diagnostic_floors=False,
-        response_poisson_count_variance_preserve_guard_floors=False,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a tail disagreement with a large guard variance."""
-        self.last_count_variances = {"Cs-137": 1.0e9}
-        self.last_response_poisson_diagnostics = {
-            "reduced_chi2": 1.0,
-            "design_condition_number": 1.0,
-            "fisher_condition_number": 1.0,
-            "crosstalk_count_guard": {
-                "Cs-137": {
-                    "reason": "combined_crosstalk_photopeak_log_blend",
-                    "adjust_count": False,
-                    "poisson_count": 100000.0,
-                    "photopeak_count": 1000.0,
-                    "disagreement_fraction": 0.99,
-                    "combined_crosstalk_weight": 1.0,
-                    "guarded_variance": 1.0e8,
-                }
-            },
-        }
-        return {"Cs-137": 100000.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    naive_ceiling = (0.15 * 100000.0) ** 2
-    diagnostic_floor = (0.99 * 100000.0) ** 2
-    assert result.variances["Cs-137"] > naive_ceiling
-    assert result.variances["Cs-137"] == pytest.approx(diagnostic_floor)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    components = diagnostics["runtime_variance_components"]["Cs-137"]
-    assert components["formal_after_ceiling_variance"] <= naive_ceiling
-    assert components["formal_after_ceiling_variance"] == pytest.approx(
-        naive_ceiling
-    )
-    assert components["isotope_diagnostic_variance"] == pytest.approx(
-        diagnostic_floor
-    )
-    assert components["isotope_diagnostic_increment"] == pytest.approx(
-        diagnostic_floor - components["transport_statistical_variance"]
-    )
-
-
-def test_low_snr_photo_count_disagreement_survives_runtime_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Low-SNR suppression should not become an overconfident PF observation."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=False,
-        response_poisson_count_variance_ceiling_enable=True,
-        response_poisson_count_variance_max_rel_sigma=0.15,
-        response_poisson_count_variance_max_abs_sigma=40.0,
-        response_poisson_count_variance_preserve_guard_floors=True,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a suppressed low-SNR count with a large hidden disagreement."""
-        self.last_count_variances = {"Co-60": 3.0e7}
-        self.last_response_poisson_diagnostics = {
-            "low_snr_photopeak_suppression": {
-                "Co-60": {
-                    "suppressed": True,
-                    "reason": "missing_expected_photopeaks",
-                    "poisson_count": 6500.0,
-                    "photo_count": 1100.0,
-                    "photo_snr": 3.0,
-                }
-            }
-        }
-        return {"Co-60": 1100.0}, {"Co-60"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    naive_ceiling = (0.15 * 1100.0) ** 2
-    disagreement_floor = (6500.0 - 1100.0) ** 2
-    assert result.variances["Co-60"] > naive_ceiling
-    assert result.variances["Co-60"] >= disagreement_floor
-    assert result.variances["Co-60"] == pytest.approx(3.0e7)
-
-
-def test_low_snr_threshold_variance_survives_runtime_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Low-SNR zero estimates should retain threshold uncertainty in PF."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=False,
-        response_poisson_count_variance_ceiling_enable=True,
-        response_poisson_count_variance_max_rel_sigma=0.15,
-        response_poisson_count_variance_max_abs_sigma=40.0,
-        response_poisson_count_variance_preserve_guard_floors=True,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return a zero low-SNR estimate with a threshold variance."""
-        self.last_count_variances = {"Cs-137": 50000.0}
-        self.last_response_poisson_diagnostics = {
-            "low_snr_photopeak_suppression": {
-                "Cs-137": {
-                    "suppressed": False,
-                    "reason": "zero_poisson_photopeak_fused",
-                    "poisson_count": 0.0,
-                    "photo_count": 0.0,
-                    "photo_snr": 0.0,
-                }
-            }
-        }
-        return {"Cs-137": 0.0}, set()
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-    )
-
-    assert result.variances["Cs-137"] == pytest.approx(50000.0)
-
-
-def test_response_truth_calibration_is_not_runtime_count_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Runtime count extraction should ignore truth-fit calibration payloads."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=False,
-    )
-    setattr(
-        config,
-        "response_poisson_truth_calibration",
-        {
-            "enabled": True,
-            "feature_names": ["log_count"],
-            "neighbor_count": 1.0,
-            "distance_epsilon": 0.05,
-            "fallback_scale_by_isotope": {"Cs-137": 1.0},
-            "groups": {
-                "Cs-137|10": {
-                    "n": 1.0,
-                    "feature_mean": [float(np.log(100.0))],
-                    "feature_std": [1.0],
-                    "features": [[0.0]],
-                    "log_scales": [float(np.log(1.25))],
-                }
-            },
-        },
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return stable counts with intentionally small base variances."""
-        self.last_count_variances = {"Cs-137": 16.0}
-        self.last_response_poisson_diagnostics = {
-            "coefficients": {"Cs-137": 100.0},
-            "photopeak_counts": {"Cs-137": 100.0},
-            "reduced_chi2": 1.0,
-        }
-        return {"Cs-137": 100.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-        transport_metadata={
-            "fe_orientation_index": 1,
-            "pb_orientation_index": 2,
-            "shield_num_orientations": 8,
-        },
-    )
-
-    assert result.counts["Cs-137"] == pytest.approx(100.0)
-    assert result.variances["Cs-137"] == pytest.approx(16.0)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    assert "runtime_response_truth_calibration" not in diagnostics
-
-
-def test_runtime_config_ignores_response_truth_calibration_keys() -> None:
-    """Runtime config conversion should not expose truth-fit count calibration."""
-    config = spectrum_config_from_runtime_config(
-        {
-            "response_poisson_truth_calibration": {"enabled": True},
-            "response_poisson_truth_calibration_path": "unused.json",
-        }
-    )
-
-    assert not hasattr(config, "response_poisson_truth_calibration")
-    assert not hasattr(config, "response_poisson_truth_calibration_path")
-
-
-def test_shield_systematics_inflate_runtime_count_variance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Shielded spectra should carry a configurable response-model variance floor."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=False,
-        response_poisson_shield_systematic_variance_enable=True,
-        response_poisson_shield_systematic_rel_sigma=0.2,
-        response_poisson_shield_systematic_anchor_pair_ids=(0,),
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return stable counts with intentionally small base variances."""
-        self.last_count_variances = {"Cs-137": 1.0}
-        self.last_response_poisson_diagnostics = {"status": "ok"}
-        return {"Cs-137": 100.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-        transport_metadata={
-            "fe_orientation_index": 1,
-            "pb_orientation_index": 2,
-            "shield_num_orientations": 8,
-            "shield_thickness_scale": 1.0,
-        },
-    )
-
-    assert result.variances["Cs-137"] == pytest.approx(400.0)
-    diagnostics = decomposer.last_response_poisson_diagnostics
-    assert diagnostics["runtime_shield_systematic_pair_id"] == 10
-    assert diagnostics["runtime_shield_systematic_anchor_pair"] is False
-
-
-def test_shield_systematics_skip_zero_thickness_no_shield(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No-shield baselines should not receive shield-model mismatch inflation."""
-    config = SpectrumConfig(
-        response_poisson_diagnostic_variance_enable=False,
-        response_poisson_shield_systematic_variance_enable=True,
-        response_poisson_shield_systematic_rel_sigma=0.2,
-    )
-    decomposer = SpectralDecomposer(config)
-    spectrum = np.ones_like(decomposer.energy_axis, dtype=float)
-
-    def _fake_counts(
-        self: SpectralDecomposer,
-        spectrum: np.ndarray,
-        *,
-        live_time_s: float = 1.0,
-        **kwargs: object,
-    ) -> tuple[dict[str, float], set[str]]:
-        """Return stable counts with intentionally small base variances."""
-        self.last_count_variances = {"Cs-137": 9.0}
-        self.last_response_poisson_diagnostics = {"status": "ok"}
-        return {"Cs-137": 100.0}, {"Cs-137"}
-
-    monkeypatch.setattr(
-        SpectralDecomposer,
-        "isotope_counts_with_detection",
-        _fake_counts,
-    )
-
-    result = RuntimeCountExtractor(decomposer).extract(
-        spectrum,
-        live_time_s=30.0,
-        detect_threshold_abs=0.0,
-        detect_threshold_rel=0.0,
-        detect_threshold_rel_by_isotope={},
-        min_peaks_by_isotope=None,
-        transport_metadata={
-            "shield_pair_id": 10,
-            "shield_thickness_scale": 0.0,
-        },
-    )
-
-    assert result.variances["Cs-137"] == pytest.approx(9.0)
-    assert "runtime_shield_systematic_variance_floor" not in (
-        decomposer.last_response_poisson_diagnostics
-    )
-
-
-def _pure_runtime_with_count_method(method: str) -> dict[str, object]:
-    """Return a minimal current-schema runtime with one count extractor."""
-    return {
+@pytest.mark.parametrize(
+    "retired_key",
+    (
+        "adaptive_cardinality_min_bic_margin",
+        "batch_fit_enable",
+        "maximum_likelihood_enable",
+        "mle_enable",
+        "report_mle_enable",
+        "report_refit_enable",
+        "strength_refit_enable",
+        "surface_map_enable",
+    ),
+)
+def test_removed_estimation_switches_fail_closed(retired_key: str) -> None:
+    """Deleted estimator switches must not survive as silently ignored keys."""
+    runtime_config = {
         "pure_pf_schema_version": 1,
         "estimator_profile": "pf_strict",
-        "variable_cardinality": False,
-        "pf_strength_prior_min_cps_1m": 0.0,
-        "pf_strength_prior_max_cps_1m": 2_000_000.0,
-        "spectrum_count_method": method,
+        retired_key: False,
     }
 
-
-def test_runtime_rejects_peak_window_count_method(tmp_path: Path) -> None:
-    """Runtime simulations should reject lower-fidelity peak-window counting."""
-    config_path = tmp_path / "runtime.json"
-    config_path.write_text(
-        json.dumps(_pure_runtime_with_count_method("peak_window")),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="response_poisson"):
-        run_live_pf(
-            live=False,
-            sim_config_path=config_path.as_posix(),
-            max_steps=0,
-            save_outputs=False,
-        )
-
-
-def test_runtime_rejects_photopeak_nnls_count_method(tmp_path: Path) -> None:
-    """Runtime simulations should keep photopeak NNLS out of PF ingestion."""
-    config_path = tmp_path / "runtime.json"
-    config_path.write_text(
-        json.dumps(_pure_runtime_with_count_method("photopeak_nnls")),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="response_poisson"):
-        run_live_pf(
-            live=False,
-            sim_config_path=config_path.as_posix(),
-            max_steps=0,
-            save_outputs=False,
-        )
-
-
-def test_runtime_rejects_full_spectrum_response_count_method(tmp_path: Path) -> None:
-    """Runtime simulations should reject continuum-fitting count extraction."""
-    config_path = tmp_path / "runtime.json"
-    config_path.write_text(
-        json.dumps(_pure_runtime_with_count_method("response_matrix")),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="response_poisson"):
-        run_live_pf(
-            live=False,
-            sim_config_path=config_path.as_posix(),
-            max_steps=0,
-            save_outputs=False,
-        )
-
-
-def test_wall_absorber_is_explicit_native_transport_mode() -> None:
-    """Wall absorption should be an explicit mode, not a hidden shortcut."""
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "native" / "geant4_sidecar" / "geant4_sidecar.cpp").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'transport_mode) != "absorber"' in source
-    assert "TransportSteppingAction" in source
-    assert "SetTrackStatus(fStopAndKill)" in source
-    assert 'result.metadata["absorbing_volume_count"]' in source
+    with pytest.raises(
+        ValueError,
+        match="Retired particle-filter settings",
+    ):
+        enforce_pure_runtime_settings(runtime_config)

@@ -5,21 +5,23 @@ from __future__ import annotations
 from hashlib import sha256
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from measurement.model import EnvironmentConfig
 from pf.profiles import apply_profile_to_config
 from pf.provenance import canonical_json_bytes, sha256_json
 from pf.pure_estimator import RotatingShieldPFConfig
-from pf.replay import build_replay_estimator
-from pf.runtime_route import RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY
+from pf.replay import PFReplayError, build_replay_estimator
 from realtime_demo import (
     _build_effective_live_runtime_config,
     _build_resume_compatibility_provenance,
     _build_resume_replay_estimator,
     _build_live_controller_checkpoint,
     _online_compute_timing_provenance,
+    _physical_surface_atlas_diagnostic_points,
     _planning_candidate_checkpoint_parameters,
     _reconstruct_resume_controller_state,
     _restore_live_controller_checkpoint,
@@ -33,7 +35,6 @@ from runtime.measurement_log import (
 from tests.pure_pf_test_support import (
     TEST_COMMIT,
     TEST_ISOTOPES,
-    count_likelihood_routes,
     environment,
     make_measurement_log,
     records,
@@ -75,15 +76,11 @@ def _stream_writer(
     first, second, third, fourth = records(4)
     writer.append_before_update(first)
     writer.append_before_update(second)
-    writer.mark_station_complete_before_update(
-        0,
-        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
-    )
+    writer.mark_station_complete_before_update(0)
     writer.append_before_update(third)
     writer.append_before_update(fourth)
     writer.mark_station_complete_before_update(
         1,
-        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
         completion_metadata=final_completion_metadata,
     )
     return writer, config, env, forward
@@ -148,18 +145,20 @@ def test_online_compute_timing_scope_distinguishes_resumed_suffix() -> None:
         _online_compute_timing_provenance(-1)
 
 
-def test_resume_replay_restores_logged_effective_pf_config(
-    tmp_path: Path,
-) -> None:
-    """Resume must restore the exact logged pure-PF configuration."""
-    candidates = np.asarray(
-        [
-            [x, y, z]
-            for x in (0.0, 2.0)
-            for y in (0.0, 2.0)
-            for z in (0.0, 1.5)
-        ],
-        dtype=np.float64,
+def _replay_ready_runtime_config() -> dict[str, object]:
+    """Return a complete effective live configuration authenticated for replay."""
+    candidates, surface_diagnostics, _ = (
+        _physical_surface_atlas_diagnostic_points(
+            EnvironmentConfig(
+                size_x=2.0,
+                size_y=2.0,
+                size_z=1.5,
+                detector_position=(0.25, 0.25, 0.4),
+            ),
+            None,
+            chart_max_edge_m=1.0,
+            point_count=8,
+        )
     )
     pf_config = RotatingShieldPFConfig(
         estimator_profile="pf_strict",
@@ -168,30 +167,34 @@ def test_resume_replay_restores_logged_effective_pf_config(
         init_num_sources=[1, 1],
         variable_cardinality=False,
         use_gpu=False,
-        parallel_isotope_updates=False,
         position_max=(2.0, 2.0, 1.5),
-        strength_prior_min_cps_1m=0.0,
+        strength_prior_min_cps_1m=300_000.0,
         strength_prior_max_cps_1m=2_000_000.0,
     )
     apply_profile_to_config(pf_config)
-    effective_runtime = _build_effective_live_runtime_config(
+    return _build_effective_live_runtime_config(
         {
             **runtime_config(),
             "pure_pf_schema_version": 1,
             "estimator_profile": "pf_strict",
         },
         pf_config=pf_config,
-        candidate_sources_xyz=candidates,
-        source_position_bounds=(
-            np.zeros(3, dtype=np.float64),
-            np.asarray([2.0, 2.0, 1.5], dtype=np.float64),
-        ),
+        surface_diagnostic_points_xyz=candidates,
+        surface_atlas_diagnostics=surface_diagnostics,
         api_settings={
-            "candidate_grid_spacing_m": [2.0, 2.0, 1.5],
+            "structural_rj_surface_chart_max_edge_m": 1.0,
             "obstacle_height_m": 1.0,
             "pf_random_seed": 41,
         },
+        isotopes=TEST_ISOTOPES,
     )
+
+
+def test_resume_replay_restores_logged_effective_pf_config(
+    tmp_path: Path,
+) -> None:
+    """Resume must restore the exact logged pure-PF configuration."""
+    effective_runtime = _replay_ready_runtime_config()
     log = load_measurement_log(
         make_measurement_log(
             tmp_path / "measurement-log",
@@ -217,7 +220,154 @@ def test_resume_replay_restores_logged_effective_pf_config(
     assert resumed.pf_config.num_particles == 12
     assert resumed.pf_config.position_max == (2.0, 2.0, 1.5)
     assert resumed.pf_config.strength_prior_max_cps_1m == 2_000_000.0
+    direct._ensure_kernel_cache()
+    resumed._ensure_kernel_cache()
+    direct_row_ids = {
+        isotope: tuple(
+            particle.joint_row_identity.row_sha256
+            for particle in direct.filters[isotope].continuous_particles
+        )
+        for isotope in direct.joint_isotope_order()
+    }
+    resumed_row_ids = {
+        isotope: tuple(
+            particle.joint_row_identity.row_sha256
+            for particle in resumed.filters[isotope].continuous_particles
+        )
+        for isotope in resumed.joint_isotope_order()
+    }
+    assert direct_row_ids == resumed_row_ids
+    assert len(set(next(iter(direct_row_ids.values())))) == 12
     assert resumed.serialized_state() == direct.serialized_state()
+
+
+def test_replay_rejects_logged_position_max_environment_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Replay cannot silently replace mismatched logged PF position bounds."""
+    effective_runtime = _replay_ready_runtime_config()
+    effective = effective_runtime["effective_pf_replay"]
+    assert isinstance(effective, dict)
+    pf_config = effective["pf_config"]
+    assert isinstance(pf_config, dict)
+    pf_config["position_max"] = [3.0, 2.0, 1.5]
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="position_max"):
+        build_replay_estimator(
+            log,
+            effective_runtime,
+            profile="pf_strict",
+            seed=41,
+        )
+
+
+def test_replay_rejects_surface_atlas_identity_mismatch(tmp_path: Path) -> None:
+    """The PF surface support must match the logged environment-derived atlas."""
+    effective_runtime = _replay_ready_runtime_config()
+    effective = effective_runtime["effective_pf_replay"]
+    assert isinstance(effective, dict)
+    diagnostics = effective["surface_atlas_diagnostics"]
+    assert isinstance(diagnostics, dict)
+    diagnostics["surface_atlas_contract_sha256"] = "0" * 64
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="surface-atlas diagnostics"):
+        build_replay_estimator(
+            log,
+            effective_runtime,
+            profile="pf_strict",
+            seed=41,
+        )
+
+
+def test_replay_rejects_rng_lineage_mismatch(tmp_path: Path) -> None:
+    """Isotope PF streams remain bound to the exact root-seed lineage."""
+    effective_runtime = _replay_ready_runtime_config()
+    effective = effective_runtime["effective_pf_replay"]
+    assert isinstance(effective, dict)
+    api_settings = effective["api_settings"]
+    assert isinstance(api_settings, dict)
+    rng_provenance = api_settings["pf_rng_provenance"]
+    assert isinstance(rng_provenance, dict)
+    rng_provenance["root_seed"] = 42
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="RNG provenance"):
+        build_replay_estimator(
+            log,
+            effective_runtime,
+            profile="pf_strict",
+            seed=41,
+        )
+
+
+def test_replay_rejects_unbound_resolved_config_hash(tmp_path: Path) -> None:
+    """Caller provenance cannot replace the computed replay configuration digest."""
+    effective_runtime = _replay_ready_runtime_config()
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+
+    with pytest.raises(PFReplayError, match="does not bind"):
+        build_replay_estimator(
+            log,
+            effective_runtime,
+            profile="pf_strict",
+            seed=41,
+            resolved_config_hash="0" * 64,
+        )
+
+
+def test_replay_rejects_ignored_external_runtime_override(
+    tmp_path: Path,
+) -> None:
+    """An overlapping external physics field cannot differ and be ignored."""
+    effective_runtime = _replay_ready_runtime_config()
+    log = load_measurement_log(
+        make_measurement_log(
+            tmp_path / "measurement-log",
+            record_count=1,
+            runtime_overrides=effective_runtime,
+            station_complete_markers=True,
+        )
+    )
+    external = json.loads(json.dumps(effective_runtime))
+    external["pf_obstacle_attenuation"] = False
+
+    with pytest.raises(PFReplayError, match="External runtime field"):
+        build_replay_estimator(
+            log,
+            external,
+            profile="pf_strict",
+            seed=41,
+        )
 
 
 def test_resume_compatibility_requires_every_runtime_delta_explicitly(
@@ -325,10 +475,7 @@ def test_stream_stage_adopts_old_prefix_and_continues_without_overwrite(
 
     fifth = records(5)[4]
     assert resumed.append_before_update(fifth) == 4
-    resumed.mark_station_complete_before_update(
-        2,
-        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
-    )
+    resumed.mark_station_complete_before_update(2)
     finalized = resumed.finalize()
     assert stage.exists()
     assert _tree_hashes(stage) == source_hashes
@@ -378,10 +525,7 @@ def test_stream_stage_rolls_back_partial_station_and_can_resume_twice(
     assert _tree_hashes(first_fork) == first_fork_hashes
 
     second_resume.append_before_update(fifth)
-    second_resume.mark_station_complete_before_update(
-        2,
-        runtime_likelihood_route_by_isotope=count_likelihood_routes(),
-    )
+    second_resume.mark_station_complete_before_update(2)
     finalized = second_resume.finalize()
     assert len(finalized.records) == 5
     assert not second_fork.exists()
@@ -481,7 +625,6 @@ def test_stream_stage_resume_rejects_incomplete_station_boundary(
     ]
     for row in rows:
         row["metadata"].pop("station_complete", None)
-        row["metadata"].pop(RUNTIME_LIKELIHOOD_ROUTE_METADATA_KEY, None)
     writer.metadata_stage_path.write_text(
         "".join(
             json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
@@ -533,39 +676,23 @@ def test_controller_checkpoint_survives_stage_adoption_and_restores_rng(
 ) -> None:
     """A fresh checkpoint resumes the next candidate draw without log inference."""
 
-    class Estimator:
-        """Expose estimator-neutral remaining-budget controller state."""
-
-        _remaining_measurement_budget_history = [
-            {"budget": 7.5, "predicted_gain": 2.5}
-        ]
-        _remaining_measurement_eta_ratios = [0.8, 1.2]
-
     parameters = _planning_candidate_checkpoint_parameters(
         pose_candidates=64,
         pose_min_dist=3.0,
         bounds_xyz=(np.zeros(3), np.asarray([10.0, 20.0, 10.0])),
         detector_heights_m=None,
-        continuous_height_anchor_count=8,
-        height_partner_xy_tolerance_m=1.0e-6,
-        height_partner_z_tolerance_m=1.0e-9,
-        height_partner_min_z_separation_m=0.25,
     )
     rng = np.random.default_rng(91)
     reference = np.random.default_rng(91)
+    dss_rng = np.random.default_rng(123)
+    dss_reference = np.random.default_rng(123)
     assert np.array_equal(rng.random(17), reference.random(17))
+    assert np.array_equal(dss_rng.random(11), dss_reference.random(11))
     checkpoint = _build_live_controller_checkpoint(
         planning_candidate_rng=rng,
+        dss_eig_rng=dss_rng,
         planning_candidate_parameters=parameters,
-        remaining_measurement_estimates=(
-            {"estimated_remaining_stations": 3, "empirical_eta": 0.8},
-        ),
-        estimator=Estimator(),  # type: ignore[arg-type]
         max_poses=22,
-        ig_max_global=4.5,
-        ig_max_pose=1.5,
-        ig_threshold_current=0.2,
-        last_max_ig=0.7,
     )
     writer, config, env, forward = _stream_writer(
         tmp_path,
@@ -573,22 +700,17 @@ def test_controller_checkpoint_survives_stage_adoption_and_restores_rng(
     )
     resumed = _adopt(writer, config=config, env=env, forward=forward)
     restored_rng = np.random.default_rng(91)
+    restored_dss_rng = np.random.default_rng(123)
     restored = _restore_live_controller_checkpoint(
         record=resumed.records[-1],
         planning_candidate_rng=restored_rng,
+        dss_eig_rng=restored_dss_rng,
         expected_planning_candidate_parameters=parameters,
     )
     assert restored is not None
     assert restored_rng.random() == reference.random()
-    assert restored.remaining_measurement_eta_ratios == (0.8, 1.2)
-    assert restored.remaining_measurement_budget_history == (
-        {"budget": 7.5, "predicted_gain": 2.5},
-    )
+    assert restored_dss_rng.random() == dss_reference.random()
     assert restored.max_poses == 22
-    assert restored.ig_max_global == 4.5
-    assert restored.ig_max_pose == 1.5
-    assert restored.ig_threshold_current == 0.2
-    assert restored.last_max_ig == 0.7
 
 
 def test_controller_checkpoint_rejects_candidate_parameter_drift(
@@ -596,29 +718,17 @@ def test_controller_checkpoint_rejects_candidate_parameter_drift(
 ) -> None:
     """A checkpoint cannot restore across candidate-generation parameter drift."""
 
-    class Estimator:
-        """Provide empty estimator-neutral controller histories."""
-
     parameters = _planning_candidate_checkpoint_parameters(
         pose_candidates=8,
         pose_min_dist=1.0,
         bounds_xyz=(np.zeros(3), np.ones(3)),
         detector_heights_m=(0.4,),
-        continuous_height_anchor_count=0,
-        height_partner_xy_tolerance_m=1.0e-9,
-        height_partner_z_tolerance_m=1.0e-9,
-        height_partner_min_z_separation_m=0.0,
     )
     checkpoint = _build_live_controller_checkpoint(
         planning_candidate_rng=np.random.default_rng(5),
+        dss_eig_rng=np.random.default_rng(6),
         planning_candidate_parameters=parameters,
-        remaining_measurement_estimates=(),
-        estimator=Estimator(),  # type: ignore[arg-type]
         max_poses=2,
-        ig_max_global=0.0,
-        ig_max_pose=0.0,
-        ig_threshold_current=0.1,
-        last_max_ig=None,
     )
     writer, _, _, _ = _stream_writer(
         tmp_path,
@@ -629,5 +739,35 @@ def test_controller_checkpoint_rejects_candidate_parameter_drift(
         _restore_live_controller_checkpoint(
             record=writer.records[-1],
             planning_candidate_rng=np.random.default_rng(5),
+            dss_eig_rng=np.random.default_rng(6),
             expected_planning_candidate_parameters=drifted,
+        )
+
+
+@pytest.mark.parametrize("invalid_max_poses", ("22", 22.5, True, 0, -1))
+def test_controller_checkpoint_rejects_coerced_mission_limit(
+    invalid_max_poses: object,
+) -> None:
+    """A corrupt checkpoint must not silently change the resumed mission."""
+    parameters = _planning_candidate_checkpoint_parameters(
+        pose_candidates=8,
+        pose_min_dist=1.0,
+        bounds_xyz=(np.zeros(3), np.ones(3)),
+        detector_heights_m=None,
+    )
+    checkpoint = _build_live_controller_checkpoint(
+        planning_candidate_rng=np.random.default_rng(5),
+        dss_eig_rng=np.random.default_rng(6),
+        planning_candidate_parameters=parameters,
+        max_poses=2,
+    )
+    checkpoint["mission_state"]["max_poses"] = invalid_max_poses
+    with pytest.raises(RuntimeError, match="controller values are invalid"):
+        _restore_live_controller_checkpoint(
+            record=SimpleNamespace(
+                metadata={"live_controller_checkpoint": checkpoint}
+            ),
+            planning_candidate_rng=np.random.default_rng(5),
+            dss_eig_rng=np.random.default_rng(6),
+            expected_planning_candidate_parameters=parameters,
         )

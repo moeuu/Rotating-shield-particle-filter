@@ -35,7 +35,7 @@ from sim.shield_geometry import (
     resolve_shield_thickness_config,
     spherical_octant_path_length_cm,
 )
-from spectrum.pipeline import SpectralDecomposer
+from spectrum.library import default_library
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,9 @@ def _obstacle_grid_from_scene(scene: SceneDescription) -> ObstacleGrid | None:
         transport_boxes_m=scene.transport_boxes_m,
         transport_mu_by_isotope=scene.transport_mu_by_isotope,
         transport_line_mu_by_isotope=scene.transport_line_mu_by_isotope,
+        transport_line_compton_mu_by_isotope=(
+            scene.transport_line_compton_mu_by_isotope
+        ),
     )
 
 
@@ -99,12 +102,12 @@ class MockObservationModel(ObservationModel):
     ) -> None:
         """Create the shared Python transport simulator used in mock mode."""
         geometry = asset_geometry or IsaacAssetGeometry()
-        decomposer = SpectralDecomposer()
+        isotope_names = tuple(default_library())
         self.scene = SceneDescription()
         shield_thickness = shield_thickness or resolve_shield_thickness_config()
         self._mu_by_isotope = mu_by_isotope_from_tvl_mm(
             HVL_TVL_TABLE_MM,
-            isotopes=list(decomposer.isotope_names),
+            isotopes=list(isotope_names),
         )
         detector_outer_radius_cm = detector_outer_radius_cm_from_model(detector_model)
         fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
@@ -113,7 +116,6 @@ class MockObservationModel(ObservationModel):
         )
         self.transport_model = PythonTransportSpectrumModel(
             sources=(),
-            decomposer=decomposer,
             mu_by_isotope=self._mu_by_isotope,
             shield_params=ShieldParams(
                 thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
@@ -169,12 +171,11 @@ class IsaacSimObservationModel(ObservationModel):
         self.stage_material_rules = tuple(stage_material_rules)
         self.rng_seed = int(rng_seed)
         self.scatter_gain = float(scatter_gain)
-        self.decomposer = SpectralDecomposer()
         self.scene = SceneDescription()
         self.shield_thickness = shield_thickness or resolve_shield_thickness_config()
         self._mu_by_isotope = mu_by_isotope_from_tvl_mm(
             HVL_TVL_TABLE_MM,
-            isotopes=list(self.decomposer.isotope_names),
+            isotopes=list(default_library()),
         )
         detector_outer_radius_cm = detector_outer_radius_cm_from_model(detector_model)
         fe_inner_cm, pb_inner_cm = nested_shield_inner_radii_cm(
@@ -183,7 +184,6 @@ class IsaacSimObservationModel(ObservationModel):
         )
         self.transport_model = PythonTransportSpectrumModel(
             sources=(),
-            decomposer=self.decomposer,
             mu_by_isotope=self._mu_by_isotope,
             shield_params=ShieldParams(
                 thickness_fe_cm=float(self.shield_thickness.thickness_fe_cm),
@@ -228,7 +228,15 @@ class IsaacSimObservationModel(ObservationModel):
         detector_xyz: tuple[float, float, float],
     ) -> tuple[TransportSegment, ...]:
         """Return static stage material crossings for one point source."""
-        source_position = tuple(float(value) for value in getattr(source, "position"))
+        transport_position = getattr(source, "transport_position_array", None)
+        source_position = tuple(
+            float(value)
+            for value in (
+                transport_position()
+                if callable(transport_position)
+                else getattr(source, "position")
+            )
+        )
         return self._stage_geometry_segments(source_position, detector_xyz)
 
     def _shield_path_lengths_for_command(
@@ -239,7 +247,15 @@ class IsaacSimObservationModel(ObservationModel):
     ) -> tuple[float, float]:
         """Return shield path lengths from the current stage-authored shield poses."""
         del detector_xyz, command
-        source_position = tuple(float(value) for value in getattr(source, "position"))
+        transport_position = getattr(source, "transport_position_array", None)
+        source_position = tuple(
+            float(value)
+            for value in (
+                transport_position()
+                if callable(transport_position)
+                else getattr(source, "position")
+            )
+        )
         return self._shield_path_lengths_cm(source_position)
 
     def _stage_geometry_segments(

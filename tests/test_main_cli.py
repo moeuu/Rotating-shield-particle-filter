@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
+from measurement.source_boundary import surface_emission_policy_sha256
 from sim.runtime import load_runtime_config
 
 
@@ -50,31 +53,12 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
             "1.25",
             "--measurement-time-s",
             "12",
-            "--adaptive-dwell",
-            "--adaptive-dwell-chunk-s",
-            "1.5",
-            "--adaptive-min-dwell-s",
-            "3",
-            "--adaptive-ready-min-counts",
-            "250",
-            "--adaptive-ready-min-isotopes",
-            "2",
-            "--adaptive-ready-min-snr",
-            "1.5",
-            "--pose-min-observation-counts",
-            "6.5",
-            "--pose-min-observation-penalty-scale",
-            "1.7",
-            "--pose-min-observation-aggregate",
-            "mean",
             "--num-particles",
             "600",
             "--rotations-per-pose",
             "4",
             "--planning-eig-samples",
             "12",
-            "--planning-rollout-particles",
-            "48",
             "--notify-spectrum",
             "--notify-spectrum-every",
             "2",
@@ -92,20 +76,10 @@ def test_main_passes_environment_mode_to_runtime(monkeypatch) -> None:
     assert captured["nominal_motion_speed_m_s"] == 0.8
     assert captured["rotation_overhead_s"] == 1.25
     assert captured["measurement_time_s"] == 12.0
-    assert captured["adaptive_dwell"] is True
-    assert captured["adaptive_dwell_chunk_s"] == 1.5
-    assert captured["adaptive_min_dwell_s"] == 3.0
-    assert captured["adaptive_ready_min_counts"] == 250.0
-    assert captured["adaptive_ready_min_isotopes"] == 2
-    assert captured["adaptive_ready_min_snr"] == 1.5
-    assert captured["pose_min_observation_counts"] == 6.5
-    assert captured["pose_min_observation_penalty_scale"] == 1.7
-    assert captured["pose_min_observation_aggregate"] == "mean"
     assert captured["num_particles"] == 600
     assert captured["pf_config_overrides"]["orientation_k"] == 4
     assert captured["pf_config_overrides"]["min_rotations_per_pose"] == 4
     assert captured["pf_config_overrides"]["planning_eig_samples"] == 12
-    assert captured["pf_config_overrides"]["planning_rollout_particles"] == 48
     assert captured["notify_spectrum"] is True
     assert captured["notify_spectrum_every"] == 2
     assert captured["notify_spectrum_max_bins"] == 256
@@ -280,8 +254,196 @@ def test_main_explicit_source_config_keeps_fixed_sources_in_random_environment(
 
     module.main()
 
-    assert captured["source_generation_mode"] == "demo"
+    source_path = Path(__file__).resolve().parents[1] / "source_layouts/demo_sources.json"
+    assert captured["source_generation_mode"] == "provided_file"
     assert captured["sources"] is not None
+    assert captured["source_config_provenance"] == {
+        "provided_file_path": "source_layouts/demo_sources.json",
+        "provided_file_path_kind": "repository_relative",
+        "provided_file_bytes_sha256": hashlib.sha256(
+            source_path.read_bytes()
+        ).hexdigest(),
+        "provided_file_declared_metadata": {},
+    }
+
+
+@pytest.mark.parametrize("legacy_field", ["intensity", "strength_cps_1m"])
+def test_source_config_rejects_removed_intensity_aliases(
+    tmp_path: Path,
+    legacy_field: str,
+) -> None:
+    """Explicit truth files must use the single detector-cps intensity field."""
+    module = _load_main_module()
+    source_path = tmp_path / "legacy_source.json"
+    source_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "isotope": "Cs-137",
+                        "position": [1.0, 2.0, 3.0],
+                        legacy_field: 1000.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="removed intensity field"):
+        module.load_sources_from_json(
+            source_path,
+            repository_root=Path(__file__).resolve().parents[1],
+        )
+
+
+def test_source_config_provenance_retains_external_path_hash_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """The parsed source truth must retain its exact external-file identity."""
+    module = _load_main_module()
+    source_path = tmp_path / "provided_sources.json"
+    declared_metadata = {
+        "sampling_measure": "predeclared_area_uniform",
+        "source_seed": 20260728,
+    }
+    raw_bytes = json.dumps(
+        {
+            "metadata": declared_metadata,
+            "sources": [
+                {
+                    "isotope": "Co-60",
+                    "position": [4.0, 5.0, 6.0],
+                    "intensity_cps_1m": 250000.0,
+                }
+            ],
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    source_path.write_bytes(raw_bytes)
+
+    loaded = module.load_sources_from_json(
+        source_path,
+        repository_root=Path(__file__).resolve().parents[1],
+    )
+
+    assert len(loaded.sources) == 1
+    assert loaded.provenance == {
+        "provided_file_path": source_path.resolve().as_posix(),
+        "provided_file_path_kind": "resolved_absolute",
+        "provided_file_bytes_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "provided_file_declared_metadata": declared_metadata,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    (
+        '{"sources": [], "sources": []}',
+        '{"metadata": {"seed": 1, "seed": 2}, "sources": []}',
+        (
+            '{"sources": [{"isotope": "Cs-137", "isotope": "Co-60", '
+            '"position": [1, 2, 3], "intensity_cps_1m": 300000}]}'
+        ),
+    ),
+)
+def test_source_config_rejects_duplicate_json_object_keys(
+    tmp_path: Path,
+    raw_json: str,
+) -> None:
+    """No truth or provenance field may be silently replaced by last-wins JSON."""
+    module = _load_main_module()
+    source_path = tmp_path / "duplicate_keys.json"
+    source_path.write_text(raw_json, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        module.load_sources_from_json(
+            source_path,
+            repository_root=Path(__file__).resolve().parents[1],
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    (
+        (
+            {"sources": [], "unexpected": "silently ignored"},
+            "unsupported top-level fields",
+        ),
+        ({"metadata": {}}, "explicit 'sources' list"),
+    ),
+)
+def test_source_config_rejects_ambiguous_top_level_schema(
+    tmp_path: Path,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    """Object-form truth files must use only the declared explicit schema."""
+    module = _load_main_module()
+    source_path = tmp_path / "ambiguous_top_level.json"
+    source_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        module.load_sources_from_json(
+            source_path,
+            repository_root=Path(__file__).resolve().parents[1],
+        )
+
+
+def test_source_config_preserves_authoritative_surface_coordinates(
+    tmp_path: Path,
+) -> None:
+    """A complete chart/UV truth entry must not be reduced back to XYZ only."""
+    module = _load_main_module()
+    source_path = tmp_path / "surface_sources.json"
+    policy_hash = surface_emission_policy_sha256()
+    source_path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "isotope": "Cs-137",
+                        "position": [0.0, 0.5, 0.5],
+                        "transport_position": [1.0e-6, 0.5, 0.5],
+                        "intensity_cps_1m": 300_000.0,
+                        "surface_chart_id": 7,
+                        "surface_uv": [0.25, 0.75],
+                        "surface_normal": [1.0, 0.0, 0.0],
+                        "surface_emission_policy_sha256": policy_hash,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = module.load_sources_from_json(
+        source_path,
+        repository_root=Path(__file__).resolve().parents[1],
+    )
+
+    source = loaded.sources[0]
+    assert source.surface_chart_id == 7
+    assert source.surface_uv == (0.25, 0.75)
+    assert source.surface_normal == (1.0, 0.0, 0.0)
+    assert source.transport_position == (1.0e-6, 0.5, 0.5)
+    assert source.surface_emission_policy_sha256 == policy_hash
+
+
+def test_main_rejects_missing_explicit_source_config(monkeypatch, tmp_path: Path) -> None:
+    """A requested truth layout must never fall back to unrelated demo sources."""
+    module = _load_main_module()
+    missing_path = tmp_path / "missing_sources.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--source-config", missing_path.as_posix()],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    assert error.value.code == 2
 
 
 def test_main_random_source_token_uses_surface_source_generation(monkeypatch) -> None:
@@ -344,6 +506,30 @@ def test_main_allows_min_rotations_override(monkeypatch) -> None:
 
     assert captured["pf_config_overrides"]["orientation_k"] == 4
     assert captured["pf_config_overrides"]["min_rotations_per_pose"] == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--rotations-per-pose", "0"),
+        ("--min-rotations-per-pose", "-1"),
+        ("--planning-eig-samples", "0"),
+        ("--max-temper-steps", "0"),
+        ("--min-delta-beta", "0"),
+        ("--target-ess-ratio", "1"),
+        ("--max-sources", "0"),
+    ),
+)
+def test_main_rejects_invalid_pf_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, str],
+) -> None:
+    """Invalid CLI values must not be clamped into a different PF model."""
+    module = _load_main_module()
+    monkeypatch.setattr(sys, "argv", ["main.py", *arguments])
+
+    with pytest.raises(SystemExit):
+        module.main()
 
 
 @pytest.mark.parametrize(
@@ -414,9 +600,7 @@ def test_main_default_selects_standard_geant4_full_simulation(monkeypatch) -> No
     assert runtime_config["pure_pf_schema_version"] == 1
     assert runtime_config["variable_cardinality"] is True
     assert runtime_config["pf_max_sources"] == 5
-    assert runtime_config["structural_cardinality_prior_probs"] == pytest.approx(
-        [1.0 / 6.0] * 6
-    )
+    assert runtime_config["structural_cardinality_prior_mean"] == pytest.approx(2.0)
     assert runtime_config["estimator_profile"] == "pf_strict"
     assert float(runtime_config["pf_strength_prior_min_cps_1m"]) >= 0.0
     assert (
@@ -499,6 +683,67 @@ def test_main_standard_full_aliases_select_geant4_cui(
     )
     assert captured["live"] is False
     assert captured["variable_cardinality"] is True
+
+
+@pytest.mark.parametrize(
+    ("mode_flag", "backend"),
+    [
+        ("--full-simulation", "analytic"),
+        ("--cui", "isaacsim"),
+        ("--python-cui", "geant4"),
+    ],
+)
+def test_main_rejects_mode_backend_contradictions(
+    monkeypatch,
+    mode_flag: str,
+    backend: str,
+) -> None:
+    """A named runtime mode must not be relabeled with another transport."""
+    module = _load_main_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", mode_flag, "--sim-backend", backend],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    assert error.value.code == 2
+
+
+def test_main_rejects_config_backend_mismatch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A Geant4 mode must not ingest a config declaring analytic transport."""
+    module = _load_main_module()
+    config_path = tmp_path / "wrong_backend.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "backend": "analytic",
+                "pure_pf_schema_version": 1,
+                "estimator_profile": "pf_strict",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--full-simulation",
+            "--sim-config",
+            config_path.as_posix(),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as error:
+        module.main()
+
+    assert error.value.code == 2
 
 
 def test_main_can_explicitly_select_fixed_cardinality(monkeypatch) -> None:

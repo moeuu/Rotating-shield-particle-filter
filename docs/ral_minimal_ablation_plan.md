@@ -98,7 +98,6 @@ The current PDF may contain placeholder or old representative values while new
 MIX-9 experiments are pending. Treat those values as replaceable table entries;
 do not change the agreed experiment scope just to match an old result table.
 
-Shield-systematic strength handling is documented in
-`docs/shield_strength_systematics.md`. It is reversible through
-`response_poisson_shield_systematic_variance_enable=false` and must not be used
-to artificially degrade no-shield baselines.
+Every variant uses the same immutable joint full-spectrum observation model.
+There is no shield-pair-specific variance inflation, isotope-count rescue, or
+baseline-specific observation correction.

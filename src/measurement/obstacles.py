@@ -4,12 +4,162 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
+from numbers import Real
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 import numpy as np
 
 EXPLORATION_BACKBONE_MAX_GAP_CELLS = 4
+_BOX_CONTACT_TOLERANCE_M = 1.0e-12
+
+
+def _finite_real(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite real value satisfying a physical domain."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a real number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{field_name} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _json_integer(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int = 0,
+) -> int:
+    """Return an exact JSON integer with a lower bound."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be a JSON integer.")
+    if value < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return value
+
+
+def _real_tuple(
+    value: object,
+    *,
+    length: int,
+    field_name: str,
+) -> tuple[float, ...]:
+    """Return an exact-length tuple of finite real values."""
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ValueError(f"{field_name} must contain exactly {length} values.")
+    return tuple(
+        _finite_real(item, field_name=f"{field_name}[{index}]")
+        for index, item in enumerate(value)
+    )
+
+
+def _validated_boxes(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[tuple[float, float, float, float, float, float], ...]:
+    """Return finite, positive-volume, non-overlapping axis-aligned boxes."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list or tuple.")
+    boxes = tuple(
+        _real_tuple(
+            box,
+            length=6,
+            field_name=f"{field_name}[{index}]",
+        )
+        for index, box in enumerate(value)
+    )
+    for index, box in enumerate(boxes):
+        extents = np.asarray(box[3:], dtype=float) - np.asarray(
+            box[:3],
+            dtype=float,
+        )
+        if np.any(extents <= 0.0):
+            raise ValueError(
+                f"{field_name}[{index}] must have positive extent on every axis."
+            )
+    if len(boxes) > 1:
+        array = np.asarray(boxes, dtype=float)
+        lower = np.maximum(array[:, None, :3], array[None, :, :3])
+        upper = np.minimum(array[:, None, 3:], array[None, :, 3:])
+        overlap = np.all(
+            upper - lower > _BOX_CONTACT_TOLERANCE_M,
+            axis=2,
+        )
+        overlap &= np.triu(np.ones(overlap.shape, dtype=bool), k=1)
+        pairs = np.argwhere(overlap)
+        if pairs.size:
+            first, second = (int(value) for value in pairs[0])
+            raise ValueError(
+                f"{field_name}[{first}] and {field_name}[{second}] have "
+                "positive-volume overlap."
+            )
+    return boxes
+
+
+def _validated_isotope_table(
+    value: object,
+    *,
+    field_name: str,
+    box_count: int,
+    line_resolved: bool,
+) -> dict[str, tuple[float, ...]] | dict[str, tuple[tuple[float, ...], ...]]:
+    """Return a strict isotope attenuation table matching the box geometry."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping.")
+    parsed: dict[str, tuple[float, ...]] | dict[
+        str,
+        tuple[tuple[float, ...], ...],
+    ] = {}
+    normalized_keys: set[str] = set()
+    for isotope, raw_values in value.items():
+        if not isinstance(isotope, str) or not isotope:
+            raise ValueError(f"{field_name} isotope keys must be nonempty strings.")
+        normalized = _normalize_isotope_key(isotope)
+        if not normalized or normalized in normalized_keys:
+            raise ValueError(
+                f"{field_name} contains duplicate normalized isotope keys."
+            )
+        normalized_keys.add(normalized)
+        if not isinstance(raw_values, (list, tuple)):
+            raise ValueError(f"{field_name}[{isotope!r}] must be a list or tuple.")
+        if line_resolved:
+            rows: list[tuple[float, ...]] = []
+            for row_index, row in enumerate(raw_values):
+                mu_values = _real_tuple(
+                    row,
+                    length=box_count,
+                    field_name=(
+                        f"{field_name}[{isotope!r}][{row_index}]"
+                    ),
+                )
+                if any(mu < 0.0 for mu in mu_values):
+                    raise ValueError(
+                        f"{field_name} entries must be non-negative."
+                    )
+                rows.append(mu_values)
+            parsed[isotope] = tuple(rows)
+        else:
+            mu_values = _real_tuple(
+                raw_values,
+                length=box_count,
+                field_name=f"{field_name}[{isotope!r}]",
+            )
+            if any(mu < 0.0 for mu in mu_values):
+                raise ValueError(f"{field_name} entries must be non-negative.")
+            parsed[isotope] = mu_values
+    return parsed
 
 
 def _normalize_isotope_key(value: str) -> str:
@@ -30,77 +180,104 @@ class ObstacleGrid:
     transport_line_mu_by_isotope: dict[str, tuple[tuple[float, ...], ...]] = field(
         default_factory=dict
     )
+    transport_line_compton_mu_by_isotope: dict[
+        str,
+        tuple[tuple[float, ...], ...],
+    ] = field(default_factory=dict)
     collision_boxes_m: tuple[tuple[float, float, float, float, float, float], ...] = ()
 
     def __post_init__(self) -> None:
-        """Normalize inputs and validate bounds."""
-        if len(self.origin) != 2:
-            raise ValueError("origin must have length 2.")
-        if len(self.grid_shape) != 2:
-            raise ValueError("grid_shape must have length 2.")
-        origin = (float(self.origin[0]), float(self.origin[1]))
-        cell_size = float(self.cell_size)
-        grid_shape = (int(self.grid_shape[0]), int(self.grid_shape[1]))
-        if cell_size <= 0.0:
-            raise ValueError("cell_size must be positive.")
-        if grid_shape[0] < 0 or grid_shape[1] < 0:
-            raise ValueError("grid_shape must be non-negative.")
-        blocked = tuple(
-            sorted((int(cell[0]), int(cell[1])) for cell in self.blocked_cells)
+        """Normalize exact inputs and validate physical geometry."""
+        origin_values = _real_tuple(
+            self.origin,
+            length=2,
+            field_name="origin",
         )
+        origin = (origin_values[0], origin_values[1])
+        cell_size = _finite_real(
+            self.cell_size,
+            field_name="cell_size",
+            strictly_positive=True,
+        )
+        if not isinstance(self.grid_shape, (list, tuple)) or len(
+            self.grid_shape
+        ) != 2:
+            raise ValueError("grid_shape must contain exactly two integers.")
+        grid_shape = (
+            _json_integer(self.grid_shape[0], field_name="grid_shape[0]"),
+            _json_integer(self.grid_shape[1], field_name="grid_shape[1]"),
+        )
+        if not isinstance(self.blocked_cells, (list, tuple)):
+            raise ValueError("blocked_cells must be a list or tuple.")
+        parsed_blocked: list[tuple[int, int]] = []
+        for index, cell in enumerate(self.blocked_cells):
+            if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+                raise ValueError(
+                    f"blocked_cells[{index}] must contain exactly two integers."
+                )
+            parsed_blocked.append(
+                (
+                    _json_integer(
+                        cell[0],
+                        field_name=f"blocked_cells[{index}][0]",
+                    ),
+                    _json_integer(
+                        cell[1],
+                        field_name=f"blocked_cells[{index}][1]",
+                    ),
+                )
+            )
+        if len(set(parsed_blocked)) != len(parsed_blocked):
+            raise ValueError("blocked_cells must not contain duplicates.")
+        blocked = tuple(sorted(parsed_blocked))
         for cell in blocked:
-            if cell[0] < 0 or cell[1] < 0:
-                raise ValueError("blocked_cells indices must be non-negative.")
             if cell[0] >= grid_shape[0] or cell[1] >= grid_shape[1]:
                 raise ValueError("blocked_cells entry out of grid bounds.")
-        collision_boxes = tuple(
-            tuple(float(value) for value in box) for box in self.collision_boxes_m
+        collision_boxes = _validated_boxes(
+            self.collision_boxes_m,
+            field_name="collision_boxes_m",
         )
-        transport_boxes = tuple(
-            tuple(float(value) for value in box) for box in self.transport_boxes_m
+        transport_boxes = _validated_boxes(
+            self.transport_boxes_m,
+            field_name="transport_boxes_m",
         )
-        for field_name, boxes in (
-            ("collision_boxes_m", collision_boxes),
-            ("transport_boxes_m", transport_boxes),
-        ):
-            for box in boxes:
-                if len(box) != 6:
-                    raise ValueError(f"{field_name} entries must have six values.")
-                if not np.all(np.isfinite(np.asarray(box, dtype=float))):
-                    raise ValueError(f"{field_name} entries must be finite.")
-                if box[3] < box[0] or box[4] < box[1] or box[5] < box[2]:
-                    raise ValueError(
-                        f"{field_name} entries must be ordered lower-to-upper."
-                    )
-        transport_mu: dict[str, tuple[float, ...]] = {}
-        for isotope, values in self.transport_mu_by_isotope.items():
-            mu_values = tuple(float(value) for value in values)
-            if len(mu_values) != len(transport_boxes):
+        transport_mu = _validated_isotope_table(
+            self.transport_mu_by_isotope,
+            field_name="transport_mu_by_isotope",
+            box_count=len(transport_boxes),
+            line_resolved=False,
+        )
+        transport_line_mu = _validated_isotope_table(
+            self.transport_line_mu_by_isotope,
+            field_name="transport_line_mu_by_isotope",
+            box_count=len(transport_boxes),
+            line_resolved=True,
+        )
+        transport_line_compton_mu = _validated_isotope_table(
+            self.transport_line_compton_mu_by_isotope,
+            field_name="transport_line_compton_mu_by_isotope",
+            box_count=len(transport_boxes),
+            line_resolved=True,
+        )
+        for isotope, rows in transport_line_compton_mu.items():
+            total_rows = transport_line_mu.get(isotope)
+            if total_rows is None or len(total_rows) != len(rows):
                 raise ValueError(
-                    "transport_mu_by_isotope entries must match transport_boxes_m length."
+                    "Obstacle Compton and total line attenuation tables must "
+                    "share isotope keys and line counts."
                 )
-            if any(not np.isfinite(value) or value < 0.0 for value in mu_values):
+            if any(
+                compton > total * (1.0 + 1.0e-12)
+                for compton_row, total_row in zip(rows, total_rows, strict=True)
+                for compton, total in zip(
+                    compton_row,
+                    total_row,
+                    strict=True,
+                )
+            ):
                 raise ValueError(
-                    "transport_mu_by_isotope entries must be finite and non-negative."
+                    "Obstacle Compton attenuation cannot exceed total attenuation."
                 )
-            transport_mu[str(isotope)] = mu_values
-        transport_line_mu: dict[str, tuple[tuple[float, ...], ...]] = {}
-        for isotope, rows in self.transport_line_mu_by_isotope.items():
-            parsed_rows: list[tuple[float, ...]] = []
-            for row in rows:
-                mu_values = tuple(float(value) for value in row)
-                if len(mu_values) != len(transport_boxes):
-                    raise ValueError(
-                        "transport_line_mu_by_isotope rows must match "
-                        "transport_boxes_m length."
-                    )
-                if any(not np.isfinite(value) or value < 0.0 for value in mu_values):
-                    raise ValueError(
-                        "transport_line_mu_by_isotope entries must be finite and "
-                        "non-negative."
-                    )
-                parsed_rows.append(mu_values)
-            transport_line_mu[str(isotope)] = tuple(parsed_rows)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "cell_size", cell_size)
         object.__setattr__(self, "grid_shape", grid_shape)
@@ -112,6 +289,11 @@ class ObstacleGrid:
             self,
             "transport_line_mu_by_isotope",
             transport_line_mu,
+        )
+        object.__setattr__(
+            self,
+            "transport_line_compton_mu_by_isotope",
+            transport_line_compton_mu,
         )
         object.__setattr__(self, "_blocked_set", frozenset(blocked))
 
@@ -238,10 +420,10 @@ class ObstacleGrid:
         z_max: float = 2.0,
     ) -> list[tuple[float, float, float, float, float, float]]:
         """Return blocked cells as 3D boxes (x0, y0, z0, x1, y1, z1)."""
-        z_min = float(z_min)
-        z_max = float(z_max)
-        if z_max < z_min:
-            z_min, z_max = z_max, z_min
+        z_min = _finite_real(z_min, field_name="z_min")
+        z_max = _finite_real(z_max, field_name="z_max")
+        if z_max <= z_min:
+            raise ValueError("z_max must be greater than z_min.")
         boxes: list[tuple[float, float, float, float, float, float]] = []
         for x0, x1, y0, y1 in self.blocked_bounds():
             boxes.append((x0, y0, z_min, x1, y1, z_max))
@@ -296,12 +478,31 @@ class ObstacleGrid:
         }
         return normalized.get(_normalize_isotope_key(isotope))
 
+    def transport_line_compton_mu_values(
+        self,
+        isotope: str,
+    ) -> tuple[tuple[float, ...], ...] | None:
+        """Return per-line, per-box physical Compton attenuation values."""
+        table = self.transport_line_compton_mu_by_isotope
+        if not table:
+            return None
+        if isotope in table:
+            return table[isotope]
+        normalized = {
+            _normalize_isotope_key(key): values
+            for key, values in table.items()
+        }
+        return normalized.get(_normalize_isotope_key(isotope))
+
     def with_transport_model(
         self,
         *,
         boxes_m: Iterable[Sequence[float]],
         mu_by_isotope: dict[str, Sequence[float]],
         line_mu_by_isotope: dict[str, Sequence[Sequence[float]]] | None = None,
+        line_compton_mu_by_isotope: (
+            dict[str, Sequence[Sequence[float]]] | None
+        ) = None,
     ) -> "ObstacleGrid":
         """Return a copy with known obstacle transport components attached."""
         return ObstacleGrid(
@@ -310,18 +511,17 @@ class ObstacleGrid:
             grid_shape=self.grid_shape,
             blocked_cells=self.blocked_cells,
             collision_boxes_m=self.collision_boxes_m,
-            transport_boxes_m=tuple(
-                tuple(float(value) for value in box) for box in boxes_m
-            ),
-            transport_mu_by_isotope={
-                str(isotope): tuple(float(value) for value in values)
-                for isotope, values in mu_by_isotope.items()
-            },
+            transport_boxes_m=tuple(tuple(box) for box in boxes_m),
+            transport_mu_by_isotope=dict(mu_by_isotope),
             transport_line_mu_by_isotope={
-                str(isotope): tuple(
-                    tuple(float(value) for value in row) for row in rows
-                )
+                isotope: tuple(tuple(row) for row in rows)
                 for isotope, rows in (line_mu_by_isotope or {}).items()
+            },
+            transport_line_compton_mu_by_isotope={
+                isotope: tuple(tuple(row) for row in rows)
+                for isotope, rows in (
+                    line_compton_mu_by_isotope or {}
+                ).items()
             },
         )
 
@@ -336,12 +536,13 @@ class ObstacleGrid:
             cell_size=self.cell_size,
             grid_shape=self.grid_shape,
             blocked_cells=self.blocked_cells,
-            collision_boxes_m=tuple(
-                tuple(float(value) for value in box) for box in boxes_m
-            ),
+            collision_boxes_m=tuple(tuple(box) for box in boxes_m),
             transport_boxes_m=self.transport_boxes_m,
             transport_mu_by_isotope=self.transport_mu_by_isotope,
             transport_line_mu_by_isotope=self.transport_line_mu_by_isotope,
+            transport_line_compton_mu_by_isotope=(
+                self.transport_line_compton_mu_by_isotope
+            ),
         )
 
     def blocked_polygons(
@@ -372,61 +573,95 @@ class ObstacleGrid:
                 isotope: [[float(value) for value in row] for row in rows]
                 for isotope, rows in sorted(self.transport_line_mu_by_isotope.items())
             },
+            "transport_line_compton_mu_by_isotope": {
+                isotope: [[float(value) for value in row] for row in rows]
+                for isotope, rows in sorted(
+                    self.transport_line_compton_mu_by_isotope.items()
+                )
+            },
         }
 
     def save(self, path: Path) -> None:
         """Save the obstacle layout to a JSON file."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
-            json.dump(self.to_dict(), handle, indent=2, sort_keys=True)
+            json.dump(
+                self.to_dict(),
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
 
     @classmethod
     def from_dict(cls, data: dict) -> ObstacleGrid:
         """Construct an ObstacleGrid from a dictionary payload."""
         if not isinstance(data, dict):
             raise ValueError("Obstacle layout must be a dict.")
-        origin = data.get("origin", (0.0, 0.0))
-        cell_size = data.get("cell_size", 1.0)
-        grid_shape = data.get("grid_shape")
-        blocked_cells = data.get("blocked_cells", [])
-        collision_boxes = data.get("collision_boxes_m", [])
-        transport_boxes = data.get("transport_boxes_m", [])
-        transport_mu_by_isotope = data.get("transport_mu_by_isotope", {})
-        transport_line_mu_by_isotope = data.get("transport_line_mu_by_isotope", {})
-        if grid_shape is None:
-            raise ValueError("Obstacle layout missing 'grid_shape'.")
-        if not isinstance(blocked_cells, list):
-            raise ValueError("blocked_cells must be a list.")
-        if not isinstance(collision_boxes, list):
-            raise ValueError("collision_boxes_m must be a list.")
-        if not isinstance(transport_boxes, list):
-            raise ValueError("transport_boxes_m must be a list.")
-        if not isinstance(transport_mu_by_isotope, dict):
-            raise ValueError("transport_mu_by_isotope must be a dict.")
-        if not isinstance(transport_line_mu_by_isotope, dict):
-            raise ValueError("transport_line_mu_by_isotope must be a dict.")
-        return cls(
-            origin=(float(origin[0]), float(origin[1])),
-            cell_size=float(cell_size),
-            grid_shape=(int(grid_shape[0]), int(grid_shape[1])),
-            blocked_cells=tuple((int(cell[0]), int(cell[1])) for cell in blocked_cells),
-            collision_boxes_m=tuple(
-                tuple(float(value) for value in box) for box in collision_boxes
-            ),
-            transport_boxes_m=tuple(
-                tuple(float(value) for value in box) for box in transport_boxes
-            ),
-            transport_mu_by_isotope={
-                str(isotope): tuple(float(value) for value in values)
-                for isotope, values in transport_mu_by_isotope.items()
-            },
-            transport_line_mu_by_isotope={
-                str(isotope): tuple(
-                    tuple(float(value) for value in row) for row in rows
-                )
-                for isotope, rows in transport_line_mu_by_isotope.items()
-            },
+        required = {
+            "version",
+            "origin",
+            "cell_size",
+            "grid_shape",
+            "blocked_cells",
+            "blocked_fraction",
+        }
+        optional = {
+            "collision_boxes_m",
+            "transport_boxes_m",
+            "transport_mu_by_isotope",
+            "transport_line_mu_by_isotope",
+            "transport_line_compton_mu_by_isotope",
+        }
+        keys = set(data)
+        missing = required - keys
+        unknown = keys - required - optional
+        if missing or unknown:
+            raise ValueError(
+                "Obstacle layout schema mismatch: "
+                f"missing={sorted(missing)}, unknown={sorted(unknown)}."
+            )
+        version = _json_integer(
+            data["version"],
+            field_name="version",
+            minimum=1,
         )
+        if version != 1:
+            raise ValueError("Obstacle layout version must be exactly 1.")
+        grid = cls(
+            origin=data["origin"],
+            cell_size=data["cell_size"],
+            grid_shape=data["grid_shape"],
+            blocked_cells=data["blocked_cells"],
+            collision_boxes_m=data.get("collision_boxes_m", ()),
+            transport_boxes_m=data.get("transport_boxes_m", ()),
+            transport_mu_by_isotope=data.get("transport_mu_by_isotope", {}),
+            transport_line_mu_by_isotope=data.get(
+                "transport_line_mu_by_isotope",
+                {},
+            ),
+            transport_line_compton_mu_by_isotope=data.get(
+                "transport_line_compton_mu_by_isotope",
+                {},
+            ),
+        )
+        declared_fraction = _finite_real(
+            data["blocked_fraction"],
+            field_name="blocked_fraction",
+            minimum=0.0,
+        )
+        if declared_fraction > 1.0:
+            raise ValueError("blocked_fraction must not exceed 1.")
+        if not math.isclose(
+            declared_fraction,
+            grid.blocked_fraction,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError(
+                "blocked_fraction does not match blocked_cells/grid_shape."
+            )
+        return grid
 
     @classmethod
     def load(cls, path: Path) -> ObstacleGrid:

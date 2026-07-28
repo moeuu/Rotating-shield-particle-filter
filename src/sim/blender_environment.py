@@ -175,7 +175,12 @@ def attach_known_obstacle_transport_model(
     room_boundary_thickness_m: float = 0.1,
 ) -> ObstacleGrid:
     """Return an obstacle grid whose PF transport uses known obstacle components."""
-    boxes_m, mu_by_isotope, line_mu_by_isotope = environment_transport_model(
+    (
+        boxes_m,
+        mu_by_isotope,
+        line_mu_by_isotope,
+        line_compton_mu_by_isotope,
+    ) = environment_transport_model(
         instances,
         room_size_xyz=room_size_xyz,
         include_room_boundaries=include_room_boundaries,
@@ -185,4 +190,5 @@ def attach_known_obstacle_transport_model(
         boxes_m=boxes_m,
         mu_by_isotope=mu_by_isotope,
         line_mu_by_isotope=line_mu_by_isotope,
+        line_compton_mu_by_isotope=line_compton_mu_by_isotope,
     )

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from numbers import Real
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -15,6 +17,7 @@ from sim.isaacsim_app.materials import (
     resolve_material_preset,
 )
 from sim.transport import DEFAULT_MATERIAL_MU_CM_INV
+from spectrum.additive_scatter import material_compton_mu_cm_inv_numpy
 from spectrum.library import default_library
 
 
@@ -29,6 +32,27 @@ class ObstacleComponent:
     center_xyz: tuple[float, float, float]
     size_xyz: tuple[float, float, float]
     material: str
+
+    def __post_init__(self) -> None:
+        """Validate one physical component without implicit coercion."""
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("Obstacle component name must be a nonempty string.")
+        center = _as_float_tuple(
+            self.center_xyz,
+            3,
+            "ObstacleComponent.center_xyz",
+        )
+        size = _as_float_tuple(
+            self.size_xyz,
+            3,
+            "ObstacleComponent.size_xyz",
+        )
+        if any(value <= 0.0 for value in size):
+            raise ValueError("Obstacle component size_xyz must be positive.")
+        if not isinstance(self.material, str) or not self.material:
+            raise ValueError("Obstacle component material must be a nonempty string.")
+        object.__setattr__(self, "center_xyz", center)
+        object.__setattr__(self, "size_xyz", size)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable component payload."""
@@ -66,6 +90,71 @@ class KnownObstacleInstance:
     footprint_cells: tuple[tuple[int, int], ...]
     components: tuple[ObstacleComponent, ...]
 
+    def __post_init__(self) -> None:
+        """Validate planning and transport geometry for one known obstacle."""
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("Known obstacle name must be a nonempty string.")
+        if not isinstance(self.template, str) or not self.template:
+            raise ValueError("Known obstacle template must be a nonempty string.")
+        footprint = _as_float_tuple(
+            self.footprint_xy,
+            4,
+            "KnownObstacleInstance.footprint_xy",
+        )
+        if footprint[1] <= footprint[0] or footprint[3] <= footprint[2]:
+            raise ValueError(
+                "Known obstacle footprint_xy must have positive XY extent."
+            )
+        if not isinstance(self.footprint_cells, (list, tuple)):
+            raise ValueError("Known obstacle footprint_cells must be a list or tuple.")
+        cells: list[tuple[int, int]] = []
+        for index, cell in enumerate(self.footprint_cells):
+            if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+                raise ValueError(
+                    f"Known obstacle footprint_cells[{index}] must contain two "
+                    "integers."
+                )
+            cells.append(
+                (
+                    _exact_integer(
+                        cell[0],
+                        field_name=f"footprint_cells[{index}][0]",
+                    ),
+                    _exact_integer(
+                        cell[1],
+                        field_name=f"footprint_cells[{index}][1]",
+                    ),
+                )
+            )
+        if not cells:
+            raise ValueError("Known obstacle footprint_cells must not be empty.")
+        if len(set(cells)) != len(cells):
+            raise ValueError("Known obstacle footprint_cells must not contain duplicates.")
+        if not isinstance(self.components, (list, tuple)) or not self.components:
+            raise ValueError("Known obstacle components must not be empty.")
+        components = tuple(self.components)
+        if any(not isinstance(component, ObstacleComponent) for component in components):
+            raise ValueError(
+                "Known obstacle components must contain ObstacleComponent values."
+            )
+        component_names = [component.name for component in components]
+        if len(set(component_names)) != len(component_names):
+            raise ValueError("Known obstacle component names must be unique.")
+        for component in components:
+            box = component.box_m
+            if (
+                box[0] < footprint[0] - 1.0e-12
+                or box[3] > footprint[1] + 1.0e-12
+                or box[1] < footprint[2] - 1.0e-12
+                or box[4] > footprint[3] + 1.0e-12
+            ):
+                raise ValueError(
+                    "Known obstacle component lies outside footprint_xy."
+                )
+        object.__setattr__(self, "footprint_xy", footprint)
+        object.__setattr__(self, "footprint_cells", tuple(cells))
+        object.__setattr__(self, "components", components)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable known-obstacle payload."""
         return {
@@ -88,46 +177,128 @@ def obstacle_instances_from_dicts(
     payloads: Iterable[dict[str, Any]],
 ) -> tuple[KnownObstacleInstance, ...]:
     """Parse known obstacle instances from manifest dictionaries."""
+    if not isinstance(payloads, (list, tuple)):
+        raise ValueError("obstacle_instances must be a list or tuple.")
     instances: list[KnownObstacleInstance] = []
     for index, payload in enumerate(payloads):
+        if not isinstance(payload, dict):
+            raise ValueError(f"obstacle_instances[{index}] must be a mapping.")
+        required = {
+            "name",
+            "template",
+            "footprint_xy",
+            "footprint_cells",
+            "components",
+        }
+        if set(payload) != required:
+            raise ValueError(
+                f"obstacle_instances[{index}] schema mismatch: "
+                f"missing={sorted(required - set(payload))}, "
+                f"unknown={sorted(set(payload) - required)}."
+            )
+        raw_components = payload["components"]
+        if not isinstance(raw_components, list):
+            raise ValueError(
+                f"obstacle_instances[{index}].components must be a list."
+            )
         components: list[ObstacleComponent] = []
-        for comp_index, comp in enumerate(payload.get("components", [])):
+        for comp_index, comp in enumerate(raw_components):
+            if not isinstance(comp, dict):
+                raise ValueError(
+                    f"obstacle_instances[{index}].components[{comp_index}] "
+                    "must be a mapping."
+                )
+            component_fields = {"name", "center_xyz", "size_xyz", "material"}
+            if set(comp) != component_fields:
+                raise ValueError(
+                    f"obstacle_instances[{index}].components[{comp_index}] "
+                    "schema mismatch."
+                )
             center = _as_float_tuple(
-                comp.get("center_xyz", (0.0, 0.0, 0.0)),
+                comp["center_xyz"],
                 3,
                 f"obstacle_instances[{index}].components[{comp_index}].center_xyz",
             )
             size = _as_float_tuple(
-                comp.get("size_xyz", (0.0, 0.0, 0.0)),
+                comp["size_xyz"],
                 3,
                 f"obstacle_instances[{index}].components[{comp_index}].size_xyz",
             )
             components.append(
                 ObstacleComponent(
-                    name=str(comp.get("name", f"component_{comp_index:02d}")),
+                    name=_nonempty_string(
+                        comp["name"],
+                        field_name=(
+                            f"obstacle_instances[{index}].components"
+                            f"[{comp_index}].name"
+                        ),
+                    ),
                     center_xyz=(center[0], center[1], center[2]),
                     size_xyz=(size[0], size[1], size[2]),
-                    material=str(comp.get("material", "concrete")),
+                    material=_nonempty_string(
+                        comp["material"],
+                        field_name=(
+                            f"obstacle_instances[{index}].components"
+                            f"[{comp_index}].material"
+                        ),
+                    ),
                 )
             )
         footprint = _as_float_tuple(
-            payload.get("footprint_xy", (0.0, 0.0, 0.0, 0.0)),
+            payload["footprint_xy"],
             4,
             f"obstacle_instances[{index}].footprint_xy",
         )
-        cells = tuple(
-            (int(cell[0]), int(cell[1]))
-            for cell in payload.get("footprint_cells", [])
-        )
+        raw_cells = payload["footprint_cells"]
+        if not isinstance(raw_cells, list):
+            raise ValueError(
+                f"obstacle_instances[{index}].footprint_cells must be a list."
+            )
+        parsed_cells: list[tuple[int, int]] = []
+        for cell_index, cell in enumerate(raw_cells):
+            _validate_cell_shape(
+                cell,
+                field_name=(
+                    f"obstacle_instances[{index}].footprint_cells[{cell_index}]"
+                ),
+            )
+            parsed_cells.append(
+                (
+                    _exact_integer(
+                        cell[0],
+                        field_name=(
+                            f"obstacle_instances[{index}].footprint_cells"
+                            f"[{cell_index}][0]"
+                        ),
+                    ),
+                    _exact_integer(
+                        cell[1],
+                        field_name=(
+                            f"obstacle_instances[{index}].footprint_cells"
+                            f"[{cell_index}][1]"
+                        ),
+                    ),
+                )
+            )
+        cells = tuple(parsed_cells)
         instances.append(
             KnownObstacleInstance(
-                name=str(payload.get("name", f"KnownObstacle_{index:04d}")),
-                template=str(payload.get("template", "unknown")),
+                name=_nonempty_string(
+                    payload["name"],
+                    field_name=f"obstacle_instances[{index}].name",
+                ),
+                template=_nonempty_string(
+                    payload["template"],
+                    field_name=f"obstacle_instances[{index}].template",
+                ),
                 footprint_xy=(footprint[0], footprint[1], footprint[2], footprint[3]),
                 footprint_cells=cells,
                 components=tuple(components),
             )
         )
+    names = [instance.name for instance in instances]
+    if len(set(names)) != len(names):
+        raise ValueError("obstacle_instances names must be unique.")
     return tuple(instances)
 
 
@@ -230,6 +401,56 @@ def line_transport_model_from_components(
     return line_mu_by_isotope
 
 
+def line_compton_transport_model_from_components(
+    components: Iterable[ObstacleComponent],
+    *,
+    isotopes: Sequence[str] = DEFAULT_TRANSPORT_ISOTOPES,
+) -> dict[str, tuple[tuple[float, ...], ...]]:
+    """Return per-line, per-component physical Compton attenuation values."""
+    component_tuple = tuple(components)
+    if not component_tuple:
+        return {}
+    material_presets = []
+    for component in component_tuple:
+        normalized = normalize_material_name(component.material)
+        preset = resolve_material_preset(normalized)
+        if (
+            preset is None
+            or preset.density_g_cm3 is None
+            or not preset.composition_by_mass
+        ):
+            raise ValueError(
+                "Obstacle scatter requires a known material composition for "
+                f"{component.material!r}."
+            )
+        material_presets.append(preset)
+    library = default_library()
+    by_isotope: dict[str, tuple[tuple[float, ...], ...]] = {}
+    for isotope in isotopes:
+        nuclide = _lookup_nuclide(library, str(isotope))
+        if nuclide is None:
+            continue
+        rows: list[tuple[float, ...]] = []
+        for line in nuclide.lines:
+            if max(float(line.intensity), 0.0) <= 0.0:
+                continue
+            rows.append(
+                tuple(
+                    float(
+                        material_compton_mu_cm_inv_numpy(
+                            float(line.energy_keV),
+                            density_g_cm3=float(preset.density_g_cm3),
+                            composition_by_mass=preset.composition_by_mass,
+                        )
+                    )
+                    for preset in material_presets
+                )
+            )
+        if rows:
+            by_isotope[str(isotope)] = tuple(rows)
+    return by_isotope
+
+
 def room_boundary_transport_components(
     room_size_xyz: tuple[float, float, float],
     *,
@@ -300,6 +521,7 @@ def environment_transport_model(
     tuple[tuple[float, float, float, float, float, float], ...],
     dict[str, tuple[float, ...]],
     dict[str, tuple[tuple[float, ...], ...]],
+    dict[str, tuple[tuple[float, ...], ...]],
 ]:
     """Return a complete PF/Geant4 environment transport model."""
     components = list(_components_from_instances(instances))
@@ -321,7 +543,16 @@ def environment_transport_model(
         components,
         isotopes=isotopes,
     )
-    return boxes_m, mu_by_isotope, line_mu_by_isotope
+    line_compton_mu_by_isotope = line_compton_transport_model_from_components(
+        components,
+        isotopes=isotopes,
+    )
+    return (
+        boxes_m,
+        mu_by_isotope,
+        line_mu_by_isotope,
+        line_compton_mu_by_isotope,
+    )
 
 
 def known_obstacle_traversability_rects(
@@ -457,11 +688,49 @@ def generate_manchester_obstacle_instances(
     return tuple(instances)
 
 
-def _as_float_tuple(values: Any, expected_len: int, field_name: str) -> tuple[float, ...]:
-    """Validate and normalize a numeric tuple-like payload."""
+def _as_float_tuple(
+    values: Any,
+    expected_len: int,
+    field_name: str,
+) -> tuple[float, ...]:
+    """Return finite real values without accepting strings or booleans."""
     if not isinstance(values, (list, tuple)) or len(values) != expected_len:
         raise ValueError(f"{field_name} must be a {expected_len}-element list.")
-    return tuple(float(value) for value in values)
+    parsed: list[float] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"{field_name}[{index}] must be a real number.")
+        parsed_value = float(value)
+        if not math.isfinite(parsed_value):
+            raise ValueError(f"{field_name}[{index}] must be finite.")
+        parsed.append(parsed_value)
+    return tuple(parsed)
+
+
+def _exact_integer(
+    value: object,
+    *,
+    field_name: str,
+) -> int:
+    """Return a non-negative exact JSON integer."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be a JSON integer.")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative.")
+    return value
+
+
+def _nonempty_string(value: object, *, field_name: str) -> str:
+    """Return an exact nonempty string."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a nonempty string.")
+    return value
+
+
+def _validate_cell_shape(value: object, *, field_name: str) -> None:
+    """Validate a serialized grid-cell pair."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{field_name} must contain exactly two integers.")
 
 
 def _cell_bounds(
@@ -505,13 +774,9 @@ def _component(
     """Create one axis-aligned obstacle component."""
     return ObstacleComponent(
         name=name,
-        center_xyz=(float(center_xy[0]), float(center_xy[1]), float(z_center)),
-        size_xyz=(
-            max(float(size_xyz[0]), 1.0e-3),
-            max(float(size_xyz[1]), 1.0e-3),
-            max(float(size_xyz[2]), 1.0e-3),
-        ),
-        material=str(material),
+        center_xyz=(center_xy[0], center_xy[1], z_center),
+        size_xyz=size_xyz,
+        material=material,
     )
 
 

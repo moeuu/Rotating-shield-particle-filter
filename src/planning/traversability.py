@@ -6,6 +6,8 @@ from collections import deque
 from dataclasses import dataclass
 import heapq
 import json
+import math
+from numbers import Real
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -15,6 +17,40 @@ from matplotlib.patches import Rectangle
 import numpy as np
 
 from measurement.obstacles import ObstacleGrid
+
+
+def _finite_real(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite real value satisfying a physical domain."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a real number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{field_name} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _json_integer(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int = 0,
+) -> int:
+    """Return an exact JSON integer with a lower bound."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be a JSON integer.")
+    if value < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -34,25 +70,55 @@ class TraversabilityMap:
             raise ValueError("origin must have length 2.")
         if len(self.grid_shape) != 2:
             raise ValueError("grid_shape must have length 2.")
-        origin = (float(self.origin[0]), float(self.origin[1]))
-        cell_size = float(self.cell_size)
-        grid_shape = (int(self.grid_shape[0]), int(self.grid_shape[1]))
-        if cell_size <= 0.0:
-            raise ValueError("cell_size must be positive.")
-        if grid_shape[0] < 0 or grid_shape[1] < 0:
-            raise ValueError("grid_shape must be non-negative.")
-        traversable = tuple(
-            sorted((int(cell[0]), int(cell[1])) for cell in self.traversable_cells)
+        origin = (
+            _finite_real(self.origin[0], field_name="origin[0]"),
+            _finite_real(self.origin[1], field_name="origin[1]"),
         )
+        cell_size = _finite_real(
+            self.cell_size,
+            field_name="cell_size",
+            strictly_positive=True,
+        )
+        grid_shape = (
+            _json_integer(self.grid_shape[0], field_name="grid_shape[0]"),
+            _json_integer(self.grid_shape[1], field_name="grid_shape[1]"),
+        )
+        robot_radius = _finite_real(
+            self.robot_radius_m,
+            field_name="robot_radius_m",
+            minimum=0.0,
+        )
+        normalized_cells: list[tuple[int, int]] = []
+        for index, cell in enumerate(self.traversable_cells):
+            if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+                raise ValueError(
+                    f"traversable_cells[{index}] must contain two integers."
+                )
+            normalized_cells.append(
+                (
+                    _json_integer(
+                        cell[0],
+                        field_name=f"traversable_cells[{index}][0]",
+                    ),
+                    _json_integer(
+                        cell[1],
+                        field_name=f"traversable_cells[{index}][1]",
+                    ),
+                )
+            )
+        if len(set(normalized_cells)) != len(normalized_cells):
+            raise ValueError("traversable_cells must not contain duplicates.")
+        traversable = tuple(sorted(normalized_cells))
         for ix, iy in traversable:
             if ix < 0 or iy < 0 or ix >= grid_shape[0] or iy >= grid_shape[1]:
                 raise ValueError("traversable_cells entry out of grid bounds.")
+        if not isinstance(self.source, str) or not self.source:
+            raise ValueError("source must be a nonempty string.")
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "cell_size", cell_size)
         object.__setattr__(self, "grid_shape", grid_shape)
         object.__setattr__(self, "traversable_cells", traversable)
-        object.__setattr__(self, "robot_radius_m", float(self.robot_radius_m))
-        object.__setattr__(self, "source", str(self.source))
+        object.__setattr__(self, "robot_radius_m", robot_radius)
         object.__setattr__(self, "_traversable_set", frozenset(traversable))
 
     @property
@@ -209,21 +275,62 @@ class TraversabilityMap:
         """Construct a TraversabilityMap from a dictionary payload."""
         if not isinstance(data, dict):
             raise ValueError("Traversability map must be a dict.")
-        origin = data.get("origin", (0.0, 0.0))
-        grid_shape = data.get("grid_shape")
-        if grid_shape is None:
-            raise ValueError("Traversability map missing 'grid_shape'.")
-        cells = data.get("traversable_cells", [])
+        schema_keys = {
+            "version",
+            "source",
+            "origin",
+            "cell_size",
+            "grid_shape",
+            "robot_radius_m",
+            "traversable_fraction",
+            "traversable_cells",
+        }
+        missing = sorted(schema_keys - set(data))
+        unknown = sorted(set(data) - schema_keys)
+        if missing or unknown:
+            raise ValueError(
+                "Traversability map schema mismatch: "
+                f"missing={missing}, unknown={unknown}."
+            )
+        version = _json_integer(
+            data["version"],
+            field_name="version",
+            minimum=1,
+        )
+        if version != 1:
+            raise ValueError("Only traversability map version 1 is supported.")
+        origin = data["origin"]
+        grid_shape = data["grid_shape"]
+        if not isinstance(origin, list) or len(origin) != 2:
+            raise ValueError("origin must be a two-element JSON array.")
+        if not isinstance(grid_shape, list) or len(grid_shape) != 2:
+            raise ValueError("grid_shape must be a two-element JSON array.")
+        cells = data["traversable_cells"]
         if not isinstance(cells, list):
             raise ValueError("traversable_cells must be a list.")
-        return cls(
-            origin=(float(origin[0]), float(origin[1])),
-            cell_size=float(data.get("cell_size", 1.0)),
-            grid_shape=(int(grid_shape[0]), int(grid_shape[1])),
-            traversable_cells=tuple((int(cell[0]), int(cell[1])) for cell in cells),
-            robot_radius_m=float(data.get("robot_radius_m", 0.0)),
-            source=str(data.get("source", "projected_3d_environment")),
+        result = cls(
+            origin=(origin[0], origin[1]),
+            cell_size=data["cell_size"],
+            grid_shape=(grid_shape[0], grid_shape[1]),
+            traversable_cells=tuple(cells),
+            robot_radius_m=data["robot_radius_m"],
+            source=data["source"],
         )
+        declared_fraction = _finite_real(
+            data["traversable_fraction"],
+            field_name="traversable_fraction",
+            minimum=0.0,
+        )
+        if declared_fraction > 1.0 or not np.isclose(
+            declared_fraction,
+            result.traversable_fraction,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise ValueError(
+                "traversable_fraction disagrees with traversable_cells."
+            )
+        return result
 
     @classmethod
     def load(cls, path: Path) -> TraversabilityMap:
@@ -276,8 +383,19 @@ def _map_cell_center(map_api: object, cell: tuple[int, int]) -> tuple[float, flo
     if callable(fn):
         center = fn(cell)
         return float(center[0]), float(center[1])
-    origin = getattr(map_api, "origin", (0.0, 0.0))
-    cell_size = float(getattr(map_api, "cell_size", 1.0))
+    if not hasattr(map_api, "origin") or not hasattr(map_api, "cell_size"):
+        raise TypeError(
+            "A grid map without cell_center must define origin and cell_size."
+        )
+    origin = np.asarray(map_api.origin, dtype=float)
+    cell_size = float(map_api.cell_size)
+    if (
+        origin.shape != (2,)
+        or np.any(~np.isfinite(origin))
+        or not np.isfinite(cell_size)
+        or cell_size <= 0.0
+    ):
+        raise ValueError("Grid-map origin and cell_size are invalid.")
     return (
         float(origin[0]) + (float(cell[0]) + 0.5) * cell_size,
         float(origin[1]) + (float(cell[1]) + 0.5) * cell_size,
@@ -308,7 +426,11 @@ def _path_neighbors(
         return
     transition_is_free = getattr(map_api, "is_transition_free", None)
     nx, ny = int(grid_shape[0]), int(grid_shape[1])
-    cell_size = float(getattr(map_api, "cell_size", 1.0))
+    if not hasattr(map_api, "cell_size"):
+        raise TypeError("A path-planning map must define cell_size.")
+    cell_size = float(map_api.cell_size)
+    if not np.isfinite(cell_size) or cell_size <= 0.0:
+        raise ValueError("Path-planning cell_size must be finite and positive.")
     ix, iy = int(cell[0]), int(cell[1])
     moves = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0)]
     if allow_diagonal:
@@ -527,27 +649,79 @@ def _build_map_from_footprints(
     source: str,
 ) -> TraversabilityMap:
     """Build a traversability map from projected obstacle rectangles."""
-    radius = max(0.0, float(robot_radius_m))
-    rects = tuple(obstacle_rects)
+    radius = _finite_real(
+        robot_radius_m,
+        field_name="robot_radius_m",
+        minimum=0.0,
+    )
+    normalized_origin = (
+        _finite_real(origin[0], field_name="origin[0]"),
+        _finite_real(origin[1], field_name="origin[1]"),
+    )
+    normalized_cell_size = _finite_real(
+        cell_size,
+        field_name="cell_size",
+        strictly_positive=True,
+    )
+    normalized_grid_shape = (
+        _json_integer(grid_shape[0], field_name="grid_shape[0]", minimum=1),
+        _json_integer(grid_shape[1], field_name="grid_shape[1]", minimum=1),
+    )
+    if not isinstance(source, str) or not source:
+        raise ValueError("source must be a nonempty string.")
+    normalized_rects: list[tuple[float, float, float, float]] = []
+    for index, rect in enumerate(obstacle_rects):
+        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+            raise ValueError(f"obstacle_rects[{index}] must contain four values.")
+        parsed = tuple(
+            _finite_real(value, field_name=f"obstacle_rects[{index}]")
+            for value in rect
+        )
+        if parsed[1] < parsed[0] or parsed[3] < parsed[2]:
+            raise ValueError("Obstacle footprint bounds must be ordered.")
+        normalized_rects.append(parsed)
+    rects = tuple(normalized_rects)
     free_cells: set[tuple[int, int]] = set()
-    nx, ny = grid_shape
+    nx, ny = normalized_grid_shape
     for ix in range(nx):
         for iy in range(ny):
-            center = _cell_center(origin, cell_size, (ix, iy))
+            center = _cell_center(
+                normalized_origin,
+                normalized_cell_size,
+                (ix, iy),
+            )
             blocked = any(_disk_intersects_rect(center, radius, rect) for rect in rects)
             if not blocked:
                 free_cells.add((ix, iy))
     if reachable_from is not None:
-        start = _point_to_cell_index(reachable_from, origin, cell_size, grid_shape)
-        free_cells = (
-            set()
-            if start is None
-            else _reachable_cells(free_cells, start=start, grid_shape=grid_shape)
+        start_point = np.asarray(reachable_from, dtype=float)
+        if (
+            start_point.ndim != 1
+            or start_point.size < 2
+            or not np.all(np.isfinite(start_point))
+        ):
+            raise ValueError("reachable_from must be one finite 2-D or 3-D point.")
+        start = _point_to_cell_index(
+            start_point,
+            normalized_origin,
+            normalized_cell_size,
+            normalized_grid_shape,
         )
+        if start is None or start not in free_cells:
+            raise ValueError(
+                "reachable_from is outside the grid or blocked by robot clearance."
+            )
+        free_cells = _reachable_cells(
+            free_cells,
+            start=start,
+            grid_shape=normalized_grid_shape,
+        )
+    if not free_cells:
+        raise ValueError("Traversability geometry contains no reachable free cell.")
     return TraversabilityMap(
-        origin=origin,
-        cell_size=cell_size,
-        grid_shape=grid_shape,
+        origin=normalized_origin,
+        cell_size=normalized_cell_size,
+        grid_shape=normalized_grid_shape,
         traversable_cells=tuple(sorted(free_cells)),
         robot_radius_m=radius,
         source=source,
@@ -585,6 +759,45 @@ def _quat_rotate(
     return vector + 2.0 * np.cross(q_vec, np.cross(q_vec, vector) + w * vector)
 
 
+def _finite_vector(
+    value: object,
+    *,
+    field_name: str,
+    length: int,
+    strictly_positive: bool = False,
+) -> tuple[float, ...]:
+    """Return an exact-length finite numeric vector."""
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        raise ValueError(f"{field_name} must be a {length}-element vector.")
+    if len(value) != length:
+        raise ValueError(f"{field_name} must be a {length}-element vector.")
+    return tuple(
+        _finite_real(
+            component,
+            field_name=f"{field_name}[{index}]",
+            strictly_positive=strictly_positive,
+        )
+        for index, component in enumerate(value)
+    )
+
+
+def _unit_quaternion(
+    value: object,
+    *,
+    field_name: str,
+) -> tuple[float, float, float, float]:
+    """Return a finite unit quaternion without accepting invalid geometry."""
+    parsed = _finite_vector(
+        value,
+        field_name=field_name,
+        length=4,
+    )
+    norm = float(np.linalg.norm(np.asarray(parsed, dtype=float)))
+    if not np.isclose(norm, 1.0, rtol=0.0, atol=1.0e-6):
+        raise ValueError(f"{field_name} must be a unit quaternion.")
+    return parsed
+
+
 def _box_footprint_rect(
     center_xyz: tuple[float, float, float],
     orientation_wxyz: tuple[float, float, float, float],
@@ -619,34 +832,78 @@ def _solid_footprint_rects(
     blocking_z_range_m: tuple[float, float],
 ) -> list[tuple[float, float, float, float]]:
     """Return projected blocking footprint rectangles for a stage solid."""
-    shape = str(getattr(solid, "shape", "")).lower()
-    pose = getattr(solid, "pose")
-    center = tuple(float(value) for value in getattr(pose, "translation_xyz"))
-    orientation = tuple(float(value) for value in getattr(pose, "orientation_wxyz"))
+    path = getattr(solid, "path", None)
+    if not isinstance(path, str) or not path:
+        raise ValueError("Stage solid path must be a nonempty string.")
+    shape = getattr(solid, "shape", None)
+    if shape not in {"box", "sphere", "mesh"}:
+        raise ValueError(
+            f"Stage solid {path!r} has unsupported shape {shape!r}."
+        )
+    pose = getattr(solid, "pose", None)
+    if pose is None:
+        raise ValueError(f"Stage solid {path!r} must define a world pose.")
+    center = _finite_vector(
+        getattr(pose, "translation_xyz", None),
+        field_name=f"{path}.translation_xyz",
+        length=3,
+    )
+    orientation = _unit_quaternion(
+        getattr(pose, "orientation_wxyz", None),
+        field_name=f"{path}.orientation_wxyz",
+    )
     if shape == "box":
         size = getattr(solid, "size_xyz", None)
         if size is None:
-            return []
+            raise ValueError(f"Box stage solid {path!r} must define size_xyz.")
+        parsed_size = _finite_vector(
+            size,
+            field_name=f"{path}.size_xyz",
+            length=3,
+            strictly_positive=True,
+        )
         rect = _box_footprint_rect(
             center,
             orientation,
-            tuple(float(value) for value in size),
+            parsed_size,
             blocking_z_range_m,
         )
         return [] if rect is None else [rect]
     if shape == "sphere":
         radius = getattr(solid, "radius_m", None)
         if radius is None:
-            return []
-        r = float(radius)
+            raise ValueError(f"Sphere stage solid {path!r} must define radius_m.")
+        r = _finite_real(
+            radius,
+            field_name=f"{path}.radius_m",
+            strictly_positive=True,
+        )
         if center[2] + r < blocking_z_range_m[0] or center[2] - r > blocking_z_range_m[1]:
             return []
         return [(center[0] - r, center[0] + r, center[1] - r, center[1] + r)]
-    if shape != "mesh":
-        return []
+    triangles = getattr(solid, "triangles_xyz", None)
+    if not isinstance(triangles, (list, tuple)) or not triangles:
+        raise ValueError(
+            f"Mesh stage solid {path!r} must define nonempty triangles_xyz."
+        )
     rects: list[tuple[float, float, float, float]] = []
-    for triangle in getattr(solid, "triangles_xyz", ()) or ():
+    for index, triangle in enumerate(triangles):
+        if not isinstance(triangle, (list, tuple, np.ndarray)):
+            raise ValueError(
+                f"{path}.triangles_xyz[{index}] must have shape (3, 3)."
+            )
         points = np.asarray(triangle, dtype=float)
+        if points.shape != (3, 3) or np.any(~np.isfinite(points)):
+            raise ValueError(
+                f"{path}.triangles_xyz[{index}] must be a finite (3, 3) array."
+            )
+        twice_area = np.linalg.norm(
+            np.cross(points[1] - points[0], points[2] - points[0])
+        )
+        if not np.isfinite(twice_area) or twice_area <= 1.0e-12:
+            raise ValueError(
+                f"{path}.triangles_xyz[{index}] must be nondegenerate."
+            )
         if float(np.max(points[:, 2])) < blocking_z_range_m[0]:
             continue
         if float(np.min(points[:, 2])) > blocking_z_range_m[1]:
@@ -680,12 +937,29 @@ def build_traversability_map_from_stage_solids(
     filtered by the robot blocking height range, then converted into robot
     center free cells.
     """
+    if (
+        not isinstance(blocking_z_range_m, (list, tuple, np.ndarray))
+        or len(blocking_z_range_m) != 2
+    ):
+        raise ValueError("blocking_z_range_m must contain two finite values.")
+    blocking_range = (
+        _finite_real(
+            blocking_z_range_m[0],
+            field_name="blocking_z_range_m[0]",
+        ),
+        _finite_real(
+            blocking_z_range_m[1],
+            field_name="blocking_z_range_m[1]",
+        ),
+    )
+    if blocking_range[1] <= blocking_range[0]:
+        raise ValueError("blocking_z_range_m bounds must be strictly ordered.")
     rects: list[tuple[float, float, float, float]] = []
     for solid in solids:
         rects.extend(
             _solid_footprint_rects(
                 solid,
-                blocking_z_range_m=blocking_z_range_m,
+                blocking_z_range_m=blocking_range,
             )
         )
     return _build_map_from_footprints(

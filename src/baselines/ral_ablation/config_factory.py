@@ -6,6 +6,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import csv
 import json
+import math
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,24 @@ import numpy as np
 
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import build_obstacle_grid
-from measurement.source_surfaces import generate_surface_sources
+from measurement.source_boundary import (
+    surface_emission_policy_sha256,
+    surface_source_runtime_contract_sha256,
+)
+from measurement.source_surfaces import (
+    generate_surface_sources,
+    validate_area_uniform_source_config,
+)
+from measurement.surface_charts import (
+    build_surface_chart_geometry,
+    surface_chart_geometry_sha256,
+)
 from pf.profiles import enforce_pure_runtime_settings
+from pf.randomness import (
+    named_random_generator,
+    named_rng_provenance,
+    named_stream_seed,
+)
 from runtime_defaults import (
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     DEFAULT_MEASUREMENT_TIME_S,
@@ -31,6 +49,55 @@ DEFAULT_BASE_CONFIG = (
 DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_MEASUREMENT_LOG_ROOT = Path("results") / "ral_ablation" / "measurement_logs"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
+TRUTH_SURFACE_SOURCE_RNG_DOMAIN = "truth_surface_sources"
+
+
+def _json_boolean(value: object, *, field_name: str) -> bool:
+    """Return an exact JSON boolean."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a JSON boolean.")
+    return value
+
+
+def _json_integer(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int | None = None,
+) -> int:
+    """Return an exact JSON integer satisfying an optional lower bound."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be a JSON integer.")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return value
+
+
+def _finite_json_number(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite JSON number satisfying its physical domain."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a JSON number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{field_name} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _nonempty_string(value: object, *, field_name: str) -> str:
+    """Return an exact nonempty string without case or whitespace aliases."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a nonempty string.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -43,6 +110,56 @@ class AblationCase:
     source_count: int
     isotope_counts: tuple[tuple[str, int], ...] | None = None
 
+    def __post_init__(self) -> None:
+        """Validate one paper-case declaration before it reaches generation."""
+        _nonempty_string(self.name, field_name="AblationCase.name")
+        _nonempty_string(self.description, field_name="AblationCase.description")
+        if not isinstance(self.isotopes, tuple) or not self.isotopes:
+            raise ValueError("AblationCase.isotopes must be a nonempty tuple.")
+        isotope_names = tuple(
+            _nonempty_string(value, field_name="AblationCase.isotopes entry")
+            for value in self.isotopes
+        )
+        if len(set(isotope_names)) != len(isotope_names):
+            raise ValueError("AblationCase.isotopes must not contain duplicates.")
+        source_count = _json_integer(
+            self.source_count,
+            field_name="AblationCase.source_count",
+            minimum=1,
+        )
+        if self.isotope_counts is None:
+            if len(isotope_names) != source_count:
+                raise ValueError(
+                    "Without isotope_counts, AblationCase.isotopes must list "
+                    "one isotope per source."
+                )
+            return
+        if not isinstance(self.isotope_counts, tuple) or not self.isotope_counts:
+            raise ValueError(
+                "AblationCase.isotope_counts must be a nonempty tuple or null."
+            )
+        declared: list[str] = []
+        count_total = 0
+        for isotope, count in self.isotope_counts:
+            declared.append(
+                _nonempty_string(
+                    isotope,
+                    field_name="AblationCase.isotope_counts isotope",
+                )
+            )
+            count_total += _json_integer(
+                count,
+                field_name="AblationCase.isotope_counts count",
+                minimum=1,
+            )
+        if len(set(declared)) != len(declared):
+            raise ValueError("AblationCase.isotope_counts must be unique by isotope.")
+        if set(declared) != set(isotope_names) or count_total != source_count:
+            raise ValueError(
+                "AblationCase isotope_counts must cover isotopes and sum to "
+                "source_count."
+            )
+
 
 @dataclass(frozen=True)
 class AblationVariant:
@@ -52,6 +169,19 @@ class AblationVariant:
     description: str
     overrides: Mapping[str, Any]
     cli_args: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate one paper-variant declaration."""
+        _nonempty_string(self.name, field_name="AblationVariant.name")
+        _nonempty_string(self.description, field_name="AblationVariant.description")
+        if not isinstance(self.overrides, Mapping):
+            raise ValueError("AblationVariant.overrides must be a mapping.")
+        if not isinstance(self.cli_args, tuple) or any(
+            not isinstance(value, str) or not value for value in self.cli_args
+        ):
+            raise ValueError(
+                "AblationVariant.cli_args must be a tuple of nonempty strings."
+            )
 
 
 @dataclass(frozen=True)
@@ -86,102 +216,6 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         overrides={},
     ),
     AblationVariant(
-        name="no_shield",
-        description=(
-            "Remove shield attenuation while taking one unshielded spectrum per "
-            "measurement station."
-        ),
-        overrides={
-            "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
-    ),
-    AblationVariant(
-        name="fixed_shield",
-        description="Repeat a fixed Fe/Pb posture pair for every shield view.",
-        overrides={
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-        },
-    ),
-    AblationVariant(
-        name="round_robin_shield",
-        description="Cycle Fe/Pb posture pairs without posterior-dependent selection.",
-        overrides={
-            "baseline_shield_policy": {
-                "name": "round_robin",
-                "start_pair_id": 0,
-                "advance_by_pose": True,
-            },
-            "strict_planned_shield_program": True,
-        },
-    ),
-    AblationVariant(
-        name="one_step_path",
-        description="Use the existing greedy one-step pose planner instead of DSS-PP.",
-        overrides={
-            "path_planner": "one_step",
-            "strict_planned_shield_program": True,
-        },
-    ),
-    AblationVariant(
-        name="eig_only_path",
-        description=(
-            "Keep active planning and shield programs but remove explicit "
-            "signature, obstacle-shadow, correlation-reduction, and elevation "
-            "terms from DSS-PP."
-        ),
-        overrides={
-            "dss_pp": {
-                "signature_weight": 0.0,
-                "temporal_separation_weight": 0.0,
-                "temporal_decorrelation_weight": 0.0,
-                "temporal_logdet_weight": 0.0,
-                "temporal_cover_weight": 0.0,
-                "correlation_reduction_weight": 0.0,
-                "environment_signature_weight": 0.0,
-                "occlusion_boundary_weight": 0.0,
-                "vertical_environment_signature_weight": 0.0,
-                "elevation_signature_weight": 0.0,
-                "elevation_condition_weight": 0.0,
-                "station_condition_weight": 0.0,
-            },
-        },
-    ),
-    AblationVariant(
-        name="passive_serpentine_path",
-        description="Use a deterministic coverage path from the baseline package.",
-        overrides={
-            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
-        },
-    ),
-    AblationVariant(
-        name="baseline_passive_no_shield",
-        description=(
-            "Ordinary mobile-PF baseline: no shield attenuation and passive "
-            "serpentine coverage path with one unshielded spectrum per "
-            "measurement station."
-        ),
-        overrides={
-            "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
-    ),
-    AblationVariant(
         name="baseline_passive_equal_time_no_shield",
         description=(
             "Passive no-shield baseline with the same per-station physical "
@@ -196,175 +230,64 @@ DEFAULT_ABLATION_VARIANTS: tuple[AblationVariant, ...] = (
         cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
-        name="baseline_passive_fixed_shield",
-        description=(
-            "Passive-path baseline with a fixed Fe/Pb shield posture and no "
-            "posterior-dependent shield selection, using the same spectra "
-            "budget as the proposed method."
-        ),
+        name="round_robin_shield",
+        description="Cycle Fe/Pb posture pairs without posterior-dependent selection.",
         overrides={
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
-        },
-    ),
-    AblationVariant(
-        name="baseline_passive_no_shield_single_view",
-        description=(
-            "Ordinary mobile-PF baseline: no shield and one spectrum per "
-            "measurement station."
-        ),
-        overrides={
-            "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
-            "dss_pp": {
-                "program_length": 1,
+            "baseline_shield_policy": {
+                "name": "round_robin",
+                "start_pair_id": 0,
+                "advance_by_pose": True,
             },
+            "strict_planned_shield_program": True,
         },
-        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
     ),
     AblationVariant(
-        name="baseline_passive_fixed_shield_single_view",
+        name="eig_only_path",
         description=(
-            "Passive-path fixed-shield baseline with one spectrum per "
-            "measurement station."
+            "Keep exact joint full-spectrum generative EIG but remove optional "
+            "route and coverage geometry terms from DSS-PP."
         ),
-        overrides={
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "baseline_path_policy": {"name": "passive_serpentine", "row_count": 8},
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-    ),
-    AblationVariant(
-        name="baseline_onestep_no_shield",
-        description=(
-            "Greedy one-step planner baseline without shield attenuation and "
-            "with one unshielded spectrum per measurement station."
-        ),
-        overrides={
-            "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "path_planner": "one_step",
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
-    ),
-    AblationVariant(
-        name="baseline_onestep_fixed_shield",
-        description=(
-            "Greedy one-step planner baseline with a fixed Fe/Pb shield posture "
-            "and the same spectra budget as the proposed method."
-        ),
-        overrides={
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "path_planner": "one_step",
-        },
-    ),
-    AblationVariant(
-        name="baseline_onestep_no_shield_single_view",
-        description=(
-            "Greedy one-step planner baseline without shield attenuation and "
-            "with one spectrum per measurement station."
-        ),
-        overrides={
-            "shield_transmission_target": 1.0,
-            "shield_thickness_scale": 0.0,
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "path_planner": "one_step",
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-        cli_args=("--rotation-overhead-s", f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"),
-    ),
-    AblationVariant(
-        name="baseline_onestep_fixed_shield_single_view",
-        description=(
-            "Greedy one-step fixed-shield baseline with one spectrum per "
-            "measurement station."
-        ),
-        overrides={
-            "orientation_k": 1,
-            "min_rotations_per_pose": 1,
-            "baseline_shield_policy": {"name": "fixed", "fixed_pair_id": 0},
-            "path_planner": "one_step",
-            "dss_pp": {
-                "program_length": 1,
-            },
-        },
-    ),
-    AblationVariant(
-        name="no_obstacle_signature",
-        description="Keep obstacle attenuation in PF/Geant4 but remove obstacle terms from DSS-PP utility.",
         overrides={
             "dss_pp": {
-                "environment_signature_weight": 0.0,
-                "occlusion_boundary_weight": 0.0,
-                "vertical_environment_signature_weight": 0.0,
+                "coverage_weight": 0.0,
+                "bearing_diversity_weight": 0.0,
+                "frontier_weight": 0.0,
+                "local_orbit_weight": 0.0,
+                "elevation_condition_weight": 0.0,
+                "revisit_penalty_weight": 0.0,
+                "turn_smoothness_weight": 0.0,
             },
         },
-    ),
-    AblationVariant(
-        name="no_pf_obstacle_attenuation",
-        description=(
-            "Keep Geant4 obstacles and obstacle-aware planning but remove "
-            "known-obstacle attenuation from the PF observation kernel."
-        ),
-        overrides={"pf_obstacle_attenuation": False},
     ),
 )
 
 
 def _parallel_runtime_overrides(base_config: Mapping[str, Any]) -> dict[str, Any]:
     """Return non-fidelity-changing compute settings for generated trials."""
-    logical_workers = int(
-        base_config.get(
-            "python_worker_count",
-            base_config.get("cpu_worker_count", 32),
-        )
+    worker_value = (
+        base_config["python_worker_count"]
+        if "python_worker_count" in base_config
+        else base_config.get("cpu_worker_count", 32)
     )
-    workers = max(1, logical_workers)
-    dss_runtime = base_config.get("dss_pp", {})
-    if not isinstance(dss_runtime, Mapping):
-        dss_runtime = {}
+    workers = _json_integer(
+        worker_value,
+        field_name="python_worker_count",
+        minimum=1,
+    )
+    thread_count = _json_integer(
+        base_config.get("thread_count", workers),
+        field_name="thread_count",
+        minimum=1,
+    )
+    pose_workers = _json_integer(
+        base_config.get("pose_selection_workers", workers),
+        field_name="pose_selection_workers",
+        minimum=1,
+    )
     return {
-        "thread_count": max(1, int(base_config.get("thread_count", workers))),
+        "thread_count": thread_count,
         "python_worker_count": workers,
-        "pose_selection_workers": max(
-            1,
-            int(base_config.get("pose_selection_workers", workers)),
-        ),
-        "ig_workers": max(1, int(base_config.get("ig_workers", workers))),
-        "parallel_isotope_updates": bool(
-            base_config.get("parallel_isotope_updates", True)
-        ),
-        "parallel_isotope_workers": max(
-            1,
-            int(base_config.get("parallel_isotope_workers", workers)),
-        ),
-        "dss_pp": {
-            "program_eval_workers": max(
-                1,
-                int(dss_runtime.get("program_eval_workers", workers)),
-            ),
-            "candidate_preselect_enable": bool(
-                dss_runtime.get("candidate_preselect_enable", True)
-            ),
-        },
+        "pose_selection_workers": pose_workers,
     }
 
 
@@ -393,14 +316,16 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Write a deterministic JSON object to a path."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
 
 
 def _resolve_base_config_path(value: object, *, base_config_path: Path) -> str | None:
     """Resolve a config-relative path so generated configs remain relocatable."""
-    if not isinstance(value, str) or value.strip() == "":
+    if value is None:
         return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("Runtime asset paths must be nonempty strings or null.")
     raw_path = Path(value).expanduser()
     if raw_path.is_absolute():
         return raw_path.as_posix()
@@ -410,14 +335,11 @@ def _resolve_base_config_path(value: object, *, base_config_path: Path) -> str |
 def _case_isotope_sequence(case: AblationCase) -> tuple[str, ...]:
     """Return the exact isotope sequence used for source generation."""
     if case.isotope_counts is None:
-        return tuple(str(isotope) for isotope in case.isotopes)
+        return case.isotopes
     expanded: list[str] = []
     for isotope, count in case.isotope_counts:
-        source_count = int(count)
-        if source_count < 0:
-            raise ValueError(f"Negative isotope count for {isotope}: {source_count}")
-        expanded.extend([str(isotope)] * source_count)
-    if len(expanded) != int(case.source_count):
+        expanded.extend([isotope] * count)
+    if len(expanded) != case.source_count:
         raise ValueError(
             f"Case {case.name} isotope_counts expand to {len(expanded)} sources, "
             f"but source_count is {case.source_count}."
@@ -430,74 +352,36 @@ def _case_isotope_count_metadata(case: AblationCase) -> dict[str, int]:
     counts: dict[str, int] = {}
     if case.isotope_counts is not None:
         for isotope, count in case.isotope_counts:
-            counts[str(isotope)] = int(count)
+            counts[isotope] = count
         return counts
-    for idx in range(max(1, int(case.source_count))):
-        isotope = str(case.isotopes[idx % len(case.isotopes)])
+    for idx in range(case.source_count):
+        isotope = case.isotopes[idx]
         counts[isotope] = counts.get(isotope, 0) + 1
     return counts
 
 
-def _free_cell_measurement_points(
-    obstacle_grid: Any,
-    env: EnvironmentConfig,
-) -> np.ndarray:
-    """Return detector-height reference points over reachable free grid cells."""
-    points: list[tuple[float, float, float]] = []
-    origin_x, origin_y = obstacle_grid.origin
-    cell_size = float(obstacle_grid.cell_size)
-    for ix in range(int(obstacle_grid.grid_shape[0])):
-        for iy in range(int(obstacle_grid.grid_shape[1])):
-            if not obstacle_grid.is_cell_free((ix, iy)):
-                continue
-            x = float(origin_x) + (float(ix) + 0.5) * cell_size
-            y = float(origin_y) + (float(iy) + 0.5) * cell_size
-            if 0.0 <= x <= float(env.size_x) and 0.0 <= y <= float(env.size_y):
-                points.append((x, y, float(env.detector_position[2])))
-    if not points:
-        points.append(
-            (
-                float(env.detector_position[0]),
-                float(env.detector_position[1]),
-                float(env.detector_position[2]),
-            )
-        )
-    return np.asarray(points, dtype=float)
-
-
 def _source_generation_options(base_config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return source-placement options shared with standard random generation."""
-    preferred_raw = base_config.get("random_source_preferred_max_z_m")
-    preferred_max_z_m = None if preferred_raw is None else float(preferred_raw)
-    ceiling_raw = base_config.get("random_source_max_ceiling_sources")
-    max_ceiling_sources = None if ceiling_raw is None else int(ceiling_raw)
+    """Return physical geometry options for area-uniform truth generation."""
+    validate_area_uniform_source_config(base_config)
     return {
-        "visibility_filter": bool(
-            base_config.get("random_source_visibility_filter", False)
+        "obstacle_height_m": _finite_json_number(
+            base_config.get("obstacle_height_m", 2.0),
+            field_name="obstacle_height_m",
+            strictly_positive=True,
         ),
-        "visibility_min_fraction": float(
-            base_config.get("random_source_min_visible_fraction", 0.0)
+        "include_room_boundaries": _json_boolean(
+            base_config.get("author_room_boundary_prims", False),
+            field_name="author_room_boundary_prims",
         ),
-        "visibility_clear_path_max_m": float(
-            base_config.get("random_source_clear_path_max_m", 0.01)
+        "room_boundary_thickness_m": _finite_json_number(
+            base_config.get("room_boundary_thickness_m", 0.1),
+            field_name="room_boundary_thickness_m",
+            strictly_positive=True,
         ),
-        "visibility_batch_size": int(
-            base_config.get("random_source_visibility_batch_size", 256)
-        ),
-        "visibility_max_attempts_per_source": int(
-            base_config.get("random_source_visibility_max_attempts_per_source", 4096)
-        ),
-        "max_ceiling_sources": max_ceiling_sources,
-        "preferred_max_z_m": preferred_max_z_m,
-        "same_isotope_min_distance_m": float(
-            base_config.get("random_source_same_isotope_min_distance_m", 0.0)
-        ),
-        "obstacle_height_m": float(base_config.get("obstacle_height_m", 2.0)),
-        "include_room_boundaries": bool(
-            base_config.get("author_room_boundary_prims", False)
-        ),
-        "room_boundary_thickness_m": float(
-            base_config.get("room_boundary_thickness_m", 0.1)
+        "structural_rj_surface_chart_max_edge_m": _finite_json_number(
+            base_config.get("structural_rj_surface_chart_max_edge_m", 1.0),
+            field_name="structural_rj_surface_chart_max_edge_m",
+            strictly_positive=True,
         ),
     }
 
@@ -528,24 +412,44 @@ def _case_source_layout(
         keep_free_points=[(env.detector_position[0], env.detector_position[1])],
         passage_width_m=1.0,
     )
-    rng = np.random.default_rng(source_seed)
+    rng = named_random_generator(
+        _json_integer(source_seed, field_name="source_seed", minimum=0),
+        TRUTH_SURFACE_SOURCE_RNG_DOMAIN,
+    )
     options = dict(source_generation_options or {})
-    obstacle_height_m = float(options.get("obstacle_height_m", 2.0))
+    obstacle_seed = _json_integer(
+        obstacle_seed,
+        field_name="obstacle_seed",
+        minimum=0,
+    )
+    obstacle_height_m = _finite_json_number(
+        options.get("obstacle_height_m", 2.0),
+        field_name="obstacle_height_m",
+        strictly_positive=True,
+    )
+    include_room_boundaries = _json_boolean(
+        options.get("include_room_boundaries", False),
+        field_name="include_room_boundaries",
+    )
+    room_boundary_thickness_m = _finite_json_number(
+        options.get("room_boundary_thickness_m", 0.1),
+        field_name="room_boundary_thickness_m",
+        strictly_positive=True,
+    )
+    chart_max_edge_m = _finite_json_number(
+        options.get("structural_rj_surface_chart_max_edge_m", 1.0),
+        field_name="structural_rj_surface_chart_max_edge_m",
+        strictly_positive=True,
+    )
+    _intensity_sampling_metadata(intensity_cps_1m)
     grid, _ = attach_random_manchester_transport_geometry(
         grid,
         room_size_xyz=(env.size_x, env.size_y, env.size_z),
         obstacle_height_m=obstacle_height_m,
         rng_seed=obstacle_seed,
-        include_room_boundaries=bool(
-            options.get("include_room_boundaries", False)
-        ),
-        room_boundary_thickness_m=float(
-            options.get("room_boundary_thickness_m", 0.1)
-        ),
+        include_room_boundaries=include_room_boundaries,
+        room_boundary_thickness_m=room_boundary_thickness_m,
     )
-    visibility_points = None
-    if bool(options.get("visibility_filter", False)):
-        visibility_points = _free_cell_measurement_points(grid, env)
     isotope_sequence = _case_isotope_sequence(case)
     sources = generate_surface_sources(
         env=env,
@@ -555,20 +459,36 @@ def _case_source_layout(
         rng=rng,
         count=case.source_count,
         obstacle_height_m=obstacle_height_m,
-        visibility_measurement_points=visibility_points,
-        visibility_min_fraction=float(options.get("visibility_min_fraction", 0.0)),
-        visibility_clear_path_max_m=float(
-            options.get("visibility_clear_path_max_m", 0.01)
-        ),
-        visibility_batch_size=int(options.get("visibility_batch_size", 256)),
-        visibility_max_attempts_per_source=int(
-            options.get("visibility_max_attempts_per_source", 4096)
-        ),
-        max_ceiling_sources=options.get("max_ceiling_sources"),
-        preferred_max_z_m=options.get("preferred_max_z_m"),
-        same_isotope_min_distance_m=float(
-            options.get("same_isotope_min_distance_m", 0.0)
-        ),
+        chart_max_edge_m=chart_max_edge_m,
+    )
+    surface_geometry = build_surface_chart_geometry(
+        env,
+        grid,
+        max_edge_m=chart_max_edge_m,
+        obstacle_height_m=obstacle_height_m,
+    )
+    surface_atlas_sha256 = surface_chart_geometry_sha256(surface_geometry)
+    source_entries = [
+        {
+            "isotope": source.isotope,
+            "position": [float(value) for value in source.position],
+            "transport_position": [
+                float(value) for value in source.transport_position
+            ],
+            "intensity_cps_1m": float(source.intensity_cps_1m),
+            "surface_chart_id": int(source.surface_chart_id),
+            "surface_uv": [float(value) for value in source.surface_uv],
+            "surface_normal": [
+                float(value) for value in source.surface_normal
+            ],
+            "surface_emission_policy_sha256": str(
+                source.surface_emission_policy_sha256
+            ),
+        }
+        for source in sources
+    ]
+    source_contract_sha256 = surface_source_runtime_contract_sha256(
+        source_entries
     )
     return {
         "name": f"ral_ablation_{case.name}_seed_{source_seed}",
@@ -576,39 +496,39 @@ def _case_source_layout(
             "case": case.name,
             "description": case.description,
             "isotope_counts": _case_isotope_count_metadata(case),
-            "source_seed": int(source_seed),
-            "obstacle_seed": int(obstacle_seed),
-            "source_surface_sampling_schema_version": 1,
+            "source_seed": source_seed,
+            "source_rng_provenance": named_rng_provenance(
+                source_seed,
+                (TRUTH_SURFACE_SOURCE_RNG_DOMAIN,),
+            ),
+            "source_derived_seed": named_stream_seed(
+                source_seed,
+                TRUTH_SURFACE_SOURCE_RNG_DOMAIN,
+            ),
+            "obstacle_seed": obstacle_seed,
+            "source_surface_sampling_schema_version": 3,
             "sampling": "continuous area-uniform physical-surface placement",
             "sampling_measure": "continuous_area_uniform",
             "surface_geometry": "runtime_transport_component_union",
-            "visibility_filter": bool(options.get("visibility_filter", False)),
-            "visibility_min_fraction": float(
-                options.get("visibility_min_fraction", 0.0)
-            ),
-            "max_ceiling_sources": options.get("max_ceiling_sources"),
-            "preferred_max_z_m": options.get("preferred_max_z_m"),
-            "same_isotope_min_distance_m": float(
-                options.get("same_isotope_min_distance_m", 0.0)
-            ),
+            "selection_conditioning": "none_physical_area_only",
             "obstacle_height_m": obstacle_height_m,
-            "include_room_boundaries": bool(
-                options.get("include_room_boundaries", False)
+            "surface_chart_max_edge_m": chart_max_edge_m,
+            "surface_atlas_contract_sha256": surface_atlas_sha256,
+            "surface_emission_policy_sha256": (
+                surface_emission_policy_sha256()
             ),
-            "room_boundary_thickness_m": float(
-                options.get("room_boundary_thickness_m", 0.1)
+            "surface_source_runtime_contract_sha256": (
+                source_contract_sha256
             ),
-            "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m",
+            "include_room_boundaries": include_room_boundaries,
+            "room_boundary_thickness_m": room_boundary_thickness_m,
+            "intensity_model": (
+                "intensity_cps_1m is expected pre-dead-time detector pulse "
+                "rate at 1 m"
+            ),
             "intensity_sampling": _intensity_sampling_metadata(intensity_cps_1m),
         },
-        "sources": [
-            {
-                "isotope": source.isotope,
-                "position": [round(float(v), 6) for v in source.position],
-                "intensity_cps_1m": float(source.intensity_cps_1m),
-            }
-            for source in sources
-        ],
+        "sources": source_entries,
     }
 
 
@@ -622,10 +542,27 @@ def _intensity_sampling_metadata(
     ):
         if len(intensity_cps_1m) != 2:
             raise ValueError("intensity range must contain exactly two values.")
-        lo = float(intensity_cps_1m[0])
-        hi = float(intensity_cps_1m[1])
+        lo = _finite_json_number(
+            intensity_cps_1m[0],
+            field_name="intensity range minimum",
+            strictly_positive=True,
+        )
+        hi = _finite_json_number(
+            intensity_cps_1m[1],
+            field_name="intensity range maximum",
+            strictly_positive=True,
+        )
+        if hi < lo:
+            raise ValueError("intensity range maximum must not be below minimum.")
         return {"mode": "uniform", "min_cps_1m": lo, "max_cps_1m": hi}
-    return {"mode": "fixed", "cps_1m": float(intensity_cps_1m)}
+    return {
+        "mode": "fixed",
+        "cps_1m": _finite_json_number(
+            intensity_cps_1m,
+            field_name="intensity_cps_1m",
+            strictly_positive=True,
+        ),
+    }
 
 
 def _variant_config(
@@ -641,36 +578,54 @@ def _variant_config(
     config = _deep_update(base_config, _parallel_runtime_overrides(base_config))
     config = _deep_update(config, variant.overrides)
     config = enforce_pure_runtime_settings(config)
+    if config.get("backend") != "geant4" or config.get("engine_mode") != "external":
+        raise ValueError(
+            "RA-L full simulations require backend='geant4' and "
+            "engine_mode='external'; analytic or in-process transport is not "
+            "an ablation backend."
+        )
     if config.get("variable_cardinality") is not True:
         raise ValueError(
             "RA-L ablations require variable_cardinality=true for exact "
             "reversible-jump PF."
         )
-    strength_min = float(config.get("pf_strength_prior_min_cps_1m", np.nan))
-    strength_max = float(config.get("pf_strength_prior_max_cps_1m", np.nan))
-    if (
-        not np.isfinite(strength_min)
-        or strength_min < 0.0
-        or not np.isfinite(strength_max)
-        or strength_max <= strength_min
-    ):
+    strength_min = _finite_json_number(
+        config.get("pf_strength_prior_min_cps_1m"),
+        field_name="pf_strength_prior_min_cps_1m",
+        minimum=0.0,
+    )
+    strength_max = _finite_json_number(
+        config.get("pf_strength_prior_max_cps_1m"),
+        field_name="pf_strength_prior_max_cps_1m",
+        strictly_positive=True,
+    )
+    if strength_max <= strength_min:
         raise ValueError(
             "RA-L ablations require finite ordered "
             "pf_strength_prior_min_cps_1m and "
             "pf_strength_prior_max_cps_1m bounds."
         )
     transport_history_mode = _validate_ral_transport_sampling(config)
-    thread_count = int(config.get("thread_count", 1))
+    config["primary_sampling_fraction"] = 1.0
+    config["accelerated_weighted_transport_enable"] = False
+    config["target_sampled_primaries"] = None
+    thread_count = _json_integer(
+        config.get("thread_count", 1),
+        field_name="thread_count",
+        minimum=1,
+    )
     if thread_count <= 1:
         raise ValueError(
             "RA-L full simulations require a multithreaded Geant4 runtime; "
             "thread_count must be greater than one."
         )
-    config["random_seed_base"] = int(seed)
+    seed = _json_integer(seed, field_name="seed", minimum=0)
+    output_tag = _nonempty_string(output_tag, field_name="output_tag")
+    config["random_seed_base"] = seed
     config["measurement_log_output_dir"] = (
         DEFAULT_MEASUREMENT_LOG_ROOT / output_tag
     ).as_posix()
-    config["measurement_log_run_id"] = str(output_tag)
+    config["measurement_log_run_id"] = output_tag
     # Keep the browser progress page stable across ablation runs. The final
     # result files still use output_tag, so only the live progress view is shared.
     config["cui_split_view_dir"] = DEFAULT_CUI_SPLIT_VIEW_DIR
@@ -681,74 +636,56 @@ def _variant_config(
         )
         if resolved_path is not None:
             config[path_key] = resolved_path
-    config.setdefault("metadata", {})
-    if isinstance(config["metadata"], dict):
-        config["metadata"].update(
-            {
-                "ral_ablation_case": case.name,
-                "ral_ablation_variant": variant.name,
-                "ral_ablation_seed": int(seed),
-                "ral_transport_history_mode": transport_history_mode,
-                "ral_accelerated_transport_exception": bool(
-                    transport_history_mode != "full_unit_weight"
-                ),
-                "ral_primary_sampling_fraction": float(
-                    config.get("primary_sampling_fraction", 1.0)
-                ),
-                "ral_target_sampled_primaries": config.get(
-                    "target_sampled_primaries"
-                ),
-            }
-        )
+    metadata = config.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("RA-L runtime metadata must be a JSON object.")
+    metadata.update(
+        {
+            "ral_ablation_case": case.name,
+            "ral_ablation_variant": variant.name,
+            "ral_ablation_seed": seed,
+            "ral_transport_history_mode": transport_history_mode,
+            "ral_accelerated_transport": False,
+            "ral_primary_sampling_fraction": config["primary_sampling_fraction"],
+            "ral_primary_history_weight": 1.0,
+            "ral_target_sampled_primaries": None,
+        }
+    )
+    config["metadata"] = metadata
     return config
 
 
 def _validate_ral_transport_sampling(config: Mapping[str, Any]) -> str:
-    """Validate and label the transport-history policy for one RA-L run.
-
-    RA-L generation remains full-history by default. Fractional sampling is
-    accepted only for the explicit, user-authorized accelerated experiment
-    mode and only with detector-equivalent source-rate semantics.
-    """
-    fraction = float(config.get("primary_sampling_fraction", 1.0))
-    if not np.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
-        raise ValueError("primary_sampling_fraction must be in (0, 1].")
-    accelerated = bool(config.get("accelerated_weighted_transport_enable", False))
-    target_value = config.get("target_sampled_primaries")
-    if target_value is None:
-        target = None
-    else:
-        if isinstance(target_value, bool) or not isinstance(target_value, int):
-            raise ValueError(
-                "target_sampled_primaries must be a positive JSON integer."
-            )
-        if target_value <= 0:
-            raise ValueError(
-                "target_sampled_primaries must be a positive JSON integer."
-            )
-        target = int(target_value)
-    if fraction == 1.0 and target is None:
-        if accelerated:
-            raise ValueError(
-                "accelerated_weighted_transport_enable requires fractional "
-                "sampling or target_sampled_primaries."
-            )
-        return "full_unit_weight"
-    if not accelerated:
+    """Require full, unit-weight native histories for every RA-L variant."""
+    fraction_raw = config.get("primary_sampling_fraction", 1.0)
+    if isinstance(fraction_raw, bool) or not isinstance(
+        fraction_raw,
+        (int, float),
+    ):
+        raise ValueError("primary_sampling_fraction must be the JSON number 1.0.")
+    fraction = float(fraction_raw)
+    if not np.isfinite(fraction) or fraction != 1.0:
         raise ValueError(
-            "RA-L full simulations require primary_sampling_fraction=1.0 unless "
-            "accelerated_weighted_transport_enable=true is explicitly selected."
+            "RA-L full simulations require primary_sampling_fraction=1.0."
         )
-    if str(config.get("source_rate_model", "detector_cps_1m")) != "detector_cps_1m":
+    accelerated = config.get("accelerated_weighted_transport_enable", False)
+    if not isinstance(accelerated, bool) or accelerated:
         raise ValueError(
-            "RA-L weighted history thinning is restricted to "
-            "source_rate_model=detector_cps_1m."
+            "RA-L full simulations require "
+            "accelerated_weighted_transport_enable=false."
         )
-    return (
-        "budgeted_weighted_transport"
-        if target is not None
-        else "weighted_thinning"
-    )
+    if config.get("target_sampled_primaries") is not None:
+        raise ValueError(
+            "RA-L full simulations require target_sampled_primaries=null."
+        )
+    source_rate_model = config.get("source_rate_model", "detector_cps_1m")
+    if not isinstance(source_rate_model, str) or (
+        source_rate_model != "detector_cps_1m"
+    ):
+        raise ValueError(
+            "RA-L full simulations require source_rate_model=detector_cps_1m."
+        )
+    return "full_unit_weight"
 
 
 def build_ablation_plan(
@@ -766,7 +703,9 @@ def build_ablation_plan(
     base_config = _load_json(base_config_path)
     source_options = _source_generation_options(base_config)
     entries: list[AblationPlanEntry] = []
-    normalized_suffix = str(output_tag_suffix).strip().strip("_")
+    if not isinstance(output_tag_suffix, str):
+        raise ValueError("output_tag_suffix must be a string.")
+    normalized_suffix = output_tag_suffix.strip().strip("_")
     if normalized_suffix and any(
         not (character.isalnum() or character in {"-", "_"})
         for character in normalized_suffix
@@ -777,11 +716,12 @@ def build_ablation_plan(
     config_dir = Path(output_dir) / "configs"
     source_dir = Path(output_dir) / "sources"
     for case in cases:
-        for seed in seeds:
-            source_seed = int(seed) + 17
+        for seed_raw in seeds:
+            seed = _json_integer(seed_raw, field_name="seed", minimum=0)
+            source_seed = seed + 17
             source_payload = _case_source_layout(
                 case,
-                obstacle_seed=int(seed),
+                obstacle_seed=seed,
                 source_seed=source_seed,
                 intensity_cps_1m=intensity_cps_1m,
                 source_generation_options=source_options,
@@ -797,7 +737,7 @@ def build_ablation_plan(
                     base_config_path=base_config_path,
                     case=case,
                     variant=variant,
-                    seed=int(seed),
+                    seed=seed,
                     output_tag=tag,
                 )
                 config_path = config_dir / f"{tag}.json"
@@ -805,7 +745,7 @@ def build_ablation_plan(
                 command = _trial_command(
                     config_path=config_path,
                     source_path=source_path,
-                    obstacle_seed=int(seed),
+                    obstacle_seed=seed,
                     output_tag=tag,
                     extra_args=variant.cli_args,
                 )
@@ -813,7 +753,7 @@ def build_ablation_plan(
                     AblationPlanEntry(
                         case=case.name,
                         variant=variant.name,
-                        seed=int(seed),
+                        seed=seed,
                         config_path=config_path,
                         source_path=source_path,
                         command=command,
@@ -842,7 +782,7 @@ def _trial_command(
         "--environment-mode",
         "random",
         "--obstacle-seed",
-        str(int(obstacle_seed)),
+        str(_json_integer(obstacle_seed, field_name="obstacle_seed", minimum=0)),
         "--source-config",
         source_path.as_posix(),
         "--measurement-time-s",

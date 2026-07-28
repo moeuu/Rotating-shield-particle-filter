@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Callable, Dict, Iterable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from spectrum.library import Nuclide, NuclideLine
+
+
+NATIVE_GEANT4_ENERGY_MIN_KEV = 0.0
+NATIVE_GEANT4_ENERGY_MAX_KEV = 1700.0
+NATIVE_GEANT4_BIN_WIDTH_KEV = 2.0
+NATIVE_GEANT4_BIN_COUNT = 851
+NATIVE_GEANT4_BACKGROUND_MODEL_ID = (
+    "native_geant4_background_shape_v1_bin_centres"
+)
+NATIVE_GEANT4_DETECTOR_RESPONSE_SPEC = (
+    "native_incident_gamma_response_v1|axis=index*bin_width|"
+    "sigma=max(0.5*sqrt(E)-1.5,0.5)|"
+    "continuum=exp(-E/max(compton_edge/3,1e-12)),weight=2|"
+    "backscatter=gaussian(E/(1+2E/511)),weight=0.03|"
+    "discrete_column_normalization"
+)
+NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256 = hashlib.sha256(
+    NATIVE_GEANT4_DETECTOR_RESPONSE_SPEC.encode("ascii")
+).hexdigest()
 
 try:
     import torch
@@ -185,6 +205,45 @@ def default_background_shape(energy_axis_keV: NDArray[np.float64]) -> NDArray[np
     if total > 0:
         bg = bg / total
     return bg
+
+
+def native_geant4_background_shape(
+    energy_axis_keV: NDArray[np.float64],
+    bin_width_keV: float,
+) -> NDArray[np.float64]:
+    """
+    Return the normalized raw-bin background distribution used by Geant4.
+
+    The native sidecar evaluates its analytic background at each histogram
+    bin centre.  ``energy_axis_keV`` stores the corresponding lower-edge
+    coordinate used throughout the Python spectrum pipeline, so half a bin is
+    added here before evaluating the shared formula.
+    """
+    axis = np.asarray(energy_axis_keV, dtype=np.float64)
+    width = float(bin_width_keV)
+    if (
+        axis.ndim != 1
+        or axis.size == 0
+        or not np.all(np.isfinite(axis))
+        or not np.isfinite(width)
+        or width <= 0.0
+    ):
+        raise ValueError(
+            "Native Geant4 background requires a finite one-dimensional "
+            "energy axis and positive bin width."
+        )
+    centres = axis + 0.5 * width
+    shape = (
+        0.62 * np.exp(-np.maximum(centres, 0.0) / 260.0)
+        + 0.30 * np.exp(-np.maximum(centres, 0.0) / 1050.0)
+        + 0.08
+        * np.exp(-0.5 * np.square((centres - 1460.0) / 38.0))
+    )
+    shape = np.maximum(shape, 0.0)
+    normalization = float(np.sum(shape))
+    if not np.isfinite(normalization) or normalization <= 0.0:
+        raise RuntimeError("Native Geant4 background shape is not normalizable.")
+    return np.asarray(shape / normalization, dtype=np.float64)
 
 
 def default_resolution() -> Callable[[float], float]:
@@ -368,6 +427,95 @@ def build_incident_gamma_response_matrix(
             backscatter_fraction=backscatter_fraction,
         )
     return operator
+
+
+def build_native_geant4_detector_response_matrix(
+    energy_axis: NDArray[np.float64],
+    bin_width_keV: float | None = None,
+) -> NDArray[np.float64]:
+    """Return the exact probability matrix sampled by the native sidecar.
+
+    This is intentionally separate from the configurable analysis response
+    model.  Its discrete bin coordinates, 0.5-keV minimum resolution,
+    continuum-to-peak ratio of 2, and backscatter fraction of 0.03 mirror
+    ``BuildDetectorResponseCdfs`` in the C++ Geant4 sidecar.
+    """
+    axis = np.asarray(energy_axis, dtype=np.float64)
+    if (
+        axis.ndim != 1
+        or axis.size < 2
+        or np.any(~np.isfinite(axis))
+        or np.any(np.diff(axis) <= 0.0)
+    ):
+        raise ValueError(
+            "Native Geant4 response requires a finite increasing energy axis."
+        )
+    width = (
+        float(axis[1] - axis[0])
+        if bin_width_keV is None
+        else float(bin_width_keV)
+    )
+    expected_axis = np.arange(axis.size, dtype=np.float64) * width
+    if (
+        not np.isfinite(width)
+        or width <= 0.0
+        or not np.array_equal(axis, expected_axis)
+    ):
+        raise ValueError(
+            "Native Geant4 response requires the exact index-times-bin-width "
+            "axis used by the sidecar."
+        )
+    incident = axis[np.newaxis, :]
+    output = axis[:, np.newaxis]
+    sigma = np.maximum(0.5 * np.sqrt(incident) - 1.5, 0.5)
+    peak = np.exp(-0.5 * np.square((output - incident) / sigma))
+    peak /= np.maximum(
+        np.sum(peak, axis=0, keepdims=True),
+        np.finfo(np.float64).tiny,
+    )
+    electron_rest_energy_keV = 511.0
+    compton_edge = incident * (
+        1.0
+        - 1.0
+        / (1.0 + 2.0 * incident / electron_rest_energy_keV)
+    )
+    continuum_tau = np.maximum(compton_edge / 3.0, 1.0e-12)
+    continuum = np.where(
+        output <= compton_edge,
+        np.exp(-output / continuum_tau),
+        0.0,
+    )
+    continuum /= np.maximum(
+        np.sum(continuum, axis=0, keepdims=True),
+        np.finfo(np.float64).tiny,
+    )
+    backscatter_energy = incident / (
+        1.0 + 2.0 * incident / electron_rest_energy_keV
+    )
+    backscatter_sigma = np.maximum(
+        0.5 * np.sqrt(backscatter_energy) - 1.5,
+        0.5,
+    )
+    backscatter = np.exp(
+        -0.5
+        * np.square(
+            (output - backscatter_energy) / backscatter_sigma
+        )
+    )
+    backscatter /= np.maximum(
+        np.sum(backscatter, axis=0, keepdims=True),
+        np.finfo(np.float64).tiny,
+    )
+    operator = (
+        peak + 2.0 * continuum + 0.03 * backscatter
+    ) / 3.03
+    operator[:, 0] = 0.0
+    operator[0, 0] = 1.0
+    operator /= np.maximum(
+        np.sum(operator, axis=0, keepdims=True),
+        np.finfo(np.float64).tiny,
+    )
+    return np.asarray(operator, dtype=np.float64)
 
 
 def _nuclide_response(

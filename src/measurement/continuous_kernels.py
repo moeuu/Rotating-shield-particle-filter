@@ -7,6 +7,7 @@ consistent with Sec. 3.2–3.3 of the thesis (inverse-square law plus attenuatio
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 import re
 from typing import Callable, Dict, TypeVar
 
@@ -20,15 +21,16 @@ from measurement.shielding import (
     CONCRETE_MU_CM_INV,
     LOCAL_POSITIVE_OCTANT_CENTER,
     OctantShield,
-    SHIELD_GEOMETRY_SPHERICAL_OCTANT,
     generate_octant_orientations,
     octant_index_from_normal,
-    path_length_cm,
-    rotated_positive_octant_blocks_direction,
     resolve_mu_values,
     rotation_matrix_between_vectors,
-    spherical_shell_path_length_cm,
     spherical_shell_path_length_cm_torch,
+)
+from spectrum.additive_scatter import (
+    AdditiveNoncollidedTransportResponse,
+    physical_scatter_basis_numpy,
+    physical_scatter_basis_torch,
 )
 
 try:  # optional dependency
@@ -46,6 +48,72 @@ _CUDA_CHUNK_FREE_MEMORY_FRACTION = 0.20
 _CUDA_CHUNK_LOW_MEMORY_FRACTION = 0.05
 _CUDA_CHUNK_MIN_RESERVE_BYTES = 512 * 1024**2
 _CUDA_CHUNK_RESERVE_FRACTION = 0.10
+_LINE_RESPONSE_CACHE_MAX_ENTRIES = 8
+_LINE_RESPONSE_CACHE_MAX_BYTES = 256 * 1024**2
+
+
+def validate_orientation_pair_indices(
+    fe_indices: object,
+    pb_indices: object,
+    *,
+    orientation_count: int,
+    expected_count: int | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Return strict zero-based Fe/Pb orientation-index arrays.
+
+    Production shield-pair identifiers are serialized as zero-based indices.
+    Negative Python-style indexing and implicit floating-point truncation would
+    silently reinterpret a corrupt live/replay record as another physical
+    shield posture, so both are rejected at the physics boundary.
+    """
+    if isinstance(orientation_count, bool) or not isinstance(
+        orientation_count,
+        (int, np.integer),
+    ):
+        raise TypeError("orientation_count must be an integer.")
+    count = int(orientation_count)
+    if count <= 0:
+        raise ValueError("orientation_count must be positive.")
+    fe_raw = np.asarray(fe_indices)
+    pb_raw = np.asarray(pb_indices)
+    if (
+        fe_raw.ndim != 1
+        or pb_raw.ndim != 1
+        or fe_raw.dtype == np.bool_
+        or pb_raw.dtype == np.bool_
+        or not np.issubdtype(fe_raw.dtype, np.integer)
+        or not np.issubdtype(pb_raw.dtype, np.integer)
+    ):
+        raise ValueError(
+            "Fe/Pb orientation indices must be one-dimensional integer arrays."
+        )
+    if fe_raw.size != pb_raw.size:
+        raise ValueError("Fe and Pb index arrays must have matching lengths.")
+    if expected_count is not None:
+        if isinstance(expected_count, bool) or not isinstance(
+            expected_count,
+            (int, np.integer),
+        ):
+            raise TypeError("expected_count must be an integer.")
+        expected = int(expected_count)
+        if expected < 0:
+            raise ValueError("expected_count must be nonnegative.")
+        if fe_raw.size != expected:
+            raise ValueError(
+                "Fe/Pb index arrays must match the expected row count."
+            )
+    fe_arr = fe_raw.astype(np.int64, copy=False)
+    pb_arr = pb_raw.astype(np.int64, copy=False)
+    if (
+        np.any(fe_arr < 0)
+        or np.any(fe_arr >= count)
+        or np.any(pb_arr < 0)
+        or np.any(pb_arr >= count)
+    ):
+        raise IndexError(
+            f"Fe/Pb orientation index values must lie in [0, {count})."
+        )
+    return fe_arr, pb_arr
 
 
 def _finite_sphere_geometric_term_torch(
@@ -80,16 +148,24 @@ def _source_scale_rows_torch(
     device: "torch.device",
     dtype: "torch.dtype",
 ) -> "torch.Tensor":
-    """Return a nonnegative row-wise source scale tensor for pair batches."""
+    """Return a validated row-wise source scale tensor for pair batches."""
     if torch is None:
         raise RuntimeError("torch is not available")
     scale = torch.as_tensor(source_scale, device=device, dtype=dtype)
     if scale.numel() == 1:
-        return torch.clamp(scale.reshape(1, 1), min=0.0)
+        scale = scale.reshape(1)
+    else:
+        scale = scale.reshape(-1)
+        if int(scale.numel()) != int(num_rows):
+            raise ValueError(
+                "source_scale must be scalar or contain one value per pair."
+            )
+    if not bool(torch.all(torch.isfinite(scale))) or bool(torch.any(scale < 0.0)):
+        raise ValueError("source_scale values must be finite and nonnegative.")
+    if int(scale.numel()) == 1:
+        return scale.reshape(1, 1)
     scale = scale.reshape(-1)
-    if int(scale.numel()) != int(num_rows):
-        raise ValueError("source_scale must be scalar or contain one value per pair.")
-    return torch.clamp(scale, min=0.0).view(int(num_rows), 1)
+    return scale.view(int(num_rows), 1)
 
 
 def geometric_term(detector: NDArray[np.float64], source: NDArray[np.float64]) -> float:
@@ -139,251 +215,6 @@ def finite_sphere_geometric_term(
 def _normalize_isotope_key(isotope: str) -> str:
     """Return a normalized isotope key for table lookups."""
     return re.sub(r"[^A-Za-z0-9]", "", str(isotope)).upper()
-
-
-_TRANSPORT_RESPONSE_COEFFICIENT_KEYS = frozenset(
-    {
-        "distance",
-        "distance_fe",
-        "distance_obstacle",
-        "distance_pb",
-        "distance_shield",
-        "fe",
-        "fe_obstacle",
-        "fe_pb",
-        "fe_squared",
-        "obstacle",
-        "obstacle_squared",
-        "pb",
-        "pb_obstacle",
-        "pb_squared",
-        "shield",
-        "shield_obstacle",
-        "shield_squared",
-    }
-)
-_TRANSPORT_RESPONSE_CAP_KEYS = frozenset(
-    {
-        "distance_fe",
-        "distance_obstacle",
-        "distance_pb",
-        "distance_shield",
-        "fe",
-        "obstacle",
-        "pb",
-        "shield",
-    }
-)
-
-
-def transport_response_payload_for_isotope(
-    model: dict[str, object] | None,
-    isotope: str,
-) -> dict[str, object]:
-    """Return the configured transport-response payload for one isotope."""
-    if not isinstance(model, dict) or bool(model.get("enabled", True)) is False:
-        return {}
-    by_isotope = model.get("by_isotope", {})
-    if not isinstance(by_isotope, dict):
-        return {}
-    payload = by_isotope.get(str(isotope))
-    if payload is None:
-        normalized = {
-            _normalize_isotope_key(key): value for key, value in by_isotope.items()
-        }
-        payload = normalized.get(_normalize_isotope_key(isotope))
-    return dict(payload) if isinstance(payload, dict) else {}
-
-
-def transport_response_coefficients_from_payload(
-    payload: dict[str, object],
-    *,
-    default_min_log: float = -50.0,
-    default_max_log: float = 50.0,
-) -> tuple[dict[str, float], float, float]:
-    """Return optical-depth response coefficients and log-scale bounds."""
-    if not isinstance(payload, dict) or not payload:
-        return {}, float(default_min_log), float(default_max_log)
-    coeffs = payload.get("tau_coefficients", {})
-    if not isinstance(coeffs, dict):
-        raise ValueError("tau_coefficients must be an object.")
-    unknown = sorted(set(coeffs) - _TRANSPORT_RESPONSE_COEFFICIENT_KEYS)
-    if unknown:
-        raise ValueError(
-            "Unsupported tau_coefficients settings: " + ", ".join(unknown)
-        )
-    parsed = {
-        key: float(coeffs[key])
-        for key in _TRANSPORT_RESPONSE_COEFFICIENT_KEYS
-        if key in coeffs
-    }
-    min_log = float(payload.get("min_log_scale", default_min_log))
-    max_log = float(payload.get("max_log_scale", default_max_log))
-    if max_log < min_log:
-        raise ValueError("max_log_scale must be greater than or equal to min_log_scale.")
-    return parsed, min_log, max_log
-
-
-def transport_response_feature_caps_from_payload(
-    payload: dict[str, object],
-) -> tuple[
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-    float | None,
-]:
-    """Return optional optical-depth feature caps from one payload."""
-    if "feature_caps" in payload:
-        raise ValueError(
-            "feature_caps is retired; use the canonical tau_feature_caps field."
-        )
-    caps = payload.get("tau_feature_caps", {})
-    if not isinstance(caps, dict):
-        raise ValueError("tau_feature_caps must be an object.")
-    unknown = sorted(set(caps) - _TRANSPORT_RESPONSE_CAP_KEYS)
-    if unknown:
-        raise ValueError(
-            "Unsupported tau_feature_caps settings: " + ", ".join(unknown)
-        )
-
-    def _cap_value(name: str) -> float | None:
-        """Return one finite nonnegative cap when configured."""
-        if name not in caps:
-            return None
-        value = float(caps[name])
-        if np.isfinite(value) and value >= 0.0:
-            return value
-        return None
-
-    return (
-        _cap_value("shield"),
-        _cap_value("obstacle"),
-        _cap_value("fe"),
-        _cap_value("pb"),
-        _cap_value("distance_shield"),
-        _cap_value("distance_fe"),
-        _cap_value("distance_pb"),
-        _cap_value("distance_obstacle"),
-    )
-
-
-def capped_transport_response_feature(
-    value: float,
-    cap: float | None,
-) -> float:
-    """Return a nonnegative optical-depth feature with an optional cap."""
-    feature = max(float(value), 0.0)
-    if cap is None:
-        return feature
-    return min(feature, float(cap))
-
-
-def transport_response_pair_log_scale_from_payload(
-    payload: dict[str, object],
-    pair_id: int,
-) -> float:
-    """Return the log-scale transport-response term for one shield pair."""
-    if not isinstance(payload, dict) or not payload:
-        return 0.0
-    scale = float(payload.get("scale", 1.0))
-    pair_scales = payload.get("scale_by_pair", {})
-    if isinstance(pair_scales, dict):
-        value = pair_scales.get(str(int(pair_id)), pair_scales.get(int(pair_id)))
-        if value is not None:
-            scale = float(value)
-    return float(np.log(max(scale, 1.0e-12)))
-
-
-def transport_response_factor_from_payload(
-    payload: dict[str, object],
-    *,
-    pair_id: int,
-    shield_tau_feature: float,
-    obstacle_tau_feature: float,
-    fe_tau_feature: float | None = None,
-    pb_tau_feature: float | None = None,
-    distance_feature: float | None = None,
-    distance_shield_feature: float | None = None,
-    default_min_log: float = -50.0,
-    default_max_log: float = 50.0,
-) -> float:
-    """Return source-local transport-response factor from one payload."""
-    if not isinstance(payload, dict) or not payload:
-        return 1.0
-    coeffs, min_log, max_log = transport_response_coefficients_from_payload(
-        payload,
-        default_min_log=default_min_log,
-        default_max_log=default_max_log,
-    )
-    (
-        shield_cap,
-        obstacle_cap,
-        fe_cap,
-        pb_cap,
-        distance_shield_cap,
-        distance_fe_cap,
-        distance_pb_cap,
-        distance_obstacle_cap,
-    ) = transport_response_feature_caps_from_payload(payload)
-    shield_tau_raw = max(float(shield_tau_feature), 0.0)
-    obstacle_tau_raw = max(float(obstacle_tau_feature), 0.0)
-    fe_tau_raw = max(float(fe_tau_feature or 0.0), 0.0)
-    pb_tau_raw = max(float(pb_tau_feature or 0.0), 0.0)
-    shield_tau = capped_transport_response_feature(shield_tau_raw, shield_cap)
-    obstacle_tau = capped_transport_response_feature(
-        obstacle_tau_raw,
-        obstacle_cap,
-    )
-    fe_tau = capped_transport_response_feature(fe_tau_raw, fe_cap)
-    pb_tau = capped_transport_response_feature(pb_tau_raw, pb_cap)
-    distance = max(float(distance_feature or 0.0), 0.0)
-    distance_shield = (
-        max(float(distance_shield_feature), 0.0)
-        if distance_shield_feature is not None
-        else distance * shield_tau_raw
-    )
-    distance_shield = capped_transport_response_feature(
-        distance_shield,
-        distance_shield_cap,
-    )
-    distance_fe = capped_transport_response_feature(
-        distance * fe_tau_raw,
-        distance_fe_cap,
-    )
-    distance_pb = capped_transport_response_feature(
-        distance * pb_tau_raw,
-        distance_pb_cap,
-    )
-    distance_obstacle = capped_transport_response_feature(
-        distance * obstacle_tau_raw,
-        distance_obstacle_cap,
-    )
-    log_scale = transport_response_pair_log_scale_from_payload(payload, pair_id)
-    log_scale += float(coeffs.get("shield", 0.0)) * shield_tau
-    log_scale += float(coeffs.get("obstacle", 0.0)) * obstacle_tau
-    log_scale += float(coeffs.get("shield_squared", 0.0)) * shield_tau * shield_tau
-    log_scale += (
-        float(coeffs.get("obstacle_squared", 0.0)) * obstacle_tau * obstacle_tau
-    )
-    log_scale += float(coeffs.get("shield_obstacle", 0.0)) * shield_tau * obstacle_tau
-    log_scale += float(coeffs.get("fe", 0.0)) * fe_tau
-    log_scale += float(coeffs.get("pb", 0.0)) * pb_tau
-    log_scale += float(coeffs.get("fe_squared", 0.0)) * fe_tau * fe_tau
-    log_scale += float(coeffs.get("pb_squared", 0.0)) * pb_tau * pb_tau
-    log_scale += float(coeffs.get("fe_pb", 0.0)) * fe_tau * pb_tau
-    log_scale += float(coeffs.get("fe_obstacle", 0.0)) * fe_tau * obstacle_tau
-    log_scale += float(coeffs.get("pb_obstacle", 0.0)) * pb_tau * obstacle_tau
-    log_scale += float(coeffs.get("distance", 0.0)) * distance
-    log_scale += float(coeffs.get("distance_shield", 0.0)) * distance_shield
-    log_scale += float(coeffs.get("distance_fe", 0.0)) * distance_fe
-    log_scale += float(coeffs.get("distance_pb", 0.0)) * distance_pb
-    log_scale += float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
-    log_scale = min(max(log_scale, min_log), max_log)
-    return float(np.exp(log_scale))
 
 
 def resolve_obstacle_mu_cm_inv(
@@ -1161,6 +992,62 @@ def _resolve_dtype(dtype: str) -> "torch.dtype":
     raise ValueError(f"Unsupported torch dtype: {dtype}")
 
 
+@dataclass(frozen=True)
+class LineTransportComponents:
+    """Store physical transport components with one trailing line axis."""
+
+    total_kernel: NDArray[np.float64]
+    unattenuated_kernel: NDArray[np.float64]
+    uncollided_kernel: NDArray[np.float64]
+    tau_fe: NDArray[np.float64]
+    tau_pb: NDArray[np.float64]
+    tau_obstacle: NDArray[np.float64]
+    tau_obstacle_compton: NDArray[np.float64]
+    distance_m: NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        """Require one common finite nonnegative shape ending in lines."""
+        arrays = tuple(
+            np.asarray(getattr(self, name), dtype=np.float64)
+            for name in (
+                "total_kernel",
+                "unattenuated_kernel",
+                "uncollided_kernel",
+                "tau_fe",
+                "tau_pb",
+                "tau_obstacle",
+                "tau_obstacle_compton",
+                "distance_m",
+            )
+        )
+        shape = arrays[0].shape
+        if (
+            len(shape) < 2
+            or any(array.shape != shape for array in arrays)
+            or any(np.any(~np.isfinite(array)) for array in arrays)
+            or any(np.any(array < 0.0) for array in arrays)
+        ):
+            raise ValueError(
+                "Line transport components must be finite nonnegative "
+                "arrays with one common shape and a trailing line axis."
+            )
+        for name, array in zip(
+            (
+                "total_kernel",
+                "unattenuated_kernel",
+                "uncollided_kernel",
+                "tau_fe",
+                "tau_pb",
+                "tau_obstacle",
+                "tau_obstacle_compton",
+                "distance_m",
+            ),
+            arrays,
+            strict=True,
+        ):
+            object.__setattr__(self, name, array)
+
+
 @dataclass
 class ContinuousKernel:
     """
@@ -1190,7 +1077,7 @@ class ContinuousKernel:
     source_extent_radius_m: float = 0.0
     source_extent_samples: int = 1
     line_mu_by_isotope: Dict[str, object] | None = None
-    transport_response_model: Dict[str, object] | None = None
+    additive_scatter_response: AdditiveNoncollidedTransportResponse | None = None
     _obstacle_boxes_cache: NDArray[np.float64] | None = field(
         default=None, init=False, repr=False
     )
@@ -1206,38 +1093,85 @@ class ContinuousKernel:
         init=False,
         repr=False,
     )
+    _line_response_cache: dict[tuple[object, ...], NDArray[np.float64]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    line_response_cache_hits: int = field(default=0, init=False)
+    line_response_cache_misses: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        """Validate obstacle attenuation settings."""
-        self.obstacle_height_m = float(self.obstacle_height_m)
-        if self.obstacle_height_m < 0.0:
-            raise ValueError("obstacle_height_m must be non-negative.")
-        self.obstacle_buildup_coeff = max(float(self.obstacle_buildup_coeff), 0.0)
-        self.shield_params = ShieldParams(
-            mu_pb=float(self.shield_params.mu_pb),
-            mu_fe=float(self.shield_params.mu_fe),
-            thickness_pb_cm=float(self.shield_params.thickness_pb_cm),
-            thickness_fe_cm=float(self.shield_params.thickness_fe_cm),
-            inner_radius_fe_cm=float(self.shield_params.inner_radius_fe_cm),
-            inner_radius_pb_cm=float(self.shield_params.inner_radius_pb_cm),
-            buildup_fe_coeff=max(float(self.shield_params.buildup_fe_coeff), 0.0),
-            buildup_pb_coeff=max(float(self.shield_params.buildup_pb_coeff), 0.0),
-            shield_geometry_model=self.shield_params.shield_geometry_model,
-            use_angle_attenuation=bool(self.shield_params.use_angle_attenuation),
-        )
-        self.detector_radius_m = max(float(self.detector_radius_m), 0.0)
+        """Validate every physical and execution field without silent repair."""
+        for name in (
+            "obstacle_height_m",
+            "obstacle_buildup_coeff",
+            "detector_radius_m",
+            "source_extent_radius_m",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{name} must be a real number.")
+            resolved = float(value)
+            if not np.isfinite(resolved) or resolved < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative.")
+            setattr(self, name, resolved)
+        if not isinstance(self.shield_params, ShieldParams):
+            raise TypeError("shield_params must be a ShieldParams instance.")
         if self.detector_aperture_radius_m is None:
             self.detector_aperture_radius_m = self.detector_radius_m
-        self.detector_aperture_radius_m = max(
-            float(self.detector_aperture_radius_m),
-            0.0,
-        )
-        self.detector_aperture_samples = max(int(self.detector_aperture_samples), 1)
+        aperture_radius = self.detector_aperture_radius_m
+        if isinstance(aperture_radius, bool) or not isinstance(
+            aperture_radius,
+            Real,
+        ):
+            raise TypeError(
+                "detector_aperture_radius_m must be a real number or None."
+            )
+        self.detector_aperture_radius_m = float(aperture_radius)
+        if (
+            not np.isfinite(self.detector_aperture_radius_m)
+            or self.detector_aperture_radius_m < 0.0
+        ):
+            raise ValueError(
+                "detector_aperture_radius_m must be finite and nonnegative."
+            )
+        for name in ("detector_aperture_samples", "source_extent_samples"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{name} must be an integer.")
+            resolved = int(value)
+            if resolved <= 0:
+                raise ValueError(f"{name} must be positive.")
+            setattr(self, name, resolved)
         self.detector_aperture_sampling = normalize_detector_aperture_sampling(
             self.detector_aperture_sampling
         )
-        self.source_extent_radius_m = max(float(self.source_extent_radius_m), 0.0)
-        self.source_extent_samples = max(int(self.source_extent_samples), 1)
+        if (self.source_extent_radius_m == 0.0) != (
+            self.source_extent_samples == 1
+        ):
+            raise ValueError(
+                "Source extent requires radius=0 with one sample, or a "
+                "positive radius with at least two samples."
+            )
+        if not isinstance(self.use_gpu, bool):
+            raise TypeError("use_gpu must be a boolean.")
+        if not isinstance(self.gpu_device, str) or not self.gpu_device:
+            raise TypeError("gpu_device must be a nonempty string.")
+        if not isinstance(self.gpu_dtype, str) or not self.gpu_dtype:
+            raise TypeError("gpu_dtype must be a nonempty string.")
+        orientations = np.asarray(self.orientations, dtype=np.float64)
+        if (
+            orientations.ndim != 2
+            or orientations.shape[1] != 3
+            or orientations.shape[0] == 0
+            or np.any(~np.isfinite(orientations))
+            or np.any(np.linalg.norm(orientations, axis=1) <= 0.0)
+        ):
+            raise ValueError(
+                "orientations must be a nonempty finite array shaped N x 3."
+            )
+        self.orientations = np.ascontiguousarray(orientations)
 
     def _rotated_octant_rotation_torch(
         self,
@@ -1540,6 +1474,100 @@ class ContinuousKernel:
             (weight / total_weight, mu_fe, mu_pb) for weight, mu_fe, mu_pb in rows
         )
 
+    def _line_energy_values_keV(self, isotope: str) -> tuple[float, ...]:
+        """Return positive-line energies in the shared attenuation-table order."""
+        table = self.line_mu_by_isotope
+        if not isinstance(table, dict):
+            return ()
+        entry = table.get(isotope)
+        if entry is None:
+            normalized = {
+                _normalize_isotope_key(key): value
+                for key, value in table.items()
+            }
+            entry = normalized.get(_normalize_isotope_key(isotope))
+        energies: list[float] = []
+        for item in entry if isinstance(entry, (list, tuple)) else ():
+            if not isinstance(item, dict) or "energy_keV" not in item:
+                return ()
+            energy = float(item["energy_keV"])
+            if not np.isfinite(energy) or energy <= 0.0:
+                return ()
+            energies.append(energy)
+        if len(energies) != len(self._line_mu_values(isotope)):
+            return ()
+        return tuple(energies)
+
+    def _validated_positive_line_indices(
+        self,
+        isotope: str,
+        line_indices: object,
+    ) -> NDArray[np.int64]:
+        """Return unique indices into the configured positive-line basis.
+
+        The spectrum pipeline records line indices after filtering the isotope
+        library to positive-intensity lines.  Production line attenuation
+        tables use that same order.  This validator intentionally rejects
+        implicit float truncation, duplicates, missing line tables, and
+        out-of-range indices instead of silently changing the event basis.
+        """
+        entries = self._line_mu_values(str(isotope))
+        if not entries:
+            raise ValueError(
+                f"No positive line-resolved transport basis exists for {isotope!r}."
+            )
+        raw = np.asarray(line_indices)
+        if raw.ndim != 1 or raw.size == 0 or raw.dtype == np.bool_:
+            raise ValueError(
+                "positive_line_indices must be a non-empty one-dimensional "
+                "integer array."
+            )
+        if np.issubdtype(raw.dtype, np.integer):
+            indices = raw.astype(np.int64, copy=False)
+        elif np.issubdtype(raw.dtype, np.floating):
+            if np.any(~np.isfinite(raw)) or np.any(raw != np.floor(raw)):
+                raise ValueError(
+                    "positive_line_indices must contain exact integer values."
+                )
+            indices = raw.astype(np.int64)
+        else:
+            raise ValueError(
+                "positive_line_indices must contain exact integer values."
+            )
+        if np.unique(indices).size != indices.size:
+            raise ValueError("positive_line_indices must not contain duplicates.")
+        if np.any(indices < 0) or np.any(indices >= len(entries)):
+            raise IndexError(
+                "positive_line_indices contains an index outside the configured "
+                f"positive-line basis [0, {len(entries)})."
+            )
+        return np.asarray(indices, dtype=np.int64)
+
+    def line_branching_weights(
+        self,
+        isotope: str,
+        positive_line_indices: object,
+    ) -> NDArray[np.float64]:
+        """Return normalized branching weights for selected positive lines."""
+        indices = self._validated_positive_line_indices(
+            isotope,
+            positive_line_indices,
+        )
+        entries = np.asarray(self._line_mu_values(str(isotope)), dtype=np.float64)
+        return np.asarray(entries[indices, 0], dtype=np.float64)
+
+    def clear_line_response_cache(self) -> None:
+        """Clear exact-input cached line responses and reset cache counters."""
+        self._line_response_cache.clear()
+        self.line_response_cache_hits = 0
+        self.line_response_cache_misses = 0
+
+    @staticmethod
+    def _line_response_array_key(values: NDArray[np.generic]) -> tuple[object, ...]:
+        """Return an exact dtype/shape/byte key for one response input array."""
+        array = np.ascontiguousarray(values)
+        return (str(array.dtype), tuple(int(value) for value in array.shape), array.tobytes())
+
     def _max_line_count(self) -> int:
         """Return the maximum configured line count used by attenuation batching."""
         table = self.line_mu_by_isotope
@@ -1549,427 +1577,6 @@ class ContinuousKernel:
         for isotope in table:
             count = max(count, len(self._line_mu_values(str(isotope))))
         return max(1, int(count))
-
-    def _transport_response_payload(self, isotope: str) -> dict[str, object]:
-        """Return the configured transport-response payload for one isotope."""
-        return transport_response_payload_for_isotope(
-            self.transport_response_model,
-            isotope,
-        )
-
-    def _transport_response_pair_log_scale(
-        self,
-        isotope: str,
-        fe_index: int,
-        pb_index: int,
-    ) -> float:
-        """Return the isotope/pair log-scale transport response term."""
-        payload = self._transport_response_payload(isotope)
-        pair_id = int(fe_index) * int(len(self.orientations)) + int(pb_index)
-        return transport_response_pair_log_scale_from_payload(payload, pair_id)
-
-    def _transport_response_coefficients(
-        self,
-        isotope: str,
-    ) -> tuple[dict[str, float], float, float]:
-        """Return optical-depth response coefficients and log-scale bounds."""
-        payload = self._transport_response_payload(isotope)
-        return transport_response_coefficients_from_payload(payload)
-
-    def _transport_response_feature_caps(
-        self,
-        isotope: str,
-    ) -> tuple[
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-        float | None,
-    ]:
-        """Return optional optical-depth feature caps for one isotope."""
-        payload = self._transport_response_payload(isotope)
-        return transport_response_feature_caps_from_payload(payload)
-
-    @staticmethod
-    def _capped_transport_feature(value: float, cap: float | None) -> float:
-        """Return a nonnegative optical-depth feature with an optional cap."""
-        return capped_transport_response_feature(value, cap)
-
-    def _transport_response_factor(
-        self,
-        isotope: str,
-        fe_index: int,
-        pb_index: int,
-        shield_tau_feature: float,
-        obstacle_tau_feature: float,
-        fe_tau_feature: float | None = None,
-        pb_tau_feature: float | None = None,
-        distance_feature: float | None = None,
-        distance_shield_feature: float | None = None,
-    ) -> float:
-        """Return source-local transport response factor for CPU kernel math."""
-        payload = self._transport_response_payload(isotope)
-        pair_id = int(fe_index) * int(len(self.orientations)) + int(pb_index)
-        return transport_response_factor_from_payload(
-            payload,
-            pair_id=pair_id,
-            shield_tau_feature=shield_tau_feature,
-            obstacle_tau_feature=obstacle_tau_feature,
-            fe_tau_feature=fe_tau_feature,
-            pb_tau_feature=pb_tau_feature,
-            distance_feature=distance_feature,
-            distance_shield_feature=distance_shield_feature,
-        )
-
-    def _response_adjusted_attenuation(
-        self,
-        isotope: str,
-        attenuation: float,
-        response_factor: float,
-    ) -> float:
-        """
-        Return attenuation after applying an optional transport-response model.
-
-        Without a calibrated transport-response payload, attenuation remains a
-        transmission probability and is capped at unity.  A configured
-        transport-response model is fitted to ``transport truth / PF target``
-        and may represent detected interacted-primary contributions, so it must
-        be allowed to exceed the unattenuated transmission cap to match the
-        validation residual model that exported it.
-        """
-        base_attenuation = float(min(1.0, max(0.0, float(attenuation))))
-        if self._transport_response_payload(isotope):
-            return max(0.0, base_attenuation * float(response_factor))
-        return base_attenuation
-
-    def _response_adjusted_attenuation_torch(
-        self,
-        isotope: str,
-        attenuation: "torch.Tensor",
-        response_factor: "torch.Tensor | float" = 1.0,
-    ) -> "torch.Tensor":
-        """Return torch attenuation with the same response-model cap semantics."""
-        if torch is None:
-            raise RuntimeError("torch is not available")
-        base_attenuation = torch.clamp(attenuation, min=0.0, max=1.0)
-        if self._transport_response_payload(isotope):
-            return torch.clamp(base_attenuation * response_factor, min=0.0)
-        return base_attenuation
-
-    def _transport_response_factor_torch(
-        self,
-        isotope: str,
-        fe_indices: NDArray[np.int64],
-        pb_indices: NDArray[np.int64],
-        shield_tau_feature: "torch.Tensor",
-        obstacle_tau_feature: "torch.Tensor",
-        fe_tau_feature: "torch.Tensor | None" = None,
-        pb_tau_feature: "torch.Tensor | None" = None,
-        distance_feature: "torch.Tensor | None" = None,
-        distance_shield_feature: "torch.Tensor | None" = None,
-        *,
-        device: "torch.device",
-        dtype: "torch.dtype",
-    ) -> "torch.Tensor":
-        """Return source-local transport response factors for torch kernel math."""
-        if torch is None:
-            raise RuntimeError("torch is not available")
-        payload = self._transport_response_payload(isotope)
-        if not payload:
-            return torch.ones_like(shield_tau_feature, device=device, dtype=dtype)
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        pair_logs = [
-            self._transport_response_pair_log_scale(isotope, int(fe), int(pb))
-            for fe, pb in zip(fe_arr, pb_arr)
-        ]
-        pair_log_t = torch.as_tensor(pair_logs, device=device, dtype=dtype)
-        while pair_log_t.ndim < shield_tau_feature.ndim:
-            pair_log_t = pair_log_t.unsqueeze(-1)
-        coeffs, min_log, max_log = self._transport_response_coefficients(isotope)
-        (
-            shield_cap,
-            obstacle_cap,
-            fe_cap,
-            pb_cap,
-            distance_shield_cap,
-            distance_fe_cap,
-            distance_pb_cap,
-            distance_obstacle_cap,
-        ) = self._transport_response_feature_caps(isotope)
-        shield_tau_raw = torch.clamp(shield_tau_feature, min=0.0)
-        shield_tau = shield_tau_raw
-        if shield_cap is not None:
-            shield_tau = torch.clamp(shield_tau, max=float(shield_cap))
-        obstacle_tau_raw = torch.clamp(obstacle_tau_feature, min=0.0)
-        obstacle_tau = obstacle_tau_raw
-        if obstacle_cap is not None:
-            obstacle_tau = torch.clamp(obstacle_tau, max=float(obstacle_cap))
-        fe_tau_raw = (
-            torch.zeros_like(shield_tau)
-            if fe_tau_feature is None
-            else torch.clamp(fe_tau_feature, min=0.0)
-        )
-        fe_tau = fe_tau_raw
-        if fe_cap is not None:
-            fe_tau = torch.clamp(fe_tau, max=float(fe_cap))
-        pb_tau_raw = (
-            torch.zeros_like(shield_tau)
-            if pb_tau_feature is None
-            else torch.clamp(pb_tau_feature, min=0.0)
-        )
-        pb_tau = pb_tau_raw
-        if pb_cap is not None:
-            pb_tau = torch.clamp(pb_tau, max=float(pb_cap))
-        distance = (
-            torch.zeros_like(shield_tau)
-            if distance_feature is None
-            else torch.clamp(distance_feature, min=0.0)
-        )
-        while distance.ndim < shield_tau.ndim:
-            distance = distance.unsqueeze(-1)
-        distance_shield = (
-            distance * shield_tau_raw
-            if distance_shield_feature is None
-            else torch.clamp(distance_shield_feature, min=0.0)
-        )
-        while distance_shield.ndim < shield_tau.ndim:
-            distance_shield = distance_shield.unsqueeze(-1)
-        if distance_shield_cap is not None:
-            distance_shield = torch.clamp(
-                distance_shield,
-                max=float(distance_shield_cap),
-            )
-        distance_fe = distance * fe_tau_raw
-        if distance_fe_cap is not None:
-            distance_fe = torch.clamp(distance_fe, max=float(distance_fe_cap))
-        distance_pb = distance * pb_tau_raw
-        if distance_pb_cap is not None:
-            distance_pb = torch.clamp(distance_pb, max=float(distance_pb_cap))
-        distance_obstacle = distance * obstacle_tau_raw
-        if distance_obstacle_cap is not None:
-            distance_obstacle = torch.clamp(
-                distance_obstacle,
-                max=float(distance_obstacle_cap),
-            )
-        log_scale = pair_log_t
-        log_scale = log_scale + float(coeffs.get("shield", 0.0)) * shield_tau
-        log_scale = log_scale + float(coeffs.get("obstacle", 0.0)) * obstacle_tau
-        log_scale = (
-            log_scale
-            + float(coeffs.get("shield_squared", 0.0)) * shield_tau * shield_tau
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("obstacle_squared", 0.0)) * obstacle_tau * obstacle_tau
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("shield_obstacle", 0.0)) * shield_tau * obstacle_tau
-        )
-        log_scale = log_scale + float(coeffs.get("fe", 0.0)) * fe_tau
-        log_scale = log_scale + float(coeffs.get("pb", 0.0)) * pb_tau
-        log_scale = log_scale + float(coeffs.get("fe_squared", 0.0)) * fe_tau * fe_tau
-        log_scale = log_scale + float(coeffs.get("pb_squared", 0.0)) * pb_tau * pb_tau
-        log_scale = log_scale + float(coeffs.get("fe_pb", 0.0)) * fe_tau * pb_tau
-        log_scale = (
-            log_scale + float(coeffs.get("fe_obstacle", 0.0)) * fe_tau * obstacle_tau
-        )
-        log_scale = (
-            log_scale + float(coeffs.get("pb_obstacle", 0.0)) * pb_tau * obstacle_tau
-        )
-        log_scale = log_scale + float(coeffs.get("distance", 0.0)) * distance
-        log_scale = (
-            log_scale + float(coeffs.get("distance_shield", 0.0)) * distance_shield
-        )
-        log_scale = log_scale + float(coeffs.get("distance_fe", 0.0)) * distance_fe
-        log_scale = log_scale + float(coeffs.get("distance_pb", 0.0)) * distance_pb
-        log_scale = (
-            log_scale + float(coeffs.get("distance_obstacle", 0.0)) * distance_obstacle
-        )
-        log_scale = torch.clamp(log_scale, min=float(min_log), max=float(max_log))
-        return torch.exp(log_scale)
-
-    def _transport_response_factor_numpy(
-        self,
-        isotope: str,
-        fe_indices: NDArray[np.int64],
-        pb_indices: NDArray[np.int64],
-        shield_tau_feature: NDArray[np.float64],
-        obstacle_tau_feature: NDArray[np.float64],
-        fe_tau_feature: NDArray[np.float64] | None = None,
-        pb_tau_feature: NDArray[np.float64] | None = None,
-        distance_feature: NDArray[np.float64] | None = None,
-        distance_shield_feature: NDArray[np.float64] | None = None,
-    ) -> NDArray[np.float64]:
-        """Return source-local response factors for batched NumPy kernel math."""
-        shield_feature = np.asarray(shield_tau_feature, dtype=float)
-        payload = self._transport_response_payload(isotope)
-        if not payload:
-            return np.ones_like(shield_feature)
-
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        pair_ids = fe_arr * int(len(self.orientations)) + pb_arr
-        base_scale = max(float(payload.get("scale", 1.0)), 1.0e-12)
-        pair_log_lookup = np.full(
-            int(len(self.orientations)) ** 2,
-            np.log(base_scale),
-            dtype=float,
-        )
-        pair_scales = payload.get("scale_by_pair", {})
-        if isinstance(pair_scales, dict):
-            # Parsing the fixed 64-entry calibration table is configuration
-            # work; detector/source evaluation below remains fully batched.
-            for raw_pair_id, raw_scale in pair_scales.items():
-                try:
-                    pair_id = int(raw_pair_id)
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= pair_id < pair_log_lookup.size:
-                    pair_log_lookup[pair_id] = np.log(
-                        max(float(raw_scale), 1.0e-12)
-                    )
-        pair_logs = pair_log_lookup[pair_ids]
-        while pair_logs.ndim < shield_feature.ndim:
-            pair_logs = pair_logs[..., None]
-
-        coeffs, min_log, max_log = self._transport_response_coefficients(isotope)
-        (
-            shield_cap,
-            obstacle_cap,
-            fe_cap,
-            pb_cap,
-            distance_shield_cap,
-            distance_fe_cap,
-            distance_pb_cap,
-            distance_obstacle_cap,
-        ) = self._transport_response_feature_caps(isotope)
-        shield_raw = np.maximum(shield_feature, 0.0)
-        shield = (
-            np.minimum(shield_raw, float(shield_cap))
-            if shield_cap is not None
-            else shield_raw
-        )
-        obstacle_raw = np.maximum(
-            np.asarray(obstacle_tau_feature, dtype=float),
-            0.0,
-        )
-        obstacle = (
-            np.minimum(obstacle_raw, float(obstacle_cap))
-            if obstacle_cap is not None
-            else obstacle_raw
-        )
-        fe_raw = (
-            np.zeros_like(shield)
-            if fe_tau_feature is None
-            else np.maximum(np.asarray(fe_tau_feature, dtype=float), 0.0)
-        )
-        fe_feature = (
-            np.minimum(fe_raw, float(fe_cap)) if fe_cap is not None else fe_raw
-        )
-        pb_raw = (
-            np.zeros_like(shield)
-            if pb_tau_feature is None
-            else np.maximum(np.asarray(pb_tau_feature, dtype=float), 0.0)
-        )
-        pb_feature = (
-            np.minimum(pb_raw, float(pb_cap)) if pb_cap is not None else pb_raw
-        )
-        distance = (
-            np.zeros_like(shield)
-            if distance_feature is None
-            else np.maximum(np.asarray(distance_feature, dtype=float), 0.0)
-        )
-        while distance.ndim < shield.ndim:
-            distance = distance[..., None]
-        distance_shield = (
-            distance * shield_raw
-            if distance_shield_feature is None
-            else np.maximum(
-                np.asarray(distance_shield_feature, dtype=float),
-                0.0,
-            )
-        )
-        while distance_shield.ndim < shield.ndim:
-            distance_shield = distance_shield[..., None]
-        if distance_shield_cap is not None:
-            distance_shield = np.minimum(
-                distance_shield,
-                float(distance_shield_cap),
-            )
-        distance_fe = distance * fe_raw
-        if distance_fe_cap is not None:
-            distance_fe = np.minimum(distance_fe, float(distance_fe_cap))
-        distance_pb = distance * pb_raw
-        if distance_pb_cap is not None:
-            distance_pb = np.minimum(distance_pb, float(distance_pb_cap))
-        distance_obstacle = distance * obstacle_raw
-        if distance_obstacle_cap is not None:
-            distance_obstacle = np.minimum(
-                distance_obstacle,
-                float(distance_obstacle_cap),
-            )
-
-        log_scale = pair_logs
-        log_scale = log_scale + float(coeffs.get("shield", 0.0)) * shield
-        log_scale = log_scale + float(coeffs.get("obstacle", 0.0)) * obstacle
-        log_scale = (
-            log_scale
-            + float(coeffs.get("shield_squared", 0.0)) * shield * shield
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("obstacle_squared", 0.0))
-            * obstacle
-            * obstacle
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("shield_obstacle", 0.0)) * shield * obstacle
-        )
-        log_scale = log_scale + float(coeffs.get("fe", 0.0)) * fe_feature
-        log_scale = log_scale + float(coeffs.get("pb", 0.0)) * pb_feature
-        log_scale = (
-            log_scale
-            + float(coeffs.get("fe_squared", 0.0)) * fe_feature * fe_feature
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("pb_squared", 0.0)) * pb_feature * pb_feature
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("fe_pb", 0.0)) * fe_feature * pb_feature
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("fe_obstacle", 0.0)) * fe_feature * obstacle
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("pb_obstacle", 0.0)) * pb_feature * obstacle
-        )
-        log_scale = log_scale + float(coeffs.get("distance", 0.0)) * distance
-        log_scale = (
-            log_scale
-            + float(coeffs.get("distance_shield", 0.0)) * distance_shield
-        )
-        log_scale = (
-            log_scale + float(coeffs.get("distance_fe", 0.0)) * distance_fe
-        )
-        log_scale = (
-            log_scale + float(coeffs.get("distance_pb", 0.0)) * distance_pb
-        )
-        log_scale = (
-            log_scale
-            + float(coeffs.get("distance_obstacle", 0.0))
-            * distance_obstacle
-        )
-        return np.exp(np.clip(log_scale, float(min_log), float(max_log)))
 
     def obstacle_boxes_m(self) -> NDArray[np.float64]:
         """Return cached obstacle boxes in meters as (x0, y0, z0, x1, y1, z1)."""
@@ -2014,6 +1621,29 @@ class ContinuousKernel:
         array = np.asarray(values, dtype=float)
         if array.ndim != 2 or array.shape[1] != boxes.shape[0]:
             return np.zeros((0, boxes.shape[0]), dtype=float)
+        return array
+
+    def obstacle_line_compton_mu_values_cm_inv(
+        self,
+        isotope: str,
+    ) -> NDArray[np.float64]:
+        """Return per-line, per-box physical Compton attenuation values."""
+        boxes = self.obstacle_boxes_m()
+        if boxes.size == 0 or self.obstacle_grid is None:
+            return np.zeros((0, 0), dtype=float)
+        values = self.obstacle_grid.transport_line_compton_mu_values(isotope)
+        if values is None:
+            return np.zeros((0, boxes.shape[0]), dtype=float)
+        array = np.asarray(values, dtype=float)
+        if array.ndim != 2 or array.shape[1] != boxes.shape[0]:
+            return np.zeros((0, boxes.shape[0]), dtype=float)
+        total = self.obstacle_line_mu_values_cm_inv(isotope)
+        if array.shape != total.shape or np.any(
+            array > total * (1.0 + 1.0e-12)
+        ):
+            raise ValueError(
+                "Obstacle Compton and total line attenuation contracts disagree."
+            )
         return array
 
     def obstacle_path_length_cm(
@@ -2317,6 +1947,33 @@ class ContinuousKernel:
         mu_t = torch.as_tensor(mu_values, device=device, dtype=dtype)
         return torch.sum(path_by_box_cm.unsqueeze(-2) * mu_t, dim=-1)
 
+    def _obstacle_line_compton_tau_from_lengths_torch(
+        self,
+        isotope: str,
+        path_by_box_cm: "torch.Tensor",
+        *,
+        line_count: int,
+        device: "torch.device",
+        dtype: "torch.dtype",
+    ) -> "torch.Tensor | None":
+        """Return line-resolved obstacle Compton depths from path lengths."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        if path_by_box_cm.shape[-1] == 0:
+            return torch.zeros(
+                (*path_by_box_cm.shape[:-1], int(line_count)),
+                device=device,
+                dtype=dtype,
+            )
+        mu_values = self.obstacle_line_compton_mu_values_cm_inv(isotope)
+        if mu_values.shape != (
+            int(line_count),
+            int(path_by_box_cm.shape[-1]),
+        ):
+            return None
+        mu_t = torch.as_tensor(mu_values, device=device, dtype=dtype)
+        return torch.sum(path_by_box_cm.unsqueeze(-2) * mu_t, dim=-1)
+
     def _gpu_enabled(self) -> bool:
         """Return True if GPU computation is enabled and available."""
         if not self.use_gpu:
@@ -2367,64 +2024,23 @@ class ContinuousKernel:
         local_direction = detector_to_source_unit @ rotation
         return torch.all(local_direction >= -float(tol), dim=-1)
 
-    def _shield_path_length_cm(
-        self,
-        direction_m: NDArray[np.float64],
-        normal: NDArray[np.float64],
-        thickness_cm: float,
-        inner_radius_cm: float,
-        blocked: bool,
-    ) -> float:
-        """Return Pb/Fe path length through the configured shield geometry."""
-        if (
-            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-            and not self.shield_params.use_angle_attenuation
-        ):
-            return spherical_shell_path_length_cm(
-                direction_m=direction_m,
-                inner_radius_cm=inner_radius_cm,
-                outer_radius_cm=inner_radius_cm + thickness_cm,
-                blocked=blocked,
-            )
-        return path_length_cm(
-            direction_m,
-            normal,
-            thickness_cm,
-            blocked=blocked,
-            use_angle_attenuation=self.shield_params.use_angle_attenuation,
-        )
-
     def _shield_segment_path_length_cm(
         self,
         source_pos: NDArray[np.float64],
         target_pos: NDArray[np.float64],
         detector_center: NDArray[np.float64],
-        incoming_normal: NDArray[np.float64],
         physical_normal: NDArray[np.float64],
         thickness_cm: float,
         inner_radius_cm: float,
-        blocked: bool,
     ) -> float:
-        """Return shield path length for a source-to-detector-aperture segment."""
-        if (
-            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-            and not self.shield_params.use_angle_attenuation
-        ):
-            return segment_rotated_octant_shell_path_length_cm(
-                source_pos=source_pos,
-                target_pos=target_pos,
-                center_pos=detector_center,
-                shield_normal=physical_normal,
-                inner_radius_cm=inner_radius_cm,
-                outer_radius_cm=inner_radius_cm + thickness_cm,
-            )
-        return self._shield_path_length_cm(
-            direction_m=np.asarray(target_pos, dtype=float)
-            - np.asarray(source_pos, dtype=float),
-            normal=incoming_normal,
-            thickness_cm=thickness_cm,
+        """Return path length through the shared spherical-octant shell."""
+        return segment_rotated_octant_shell_path_length_cm(
+            source_pos=source_pos,
+            target_pos=target_pos,
+            center_pos=detector_center,
+            shield_normal=physical_normal,
             inner_radius_cm=inner_radius_cm,
-            blocked=blocked,
+            outer_radius_cm=inner_radius_cm + thickness_cm,
         )
 
     def _detector_aperture_targets(
@@ -2617,42 +2233,21 @@ class ContinuousKernel:
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         normal_fe = self.orientations[fe_index]
         normal_pb = self.orientations[pb_index]
-        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(
-            target_pos, dtype=float
-        )
-        distance_feature = float(
-            np.linalg.norm(
-                np.asarray(source_pos, dtype=float)
-                - np.asarray(detector_pos, dtype=float)
-            )
-        )
-        blocked_fe = rotated_positive_octant_blocks_direction(
-            detector_to_source,
-            -normal_fe,
-        )
-        blocked_pb = rotated_positive_octant_blocks_direction(
-            detector_to_source,
-            -normal_pb,
-        )
         l_fe = self._shield_segment_path_length_cm(
             source_pos=source_pos,
             target_pos=target_pos,
             detector_center=detector_pos,
-            incoming_normal=normal_fe,
             physical_normal=-normal_fe,
             thickness_cm=self.shield_params.thickness_fe_cm,
             inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-            blocked=blocked_fe,
         )
         l_pb = self._shield_segment_path_length_cm(
             source_pos=source_pos,
             target_pos=target_pos,
             detector_center=detector_pos,
-            incoming_normal=normal_pb,
             physical_normal=-normal_pb,
             thickness_cm=self.shield_params.thickness_pb_cm,
             inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-            blocked=blocked_pb,
         )
         obstacle_path_by_box = np.zeros(0, dtype=float)
         tau_obstacle = 0.0
@@ -2675,10 +2270,6 @@ class ContinuousKernel:
                 line_count=len(line_entries),
             )
             attenuation = 0.0
-            shield_tau_feature = 0.0
-            fe_tau_feature = 0.0
-            pb_tau_feature = 0.0
-            obstacle_tau_feature = 0.0
             for line_index, (weight, line_mu_fe, line_mu_pb) in enumerate(line_entries):
                 tau_fe = float(line_mu_fe * l_fe)
                 tau_pb = float(line_mu_pb * l_pb)
@@ -2690,45 +2281,17 @@ class ContinuousKernel:
                 total_tau = tau_fe + tau_pb + tau_obs_line
                 buildup = self._buildup_factor(tau_fe, tau_pb, tau_obs_line)
                 attenuation += float(weight) * float(np.exp(-total_tau)) * buildup
-                shield_tau_feature += float(weight) * (tau_fe + tau_pb)
-                fe_tau_feature += float(weight) * tau_fe
-                pb_tau_feature += float(weight) * tau_pb
-                obstacle_tau_feature += float(weight) * tau_obs_line
-            response_factor = self._transport_response_factor(
-                isotope,
-                fe_index,
-                pb_index,
-                shield_tau_feature,
-                obstacle_tau_feature,
-                fe_tau_feature,
-                pb_tau_feature,
-                distance_feature,
-                distance_feature * shield_tau_feature,
-            )
-            return self._response_adjusted_attenuation(
-                isotope,
-                attenuation,
-                response_factor,
-            )
+            return float(np.clip(attenuation, 0.0, 1.0))
         tau_fe = float(mu_fe * l_fe)
         tau_pb = float(mu_pb * l_pb)
         total_tau = tau_fe + tau_pb + tau_obstacle
         buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
-        response_factor = self._transport_response_factor(
-            isotope,
-            fe_index,
-            pb_index,
-            tau_fe + tau_pb,
-            tau_obstacle,
-            tau_fe,
-            tau_pb,
-            distance_feature,
-            distance_feature * (tau_fe + tau_pb),
-        )
-        return self._response_adjusted_attenuation(
-            isotope,
-            float(np.exp(-total_tau)) * buildup,
-            response_factor,
+        return float(
+            np.clip(
+                float(np.exp(-total_tau)) * buildup,
+                0.0,
+                1.0,
+            )
         )
 
     def _shield_path_lengths_torch(
@@ -2736,63 +2299,21 @@ class ContinuousKernel:
         direction: "torch.Tensor",
         blocked_fe: "torch.Tensor",
         blocked_pb: "torch.Tensor",
-        cos_fe: "torch.Tensor",
-        cos_pb: "torch.Tensor",
-        tol_t: "torch.Tensor",
-        device: "torch.device",
-        dtype: "torch.dtype",
     ) -> tuple["torch.Tensor", "torch.Tensor"]:
-        """Return Fe/Pb path lengths through the configured shield geometry."""
-        if (
-            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-            and not self.shield_params.use_angle_attenuation
-        ):
-            l_fe = spherical_shell_path_length_cm_torch(
-                direction,
-                self.shield_params.inner_radius_fe_cm,
-                self.shield_params.inner_radius_fe_cm
-                + self.shield_params.thickness_fe_cm,
-                blocked_fe,
-            )
-            l_pb = spherical_shell_path_length_cm_torch(
-                direction,
-                self.shield_params.inner_radius_pb_cm,
-                self.shield_params.inner_radius_pb_cm
-                + self.shield_params.thickness_pb_cm,
-                blocked_pb,
-            )
-            return l_fe, l_pb
-        if self.shield_params.use_angle_attenuation:
-            l_fe = torch.where(
-                blocked_fe & (cos_fe > tol_t),
-                torch.as_tensor(
-                    self.shield_params.thickness_fe_cm, device=device, dtype=dtype
-                )
-                / cos_fe,
-                torch.zeros_like(cos_fe),
-            )
-            l_pb = torch.where(
-                blocked_pb & (cos_pb > tol_t),
-                torch.as_tensor(
-                    self.shield_params.thickness_pb_cm, device=device, dtype=dtype
-                )
-                / cos_pb,
-                torch.zeros_like(cos_pb),
-            )
-            return l_fe, l_pb
-        l_fe = torch.where(
+        """Return Fe/Pb path lengths through spherical-octant shells."""
+        l_fe = spherical_shell_path_length_cm_torch(
+            direction,
+            self.shield_params.inner_radius_fe_cm,
+            self.shield_params.inner_radius_fe_cm
+            + self.shield_params.thickness_fe_cm,
             blocked_fe,
-            torch.as_tensor(
-                self.shield_params.thickness_fe_cm, device=device, dtype=dtype
-            ),
-            torch.zeros_like(cos_fe),
         )
-        l_pb = torch.where(
+        l_pb = spherical_shell_path_length_cm_torch(
+            direction,
+            self.shield_params.inner_radius_pb_cm,
+            self.shield_params.inner_radius_pb_cm
+            + self.shield_params.thickness_pb_cm,
             blocked_pb,
-            torch.as_tensor(
-                self.shield_params.thickness_pb_cm, device=device, dtype=dtype
-            ),
-            torch.zeros_like(cos_pb),
         )
         return l_fe, l_pb
 
@@ -3243,6 +2764,14 @@ class ContinuousKernel:
         """Compute expected rate for a Fe/Pb orientation pair using torch."""
         if torch is None:
             raise RuntimeError("torch is not available")
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            np.asarray([fe_index]),
+            np.asarray([pb_index]),
+            orientation_count=int(len(self.orientations)),
+            expected_count=1,
+        )
+        fe_index = int(fe_arr[0])
+        pb_index = int(pb_arr[0])
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
         sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
@@ -3270,77 +2799,42 @@ class ContinuousKernel:
         sampled_direction = targets - sampled_sources
         sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
         sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
-        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
-        response_distance = torch.linalg.norm(
-            sampled_sources - detector_t.view(1, 1, 3),
-            dim=-1,
-        )
 
-        detector_to_source_unit = -dir_unit
-        blocked_fe = self._rotated_octant_blocked_mask_torch(
-            detector_to_source_unit, fe_index, tol
+        center = detector_t.expand_as(sources_t).unsqueeze(-2)
+        fe_normal = -np.asarray(self.orientations[fe_index], dtype=float)
+        pb_normal = -np.asarray(self.orientations[pb_index], dtype=float)
+        fe_rotation = self._rotated_octant_rotation_torch(
+            fe_normal,
+            device=device,
+            dtype=dtype,
         )
-        blocked_pb = self._rotated_octant_blocked_mask_torch(
-            detector_to_source_unit, pb_index, tol
+        pb_rotation = self._rotated_octant_rotation_torch(
+            pb_normal,
+            device=device,
+            dtype=dtype,
         )
-        normal_fe = torch.as_tensor(
-            self.orientations[fe_index], device=device, dtype=dtype
+        L_fe = segment_rotated_octant_shell_path_length_cm_torch(
+            source_pos=sampled_sources,
+            target_pos=targets,
+            center_pos=center,
+            shield_normal=fe_normal,
+            inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+            outer_radius_cm=self.shield_params.inner_radius_fe_cm
+            + self.shield_params.thickness_fe_cm,
+            tol=tol,
+            rotation=fe_rotation,
         )
-        normal_pb = torch.as_tensor(
-            self.orientations[pb_index], device=device, dtype=dtype
+        L_pb = segment_rotated_octant_shell_path_length_cm_torch(
+            source_pos=sampled_sources,
+            target_pos=targets,
+            center_pos=center,
+            shield_normal=pb_normal,
+            inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+            outer_radius_cm=self.shield_params.inner_radius_pb_cm
+            + self.shield_params.thickness_pb_cm,
+            tol=tol,
+            rotation=pb_rotation,
         )
-        cos_fe = torch.clamp(torch.sum(dir_unit * normal_fe, dim=-1), 0.0, 1.0)
-        cos_pb = torch.clamp(torch.sum(dir_unit * normal_pb, dim=-1), 0.0, 1.0)
-        if (
-            self.shield_params.shield_geometry_model == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-            and not self.shield_params.use_angle_attenuation
-        ):
-            center = detector_t.expand_as(sources_t).unsqueeze(-2)
-            fe_normal = -np.asarray(self.orientations[fe_index], dtype=float)
-            pb_normal = -np.asarray(self.orientations[pb_index], dtype=float)
-            fe_rotation = self._rotated_octant_rotation_torch(
-                fe_normal,
-                device=device,
-                dtype=dtype,
-            )
-            pb_rotation = self._rotated_octant_rotation_torch(
-                pb_normal,
-                device=device,
-                dtype=dtype,
-            )
-            L_fe = segment_rotated_octant_shell_path_length_cm_torch(
-                source_pos=sampled_sources,
-                target_pos=targets,
-                center_pos=center,
-                shield_normal=fe_normal,
-                inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-                outer_radius_cm=self.shield_params.inner_radius_fe_cm
-                + self.shield_params.thickness_fe_cm,
-                tol=tol,
-                rotation=fe_rotation,
-            )
-            L_pb = segment_rotated_octant_shell_path_length_cm_torch(
-                source_pos=sampled_sources,
-                target_pos=targets,
-                center_pos=center,
-                shield_normal=pb_normal,
-                inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-                outer_radius_cm=self.shield_params.inner_radius_pb_cm
-                + self.shield_params.thickness_pb_cm,
-                tol=tol,
-                rotation=pb_rotation,
-            )
-        else:
-            L_fe, L_pb = self._shield_path_lengths_torch(
-                direction=sampled_direction,
-                blocked_fe=blocked_fe,
-                blocked_pb=blocked_pb,
-                cos_fe=cos_fe,
-                cos_pb=cos_pb,
-                tol_t=tol_t,
-                device=device,
-                dtype=dtype,
-            )
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         tau_fe = float(mu_fe) * L_fe
         tau_pb = float(mu_pb) * L_pb
@@ -3414,64 +2908,18 @@ class ContinuousKernel:
                 line_tau_pb,
                 line_tau_obstacle,
             )
-            shield_tau_feature = torch.sum(
-                (line_tau_fe + line_tau_pb) * weights_t.view(1, 1, -1),
-                dim=-1,
-            )
-            fe_tau_feature = torch.sum(
-                line_tau_fe * weights_t.view(1, 1, -1),
-                dim=-1,
-            )
-            pb_tau_feature = torch.sum(
-                line_tau_pb * weights_t.view(1, 1, -1),
-                dim=-1,
-            )
-            obstacle_tau_feature = torch.sum(
-                line_tau_obstacle * weights_t.view(1, 1, -1),
-                dim=-1,
-            )
-            response_factor = self._transport_response_factor_torch(
-                isotope,
-                np.asarray([int(fe_index)], dtype=np.int64),
-                np.asarray([int(pb_index)], dtype=np.int64),
-                shield_tau_feature,
-                obstacle_tau_feature,
-                fe_tau_feature,
-                pb_tau_feature,
-                distance_feature=response_distance,
-                distance_shield_feature=response_distance * shield_tau_feature,
-                device=device,
-                dtype=dtype,
-            )
             base_att = torch.sum(
                 torch.exp(-line_total_tau) * line_buildup * weights_t.view(1, 1, -1),
                 dim=-1,
             )
-            att = self._response_adjusted_attenuation_torch(
-                isotope,
-                base_att,
-                response_factor,
-            )
+            att = torch.clamp(base_att, min=0.0, max=1.0)
         else:
             total_tau = tau_fe + tau_pb + tau_obstacle
             buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
-            response_factor = self._transport_response_factor_torch(
-                isotope,
-                np.asarray([int(fe_index)], dtype=np.int64),
-                np.asarray([int(pb_index)], dtype=np.int64),
-                tau_fe + tau_pb,
-                tau_obstacle,
-                tau_fe,
-                tau_pb,
-                distance_feature=response_distance,
-                distance_shield_feature=response_distance * (tau_fe + tau_pb),
-                device=device,
-                dtype=dtype,
-            )
-            att = self._response_adjusted_attenuation_torch(
-                isotope,
+            att = torch.clamp(
                 torch.exp(-total_tau) * buildup,
-                response_factor,
+                min=0.0,
+                max=1.0,
             )
         att = torch.mean(att, dim=-1)
         rate = torch.sum(geom * att * strengths_t) + float(background)
@@ -3494,10 +2942,11 @@ class ContinuousKernel:
         device = sources_t.device
         dtype = sources_t.dtype
         num_orients = int(len(self.orientations))
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1) % num_orients
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1) % num_orients
-        if fe_arr.size != pb_arr.size:
-            raise ValueError("Fe and Pb index arrays must have matching lengths.")
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=num_orients,
+        )
         pair_count = int(fe_arr.size)
         if pair_count == 0:
             return torch.zeros((0, int(sources_t.shape[0])), device=device, dtype=dtype)
@@ -3525,84 +2974,46 @@ class ContinuousKernel:
         sampled_direction = targets - sampled_sources
         sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
         sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
-        dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
-        detector_to_source_unit = -dir_unit
-        response_distance = torch.linalg.norm(
-            sampled_sources - detector_t.view(1, 1, 3),
-            dim=-1,
-        )
-
         unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
         path_lengths: dict[int, tuple["torch.Tensor", "torch.Tensor"]] = {}
         for orient_idx in unique_orients:
             orient_int = int(orient_idx)
-            if (
-                self.shield_params.shield_geometry_model
-                == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-                and not self.shield_params.use_angle_attenuation
-            ):
-                center = detector_t.expand_as(sources_t).unsqueeze(-2)
-                shield_normal = -np.asarray(
-                    self.orientations[orient_int],
-                    dtype=float,
-                )
-                rotation = self._rotated_octant_rotation_torch(
-                    shield_normal,
-                    device=device,
-                    dtype=dtype,
-                )
-                l_fe = segment_rotated_octant_shell_path_length_cm_torch(
-                    source_pos=sampled_sources,
-                    target_pos=targets,
-                    center_pos=center,
-                    shield_normal=shield_normal,
-                    inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-                    outer_radius_cm=(
-                        self.shield_params.inner_radius_fe_cm
-                        + self.shield_params.thickness_fe_cm
-                    ),
-                    tol=tol,
-                    rotation=rotation,
-                )
-                l_pb = segment_rotated_octant_shell_path_length_cm_torch(
-                    source_pos=sampled_sources,
-                    target_pos=targets,
-                    center_pos=center,
-                    shield_normal=shield_normal,
-                    inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-                    outer_radius_cm=(
-                        self.shield_params.inner_radius_pb_cm
-                        + self.shield_params.thickness_pb_cm
-                    ),
-                    tol=tol,
-                    rotation=rotation,
-                )
-            else:
-                blocked = self._rotated_octant_blocked_mask_torch(
-                    detector_to_source_unit,
-                    orient_int,
-                    tol,
-                )
-                normal = torch.as_tensor(
-                    self.orientations[orient_int],
-                    device=device,
-                    dtype=dtype,
-                )
-                cos_theta = torch.clamp(
-                    torch.sum(dir_unit * normal, dim=-1),
-                    0.0,
-                    1.0,
-                )
-                l_fe, l_pb = self._shield_path_lengths_torch(
-                    direction=sampled_direction,
-                    blocked_fe=blocked,
-                    blocked_pb=blocked,
-                    cos_fe=cos_theta,
-                    cos_pb=cos_theta,
-                    tol_t=tol_t,
-                    device=device,
-                    dtype=dtype,
-                )
+            center = detector_t.expand_as(sources_t).unsqueeze(-2)
+            shield_normal = -np.asarray(
+                self.orientations[orient_int],
+                dtype=float,
+            )
+            rotation = self._rotated_octant_rotation_torch(
+                shield_normal,
+                device=device,
+                dtype=dtype,
+            )
+            l_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=shield_normal,
+                inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                outer_radius_cm=(
+                    self.shield_params.inner_radius_fe_cm
+                    + self.shield_params.thickness_fe_cm
+                ),
+                tol=tol,
+                rotation=rotation,
+            )
+            l_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                source_pos=sampled_sources,
+                target_pos=targets,
+                center_pos=center,
+                shield_normal=shield_normal,
+                inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                outer_radius_cm=(
+                    self.shield_params.inner_radius_pb_cm
+                    + self.shield_params.thickness_pb_cm
+                ),
+                tol=tol,
+                rotation=rotation,
+            )
             path_lengths[orient_int] = (l_fe, l_pb)
 
         l_fe_pairs = torch.stack([path_lengths[int(idx)][0] for idx in fe_arr], dim=0)
@@ -3671,70 +3082,20 @@ class ContinuousKernel:
                 line_tau_pb,
                 line_tau_obstacle,
             )
-            shield_tau_feature = torch.sum(
-                (line_tau_fe + line_tau_pb) * weights_t.view(1, 1, 1, -1),
-                dim=-1,
-            )
-            fe_tau_feature = torch.sum(
-                line_tau_fe * weights_t.view(1, 1, 1, -1),
-                dim=-1,
-            )
-            pb_tau_feature = torch.sum(
-                line_tau_pb * weights_t.view(1, 1, 1, -1),
-                dim=-1,
-            )
-            obstacle_tau_feature = torch.sum(
-                line_tau_obstacle * weights_t.view(1, 1, 1, -1),
-                dim=-1,
-            )
-            response_factor = self._transport_response_factor_torch(
-                isotope,
-                fe_arr,
-                pb_arr,
-                shield_tau_feature,
-                obstacle_tau_feature,
-                fe_tau_feature,
-                pb_tau_feature,
-                distance_feature=response_distance.unsqueeze(0),
-                distance_shield_feature=(
-                    response_distance.unsqueeze(0) * shield_tau_feature
-                ),
-                device=device,
-                dtype=dtype,
-            )
             base_att = torch.sum(
                 torch.exp(-(line_tau_fe + line_tau_pb + line_tau_obstacle))
                 * line_buildup
                 * weights_t.view(1, 1, 1, -1),
                 dim=-1,
             )
-            att = self._response_adjusted_attenuation_torch(
-                isotope,
-                base_att,
-                response_factor,
-            )
+            att = torch.clamp(base_att, min=0.0, max=1.0)
         else:
             total_tau = tau_fe + tau_pb + tau_obstacle
             buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
-            response_factor = self._transport_response_factor_torch(
-                isotope,
-                fe_arr,
-                pb_arr,
-                tau_fe + tau_pb,
-                tau_obstacle,
-                tau_fe,
-                tau_pb,
-                distance_feature=response_distance.unsqueeze(0),
-                distance_shield_feature=(
-                    response_distance.unsqueeze(0) * (tau_fe + tau_pb)
-                ),
-                device=device,
-                dtype=dtype,
-            )
-            att = self._response_adjusted_attenuation_torch(
-                isotope,
+            att = torch.clamp(
                 torch.exp(-total_tau) * buildup,
-                response_factor,
+                min=0.0,
+                max=1.0,
             )
 
         att = torch.mean(att, dim=-1)
@@ -3759,10 +3120,11 @@ class ContinuousKernel:
         """Compute selected pair counts from the ContinuousKernel torch kernel."""
         if torch is None:
             raise RuntimeError("torch is not available")
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        if fe_arr.size != pb_arr.size:
-            raise ValueError("Fe and Pb index arrays must have matching lengths.")
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=int(len(self.orientations)),
+        )
         pair_count = int(fe_arr.size)
         particle_count = int(positions.shape[0])
         slot_count = int(positions.shape[1]) if positions.ndim >= 2 else 0
@@ -3930,83 +3292,45 @@ class ContinuousKernel:
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
             sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
-            dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
-            detector_to_source_unit = -dir_unit
-            response_distance = torch.linalg.norm(
-                sampled_sources - detectors_t.unsqueeze(-2),
-                dim=-1,
-            )
-
             l_fe_by_orient: list[torch.Tensor] = []
             l_pb_by_orient: list[torch.Tensor] = []
             for orient_idx in range(num_orients):
-                if (
-                    self.shield_params.shield_geometry_model
-                    == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-                    and not self.shield_params.use_angle_attenuation
-                ):
-                    shield_normal = -np.asarray(
-                        self.orientations[orient_idx],
-                        dtype=float,
-                    )
-                    rotation = self._rotated_octant_rotation_torch(
-                        shield_normal,
-                        device=device,
-                        dtype=dtype,
-                    )
-                    center = detectors_t.unsqueeze(-2)
-                    l_fe = segment_rotated_octant_shell_path_length_cm_torch(
-                        source_pos=sampled_sources,
-                        target_pos=targets,
-                        center_pos=center,
-                        shield_normal=shield_normal,
-                        inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-                        outer_radius_cm=(
-                            self.shield_params.inner_radius_fe_cm
-                            + self.shield_params.thickness_fe_cm
-                        ),
-                        tol=tol,
-                        rotation=rotation,
-                    )
-                    l_pb = segment_rotated_octant_shell_path_length_cm_torch(
-                        source_pos=sampled_sources,
-                        target_pos=targets,
-                        center_pos=center,
-                        shield_normal=shield_normal,
-                        inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-                        outer_radius_cm=(
-                            self.shield_params.inner_radius_pb_cm
-                            + self.shield_params.thickness_pb_cm
-                        ),
-                        tol=tol,
-                        rotation=rotation,
-                    )
-                else:
-                    blocked = self._rotated_octant_blocked_mask_torch(
-                        detector_to_source_unit,
-                        orient_idx,
-                        tol,
-                    )
-                    normal = torch.as_tensor(
-                        self.orientations[orient_idx],
-                        device=device,
-                        dtype=dtype,
-                    )
-                    cos_theta = torch.clamp(
-                        torch.sum(dir_unit * normal, dim=-1),
-                        0.0,
-                        1.0,
-                    )
-                    l_fe, l_pb = self._shield_path_lengths_torch(
-                        direction=sampled_direction,
-                        blocked_fe=blocked,
-                        blocked_pb=blocked,
-                        cos_fe=cos_theta,
-                        cos_pb=cos_theta,
-                        tol_t=tol_t,
-                        device=device,
-                        dtype=dtype,
-                    )
+                shield_normal = -np.asarray(
+                    self.orientations[orient_idx],
+                    dtype=float,
+                )
+                rotation = self._rotated_octant_rotation_torch(
+                    shield_normal,
+                    device=device,
+                    dtype=dtype,
+                )
+                center = detectors_t.unsqueeze(-2)
+                l_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    center_pos=center,
+                    shield_normal=shield_normal,
+                    inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                    outer_radius_cm=(
+                        self.shield_params.inner_radius_fe_cm
+                        + self.shield_params.thickness_fe_cm
+                    ),
+                    tol=tol,
+                    rotation=rotation,
+                )
+                l_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    center_pos=center,
+                    shield_normal=shield_normal,
+                    inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                    outer_radius_cm=(
+                        self.shield_params.inner_radius_pb_cm
+                        + self.shield_params.thickness_pb_cm
+                    ),
+                    tol=tol,
+                    rotation=rotation,
+                )
                 l_fe_by_orient.append(l_fe)
                 l_pb_by_orient.append(l_pb)
 
@@ -4015,9 +3339,6 @@ class ContinuousKernel:
             pair_ids = torch.arange(num_pairs, device=device, dtype=torch.long)
             fe_indices = torch.div(pair_ids, num_orients, rounding_mode="floor")
             pb_indices = torch.remainder(pair_ids, num_orients)
-            pair_ids_np = np.arange(num_pairs, dtype=np.int64)
-            fe_indices_np = pair_ids_np // num_orients
-            pb_indices_np = pair_ids_np % num_orients
             l_fe_pairs = l_fe_stack.index_select(0, fe_indices)
             l_pb_pairs = l_pb_stack.index_select(0, pb_indices)
 
@@ -4077,74 +3398,126 @@ class ContinuousKernel:
                     line_tau_pb,
                     line_tau_obstacle,
                 )
-                shield_tau_feature = torch.sum(
-                    (line_tau_fe + line_tau_pb) * weights_t.view(1, 1, 1, -1),
-                    dim=-1,
-                )
-                fe_tau_feature = torch.sum(
-                    line_tau_fe * weights_t.view(1, 1, 1, -1),
-                    dim=-1,
-                )
-                pb_tau_feature = torch.sum(
-                    line_tau_pb * weights_t.view(1, 1, 1, -1),
-                    dim=-1,
-                )
-                obstacle_tau_feature = torch.sum(
-                    line_tau_obstacle * weights_t.view(1, 1, 1, -1),
-                    dim=-1,
-                )
-                response_factor = self._transport_response_factor_torch(
-                    isotope,
-                    fe_indices_np,
-                    pb_indices_np,
-                    shield_tau_feature,
-                    obstacle_tau_feature,
-                    fe_tau_feature,
-                    pb_tau_feature,
-                    distance_feature=response_distance.unsqueeze(0),
-                    distance_shield_feature=(
-                        response_distance.unsqueeze(0) * shield_tau_feature
-                    ),
-                    device=device,
-                    dtype=dtype,
-                )
                 base_att = torch.sum(
                     torch.exp(-line_total_tau)
                     * line_buildup
                     * weights_t.view(1, 1, 1, -1),
                     dim=-1,
                 )
-                att = self._response_adjusted_attenuation_torch(
-                    isotope,
-                    base_att,
-                    response_factor,
-                )
+                att = torch.clamp(base_att, min=0.0, max=1.0)
             else:
                 total_tau = tau_fe + tau_pb + tau_obstacle
                 buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
-                response_factor = self._transport_response_factor_torch(
-                    isotope,
-                    fe_indices_np,
-                    pb_indices_np,
-                    tau_fe + tau_pb,
-                    tau_obstacle,
-                    tau_fe,
-                    tau_pb,
-                    distance_feature=response_distance.unsqueeze(0),
-                    distance_shield_feature=(
-                        response_distance.unsqueeze(0) * (tau_fe + tau_pb)
-                    ),
-                    device=device,
-                    dtype=dtype,
-                )
-                att = self._response_adjusted_attenuation_torch(
-                    isotope,
+                att = torch.clamp(
                     torch.exp(-total_tau) * buildup,
-                    response_factor,
+                    min=0.0,
+                    max=1.0,
                 )
             att = torch.mean(att, dim=-1)
             values = geom.unsqueeze(0) * att
         return values.transpose(0, 1).detach().cpu().numpy().astype(float, copy=False)
+
+    def _kernel_values_unshielded_for_detector_source_numpy_chunk(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        tol: float = 1.0e-12,
+    ) -> NDArray[np.float64]:
+        """Return matched-row physical kernels without Fe/Pb attenuation."""
+        detectors = np.asarray(detector_positions, dtype=float)
+        source_arr = np.asarray(sources, dtype=float)
+        if detectors.ndim != 2 or detectors.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (N, 3).")
+        if source_arr.ndim != 2 or source_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if detectors.shape[0] != source_arr.shape[0]:
+            raise ValueError(
+                "detector_positions and sources must have the same row count."
+            )
+        if (
+            not np.all(np.isfinite(detectors))
+            or not np.all(np.isfinite(source_arr))
+        ):
+            raise ValueError(
+                "detector_positions and sources must contain finite values."
+            )
+        row_count = int(source_arr.shape[0])
+        if row_count == 0:
+            return np.zeros(0, dtype=float)
+
+        center_distance = np.linalg.norm(detectors - source_arr, axis=1)
+        geom = _finite_sphere_geometric_term_numpy(
+            center_distance,
+            detector_radius_m=self.detector_radius_m,
+        )
+        sampled_sources, targets, _ = self._ray_sample_points_numpy(
+            source_arr,
+            detectors,
+            tol=tol,
+        )
+        obstacle_path_cm = None
+        tau_obstacle = np.zeros(sampled_sources.shape[:-1], dtype=float)
+        boxes = self.obstacle_boxes_m()
+        if boxes.size:
+            obstacle_path_cm = (
+                _obstacle_path_lengths_between_points_by_box_cm_numpy(
+                    sampled_sources,
+                    targets,
+                    boxes,
+                    tol=tol,
+                )
+            )
+            obstacle_mu = self.obstacle_mu_values_cm_inv(isotope)
+            tau_obstacle = np.sum(
+                obstacle_path_cm * obstacle_mu.reshape(1, 1, -1),
+                axis=-1,
+            )
+
+        line_entries = self._line_mu_values(isotope)
+        if line_entries:
+            line_values = np.asarray(line_entries, dtype=float)
+            weights = line_values[:, 0]
+            line_tau_obstacle = tau_obstacle[..., None]
+            if obstacle_path_cm is not None:
+                obstacle_line_mu = self.obstacle_line_mu_values_cm_inv(isotope)
+                if obstacle_line_mu.shape == (
+                    len(line_entries),
+                    obstacle_path_cm.shape[-1],
+                ):
+                    line_tau_obstacle = np.einsum(
+                        "nrb,lb->nrl",
+                        obstacle_path_cm,
+                        obstacle_line_mu,
+                        optimize=True,
+                    )
+            zeros = np.zeros_like(line_tau_obstacle)
+            line_buildup = self._buildup_factor_numpy(
+                zeros,
+                zeros,
+                line_tau_obstacle,
+            )
+            attenuation = np.sum(
+                np.exp(-line_tau_obstacle)
+                * line_buildup
+                * weights.reshape(1, 1, -1),
+                axis=-1,
+            )
+        else:
+            zeros = np.zeros_like(tau_obstacle)
+            buildup = self._buildup_factor_numpy(
+                zeros,
+                zeros,
+                tau_obstacle,
+            )
+            attenuation = np.exp(-tau_obstacle) * buildup
+        attenuation = np.clip(attenuation, 0.0, 1.0)
+        values = geom * np.mean(attenuation, axis=-1)
+        if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+            raise RuntimeError(
+                "Unshielded physical kernel produced an invalid response."
+            )
+        return values.astype(float, copy=False)
 
     def _kernel_values_selected_pairs_for_detector_source_numpy_chunk(
         self,
@@ -4154,8 +3527,18 @@ class ContinuousKernel:
         fe_indices: NDArray[np.int64],
         pb_indices: NDArray[np.int64],
         tol: float = 1.0e-12,
-    ) -> NDArray[np.float64]:
+        positive_line_indices: object | None = None,
+        return_line_transport_components: bool = False,
+    ) -> NDArray[np.float64] | LineTransportComponents:
         """Return selected-pair kernels for matched rows via batched NumPy."""
+        line_selection = (
+            None
+            if positive_line_indices is None
+            else self._validated_positive_line_indices(
+                isotope,
+                positive_line_indices,
+            )
+        )
         detectors = np.asarray(detector_positions, dtype=float)
         source_arr = np.asarray(sources, dtype=float)
         if detectors.ndim != 2 or detectors.shape[1] != 3:
@@ -4168,23 +3551,35 @@ class ContinuousKernel:
             )
         row_count = int(source_arr.shape[0])
         if row_count == 0:
-            return np.zeros(0, dtype=float)
-        num_orients = int(len(self.orientations))
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        if fe_arr.size != row_count or pb_arr.size != row_count:
+            if line_selection is None:
+                return np.zeros(0, dtype=float)
+            if return_line_transport_components:
+                empty = np.zeros(
+                    (0, int(line_selection.size)),
+                    dtype=np.float64,
+                )
+                return LineTransportComponents(
+                    total_kernel=empty,
+                    unattenuated_kernel=empty.copy(),
+                    uncollided_kernel=empty.copy(),
+                    tau_fe=empty.copy(),
+                    tau_pb=empty.copy(),
+                    tau_obstacle=empty.copy(),
+                    tau_obstacle_compton=empty.copy(),
+                    distance_m=empty.copy(),
+                )
+            return np.zeros((0, line_selection.size), dtype=float)
+        if return_line_transport_components and line_selection is None:
             raise ValueError(
-                "Fe/Pb index arrays must match the detector-source row count."
+                "Line transport components require positive_line_indices."
             )
-        if (
-            np.any(fe_arr < -num_orients)
-            or np.any(fe_arr >= num_orients)
-            or np.any(pb_arr < -num_orients)
-            or np.any(pb_arr >= num_orients)
-        ):
-            raise IndexError("Fe/Pb orientation index is out of bounds.")
-        fe_arr = fe_arr % num_orients
-        pb_arr = pb_arr % num_orients
+        num_orients = int(len(self.orientations))
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=num_orients,
+            expected_count=row_count,
+        )
 
         center_direction = detectors - source_arr
         center_distance = np.linalg.norm(center_direction, axis=1)
@@ -4197,10 +3592,6 @@ class ContinuousKernel:
             detectors,
             tol=tol,
         )
-        sampled_direction = targets - sampled_sources
-        sampled_distance = np.linalg.norm(sampled_direction, axis=-1)
-        safe_sampled_distance = np.maximum(sampled_distance, float(tol))
-        direction_unit = sampled_direction / safe_sampled_distance[..., None]
         response_distance = np.linalg.norm(
             sampled_sources - detectors[:, None, :],
             axis=-1,
@@ -4208,90 +3599,31 @@ class ContinuousKernel:
         rotations = self._rotated_octant_rotations_numpy()
         fe_rotations = rotations[fe_arr]
         pb_rotations = rotations[pb_arr]
-
-        if (
-            self.shield_params.shield_geometry_model
-            == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-            and not self.shield_params.use_angle_attenuation
-        ):
-            centers = detectors[:, None, :]
-            l_fe = _segment_rotated_octant_shell_path_length_cm_numpy(
-                sampled_sources,
-                targets,
-                centers,
-                fe_rotations,
-                self.shield_params.inner_radius_fe_cm,
-                (
-                    self.shield_params.inner_radius_fe_cm
-                    + self.shield_params.thickness_fe_cm
-                ),
-                tol=tol,
-            )
-            l_pb = _segment_rotated_octant_shell_path_length_cm_numpy(
-                sampled_sources,
-                targets,
-                centers,
-                pb_rotations,
-                self.shield_params.inner_radius_pb_cm,
-                (
-                    self.shield_params.inner_radius_pb_cm
-                    + self.shield_params.thickness_pb_cm
-                ),
-                tol=tol,
-            )
-        else:
-            detector_to_source_unit = -direction_unit
-            local_fe = np.einsum(
-                "nri,nij->nrj",
-                detector_to_source_unit,
-                fe_rotations,
-                optimize=True,
-            )
-            local_pb = np.einsum(
-                "nri,nij->nrj",
-                detector_to_source_unit,
-                pb_rotations,
-                optimize=True,
-            )
-            nonzero_ray = sampled_distance > float(tol)
-            blocked_fe = nonzero_ray & np.all(local_fe >= -float(tol), axis=-1)
-            blocked_pb = nonzero_ray & np.all(local_pb >= -float(tol), axis=-1)
-            normal_fe = np.asarray(self.orientations, dtype=float)[fe_arr]
-            normal_pb = np.asarray(self.orientations, dtype=float)[pb_arr]
-            cos_fe = np.clip(
-                np.sum(direction_unit * normal_fe[:, None, :], axis=-1),
-                0.0,
-                1.0,
-            )
-            cos_pb = np.clip(
-                np.sum(direction_unit * normal_pb[:, None, :], axis=-1),
-                0.0,
-                1.0,
-            )
-            if self.shield_params.use_angle_attenuation:
-                l_fe = np.where(
-                    blocked_fe & (cos_fe > float(tol)),
-                    self.shield_params.thickness_fe_cm
-                    / np.maximum(cos_fe, float(tol)),
-                    0.0,
-                )
-                l_pb = np.where(
-                    blocked_pb & (cos_pb > float(tol)),
-                    self.shield_params.thickness_pb_cm
-                    / np.maximum(cos_pb, float(tol)),
-                    0.0,
-                )
-            else:
-                l_fe = np.where(
-                    blocked_fe,
-                    self.shield_params.thickness_fe_cm,
-                    0.0,
-                )
-                l_pb = np.where(
-                    blocked_pb,
-                    self.shield_params.thickness_pb_cm,
-                    0.0,
-                )
+        centers = detectors[:, None, :]
+        l_fe = _segment_rotated_octant_shell_path_length_cm_numpy(
+            sampled_sources,
+            targets,
+            centers,
+            fe_rotations,
+            self.shield_params.inner_radius_fe_cm,
+            (
+                self.shield_params.inner_radius_fe_cm
+                + self.shield_params.thickness_fe_cm
+            ),
+            tol=tol,
+        )
+        l_pb = _segment_rotated_octant_shell_path_length_cm_numpy(
+            sampled_sources,
+            targets,
+            centers,
+            pb_rotations,
+            self.shield_params.inner_radius_pb_cm,
+            (
+                self.shield_params.inner_radius_pb_cm
+                + self.shield_params.thickness_pb_cm
+            ),
+            tol=tol,
+        )
 
         mu_fe, mu_pb = self._mu_values(isotope=isotope)
         tau_fe = float(mu_fe) * l_fe
@@ -4322,7 +3654,11 @@ class ContinuousKernel:
             line_mu_pb = line_values[:, 2]
             line_tau_fe = l_fe[..., None] * line_mu_fe.reshape(1, 1, -1)
             line_tau_pb = l_pb[..., None] * line_mu_pb.reshape(1, 1, -1)
-            line_tau_obstacle = tau_obstacle[..., None]
+            line_tau_obstacle = np.broadcast_to(
+                tau_obstacle[..., None],
+                line_tau_fe.shape,
+            ).copy()
+            line_tau_obstacle_compton = np.zeros_like(line_tau_fe)
             if obstacle_path_cm is not None:
                 obstacle_line_mu = self.obstacle_line_mu_values_cm_inv(isotope)
                 if obstacle_line_mu.shape == (
@@ -4335,46 +3671,64 @@ class ContinuousKernel:
                         obstacle_line_mu,
                         optimize=True,
                     )
+                obstacle_compton_mu = (
+                    self.obstacle_line_compton_mu_values_cm_inv(isotope)
+                )
+                if obstacle_compton_mu.shape == (
+                    len(line_entries),
+                    obstacle_path_cm.shape[-1],
+                ):
+                    line_tau_obstacle_compton = np.einsum(
+                        "nrb,lb->nrl",
+                        obstacle_path_cm,
+                        obstacle_compton_mu,
+                        optimize=True,
+                    )
             line_total_tau = (
                 line_tau_fe + line_tau_pb + line_tau_obstacle
             )
-            line_buildup = self._buildup_factor_numpy(
-                line_tau_fe,
-                line_tau_pb,
-                line_tau_obstacle,
-            )
+            uncollided_line_attenuation = np.exp(-line_total_tau)
+            if self.additive_scatter_response is not None:
+                line_energies = np.asarray(
+                    self._line_energy_values_keV(isotope),
+                    dtype=np.float64,
+                )
+                if line_energies.shape != (len(line_entries),):
+                    raise RuntimeError(
+                        "Additive scatter requires exact positive-line energies."
+                    )
+                scatter_basis = physical_scatter_basis_numpy(
+                    tau_fe=line_tau_fe,
+                    tau_pb=line_tau_pb,
+                    tau_obstacle=line_tau_obstacle,
+                    tau_obstacle_compton=line_tau_obstacle_compton,
+                    distance_m=np.broadcast_to(
+                        response_distance[..., None],
+                        line_total_tau.shape,
+                    ),
+                    energy_keV=line_energies.reshape(1, 1, -1),
+                    mu_fe_cm_inv=line_mu_fe.reshape(1, 1, -1),
+                    mu_pb_cm_inv=line_mu_pb.reshape(1, 1, -1),
+                )
+                line_base_attenuation = (
+                    self.additive_scatter_response.total_kernel_numpy(
+                        np.ones_like(uncollided_line_attenuation),
+                        uncollided_line_attenuation,
+                        scatter_basis,
+                    )
+                )
+            else:
+                line_buildup = self._buildup_factor_numpy(
+                    line_tau_fe,
+                    line_tau_pb,
+                    line_tau_obstacle,
+                )
+                line_base_attenuation = (
+                    uncollided_line_attenuation * line_buildup
+                )
             weight_view = weights.reshape(1, 1, -1)
-            shield_tau_feature = np.sum(
-                (line_tau_fe + line_tau_pb) * weight_view,
-                axis=-1,
-            )
-            fe_tau_feature = np.sum(
-                line_tau_fe * weight_view,
-                axis=-1,
-            )
-            pb_tau_feature = np.sum(
-                line_tau_pb * weight_view,
-                axis=-1,
-            )
-            obstacle_tau_feature = np.sum(
-                line_tau_obstacle * weight_view,
-                axis=-1,
-            )
-            response_factor = self._transport_response_factor_numpy(
-                isotope,
-                fe_arr,
-                pb_arr,
-                shield_tau_feature,
-                obstacle_tau_feature,
-                fe_tau_feature,
-                pb_tau_feature,
-                distance_feature=response_distance,
-                distance_shield_feature=(
-                    response_distance * shield_tau_feature
-                ),
-            )
             base_attenuation = np.sum(
-                np.exp(-line_total_tau) * line_buildup * weight_view,
+                line_base_attenuation * weight_view,
                 axis=-1,
             )
         else:
@@ -4384,25 +3738,125 @@ class ContinuousKernel:
                 tau_pb,
                 tau_obstacle,
             )
-            shield_tau_feature = tau_fe + tau_pb
-            response_factor = self._transport_response_factor_numpy(
-                isotope,
-                fe_arr,
-                pb_arr,
-                shield_tau_feature,
-                tau_obstacle,
-                tau_fe,
-                tau_pb,
-                distance_feature=response_distance,
-                distance_shield_feature=(
-                    response_distance * shield_tau_feature
-                ),
-            )
             base_attenuation = np.exp(-total_tau) * buildup
 
-        attenuation = np.clip(base_attenuation, 0.0, 1.0)
-        if self._transport_response_payload(isotope):
-            attenuation = np.maximum(attenuation * response_factor, 0.0)
+        if line_selection is not None:
+            if not line_entries:
+                raise RuntimeError(
+                    "Validated positive-line selection lacks line entries."
+                )
+            if self.additive_scatter_response is None:
+                capped_base = np.clip(base_attenuation, 0.0, 1.0)
+                aggregate_scale = np.divide(
+                    capped_base,
+                    base_attenuation,
+                    out=np.zeros_like(capped_base),
+                    where=base_attenuation > 0.0,
+                )
+            else:
+                aggregate_scale = np.ones_like(base_attenuation)
+            selected_attenuation = (
+                line_base_attenuation[..., line_selection]
+                * aggregate_scale[..., None]
+            )
+            if return_line_transport_components:
+                selected = np.asarray(line_selection, dtype=np.int64)
+                uncollided_attenuation = np.exp(
+                    -line_total_tau[..., selected]
+                )
+                total_kernel = (
+                    geom[:, None]
+                    * np.mean(selected_attenuation, axis=1)
+                )
+                uncollided_kernel = (
+                    geom[:, None]
+                    * np.mean(uncollided_attenuation, axis=1)
+                )
+                unattenuated_kernel = np.broadcast_to(
+                    geom[:, None],
+                    total_kernel.shape,
+                ).copy()
+                direct_attenuation = np.minimum(
+                    selected_attenuation,
+                    uncollided_attenuation,
+                )
+                scatter_weights = np.maximum(
+                    selected_attenuation - direct_attenuation,
+                    0.0,
+                )
+                fallback_weights = np.maximum(
+                    uncollided_attenuation,
+                    0.0,
+                )
+                scatter_weight_sum = np.sum(
+                    scatter_weights,
+                    axis=1,
+                    keepdims=True,
+                )
+                feature_weights = np.where(
+                    scatter_weight_sum > np.finfo(np.float64).tiny,
+                    scatter_weights,
+                    fallback_weights,
+                )
+                feature_weight_sum = np.maximum(
+                    np.sum(feature_weights, axis=1),
+                    np.finfo(np.float64).tiny,
+                )
+
+                def _weighted_feature(
+                    values: NDArray[np.float64],
+                ) -> NDArray[np.float64]:
+                    """Average one ray feature by its spectral contribution."""
+                    return np.sum(
+                        values * feature_weights,
+                        axis=1,
+                    ) / feature_weight_sum
+
+                return LineTransportComponents(
+                    total_kernel=np.asarray(
+                        total_kernel,
+                        dtype=np.float64,
+                    ),
+                    unattenuated_kernel=np.asarray(
+                        unattenuated_kernel,
+                        dtype=np.float64,
+                    ),
+                    uncollided_kernel=np.asarray(
+                        uncollided_kernel,
+                        dtype=np.float64,
+                    ),
+                    tau_fe=_weighted_feature(
+                        line_tau_fe[..., selected],
+                    ),
+                    tau_pb=_weighted_feature(
+                        line_tau_pb[..., selected],
+                    ),
+                    tau_obstacle=_weighted_feature(
+                        line_tau_obstacle[..., selected],
+                    ),
+                    tau_obstacle_compton=_weighted_feature(
+                        line_tau_obstacle_compton[..., selected],
+                    ),
+                    distance_m=_weighted_feature(
+                        np.broadcast_to(
+                            response_distance[..., None],
+                            selected_attenuation.shape,
+                        )
+                    ),
+                )
+            mean_selected_attenuation = np.mean(
+                selected_attenuation,
+                axis=1,
+            )
+            return (
+                geom[:, None] * mean_selected_attenuation
+            ).astype(float, copy=False)
+
+        attenuation = (
+            np.maximum(base_attenuation, 0.0)
+            if self.additive_scatter_response is not None
+            else np.clip(base_attenuation, 0.0, 1.0)
+        )
         mean_attenuation = np.mean(attenuation, axis=-1)
         return (geom * mean_attenuation).astype(float, copy=False)
 
@@ -4464,6 +3918,138 @@ class ContinuousKernel:
         flat_values = np.concatenate(parts) if parts else np.zeros(0, dtype=float)
         return flat_values.reshape(detector_count, pair_count, source_count)
 
+    def _kernel_values_unshielded_for_detector_source_torch_chunk(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        tol: float = 1.0e-6,
+    ) -> NDArray[np.float64]:
+        """Return matched-row unshielded physical kernels through Torch."""
+        if torch is None:
+            raise RuntimeError("torch is not available")
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        detectors_t = torch.as_tensor(
+            detector_positions,
+            device=device,
+            dtype=dtype,
+        )
+        sources_t = torch.as_tensor(sources, device=device, dtype=dtype)
+        if detectors_t.ndim != 2 or detectors_t.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (N, 3).")
+        if sources_t.ndim != 2 or sources_t.shape[1] != 3:
+            raise ValueError("sources must be shaped (N, 3).")
+        if detectors_t.shape[0] != sources_t.shape[0]:
+            raise ValueError(
+                "detector_positions and sources must have the same row count."
+            )
+        if not bool(torch.all(torch.isfinite(detectors_t))) or not bool(
+            torch.all(torch.isfinite(sources_t))
+        ):
+            raise ValueError(
+                "detector_positions and sources must contain finite values."
+            )
+        row_count = int(sources_t.shape[0])
+        if row_count == 0:
+            return np.zeros(0, dtype=float)
+
+        with torch.no_grad():
+            direction = detectors_t - sources_t
+            distance = torch.linalg.norm(direction, dim=1)
+            tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
+            safe_distance = torch.where(
+                distance <= tol_t,
+                tol_t,
+                distance,
+            )
+            geom = _finite_sphere_geometric_term_torch(
+                safe_distance,
+                detector_radius_m=self.detector_radius_m,
+                tol=tol_t,
+            )
+            sampled_sources, targets, _ = self._ray_sample_points_torch(
+                sources=sources_t,
+                detector=detectors_t,
+                dist=safe_distance,
+                tol=tol,
+            )
+            tau_obstacle = torch.zeros(
+                sampled_sources.shape[:-1],
+                device=device,
+                dtype=dtype,
+            )
+            obstacle_path_cm = None
+            boxes_np = self.obstacle_boxes_m()
+            if boxes_np.size:
+                boxes_t = torch.as_tensor(
+                    boxes_np,
+                    device=device,
+                    dtype=dtype,
+                )
+                obstacle_path_cm = (
+                    obstacle_path_lengths_between_points_by_box_cm_torch(
+                        source_pos=sampled_sources,
+                        target_pos=targets,
+                        obstacle_boxes_m=boxes_t,
+                        tol=tol,
+                    )
+                )
+                tau_obstacle = self._obstacle_tau_from_lengths_torch(
+                    isotope,
+                    obstacle_path_cm,
+                    device=device,
+                    dtype=dtype,
+                )
+
+            line_entries = self._line_mu_values(isotope)
+            if line_entries:
+                weights_t = torch.as_tensor(
+                    [entry[0] for entry in line_entries],
+                    device=device,
+                    dtype=dtype,
+                )
+                line_tau_obstacle = tau_obstacle.unsqueeze(-1)
+                if obstacle_path_cm is not None:
+                    candidate_tau = self._obstacle_line_tau_from_lengths_torch(
+                        isotope,
+                        obstacle_path_cm,
+                        line_count=len(line_entries),
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if candidate_tau is not None:
+                        line_tau_obstacle = candidate_tau
+                zeros = torch.zeros_like(line_tau_obstacle)
+                line_buildup = self._buildup_factor_torch(
+                    zeros,
+                    zeros,
+                    line_tau_obstacle,
+                )
+                attenuation = torch.sum(
+                    torch.exp(-line_tau_obstacle)
+                    * line_buildup
+                    * weights_t.view(1, 1, -1),
+                    dim=-1,
+                )
+            else:
+                zeros = torch.zeros_like(tau_obstacle)
+                buildup = self._buildup_factor_torch(
+                    zeros,
+                    zeros,
+                    tau_obstacle,
+                )
+                attenuation = torch.exp(-tau_obstacle) * buildup
+            attenuation = torch.clamp(attenuation, min=0.0, max=1.0)
+            values = geom * torch.mean(attenuation, dim=-1)
+            if not bool(torch.all(torch.isfinite(values))) or bool(
+                torch.any(values < 0.0)
+            ):
+                raise RuntimeError(
+                    "Unshielded physical Torch kernel produced an invalid response."
+                )
+        return values.detach().cpu().numpy().astype(float, copy=False)
+
     def _kernel_values_selected_pairs_for_detector_source_torch_chunk(
         self,
         isotope: str,
@@ -4472,10 +4058,20 @@ class ContinuousKernel:
         fe_indices: NDArray[np.int64],
         pb_indices: NDArray[np.int64],
         tol: float = 1e-6,
-    ) -> NDArray[np.float64]:
+        positive_line_indices: object | None = None,
+        return_line_transport_components: bool = False,
+    ) -> NDArray[np.float64] | LineTransportComponents:
         """Return selected Fe/Pb-pair kernels for matched detector-source rows."""
         if torch is None:
             raise RuntimeError("torch is not available")
+        line_selection = (
+            None
+            if positive_line_indices is None
+            else self._validated_positive_line_indices(
+                isotope,
+                positive_line_indices,
+            )
+        )
         device = _resolve_device(self.gpu_device)
         dtype = _resolve_dtype(self.gpu_dtype)
         detectors_t = torch.as_tensor(detector_positions, device=device, dtype=dtype)
@@ -4490,14 +4086,35 @@ class ContinuousKernel:
             )
         row_count = int(sources_t.shape[0])
         if row_count == 0:
-            return np.zeros(0, dtype=float)
-        num_orients = int(len(self.orientations))
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1) % num_orients
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1) % num_orients
-        if fe_arr.size != row_count or pb_arr.size != row_count:
+            if line_selection is None:
+                return np.zeros(0, dtype=float)
+            if return_line_transport_components:
+                empty = np.zeros(
+                    (0, int(line_selection.size)),
+                    dtype=np.float64,
+                )
+                return LineTransportComponents(
+                    total_kernel=empty,
+                    unattenuated_kernel=empty.copy(),
+                    uncollided_kernel=empty.copy(),
+                    tau_fe=empty.copy(),
+                    tau_pb=empty.copy(),
+                    tau_obstacle=empty.copy(),
+                    tau_obstacle_compton=empty.copy(),
+                    distance_m=empty.copy(),
+                )
+            return np.zeros((0, line_selection.size), dtype=float)
+        if return_line_transport_components and line_selection is None:
             raise ValueError(
-                "Fe/Pb index arrays must match the detector-source row count."
+                "Line transport components require positive_line_indices."
             )
+        num_orients = int(len(self.orientations))
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=num_orients,
+            expected_count=row_count,
+        )
         unique_orients = np.unique(np.concatenate([fe_arr, pb_arr]))
         orient_to_row = {int(orient): idx for idx, orient in enumerate(unique_orients)}
         fe_select = torch.as_tensor(
@@ -4530,8 +4147,6 @@ class ContinuousKernel:
             sampled_direction = targets - sampled_sources
             sampled_dist = torch.linalg.norm(sampled_direction, dim=-1)
             sampled_dist = torch.where(sampled_dist <= tol_t, tol_t, sampled_dist)
-            dir_unit = sampled_direction / sampled_dist.unsqueeze(-1)
-            detector_to_source_unit = -dir_unit
             response_distance = torch.linalg.norm(
                 sampled_sources - detectors_t.unsqueeze(-2),
                 dim=-1,
@@ -4541,73 +4156,42 @@ class ContinuousKernel:
             l_pb_by_orient: list[torch.Tensor] = []
             for orient_idx in unique_orients:
                 orient_int = int(orient_idx)
-                if (
-                    self.shield_params.shield_geometry_model
-                    == SHIELD_GEOMETRY_SPHERICAL_OCTANT
-                    and not self.shield_params.use_angle_attenuation
-                ):
-                    shield_normal = -np.asarray(
-                        self.orientations[orient_int],
-                        dtype=float,
-                    )
-                    rotation = self._rotated_octant_rotation_torch(
-                        shield_normal,
-                        device=device,
-                        dtype=dtype,
-                    )
-                    center = detectors_t.unsqueeze(-2)
-                    l_fe = segment_rotated_octant_shell_path_length_cm_torch(
-                        source_pos=sampled_sources,
-                        target_pos=targets,
-                        center_pos=center,
-                        shield_normal=shield_normal,
-                        inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-                        outer_radius_cm=(
-                            self.shield_params.inner_radius_fe_cm
-                            + self.shield_params.thickness_fe_cm
-                        ),
-                        tol=tol,
-                        rotation=rotation,
-                    )
-                    l_pb = segment_rotated_octant_shell_path_length_cm_torch(
-                        source_pos=sampled_sources,
-                        target_pos=targets,
-                        center_pos=center,
-                        shield_normal=shield_normal,
-                        inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-                        outer_radius_cm=(
-                            self.shield_params.inner_radius_pb_cm
-                            + self.shield_params.thickness_pb_cm
-                        ),
-                        tol=tol,
-                        rotation=rotation,
-                    )
-                else:
-                    blocked = self._rotated_octant_blocked_mask_torch(
-                        detector_to_source_unit,
-                        orient_int,
-                        tol,
-                    )
-                    normal = torch.as_tensor(
-                        self.orientations[orient_int],
-                        device=device,
-                        dtype=dtype,
-                    )
-                    cos_theta = torch.clamp(
-                        torch.sum(dir_unit * normal, dim=-1),
-                        0.0,
-                        1.0,
-                    )
-                    l_fe, l_pb = self._shield_path_lengths_torch(
-                        direction=sampled_direction,
-                        blocked_fe=blocked,
-                        blocked_pb=blocked,
-                        cos_fe=cos_theta,
-                        cos_pb=cos_theta,
-                        tol_t=tol_t,
-                        device=device,
-                        dtype=dtype,
-                    )
+                shield_normal = -np.asarray(
+                    self.orientations[orient_int],
+                    dtype=float,
+                )
+                rotation = self._rotated_octant_rotation_torch(
+                    shield_normal,
+                    device=device,
+                    dtype=dtype,
+                )
+                center = detectors_t.unsqueeze(-2)
+                l_fe = segment_rotated_octant_shell_path_length_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    center_pos=center,
+                    shield_normal=shield_normal,
+                    inner_radius_cm=self.shield_params.inner_radius_fe_cm,
+                    outer_radius_cm=(
+                        self.shield_params.inner_radius_fe_cm
+                        + self.shield_params.thickness_fe_cm
+                    ),
+                    tol=tol,
+                    rotation=rotation,
+                )
+                l_pb = segment_rotated_octant_shell_path_length_cm_torch(
+                    source_pos=sampled_sources,
+                    target_pos=targets,
+                    center_pos=center,
+                    shield_normal=shield_normal,
+                    inner_radius_cm=self.shield_params.inner_radius_pb_cm,
+                    outer_radius_cm=(
+                        self.shield_params.inner_radius_pb_cm
+                        + self.shield_params.thickness_pb_cm
+                    ),
+                    tol=tol,
+                    rotation=rotation,
+                )
                 l_fe_by_orient.append(l_fe)
                 l_pb_by_orient.append(l_pb)
 
@@ -4655,7 +4239,11 @@ class ContinuousKernel:
                 )
                 line_tau_fe = l_fe_pairs.unsqueeze(-1) * mu_fe_t.view(1, 1, -1)
                 line_tau_pb = l_pb_pairs.unsqueeze(-1) * mu_pb_t.view(1, 1, -1)
-                line_tau_obstacle = tau_obstacle.unsqueeze(-1)
+                line_tau_obstacle = torch.broadcast_to(
+                    tau_obstacle.unsqueeze(-1),
+                    line_tau_fe.shape,
+                )
+                line_tau_obstacle_compton = torch.zeros_like(line_tau_fe)
                 if obstacle_path_cm is not None:
                     candidate_tau = self._obstacle_line_tau_from_lengths_torch(
                         isotope,
@@ -4666,76 +4254,461 @@ class ContinuousKernel:
                     )
                     if candidate_tau is not None:
                         line_tau_obstacle = candidate_tau
+                    candidate_compton_tau = (
+                        self
+                        ._obstacle_line_compton_tau_from_lengths_torch(
+                            isotope,
+                            obstacle_path_cm,
+                            line_count=len(line_entries),
+                            device=device,
+                            dtype=dtype,
+                        )
+                    )
+                    if candidate_compton_tau is not None:
+                        line_tau_obstacle_compton = candidate_compton_tau
                 line_total_tau = line_tau_fe + line_tau_pb + line_tau_obstacle
-                line_buildup = self._buildup_factor_torch(
-                    line_tau_fe,
-                    line_tau_pb,
-                    line_tau_obstacle,
-                )
-                shield_tau_feature = torch.sum(
-                    (line_tau_fe + line_tau_pb) * weights_t.view(1, 1, -1),
-                    dim=-1,
-                )
-                fe_tau_feature = torch.sum(
-                    line_tau_fe * weights_t.view(1, 1, -1),
-                    dim=-1,
-                )
-                pb_tau_feature = torch.sum(
-                    line_tau_pb * weights_t.view(1, 1, -1),
-                    dim=-1,
-                )
-                obstacle_tau_feature = torch.sum(
-                    line_tau_obstacle * weights_t.view(1, 1, -1),
-                    dim=-1,
-                )
-                response_factor = self._transport_response_factor_torch(
-                    isotope,
-                    fe_arr,
-                    pb_arr,
-                    shield_tau_feature,
-                    obstacle_tau_feature,
-                    fe_tau_feature,
-                    pb_tau_feature,
-                    distance_feature=response_distance,
-                    distance_shield_feature=response_distance * shield_tau_feature,
-                    device=device,
-                    dtype=dtype,
-                )
+                uncollided_line_att = torch.exp(-line_total_tau)
+                if self.additive_scatter_response is not None:
+                    line_energies = self._line_energy_values_keV(isotope)
+                    if len(line_energies) != len(line_entries):
+                        raise RuntimeError(
+                            "Additive scatter requires exact positive-line "
+                            "energies."
+                        )
+                    scatter_basis = physical_scatter_basis_torch(
+                        tau_fe=line_tau_fe,
+                        tau_pb=line_tau_pb,
+                        tau_obstacle=line_tau_obstacle,
+                        tau_obstacle_compton=(
+                            line_tau_obstacle_compton
+                        ),
+                        distance_m=torch.broadcast_to(
+                            response_distance.unsqueeze(-1),
+                            line_total_tau.shape,
+                        ),
+                        energy_keV=torch.as_tensor(
+                            line_energies,
+                            device=device,
+                            dtype=dtype,
+                        ).view(1, 1, -1),
+                        mu_fe_cm_inv=mu_fe_t.view(1, 1, -1),
+                        mu_pb_cm_inv=mu_pb_t.view(1, 1, -1),
+                    )
+                    line_base_att = (
+                        self.additive_scatter_response.total_kernel_torch(
+                            torch.ones_like(uncollided_line_att),
+                            uncollided_line_att,
+                            scatter_basis,
+                        )
+                    )
+                else:
+                    line_buildup = self._buildup_factor_torch(
+                        line_tau_fe,
+                        line_tau_pb,
+                        line_tau_obstacle,
+                    )
+                    line_base_att = (
+                        uncollided_line_att * line_buildup
+                    )
                 base_att = torch.sum(
-                    torch.exp(-line_total_tau)
-                    * line_buildup
-                    * weights_t.view(1, 1, -1),
+                    line_base_att * weights_t.view(1, 1, -1),
                     dim=-1,
                 )
-                att = self._response_adjusted_attenuation_torch(
-                    isotope,
-                    base_att,
-                    response_factor,
-                )
+                att = base_att
             else:
                 total_tau = tau_fe + tau_pb + tau_obstacle
                 buildup = self._buildup_factor_torch(tau_fe, tau_pb, tau_obstacle)
-                response_factor = self._transport_response_factor_torch(
-                    isotope,
-                    fe_arr,
-                    pb_arr,
-                    tau_fe + tau_pb,
-                    tau_obstacle,
-                    tau_fe,
-                    tau_pb,
-                    distance_feature=response_distance,
-                    distance_shield_feature=response_distance * (tau_fe + tau_pb),
-                    device=device,
-                    dtype=dtype,
+                att = torch.exp(-total_tau) * buildup
+            if line_selection is not None:
+                if not line_entries:
+                    raise RuntimeError(
+                        "Validated positive-line selection lacks line entries."
+                    )
+                if self.additive_scatter_response is None:
+                    capped_base = torch.clamp(
+                        base_att,
+                        min=0.0,
+                        max=1.0,
+                    )
+                    aggregate_scale = torch.where(
+                        base_att > 0.0,
+                        capped_base / base_att,
+                        torch.zeros_like(base_att),
+                    )
+                else:
+                    aggregate_scale = torch.ones_like(base_att)
+                selected_attenuation = line_base_att.index_select(
+                    -1,
+                    torch.as_tensor(
+                        line_selection,
+                        device=device,
+                        dtype=torch.long,
+                    ),
+                ) * aggregate_scale.unsqueeze(-1)
+                if return_line_transport_components:
+                    selected = torch.as_tensor(
+                        line_selection,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    uncollided_attenuation = torch.exp(
+                        -line_total_tau.index_select(-1, selected)
+                    )
+                    total_kernel = geom.unsqueeze(-1) * torch.mean(
+                        selected_attenuation,
+                        dim=1,
+                    )
+                    uncollided_kernel = geom.unsqueeze(-1) * torch.mean(
+                        uncollided_attenuation,
+                        dim=1,
+                    )
+                    unattenuated_kernel = torch.broadcast_to(
+                        geom.unsqueeze(-1),
+                        total_kernel.shape,
+                    )
+                    direct_attenuation = torch.minimum(
+                        selected_attenuation,
+                        uncollided_attenuation,
+                    )
+                    scatter_weights = torch.clamp(
+                        selected_attenuation - direct_attenuation,
+                        min=0.0,
+                    )
+                    fallback_weights = torch.clamp(
+                        uncollided_attenuation,
+                        min=0.0,
+                    )
+                    scatter_weight_sum = torch.sum(
+                        scatter_weights,
+                        dim=1,
+                        keepdim=True,
+                    )
+                    feature_weights = torch.where(
+                        scatter_weight_sum
+                        > torch.finfo(dtype).tiny,
+                        scatter_weights,
+                        fallback_weights,
+                    )
+                    feature_weight_sum = torch.clamp(
+                        torch.sum(feature_weights, dim=1),
+                        min=torch.finfo(dtype).tiny,
+                    )
+
+                    def _weighted_feature(
+                        values: "torch.Tensor",
+                    ) -> "torch.Tensor":
+                        """Average one ray feature by spectral contribution."""
+                        return (
+                            torch.sum(values * feature_weights, dim=1)
+                            / feature_weight_sum
+                        )
+
+                    def _as_numpy(value: "torch.Tensor") -> NDArray[np.float64]:
+                        """Return one detached float64 component array."""
+                        return (
+                            value.detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.float64, copy=False)
+                        )
+
+                    return LineTransportComponents(
+                        total_kernel=_as_numpy(total_kernel),
+                        unattenuated_kernel=_as_numpy(
+                            unattenuated_kernel
+                        ),
+                        uncollided_kernel=_as_numpy(
+                            uncollided_kernel
+                        ),
+                        tau_fe=_as_numpy(
+                            _weighted_feature(
+                                line_tau_fe.index_select(-1, selected)
+                            )
+                        ),
+                        tau_pb=_as_numpy(
+                            _weighted_feature(
+                                line_tau_pb.index_select(-1, selected)
+                            )
+                        ),
+                        tau_obstacle=_as_numpy(
+                            _weighted_feature(
+                                line_tau_obstacle.index_select(
+                                    -1,
+                                    selected,
+                                )
+                            )
+                        ),
+                        tau_obstacle_compton=_as_numpy(
+                            _weighted_feature(
+                                line_tau_obstacle_compton.index_select(
+                                    -1,
+                                    selected,
+                                )
+                            )
+                        ),
+                        distance_m=_as_numpy(
+                            _weighted_feature(
+                                torch.broadcast_to(
+                                    response_distance.unsqueeze(-1),
+                                    selected_attenuation.shape,
+                                )
+                            )
+                        ),
+                    )
+                selected_attenuation = torch.mean(
+                    selected_attenuation,
+                    dim=1,
                 )
-                att = self._response_adjusted_attenuation_torch(
-                    isotope,
-                    torch.exp(-total_tau) * buildup,
-                    response_factor,
+                selected_values = geom.unsqueeze(-1) * selected_attenuation
+                return (
+                    selected_values.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(float, copy=False)
                 )
             att = torch.mean(att, dim=-1)
             values = geom * att
         return values.detach().cpu().numpy().astype(float, copy=False)
+
+    def kernel_values_unshielded_for_detector_source_pairs(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        chunk_size: int = 262144,
+    ) -> NDArray[np.float64]:
+        """Evaluate matched detector/source rows without shield attenuation."""
+        detectors = np.asarray(detector_positions, dtype=np.float64)
+        source_rows = np.asarray(sources, dtype=np.float64)
+        if (
+            detectors.ndim != 2
+            or detectors.shape[1] != 3
+            or source_rows.shape != detectors.shape
+            or np.any(~np.isfinite(detectors))
+            or np.any(~np.isfinite(source_rows))
+        ):
+            raise ValueError(
+                "Matched detector/source inputs must be finite (N, 3) arrays."
+            )
+        row_count = int(detectors.shape[0])
+        if row_count == 0:
+            return np.zeros(0, dtype=np.float64)
+        if not self.use_gpu:
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            return np.concatenate(
+                [
+                    self._kernel_values_unshielded_for_detector_source_numpy_chunk(
+                        isotope=isotope,
+                        detector_positions=detectors[start:stop],
+                        sources=source_rows[start:stop],
+                    )
+                    for start in range(0, row_count, chunk)
+                    for stop in [min(start + chunk, row_count)]
+                ]
+            )
+        self._gpu_enabled()
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=1,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=False,
+        )
+
+        def _evaluate(start: int, stop: int) -> NDArray[np.float64]:
+            """Evaluate one matched unshielded Torch chunk."""
+            return self._kernel_values_unshielded_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors[start:stop],
+                sources=source_rows[start:stop],
+            )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=row_count,
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate,
+        )
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float64)
+
+    def kernel_values_selected_pairs_for_detector_source_pairs(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        chunk_size: int = 262144,
+    ) -> NDArray[np.float64]:
+        """Evaluate one selected shield pair for each matched detector/source row."""
+        detectors = np.asarray(detector_positions, dtype=np.float64)
+        source_rows = np.asarray(sources, dtype=np.float64)
+        if (
+            detectors.ndim != 2
+            or detectors.shape[1] != 3
+            or source_rows.shape != detectors.shape
+            or np.any(~np.isfinite(detectors))
+            or np.any(~np.isfinite(source_rows))
+        ):
+            raise ValueError(
+                "Matched detector/source inputs must be finite (N, 3) arrays."
+            )
+        row_count = int(detectors.shape[0])
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=int(len(self.orientations)),
+            expected_count=row_count,
+        )
+        if row_count == 0:
+            return np.zeros(0, dtype=np.float64)
+        if not self.use_gpu:
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            return np.concatenate(
+                [
+                    self
+                    ._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                        isotope=isotope,
+                        detector_positions=detectors[start:stop],
+                        sources=source_rows[start:stop],
+                        fe_indices=fe_arr[start:stop],
+                        pb_indices=pb_arr[start:stop],
+                    )
+                    for start in range(0, row_count, chunk)
+                    for stop in [min(start + chunk, row_count)]
+                ]
+            )
+        self._gpu_enabled()
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=1,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=False,
+        )
+
+        def _evaluate(start: int, stop: int) -> NDArray[np.float64]:
+            """Evaluate one matched selected-pair Torch chunk."""
+            return (
+                self
+                ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors[start:stop],
+                    sources=source_rows[start:stop],
+                    fe_indices=fe_arr[start:stop],
+                    pb_indices=pb_arr[start:stop],
+                )
+            )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=row_count,
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate,
+        )
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float64)
+
+    def kernel_values_unshielded_for_detectors(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        chunk_size: int = 262144,
+    ) -> NDArray[np.float64]:
+        """Evaluate physical distance-plus-obstacle response without shields.
+
+        The result is shaped ``(detector_count, source_count)``. It
+        intentionally excludes Fe/Pb attenuation and pair-specific transport
+        calibration, so it is a PF-independent physical observability kernel
+        rather than an observation-likelihood shortcut.
+        """
+        detectors_arr = np.asarray(detector_positions, dtype=float)
+        sources_arr = np.asarray(sources, dtype=float)
+        if detectors_arr.ndim != 2 or detectors_arr.shape[1] != 3:
+            raise ValueError("detector_positions must be shaped (P, 3).")
+        if sources_arr.ndim != 2 or sources_arr.shape[1] != 3:
+            raise ValueError("sources must be shaped (S, 3).")
+        if not np.all(np.isfinite(detectors_arr)):
+            raise ValueError("detector_positions must contain finite values.")
+        if not np.all(np.isfinite(sources_arr)):
+            raise ValueError("sources must contain finite values.")
+        pose_count = int(detectors_arr.shape[0])
+        source_count = int(sources_arr.shape[0])
+        if pose_count == 0 or source_count == 0:
+            return np.zeros((pose_count, source_count), dtype=float)
+
+        total_rows = pose_count * source_count
+        if not self.use_gpu:
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            parts: list[NDArray[np.float64]] = []
+            for start in range(0, total_rows, chunk):
+                stop = min(start + chunk, total_rows)
+                flat_rows = np.arange(start, stop, dtype=np.int64)
+                detector_indices = flat_rows // source_count
+                source_indices = flat_rows % source_count
+                parts.append(
+                    self._kernel_values_unshielded_for_detector_source_numpy_chunk(
+                        isotope=isotope,
+                        detector_positions=detectors_arr[detector_indices],
+                        sources=sources_arr[source_indices],
+                    )
+                )
+            flat_values = (
+                np.concatenate(parts) if parts else np.zeros(0, dtype=float)
+            )
+            return flat_values.reshape(pose_count, source_count)
+
+        self._gpu_enabled()
+        device = _resolve_device(self.gpu_device)
+        dtype = _resolve_dtype(self.gpu_dtype)
+        chunk = self._adaptive_torch_chunk_size(
+            chunk_size,
+            isotope=isotope,
+            orientation_pair_count=1,
+            device=device,
+            dtype=dtype,
+            all_orientation_pairs=False,
+        )
+
+        def _evaluate_unshielded_detector_source_chunk(
+            start: int,
+            stop: int,
+        ) -> NDArray[np.float64]:
+            """Return unshielded kernels for one flat detector/source chunk."""
+            flat_rows = np.arange(start, stop, dtype=np.int64)
+            detector_indices = flat_rows // source_count
+            source_indices = flat_rows % source_count
+            return self._kernel_values_unshielded_for_detector_source_torch_chunk(
+                isotope=isotope,
+                detector_positions=detectors_arr[detector_indices],
+                sources=sources_arr[source_indices],
+            )
+
+        parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+            total_size=total_rows,
+            initial_chunk=chunk,
+            device=device,
+            evaluator=_evaluate_unshielded_detector_source_chunk,
+        )
+        flat_values = (
+            np.concatenate(parts) if parts else np.zeros(0, dtype=float)
+        )
+        return flat_values.reshape(pose_count, source_count)
 
     def kernel_values_all_pairs(
         self,
@@ -4880,10 +4853,12 @@ class ContinuousKernel:
             raise ValueError("sources must be shaped (S, 3).")
         pose_count = int(detectors_arr.shape[0])
         source_count = int(sources_arr.shape[0])
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        if fe_arr.size != pose_count or pb_arr.size != pose_count:
-            raise ValueError("Fe/Pb index arrays must match detector count.")
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=int(len(self.orientations)),
+            expected_count=pose_count,
+        )
         if pose_count == 0 or source_count == 0:
             return np.zeros((pose_count, source_count), dtype=float)
         if not self.use_gpu:
@@ -4948,6 +4923,334 @@ class ContinuousKernel:
             return np.zeros((pose_count, source_count), dtype=float)
         return np.concatenate(parts).reshape(pose_count, source_count)
 
+    def kernel_values_selected_pairs_for_detectors_by_line(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        positive_line_indices: object,
+        chunk_size: int = 262144,
+    ) -> NDArray[np.float64]:
+        """Return view-by-source-by-line source-equivalent kernel means.
+
+        ``positive_line_indices`` addresses the isotope library after removing
+        nonpositive-intensity lines, matching the spectrum identification
+        contract.  The returned last axis preserves the requested index order.
+        Values are evaluated before multiplying by branching weights.
+
+        Each line shares the aggregate transport-response correction and, when
+        buildup makes the raw mixture exceed unity, the aggregate transmission
+        cap.  Consequently multiplying the complete line axis by
+        :meth:`line_branching_weights` and summing reproduces the aggregate
+        kernel exactly while retaining genuinely line-specific Fe/Pb and
+        obstacle attenuation.
+        """
+        line_selection = self._validated_positive_line_indices(
+            isotope,
+            positive_line_indices,
+        )
+        detectors_arr = np.asarray(detector_positions, dtype=np.float64)
+        sources_arr = np.asarray(sources, dtype=np.float64)
+        if (
+            detectors_arr.ndim != 2
+            or detectors_arr.shape[1] != 3
+            or np.any(~np.isfinite(detectors_arr))
+        ):
+            raise ValueError(
+                "detector_positions must contain finite values with shape (P, 3)."
+            )
+        if (
+            sources_arr.ndim != 2
+            or sources_arr.shape[1] != 3
+            or np.any(~np.isfinite(sources_arr))
+        ):
+            raise ValueError(
+                "sources must contain finite values with shape (S, 3)."
+        )
+        pose_count = int(detectors_arr.shape[0])
+        source_count = int(sources_arr.shape[0])
+        orientation_count = int(len(self.orientations))
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=orientation_count,
+            expected_count=pose_count,
+        )
+        output_shape = (
+            pose_count,
+            source_count,
+            int(line_selection.size),
+        )
+        if pose_count == 0 or source_count == 0:
+            return np.zeros(output_shape, dtype=np.float64)
+
+        cache_key = (
+            str(isotope),
+            tuple(int(value) for value in line_selection),
+            bool(self.use_gpu),
+            str(self.gpu_device),
+            str(self.gpu_dtype),
+            self._line_response_array_key(detectors_arr),
+            self._line_response_array_key(sources_arr),
+            self._line_response_array_key(fe_arr),
+            self._line_response_array_key(pb_arr),
+        )
+        cached = self._line_response_cache.get(cache_key)
+        if cached is not None:
+            self.line_response_cache_hits += 1
+            return cached.copy()
+        self.line_response_cache_misses += 1
+
+        detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
+        sources_flat = np.tile(sources_arr, (pose_count, 1))
+        fe_flat = np.repeat(fe_arr, source_count)
+        pb_flat = np.repeat(pb_arr, source_count)
+        if not self.use_gpu:
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            parts = [
+                self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors_flat[start:stop],
+                    sources=sources_flat[start:stop],
+                    fe_indices=fe_flat[start:stop],
+                    pb_indices=pb_flat[start:stop],
+                    positive_line_indices=line_selection,
+                )
+                for start in range(0, sources_flat.shape[0], chunk)
+                for stop in [min(start + chunk, sources_flat.shape[0])]
+            ]
+        else:
+            self._gpu_enabled()
+            device = _resolve_device(self.gpu_device)
+            dtype = _resolve_dtype(self.gpu_dtype)
+            chunk = self._adaptive_torch_chunk_size(
+                chunk_size,
+                isotope=isotope,
+                orientation_pair_count=1,
+                device=device,
+                dtype=dtype,
+                all_orientation_pairs=False,
+            )
+
+            def _evaluate_line_chunk(
+                start: int,
+                stop: int,
+            ) -> NDArray[np.float64]:
+                """Return matched-row line kernels for one Torch chunk."""
+                return (
+                    self
+                    ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                        isotope=isotope,
+                        detector_positions=detectors_flat[start:stop],
+                        sources=sources_flat[start:stop],
+                        fe_indices=fe_flat[start:stop],
+                        pb_indices=pb_flat[start:stop],
+                        positive_line_indices=line_selection,
+                    )
+                )
+
+            parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+                total_size=int(sources_flat.shape[0]),
+                initial_chunk=chunk,
+                device=device,
+                evaluator=_evaluate_line_chunk,
+            )
+        flat = (
+            np.concatenate(parts, axis=0)
+            if parts
+            else np.zeros(
+                (0, int(line_selection.size)),
+                dtype=np.float64,
+            )
+        )
+        result = np.asarray(flat, dtype=np.float64).reshape(output_shape)
+        cached_result = result.copy()
+        cached_result.setflags(write=False)
+        self._line_response_cache[cache_key] = cached_result
+        while (
+            len(self._line_response_cache) > _LINE_RESPONSE_CACHE_MAX_ENTRIES
+            or sum(
+                int(values.nbytes)
+                for values in self._line_response_cache.values()
+            )
+            > _LINE_RESPONSE_CACHE_MAX_BYTES
+        ):
+            self._line_response_cache.pop(next(iter(self._line_response_cache)))
+        return result
+
+    def line_transport_components_selected_pairs_for_detectors(
+        self,
+        isotope: str,
+        detector_positions: NDArray[np.float64],
+        sources: NDArray[np.float64],
+        fe_indices: NDArray[np.int64],
+        pb_indices: NDArray[np.int64],
+        positive_line_indices: object,
+        chunk_size: int = 262144,
+    ) -> LineTransportComponents:
+        """Return view-by-source-by-line spectral transport components.
+
+        The total kernel is bit-identical to
+        :meth:`kernel_values_selected_pairs_for_detectors_by_line`.  The
+        unattenuated term contains geometry only, the uncollided term contains
+        exact material attenuation, and total adds the authenticated
+        nonnegative scatter response.  The remaining arrays expose physical
+        optical depths and source-detector distance.  Computation follows the
+        same batched CPU/GPU ray path as the production scalar kernel.
+        """
+        line_selection = self._validated_positive_line_indices(
+            isotope,
+            positive_line_indices,
+        )
+        detectors_arr = np.asarray(detector_positions, dtype=np.float64)
+        sources_arr = np.asarray(sources, dtype=np.float64)
+        if (
+            detectors_arr.ndim != 2
+            or detectors_arr.shape[1] != 3
+            or np.any(~np.isfinite(detectors_arr))
+        ):
+            raise ValueError(
+                "detector_positions must contain finite values with shape (P, 3)."
+            )
+        if (
+            sources_arr.ndim != 2
+            or sources_arr.shape[1] != 3
+            or np.any(~np.isfinite(sources_arr))
+        ):
+            raise ValueError(
+                "sources must contain finite values with shape (S, 3)."
+            )
+        view_count = int(detectors_arr.shape[0])
+        source_count = int(sources_arr.shape[0])
+        orientation_count = int(len(self.orientations))
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=orientation_count,
+            expected_count=view_count,
+        )
+        output_shape = (
+            view_count,
+            source_count,
+            int(line_selection.size),
+        )
+        if view_count == 0 or source_count == 0:
+            empty = np.zeros(output_shape, dtype=np.float64)
+            return LineTransportComponents(
+                total_kernel=empty,
+                unattenuated_kernel=empty.copy(),
+                uncollided_kernel=empty.copy(),
+                tau_fe=empty.copy(),
+                tau_pb=empty.copy(),
+                tau_obstacle=empty.copy(),
+                tau_obstacle_compton=empty.copy(),
+                distance_m=empty.copy(),
+            )
+        detectors_flat = np.repeat(detectors_arr, source_count, axis=0)
+        sources_flat = np.tile(sources_arr, (view_count, 1))
+        fe_flat = np.repeat(fe_arr, source_count)
+        pb_flat = np.repeat(pb_arr, source_count)
+        if not self.use_gpu:
+            chunk = self._adaptive_numpy_chunk_size(
+                chunk_size,
+                isotope=isotope,
+            )
+            parts = [
+                self._kernel_values_selected_pairs_for_detector_source_numpy_chunk(
+                    isotope=isotope,
+                    detector_positions=detectors_flat[start:stop],
+                    sources=sources_flat[start:stop],
+                    fe_indices=fe_flat[start:stop],
+                    pb_indices=pb_flat[start:stop],
+                    positive_line_indices=line_selection,
+                    return_line_transport_components=True,
+                )
+                for start in range(0, sources_flat.shape[0], chunk)
+                for stop in [min(start + chunk, sources_flat.shape[0])]
+            ]
+        else:
+            self._gpu_enabled()
+            device = _resolve_device(self.gpu_device)
+            dtype = _resolve_dtype(self.gpu_dtype)
+            chunk = self._adaptive_torch_chunk_size(
+                chunk_size,
+                isotope=isotope,
+                orientation_pair_count=1,
+                device=device,
+                dtype=dtype,
+                all_orientation_pairs=False,
+            )
+
+            def _evaluate_component_chunk(
+                start: int,
+                stop: int,
+            ) -> LineTransportComponents:
+                """Return physical line components for one Torch chunk."""
+                result = (
+                    self
+                    ._kernel_values_selected_pairs_for_detector_source_torch_chunk(
+                        isotope=isotope,
+                        detector_positions=detectors_flat[start:stop],
+                        sources=sources_flat[start:stop],
+                        fe_indices=fe_flat[start:stop],
+                        pb_indices=pb_flat[start:stop],
+                        positive_line_indices=line_selection,
+                        return_line_transport_components=True,
+                    )
+                )
+                if not isinstance(result, LineTransportComponents):
+                    raise RuntimeError(
+                        "Torch line-component path returned scalar kernels."
+                    )
+                return result
+
+            parts, _ = self._evaluate_torch_chunks_with_oom_retry(
+                total_size=int(sources_flat.shape[0]),
+                initial_chunk=chunk,
+                device=device,
+                evaluator=_evaluate_component_chunk,
+            )
+        if any(not isinstance(part, LineTransportComponents) for part in parts):
+            raise RuntimeError(
+                "Line-component chunk evaluation returned scalar kernels."
+            )
+
+        def _joined(field_name: str) -> NDArray[np.float64]:
+            """Concatenate and reshape one component field."""
+            values = [
+                np.asarray(
+                    getattr(part, field_name),
+                    dtype=np.float64,
+                )
+                for part in parts
+                if isinstance(part, LineTransportComponents)
+            ]
+            flat = (
+                np.concatenate(values, axis=0)
+                if values
+                else np.zeros(
+                    (0, int(line_selection.size)),
+                    dtype=np.float64,
+                )
+            )
+            return flat.reshape(output_shape)
+
+        return LineTransportComponents(
+            total_kernel=_joined("total_kernel"),
+            unattenuated_kernel=_joined("unattenuated_kernel"),
+            uncollided_kernel=_joined("uncollided_kernel"),
+            tau_fe=_joined("tau_fe"),
+            tau_pb=_joined("tau_pb"),
+            tau_obstacle=_joined("tau_obstacle"),
+            tau_obstacle_compton=_joined("tau_obstacle_compton"),
+            distance_m=_joined("distance_m"),
+        )
+
     def _kernel_values_pair_scalar_oracle(
         self,
         isotope: str,
@@ -4986,6 +5289,14 @@ class ContinuousKernel:
         chunk_size: int = 8192,
     ) -> NDArray[np.float64]:
         """Evaluate K values for many sources at one detector pose."""
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            np.asarray([fe_index]),
+            np.asarray([pb_index]),
+            orientation_count=int(len(self.orientations)),
+            expected_count=1,
+        )
+        fe_index = int(fe_arr[0])
+        pb_index = int(pb_arr[0])
         sources_arr = np.asarray(sources, dtype=float)
         if sources_arr.size == 0:
             return np.zeros(0, dtype=float)
@@ -5076,6 +5387,14 @@ class ContinuousKernel:
         pb_index: int,
     ) -> float:
         """Return combined Fe/Pb attenuation factor A^{sh} (Sec. 3.2)."""
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            np.asarray([fe_index]),
+            np.asarray([pb_index]),
+            orientation_count=int(len(self.orientations)),
+            expected_count=1,
+        )
+        fe_index = int(fe_arr[0])
+        pb_index = int(pb_arr[0])
         sampled_sources, targets = self._ray_sample_points(source_pos, detector_pos)
         values = [
             self._attenuation_factor_for_target(
@@ -5089,242 +5408,6 @@ class ContinuousKernel:
             for sampled_source, target in zip(sampled_sources, targets)
         ]
         return float(np.mean(values)) if values else 1.0
-
-    def transport_response_terms_pair(
-        self,
-        isotope: str,
-        detector_pos: NDArray[np.float64],
-        source_pos: NDArray[np.float64],
-        fe_index: int,
-        pb_index: int,
-    ) -> list[dict[str, float]]:
-        """
-        Return per-aperture transport-response basis terms for calibration.
-
-        Runtime expected counts apply the optional transport-response factor
-        per detector-aperture ray before averaging.  Calibration and validation
-        must use the same feature granularity; otherwise a fitted response model
-        is trained on center-ray features but evaluated on aperture-ray
-        features.  This diagnostic helper mirrors the CPU attenuation kernel.
-        Its ``kernel`` values sum to ``kernel_value_pair`` for this kernel, and
-        its ``base_kernel`` values sum to the capped base kernel before applying
-        any configured transport-response factor.
-        """
-        geom = finite_sphere_geometric_term(
-            detector_pos,
-            source_pos,
-            self.detector_radius_m,
-        )
-        sampled_sources, targets = self._ray_sample_points(source_pos, detector_pos)
-        if len(targets) == 0:
-            return []
-        sample_scale = float(geom) / float(len(targets))
-        return [
-            self._transport_response_term_for_target(
-                isotope=isotope,
-                source_pos=sampled_source,
-                target_pos=target,
-                detector_pos=detector_pos,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                sample_scale=sample_scale,
-            )
-            for sampled_source, target in zip(sampled_sources, targets)
-        ]
-
-    def _transport_response_term_for_target(
-        self,
-        isotope: str,
-        source_pos: NDArray[np.float64],
-        target_pos: NDArray[np.float64],
-        detector_pos: NDArray[np.float64],
-        fe_index: int,
-        pb_index: int,
-        sample_scale: float,
-    ) -> dict[str, float]:
-        """Return one aperture-ray term matching the CPU attenuation kernel."""
-        mu_fe, mu_pb = self._mu_values(isotope=isotope)
-        normal_fe = self.orientations[fe_index]
-        normal_pb = self.orientations[pb_index]
-        detector_to_source = np.asarray(source_pos, dtype=float) - np.asarray(
-            target_pos, dtype=float
-        )
-        distance_feature = float(
-            np.linalg.norm(
-                np.asarray(source_pos, dtype=float)
-                - np.asarray(detector_pos, dtype=float)
-            )
-        )
-        blocked_fe = rotated_positive_octant_blocks_direction(
-            detector_to_source,
-            -normal_fe,
-        )
-        blocked_pb = rotated_positive_octant_blocks_direction(
-            detector_to_source,
-            -normal_pb,
-        )
-        l_fe = self._shield_segment_path_length_cm(
-            source_pos=source_pos,
-            target_pos=target_pos,
-            detector_center=detector_pos,
-            incoming_normal=normal_fe,
-            physical_normal=-normal_fe,
-            thickness_cm=self.shield_params.thickness_fe_cm,
-            inner_radius_cm=self.shield_params.inner_radius_fe_cm,
-            blocked=blocked_fe,
-        )
-        l_pb = self._shield_segment_path_length_cm(
-            source_pos=source_pos,
-            target_pos=target_pos,
-            detector_center=detector_pos,
-            incoming_normal=normal_pb,
-            physical_normal=-normal_pb,
-            thickness_cm=self.shield_params.thickness_pb_cm,
-            inner_radius_cm=self.shield_params.inner_radius_pb_cm,
-            blocked=blocked_pb,
-        )
-        obstacle_path_by_box = np.zeros(0, dtype=float)
-        tau_obstacle = 0.0
-        if self.obstacle_grid is not None:
-            obstacle_path_by_box = obstacle_path_lengths_by_box_cm(
-                source_pos=source_pos,
-                detector_pos=target_pos,
-                obstacle_boxes_m=self.obstacle_boxes_m(),
-            )
-            tau_obstacle = float(
-                np.sum(self.obstacle_mu_values_cm_inv(isotope) * obstacle_path_by_box)
-            )
-        line_entries = self._line_mu_values(isotope)
-        if line_entries:
-            line_obstacle_tau = self._line_obstacle_tau_values(
-                isotope,
-                obstacle_path_by_box,
-                line_count=len(line_entries),
-            )
-            attenuation = 0.0
-            shield_tau_feature = 0.0
-            fe_tau_feature = 0.0
-            pb_tau_feature = 0.0
-            obstacle_tau_feature = 0.0
-            for line_index, (weight, line_mu_fe, line_mu_pb) in enumerate(line_entries):
-                tau_fe = float(line_mu_fe * l_fe)
-                tau_pb = float(line_mu_pb * l_pb)
-                tau_obs_line = (
-                    tau_obstacle
-                    if line_obstacle_tau is None
-                    else float(line_obstacle_tau[line_index])
-                )
-                buildup = self._buildup_factor(tau_fe, tau_pb, tau_obs_line)
-                attenuation += (
-                    float(weight)
-                    * float(np.exp(-(tau_fe + tau_pb + tau_obs_line)))
-                    * buildup
-                )
-                shield_tau_feature += float(weight) * (tau_fe + tau_pb)
-                fe_tau_feature += float(weight) * tau_fe
-                pb_tau_feature += float(weight) * tau_pb
-                obstacle_tau_feature += float(weight) * tau_obs_line
-        else:
-            tau_fe = float(mu_fe * l_fe)
-            tau_pb = float(mu_pb * l_pb)
-            buildup = self._buildup_factor(tau_fe, tau_pb, tau_obstacle)
-            attenuation = float(np.exp(-(tau_fe + tau_pb + tau_obstacle))) * buildup
-            shield_tau_feature = tau_fe + tau_pb
-            fe_tau_feature = tau_fe
-            pb_tau_feature = tau_pb
-            obstacle_tau_feature = tau_obstacle
-        (
-            shield_cap,
-            obstacle_cap,
-            fe_cap,
-            pb_cap,
-            distance_shield_cap,
-            distance_fe_cap,
-            distance_pb_cap,
-            distance_obstacle_cap,
-        ) = self._transport_response_feature_caps(isotope)
-        distance_shield_feature = max(distance_feature, 0.0) * max(
-            shield_tau_feature, 0.0
-        )
-        distance_fe_feature = max(distance_feature, 0.0) * max(fe_tau_feature, 0.0)
-        distance_pb_feature = max(distance_feature, 0.0) * max(pb_tau_feature, 0.0)
-        distance_obstacle_feature = max(distance_feature, 0.0) * max(
-            obstacle_tau_feature, 0.0
-        )
-        shield_tau_capped = self._capped_transport_feature(
-            shield_tau_feature,
-            shield_cap,
-        )
-        fe_tau_capped = self._capped_transport_feature(fe_tau_feature, fe_cap)
-        pb_tau_capped = self._capped_transport_feature(pb_tau_feature, pb_cap)
-        obstacle_tau_capped = self._capped_transport_feature(
-            obstacle_tau_feature,
-            obstacle_cap,
-        )
-        distance_shield_capped = self._capped_transport_feature(
-            distance_shield_feature,
-            distance_shield_cap,
-        )
-        distance_fe_capped = self._capped_transport_feature(
-            distance_fe_feature,
-            distance_fe_cap,
-        )
-        distance_pb_capped = self._capped_transport_feature(
-            distance_pb_feature,
-            distance_pb_cap,
-        )
-        distance_obstacle_capped = self._capped_transport_feature(
-            distance_obstacle_feature,
-            distance_obstacle_cap,
-        )
-        response_factor = self._transport_response_factor(
-            isotope,
-            fe_index,
-            pb_index,
-            shield_tau_feature,
-            obstacle_tau_feature,
-            fe_tau_feature,
-            pb_tau_feature,
-            distance_feature,
-            distance_shield_feature,
-        )
-        base_attenuation = self._response_adjusted_attenuation(
-            isotope,
-            attenuation,
-            1.0,
-        )
-        adjusted_attenuation = self._response_adjusted_attenuation(
-            isotope,
-            attenuation,
-            response_factor,
-        )
-        uncapped_kernel = float(sample_scale) * float(attenuation)
-        base_kernel = float(sample_scale) * float(base_attenuation)
-        kernel = float(sample_scale) * adjusted_attenuation
-        return {
-            "kernel": kernel,
-            "base_kernel": base_kernel,
-            "uncapped_kernel": uncapped_kernel,
-            "response_factor": float(response_factor),
-            "shield_tau_feature": float(max(shield_tau_feature, 0.0)),
-            "fe_tau_feature": float(max(fe_tau_feature, 0.0)),
-            "pb_tau_feature": float(max(pb_tau_feature, 0.0)),
-            "obstacle_tau_feature": float(max(obstacle_tau_feature, 0.0)),
-            "distance_feature": float(max(distance_feature, 0.0)),
-            "distance_shield_feature": float(distance_shield_feature),
-            "distance_fe_feature": float(distance_fe_feature),
-            "distance_pb_feature": float(distance_pb_feature),
-            "distance_obstacle_feature": float(distance_obstacle_feature),
-            "shield_tau_feature_capped": float(shield_tau_capped),
-            "fe_tau_feature_capped": float(fe_tau_capped),
-            "pb_tau_feature_capped": float(pb_tau_capped),
-            "obstacle_tau_feature_capped": float(obstacle_tau_capped),
-            "distance_shield_feature_capped": float(distance_shield_capped),
-            "distance_fe_feature_capped": float(distance_fe_capped),
-            "distance_pb_feature_capped": float(distance_pb_capped),
-            "distance_obstacle_feature_capped": float(distance_obstacle_capped),
-            "sample_scale": float(sample_scale),
-        }
 
     def kernel_value(
         self,
@@ -5398,6 +5481,14 @@ class ContinuousKernel:
         """
         Compute λ_{k,h} for a Fe/Pb orientation pair (Eq. 3.41 with separate R_Fe, R_Pb).
         """
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            np.asarray([fe_index]),
+            np.asarray([pb_index]),
+            orientation_count=int(len(self.orientations)),
+            expected_count=1,
+        )
+        fe_index = int(fe_arr[0])
+        pb_index = int(pb_arr[0])
         if not self.use_gpu:
             sources_arr = np.asarray(sources, dtype=float)
             strengths_arr = np.asarray(strengths, dtype=float)
@@ -5484,6 +5575,12 @@ class ContinuousKernel:
         dtype: "torch.dtype",
     ) -> "torch.Tensor":
         """Compute packed-state pair counts through ContinuousKernel GPU math."""
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            np.asarray([fe_index]),
+            np.asarray([pb_index]),
+            orientation_count=int(len(self.orientations)),
+            expected_count=1,
+        )
         counts = self._expected_counts_selected_pairs_for_packed_states_torch(
             isotope=isotope,
             detector_pos=np.asarray(detector_pos, dtype=float),
@@ -5491,8 +5588,8 @@ class ContinuousKernel:
             strengths=strengths,
             backgrounds=backgrounds,
             mask=mask,
-            fe_indices=np.asarray([int(fe_index)], dtype=np.int64),
-            pb_indices=np.asarray([int(pb_index)], dtype=np.int64),
+            fe_indices=fe_arr,
+            pb_indices=pb_arr,
             live_time_s=float(live_time_s),
             source_scale=source_scale,
             device=device,
@@ -5551,6 +5648,11 @@ class ContinuousKernel:
         dtype: "torch.dtype",
     ) -> "torch.Tensor":
         """Compute selected Fe/Pb-pair counts through ContinuousKernel GPU math."""
+        fe_arr, pb_arr = validate_orientation_pair_indices(
+            fe_indices,
+            pb_indices,
+            orientation_count=int(len(self.orientations)),
+        )
         return self._expected_counts_selected_pairs_for_packed_states_torch(
             isotope=isotope,
             detector_pos=np.asarray(detector_pos, dtype=float),
@@ -5558,8 +5660,8 @@ class ContinuousKernel:
             strengths=strengths,
             backgrounds=backgrounds,
             mask=mask,
-            fe_indices=np.asarray(fe_indices, dtype=int),
-            pb_indices=np.asarray(pb_indices, dtype=int),
+            fe_indices=fe_arr,
+            pb_indices=pb_arr,
             live_time_s=float(live_time_s),
             source_scale=source_scale,
             device=device,

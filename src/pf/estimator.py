@@ -2,196 +2,317 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 import hashlib
+import math
 import re
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence, Tuple
-import copy
-import os
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.special import logsumexp
-from scipy.stats import chi2
 
 from measurement.kernels import MeasurementGeometry, ShieldParams
 from measurement.model import EnvironmentConfig
-from measurement.shielding import octant_index_from_rotation
-from measurement.continuous_kernels import ContinuousKernel
+from measurement.continuous_kernels import (
+    ContinuousKernel,
+    validate_orientation_pair_indices,
+)
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import (
     SOURCE_SURFACE_REPORT_LABELS,
     source_surface_kinds,
 )
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
-from pf.likelihood import (
-    CountLikelihoodSpec,
-    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
-    OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL,
-    count_log_likelihood_terms_np,
-    count_log_likelihood_terms_torch,
-    expected_counts_per_source,
-    normalize_count_likelihood_model,
-    predictive_count_likelihood_variance,
-    predictive_count_likelihood_variance_torch,
-    normalize_observation_count_variance_semantics,
+from pf.full_spectrum import (
+    FullSpectrumGenerativeModel,
+    validate_full_spectrum_model,
+    validate_observed_spectrum,
 )
-from pf.particle_filter import IsotopeParticleFilter, MeasurementData, PFConfig
-from pf.posterior import posterior_point_estimate_from_states
+from pf.particle_filter import (
+    IsotopeParticle,
+    IsotopeParticleFilter,
+    JointRowIdentity,
+    StructuralGeometryBatch,
+    PFConfig,
+    TemperingIncrementRequiresRejuvenation,
+)
+from pf.posterior import (
+    PFPointEstimate,
+    posterior_point_estimate_from_states,
+    validated_probability_distribution,
+    validated_state_cardinality,
+)
 from pf.posterior_uncertainty import posterior_mode_uncertainty_batched
-from pf.reporting import measurement_vector
-from pf.resampling import systematic_resample
-from pf.runtime_route import (
-    COUNT_COVARIANCE_LIKELIHOOD_ROUTE,
-    COUNT_LIKELIHOOD_ROUTE,
-    canonical_runtime_likelihood_route_mapping,
+from pf.provenance import sha256_json
+from pf.randomness import (
+    named_random_generator,
+    normalize_pf_random_seed,
+    pf_rng_provenance,
 )
+from pf.resampling import systematic_resample
 from pf.state import IsotopeState
-
+from pf.structural_rj import (
+    TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    validate_cardinality_prior_policy,
+)
+from pf.transport_response import expected_counts_per_source
 if TYPE_CHECKING:
     import torch
 
 
-def _weighted_quantile(
-    values: NDArray[np.float64],
-    weights: NDArray[np.float64],
-    quantile: float,
-) -> float:
-    """Return a weighted quantile for non-negative planning statistics."""
-    values = np.asarray(values, dtype=float).ravel()
-    weights = np.asarray(weights, dtype=float).ravel()
-    if values.size == 0:
-        return 0.0
-    if weights.size != values.size:
-        raise ValueError("weights must have the same size as values.")
-    finite = np.isfinite(values) & np.isfinite(weights) & (weights >= 0.0)
-    if not np.any(finite):
-        return 0.0
-    values = values[finite]
-    weights = weights[finite]
-    total = float(np.sum(weights))
-    if total <= 0.0:
-        return float(np.quantile(values, np.clip(float(quantile), 0.0, 1.0)))
-    order = np.argsort(values)
-    values = values[order]
-    weights = weights[order] / total
-    cdf = np.cumsum(weights)
-    idx = int(np.searchsorted(cdf, np.clip(float(quantile), 0.0, 1.0), side="left"))
-    idx = min(max(idx, 0), values.size - 1)
-    return float(values[idx])
+JOINT_HISTORY_STATION_ACTION_BATCH_SIZE = 4
+
+
+def _strict_nonnegative_integer(value: object, *, name: str) -> int:
+    """Return one exact nonnegative integer without coercion or truncation."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, np.integer),
+    ):
+        raise TypeError(f"{name} must be an integer.")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be nonnegative.")
+    return result
+
+
+def _strict_config_boolean(value: object, *, name: str) -> bool:
+    """Return one exact configuration boolean without truthy coercion."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean.")
+    return value
+
+
+def _strict_config_number(value: object, *, name: str) -> float:
+    """Return one finite numeric configuration value without string coercion."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value,
+        (int, float, np.integer, np.floating),
+    ):
+        raise TypeError(f"{name} must be numeric.")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite.")
+    return result
 
 
 @dataclass
 class RotatingShieldPFConfig:
-    """Configure the exact finite-surface PF and its active planner."""
+    """Configure the exact continuous-surface PF and its active planner."""
 
     estimator_profile: str = "pf_strict"
     num_particles: int = 200
     max_sources: int | None = DEFAULT_MAX_SOURCES_PER_ISOTOPE
-    resample_threshold: float = 0.5
-    background_level: float | dict[str, float] = 0.0
-    measurement_scale_by_isotope: Dict[str, float] | None = None
-    measurement_scale_by_isotope_and_pair: Dict[str, Dict[int, float]] | None = None
-    count_likelihood_model: str = "poisson"
-    transport_model_rel_sigma: float | Dict[str, float] = 0.0
-    transport_model_abs_sigma: float | Dict[str, float] = 0.0
-    spectrum_count_rel_sigma: float | Dict[str, float] = 0.0
-    spectrum_count_abs_sigma: float | Dict[str, float] = 0.0
-    low_count_abs_sigma: float | Dict[str, float] = 0.0
-    low_count_transition_counts: float | Dict[str, float] = 0.0
-    observation_count_variance_semantics: str = (
-        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
-    )
-    count_likelihood_df: float = 5.0
-    shield_contrast_likelihood_enable: bool = False
-    shield_contrast_likelihood_weight: float = 1.0
-    shield_contrast_log_sigma_floor: float = 0.5
-    shield_contrast_log_sigma_ceiling: float = 2.0
-    shield_contrast_min_count: float = 25.0
-    shield_contrast_min_views: int = 2
-    shield_contrast_likelihood_df: float = 5.0
-    shield_view_ratio_likelihood_enable: bool = False
-    shield_view_ratio_likelihood_weight: float = 1.0
-    shield_view_ratio_likelihood_concentration: float = 128.0
-    shield_view_ratio_likelihood_min_total_count: float = 25.0
-    shield_view_ratio_likelihood_min_views: int = 2
-    station_view_covariance_enable: bool = False
-    station_view_correlated_spectrum_fraction: float = 0.0
     variable_cardinality: bool = True
     history_estimate_interval: int = 1
-    candidate_response_cache_max_entries: int = 24
-    structural_rj_patch_spacing_m: float = 1.0
+    surface_diagnostic_response_cache_max_entries: int = 24
+    structural_rj_surface_chart_max_edge_m: float = 1.0
     structural_rj_move_probability: float = 1.0
     structural_rj_birth_probability: float = 0.5
     structural_rj_death_probability: float = 0.5
     structural_rj_position_move_probability: float = 1.0
+    structural_rj_position_proposal_prior_weight: float = 0.5
+    structural_rj_strength_proposal_prior_weight: float = 0.5
+    structural_rj_strength_proposal_sigma_fraction: float = 0.15
+    structural_rj_strength_proposal_grid_size: int = 9
+    structural_rj_proposal_chart_batch_size: int = 256
+    structural_rj_proposal_score_cache_max_bytes: int = 268_435_456
     structural_rj_local_position_move_probability: float = 1.0
+    structural_rj_local_position_sigma_m: float = 0.5
     structural_rj_strength_move_probability: float = 1.0
+    structural_rj_split_merge_probability: float = 1.0
+    structural_rj_split_probability: float = 0.5
+    structural_rj_merge_probability: float = 0.5
+    structural_cardinality_prior_policy: str = (
+        TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY
+    )
     structural_cardinality_prior_probs: tuple[float, ...] | list[float] | None = None
-    ig_threshold: float = 1e-3  # ΔIG stopping threshold (Sec. 3.4.4).
+    structural_cardinality_prior_mean: float = 2.0
     max_dwell_time_s: float = 5.0  # Max dwell time per pose.
-    lambda_cost: float = 1.0  # Motion-cost weight (Eq. 3.51).
-    alpha_weights: Dict[str, float] | None = None  # EIG isotope weights alpha_h.
-    credible_volume_threshold: float = 1e-3  # Max 95% credible volume for convergence.
+    credible_surface_radius_threshold_m: float = 0.5
+    converge_min_ess_ratio: float = 0.5
+    converge_cardinality_min_probability: float = 0.95
+    converge_max_cardinality_boundary_mass: float = 0.05
+    converge_innovation_confidence: float = 0.99
     target_ess_ratio: float = 0.5
-    max_temper_steps: int = 16
-    min_delta_beta: float = 1e-3
-    use_tempering: bool = True
-    max_resamples_per_observation: int = 2
-    temper_resample_cooldown_steps: int = 2
-    temper_resample_force_ratio: float = 0.1
+    max_temper_steps: int = 256
+    min_delta_beta: float = 1e-10
     position_max: Tuple[float, float, float] = (10.0, 10.0, 10.0)
     init_num_sources: Tuple[int, int] = (
         0,
         DEFAULT_MAX_SOURCES_PER_ISOTOPE,
     )
-    strength_prior_min_cps_1m: float = 0.0
+    strength_prior_min_cps_1m: float = 1.0
     strength_prior_max_cps_1m: float = 2_000_000.0
-    observation_covariance_projection_enable: bool = True
-    observation_covariance_projection_weight: float = 1.0
-    observation_covariance_projection_max_corr: float = 0.999
-    pose_min_observation_counts: float = 0.0
-    pose_min_observation_penalty_scale: float = 1.0
-    pose_min_observation_aggregate: str = "max"
-    pose_min_observation_max_particles: int | None = None
-    pose_min_observation_quantile: float = 0.25
     orientation_k: int = 8
     min_rotations_per_pose: int = 0
     planning_particles: int | None = None
     planning_method: str = "top_weight"
     use_gpu: bool = True
     gpu_device: str = "cuda"
-    gpu_dtype: str = "float32"
-    eig_num_samples: int = 50
-    planning_eig_samples: int | None = None
-    planning_rollout_particles: int | None = None
-    planning_rollout_method: str | None = None
-    preselect_orientations: bool = False
-    preselect_metric: str = "var_log_lambda"
-    preselect_delta: float = 0.05
-    preselect_k_min: int = 8
-    preselect_k_max: int = 16
-    use_fast_gpu_rollout: bool = False
-    ig_workers: int = 0
-    parallel_isotope_updates: bool = True
-    parallel_isotope_workers: int | None = None
+    gpu_dtype: str = "float64"
+    planning_eig_samples: int = 50
     converge_cardinality_var_max: float = 0.05
 
     def __post_init__(self) -> None:
         """Validate and normalize estimator configuration values."""
+        integer_fields = (
+            ("num_particles", self.num_particles, 1),
+            ("history_estimate_interval", self.history_estimate_interval, 0),
+            (
+                "surface_diagnostic_response_cache_max_entries",
+                self.surface_diagnostic_response_cache_max_entries,
+                0,
+            ),
+            (
+                "structural_rj_strength_proposal_grid_size",
+                self.structural_rj_strength_proposal_grid_size,
+                2,
+            ),
+            (
+                "structural_rj_proposal_chart_batch_size",
+                self.structural_rj_proposal_chart_batch_size,
+                1,
+            ),
+            (
+                "structural_rj_proposal_score_cache_max_bytes",
+                self.structural_rj_proposal_score_cache_max_bytes,
+                1,
+            ),
+            ("orientation_k", self.orientation_k, 1),
+            ("min_rotations_per_pose", self.min_rotations_per_pose, 0),
+            ("planning_eig_samples", self.planning_eig_samples, 1),
+            ("max_temper_steps", self.max_temper_steps, 1),
+        )
+        for name, value, minimum in integer_fields:
+            resolved = _strict_nonnegative_integer(value, name=name)
+            if resolved < minimum:
+                raise ValueError(f"{name} must be at least {minimum}.")
+        if self.max_sources is None:
+            raise ValueError("Pure PF requires a finite positive max_sources.")
+        if _strict_nonnegative_integer(
+            self.max_sources,
+            name="max_sources",
+        ) < 1:
+            raise ValueError("Pure PF requires a finite positive max_sources.")
+        _strict_config_boolean(
+            self.variable_cardinality,
+            name="variable_cardinality",
+        )
+        _strict_config_boolean(self.use_gpu, name="use_gpu")
+        if (
+            not isinstance(self.init_num_sources, (tuple, list))
+            or len(self.init_num_sources) != 2
+        ):
+            raise TypeError("init_num_sources must contain two integers.")
+        for index, value in enumerate(self.init_num_sources):
+            _strict_nonnegative_integer(
+                value,
+                name=f"init_num_sources[{index}]",
+            )
+        numeric_fields = (
+            "strength_prior_min_cps_1m",
+            "strength_prior_max_cps_1m",
+            "structural_rj_surface_chart_max_edge_m",
+            "structural_rj_local_position_sigma_m",
+            "structural_rj_position_proposal_prior_weight",
+            "structural_rj_strength_proposal_prior_weight",
+            "structural_rj_strength_proposal_sigma_fraction",
+            "structural_rj_move_probability",
+            "structural_rj_birth_probability",
+            "structural_rj_death_probability",
+            "structural_rj_position_move_probability",
+            "structural_rj_local_position_move_probability",
+            "structural_rj_strength_move_probability",
+            "structural_rj_split_merge_probability",
+            "structural_rj_split_probability",
+            "structural_rj_merge_probability",
+            "structural_cardinality_prior_mean",
+            "max_dwell_time_s",
+            "credible_surface_radius_threshold_m",
+            "converge_min_ess_ratio",
+            "converge_cardinality_min_probability",
+            "converge_max_cardinality_boundary_mass",
+            "converge_innovation_confidence",
+            "target_ess_ratio",
+            "min_delta_beta",
+            "converge_cardinality_var_max",
+        )
+        for name in numeric_fields:
+            _strict_config_number(getattr(self, name), name=name)
+        if self.structural_cardinality_prior_probs is not None:
+            for index, value in enumerate(
+                self.structural_cardinality_prior_probs
+            ):
+                _strict_config_number(
+                    value,
+                    name=f"structural_cardinality_prior_probs[{index}]",
+                )
+        if not isinstance(self.gpu_device, str) or not self.gpu_device.strip():
+            raise TypeError("gpu_device must be a nonempty string.")
+        if not isinstance(self.gpu_dtype, str):
+            raise TypeError("gpu_dtype must be a string.")
+        if self.planning_particles is not None:
+            if _strict_nonnegative_integer(
+                self.planning_particles,
+                name="planning_particles",
+            ) < 2:
+                raise ValueError("planning_particles must be at least two.")
+        if self.planning_method not in {"resample", "top_weight"}:
+            raise ValueError(
+                "planning_method must be 'resample' or 'top_weight'."
+            )
+        if self.orientation_k > 64:
+            raise ValueError("orientation_k cannot exceed 64.")
+        if self.min_rotations_per_pose > self.orientation_k:
+            raise ValueError(
+                "min_rotations_per_pose cannot exceed orientation_k."
+            )
+        if _strict_config_number(
+            self.max_dwell_time_s,
+            name="max_dwell_time_s",
+        ) <= 0.0:
+            raise ValueError("max_dwell_time_s must be positive.")
+        target_ess_ratio = _strict_config_number(
+            self.target_ess_ratio,
+            name="target_ess_ratio",
+        )
+        if not 0.0 < target_ess_ratio < 1.0:
+            raise ValueError(
+                "target_ess_ratio must lie strictly between zero and one."
+            )
+        min_delta_beta = _strict_config_number(
+            self.min_delta_beta,
+            name="min_delta_beta",
+        )
+        if not 0.0 < min_delta_beta <= 1.0:
+            raise ValueError("min_delta_beta must lie in (0, 1].")
+        innovation_confidence = _strict_config_number(
+            self.converge_innovation_confidence,
+            name="converge_innovation_confidence",
+        )
+        if not 0.0 < innovation_confidence < 1.0:
+            raise ValueError(
+                "converge_innovation_confidence must lie in (0, 1)."
+            )
         self.num_particles = int(self.num_particles)
         if self.num_particles < 1:
             raise ValueError("num_particles must be positive.")
+        if str(self.gpu_dtype).strip().lower() != "float64":
+            raise ValueError(
+                "Pure PF production kernels require gpu_dtype='float64'."
+            )
+        self.gpu_dtype = "float64"
         self.strength_prior_min_cps_1m = float(self.strength_prior_min_cps_1m)
         self.strength_prior_max_cps_1m = float(self.strength_prior_max_cps_1m)
         if (
             not np.isfinite(self.strength_prior_min_cps_1m)
-            or self.strength_prior_min_cps_1m < 0.0
+            or self.strength_prior_min_cps_1m <= 0.0
         ):
             raise ValueError(
-                "strength_prior_min_cps_1m must be finite and nonnegative."
+                "strength_prior_min_cps_1m must be finite and positive."
             )
         if (
             not np.isfinite(self.strength_prior_max_cps_1m)
@@ -202,105 +323,88 @@ class RotatingShieldPFConfig:
                 "strength_prior_max_cps_1m must be finite and greater than "
                 "strength_prior_min_cps_1m."
             )
-        self.ig_workers = int(self.ig_workers)
-        if self.ig_workers < 0:
-            raise ValueError("ig_workers must be >= 0.")
-        self.observation_covariance_projection_enable = bool(
-            self.observation_covariance_projection_enable
-        )
-        self.observation_covariance_projection_weight = max(
-            0.0,
-            float(self.observation_covariance_projection_weight),
-        )
-        self.observation_covariance_projection_max_corr = float(
-            np.clip(
-                float(self.observation_covariance_projection_max_corr),
-                0.0,
-                1.0,
-            )
-        )
-        self.pose_min_observation_counts = float(self.pose_min_observation_counts)
-        if self.pose_min_observation_counts < 0.0:
-            raise ValueError("pose_min_observation_counts must be >= 0.")
-        self.pose_min_observation_penalty_scale = float(
-            self.pose_min_observation_penalty_scale
-        )
-        if self.pose_min_observation_penalty_scale < 0.0:
-            raise ValueError("pose_min_observation_penalty_scale must be >= 0.")
-        self.pose_min_observation_aggregate = (
-            str(self.pose_min_observation_aggregate).strip().lower()
-        )
-        if self.pose_min_observation_aggregate not in {"max", "mean"}:
-            raise ValueError("pose_min_observation_aggregate must be max or mean.")
-        if self.pose_min_observation_max_particles is not None:
-            self.pose_min_observation_max_particles = int(
-                self.pose_min_observation_max_particles
-            )
-            if self.pose_min_observation_max_particles < 0:
-                raise ValueError("pose_min_observation_max_particles must be >= 0.")
-        self.pose_min_observation_quantile = float(self.pose_min_observation_quantile)
-        if not 0.0 <= self.pose_min_observation_quantile <= 1.0:
-            raise ValueError("pose_min_observation_quantile must be in [0, 1].")
-        self.count_likelihood_model = normalize_count_likelihood_model(
-            self.count_likelihood_model
-        )
-        self.observation_count_variance_semantics = (
-            normalize_observation_count_variance_semantics(
-                self.observation_count_variance_semantics,
-            )
+        self.structural_rj_surface_chart_max_edge_m = float(
+            self.structural_rj_surface_chart_max_edge_m
         )
         if (
-            self.observation_count_variance_semantics
-            == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
-            and self.count_likelihood_model == "poisson"
+            not np.isfinite(self.structural_rj_surface_chart_max_edge_m)
+            or self.structural_rj_surface_chart_max_edge_m <= 0.0
         ):
             raise ValueError(
-                "complete_statistical observation variance requires gaussian "
-                "or student_t count likelihood."
+                "structural_rj_surface_chart_max_edge_m must be positive."
             )
-        self.count_likelihood_df = max(float(self.count_likelihood_df), 1.0)
-        self.shield_contrast_likelihood_enable = bool(
-            self.shield_contrast_likelihood_enable
-        )
-        self.shield_view_ratio_likelihood_enable = bool(
-            self.shield_view_ratio_likelihood_enable
+        self.structural_rj_local_position_sigma_m = float(
+            self.structural_rj_local_position_sigma_m
         )
         if (
-            self.observation_count_variance_semantics
-            == OBSERVATION_COUNT_VARIANCE_COMPLETE_STATISTICAL
+            not np.isfinite(self.structural_rj_local_position_sigma_m)
+            or self.structural_rj_local_position_sigma_m <= 0.0
         ):
-            # These auxiliary terms reuse the same shield-view counts without
-            # the supplied cross-view covariance. Applying them would count the
-            # observation twice under complete statistical semantics.
-            self.shield_contrast_likelihood_enable = False
-            self.shield_view_ratio_likelihood_enable = False
-        self.shield_view_ratio_likelihood_weight = max(
-            0.0,
-            float(self.shield_view_ratio_likelihood_weight),
+            raise ValueError(
+                "structural_rj_local_position_sigma_m must be positive."
+            )
+        self.structural_rj_position_proposal_prior_weight = float(
+            self.structural_rj_position_proposal_prior_weight
         )
-        self.shield_view_ratio_likelihood_concentration = max(
-            1.0e-6,
-            float(self.shield_view_ratio_likelihood_concentration),
-        )
-        self.shield_view_ratio_likelihood_min_total_count = max(
-            0.0,
-            float(self.shield_view_ratio_likelihood_min_total_count),
-        )
-        self.shield_view_ratio_likelihood_min_views = max(
-            2,
-            int(self.shield_view_ratio_likelihood_min_views),
-        )
-        self.station_view_covariance_enable = bool(self.station_view_covariance_enable)
-        self.station_view_correlated_spectrum_fraction = max(
-            0.0,
-            float(self.station_view_correlated_spectrum_fraction),
-        )
-        self.structural_rj_patch_spacing_m = float(self.structural_rj_patch_spacing_m)
         if (
-            not np.isfinite(self.structural_rj_patch_spacing_m)
-            or self.structural_rj_patch_spacing_m <= 0.0
+            not np.isfinite(
+                self.structural_rj_position_proposal_prior_weight
+            )
+            or self.structural_rj_position_proposal_prior_weight <= 0.0
+            or self.structural_rj_position_proposal_prior_weight > 1.0
         ):
-            raise ValueError("structural_rj_patch_spacing_m must be positive.")
+            raise ValueError(
+                "structural_rj_position_proposal_prior_weight must lie in "
+                "(0, 1]."
+            )
+        self.structural_rj_strength_proposal_prior_weight = float(
+            self.structural_rj_strength_proposal_prior_weight
+        )
+        if (
+            not np.isfinite(
+                self.structural_rj_strength_proposal_prior_weight
+            )
+            or self.structural_rj_strength_proposal_prior_weight <= 0.0
+            or self.structural_rj_strength_proposal_prior_weight > 1.0
+        ):
+            raise ValueError(
+                "structural_rj_strength_proposal_prior_weight must lie in "
+                "(0, 1]."
+            )
+        self.structural_rj_strength_proposal_sigma_fraction = float(
+            self.structural_rj_strength_proposal_sigma_fraction
+        )
+        if (
+            not np.isfinite(
+                self.structural_rj_strength_proposal_sigma_fraction
+            )
+            or self.structural_rj_strength_proposal_sigma_fraction <= 0.0
+        ):
+            raise ValueError(
+                "structural_rj_strength_proposal_sigma_fraction must be "
+                "finite and positive."
+            )
+        self.structural_rj_strength_proposal_grid_size = int(
+            self.structural_rj_strength_proposal_grid_size
+        )
+        if self.structural_rj_strength_proposal_grid_size < 2:
+            raise ValueError(
+                "structural_rj_strength_proposal_grid_size must be at least 2."
+            )
+        self.structural_rj_proposal_chart_batch_size = int(
+            self.structural_rj_proposal_chart_batch_size
+        )
+        if self.structural_rj_proposal_chart_batch_size < 1:
+            raise ValueError(
+                "structural_rj_proposal_chart_batch_size must be positive."
+            )
+        self.structural_rj_proposal_score_cache_max_bytes = int(
+            self.structural_rj_proposal_score_cache_max_bytes
+        )
+        if self.structural_rj_proposal_score_cache_max_bytes < 1:
+            raise ValueError(
+                "structural_rj_proposal_score_cache_max_bytes must be positive."
+            )
         for probability_field in (
             "structural_rj_move_probability",
             "structural_rj_birth_probability",
@@ -308,11 +412,22 @@ class RotatingShieldPFConfig:
             "structural_rj_position_move_probability",
             "structural_rj_local_position_move_probability",
             "structural_rj_strength_move_probability",
+            "structural_rj_split_merge_probability",
+            "structural_rj_split_probability",
+            "structural_rj_merge_probability",
         ):
             probability = float(getattr(self, probability_field))
             if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
                 raise ValueError(f"{probability_field} must be in [0, 1].")
             setattr(self, probability_field, probability)
+        self.structural_cardinality_prior_policy = (
+            validate_cardinality_prior_policy(
+                self.structural_cardinality_prior_policy,
+                has_explicit_probabilities=(
+                    self.structural_cardinality_prior_probs is not None
+                ),
+            )
+        )
         if self.structural_cardinality_prior_probs is not None:
             if not isinstance(
                 self.structural_cardinality_prior_probs,
@@ -334,22 +449,68 @@ class RotatingShieldPFConfig:
                     "structural_cardinality_prior_probs must contain only "
                     "positive finite values."
                 )
-            cardinality_prior /= float(np.sum(cardinality_prior))
+            cardinality_prior /= math.fsum(
+                float(value) for value in cardinality_prior
+            )
             self.structural_cardinality_prior_probs = tuple(
                 float(value) for value in cardinality_prior
             )
+        self.structural_cardinality_prior_mean = float(
+            self.structural_cardinality_prior_mean
+        )
+        if (
+            not np.isfinite(self.structural_cardinality_prior_mean)
+            or self.structural_cardinality_prior_mean <= 0.0
+        ):
+            raise ValueError(
+                "structural_cardinality_prior_mean must be finite and positive."
+            )
         self.history_estimate_interval = max(0, int(self.history_estimate_interval))
-        self.candidate_response_cache_max_entries = max(
+        self.surface_diagnostic_response_cache_max_entries = max(
             0,
-            int(self.candidate_response_cache_max_entries),
+            int(self.surface_diagnostic_response_cache_max_entries),
         )
-        self.converge_cardinality_var_max = max(
-            0.0,
-            float(self.converge_cardinality_var_max),
+        self.credible_surface_radius_threshold_m = float(
+            self.credible_surface_radius_threshold_m
         )
-        self.parallel_isotope_updates = bool(self.parallel_isotope_updates)
-        if self.parallel_isotope_workers is not None:
-            self.parallel_isotope_workers = max(1, int(self.parallel_isotope_workers))
+        if (
+            not np.isfinite(self.credible_surface_radius_threshold_m)
+            or self.credible_surface_radius_threshold_m < 0.0
+        ):
+            raise ValueError(
+                "credible_surface_radius_threshold_m must be finite and "
+                "nonnegative."
+            )
+        for probability_field, lower_inclusive in (
+            ("converge_min_ess_ratio", False),
+            ("converge_cardinality_min_probability", False),
+            ("converge_max_cardinality_boundary_mass", True),
+            ("converge_innovation_confidence", False),
+        ):
+            probability = float(getattr(self, probability_field))
+            lower_valid = (
+                probability >= 0.0 if lower_inclusive else probability > 0.0
+            )
+            if (
+                not np.isfinite(probability)
+                or not lower_valid
+                or probability > 1.0
+            ):
+                lower_symbol = "[" if lower_inclusive else "("
+                raise ValueError(
+                    f"{probability_field} must be in {lower_symbol}0, 1]."
+                )
+            setattr(self, probability_field, probability)
+        self.converge_cardinality_var_max = float(
+            self.converge_cardinality_var_max
+        )
+        if (
+            not np.isfinite(self.converge_cardinality_var_max)
+            or self.converge_cardinality_var_max < 0.0
+        ):
+            raise ValueError(
+                "converge_cardinality_var_max must be finite and nonnegative."
+            )
         self.variable_cardinality = bool(self.variable_cardinality)
         if self.max_sources is None or int(self.max_sources) < 1:
             raise ValueError("Pure PF requires a finite positive max_sources.")
@@ -400,9 +561,9 @@ class RotatingShieldPFConfig:
 
 @dataclass(frozen=True)
 class MeasurementRecord:
-    """Store a single isotope-wise measurement and metadata."""
+    """Store one full-spectrum shield-view measurement and provenance."""
 
-    z_k: Dict[str, float]
+    spectrum_counts_b: NDArray[np.float64]
     pose_idx: int
     live_time_s: float
     fe_index: int
@@ -410,26 +571,227 @@ class MeasurementRecord:
     detector_position_xyz_m: tuple[float, float, float]
     station_sequence_id: int
     station_view_index: int
-    runtime_likelihood_route_by_isotope: Dict[str, str]
-    z_variance_k: Dict[str, float] | None = None
-    z_covariance_k: Dict[str, Dict[str, float]] | None = None
-    station_view_covariance_by_isotope: (
-        Dict[str, tuple[tuple[float, ...], ...]] | None
-    ) = None
+    generative_contract_hash_sha256: str
+
+
+@dataclass(frozen=True)
+class JointStationObservation:
+    """Store one joint view-major full-spectrum station observation."""
+
+    spectrum_vb: NDArray[np.float64]
+    energy_axis_keV: NDArray[np.float64]
+    generative_contract_hash_sha256: str
+    pose_idx: int
+    detector_position_xyz_m: tuple[float, float, float]
+    fe_indices: NDArray[np.int64]
+    pb_indices: NDArray[np.int64]
+    live_times_s: NDArray[np.float64]
+    station_sequence_id: int
+
+
+@dataclass(frozen=True)
+class JointPlanningParticles:
+    """Expose one aligned joint-particle subset as padded numeric arrays."""
+
+    isotope_order: tuple[str, ...]
+    weights_n: NDArray[np.float64]
+    positions_nk3_by_isotope: Dict[str, NDArray[np.float64]]
+    surface_chart_ids_nk_by_isotope: Dict[str, NDArray[np.int64]]
+    surface_uv_nk2_by_isotope: Dict[str, NDArray[np.float64]]
+    strengths_nk_by_isotope: Dict[str, NDArray[np.float64]]
+    source_mask_nk_by_isotope: Dict[str, NDArray[np.bool_]]
+    original_particle_indices: NDArray[np.int64]
+
+
+@dataclass(frozen=True)
+class SurfaceAtlasQuadrature:
+    """Represent a complete area-weighted chart-center surface quadrature."""
+
+    positions_s3: NDArray[np.float64]
+    area_weights_m2_s: NDArray[np.float64]
+    chart_ids_s: NDArray[np.int64]
+    chart_count: int
+    total_area_m2: float
+    maximum_hausdorff_bound_m: float
+    kinds: tuple[str, ...]
+    face_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Validate complete one-sample-per-chart quadrature semantics."""
+        positions = np.asarray(self.positions_s3, dtype=np.float64)
+        weights = np.asarray(self.area_weights_m2_s, dtype=np.float64).reshape(-1)
+        chart_ids = np.asarray(self.chart_ids_s, dtype=np.int64).reshape(-1)
+        count = int(self.chart_count)
+        total_area = float(self.total_area_m2)
+        hausdorff = float(self.maximum_hausdorff_bound_m)
+        if (
+            count <= 0
+            or positions.shape != (count, 3)
+            or weights.shape != (count,)
+            or chart_ids.shape != (count,)
+            or len(self.kinds) != count
+            or len(self.face_ids) != count
+            or np.any(~np.isfinite(positions))
+            or np.any(~np.isfinite(weights))
+            or np.any(weights <= 0.0)
+            or not np.array_equal(
+                chart_ids,
+                np.arange(count, dtype=np.int64),
+            )
+            or not np.isfinite(total_area)
+            or total_area <= 0.0
+            or not np.isclose(
+                float(np.sum(weights, dtype=np.float64)),
+                total_area,
+                rtol=1.0e-12,
+                atol=1.0e-12,
+            )
+            or not np.isfinite(hausdorff)
+            or hausdorff < 0.0
+        ):
+            raise ValueError(
+                "Surface quadrature must contain every chart exactly once "
+                "with finite positive physical area."
+            )
+        object.__setattr__(
+            self,
+            "positions_s3",
+            np.ascontiguousarray(positions),
+        )
+        object.__setattr__(
+            self,
+            "area_weights_m2_s",
+            np.ascontiguousarray(weights),
+        )
+        object.__setattr__(
+            self,
+            "chart_ids_s",
+            np.ascontiguousarray(chart_ids),
+        )
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return JSON-safe completeness and spacing provenance."""
+        unique_kinds, kind_counts = np.unique(
+            np.asarray(self.kinds, dtype=object),
+            return_counts=True,
+        )
+        return {
+            "contract": "complete_chart_center_area_quadrature_v1",
+            "sample_count": int(self.chart_count),
+            "chart_count": int(self.chart_count),
+            "total_area_m2": float(self.total_area_m2),
+            "maximum_hausdorff_bound_m": float(
+                self.maximum_hausdorff_bound_m
+            ),
+            "physical_face_count": int(len(set(self.face_ids))),
+            "surface_kind_chart_counts": {
+                str(kind): int(count)
+                for kind, count in zip(
+                    unique_kinds,
+                    kind_counts,
+                    strict=True,
+                )
+            },
+            "every_chart_represented": True,
+            "area_weighted": True,
+        }
+
+
+def build_complete_surface_atlas_quadrature(
+    atlas: object,
+    *,
+    max_points: int,
+    maximum_hausdorff_bound_m: float,
+) -> SurfaceAtlasQuadrature:
+    """Build a fail-closed one-center-per-chart physical-area quadrature."""
+    budget = int(max_points)
+    requested_bound = float(maximum_hausdorff_bound_m)
+    if budget <= 0:
+        raise ValueError("Surface quadrature max_points must be positive.")
+    if (
+        not np.isfinite(requested_bound)
+        or requested_bound <= 0.0
+    ):
+        raise ValueError(
+            "Surface quadrature Hausdorff bound must be finite and positive."
+        )
+    chart_count = int(getattr(atlas, "chart_count"))
+    if chart_count > budget:
+        raise RuntimeError(
+            "Surface coverage quadrature budget cannot represent every "
+            f"chart ({chart_count} > {budget}). Increase the predeclared "
+            "coverage_surface_quadrature_max_points budget."
+        )
+    geometry = getattr(atlas, "geometry")
+    vertices = np.asarray(geometry.vertices_xyz, dtype=np.float64)
+    centers = np.asarray(geometry.centers_xyz, dtype=np.float64)
+    if (
+        vertices.shape != (chart_count, 4, 3)
+        or centers.shape != (chart_count, 3)
+        or np.any(~np.isfinite(vertices))
+        or np.any(~np.isfinite(centers))
+    ):
+        raise RuntimeError(
+            "Surface atlas quadrature requires finite quadrilateral charts."
+        )
+    chart_center_vertex_radius = np.max(
+        np.linalg.norm(
+            vertices - centers[:, None, :],
+            axis=2,
+        ),
+        axis=1,
+    )
+    maximum_bound = float(np.max(chart_center_vertex_radius))
+    if maximum_bound > requested_bound + 1.0e-12:
+        raise RuntimeError(
+            "Surface chart-center quadrature exceeds the predeclared "
+            "Hausdorff bound "
+            f"({maximum_bound:.6g} m > {requested_bound:.6g} m). "
+            "Refine the continuous surface atlas before planning."
+        )
+    chart_ids = np.arange(chart_count, dtype=np.int64)
+    uv = np.full((chart_count, 2), 0.5, dtype=np.float64)
+    positions = np.asarray(
+        atlas.positions_xyz(chart_ids, uv),
+        dtype=np.float64,
+    )
+    if not np.allclose(
+        positions,
+        centers,
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "Surface atlas center coordinates and chart mapping differ."
+        )
+    return SurfaceAtlasQuadrature(
+        positions_s3=positions,
+        area_weights_m2_s=np.asarray(
+            geometry.areas_m2,
+            dtype=np.float64,
+        ).copy(),
+        chart_ids_s=chart_ids,
+        chart_count=chart_count,
+        total_area_m2=float(getattr(atlas, "total_area_m2")),
+        maximum_hausdorff_bound_m=maximum_bound,
+        kinds=tuple(str(value) for value in geometry.kinds),
+        face_ids=tuple(str(value) for value in geometry.face_ids),
+    )
 
 
 class RotatingShieldPFEstimator:
     """
-    Online source estimator using parallel PFs with shield rotation (Sec. 3.4–3.6).
+    Online exact-RJ particle filter using rotating shield spectra.
 
-    - Maintains one PF per isotope.
-    - Updates each PF with pose/orientation and Poisson weight updates.
+    Isotope state blocks share one outer particle weight and one resampling
+    ancestry. Each station is assimilated once through the immutable joint
+    full-spectrum generative likelihood.
     """
 
     def __init__(
         self,
         isotopes: Sequence[str],
-        candidate_sources: NDArray[np.float64],
+        surface_diagnostic_points: NDArray[np.float64],
         shield_normals: NDArray[np.float64] | None,
         mu_by_isotope: Dict[str, object] | None,
         pf_config: RotatingShieldPFConfig | None = None,
@@ -445,26 +807,99 @@ class RotatingShieldPFEstimator:
         source_extent_radius_m: float = 0.0,
         source_extent_samples: int = 1,
         line_mu_by_isotope: Dict[str, object] | None = None,
-        transport_response_model: Dict[str, object] | None = None,
+        full_spectrum_generative_model: object | None = None,
+        random_seed: int = 0,
     ) -> None:
         """Initialize per-isotope filters and shared measurement-model state."""
-        self.isotopes = list(isotopes)
+        configured_isotopes = tuple(isotopes)
+        if (
+            not configured_isotopes
+            or any(
+                not isinstance(isotope, str) or not isotope.strip()
+                for isotope in configured_isotopes
+            )
+            or len(set(configured_isotopes)) != len(configured_isotopes)
+        ):
+            raise ValueError(
+                "Joint PF isotopes must be unique nonempty strings."
+            )
+        self.isotopes = list(configured_isotopes)
+        self.random_seed = normalize_pf_random_seed(random_seed)
+        self.rng_provenance = pf_rng_provenance(
+            self.random_seed,
+            self.isotopes,
+        )
         self.pf_config = pf_config or RotatingShieldPFConfig()
         self.shield_params = shield_params or ShieldParams()
+        if not isinstance(self.shield_params, ShieldParams):
+            raise TypeError("shield_params must be a ShieldParams instance.")
         self.obstacle_grid = obstacle_grid
-        self.obstacle_height_m = float(obstacle_height_m)
+        self.obstacle_height_m = _strict_config_number(
+            obstacle_height_m,
+            name="obstacle_height_m",
+        )
+        if self.obstacle_height_m < 0.0:
+            raise ValueError("obstacle_height_m must be nonnegative.")
         self.obstacle_mu_by_isotope = obstacle_mu_by_isotope
-        self.obstacle_buildup_coeff = max(float(obstacle_buildup_coeff), 0.0)
-        self.detector_radius_m = max(float(detector_radius_m), 0.0)
+        self.obstacle_buildup_coeff = _strict_config_number(
+            obstacle_buildup_coeff,
+            name="obstacle_buildup_coeff",
+        )
+        if self.obstacle_buildup_coeff < 0.0:
+            raise ValueError("obstacle_buildup_coeff must be nonnegative.")
+        self.detector_radius_m = _strict_config_number(
+            detector_radius_m,
+            name="detector_radius_m",
+        )
+        if self.detector_radius_m < 0.0:
+            raise ValueError("detector_radius_m must be nonnegative.")
         if detector_aperture_radius_m is None:
             detector_aperture_radius_m = self.detector_radius_m
-        self.detector_aperture_radius_m = max(float(detector_aperture_radius_m), 0.0)
-        self.detector_aperture_samples = max(int(detector_aperture_samples), 1)
-        self.detector_aperture_sampling = str(detector_aperture_sampling)
-        self.source_extent_radius_m = max(float(source_extent_radius_m), 0.0)
-        self.source_extent_samples = max(int(source_extent_samples), 1)
+        self.detector_aperture_radius_m = _strict_config_number(
+            detector_aperture_radius_m,
+            name="detector_aperture_radius_m",
+        )
+        if self.detector_aperture_radius_m < 0.0:
+            raise ValueError(
+                "detector_aperture_radius_m must be nonnegative."
+            )
+        self.detector_aperture_samples = _strict_nonnegative_integer(
+            detector_aperture_samples,
+            name="detector_aperture_samples",
+        )
+        if self.detector_aperture_samples == 0:
+            raise ValueError("detector_aperture_samples must be positive.")
+        if not isinstance(detector_aperture_sampling, str):
+            raise TypeError("detector_aperture_sampling must be a string.")
+        self.detector_aperture_sampling = detector_aperture_sampling
+        self.source_extent_radius_m = _strict_config_number(
+            source_extent_radius_m,
+            name="source_extent_radius_m",
+        )
+        if self.source_extent_radius_m < 0.0:
+            raise ValueError("source_extent_radius_m must be nonnegative.")
+        self.source_extent_samples = _strict_nonnegative_integer(
+            source_extent_samples,
+            name="source_extent_samples",
+        )
+        if self.source_extent_samples == 0:
+            raise ValueError("source_extent_samples must be positive.")
+        if (self.source_extent_radius_m == 0.0) != (
+            self.source_extent_samples == 1
+        ):
+            raise ValueError(
+                "Source extent requires radius=0 with one sample, or a "
+                "positive radius with at least two samples."
+            )
         self.line_mu_by_isotope = line_mu_by_isotope
-        self.transport_response_model = transport_response_model
+        self.full_spectrum_generative_model = validate_full_spectrum_model(
+            full_spectrum_generative_model
+        )
+        self.additive_scatter_response = getattr(
+            self.full_spectrum_generative_model,
+            "additive_scatter_response",
+            None,
+        )
         # Measurement poses are appended incrementally.
         self.poses: List[NDArray[np.float64]] = []
         if shield_normals is None:
@@ -476,26 +911,94 @@ class RotatingShieldPFEstimator:
         self.mu_by_isotope = self._resolve_mu_by_isotope(mu_by_isotope)
         self.kernel_cache: MeasurementGeometry | None = None
         self.filters: Dict[str, IsotopeParticleFilter] = {}
-        self.candidate_sources = candidate_sources
+        self._joint_particles_initialized = False
+        self._joint_row_identity_root_sha256: str | None = None
+        self._joint_row_generation: int | None = None
+        diagnostic_points = np.asarray(
+            surface_diagnostic_points,
+            dtype=np.float64,
+        )
+        if diagnostic_points.ndim != 2 or diagnostic_points.shape[1] != 3:
+            raise ValueError(
+                "surface_diagnostic_points must be shaped (N, 3)."
+            )
+        if not np.all(np.isfinite(diagnostic_points)):
+            raise ValueError(
+                "surface_diagnostic_points must contain only finite values."
+            )
+        self.surface_diagnostic_points = np.ascontiguousarray(diagnostic_points)
         self.history_estimates: List[
             Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]
         ] = []
         self.measurements: List[MeasurementRecord] = []
+        self._joint_station_history: list[JointStationObservation] = []
+        self._active_joint_station_history: (
+            tuple[JointStationObservation, ...] | None
+        ) = None
+        self._active_joint_structural_geometry: (
+            StructuralGeometryBatch | None
+        ) = None
+        self._joint_structural_transport_cache: (
+            tuple[
+                NDArray[np.float64],
+                NDArray[np.float64],
+                NDArray[np.float64],
+            ]
+            | None
+        ) = None
+        self._joint_birth_proposal_station_score_cache: dict[
+            tuple[str, str],
+            NDArray[np.float64],
+        ] = {}
+        self._joint_birth_proposal_station_score_cache_order: list[
+            tuple[str, str]
+        ] = []
+        self._joint_birth_proposal_prefix_scores: dict[
+            str,
+            NDArray[np.float64],
+        ] = {}
+        self._joint_birth_proposal_prefix_station_count = 0
+        self.last_joint_birth_proposal_cache_hits = 0
+        self.last_joint_birth_proposal_cache_misses = 0
+        self._joint_random_generator = named_random_generator(
+            self.random_seed,
+            "joint_isotope_particle_filter",
+        )
+        self.last_joint_resample_indices = np.zeros(0, dtype=np.int64)
+        self.last_joint_temper_steps: list[dict[str, float]] = []
+        self.last_joint_unique_ancestor_count: int | None = None
+        self.last_joint_station_unique_ancestor_count: int | None = None
+        self.last_joint_cumulative_unique_ancestor_count: int | None = None
+        self._joint_cumulative_lineage_ids: NDArray[np.int64] | None = None
         self.last_pair_sequence_update_workers = 1
         self.last_pair_sequence_update_wall_s = 0.0
         self.last_pair_sequence_stage_wall_s: Dict[str, float] = {}
         self.last_structural_update_workers = 1
         self.last_structural_update_wall_s = 0.0
-        self._candidate_response_cache: dict[
+        self._surface_diagnostic_response_cache: dict[
             tuple[Any, ...],
             NDArray[np.float64],
         ] = {}
-        self._candidate_response_cache_order: list[tuple[Any, ...]] = []
-        self._candidate_response_prefix_cache: dict[
+        self._surface_diagnostic_response_cache_order: list[tuple[Any, ...]] = []
+        self._surface_diagnostic_response_prefix_cache: dict[
             tuple[Any, ...],
             dict[str, NDArray[np.float64]],
         ] = {}
-        self._candidate_response_prefix_cache_order: list[tuple[Any, ...]] = []
+        self._surface_diagnostic_response_prefix_cache_order: list[tuple[Any, ...]] = []
+
+    def _named_planning_rng(
+        self,
+        operation: str,
+        *components: object,
+    ) -> np.random.Generator:
+        """Return an order-independent planning stream from the logged PF seed."""
+        return named_random_generator(
+            self.random_seed,
+            "estimator_planning",
+            str(operation),
+            len(self.measurements),
+            *components,
+        )
 
     def _record_history_estimate(self, measurement_count: int) -> None:
         """Record an exact report estimate when the configured history stride allows it."""
@@ -510,13 +1013,13 @@ class RotatingShieldPFEstimator:
             return
         self.history_estimates.append(self.estimates())
 
-    def _candidate_response_source_key(
+    def _surface_diagnostic_response_source_key(
         self,
         sources: NDArray[np.float64],
     ) -> tuple[str, int] | None:
-        """Return a stable cache key for the full shared candidate-source grid."""
+        """Return a stable cache key for the full shared surface-diagnostic atlas sample."""
         source_arr = np.asarray(sources, dtype=float).reshape(-1, 3)
-        candidate_arr = np.asarray(self.candidate_sources, dtype=float).reshape(
+        candidate_arr = np.asarray(self.surface_diagnostic_points, dtype=float).reshape(
             -1,
             3,
         )
@@ -525,11 +1028,11 @@ class RotatingShieldPFEstimator:
             and source_arr.size > 0
             and np.shares_memory(source_arr, candidate_arr)
         ):
-            return ("candidate_sources", int(source_arr.shape[0]))
+            return ("surface_diagnostic_points", int(source_arr.shape[0]))
         return None
 
     @staticmethod
-    def _measurement_geometry_digest(data: MeasurementData) -> bytes:
+    def _measurement_geometry_digest(data: StructuralGeometryBatch) -> bytes:
         """Return a compact digest for measurement geometry arrays used by responses."""
         digest = hashlib.blake2b(digest_size=16)
         for array in (
@@ -544,51 +1047,30 @@ class RotatingShieldPFEstimator:
             digest.update(contiguous.tobytes())
         return digest.digest()
 
-    @staticmethod
-    def _response_scale_vector(
-        scale: NDArray[np.float64] | float,
-        measurement_count: int,
-    ) -> NDArray[np.float64]:
-        """Return one response-scale value per measurement row."""
-        count = max(0, int(measurement_count))
-        scale_arr = np.asarray(scale, dtype=float).reshape(-1)
-        if count == 0:
-            return np.zeros(0, dtype=float)
-        if scale_arr.size == 0:
-            return np.ones(count, dtype=float)
-        if scale_arr.size == 1 and count != 1:
-            return np.full(count, float(scale_arr[0]), dtype=float)
-        if scale_arr.size != count:
-            raise ValueError(
-                "source_scale must be scalar or one value per measurement."
-            )
-        return scale_arr.astype(float, copy=False)
-
-    def _store_candidate_response_cache(
+    def _store_surface_diagnostic_response_cache(
         self,
         cache_key: tuple[Any, ...],
         counts: NDArray[np.float64],
     ) -> None:
-        """Store an exact deterministic candidate response with LRU eviction."""
-        self._candidate_response_cache[cache_key] = np.asarray(
+        """Store an exact deterministic surface-diagnostic response with LRU eviction."""
+        self._surface_diagnostic_response_cache[cache_key] = np.asarray(
             counts,
             dtype=float,
         ).copy()
-        self._candidate_response_cache_order.append(cache_key)
+        self._surface_diagnostic_response_cache_order.append(cache_key)
         max_entries = max(
             0,
-            int(self.pf_config.candidate_response_cache_max_entries),
+            int(self.pf_config.surface_diagnostic_response_cache_max_entries),
         )
-        while len(self._candidate_response_cache_order) > max_entries:
-            old_key = self._candidate_response_cache_order.pop(0)
-            if old_key not in self._candidate_response_cache_order:
-                self._candidate_response_cache.pop(old_key, None)
+        while len(self._surface_diagnostic_response_cache_order) > max_entries:
+            old_key = self._surface_diagnostic_response_cache_order.pop(0)
+            if old_key not in self._surface_diagnostic_response_cache_order:
+                self._surface_diagnostic_response_cache.pop(old_key, None)
 
     @staticmethod
-    def _candidate_response_prefix_matches(
+    def _surface_diagnostic_response_prefix_matches(
         payload: Mapping[str, NDArray[np.float64]],
-        data: MeasurementData,
-        scale: NDArray[np.float64],
+        data: StructuralGeometryBatch,
         row_count: int,
     ) -> bool:
         """Return True when cached response rows match the requested prefix."""
@@ -617,69 +1099,55 @@ class RotatingShieldPFEstimator:
                     np.asarray(payload["pb_indices"], dtype=int)[:rows],
                     np.asarray(data.pb_indices, dtype=int)[:rows],
                 )
-                and np.allclose(
-                    np.asarray(payload["source_scale"], dtype=float)[:rows],
-                    np.asarray(scale, dtype=float)[:rows],
-                    rtol=0.0,
-                    atol=1.0e-12,
-                )
             )
         except (KeyError, ValueError, TypeError):
             return False
 
-    def _store_candidate_response_prefix_cache(
+    def _store_surface_diagnostic_response_prefix_cache(
         self,
         prefix_key: tuple[Any, ...],
-        data: MeasurementData,
-        scale: NDArray[np.float64],
+        data: StructuralGeometryBatch,
         counts: NDArray[np.float64],
     ) -> None:
         """Store a full-history response prefix for incremental extension."""
-        self._candidate_response_prefix_cache[prefix_key] = {
+        self._surface_diagnostic_response_prefix_cache[prefix_key] = {
             "detector_positions": np.asarray(
                 data.detector_positions, dtype=float
             ).copy(),
             "live_times": np.asarray(data.live_times, dtype=float).copy(),
             "fe_indices": np.asarray(data.fe_indices, dtype=int).copy(),
             "pb_indices": np.asarray(data.pb_indices, dtype=int).copy(),
-            "source_scale": np.asarray(scale, dtype=float).copy(),
             "counts": np.asarray(counts, dtype=float).copy(),
         }
-        self._candidate_response_prefix_cache_order.append(prefix_key)
+        self._surface_diagnostic_response_prefix_cache_order.append(prefix_key)
         max_entries = max(
             0,
-            int(self.pf_config.candidate_response_cache_max_entries),
+            int(self.pf_config.surface_diagnostic_response_cache_max_entries),
         )
-        while len(self._candidate_response_prefix_cache_order) > max_entries:
-            old_key = self._candidate_response_prefix_cache_order.pop(0)
-            if old_key not in self._candidate_response_prefix_cache_order:
-                self._candidate_response_prefix_cache.pop(old_key, None)
+        while len(self._surface_diagnostic_response_prefix_cache_order) > max_entries:
+            old_key = self._surface_diagnostic_response_prefix_cache_order.pop(0)
+            if old_key not in self._surface_diagnostic_response_prefix_cache_order:
+                self._surface_diagnostic_response_prefix_cache.pop(old_key, None)
 
     def _cached_expected_counts_for_kernel(
         self,
         *,
         kernel: ContinuousKernel,
         isotope: str,
-        data: MeasurementData,
+        data: StructuralGeometryBatch,
         sources: NDArray[np.float64],
         strengths: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Return batched expected counts from a particle-independent kernel."""
         source_arr = np.asarray(sources, dtype=float).reshape(-1, 3)
         strength_arr = np.asarray(strengths, dtype=float).reshape(-1)
-        source_key = self._candidate_response_source_key(source_arr)
-        scale = self.response_scales_for_measurements(
-            isotope,
-            data.fe_indices,
-            data.pb_indices,
-        )
+        source_key = self._surface_diagnostic_response_source_key(source_arr)
         measurement_count = int(np.asarray(data.live_times, dtype=float).size)
-        scale_arr = self._response_scale_vector(scale, measurement_count)
         cache_enabled = (
             source_key is not None
             and strength_arr.size == source_arr.shape[0]
             and np.allclose(strength_arr, 1.0)
-            and int(self.pf_config.candidate_response_cache_max_entries) > 0
+            and int(self.pf_config.surface_diagnostic_response_cache_max_entries) > 0
         )
         cache_key: tuple[Any, ...] | None = None
         prefix_key: tuple[Any, ...] | None = None
@@ -689,13 +1157,12 @@ class RotatingShieldPFEstimator:
                 int(id(kernel)),
                 source_key,
                 self._measurement_geometry_digest(data),
-                tuple(scale_arr.round(12).tolist()),
             )
-            cached = self._candidate_response_cache.get(cache_key)
+            cached = self._surface_diagnostic_response_cache.get(cache_key)
             if cached is not None:
                 return cached.copy()
             prefix_key = (str(isotope), int(id(kernel)), source_key)
-            prefix_payload = self._candidate_response_prefix_cache.get(prefix_key)
+            prefix_payload = self._surface_diagnostic_response_prefix_cache.get(prefix_key)
             if isinstance(prefix_payload, dict):
                 cached_counts = np.asarray(
                     prefix_payload.get("counts", np.zeros((0, 0))),
@@ -704,22 +1171,20 @@ class RotatingShieldPFEstimator:
                 cached_rows = int(cached_counts.shape[0])
                 if (
                     cached_rows >= measurement_count
-                    and self._candidate_response_prefix_matches(
+                    and self._surface_diagnostic_response_prefix_matches(
                         prefix_payload,
                         data,
-                        scale_arr,
                         measurement_count,
                     )
                 ):
                     counts_arr = cached_counts[:measurement_count].copy()
-                    self._store_candidate_response_cache(cache_key, counts_arr)
+                    self._store_surface_diagnostic_response_cache(cache_key, counts_arr)
                     return counts_arr
                 if (
                     cached_rows < measurement_count
-                    and self._candidate_response_prefix_matches(
+                    and self._surface_diagnostic_response_prefix_matches(
                         prefix_payload,
                         data,
-                        scale_arr,
                         cached_rows,
                     )
                 ):
@@ -737,7 +1202,6 @@ class RotatingShieldPFEstimator:
                         ],
                         fe_indices=np.asarray(data.fe_indices, dtype=int)[cached_rows:],
                         pb_indices=np.asarray(data.pb_indices, dtype=int)[cached_rows:],
-                        source_scale=scale_arr[cached_rows:],
                     )
                     counts_arr = np.vstack(
                         [
@@ -745,13 +1209,12 @@ class RotatingShieldPFEstimator:
                             np.asarray(suffix_counts, dtype=float),
                         ]
                     )
-                    self._store_candidate_response_prefix_cache(
+                    self._store_surface_diagnostic_response_prefix_cache(
                         prefix_key,
                         data,
-                        scale_arr,
                         counts_arr,
                     )
-                    self._store_candidate_response_cache(cache_key, counts_arr)
+                    self._store_surface_diagnostic_response_cache(cache_key, counts_arr)
                     return counts_arr.copy()
         counts = expected_counts_per_source(
             kernel=kernel,
@@ -762,16 +1225,14 @@ class RotatingShieldPFEstimator:
             live_times=data.live_times,
             fe_indices=data.fe_indices,
             pb_indices=data.pb_indices,
-            source_scale=scale_arr,
         )
         counts_arr = np.asarray(counts, dtype=float)
         if cache_enabled and cache_key is not None:
-            self._store_candidate_response_cache(cache_key, counts_arr)
+            self._store_surface_diagnostic_response_cache(cache_key, counts_arr)
             if prefix_key is not None:
-                self._store_candidate_response_prefix_cache(
+                self._store_surface_diagnostic_response_prefix_cache(
                     prefix_key,
                     data,
-                    scale_arr,
                     counts_arr,
                 )
         return counts_arr
@@ -781,7 +1242,7 @@ class RotatingShieldPFEstimator:
         *,
         filt: IsotopeParticleFilter,
         isotope: str,
-        data: MeasurementData,
+        data: StructuralGeometryBatch,
         sources: NDArray[np.float64],
         strengths: NDArray[np.float64],
     ) -> NDArray[np.float64]:
@@ -858,7 +1319,6 @@ class RotatingShieldPFEstimator:
             raise ValueError("No poses added; cannot build kernel cache.")
         poses_arr = np.stack(self.poses, axis=0)
         self.kernel_cache = MeasurementGeometry(
-            candidate_sources=self.candidate_sources,
             poses=poses_arr,
             orientations=self.normals,
             shield_params=self.shield_params,
@@ -877,6 +1337,7 @@ class RotatingShieldPFEstimator:
         else:
             for iso in self.isotopes:
                 self.filters[iso] = self._build_filter(iso, pf_conf)
+        self._configure_joint_particle_filters()
 
     def _build_filter(self, isotope: str, pf_conf: PFConfig) -> IsotopeParticleFilter:
         """Build an isotope filter with shared PF observation-model settings."""
@@ -895,7 +1356,8 @@ class RotatingShieldPFEstimator:
             source_extent_radius_m=self.source_extent_radius_m,
             source_extent_samples=self.source_extent_samples,
             line_mu_by_isotope=self.line_mu_by_isotope,
-            transport_response_model=self.transport_response_model,
+            additive_scatter_response=self.additive_scatter_response,
+            random_seed=self.random_seed,
         )
 
     def _build_pf_config(self) -> PFConfig:
@@ -915,344 +1377,17 @@ class RotatingShieldPFEstimator:
             raise RuntimeError(
                 "GPU-only mode: enable use_gpu in RotatingShieldPFConfig."
             )
-        if not gpu_utils.torch_device_available(self.pf_config.gpu_device):
-            raise RuntimeError("GPU-only mode requires torch on the requested device.")
+        gpu_utils.require_torch_compute_device(
+            str(self.pf_config.gpu_device),
+            str(self.pf_config.gpu_dtype),
+        )
         return True
 
     def _can_use_gpu(self) -> bool:
-        """Return whether torch-backed estimator math is available."""
-        from pf import gpu_utils
-
-        return bool(
-            self.pf_config.use_gpu
-            and gpu_utils.torch_device_available(self.pf_config.gpu_device)
-        )
-
-    def response_scale_for_isotope(
-        self,
-        isotope: str,
-        *,
-        fe_index: int,
-        pb_index: int,
-    ) -> float:
-        """Return the configured source response scale for one isotope."""
-        pair_id = int(fe_index) * int(self.num_orientations) + int(pb_index)
-        pair_scales = self.pf_config.measurement_scale_by_isotope_and_pair
-        if isinstance(pair_scales, Mapping):
-            iso_pair_scales = pair_scales.get(str(isotope), {})
-            if isinstance(iso_pair_scales, Mapping):
-                value = iso_pair_scales.get(int(pair_id))
-                if value is None:
-                    value = iso_pair_scales.get(str(int(pair_id)))  # type: ignore[arg-type]
-                if value is not None:
-                    return max(float(value), 0.0)
-        scales = self.pf_config.measurement_scale_by_isotope
-        if not isinstance(scales, dict):
-            return 1.0
-        return max(float(scales.get(isotope, 1.0)), 0.0)
-
-    def response_scales_for_measurements(
-        self,
-        isotope: str,
-        fe_indices: NDArray[np.int64],
-        pb_indices: NDArray[np.int64],
-    ) -> NDArray[np.float64]:
-        """Return one source response scale per Fe/Pb measurement pair."""
-        fe_arr = np.asarray(fe_indices, dtype=int).reshape(-1)
-        pb_arr = np.asarray(pb_indices, dtype=int).reshape(-1)
-        if fe_arr.size != pb_arr.size:
-            raise ValueError("fe_indices and pb_indices must have matching length.")
-        return np.asarray(
-            [
-                self.response_scale_for_isotope(
-                    isotope,
-                    fe_index=int(fe),
-                    pb_index=int(pb),
-                )
-                for fe, pb in zip(fe_arr, pb_arr)
-            ],
-            dtype=float,
-        )
-
-    def _project_observation_covariance_to_variance(
-        self,
-        z_k: Mapping[str, float],
-        z_variance_k: Mapping[str, float] | None,
-        z_covariance_k: Mapping[str, Mapping[str, float]] | None,
-    ) -> tuple[Dict[str, float] | None, Dict[str, Dict[str, float]] | None]:
-        """
-        Return diagonal PF variances that conservatively cover isotope covariance.
-
-        The per-isotope filters are conditionally independent, while the
-        response-Poisson spectrum regression reports a same-spectrum covariance
-        across isotope count channels.  This projection keeps the observed count
-        means unchanged and uses a Gershgorin-style diagonal envelope,
-        ``var_i + sum_j |cov_ij|``, so ignoring off-diagonal terms cannot make
-        the independent isotope filters more confident than the structured
-        covariance supports.
-        """
-        if z_variance_k is None and z_covariance_k is None:
-            return None, None
-        isotopes = [str(isotope) for isotope in z_k]
-        if not isotopes:
-            return {}, None
-        base_variances = np.asarray(
-            [
-                max(
-                    float(
-                        z_variance_k.get(
-                            isotope, max(float(z_k.get(isotope, 0.0)), 1.0)
-                        )
-                        if z_variance_k is not None
-                        else max(float(z_k.get(isotope, 0.0)), 1.0)
-                    ),
-                    1.0,
-                )
-                for isotope in isotopes
-            ],
-            dtype=float,
-        )
-        if z_covariance_k is None or not bool(
-            self.pf_config.observation_covariance_projection_enable
-        ):
-            return (
-                {
-                    isotope: float(variance)
-                    for isotope, variance in zip(isotopes, base_variances)
-                },
-                self._sanitize_observation_covariance(
-                    isotopes,
-                    base_variances,
-                    z_covariance_k,
-                ),
-            )
-        covariance = self._observation_covariance_matrix(
-            isotopes,
-            base_variances,
-            z_covariance_k,
-        )
-        if covariance is None:
-            return (
-                {
-                    isotope: float(variance)
-                    for isotope, variance in zip(isotopes, base_variances)
-                },
-                None,
-            )
-        offdiag_abs = np.sum(np.abs(covariance), axis=1) - np.abs(np.diag(covariance))
-        projected = np.maximum(
-            base_variances,
-            np.diag(covariance)
-            + float(self.pf_config.observation_covariance_projection_weight)
-            * offdiag_abs,
-        )
-        return (
-            {
-                isotope: float(variance)
-                for isotope, variance in zip(isotopes, projected)
-            },
-            {
-                row_iso: {
-                    col_iso: float(covariance[row_idx, col_idx])
-                    for col_idx, col_iso in enumerate(isotopes)
-                }
-                for row_idx, row_iso in enumerate(isotopes)
-            },
-        )
-
-    def _observation_covariance_matrix(
-        self,
-        isotopes: Sequence[str],
-        base_variances: NDArray[np.float64],
-        z_covariance_k: Mapping[str, Mapping[str, float]],
-    ) -> NDArray[np.float64] | None:
-        """Build a symmetric isotope covariance matrix for one spectrum."""
-        covariance = np.diag(np.maximum(np.asarray(base_variances, dtype=float), 1.0))
-        index_by_isotope = {str(isotope): idx for idx, isotope in enumerate(isotopes)}
-        for row_iso, row_payload in z_covariance_k.items():
-            if str(row_iso) not in index_by_isotope or not isinstance(
-                row_payload,
-                Mapping,
-            ):
-                continue
-            row_idx = index_by_isotope[str(row_iso)]
-            for col_iso, raw_value in row_payload.items():
-                col_key = str(col_iso)
-                if col_key not in index_by_isotope:
-                    continue
-                try:
-                    value = float(raw_value)
-                except (TypeError, ValueError):
-                    continue
-                if not np.isfinite(value):
-                    continue
-                col_idx = index_by_isotope[col_key]
-                covariance[row_idx, col_idx] = value
-        covariance = 0.5 * (covariance + covariance.T)
-        np.fill_diagonal(covariance, np.maximum(np.diag(covariance), base_variances))
-        diag = np.maximum(np.diag(covariance), 1.0)
-        corr_limit = float(self.pf_config.observation_covariance_projection_max_corr)
-        if corr_limit < 1.0:
-            scale = np.sqrt(diag[:, None] * diag[None, :])
-            corr = np.divide(
-                covariance,
-                scale,
-                out=np.zeros_like(covariance, dtype=float),
-                where=scale > 0.0,
-            )
-            corr = np.clip(corr, -corr_limit, corr_limit)
-            covariance = corr * scale
-            np.fill_diagonal(covariance, diag)
-        return covariance
-
-    def _sanitize_observation_covariance(
-        self,
-        isotopes: Sequence[str],
-        base_variances: NDArray[np.float64],
-        z_covariance_k: Mapping[str, Mapping[str, float]] | None,
-    ) -> Dict[str, Dict[str, float]] | None:
-        """Return a JSON-safe covariance payload when one was supplied."""
-        if z_covariance_k is None:
-            return None
-        covariance = self._observation_covariance_matrix(
-            isotopes,
-            base_variances,
-            z_covariance_k,
-        )
-        if covariance is None:
-            return None
-        return {
-            row_iso: {
-                col_iso: float(covariance[row_idx, col_idx])
-                for col_idx, col_iso in enumerate(isotopes)
-            }
-            for row_idx, row_iso in enumerate(isotopes)
-        }
-
-    def select_runtime_likelihood_routes(
-        self,
-        *,
-        sequence_length: int,
-        z_view_covariance_by_isotope: (
-            Mapping[str, NDArray[np.float64]] | None
-        ) = None,
-    ) -> dict[str, str]:
-        """Select one explicit likelihood route per isotope before PF ingestion."""
-        length = int(sequence_length)
-        if length <= 0:
-            raise ValueError("sequence_length must be positive.")
-        if not self.filters:
-            self._ensure_kernel_cache()
-        routes: dict[str, str] = {}
-        for isotope, filt in self.filters.items():
-            view_covariance = self._view_covariance_for_isotope(
-                isotope,
-                sequence_length=length,
-                z_view_covariance_by_isotope=z_view_covariance_by_isotope,
-            )
-            model = normalize_count_likelihood_model(
-                str(filt.config.count_likelihood_model)
-            )
-            routes[str(isotope)] = (
-                COUNT_COVARIANCE_LIKELIHOOD_ROUTE
-                if model != "poisson"
-                and filt._sequence_covariance_enabled(length, view_covariance)
-                else COUNT_LIKELIHOOD_ROUTE
-            )
-        return canonical_runtime_likelihood_route_mapping(
-            routes,
-            self.configured_isotope_order(),
-        )
-
-    def _runtime_likelihood_routes_for_records(
-        self,
-        isotope: str,
-        records: Sequence[MeasurementRecord],
-    ) -> NDArray[np.str_]:
-        """Return the exact per-row runtime likelihood route for one isotope."""
-        configured_isotopes = self.configured_isotope_order()
-        if str(isotope) not in configured_isotopes:
-            raise ValueError(f"Isotope {isotope!r} is not configured.")
-        routes: list[str] = []
-        for record in records:
-            mapping = canonical_runtime_likelihood_route_mapping(
-                record.runtime_likelihood_route_by_isotope,
-                configured_isotopes,
-            )
-            routes.append(mapping[str(isotope)])
-        return np.asarray(routes, dtype="<U16")
-
-    @staticmethod
-    def _normalize_pair_sequence_record(
-        record: Sequence[object],
-    ) -> tuple[
-        Dict[str, float],
-        int,
-        int,
-        float,
-        Dict[str, float] | None,
-        Dict[str, Dict[str, float]] | None,
-    ]:
-        """Return a canonical same-pose shield-program observation record."""
-        if len(record) == 5:
-            z_k, fe_index, pb_index, live_time_s, z_variance_k = record
-            z_covariance_k = None
-        elif len(record) == 6:
-            (
-                z_k,
-                fe_index,
-                pb_index,
-                live_time_s,
-                z_variance_k,
-                z_covariance_k,
-            ) = record
-        else:
-            raise ValueError(
-                "Pair sequence records must have 5 fields "
-                "(z, fe, pb, live, variance) or 6 fields with covariance."
-            )
-        return (
-            {str(isotope): float(value) for isotope, value in dict(z_k).items()},
-            int(fe_index),
-            int(pb_index),
-            float(live_time_s),
-            None
-            if z_variance_k is None
-            else {
-                str(isotope): float(value)
-                for isotope, value in dict(z_variance_k).items()
-            },
-            None
-            if z_covariance_k is None
-            else {
-                str(row_iso): {
-                    str(col_iso): float(value)
-                    for col_iso, value in dict(row_payload).items()
-                }
-                for row_iso, row_payload in dict(z_covariance_k).items()
-            },
-        )
-
-    @staticmethod
-    def _view_covariance_for_isotope(
-        isotope: str,
-        *,
-        sequence_length: int,
-        z_view_covariance_by_isotope: Mapping[str, NDArray[np.float64]] | None,
-    ) -> NDArray[np.float64] | None:
-        """Return a same-station shield-view covariance matrix for one isotope."""
-        if z_view_covariance_by_isotope is None:
-            return None
-        payload = z_view_covariance_by_isotope.get(str(isotope))
-        if payload is None:
-            return None
-        covariance = np.asarray(payload, dtype=float)
-        expected_shape = (int(sequence_length), int(sequence_length))
-        if covariance.shape != expected_shape:
-            raise ValueError(
-                "z_view_covariance_by_isotope entries must be shaped K x K."
-            )
-        return 0.5 * (covariance + covariance.T)
+        """Select explicit NumPy mode or require the configured torch device."""
+        if not self.pf_config.use_gpu:
+            return False
+        return self._gpu_enabled()
 
     def continuous_kernel(
         self,
@@ -1261,13 +1396,20 @@ class RotatingShieldPFEstimator:
         use_gpu: bool | None = None,
     ) -> ContinuousKernel:
         """Build the shared ContinuousKernel for PF, planning, and diagnostics."""
-        active_aperture_samples = (
-            int(self.detector_aperture_samples)
+        requested_aperture_samples = (
+            self.detector_aperture_samples
             if detector_aperture_samples is None
-            else int(detector_aperture_samples)
+            else detector_aperture_samples
         )
-        active_use_gpu = (
-            bool(self.pf_config.use_gpu) if use_gpu is None else bool(use_gpu)
+        active_aperture_samples = _strict_nonnegative_integer(
+            requested_aperture_samples,
+            name="detector_aperture_samples",
+        )
+        if active_aperture_samples < 1:
+            raise ValueError("detector_aperture_samples must be positive.")
+        active_use_gpu = _strict_config_boolean(
+            self.pf_config.use_gpu if use_gpu is None else use_gpu,
+            name="use_gpu",
         )
         return ContinuousKernel(
             mu_by_isotope=self.mu_by_isotope,
@@ -1282,31 +1424,2296 @@ class RotatingShieldPFEstimator:
             obstacle_buildup_coeff=self.obstacle_buildup_coeff,
             detector_radius_m=self.detector_radius_m,
             detector_aperture_radius_m=self.detector_aperture_radius_m,
-            detector_aperture_samples=max(1, active_aperture_samples),
+            detector_aperture_samples=active_aperture_samples,
             detector_aperture_sampling=self.detector_aperture_sampling,
             source_extent_radius_m=self.source_extent_radius_m,
             source_extent_samples=self.source_extent_samples,
             line_mu_by_isotope=self.line_mu_by_isotope,
-            transport_response_model=self.transport_response_model,
+            additive_scatter_response=self.additive_scatter_response,
+        )
+
+    def surface_transport_positions(
+        self,
+        isotope: str,
+        anchors_xyz: NDArray[np.float64],
+        chart_ids: NDArray[np.int64],
+        surface_uv: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Map exact surface anchors to the shared air-side physics positions."""
+        isotope_key = str(isotope)
+        try:
+            filt = self.filters[isotope_key]
+        except KeyError as error:
+            raise ValueError(
+                f"Unknown isotope for surface transport: {isotope_key!r}."
+            ) from error
+        atlas = filt._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("The continuous surface atlas is unavailable.")
+        anchors = np.asarray(anchors_xyz, dtype=np.float64)
+        raw_chart_ids = np.asarray(chart_ids)
+        uv = np.asarray(surface_uv, dtype=np.float64)
+        if (
+            anchors.ndim != 2
+            or anchors.shape[1] != 3
+            or not np.issubdtype(raw_chart_ids.dtype, np.integer)
+            or raw_chart_ids.shape != anchors.shape[:1]
+            or uv.shape != anchors.shape[:1] + (2,)
+        ):
+            raise ValueError(
+                "Surface anchors, chart IDs, and UV coordinates are misaligned."
+            )
+        chart_id_array = np.asarray(raw_chart_ids, dtype=np.int64)
+        mapped = atlas.positions_xyz(chart_id_array, uv)
+        if not np.allclose(mapped, anchors, rtol=0.0, atol=1.0e-12):
+            raise ValueError(
+                "Surface chart/UV coordinates do not map to their exact anchors."
+            )
+        return filt._surface_transport_positions(
+            anchors,
+            chart_ids=chart_id_array,
         )
 
     def configured_isotope_order(self) -> tuple[str, ...]:
         """Return the stable pure-PF isotope order."""
         return tuple(dict.fromkeys(str(isotope) for isotope in self.isotopes))
 
+    def joint_isotope_order(self) -> tuple[str, ...]:
+        """Return the canonical order used by every joint likelihood vector."""
+        order = tuple(sorted(self.configured_isotope_order()))
+        if not order or len(order) != len(self.isotopes):
+            raise RuntimeError("Joint PF requires unique configured isotope names.")
+        return order
+
+    def _configure_joint_particle_filters(self) -> None:
+        """Attach the conditional joint target and verify aligned initialization."""
+        if not self.filters:
+            return
+        if not self._joint_particles_initialized:
+            self._initialize_joint_particles_from_product_prior()
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            filt.set_joint_target_evaluator(
+                self._joint_structural_target_evaluator
+            )
+            filt.set_joint_proposal_evaluator(
+                self._joint_structural_proposal_evaluator
+            )
+        self._assert_joint_particle_alignment()
+
+    def _joint_row_identity_root(self, *, particle_count: int) -> str:
+        """Return the deterministic contract root for joint row identities."""
+        atlas_sha256 = self._assert_joint_surface_atlas_alignment()
+        model_sha256 = self._full_spectrum_model().contract_hash_sha256
+        return sha256_json(
+            {
+                "schema_version": 1,
+                "identity_domain": "pure_pf_joint_row_identity_root_v1",
+                "random_seed": self.random_seed,
+                "isotope_order": list(self.joint_isotope_order()),
+                "particle_count": int(particle_count),
+                "surface_atlas_sha256": atlas_sha256,
+                "full_spectrum_contract_sha256": model_sha256,
+                "pf_config": {
+                    config_field.name: getattr(
+                        self.pf_config,
+                        config_field.name,
+                    )
+                    for config_field in fields(self.pf_config)
+                },
+            }
+        )
+
+    def _initialize_joint_particles_from_product_prior(self) -> None:
+        """Draw aligned rows directly from the independent isotope product prior."""
+        order = self.joint_isotope_order()
+        if set(self.filters) != set(order):
+            raise RuntimeError(
+                "Joint prior initialization requires every isotope filter."
+            )
+        particle_counts = {
+            int(filt.config.num_particles) for filt in self.filters.values()
+        }
+        if len(particle_counts) != 1:
+            raise RuntimeError(
+                "Joint prior initialization requires one common particle count."
+            )
+        particle_count = next(iter(particle_counts))
+        if particle_count <= 0:
+            raise RuntimeError(
+                "Joint prior initialization requires positive particle count."
+            )
+        common_log_weight = float(-np.log(particle_count))
+        identity_root = self._joint_row_identity_root(
+            particle_count=particle_count
+        )
+        row_identities = tuple(
+            JointRowIdentity.initial(
+                root_sha256=identity_root,
+                ordinal=row,
+            )
+            for row in range(particle_count)
+        )
+        particles_by_isotope: dict[str, list[IsotopeParticle]] = {}
+        for isotope in order:
+            filt = self.filters[isotope]
+            atlas = filt._structural_rj_surface_atlas
+            cardinality_prior = filt._structural_rj_cardinality_prior
+            if atlas is None or cardinality_prior is None:
+                raise RuntimeError(
+                    "Joint product-prior initialization requires a surface "
+                    "atlas and cardinality prior."
+                )
+            rng = named_random_generator(
+                self.random_seed,
+                "joint_product_prior",
+                isotope,
+            )
+            if filt.config.variable_cardinality:
+                cardinalities = rng.choice(
+                    cardinality_prior.probabilities.size,
+                    size=particle_count,
+                    replace=True,
+                    p=cardinality_prior.probabilities,
+                ).astype(np.int64, copy=False)
+            else:
+                cardinalities = np.full(
+                    particle_count,
+                    int(filt.config.init_num_sources[0]),
+                    dtype=np.int64,
+                )
+            source_offsets = np.concatenate(
+                (
+                    np.zeros(1, dtype=np.int64),
+                    np.cumsum(cardinalities, dtype=np.int64),
+                )
+            )
+            total_sources = int(source_offsets[-1])
+            chart_ids, surface_uv, _ = atlas.sample(
+                total_sources,
+                rng=rng,
+            )
+            strengths = np.asarray(
+                filt._strength_prior.sample(total_sources, rng=rng),
+                dtype=np.float64,
+            )
+            particles: list[IsotopeParticle] = []
+            # Numerical sampling is batched above; this loop only creates the
+            # variable-length Python state objects used by the RJ kernel.
+            for row, cardinality in enumerate(cardinalities.tolist()):
+                begin = int(source_offsets[row])
+                end = int(source_offsets[row + 1])
+                state = IsotopeState(
+                    num_sources=int(cardinality),
+                    strengths=np.asarray(
+                        strengths[begin:end],
+                        dtype=np.float64,
+                    ).copy(),
+                    surface_chart_ids=np.asarray(
+                        chart_ids[begin:end],
+                        dtype=np.int64,
+                    ).copy(),
+                    surface_uv=np.asarray(
+                        surface_uv[begin:end],
+                        dtype=np.float64,
+                    ).copy(),
+                )
+                filt._canonicalize_structural_rj_state(state)
+                particles.append(
+                    IsotopeParticle(
+                        state=state,
+                        log_weight=common_log_weight,
+                        joint_row_identity=row_identities[row],
+                    )
+                )
+            particles_by_isotope[isotope] = particles
+        for isotope in order:
+            filt = self.filters[isotope]
+            filt.continuous_particles = particles_by_isotope[isotope]
+            filt.N = particle_count
+            filt.config.num_particles = particle_count
+        self._joint_row_identity_root_sha256 = identity_root
+        self._joint_row_generation = 0
+        self._joint_cumulative_lineage_ids = np.arange(
+            particle_count,
+            dtype=np.int64,
+        )
+        self._joint_particles_initialized = True
+
+    def _assert_joint_particle_alignment(self) -> NDArray[np.float64]:
+        """Return common log weights or reject any broken joint-row alignment."""
+        order = self.joint_isotope_order()
+        if set(self.filters) != set(order):
+            raise RuntimeError(
+                "Joint PF requires exactly one filter for every configured isotope."
+            )
+        self._assert_joint_surface_atlas_alignment()
+        particle_counts = {
+            len(self.filters[isotope].continuous_particles) for isotope in order
+        }
+        if len(particle_counts) != 1:
+            raise RuntimeError(
+                "Joint isotope filters must have the same particle count."
+            )
+        particle_count = next(iter(particle_counts))
+        if particle_count <= 0:
+            raise RuntimeError("Joint PF requires at least one aligned particle.")
+        identity_root = self._joint_row_identity_root_sha256
+        identity_generation = self._joint_row_generation
+        if identity_root is None or identity_generation is None:
+            raise RuntimeError(
+                "Joint PF row identity contract is not initialized."
+            )
+        reference_identities: tuple[JointRowIdentity, ...] | None = None
+        for isotope in order:
+            identities: list[JointRowIdentity] = []
+            for row, particle in enumerate(
+                self.filters[isotope].continuous_particles
+            ):
+                identity = particle.joint_row_identity
+                if not isinstance(identity, JointRowIdentity):
+                    raise RuntimeError(
+                        "Every joint isotope particle requires an immutable "
+                        "joint row identity."
+                    )
+                if (
+                    identity.validate() != identity.row_sha256
+                    or identity.root_sha256 != identity_root
+                    or identity.generation != identity_generation
+                    or identity.ordinal != row
+                ):
+                    raise RuntimeError(
+                        "Joint row identity does not match the current "
+                        "estimator generation and row ordering."
+                    )
+                identities.append(identity)
+            identity_tuple = tuple(identities)
+            if reference_identities is None:
+                if len(
+                    {identity.row_sha256 for identity in identity_tuple}
+                ) != particle_count:
+                    raise RuntimeError(
+                        "Current joint PF row identities must be unique."
+                    )
+                reference_identities = identity_tuple
+            elif identity_tuple != reference_identities:
+                raise RuntimeError(
+                    "Joint isotope filters lost their authenticated row "
+                    "identity ordering."
+                )
+        reference = np.asarray(
+            [
+                particle.log_weight
+                for particle in self.filters[order[0]].continuous_particles
+            ],
+            dtype=np.float64,
+        )
+        if (
+            reference.shape != (particle_count,)
+            or np.any(np.isnan(reference))
+            or np.any(np.isposinf(reference))
+            or not np.any(np.isfinite(reference))
+        ):
+            raise RuntimeError("Joint PF common log weights are invalid.")
+        for isotope in order[1:]:
+            candidate = np.asarray(
+                [
+                    particle.log_weight
+                    for particle in self.filters[isotope].continuous_particles
+                ],
+                dtype=np.float64,
+            )
+            if not np.array_equal(candidate, reference):
+                raise RuntimeError(
+                    "Joint isotope filters lost their exact common weights/order."
+                )
+        return reference
+
+    def _assert_joint_surface_atlas_alignment(self) -> str:
+        """Return the shared atlas digest or reject isotope geometry drift."""
+        order = self.joint_isotope_order()
+        if set(self.filters) != set(order):
+            raise RuntimeError(
+                "Joint PF requires exactly one filter for every configured isotope."
+            )
+        digests = tuple(
+            str(
+                getattr(
+                    self.filters[isotope],
+                    "structural_rj_surface_atlas_sha256",
+                    "",
+                )
+            ).strip()
+            for isotope in order
+        )
+        if any(
+            len(digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in digest.lower()
+            )
+            for digest in digests
+        ):
+            raise RuntimeError(
+                "Every joint isotope filter requires a valid surface-atlas "
+                "digest."
+            )
+        if len(set(digest.lower() for digest in digests)) != 1:
+            raise RuntimeError(
+                "Joint isotope rows cannot use different continuous surface "
+                "atlases."
+            )
+        return digests[0].lower()
+
+    def continuous_surface_atlas(self) -> Any:
+        """Return the one authoritative atlas shared by all isotope filters."""
+        if not self.filters:
+            raise RuntimeError(
+                "The continuous surface atlas is unavailable before PF "
+                "initialization."
+            )
+        self._assert_joint_surface_atlas_alignment()
+        atlas = next(iter(self.filters.values()))._structural_rj_surface_atlas
+        if atlas is None:
+            raise RuntimeError("The continuous surface atlas is unavailable.")
+        return atlas
+
+    def _assign_joint_log_weights(
+        self,
+        normalized_log_weights: NDArray[np.float64],
+    ) -> None:
+        """Copy one normalized log-weight vector to every aligned isotope row."""
+        values = np.asarray(normalized_log_weights, dtype=np.float64).reshape(-1)
+        self._assert_joint_particle_alignment()
+        if (
+            values.size
+            != len(
+                self.filters[self.joint_isotope_order()[0]].continuous_particles
+            )
+            or np.any(np.isnan(values))
+            or np.any(np.isposinf(values))
+            or not np.any(np.isfinite(values))
+        ):
+            raise ValueError("Joint normalized log weights are invalid.")
+        finite = np.isfinite(values)
+        normalizer = float(logsumexp(values[finite]))
+        if not np.isclose(normalizer, 0.0, rtol=0.0, atol=1.0e-10):
+            raise ValueError("Joint log weights must already be normalized.")
+        for isotope in self.joint_isotope_order():
+            for particle, log_weight in zip(
+                self.filters[isotope].continuous_particles,
+                values,
+            ):
+                particle.log_weight = float(log_weight)
+        self._assert_joint_particle_alignment()
+
+    def _strict_joint_particle_weights(self) -> NDArray[np.float64]:
+        """Return normalized joint weights or reject invalid posterior mass."""
+        log_weights = self._assert_joint_particle_alignment()
+        finite = np.isfinite(log_weights)
+        weights = np.zeros(log_weights.size, dtype=np.float64)
+        weights[finite] = np.exp(
+            log_weights[finite] - float(logsumexp(log_weights[finite]))
+        )
+        return validated_probability_distribution(
+            weights,
+            name="joint PF particle weights",
+        )
+
+    def _full_spectrum_model(self) -> FullSpectrumGenerativeModel:
+        """Return the required independently validated generative model."""
+        return self.full_spectrum_generative_model
+
+    def _joint_station_from_spectrum_records(
+        self,
+        records: Sequence[Sequence[object]],
+        *,
+        pose_idx: int,
+        station_sequence_id: int,
+        generative_contract_hash_sha256: str,
+    ) -> JointStationObservation:
+        """Build one strict view-major full-spectrum station observation."""
+        if not records:
+            raise ValueError("A joint station must contain at least one view.")
+        model = self._full_spectrum_model()
+        if not isinstance(generative_contract_hash_sha256, str):
+            raise TypeError(
+                "generative_contract_hash_sha256 must be a JSON string."
+            )
+        supplied_hash = generative_contract_hash_sha256
+        if supplied_hash != model.contract_hash_sha256:
+            raise ValueError(
+                "Station full-spectrum contract hash differs from the active "
+                "generative model."
+            )
+        bin_count = int(np.asarray(model.energy_axis_keV).size)
+        spectra: list[NDArray[np.float64]] = []
+        raw_fe_indices: list[int] = []
+        raw_pb_indices: list[int] = []
+        live_times = np.empty(len(records), dtype=np.float64)
+        for view_index, record in enumerate(records):
+            if len(record) != 4:
+                raise ValueError(
+                    "Full-spectrum station records must have exactly four "
+                    "fields: (spectrum, Fe, Pb, live time)."
+                )
+            spectrum, fe_index, pb_index, live_time_s = record
+            raw_spectrum = np.asarray(spectrum)
+            if raw_spectrum.ndim != 1:
+                raise ValueError(
+                    "Each full-spectrum station record must contain one "
+                    "one-dimensional raw spectrum."
+                )
+            validated = validate_observed_spectrum(
+                raw_spectrum[np.newaxis, :],
+                expected_bin_count=bin_count,
+            )
+            spectra.append(validated[0])
+            raw_fe_indices.append(
+                _strict_nonnegative_integer(
+                    fe_index,
+                    name=f"records[{view_index}].fe_index",
+                )
+            )
+            raw_pb_indices.append(
+                _strict_nonnegative_integer(
+                    pb_index,
+                    name=f"records[{view_index}].pb_index",
+                )
+            )
+            resolved_live_time = _strict_config_number(
+                live_time_s,
+                name=f"records[{view_index}].live_time_s",
+            )
+            if resolved_live_time <= 0.0:
+                raise ValueError(
+                    "Full-spectrum station live times must be positive."
+                )
+            live_times[view_index] = resolved_live_time
+        fe_indices, pb_indices = validate_orientation_pair_indices(
+            np.asarray(raw_fe_indices),
+            np.asarray(raw_pb_indices),
+            orientation_count=int(self.num_orientations),
+            expected_count=len(records),
+        )
+        resolved_pose_idx = _strict_nonnegative_integer(
+            pose_idx,
+            name="pose_idx",
+        )
+        resolved_station_sequence_id = _strict_nonnegative_integer(
+            station_sequence_id,
+            name="station_sequence_id",
+        )
+        return JointStationObservation(
+            spectrum_vb=np.ascontiguousarray(np.stack(spectra, axis=0)),
+            energy_axis_keV=np.ascontiguousarray(
+                np.asarray(model.energy_axis_keV, dtype=np.float64)
+            ),
+            generative_contract_hash_sha256=supplied_hash,
+            pose_idx=resolved_pose_idx,
+            detector_position_xyz_m=self._registered_detector_position_xyz(
+                resolved_pose_idx
+            ),
+            fe_indices=np.ascontiguousarray(fe_indices),
+            pb_indices=np.ascontiguousarray(pb_indices),
+            live_times_s=np.ascontiguousarray(live_times),
+            station_sequence_id=resolved_station_sequence_id,
+        )
+
+    def _joint_station_expected_means_torch(
+        self,
+        station: JointStationObservation,
+    ) -> "torch.Tensor":
+        """Return predicted spectra shaped particle x view x energy bin."""
+        model = self._full_spectrum_model()
+        total, uncollided, features = (
+            self._joint_station_transport_components_torch(station)
+        )
+        result = model.predict_mean_torch(
+            total,
+            uncollided,
+            features,
+            station.live_times_s,
+        )
+        expected_shape = (
+            len(self.filters[self.joint_isotope_order()[0]].continuous_particles),
+            int(station.fe_indices.size),
+            int(station.energy_axis_keV.size),
+        )
+        if tuple(result.shape) != expected_shape:
+            raise RuntimeError(
+                "Joint expected-spectrum tensor has an invalid aligned shape."
+            )
+        return result
+
+    def _joint_line_layout(
+        self,
+    ) -> Dict[
+        str,
+        tuple[
+            NDArray[np.int64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+        ],
+    ]:
+        """Return global columns, isotope line indices, and branching weights."""
+        model = self._full_spectrum_model()
+        line_identity = tuple(model.line_identity)
+        layout: Dict[
+            str,
+            tuple[
+                NDArray[np.int64],
+                NDArray[np.int64],
+                NDArray[np.float64],
+            ],
+        ] = {}
+        for isotope in self.joint_isotope_order():
+            global_columns = np.asarray(
+                [
+                    column
+                    for column, payload in enumerate(line_identity)
+                    if str(payload["isotope"]) == isotope
+                ],
+                dtype=np.int64,
+            )
+            local_indices = np.asarray(
+                [
+                    int(line_identity[int(column)]["transport_line_index"])
+                    for column in global_columns
+                ],
+                dtype=np.int64,
+            )
+            branching_weights = np.asarray(
+                [
+                    float(line_identity[int(column)]["branching_weight"])
+                    for column in global_columns
+                ],
+                dtype=np.float64,
+            )
+            if (
+                global_columns.size == 0
+                or np.unique(local_indices).size != local_indices.size
+                or np.any(local_indices < 0)
+                or np.any(~np.isfinite(branching_weights))
+                or np.any(branching_weights <= 0.0)
+            ):
+                raise RuntimeError(
+                    f"Full-spectrum line layout is invalid for {isotope!r}."
+                )
+            configured_weights = self.filters[
+                isotope
+            ].continuous_kernel.line_branching_weights(
+                isotope,
+                local_indices,
+            )
+            if not np.allclose(
+                configured_weights,
+                branching_weights / float(np.sum(branching_weights)),
+                rtol=1.0e-12,
+                atol=1.0e-15,
+            ):
+                raise RuntimeError(
+                    "Full-spectrum branching weights differ from the physical "
+                    f"kernel for {isotope!r}."
+                )
+            layout[isotope] = (
+                global_columns,
+                local_indices,
+                branching_weights,
+            )
+        covered = np.concatenate(
+            [value[0] for value in layout.values()]
+        )
+        if not np.array_equal(
+            np.sort(covered),
+            np.arange(len(line_identity), dtype=np.int64),
+        ):
+            raise RuntimeError(
+                "Full-spectrum line layout does not cover every global line."
+            )
+        return layout
+
+    def _joint_isotope_station_transport_components_torch(
+        self,
+        station: JointStationObservation,
+        isotope: str,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Return one isotope's fixed-slot components in global line layout."""
+        import torch
+
+        self._assert_joint_particle_alignment()
+        model = self._full_spectrum_model()
+        layout = self._joint_line_layout()
+        line_count = len(tuple(model.line_identity))
+        feature_count = len(tuple(model.transport_feature_order))
+        isotope_key = str(isotope)
+        if isotope_key not in self.joint_isotope_order():
+            raise KeyError(f"Unknown joint PF isotope: {isotope_key!r}.")
+        global_columns, local_indices, branching_weights = layout[isotope_key]
+        components = self.filters[
+            isotope_key
+        ]._continuous_expected_line_transport_components_pair_sequence_torch(
+            pose_idx=int(station.pose_idx),
+            fe_indices=station.fe_indices,
+            pb_indices=station.pb_indices,
+            live_times_s=station.live_times_s,
+            positive_line_indices=local_indices,
+        )
+        total_local = components.total_kernel.to(dtype=torch.float64)
+        uncollided_local = components.uncollided_kernel.to(
+            device=total_local.device,
+            dtype=torch.float64,
+        )
+        feature_local = torch.stack(
+            (
+                components.tau_fe,
+                components.tau_pb,
+                components.tau_obstacle,
+                components.distance_m,
+            ),
+            dim=-1,
+        ).to(device=total_local.device, dtype=torch.float64)
+        expected_local_shape = tuple(total_local.shape)
+        expected_slots = int(self.pf_config.max_sources or 0)
+        if (
+            total_local.ndim != 4
+            or int(total_local.shape[2]) != expected_slots
+            or tuple(uncollided_local.shape) != expected_local_shape
+            or tuple(feature_local.shape)
+            != expected_local_shape + (feature_count,)
+            or int(total_local.shape[-1]) != int(local_indices.size)
+        ):
+            raise RuntimeError(
+                "Full-spectrum isotope transport must use the configured "
+                "fixed source-slot layout."
+            )
+        weights = torch.as_tensor(
+            branching_weights,
+            dtype=torch.float64,
+            device=total_local.device,
+        ).view(1, 1, 1, -1)
+        total_local = total_local * weights
+        uncollided_local = uncollided_local * weights
+        global_total = torch.zeros(
+            (*total_local.shape[:-1], line_count),
+            dtype=torch.float64,
+            device=total_local.device,
+        )
+        global_uncollided = torch.zeros_like(global_total)
+        global_features = torch.zeros(
+            (*total_local.shape[:-1], line_count, feature_count),
+            dtype=torch.float64,
+            device=total_local.device,
+        )
+        global_total[..., global_columns] = total_local
+        global_uncollided[..., global_columns] = uncollided_local
+        global_features[..., global_columns, :] = feature_local
+        if (
+            bool(torch.any(~torch.isfinite(global_total)))
+            or bool(torch.any(~torch.isfinite(global_uncollided)))
+            or bool(torch.any(~torch.isfinite(global_features)))
+            or bool(torch.any(global_total < 0.0))
+            or bool(torch.any(global_uncollided < 0.0))
+        ):
+            raise RuntimeError(
+                "Full-spectrum transport components must be finite, "
+                "nonnegative source-slot contributions."
+            )
+        return global_total, global_uncollided, global_features
+
+    def _joint_station_transport_components_torch(
+        self,
+        station: JointStationObservation,
+    ) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
+        """Return source-resolved total, uncollided, and geometry features."""
+        total_parts: list["torch.Tensor"] = []
+        uncollided_parts: list["torch.Tensor"] = []
+        feature_parts: list["torch.Tensor"] = []
+        reference_device = None
+        for isotope in self.joint_isotope_order():
+            total_local, uncollided_local, feature_local = (
+                self._joint_isotope_station_transport_components_torch(
+                    station,
+                    isotope,
+                )
+            )
+            if reference_device is None:
+                reference_device = total_local.device
+            elif total_local.device != reference_device:
+                total_local = total_local.to(device=reference_device)
+                uncollided_local = uncollided_local.to(
+                    device=reference_device
+                )
+                feature_local = feature_local.to(device=reference_device)
+            total_parts.append(total_local)
+            uncollided_parts.append(uncollided_local)
+            feature_parts.append(feature_local)
+        if not total_parts:
+            raise RuntimeError(
+                "Joint transport components require configured isotopes."
+            )
+        import torch
+
+        total = torch.cat(total_parts, dim=2)
+        uncollided = torch.cat(uncollided_parts, dim=2)
+        features = torch.cat(feature_parts, dim=2)
+        if (
+            bool(torch.any(~torch.isfinite(total)))
+            or bool(torch.any(~torch.isfinite(uncollided)))
+            or bool(torch.any(~torch.isfinite(features)))
+            or bool(torch.any(total < 0.0))
+            or bool(torch.any(uncollided < 0.0))
+        ):
+            raise RuntimeError(
+                "Full-spectrum transport components must be finite, "
+                "nonnegative source-slot contributions."
+            )
+        return total, uncollided, features
+
+    def _joint_station_expected_means_np(
+        self,
+        station: JointStationObservation,
+    ) -> NDArray[np.float64]:
+        """Return the NumPy equivalent of aligned station particle means."""
+        return (
+            self._joint_station_expected_means_torch(station)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+
+    def _joint_station_log_likelihood_torch(
+        self,
+        station: JointStationObservation,
+    ) -> "torch.Tensor":
+        """Evaluate the sole joint full-spectrum likelihood for all particles."""
+        model = self._full_spectrum_model()
+        total, uncollided, features = (
+            self._joint_station_transport_components_torch(station)
+        )
+        result = model.log_likelihood_torch(
+            station.spectrum_vb,
+            total,
+            uncollided,
+            features,
+            station.live_times_s,
+        )
+        if tuple(result.shape) != (int(total.shape[0]),):
+            raise RuntimeError(
+                "Full-spectrum likelihood must return one value per particle."
+            )
+        import torch
+
+        if bool(torch.any(torch.isnan(result)).detach().cpu().item()) or bool(
+            torch.any(torch.isinf(result) & (result > 0.0))
+            .detach()
+            .cpu()
+            .item()
+        ):
+            raise RuntimeError(
+                "Full-spectrum likelihood contains NaN or positive infinity."
+            )
+        if not bool(torch.any(torch.isfinite(result)).detach().cpu().item()):
+            raise RuntimeError(
+                "Full-spectrum likelihood is negative infinity for every "
+                "particle; the observation is outside model support."
+            )
+        return result
+
+    def _joint_history_structural_geometry(
+        self,
+        isotope: str,
+        stations: Sequence[JointStationObservation],
+    ) -> StructuralGeometryBatch:
+        """Build geometry-only evidence for exact conditional RJ proposals."""
+        isotope_key = str(isotope)
+        order = self.joint_isotope_order()
+        if isotope_key not in order:
+            raise KeyError(f"Unknown joint PF isotope: {isotope_key!r}.")
+        total_rows = sum(int(station.fe_indices.size) for station in stations)
+        if total_rows <= 0:
+            raise ValueError("Joint RJ history requires at least one station row.")
+        detector_positions = np.concatenate(
+            [
+                np.repeat(
+                    np.asarray(
+                        station.detector_position_xyz_m,
+                        dtype=np.float64,
+                    ).reshape(1, 3),
+                    int(station.fe_indices.size),
+                    axis=0,
+                )
+                for station in stations
+            ],
+            axis=0,
+        )
+        fe_indices = np.concatenate(
+            [np.asarray(station.fe_indices, dtype=np.int64) for station in stations]
+        )
+        pb_indices = np.concatenate(
+            [np.asarray(station.pb_indices, dtype=np.int64) for station in stations]
+        )
+        live_times = np.concatenate(
+            [
+                np.asarray(station.live_times_s, dtype=np.float64)
+                for station in stations
+            ]
+        )
+        sequence_ids = np.concatenate(
+            [
+                np.full(
+                    int(station.fe_indices.size),
+                    int(station.station_sequence_id),
+                    dtype=np.int64,
+                )
+                for station in stations
+            ]
+        )
+        return StructuralGeometryBatch(
+            detector_positions=np.ascontiguousarray(detector_positions),
+            fe_indices=np.ascontiguousarray(fe_indices),
+            pb_indices=np.ascontiguousarray(pb_indices),
+            live_times=np.ascontiguousarray(live_times),
+            station_sequence_ids=np.ascontiguousarray(sequence_ids),
+        )
+
+    def _validate_joint_structural_geometry(
+        self,
+        data: StructuralGeometryBatch,
+        stations: Sequence[JointStationObservation],
+    ) -> None:
+        """Require exact row-wise agreement with the active station history."""
+        active_geometry = self._active_joint_structural_geometry
+        if active_geometry is not None:
+            if data is not active_geometry:
+                raise ValueError(
+                    "Conditional isotope evidence is not the immutable active "
+                    "joint-history geometry."
+                )
+            return
+        row_start = 0
+        for station in stations:
+            row_count = int(np.asarray(station.fe_indices).size)
+            row_stop = row_start + row_count
+            row_slice = slice(row_start, row_stop)
+            expected_positions = np.repeat(
+                np.asarray(
+                    station.detector_position_xyz_m,
+                    dtype=np.float64,
+                ).reshape(1, 3),
+                row_count,
+                axis=0,
+            )
+            if not (
+                np.array_equal(
+                    data.detector_positions[row_slice],
+                    expected_positions,
+                )
+                and np.array_equal(
+                    data.fe_indices[row_slice],
+                    np.asarray(station.fe_indices, dtype=np.int64),
+                )
+                and np.array_equal(
+                    data.pb_indices[row_slice],
+                    np.asarray(station.pb_indices, dtype=np.int64),
+                )
+                and np.array_equal(
+                    data.live_times[row_slice],
+                    np.asarray(station.live_times_s, dtype=np.float64),
+                )
+                and np.array_equal(
+                    data.station_sequence_ids[row_slice],
+                    np.full(
+                        row_count,
+                        int(station.station_sequence_id),
+                        dtype=np.int64,
+                    ),
+                )
+            ):
+                raise ValueError(
+                    "Conditional isotope evidence geometry differs from the "
+                    "active joint station history."
+                )
+            row_start = row_stop
+        if row_start != data.row_count:
+            raise ValueError(
+                "Conditional isotope evidence row count differs from the "
+                "active joint station history."
+            )
+
+    def _refresh_joint_structural_transport_cache(
+        self,
+        stations: Sequence[JointStationObservation],
+    ) -> None:
+        """Cache source-resolved transport components for conditional RJ."""
+        station_components = [
+            tuple(
+                value.detach().cpu().numpy().astype(np.float64, copy=False)
+                for value in self._joint_station_transport_components_torch(
+                    station
+                )
+            )
+            for station in stations
+        ]
+        self._joint_structural_transport_cache = tuple(
+            np.concatenate(
+                [components[index] for components in station_components],
+                axis=1,
+            )
+            for index in range(3)
+        )
+
+    def _refresh_joint_structural_transport_cache_isotope(
+        self,
+        stations: Sequence[JointStationObservation],
+        isotope: str,
+    ) -> None:
+        """Refresh only one moved isotope's fixed source-slot cache slice."""
+        cache = self._joint_structural_transport_cache
+        if cache is None:
+            raise RuntimeError(
+                "Incremental structural transport refresh requires a cache."
+            )
+        order = self.joint_isotope_order()
+        isotope_key = str(isotope)
+        if isotope_key not in order:
+            raise KeyError(f"Unknown joint PF isotope: {isotope_key!r}.")
+        station_components = [
+            tuple(
+                value.detach().cpu().numpy().astype(
+                    np.float64,
+                    copy=False,
+                )
+                for value in (
+                    self._joint_isotope_station_transport_components_torch(
+                        station,
+                        isotope_key,
+                    )
+                )
+            )
+            for station in stations
+        ]
+        refreshed = tuple(
+            np.concatenate(
+                [components[index] for components in station_components],
+                axis=1,
+            )
+            for index in range(3)
+        )
+        slots_per_isotope = int(self.pf_config.max_sources or 0)
+        slot_start = order.index(isotope_key) * slots_per_isotope
+        slot_stop = slot_start + slots_per_isotope
+        mutable_cache = [np.asarray(values) for values in cache]
+        for cached_values, refreshed_values in zip(
+            mutable_cache,
+            refreshed,
+            strict=True,
+        ):
+            if (
+                cached_values.shape[:2] != refreshed_values.shape[:2]
+                or cached_values.shape[2] < slot_stop
+                or refreshed_values.shape[2] != slots_per_isotope
+                or cached_values.shape[3:] != refreshed_values.shape[3:]
+            ):
+                raise RuntimeError(
+                    "Incremental isotope transport cache shapes disagree."
+                )
+            cached_values[:, :, slot_start:slot_stop, ...] = refreshed_values
+        self._joint_structural_transport_cache = tuple(mutable_cache)
+
+    def _full_spectrum_log_likelihood_numpy(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        station: JointStationObservation,
+        total_nvsl: NDArray[np.float64],
+        uncollided_nvsl: NDArray[np.float64],
+        features_nvslf: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate one batched station on GPU when available, else NumPy."""
+        model = self._full_spectrum_model()
+        total = np.asarray(total_nvsl, dtype=np.float64)
+        uncollided = np.asarray(uncollided_nvsl, dtype=np.float64)
+        features = np.asarray(features_nvslf, dtype=np.float64)
+        if filt._can_use_gpu():
+            from pf import gpu_utils
+            import torch
+
+            device = gpu_utils.resolve_device(filt.config.gpu_device)
+            result = (
+                model.log_likelihood_torch(
+                    station.spectrum_vb,
+                    torch.as_tensor(total, dtype=torch.float64, device=device),
+                    torch.as_tensor(
+                        uncollided,
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                    torch.as_tensor(
+                        features,
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                    station.live_times_s,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64, copy=False)
+            )
+        else:
+            result = np.asarray(
+                model.log_likelihood_numpy(
+                    station.spectrum_vb,
+                    total,
+                    uncollided,
+                    features,
+                    station.live_times_s,
+                ),
+                dtype=np.float64,
+            )
+        expected_shape = (int(total.shape[0]),)
+        if np.asarray(result).shape != expected_shape:
+            raise RuntimeError(
+                "Full-spectrum conditional likelihood must return one value "
+                "per candidate row."
+            )
+        if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+            raise RuntimeError(
+                "Full-spectrum conditional likelihood contains NaN or "
+                "positive infinity."
+            )
+        return np.asarray(result, dtype=np.float64)
+
+    def _joint_history_log_likelihood_numpy(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        stations: Sequence[JointStationObservation],
+        total_nvsl: NDArray[np.float64],
+        uncollided_nvsl: NDArray[np.float64],
+        features_nvslf: NDArray[np.float64],
+        target_beta: float,
+    ) -> NDArray[np.float64]:
+        """Evaluate station-independent latent blocks on one batched action axis."""
+        beta = float(target_beta)
+        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("Joint history target_beta must lie in [0, 1].")
+        model = self._full_spectrum_model()
+        total = np.asarray(total_nvsl, dtype=np.float64)
+        uncollided = np.asarray(uncollided_nvsl, dtype=np.float64)
+        features = np.asarray(features_nvslf, dtype=np.float64)
+        feature_count = len(tuple(model.transport_feature_order))
+        total_views = sum(int(station.fe_indices.size) for station in stations)
+        if (
+            total.ndim != 4
+            or uncollided.shape != total.shape
+            or features.shape != total.shape + (feature_count,)
+            or total.shape[0] <= 0
+            or total.shape[1] != total_views
+        ):
+            raise ValueError(
+                "Joint-history transport arrays must align with every station "
+                "view and configured transport feature."
+            )
+        particle_count = int(total.shape[0])
+        result = np.zeros(particle_count, dtype=np.float64)
+        grouped: dict[
+            tuple[int, bytes],
+            list[tuple[JointStationObservation, int, int, float]],
+        ] = {}
+        view_start = 0
+        for station_index, station in enumerate(stations):
+            view_count = int(station.fe_indices.size)
+            view_stop = view_start + view_count
+            power = beta if station_index == len(stations) - 1 else 1.0
+            live_times = np.ascontiguousarray(
+                station.live_times_s,
+                dtype=np.float64,
+            )
+            if live_times.shape != (view_count,):
+                raise ValueError(
+                    "Joint-history station live times must align with views."
+                )
+            if power > 0.0:
+                key = (view_count, live_times.tobytes(order="C"))
+                grouped.setdefault(key, []).append(
+                    (station, view_start, view_stop, power)
+                )
+            view_start = view_stop
+        if view_start != total_views:
+            raise ValueError(
+                "Full-spectrum transport views differ from station history."
+            )
+        for entries in grouped.values():
+            view_count = int(entries[0][2] - entries[0][1])
+            first_start = int(entries[0][1])
+            last_stop = int(entries[-1][2])
+            contiguous = all(
+                int(entry[1]) == first_start + index * view_count
+                and int(entry[2]) == first_start + (index + 1) * view_count
+                for index, entry in enumerate(entries)
+            )
+
+            def _station_action_axis(
+                values: NDArray[np.float64],
+            ) -> NDArray[np.float64]:
+                """Return station x particle x view without scalar station work."""
+                trailing_shape = tuple(values.shape[2:])
+                if contiguous:
+                    block = values[:, first_start:last_stop, ...]
+                    reshaped = block.reshape(
+                        particle_count,
+                        len(entries),
+                        view_count,
+                        *trailing_shape,
+                    )
+                    return np.moveaxis(reshaped, 1, 0)
+                return np.stack(
+                    [
+                        values[:, int(entry[1]) : int(entry[2]), ...]
+                        for entry in entries
+                    ],
+                    axis=0,
+                )
+
+            observed = np.stack(
+                [
+                    np.asarray(entry[0].spectrum_vb, dtype=np.float64)
+                    for entry in entries
+                ],
+                axis=0,
+            )[:, None, :, :]
+            total_group = _station_action_axis(total)
+            uncollided_group = _station_action_axis(uncollided)
+            feature_group = _station_action_axis(features)
+            live_times = np.asarray(
+                entries[0][0].live_times_s,
+                dtype=np.float64,
+            )
+            action_chunk_size = min(
+                len(entries),
+                JOINT_HISTORY_STATION_ACTION_BATCH_SIZE,
+            )
+            if filt._can_use_gpu():
+                from pf import gpu_utils
+                import torch
+
+                device = gpu_utils.resolve_device(filt.config.gpu_device)
+                group_ll = (
+                    model.cross_log_likelihood_torch(
+                        observed,
+                        torch.as_tensor(
+                            total_group,
+                            dtype=torch.float64,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            uncollided_group,
+                            dtype=torch.float64,
+                            device=device,
+                        ),
+                        torch.as_tensor(
+                            feature_group,
+                            dtype=torch.float64,
+                            device=device,
+                        ),
+                        live_times,
+                        action_chunk_size=action_chunk_size,
+                    )
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False)
+                )
+            else:
+                group_ll = np.asarray(
+                    model.cross_log_likelihood_numpy(
+                        observed,
+                        total_group,
+                        uncollided_group,
+                        feature_group,
+                        live_times,
+                        action_chunk_size=action_chunk_size,
+                    ),
+                    dtype=np.float64,
+                )
+            expected_shape = (len(entries), 1, particle_count)
+            if (
+                group_ll.shape != expected_shape
+                or np.any(np.isnan(group_ll))
+                or np.any(np.isposinf(group_ll))
+            ):
+                raise RuntimeError(
+                    "Batched station-history likelihood returned invalid "
+                    "action/sample/state values."
+                )
+            powers = np.asarray(
+                [entry[3] for entry in entries],
+                dtype=np.float64,
+            )
+            result += np.sum(
+                powers[:, None] * group_ll[:, 0, :],
+                axis=0,
+            )
+        if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+            raise RuntimeError(
+                "Joint history conditional likelihood is numerically invalid."
+            )
+        return result
+
+    @staticmethod
+    def _joint_birth_proposal_station_digest(
+        *,
+        filt: IsotopeParticleFilter,
+        station: JointStationObservation,
+        strength_grid: NDArray[np.float64],
+    ) -> str:
+        """Hash every immutable input to one station proposal-score grid."""
+        digest = hashlib.sha256(
+            b"joint_full_spectrum_birth_proposal_station_v1\0"
+        )
+        for text in (
+            str(filt.isotope),
+            str(station.generative_contract_hash_sha256),
+            str(filt.structural_rj_surface_atlas_sha256),
+            str(id(filt.continuous_kernel)),
+        ):
+            encoded = text.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "little"))
+            digest.update(encoded)
+        digest.update(
+            np.asarray(
+                [station.pose_idx, station.station_sequence_id],
+                dtype="<i8",
+            ).tobytes()
+        )
+        for values in (
+            station.spectrum_vb,
+            station.energy_axis_keV,
+            station.detector_position_xyz_m,
+            station.fe_indices,
+            station.pb_indices,
+            station.live_times_s,
+            strength_grid,
+        ):
+            array = np.ascontiguousarray(values)
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+            digest.update(array.tobytes(order="C"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _joint_station_structural_geometry(
+        station: JointStationObservation,
+    ) -> StructuralGeometryBatch:
+        """Return the geometry-only carrier for one immutable station."""
+        view_count = int(station.fe_indices.size)
+        return StructuralGeometryBatch(
+            detector_positions=np.repeat(
+                np.asarray(
+                    station.detector_position_xyz_m,
+                    dtype=np.float64,
+                ).reshape(1, 3),
+                view_count,
+                axis=0,
+            ),
+            fe_indices=np.asarray(station.fe_indices, dtype=np.int64),
+            pb_indices=np.asarray(station.pb_indices, dtype=np.int64),
+            live_times=np.asarray(station.live_times_s, dtype=np.float64),
+            station_sequence_ids=np.full(
+                view_count,
+                int(station.station_sequence_id),
+                dtype=np.int64,
+            ),
+        )
+
+    @property
+    def joint_birth_proposal_cache_bytes(self) -> int:
+        """Return bytes occupied by cached chart-by-strength score arrays."""
+        return int(
+            sum(
+                int(values.nbytes)
+                for values in (
+                    self._joint_birth_proposal_station_score_cache.values()
+                )
+            )
+        )
+
+    def _store_joint_birth_proposal_station_scores(
+        self,
+        cache_key: tuple[str, str],
+        score_grid: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Store one immutable score grid under a strict LRU memory bound."""
+        scores = np.ascontiguousarray(score_grid, dtype=np.float64)
+        maximum_bytes = int(
+            self.pf_config.structural_rj_proposal_score_cache_max_bytes
+        )
+        if int(scores.nbytes) > maximum_bytes:
+            raise MemoryError(
+                "One full-spectrum birth-proposal score grid exceeds "
+                "structural_rj_proposal_score_cache_max_bytes."
+            )
+        scores.setflags(write=False)
+        self._joint_birth_proposal_station_score_cache[cache_key] = scores
+        self._joint_birth_proposal_station_score_cache_order = [
+            key
+            for key in self._joint_birth_proposal_station_score_cache_order
+            if key != cache_key
+        ]
+        self._joint_birth_proposal_station_score_cache_order.append(cache_key)
+        while self.joint_birth_proposal_cache_bytes > maximum_bytes:
+            oldest = (
+                self._joint_birth_proposal_station_score_cache_order.pop(0)
+            )
+            self._joint_birth_proposal_station_score_cache.pop(oldest, None)
+        if cache_key not in self._joint_birth_proposal_station_score_cache:
+            raise RuntimeError(
+                "Birth-proposal LRU evicted the score grid being inserted."
+            )
+        return scores
+
+    def _joint_station_birth_proposal_score_grid(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        station: JointStationObservation,
+        chart_centers_xyz: NDArray[np.float64],
+        strength_grid: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return one cached proposal-only chart-by-strength score grid."""
+        centers = np.asarray(
+            chart_centers_xyz,
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        atlas = filt._structural_rj_surface_atlas
+        if atlas is None or int(centers.shape[0]) != int(atlas.chart_count):
+            raise ValueError(
+                "Birth-proposal centers must contain the authoritative atlas "
+                "charts in chart-ID order."
+            )
+        strengths = np.asarray(
+            strength_grid,
+            dtype=np.float64,
+        ).reshape(-1)
+        cache_key = (
+            str(filt.isotope),
+            self._joint_birth_proposal_station_digest(
+                filt=filt,
+                station=station,
+                strength_grid=strengths,
+            ),
+        )
+        cached = self._joint_birth_proposal_station_score_cache.get(
+            cache_key
+        )
+        expected_shape = (int(centers.shape[0]), int(strengths.size))
+        if cached is not None:
+            if cached.shape != expected_shape:
+                raise RuntimeError(
+                    "Cached birth-proposal score grid has an invalid shape."
+                )
+            self.last_joint_birth_proposal_cache_hits += 1
+            self._joint_birth_proposal_station_score_cache_order = [
+                key
+                for key in (
+                    self._joint_birth_proposal_station_score_cache_order
+                )
+                if key != cache_key
+            ]
+            self._joint_birth_proposal_station_score_cache_order.append(
+                cache_key
+            )
+            return cached
+
+        self.last_joint_birth_proposal_cache_misses += 1
+        model = self._full_spectrum_model()
+        line_count = len(tuple(model.line_identity))
+        feature_count = len(tuple(model.transport_feature_order))
+        layout = self._joint_line_layout()
+        global_columns, local_indices, branching_weights = layout[
+            str(filt.isotope)
+        ]
+        target_line_mask = np.zeros(line_count, dtype=np.bool_)
+        target_line_mask[global_columns] = True
+        view_count = int(station.fe_indices.size)
+        geometry = self._joint_station_structural_geometry(station)
+        score_cg = np.empty(expected_shape, dtype=np.float64)
+        batch_size = int(
+            self.pf_config.structural_rj_proposal_chart_batch_size
+        )
+        for chart_start in range(0, int(centers.shape[0]), batch_size):
+            chart_stop = min(
+                chart_start + batch_size,
+                int(centers.shape[0]),
+            )
+            batch_centers = centers[chart_start:chart_stop]
+            components = (
+                filt._continuous_rj_line_transport_component_columns(
+                    geometry,
+                    batch_centers,
+                    local_indices,
+                    chart_ids=np.arange(
+                        chart_start,
+                        chart_stop,
+                        dtype=np.int64,
+                    ),
+                )
+            )
+            local_shape = (
+                view_count,
+                int(batch_centers.shape[0]),
+                int(local_indices.size),
+            )
+            unit_total = np.asarray(
+                components.total_kernel,
+                dtype=np.float64,
+            ).reshape(local_shape)
+            unit_uncollided = np.asarray(
+                components.uncollided_kernel,
+                dtype=np.float64,
+            ).reshape(local_shape)
+            unit_features = np.stack(
+                (
+                    np.asarray(components.tau_fe, dtype=np.float64),
+                    np.asarray(components.tau_pb, dtype=np.float64),
+                    np.asarray(
+                        components.tau_obstacle,
+                        dtype=np.float64,
+                    ),
+                    np.asarray(components.distance_m, dtype=np.float64),
+                ),
+                axis=-1,
+            ).reshape(local_shape + (feature_count,))
+            batch_count = int(batch_centers.shape[0])
+            candidate_count = batch_count * int(strengths.size)
+            total = np.zeros(
+                (candidate_count, view_count, 1, line_count),
+                dtype=np.float64,
+            )
+            uncollided = np.zeros_like(total)
+            features = np.zeros(
+                (
+                    candidate_count,
+                    view_count,
+                    1,
+                    line_count,
+                    feature_count,
+                ),
+                dtype=np.float64,
+            )
+            scale = (
+                strengths[None, :, None, None]
+                * branching_weights[None, None, None, :]
+            )
+            total_local = (
+                np.transpose(unit_total, (1, 0, 2))[:, None, :, :]
+                * scale
+            ).reshape(
+                candidate_count,
+                view_count,
+                int(local_indices.size),
+            )
+            uncollided_local = (
+                np.transpose(unit_uncollided, (1, 0, 2))[:, None, :, :]
+                * scale
+            ).reshape(
+                candidate_count,
+                view_count,
+                int(local_indices.size),
+            )
+            feature_local = np.broadcast_to(
+                np.transpose(unit_features, (1, 0, 2, 3))[
+                    :, None, :, :, :
+                ],
+                (
+                    batch_count,
+                    int(strengths.size),
+                    view_count,
+                    int(local_indices.size),
+                    feature_count,
+                ),
+            ).reshape(
+                candidate_count,
+                view_count,
+                int(local_indices.size),
+                feature_count,
+            )
+            total[..., global_columns] = total_local[:, :, None, :]
+            uncollided[..., global_columns] = (
+                uncollided_local[:, :, None, :]
+            )
+            features[..., global_columns, :] = (
+                feature_local[:, :, None, :, :]
+            )
+            if filt._can_use_gpu():
+                from pf import gpu_utils
+                import torch
+
+                device = gpu_utils.resolve_device(filt.config.gpu_device)
+                scores = model.birth_proposal_log_scores_torch(
+                    station.spectrum_vb,
+                    torch.as_tensor(
+                        total,
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                    torch.as_tensor(
+                        uncollided,
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                    torch.as_tensor(
+                        features,
+                        dtype=torch.float64,
+                        device=device,
+                    ),
+                    station.live_times_s,
+                    target_line_mask_l=torch.as_tensor(
+                        target_line_mask,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                )
+                batch_scores = (
+                    scores.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64, copy=False)
+                )
+            else:
+                batch_scores = np.asarray(
+                    model.birth_proposal_log_scores_numpy(
+                        station.spectrum_vb,
+                        total,
+                        uncollided,
+                        features,
+                        station.live_times_s,
+                        target_line_mask_l=target_line_mask,
+                    ),
+                    dtype=np.float64,
+                )
+            if batch_scores.shape != (candidate_count,) or np.any(
+                ~np.isfinite(batch_scores)
+            ):
+                raise RuntimeError(
+                    "Full-spectrum birth proposal returned invalid scores."
+                )
+            score_cg[chart_start:chart_stop, :] = batch_scores.reshape(
+                batch_count,
+                strengths.size,
+            )
+        return self._store_joint_birth_proposal_station_scores(
+            cache_key,
+            score_cg,
+        )
+
+    def _joint_structural_proposal_evaluator(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        data: StructuralGeometryBatch,
+        chart_centers_xyz: NDArray[np.float64],
+        target_beta: float,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        bool,
+    ]:
+        """Build one cached state-independent full-spectrum birth proposal."""
+        stations = self._active_joint_station_history
+        if stations is None:
+            raise RuntimeError(
+                "Joint full-spectrum proposal target is not active."
+            )
+        self._validate_joint_structural_geometry(data, stations)
+        centers = np.asarray(
+            chart_centers_xyz,
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        chart_count = int(centers.shape[0])
+        atlas = filt._structural_rj_surface_atlas
+        if atlas is None or not np.array_equal(
+            centers,
+            np.asarray(
+                atlas.geometry.centers_xyz,
+                dtype=np.float64,
+            ),
+        ):
+            raise ValueError(
+                "Birth-proposal chart centers must be the immutable active "
+                "continuous-surface atlas centers."
+            )
+        strength_grid = np.linspace(
+            float(self.pf_config.strength_prior_min_cps_1m),
+            float(self.pf_config.strength_prior_max_cps_1m),
+            int(self.pf_config.structural_rj_strength_proposal_grid_size),
+            dtype=np.float64,
+        )
+        midpoint = float(
+            0.5
+            * (
+                self.pf_config.strength_prior_min_cps_1m
+                + self.pf_config.strength_prior_max_cps_1m
+            )
+        )
+        if chart_count == 0:
+            return (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.float64),
+                False,
+            )
+        total_views = sum(int(station.fe_indices.size) for station in stations)
+        if data.row_count != total_views:
+            raise ValueError(
+                "Residual proposal geometry differs from joint station history."
+            )
+        beta = float(target_beta)
+        has_active_likelihood = len(stations) > 1 or beta > 0.0
+        if not has_active_likelihood:
+            return (
+                np.zeros(chart_count, dtype=np.float64),
+                np.full(chart_count, midpoint, dtype=np.float64),
+                False,
+            )
+        completed_count = len(self._joint_station_history)
+        if (
+            len(stations) != completed_count + 1
+            or self._joint_birth_proposal_prefix_station_count
+            != completed_count
+        ):
+            raise RuntimeError(
+                "Birth-proposal prefix does not match the completed station "
+                "history."
+            )
+        prefix = self._joint_birth_proposal_prefix_scores.get(
+            str(filt.isotope)
+        )
+        expected_shape = (chart_count, strength_grid.size)
+        if prefix is None:
+            if completed_count:
+                raise RuntimeError(
+                    "Birth-proposal prefix is missing for a configured isotope."
+                )
+            score_cg = np.zeros(expected_shape, dtype=np.float64)
+        else:
+            score_cg = np.asarray(prefix, dtype=np.float64).copy()
+            if score_cg.shape != expected_shape or np.any(
+                ~np.isfinite(score_cg)
+            ):
+                raise RuntimeError(
+                    "Birth-proposal prefix score grid is invalid."
+                )
+        if beta > 0.0:
+            score_cg += beta * self._joint_station_birth_proposal_score_grid(
+                filt=filt,
+                station=stations[-1],
+                chart_centers_xyz=centers,
+                strength_grid=strength_grid,
+            )
+        best_grid_indices = np.argmax(score_cg, axis=1)
+        best_scores = score_cg[
+            np.arange(chart_count, dtype=np.int64),
+            best_grid_indices,
+        ]
+        best_locations = strength_grid[best_grid_indices]
+        maximum = float(np.max(best_scores))
+        informative = bool(np.isfinite(maximum) and maximum > 1.0e-9)
+        if not informative:
+            return (
+                np.zeros(chart_count, dtype=np.float64),
+                np.full(chart_count, midpoint, dtype=np.float64),
+                False,
+            )
+        alignment = np.exp(
+            np.clip(best_scores - maximum, -745.0, 0.0)
+        )
+        return (
+            np.asarray(alignment, dtype=np.float64),
+            np.asarray(best_locations, dtype=np.float64),
+            True,
+        )
+
+    def _promote_joint_birth_proposal_station(
+        self,
+        station: JointStationObservation,
+    ) -> None:
+        """Add one completed station to each isotope's exact score prefix.
+
+        Birth proposal scores are additive over conditionally independent
+        stations.  Keeping the full chart-by-strength sum for completed
+        stations is mathematically identical to rescanning every old station,
+        while preventing a bounded LRU from cyclically evicting and recomputing
+        the entire history during every intermediate rejuvenation.
+        """
+        completed_count = len(self._joint_station_history)
+        if self._joint_birth_proposal_prefix_station_count != completed_count:
+            raise RuntimeError(
+                "Birth-proposal prefix promotion is out of sequence."
+            )
+        strength_grid = np.linspace(
+            float(self.pf_config.strength_prior_min_cps_1m),
+            float(self.pf_config.strength_prior_max_cps_1m),
+            int(self.pf_config.structural_rj_strength_proposal_grid_size),
+            dtype=np.float64,
+        )
+        promoted: dict[str, NDArray[np.float64]] = {}
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            atlas = filt._structural_rj_surface_atlas
+            if atlas is None:
+                raise RuntimeError(
+                    "Birth-proposal prefix requires a continuous surface atlas."
+                )
+            station_scores = self._joint_station_birth_proposal_score_grid(
+                filt=filt,
+                station=station,
+                chart_centers_xyz=np.asarray(
+                    atlas.geometry.centers_xyz,
+                    dtype=np.float64,
+                ),
+                strength_grid=strength_grid,
+            )
+            previous = self._joint_birth_proposal_prefix_scores.get(isotope)
+            if previous is None:
+                if completed_count:
+                    raise RuntimeError(
+                        "Birth-proposal prefix is missing for a configured "
+                        "isotope."
+                    )
+                combined = np.asarray(
+                    station_scores,
+                    dtype=np.float64,
+                ).copy()
+            else:
+                if previous.shape != station_scores.shape:
+                    raise RuntimeError(
+                        "Birth-proposal prefix and station grids disagree."
+                    )
+                combined = (
+                    np.asarray(previous, dtype=np.float64)
+                    + np.asarray(station_scores, dtype=np.float64)
+                )
+            if np.any(~np.isfinite(combined)):
+                raise RuntimeError(
+                    "Birth-proposal prefix contains non-finite scores."
+                )
+            combined = np.ascontiguousarray(combined, dtype=np.float64)
+            combined.setflags(write=False)
+            promoted[isotope] = combined
+        self._joint_birth_proposal_prefix_scores = promoted
+        self._joint_birth_proposal_prefix_station_count = completed_count + 1
+        self._joint_birth_proposal_station_score_cache.clear()
+        self._joint_birth_proposal_station_score_cache_order.clear()
+
+    def _joint_structural_target_evaluator(
+        self,
+        *,
+        filt: IsotopeParticleFilter,
+        data: StructuralGeometryBatch,
+        positions_pks: NDArray[np.float64],
+        chart_ids_pk: NDArray[np.int64],
+        strengths_pk: NDArray[np.float64],
+        particle_indices: NDArray[np.int64],
+        target_beta: float,
+        tempering_start_row: int | None,
+    ) -> NDArray[np.float64]:
+        """Evaluate a conditional isotope proposal under the full joint target."""
+        stations = self._active_joint_station_history
+        cache = self._joint_structural_transport_cache
+        if stations is None or cache is None:
+            raise RuntimeError("Joint structural target is not active.")
+        self._validate_joint_structural_geometry(data, stations)
+        order = self.joint_isotope_order()
+        if filt.isotope not in order:
+            raise ValueError("Conditional RJ filter is not a joint isotope.")
+        indices = np.asarray(particle_indices, dtype=np.int64).reshape(-1)
+        positions = np.asarray(positions_pks, dtype=np.float64)
+        raw_chart_ids = np.asarray(chart_ids_pk)
+        strengths = np.asarray(strengths_pk, dtype=np.float64)
+        total_views = sum(int(station.fe_indices.size) for station in stations)
+        if (
+            positions.ndim != 3
+            or positions.shape[0] != indices.size
+            or positions.shape[2] != 3
+            or strengths.shape != positions.shape[:2]
+            or not np.issubdtype(raw_chart_ids.dtype, np.integer)
+            or raw_chart_ids.shape != strengths.shape
+        ):
+            raise ValueError(
+                "Conditional isotope candidates must be aligned surface states."
+            )
+        chart_ids = np.asarray(raw_chart_ids, dtype=np.int64)
+        model = self._full_spectrum_model()
+        cached_total, cached_uncollided, cached_features = cache
+        line_count = len(tuple(model.line_identity))
+        feature_count = len(tuple(model.transport_feature_order))
+        slots_per_isotope = int(filt.config.max_sources)
+        total_slot_count = slots_per_isotope * len(order)
+        if (
+            cached_total.shape[1:]
+            != (total_views, total_slot_count, line_count)
+            or cached_uncollided.shape != cached_total.shape
+            or cached_features.shape
+            != cached_total.shape + (feature_count,)
+            or np.any(indices < 0)
+            or np.any(indices >= cached_total.shape[0])
+        ):
+            raise RuntimeError(
+                "Joint structural transport cache is misaligned."
+            )
+        total = np.asarray(cached_total[indices], dtype=np.float64).copy()
+        uncollided = np.asarray(
+            cached_uncollided[indices],
+            dtype=np.float64,
+        ).copy()
+        features = np.asarray(
+            cached_features[indices],
+            dtype=np.float64,
+        ).copy()
+        layout = self._joint_line_layout()
+        global_columns, local_indices, branching_weights = layout[
+            str(filt.isotope)
+        ]
+        components = filt._continuous_rj_line_transport_component_columns(
+            data,
+            positions.reshape(-1, 3),
+            local_indices,
+            chart_ids=chart_ids.reshape(-1),
+        )
+        local_shape = (
+            total_views,
+            indices.size,
+            int(positions.shape[1]),
+            int(local_indices.size),
+        )
+        candidate_total = np.asarray(
+            components.total_kernel,
+            dtype=np.float64,
+        ).reshape(local_shape)
+        candidate_uncollided = np.asarray(
+            components.uncollided_kernel,
+            dtype=np.float64,
+        ).reshape(local_shape)
+        candidate_features = np.stack(
+            (
+                np.asarray(components.tau_fe, dtype=np.float64),
+                np.asarray(components.tau_pb, dtype=np.float64),
+                np.asarray(components.tau_obstacle, dtype=np.float64),
+                np.asarray(components.distance_m, dtype=np.float64),
+            ),
+            axis=-1,
+        ).reshape(local_shape + (feature_count,))
+        scale = (
+            strengths[None, :, :, None]
+            * branching_weights.reshape(1, 1, 1, -1)
+        )
+        candidate_total = np.transpose(
+            candidate_total * scale,
+            (1, 0, 2, 3),
+        )
+        candidate_uncollided = np.transpose(
+            candidate_uncollided * scale,
+            (1, 0, 2, 3),
+        )
+        candidate_features = np.transpose(
+            candidate_features,
+            (1, 0, 2, 3, 4),
+        )
+        isotope_index = order.index(str(filt.isotope))
+        slot_start = isotope_index * slots_per_isotope
+        slot_stop = slot_start + slots_per_isotope
+        total[:, :, slot_start:slot_stop, :] = 0.0
+        uncollided[:, :, slot_start:slot_stop, :] = 0.0
+        features[:, :, slot_start:slot_stop, :, :] = 0.0
+        cardinality = int(positions.shape[1])
+        if cardinality > slots_per_isotope:
+            raise ValueError(
+                "Conditional candidate cardinality exceeds its source slots."
+            )
+        if cardinality:
+            target_slots = slice(slot_start, slot_start + cardinality)
+            total_subset = total[:, :, target_slots, :]
+            uncollided_subset = uncollided[:, :, target_slots, :]
+            feature_subset = features[:, :, target_slots, :, :]
+            total_subset[..., global_columns] = candidate_total
+            uncollided_subset[..., global_columns] = candidate_uncollided
+            feature_subset[..., global_columns, :] = candidate_features
+            total[:, :, target_slots, :] = total_subset
+            uncollided[:, :, target_slots, :] = uncollided_subset
+            features[:, :, target_slots, :, :] = feature_subset
+        beta = float(target_beta)
+        if not np.isfinite(beta) or not 0.0 <= beta <= 1.0:
+            raise ValueError("Joint structural target_beta must lie in [0, 1].")
+        expected_start_row = total_views - int(stations[-1].fe_indices.size)
+        if (
+            tempering_start_row is not None
+            and int(tempering_start_row) != expected_start_row
+        ):
+            raise ValueError(
+                "Joint structural tempering must begin at the newest station."
+            )
+        if data.row_count != total_views:
+            raise ValueError(
+                "Conditional isotope evidence geometry differs from joint history."
+            )
+        return self._joint_history_log_likelihood_numpy(
+            filt=filt,
+            stations=stations,
+            total_nvsl=total,
+            uncollided_nvsl=uncollided,
+            features_nvslf=features,
+            target_beta=beta,
+        )
+
+    def _resample_joint_particles(
+        self,
+        normalized_log_weights: NDArray[np.float64],
+    ) -> NDArray[np.int64]:
+        """Apply one systematic ancestor vector to every isotope state row."""
+        log_weights = np.asarray(
+            normalized_log_weights,
+            dtype=np.float64,
+        ).reshape(-1)
+        self._assign_joint_log_weights(log_weights)
+        raw_indices = np.asarray(
+            systematic_resample(
+                log_weights,
+                rng=self._joint_random_generator,
+            )
+        )
+        if (
+            raw_indices.shape != log_weights.shape
+            or not np.issubdtype(raw_indices.dtype, np.integer)
+            or np.any(raw_indices < 0)
+            or np.any(raw_indices >= log_weights.size)
+        ):
+            raise RuntimeError(
+                "Joint systematic resampling returned invalid ancestor indices."
+            )
+        indices = np.asarray(
+            raw_indices,
+            dtype=np.int64,
+        )
+        uniform_log_weight = float(-np.log(max(indices.size, 1)))
+        reference_particles = self.filters[
+            self.joint_isotope_order()[0]
+        ].continuous_particles
+        parent_identities = tuple(
+            particle.joint_row_identity for particle in reference_particles
+        )
+        if not all(
+            isinstance(identity, JointRowIdentity)
+            for identity in parent_identities
+        ):
+            raise RuntimeError(
+                "Joint resampling requires authenticated parent row identities."
+            )
+        new_identities = tuple(
+            parent_identities[int(index)].resampled_child(ordinal=row)
+            for row, index in enumerate(indices.tolist())
+        )
+        new_particles_by_isotope: dict[str, list[IsotopeParticle]] = {}
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            previous = filt.continuous_particles
+            new_particles_by_isotope[isotope] = [
+                IsotopeParticle(
+                    state=previous[int(index)].state.copy(),
+                    log_weight=uniform_log_weight,
+                    joint_row_identity=new_identities[row],
+                )
+                for row, index in enumerate(indices.tolist())
+            ]
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            filt.continuous_particles = new_particles_by_isotope[isotope]
+            filt.last_resample_count += 1
+            filt._resample_count_in_observation += 1
+        self._joint_row_generation = new_identities[0].generation
+        self.last_joint_resample_indices = np.asarray(
+            indices,
+            dtype=np.int64,
+        )
+        self._assert_joint_particle_alignment()
+        return self.last_joint_resample_indices
+
+    def _joint_rejuvenate(
+        self,
+        stations: Sequence[JointStationObservation],
+        *,
+        target_beta: float,
+    ) -> None:
+        """Apply sequential conditional exact-RJ sweeps under one joint target."""
+        active = tuple(stations)
+        if not active:
+            return
+        self._active_joint_station_history = active
+        newest_start = sum(
+            int(station.fe_indices.size) for station in active[:-1]
+        )
+        try:
+            self._refresh_joint_structural_transport_cache(active)
+            isotope_order = self.joint_isotope_order()
+            for isotope_index, isotope in enumerate(isotope_order):
+                filt = self.filters[isotope]
+                evidence = self._joint_history_structural_geometry(
+                    isotope,
+                    active,
+                )
+                self._validate_joint_structural_geometry(evidence, active)
+                self._active_joint_structural_geometry = evidence
+                try:
+                    filt.apply_structural_moves(
+                        evidence,
+                        target_beta=float(target_beta),
+                        tempering_start_row=int(newest_start),
+                    )
+                finally:
+                    self._active_joint_structural_geometry = None
+                self._assert_joint_particle_alignment()
+                if isotope_index + 1 < len(isotope_order):
+                    self._refresh_joint_structural_transport_cache_isotope(
+                        active,
+                        isotope,
+                    )
+        finally:
+            self._active_joint_structural_geometry = None
+            self._joint_structural_transport_cache = None
+            self._active_joint_station_history = None
+
+    def _joint_tempered_station_update(
+        self,
+        station: JointStationObservation,
+    ) -> None:
+        """Assimilate one station with common weights and aligned SMC ancestors."""
+        import torch
+
+        all_stations = tuple((*self._joint_station_history, station))
+        for filt in self.filters.values():
+            filt.reset_step_stats()
+        self.last_joint_resample_indices = np.empty(0, dtype=np.int64)
+        reference_filter = self.filters[self.joint_isotope_order()[0]]
+        common_log_weights = self._assert_joint_particle_alignment()
+        likelihood = self._joint_station_log_likelihood_torch(station)
+        device = likelihood.device
+        log_weights = torch.as_tensor(
+            common_log_weights,
+            dtype=torch.float64,
+            device=device,
+        )
+        log_weights = reference_filter._normalized_log_weights_torch(log_weights)
+        self._assign_joint_log_weights(
+            log_weights.detach().cpu().numpy()
+        )
+        initial_ess = reference_filter._ess_from_logw_torch(log_weights)
+        target_ess = float(self.pf_config.target_ess_ratio) * int(
+            log_weights.numel()
+        )
+        particle_count = int(log_weights.numel())
+        station_ancestor_ids = np.arange(particle_count, dtype=np.int64)
+        if self._joint_cumulative_lineage_ids is None:
+            if self._joint_station_history:
+                raise RuntimeError(
+                    "Cumulative PF lineage is missing after prior station updates."
+                )
+            self._joint_cumulative_lineage_ids = np.arange(
+                particle_count,
+                dtype=np.int64,
+            )
+        cumulative_lineage_ids = np.asarray(
+            self._joint_cumulative_lineage_ids,
+            dtype=np.int64,
+        ).reshape(-1).copy()
+        if cumulative_lineage_ids.shape != (particle_count,):
+            raise RuntimeError(
+                "Cumulative PF lineage does not match aligned particle rows."
+            )
+        beta_total = 0.0
+        resamples = 0
+        steps: list[dict[str, float]] = []
+
+        def _likelihood() -> "torch.Tensor":
+            """Return newest-station likelihood for the current aligned states."""
+            return self._joint_station_log_likelihood_torch(station).to(
+                device=device,
+                dtype=torch.float64,
+            )
+
+        likelihood = likelihood.to(device=device, dtype=torch.float64)
+        if initial_ess <= target_ess + 1.0e-9:
+            indices = self._resample_joint_particles(
+                log_weights.detach().cpu().numpy()
+            )
+            station_ancestor_ids = station_ancestor_ids[indices]
+            cumulative_lineage_ids = cumulative_lineage_ids[indices]
+            resamples += 1
+            self._joint_rejuvenate(all_stations, target_beta=0.0)
+            likelihood = _likelihood()
+            log_weights = torch.full(
+                (int(likelihood.numel()),),
+                -math.log(max(int(likelihood.numel()), 1)),
+                dtype=torch.float64,
+                device=device,
+            )
+        max_steps = int(self.pf_config.max_temper_steps)
+        while beta_total < 1.0 - 1.0e-12:
+            if len(steps) >= max_steps:
+                raise RuntimeError(
+                    "Joint SMC reached max_temper_steps before beta=1."
+                )
+            try:
+                delta_beta, proposed_log_weights, ess = (
+                    reference_filter._select_delta_beta(
+                        logw_prev=log_weights,
+                        ll_t=likelihood,
+                        remaining=1.0 - beta_total,
+                        target_ess=target_ess,
+                    )
+                )
+            except TemperingIncrementRequiresRejuvenation:
+                current_ess = reference_filter._ess_from_logw_torch(
+                    log_weights
+                )
+                resampled = current_ess < particle_count - 1.0e-9
+                if resampled:
+                    indices = self._resample_joint_particles(
+                        log_weights.detach().cpu().numpy()
+                    )
+                    station_ancestor_ids = station_ancestor_ids[indices]
+                    cumulative_lineage_ids = cumulative_lineage_ids[indices]
+                    resamples += 1
+                    log_weights = torch.full(
+                        (particle_count,),
+                        -math.log(particle_count),
+                        dtype=torch.float64,
+                        device=device,
+                    )
+                self._joint_rejuvenate(
+                    all_stations,
+                    target_beta=float(beta_total),
+                )
+                likelihood = _likelihood()
+                recovery_step = {
+                    "beta_total": float(beta_total),
+                    "delta_beta": 0.0,
+                    "ess": float(current_ess),
+                    "resampled": float(resampled),
+                    "recovery_rejuvenation": 1.0,
+                    "station_unique_ancestors": float(
+                        np.unique(station_ancestor_ids).size
+                    ),
+                    "cumulative_unique_ancestors": float(
+                        np.unique(cumulative_lineage_ids).size
+                    ),
+                }
+                steps.append(recovery_step)
+                continue
+            log_weights = proposed_log_weights
+            self._assign_joint_log_weights(
+                log_weights.detach().cpu().numpy()
+            )
+            beta_total += float(delta_beta)
+            step = {
+                "beta_total": float(beta_total),
+                "delta_beta": float(delta_beta),
+                "ess": float(ess),
+                "resampled": 0.0,
+                "recovery_rejuvenation": 0.0,
+                "station_unique_ancestors": float(
+                    np.unique(station_ancestor_ids).size
+                ),
+                "cumulative_unique_ancestors": float(
+                    np.unique(cumulative_lineage_ids).size
+                ),
+            }
+            steps.append(step)
+            if beta_total >= 1.0 - 1.0e-12:
+                beta_total = 1.0
+                break
+            indices = self._resample_joint_particles(
+                log_weights.detach().cpu().numpy()
+            )
+            station_ancestor_ids = station_ancestor_ids[indices]
+            cumulative_lineage_ids = cumulative_lineage_ids[indices]
+            resamples += 1
+            step["resampled"] = 1.0
+            step["station_unique_ancestors"] = float(
+                np.unique(station_ancestor_ids).size
+            )
+            step["cumulative_unique_ancestors"] = float(
+                np.unique(cumulative_lineage_ids).size
+            )
+            self._joint_rejuvenate(
+                all_stations,
+                target_beta=float(beta_total),
+            )
+            likelihood = _likelihood()
+            log_weights = torch.full(
+                (int(likelihood.numel()),),
+                -math.log(max(int(likelihood.numel()), 1)),
+                dtype=torch.float64,
+                device=device,
+            )
+        self._joint_rejuvenate(all_stations, target_beta=1.0)
+        normalized = self._strict_joint_particle_weights()
+        final_ess = 1.0 / float(np.sum(normalized**2))
+        if final_ess + 1.0e-9 < target_ess:
+            raise RuntimeError(
+                "Completed joint tempering did not preserve target ESS."
+            )
+        station_unique_ancestors = int(
+            np.unique(station_ancestor_ids).size
+        )
+        cumulative_unique_ancestors = int(
+            np.unique(cumulative_lineage_ids).size
+        )
+        self._joint_cumulative_lineage_ids = cumulative_lineage_ids
+        self.last_joint_temper_steps = steps
+        self.last_joint_station_unique_ancestor_count = (
+            station_unique_ancestors
+        )
+        self.last_joint_cumulative_unique_ancestor_count = (
+            cumulative_unique_ancestors
+        )
+        # Backward-compatible field now has the conservative cumulative
+        # meaning; station-local ancestry is reported separately.
+        self.last_joint_unique_ancestor_count = cumulative_unique_ancestors
+        for filt in self.filters.values():
+            filt.last_temper_steps = [dict(step) for step in steps]
+            filt.last_temper_resample_count = int(resamples)
+            filt.last_temper_min_ess = float(
+                min((step["ess"] for step in steps), default=final_ess)
+            )
+            filt.last_station_unique_ancestor_count = (
+                station_unique_ancestors
+            )
+            filt.last_cumulative_unique_ancestor_count = (
+                cumulative_unique_ancestors
+            )
+            filt.last_unique_ancestor_count = cumulative_unique_ancestors
+            filt.last_ess_pre = float(initial_ess)
+            filt.last_ess = float(final_ess)
+            filt.last_ess_post = float(final_ess)
+            filt.last_resample_ess = bool(resamples)
+        self._promote_joint_birth_proposal_station(station)
+        self._joint_station_history.append(station)
+        self._assert_joint_particle_alignment()
+
     def configured_isotope_response_counts(
         self,
         isotope: str,
-        data: MeasurementData,
+        data: StructuralGeometryBatch,
         source_positions: NDArray[np.float64],
         strengths: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Return batched responses from the configured isotope PF kernel.
 
         Measurement rows and source positions are evaluated by the same continuous
-        transport, obstacle, aperture, shield, and calibrated response-scale model
-        used by the PF. Candidate positions remain batched and particle state is not
-        read.
+        transport, obstacle, aperture, and shield model used by the PF.
+        Candidate positions remain batched and particle state is not read.
         """
         isotope_key = str(isotope)
         if isotope_key not in self.configured_isotope_order():
@@ -1332,565 +3739,128 @@ class RotatingShieldPFEstimator:
             strengths=strength_values,
         )
 
-    def _continuous_kernel(self) -> ContinuousKernel:
-        """Build a ContinuousKernel matching the estimator observation model."""
-        return self.continuous_kernel()
-
-    def expected_counts_pair_for_states(
+    def planning_joint_particles(
         self,
-        isotope: str,
-        pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        states: Sequence[IsotopeState],
-    ) -> NDArray[np.float64]:
-        """
-        Compute Λ_{k,h}^{(n)} for an isotope over a list of states at a pose.
-
-        Uses torch acceleration when enabled; otherwise falls back to CPU kernels.
-        """
-        if pose_idx < 0 or pose_idx >= len(self.poses):
-            raise IndexError("pose_idx out of range")
-        detector_pos = np.asarray(self.poses[pose_idx], dtype=float)
-        return self.expected_counts_pair_for_states_at_detector(
-            isotope=isotope,
-            detector_pos=detector_pos,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            live_time_s=live_time_s,
-            states=states,
-        )
-
-    def expected_counts_pair_for_states_at_detector(
-        self,
-        isotope: str,
-        detector_pos: NDArray[np.float64],
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        states: Sequence[IsotopeState],
-    ) -> NDArray[np.float64]:
-        """
-        Compute Λ for a state subset at an arbitrary detector position.
-
-        This helper keeps candidate-pose and shield-selection scoring on the
-        same GPU-accelerated transport approximation as normal PF updates,
-        even when a planning particle subset is used.
-        """
-        if not states:
-            return np.zeros(0, dtype=float)
-        kernel = self._continuous_kernel()
-        detector_pos = np.asarray(detector_pos, dtype=float)
-        use_gpu = False
-        if self.pf_config.use_gpu and int(self.num_orientations) == 8:
-            try:
-                use_gpu = bool(self._gpu_enabled())
-            except RuntimeError:
-                use_gpu = False
-        if not use_gpu:
-            values = np.zeros(len(states), dtype=float)
-            source_scale = self.response_scale_for_isotope(
-                isotope,
-                fe_index=fe_index,
-                pb_index=pb_index,
+        max_particles: int | None = None,
+        method: str | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> JointPlanningParticles:
+        """Return one common-index numeric snapshot of the joint posterior."""
+        if self.kernel_cache is None:
+            self._ensure_kernel_cache()
+        weights = self._strict_joint_particle_weights()
+        particle_count = int(weights.size)
+        if max_particles is None:
+            max_particles = self.pf_config.planning_particles
+        method = str(method or self.pf_config.planning_method)
+        if (
+            max_particles is None
+            or int(max_particles) <= 0
+            or int(max_particles) >= particle_count
+        ):
+            indices = np.arange(particle_count, dtype=np.int64)
+            selected_weights = weights.copy()
+        elif method == "top_weight":
+            indices = np.argsort(weights)[::-1][: int(max_particles)].astype(
+                np.int64,
+                copy=False,
             )
-            for idx, state in enumerate(states):
-                rate = float(state.background)
-                for pos, strength in zip(
-                    state.positions[: state.num_sources],
-                    state.strengths[: state.num_sources],
-                ):
-                    rate += (
-                        source_scale
-                        * float(strength)
-                        * kernel.kernel_value_pair(
-                            isotope=isotope,
-                            detector_pos=detector_pos,
-                            source_pos=pos,
-                            fe_index=fe_index,
-                            pb_index=pb_index,
-                        )
-                    )
-                values[idx] = float(live_time_s) * rate
-            return values
-        from pf import gpu_utils
-
-        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
-            states,
-            device=device,
-            dtype=dtype,
-        )
-        lam_t = kernel.expected_counts_pair_for_packed_states_torch(
-            isotope=isotope,
-            detector_pos=detector_pos,
-            positions=positions,
-            strengths=strengths,
-            backgrounds=backgrounds,
-            mask=mask,
-            fe_index=fe_index,
-            pb_index=pb_index,
-            live_time_s=live_time_s,
-            source_scale=self.response_scale_for_isotope(
-                isotope,
-                fe_index=fe_index,
-                pb_index=pb_index,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        return lam_t.detach().cpu().numpy()
-
-    def expected_counts_all_pairs_for_states_at_detector(
-        self,
-        isotope: str,
-        detector_pos: NDArray[np.float64],
-        live_time_s: float,
-        states: Sequence[IsotopeState],
-    ) -> NDArray[np.float64]:
-        """
-        Compute expected counts for all Fe/Pb orientation pairs for state subsets.
-
-        The returned array is shaped ``(num_pairs, num_states)`` and uses the same
-        continuous kernel, spherical-octant shield geometry, detector aperture,
-        response scale, and obstacle attenuation as the per-pair helper.
-        """
-        num_pairs = int(self.num_orientations) * int(self.num_orientations)
-        if not states:
-            return np.zeros((num_pairs, 0), dtype=float)
-        kernel = self._continuous_kernel()
-        detector_pos = np.asarray(detector_pos, dtype=float)
-        use_gpu = False
-        if self.pf_config.use_gpu and int(self.num_orientations) == 8:
-            try:
-                use_gpu = bool(self._gpu_enabled())
-            except RuntimeError:
-                use_gpu = False
-        if not use_gpu:
-            rows: list[NDArray[np.float64]] = []
-            for fe_index in range(int(self.num_orientations)):
-                for pb_index in range(int(self.num_orientations)):
-                    rows.append(
-                        self.expected_counts_pair_for_states_at_detector(
-                            isotope=isotope,
-                            detector_pos=detector_pos,
-                            fe_index=fe_index,
-                            pb_index=pb_index,
-                            live_time_s=live_time_s,
-                            states=states,
-                        )
-                    )
-            return np.vstack(rows).astype(float, copy=False)
-
-        from pf import gpu_utils
-
-        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        positions, strengths, backgrounds, mask = gpu_utils.pack_states(
-            states,
-            device=device,
-            dtype=dtype,
-        )
-        num_orients = int(self.num_orientations)
-        fe_indices = np.repeat(np.arange(num_orients), num_orients)
-        pb_indices = np.tile(np.arange(num_orients), num_orients)
-        lam_t = kernel.expected_counts_all_pairs_for_packed_states_torch(
-            isotope=isotope,
-            detector_pos=detector_pos,
-            positions=positions,
-            strengths=strengths,
-            backgrounds=backgrounds,
-            mask=mask,
-            live_time_s=live_time_s,
-            source_scale=self.response_scales_for_measurements(
-                isotope,
-                fe_indices,
-                pb_indices,
-            ),
-            device=device,
-            dtype=dtype,
-        )
-        return lam_t.detach().cpu().numpy().astype(float, copy=False)
-
-    def expected_counts_all_pairs_for_states_at_detectors(
-        self,
-        isotope: str,
-        detector_positions: NDArray[np.float64],
-        live_time_s: float,
-        states: Sequence[IsotopeState],
-    ) -> NDArray[np.float64]:
-        """Compute all-pair counts for many detector positions in one batch.
-
-        The result is shaped ``(detector, pair, state)``.  Particle source slots
-        are packed once and the shared continuous kernel evaluates every
-        detector/source/pair response together.  Callers should pass bounded
-        detector chunks when many planning poses are under consideration.
-        """
-        detectors = np.asarray(detector_positions, dtype=float)
-        if detectors.size == 0:
-            detectors = np.zeros((0, 3), dtype=float)
-        if detectors.ndim != 2 or detectors.shape[1] != 3:
-            raise ValueError("detector_positions must be shaped (D, 3).")
-        num_pairs = int(self.num_orientations) * int(self.num_orientations)
-        state_count = len(states)
-        if state_count == 0:
-            return np.zeros((detectors.shape[0], num_pairs, 0), dtype=float)
-
-        max_sources = max(
-            (max(0, int(state.num_sources)) for state in states), default=0
-        )
-        backgrounds = np.asarray(
-            [max(float(state.background), 0.0) for state in states],
-            dtype=float,
-        )
-        source_rates = np.zeros(
-            (detectors.shape[0], num_pairs, state_count),
-            dtype=float,
-        )
-        if max_sources > 0 and detectors.shape[0] > 0:
-            positions = np.zeros((state_count, max_sources, 3), dtype=float)
-            strengths = np.zeros((state_count, max_sources), dtype=float)
-            for state_index, state in enumerate(states):
-                source_count = min(max(0, int(state.num_sources)), max_sources)
-                if source_count <= 0:
-                    continue
-                positions[state_index, :source_count, :] = np.asarray(
-                    state.positions[:source_count],
-                    dtype=float,
+            selected_weights = weights[indices]
+            selected_weights /= float(np.sum(selected_weights))
+        elif method == "resample":
+            if rng is not None and not isinstance(rng, np.random.Generator):
+                raise TypeError("rng must be a numpy.random.Generator.")
+            if rng is None:
+                rng = self._named_planning_rng(
+                    "joint_particle_subset",
+                    int(max_particles),
                 )
-                strengths[state_index, :source_count] = np.maximum(
-                    np.asarray(state.strengths[:source_count], dtype=float),
-                    0.0,
-                )
-            kernel_values = (
-                self._continuous_kernel().kernel_values_all_pairs_for_detectors(
-                    isotope=isotope,
-                    detector_positions=detectors,
-                    sources=positions.reshape(-1, 3),
-                )
-            )
-            expected_shape = (
-                detectors.shape[0],
-                num_pairs,
-                state_count * max_sources,
-            )
-            if kernel_values.shape != expected_shape:
-                raise RuntimeError(
-                    "Batched all-pair kernel returned an unexpected shape: "
-                    f"{kernel_values.shape} != {expected_shape}."
-                )
-            source_rates = np.einsum(
-                "daps,ps->dap",
-                kernel_values.reshape(
-                    detectors.shape[0],
-                    num_pairs,
-                    state_count,
-                    max_sources,
+            indices = np.asarray(
+                rng.choice(
+                    particle_count,
+                    size=int(max_particles),
+                    replace=True,
+                    p=weights,
                 ),
-                strengths,
-                optimize=True,
+                dtype=np.int64,
             )
-
-        num_orients = int(self.num_orientations)
-        fe_indices = np.repeat(np.arange(num_orients), num_orients)
-        pb_indices = np.tile(np.arange(num_orients), num_orients)
-        source_scales = self.response_scales_for_measurements(
-            isotope,
-            fe_indices,
-            pb_indices,
-        )
-        rates = backgrounds[None, None, :] + source_scales[None, :, None] * np.maximum(
-            source_rates, 0.0
-        )
-        return np.maximum(float(live_time_s) * rates, 0.0)
-
-    def shield_selection_batch_grids(
-        self,
-        pose_idx: int,
-        *,
-        live_time_s: float,
-        max_particles: int | None = None,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None = None,
-        alpha_by_isotope: Dict[str, float] | None = None,
-        variance_floor: float = 1.0,
-        include_count_quantiles: bool = True,
-    ) -> tuple[NDArray[np.float64], Dict[str, NDArray[np.float64]]]:
-        """
-        Return all-pair shield-signature and observability count grids.
-
-        This batches the same per-pair expected-count calculation used by
-        ``orientation_signature_separation_score`` and
-        ``expected_observation_counts_by_isotope_at_pair``. It is a planning
-        acceleration only; it does not change the observation model used for PF
-        updates.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        if pose_idx < 0 or pose_idx >= len(self.poses):
-            raise IndexError("pose_idx out of range")
-        detector_pos = np.asarray(self.poses[int(pose_idx)], dtype=float)
-        num_orients = int(self.num_orientations)
-        num_pairs = num_orients * num_orients
-        eps = 1e-12
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        alpha_sum = sum(float(v) for v in alphas.values()) or 1.0
-        floor = max(float(variance_floor), eps)
-        signature_flat = np.zeros(num_pairs, dtype=float)
-        count_quantiles: Dict[str, NDArray[np.float64]] = {}
-        if particles_by_isotope is None:
-            particles_by_isotope = self.planning_particles(
-                max_particles=max_particles,
-                method=self.pf_config.planning_method,
+            selected_weights = np.full(
+                int(max_particles),
+                1.0 / float(max_particles),
+                dtype=np.float64,
             )
-
-        for iso, filt in self.filters.items():
-            if iso in particles_by_isotope:
-                states, weights = particles_by_isotope[iso]
-            else:
-                if not filt.continuous_particles:
-                    continue
-                states = [p.state for p in filt.continuous_particles]
-                weights = filt.continuous_weights
-            if not states:
-                continue
-            weights_arr = np.asarray(weights, dtype=float)
-            weight_sum = float(np.sum(weights_arr))
-            if weight_sum <= eps:
-                weights_arr = np.ones(len(states), dtype=float) / max(len(states), 1)
-            else:
-                weights_arr = weights_arr / weight_sum
-            lambdas = self.expected_counts_all_pairs_for_states_at_detector(
-                isotope=iso,
-                detector_pos=detector_pos,
-                live_time_s=float(live_time_s),
-                states=states,
-            )
-            if lambdas.size == 0:
-                continue
-            means = lambdas @ weights_arr
-            centered = lambdas - means[:, None]
-            variances = (centered * centered) @ weights_arr
-            signature_flat += (
-                float(alphas.get(iso, 1.0))
-                / alpha_sum
-                * np.maximum(variances, 0.0)
-                / np.maximum(means, floor)
-            )
-            if include_count_quantiles:
-                quantile = float(self.pf_config.pose_min_observation_quantile)
-                count_quantiles[iso] = np.asarray(
-                    [
-                        _weighted_quantile(lambdas[pair_idx], weights_arr, quantile)
-                        for pair_idx in range(num_pairs)
-                    ],
-                    dtype=float,
-                ).reshape(num_orients, num_orients)
-        return (
-            np.maximum(signature_flat, 0.0).reshape(num_orients, num_orients),
-            count_quantiles,
-        )
-
-    def expected_observation_counts_by_isotope_at_pose(
-        self,
-        pose_xyz: NDArray[np.float64],
-        *,
-        live_time_s: float,
-        fe_pb_pairs: Sequence[tuple[int, int]] | None = None,
-        aggregate: str = "max",
-        max_particles: int | None = None,
-    ) -> Dict[str, float]:
-        """
-        Return posterior-mean expected counts for each isotope at a candidate pose.
-
-        The value for one isotope is computed from the same inverse-square,
-        spherical shield, and obstacle attenuation model used by PF updates.
-        Across shield pairs, ``aggregate="max"`` returns the best achievable
-        expected count at that pose, while ``aggregate="mean"`` returns the
-        orientation-average expected count. Each pair uses a weighted posterior
-        quantile rather than the posterior mean, so a few high-strength outlier
-        particles cannot make the pose look observable for every isotope.
-        """
-        detector = np.asarray(pose_xyz, dtype=float)
-        if detector.shape != (3,):
-            raise ValueError("pose_xyz must be shape (3,).")
-        live_time = float(live_time_s)
-        if live_time <= 0.0:
-            return {iso: 0.0 for iso in self.isotopes}
-        aggregate = str(aggregate).strip().lower()
-        if aggregate not in {"max", "mean"}:
-            raise ValueError("aggregate must be max or mean.")
-        num_orients = max(1, int(self.num_orientations))
-        if fe_pb_pairs is None:
-            pairs = [
-                (fe_index, pb_index)
-                for fe_index in range(num_orients)
-                for pb_index in range(num_orients)
-            ]
         else:
-            pairs = [(int(fe), int(pb)) for fe, pb in fe_pb_pairs]
-        if not pairs:
-            return {iso: 0.0 for iso in self.isotopes}
-        particles = self.planning_particles(max_particles=max_particles)
-        counts_by_isotope: Dict[str, float] = {}
-        eps = 1e-12
-        for iso in self.isotopes:
-            filt = self.filters.get(iso)
-            use_gpu_quantile = False
-            if (
-                max_particles is None
-                and filt is not None
-                and filt.continuous_particles
-                and self.pf_config.use_gpu
-            ):
-                try:
-                    use_gpu_quantile = bool(self._gpu_enabled())
-                except RuntimeError:
-                    use_gpu_quantile = False
-            if use_gpu_quantile:
-                weights_arr = np.asarray(filt.continuous_weights, dtype=float)
-                weight_sum = float(np.sum(weights_arr))
-                if weight_sum <= eps:
-                    weights_arr = np.ones(len(weights_arr), dtype=float) / max(
-                        len(weights_arr),
-                        1,
-                    )
-                else:
-                    weights_arr = weights_arr / weight_sum
-                pair_means = []
-                for fe_index, pb_index in pairs:
-                    lambdas = filt._continuous_expected_counts_pair_at_pose(
-                        detector_pos=detector,
-                        fe_index=fe_index,
-                        pb_index=pb_index,
-                        live_time_s=live_time,
-                    )
-                    pair_means.append(
-                        _weighted_quantile(
-                            lambdas,
-                            weights_arr,
-                            self.pf_config.pose_min_observation_quantile,
-                        )
-                    )
-                if aggregate == "mean":
-                    counts_by_isotope[iso] = float(np.mean(pair_means))
-                else:
-                    counts_by_isotope[iso] = float(np.max(pair_means))
-                continue
-            if iso not in particles:
-                counts_by_isotope[iso] = 0.0
-                continue
-            states, weights = particles[iso]
-            if not states:
-                counts_by_isotope[iso] = 0.0
-                continue
-            weights_arr = np.asarray(weights, dtype=float)
-            weight_sum = float(np.sum(weights_arr))
-            if weight_sum <= eps:
-                weights_arr = np.ones(len(states), dtype=float) / max(len(states), 1)
-            else:
-                weights_arr = weights_arr / weight_sum
-            pair_means: list[float] = []
-            for fe_index, pb_index in pairs:
-                lambdas = self.expected_counts_pair_for_states_at_detector(
-                    isotope=iso,
-                    detector_pos=detector,
-                    fe_index=fe_index,
-                    pb_index=pb_index,
-                    live_time_s=live_time,
-                    states=states,
+            raise ValueError(
+                f"Unknown joint planning particle selection method: {method}"
+            )
+        max_sources = int(self.pf_config.max_sources or 0)
+        positions_by_isotope: Dict[str, NDArray[np.float64]] = {}
+        chart_ids_by_isotope: Dict[str, NDArray[np.int64]] = {}
+        surface_uv_by_isotope: Dict[str, NDArray[np.float64]] = {}
+        strengths_by_isotope: Dict[str, NDArray[np.float64]] = {}
+        masks_by_isotope: Dict[str, NDArray[np.bool_]] = {}
+        for isotope in self.joint_isotope_order():
+            filt = self.filters[isotope]
+            (
+                all_positions,
+                all_strengths,
+                all_mask,
+                all_chart_ids,
+                all_surface_uv,
+            ) = (
+                filt._packed_continuous_surface_state_arrays()
+            )
+            selected_positions = all_positions[indices]
+            selected_strengths = all_strengths[indices]
+            selected_mask = all_mask[indices]
+            selected_chart_ids = all_chart_ids[indices]
+            selected_surface_uv = all_surface_uv[indices]
+            current_slots = int(selected_positions.shape[1])
+            if current_slots > max_sources:
+                raise RuntimeError(
+                    "Joint planning state exceeds configured max_sources."
                 )
-                pair_means.append(
-                    _weighted_quantile(
-                        lambdas,
-                        weights_arr,
-                        self.pf_config.pose_min_observation_quantile,
-                    )
-                )
-            if aggregate == "mean":
-                counts_by_isotope[iso] = float(np.mean(pair_means))
-            else:
-                counts_by_isotope[iso] = float(np.max(pair_means))
-        return counts_by_isotope
-
-    def expected_observation_counts_by_isotope_at_pair(
-        self,
-        pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        *,
-        live_time_s: float,
-        max_particles: int | None = None,
-    ) -> Dict[str, float]:
-        """Return posterior-quantile expected counts for one Fe/Pb pair."""
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        pose = np.asarray(self.poses[int(pose_idx)], dtype=float)
-        return self.expected_observation_counts_by_isotope_at_pose(
-            pose,
-            live_time_s=float(live_time_s),
-            fe_pb_pairs=[(int(fe_index), int(pb_index))],
-            aggregate="max",
-            max_particles=max_particles,
+            positions = np.zeros(
+                (indices.size, max_sources, 3),
+                dtype=np.float64,
+            )
+            chart_ids = np.zeros(
+                (indices.size, max_sources),
+                dtype=np.int64,
+            )
+            surface_uv = np.zeros(
+                (indices.size, max_sources, 2),
+                dtype=np.float64,
+            )
+            strengths = np.zeros(
+                (indices.size, max_sources),
+                dtype=np.float64,
+            )
+            mask = np.zeros(
+                (indices.size, max_sources),
+                dtype=bool,
+            )
+            if current_slots:
+                positions[:, :current_slots, :] = selected_positions
+                chart_ids[:, :current_slots] = selected_chart_ids
+                surface_uv[:, :current_slots, :] = selected_surface_uv
+                strengths[:, :current_slots] = selected_strengths
+                mask[:, :current_slots] = selected_mask
+            positions_by_isotope[isotope] = positions
+            chart_ids_by_isotope[isotope] = chart_ids
+            surface_uv_by_isotope[isotope] = surface_uv
+            strengths_by_isotope[isotope] = strengths
+            masks_by_isotope[isotope] = mask
+        return JointPlanningParticles(
+            isotope_order=self.joint_isotope_order(),
+            weights_n=np.ascontiguousarray(selected_weights),
+            positions_nk3_by_isotope=positions_by_isotope,
+            surface_chart_ids_nk_by_isotope=chart_ids_by_isotope,
+            surface_uv_nk2_by_isotope=surface_uv_by_isotope,
+            strengths_nk_by_isotope=strengths_by_isotope,
+            source_mask_nk_by_isotope=masks_by_isotope,
+            original_particle_indices=np.ascontiguousarray(indices),
         )
-
-    def orientation_signature_separation_score(
-        self,
-        pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        *,
-        live_time_s: float,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None = None,
-        alpha_by_isotope: Dict[str, float] | None = None,
-        variance_floor: float = 1.0,
-    ) -> float:
-        """
-        Return a shield-signature separation score for one orientation pair.
-
-        The score is a weighted posterior variance of predicted counts,
-        normalized by the mean count scale. It favors shield postures whose
-        response differs across currently plausible source hypotheses.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        eps = 1e-12
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        alpha_sum = sum(float(v) for v in alphas.values()) or 1.0
-        score = 0.0
-        floor = max(float(variance_floor), eps)
-        for iso, filt in self.filters.items():
-            if particles_by_isotope is not None and iso in particles_by_isotope:
-                states, weights = particles_by_isotope[iso]
-            else:
-                states = [p.state for p in filt.continuous_particles]
-                weights = filt.continuous_weights
-            if not states:
-                continue
-            weights_arr = np.asarray(weights, dtype=float)
-            weights_arr = weights_arr / max(float(np.sum(weights_arr)), eps)
-            lambdas = self.expected_counts_pair_for_states(
-                isotope=iso,
-                pose_idx=int(pose_idx),
-                fe_index=int(fe_index),
-                pb_index=int(pb_index),
-                live_time_s=float(live_time_s),
-                states=states,
-            )
-            if lambdas.size == 0:
-                continue
-            mean = float(np.sum(weights_arr * lambdas))
-            var = float(np.sum(weights_arr * (lambdas - mean) ** 2))
-            score += (
-                float(alphas.get(iso, 1.0))
-                / alpha_sum
-                * max(var, 0.0)
-                / max(mean, floor)
-            )
-        return float(max(score, 0.0))
 
     def planning_particles(
         self,
@@ -1906,448 +3876,137 @@ class RotatingShieldPFEstimator:
             method: "top_weight" or "resample"; None uses config default.
             rng: optional RNG for resampling.
         """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        if max_particles is None:
-            max_particles = self.pf_config.planning_particles
-        method = method or self.pf_config.planning_method
-        rng = rng or np.random.default_rng()
-        subsets: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]] = {}
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
-            weights = filt.continuous_weights
-            total = float(np.sum(weights))
-            if total <= 0.0:
-                continue
-            weights = weights / total
-            n_particles = len(weights)
-            if (
-                max_particles is None
-                or max_particles <= 0
-                or max_particles >= n_particles
-            ):
-                states = [p.state.copy() for p in filt.continuous_particles]
-                subsets[iso] = (states, weights)
-                continue
-            if method == "top_weight":
-                idx = np.argsort(weights)[::-1][:max_particles]
-                sel_weights = weights[idx]
-                sel_weights = sel_weights / max(np.sum(sel_weights), 1e-12)
-            elif method == "resample":
-                idx = rng.choice(n_particles, size=max_particles, p=weights)
-                sel_weights = np.ones(max_particles, dtype=float) / max_particles
-            else:
-                raise ValueError(
-                    f"Unknown planning particle selection method: {method}"
-                )
-            states = [filt.continuous_particles[i].state.copy() for i in idx]
-            subsets[iso] = (states, sel_weights)
-        return subsets
+        joint = self.planning_joint_particles(
+            max_particles=max_particles,
+            method=method,
+            rng=rng,
+        )
+        return {
+            isotope: (
+                [
+                    self.filters[isotope].continuous_particles[
+                        int(index)
+                    ].state.copy()
+                    for index in joint.original_particle_indices
+                ],
+                joint.weights_n.copy(),
+            )
+            for isotope in joint.isotope_order
+        }
 
     def add_measurement_pose(
-        self, pose: NDArray[np.float64], reset_filters: bool = True
+        self, pose: NDArray[np.float64], reset_filters: bool = False
     ) -> None:
-        """Register a new measurement pose and invalidate the kernel cache."""
+        """Register a pose without erasing posterior state unless requested."""
+        if reset_filters and (
+            self._joint_station_history or self.measurements
+        ):
+            raise RuntimeError(
+                "Pure PF cannot reset particles after observations have "
+                "entered the posterior."
+            )
         self.poses.append(np.asarray(pose, dtype=float))
         # Rebuild lazily on the next access.
         self.kernel_cache = None
         if reset_filters:
             self.filters = {}
+            self._joint_particles_initialized = False
+            self._joint_row_identity_root_sha256 = None
+            self._joint_row_generation = None
+            self._joint_cumulative_lineage_ids = None
+            self._joint_birth_proposal_prefix_scores = {}
+            self._joint_birth_proposal_prefix_station_count = 0
 
     def _registered_detector_position_xyz(
         self,
         pose_idx: int,
     ) -> tuple[float, float, float]:
         """Return the canonical registered detector position for a pose index."""
-        position = np.asarray(self.poses[int(pose_idx)], dtype=float).reshape(-1)
+        resolved_pose_idx = _strict_nonnegative_integer(
+            pose_idx,
+            name="pose_idx",
+        )
+        if resolved_pose_idx >= len(self.poses):
+            raise IndexError(
+                "pose_idx lies outside the registered measurement poses."
+            )
+        position = np.asarray(
+            self.poses[resolved_pose_idx],
+            dtype=float,
+        ).reshape(-1)
         if position.size != 3 or not np.all(np.isfinite(position)):
             raise ValueError(
                 "Registered measurement poses must contain three finite coordinates."
             )
         return tuple(float(value) for value in position)
 
-    def update_pair(
-        self,
-        z_k: Dict[str, float],
-        pose_idx: int,
-        fe_index: int,
-        pb_index: int,
-        live_time_s: float,
-        z_variance_k: Dict[str, float] | None = None,
-        z_covariance_k: Dict[str, Dict[str, float]] | None = None,
-    ) -> None:
-        """
-        Update PFs using Fe/Pb orientation indices (RFe, RPb) and isotope-wise counts z_k.
-
-        Configured isotopes omitted from ``z_k`` are observed as zero, matching
-        joint-sequence and structural-history semantics. This feeds the
-        continuous 3D PF path with expected counts from the shield pair.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        detector_position_xyz_m = self._registered_detector_position_xyz(pose_idx)
-        effective_variance_k, sanitized_covariance_k = (
-            self._project_observation_covariance_to_variance(
-                z_k,
-                z_variance_k,
-                z_covariance_k,
-            )
-        )
-        runtime_likelihood_routes = {
-            str(isotope): COUNT_LIKELIHOOD_ROUTE for isotope in self.filters
-        }
-        for iso, filt in self.filters.items():
-            val = float(z_k.get(iso, 0.0))
-            # Use continuous PF update that relies on spectrum-unfolded counts.
-            filt.update_continuous_pair(
-                z_obs=val,
-                pose_idx=pose_idx,
-                fe_index=fe_index,
-                pb_index=pb_index,
-                live_time_s=live_time_s,
-                observation_count_variance=(
-                    0.0
-                    if effective_variance_k is None
-                    else float(effective_variance_k.get(iso, 0.0))
-                ),
-                step_idx=len(self.measurements),
-            )
-        self.measurements.append(
-            MeasurementRecord(
-                z_k={iso: float(v) for iso, v in z_k.items()},
-                pose_idx=int(pose_idx),
-                live_time_s=float(live_time_s),
-                fe_index=int(fe_index),
-                pb_index=int(pb_index),
-                detector_position_xyz_m=detector_position_xyz_m,
-                station_sequence_id=int(len(self.measurements)),
-                station_view_index=0,
-                z_variance_k={
-                    str(iso): (
-                        0.0
-                        if effective_variance_k is None
-                        else float(effective_variance_k.get(iso, 0.0))
-                    )
-                    for iso in self.filters
-                },
-                z_covariance_k=sanitized_covariance_k,
-                runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
-            )
-        )
-        self._apply_structural_moves()
-        self._record_history_estimate(len(self.measurements))
-
-    def update_pair_sequence(
+    def update_spectrum_station(
         self,
         records: Sequence[Sequence[object]],
         *,
         pose_idx: int,
-        runtime_likelihood_route_by_isotope: Mapping[str, str],
-        z_view_covariance_by_isotope: Mapping[str, NDArray[np.float64]] | None = None,
+        generative_contract_hash_sha256: str,
     ) -> None:
-        """
-        Jointly update PFs from a same-pose shield-orientation sequence.
-
-        Each record is ``(z_k, fe_index, pb_index, live_time_s, z_variance_k)``.
-        A sixth ``z_covariance_k`` field may be supplied for same-spectrum
-        isotope covariance.
-        ``z_view_covariance_by_isotope`` may also supply KxK same-station
-        shield-view covariance for each isotope. The joint update uses one
-        station-level likelihood over all postures and only applies birth/death
-        after the full shield program is observed.
-        """
+        """Assimilate one shield program through the sole spectrum likelihood."""
         if not records:
-            return
-        runtime_likelihood_routes = canonical_runtime_likelihood_route_mapping(
-            runtime_likelihood_route_by_isotope,
-            self.configured_isotope_order(),
-        )
-        expected_runtime_likelihood_routes = self.select_runtime_likelihood_routes(
-            sequence_length=len(records),
-            z_view_covariance_by_isotope=z_view_covariance_by_isotope,
-        )
-        if runtime_likelihood_routes != expected_runtime_likelihood_routes:
             raise ValueError(
-                "Explicit runtime likelihood routes do not match the configured "
-                "count/covariance likelihood inputs."
+                "A spectrum station must contain at least one shield view."
             )
         sequence_start = time.perf_counter()
-        stage_wall: Dict[str, float] = {}
-        stage_start = sequence_start
         if self.kernel_cache is None:
             self._ensure_kernel_cache()
-        detector_position_xyz_m = self._registered_detector_position_xyz(pose_idx)
-        normalized_records = []
-        for record in records:
-            (
-                z_k,
-                fe_index,
-                pb_index,
-                live_time_s,
-                z_variance_k,
-                z_covariance_k,
-            ) = self._normalize_pair_sequence_record(record)
-            effective_variance_k, sanitized_covariance_k = (
-                self._project_observation_covariance_to_variance(
-                    z_k,
-                    z_variance_k,
-                    z_covariance_k,
+        self._assert_joint_particle_alignment()
+        station_sequence_id = len(self._joint_station_history)
+        station = self._joint_station_from_spectrum_records(
+            records,
+            pose_idx=pose_idx,
+            station_sequence_id=station_sequence_id,
+            generative_contract_hash_sha256=(
+                generative_contract_hash_sha256
+            ),
+        )
+        update_start = time.perf_counter()
+        self._joint_tempered_station_update(station)
+        update_wall = time.perf_counter() - update_start
+        self.last_pair_sequence_update_workers = 1
+        self.last_pair_sequence_update_wall_s = float(update_wall)
+        self.last_structural_update_workers = 1
+        self.last_structural_update_wall_s = float(
+            sum(
+                float(
+                    self.filters[isotope].last_structural_timing_s.get(
+                        "total",
+                        0.0,
+                    )
                 )
+                for isotope in self.joint_isotope_order()
             )
-            normalized_records.append(
-                (
-                    z_k,
-                    fe_index,
-                    pb_index,
-                    live_time_s,
-                    effective_variance_k,
-                    sanitized_covariance_k,
-                )
-            )
-        stage_wall["normalize_records"] = time.perf_counter() - stage_start
-        stage_start = time.perf_counter()
-        step_idx = len(self.measurements)
-        tasks: list[
-            tuple[
-                str,
-                IsotopeParticleFilter,
-                NDArray[np.float64],
-                NDArray[np.float64],
-                NDArray[np.float64],
-                NDArray[np.float64],
-                NDArray[np.float64],
-                NDArray[np.float64] | None,
-                str,
-                int,
-                int,
-            ]
-        ] = []
-        for iso, filt in self.filters.items():
-            z_arr = np.asarray(
-                [
-                    float(z_k.get(iso, 0.0))
-                    for z_k, _, _, _, _, _ in normalized_records
-                ],
-                dtype=float,
-            )
-            var_arr = np.asarray(
-                [
-                    0.0 if z_variance_k is None else float(z_variance_k.get(iso, 0.0))
-                    for _, _, _, _, z_variance_k, _ in normalized_records
-                ],
-                dtype=float,
-            )
-            fe_arr = np.asarray(
-                [int(fe_index) for _, fe_index, _, _, _, _ in normalized_records],
-                dtype=int,
-            )
-            pb_arr = np.asarray(
-                [int(pb_index) for _, _, pb_index, _, _, _ in normalized_records],
-                dtype=int,
-            )
-            live_arr = np.asarray(
-                [
-                    float(live_time_s)
-                    for _, _, _, live_time_s, _, _ in normalized_records
-                ],
-                dtype=float,
-            )
-            view_covariance = self._view_covariance_for_isotope(
-                iso,
-                sequence_length=z_arr.size,
-                z_view_covariance_by_isotope=z_view_covariance_by_isotope,
-            )
-            tasks.append(
-                (
-                    iso,
-                    filt,
-                    z_arr,
-                    fe_arr,
-                    pb_arr,
-                    live_arr,
-                    var_arr,
-                    view_covariance,
-                    runtime_likelihood_routes[str(iso)],
-                    int(pose_idx),
-                    int(step_idx),
-                )
-            )
-        stage_wall["build_isotope_tasks"] = time.perf_counter() - stage_start
-        stage_start = time.perf_counter()
-        worker_count = self._structural_update_worker_count(len(tasks))
-        self.last_pair_sequence_update_workers = int(worker_count)
-        if worker_count <= 1:
-            for task in tasks:
-                self._run_isotope_pair_sequence_update(task)
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                list(executor.map(self._run_isotope_pair_sequence_update, tasks))
-        self.last_pair_sequence_update_wall_s = time.perf_counter() - stage_start
-        stage_wall["isotope_sequence_update"] = self.last_pair_sequence_update_wall_s
-        stage_start = time.perf_counter()
-        sequence_view_covariance = {
-            str(task[0]): tuple(
-                tuple(float(value) for value in row)
-                for row in np.asarray(task[7], dtype=float)
-            )
-            for task in tasks
-            if task[7] is not None
-        }
-        for view_index, normalized_record in enumerate(normalized_records):
-            (
-                z_k,
-                fe_index,
-                pb_index,
-                live_time_s,
-                z_variance_k,
-                z_covariance_k,
-            ) = normalized_record
+        )
+        detector_position = station.detector_position_xyz_m
+        for view_index, record in enumerate(records):
             self.measurements.append(
                 MeasurementRecord(
-                    z_k={iso: float(v) for iso, v in z_k.items()},
-                    pose_idx=int(pose_idx),
-                    live_time_s=float(live_time_s),
-                    fe_index=int(fe_index),
-                    pb_index=int(pb_index),
-                    detector_position_xyz_m=detector_position_xyz_m,
-                    station_sequence_id=int(step_idx),
+                    spectrum_counts_b=np.ascontiguousarray(
+                        station.spectrum_vb[view_index]
+                    ),
+                    pose_idx=int(station.pose_idx),
+                    live_time_s=float(station.live_times_s[view_index]),
+                    fe_index=int(station.fe_indices[view_index]),
+                    pb_index=int(station.pb_indices[view_index]),
+                    detector_position_xyz_m=detector_position,
+                    station_sequence_id=int(station_sequence_id),
                     station_view_index=int(view_index),
-                    z_variance_k={
-                        str(iso): (
-                            0.0
-                            if z_variance_k is None
-                            else float(z_variance_k.get(iso, 0.0))
-                        )
-                        for iso in self.filters
-                    },
-                    z_covariance_k=z_covariance_k,
-                    runtime_likelihood_route_by_isotope=runtime_likelihood_routes,
-                    station_view_covariance_by_isotope=(
-                        None
-                        if not sequence_view_covariance
-                        else dict(sequence_view_covariance)
+                    generative_contract_hash_sha256=str(
+                        generative_contract_hash_sha256
                     ),
                 )
             )
-        stage_wall["append_measurements"] = time.perf_counter() - stage_start
-        stage_start = time.perf_counter()
-        self._apply_structural_moves()
-        stage_wall["structural_moves"] = time.perf_counter() - stage_start
-        stage_start = time.perf_counter()
         self._record_history_estimate(len(self.measurements))
-        stage_wall["history_estimate"] = time.perf_counter() - stage_start
-        stage_wall["total"] = time.perf_counter() - sequence_start
         self.last_pair_sequence_stage_wall_s = {
-            key: float(value) for key, value in stage_wall.items()
+            "normalize_and_validate": float(update_start - sequence_start),
+            "joint_smc_and_conditional_rj": float(update_wall),
+            "total": float(time.perf_counter() - sequence_start),
         }
-
-    @staticmethod
-    def _run_isotope_pair_sequence_update(
-        task: tuple[
-            str,
-            IsotopeParticleFilter,
-            NDArray[np.float64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-            NDArray[np.float64] | None,
-            str,
-            int,
-            int,
-        ],
-    ) -> None:
-        """Run one isotope's same-station shield-program likelihood update."""
-        (
-            _isotope,
-            filt,
-            z_arr,
-            fe_arr,
-            pb_arr,
-            live_arr,
-            var_arr,
-            view_covariance,
-            runtime_likelihood_route,
-            pose_idx,
-            step_idx,
-        ) = task
-        filt.update_continuous_pair_sequence(
-            z_obs=z_arr,
-            pose_idx=pose_idx,
-            fe_indices=fe_arr,
-            pb_indices=pb_arr,
-            live_times_s=live_arr,
-            runtime_likelihood_route=runtime_likelihood_route,
-            observation_count_variances=var_arr,
-            observation_count_covariance=view_covariance,
-            step_idx=step_idx,
-        )
-
-    @staticmethod
-    def _station_view_covariance_for_records(
-        isotope: str,
-        records: Sequence[MeasurementRecord],
-    ) -> NDArray[np.float64] | None:
-        """Rebuild supplied station-view covariance for selected history rows."""
-        grouped_rows: dict[
-            int,
-            list[
-                tuple[
-                    int,
-                    int,
-                    NDArray[np.float64],
-                ]
-            ],
-        ] = {}
-        for row_index, record in enumerate(records):
-            if record.station_view_covariance_by_isotope is None:
-                continue
-            covariance_payload = record.station_view_covariance_by_isotope.get(
-                str(isotope)
-            )
-            if covariance_payload is None:
-                continue
-            covariance = np.asarray(covariance_payload, dtype=float)
-            if covariance.ndim != 2 or covariance.shape[0] != covariance.shape[1]:
-                raise ValueError(
-                    "Stored station-view covariance must be a square matrix."
-                )
-            view_index = int(record.station_view_index)
-            if view_index < 0 or view_index >= covariance.shape[0]:
-                raise ValueError(
-                    "Stored station-view index lies outside its covariance matrix."
-                )
-            grouped_rows.setdefault(int(record.station_sequence_id), []).append(
-                (int(row_index), view_index, covariance)
-            )
-        if not grouped_rows:
-            return None
-        combined = np.zeros((len(records), len(records)), dtype=float)
-        for rows in grouped_rows.values():
-            reference = rows[0][2]
-            if any(
-                covariance.shape != reference.shape
-                or not np.array_equal(covariance, reference)
-                for _, _, covariance in rows[1:]
-            ):
-                raise ValueError(
-                    "Stored station-view covariance changed within one sequence."
-                )
-            history_indices = np.fromiter(
-                (row_index for row_index, _, _ in rows),
-                dtype=np.int64,
-                count=len(rows),
-            )
-            view_indices = np.fromiter(
-                (view_index for _, view_index, _ in rows),
-                dtype=np.int64,
-                count=len(rows),
-            )
-            combined[np.ix_(history_indices, history_indices)] = reference[
-                np.ix_(view_indices, view_indices)
-            ]
-        return combined
 
     @staticmethod
     def _station_sequence_ids_for_records(
@@ -2360,61 +4019,47 @@ class RotatingShieldPFEstimator:
             count=len(records),
         )
 
-    def _measurement_data_for_iso(
+    def _structural_geometry_for_records(
         self,
         isotope: str,
         window: int | None,
         records: Sequence[MeasurementRecord] | None = None,
-    ) -> MeasurementData | None:
-        """Build measurement arrays for a single isotope with an optional window."""
-        if records is None and not self.measurements:
-            return None
+    ) -> StructuralGeometryBatch | None:
+        """Return geometry-only rows without an independent isotope target."""
+        isotope_key = str(isotope)
+        if isotope_key not in self.joint_isotope_order():
+            raise KeyError(f"Unknown joint PF isotope: {isotope_key!r}.")
         if records is not None:
             selected_records = list(records)
-        elif window is None or window <= 0:
-            selected_records = self.measurements
+        elif window is None or int(window) <= 0:
+            selected_records = list(self.measurements)
         else:
             selected_records = self.measurements[-int(window) :]
         if not selected_records:
             return None
-        runtime_likelihood_routes = self._runtime_likelihood_routes_for_records(
-            isotope,
-            selected_records,
-        )
-        view_covariance = self._station_view_covariance_for_records(
-            isotope,
-            selected_records,
-        )
-        station_sequence_ids = self._station_sequence_ids_for_records(selected_records)
-        z_list = []
-        poses = []
-        fe_indices = []
-        pb_indices = []
-        live_times = []
-        variance_list = []
-        for rec in selected_records:
-            z_list.append(float(rec.z_k.get(isotope, 0.0)))
-            if rec.z_variance_k is None:
-                variance_list.append(0.0)
-            else:
-                variance_value = float(rec.z_variance_k.get(isotope, 0.0))
-                variance_list.append(
-                    max(variance_value, 0.0) if np.isfinite(variance_value) else 0.0
-                )
-            poses.append(rec.detector_position_xyz_m)
-            live_times.append(float(rec.live_time_s))
-            fe_indices.append(int(rec.fe_index))
-            pb_indices.append(int(rec.pb_index))
-        return MeasurementData(
-            z_k=np.asarray(z_list, dtype=float),
-            observation_variances=np.asarray(variance_list, dtype=float),
-            detector_positions=np.asarray(poses, dtype=float),
-            fe_indices=np.asarray(fe_indices, dtype=int),
-            pb_indices=np.asarray(pb_indices, dtype=int),
-            live_times=np.asarray(live_times, dtype=float),
-            station_sequence_ids=station_sequence_ids,
-            runtime_likelihood_routes=runtime_likelihood_routes,
-            observation_count_covariance=view_covariance,
+        return StructuralGeometryBatch(
+            detector_positions=np.asarray(
+                [
+                    record.detector_position_xyz_m
+                    for record in selected_records
+                ],
+                dtype=np.float64,
+            ),
+            fe_indices=np.asarray(
+                [record.fe_index for record in selected_records],
+                dtype=np.int64,
+            ),
+            pb_indices=np.asarray(
+                [record.pb_index for record in selected_records],
+                dtype=np.int64,
+            ),
+            live_times=np.asarray(
+                [record.live_time_s for record in selected_records],
+                dtype=np.float64,
+            ),
+            station_sequence_ids=self._station_sequence_ids_for_records(
+                selected_records
+            ),
         )
 
     def _source_prior_environment(self) -> EnvironmentConfig:
@@ -2488,7 +4133,7 @@ class RotatingShieldPFEstimator:
             ),
         }
 
-    def surface_candidate_observability_diagnostics(
+    def surface_atlas_observability_diagnostics(
         self,
         *,
         window: int | None = None,
@@ -2496,10 +4141,10 @@ class RotatingShieldPFEstimator:
     ) -> dict[str, dict[str, Any]]:
         """Return truth-independent observability diagnostics over surface candidates."""
         diagnostics: dict[str, dict[str, Any]] = {}
-        if self.candidate_sources.size == 0:
+        if self.surface_diagnostic_points.size == 0:
             return diagnostics
         self._ensure_kernel_cache()
-        pool_all = np.asarray(self.candidate_sources, dtype=float).reshape(-1, 3)
+        pool_all = np.asarray(self.surface_diagnostic_points, dtype=float).reshape(-1, 3)
         sample_count = max(1, min(int(max_candidates), int(pool_all.shape[0])))
         if pool_all.shape[0] > sample_count:
             sample_indices = np.linspace(
@@ -2527,8 +4172,8 @@ class RotatingShieldPFEstimator:
         )
         eps = 1.0e-12
         for isotope, filt in self.filters.items():
-            data = self._measurement_data_for_iso(isotope, window)
-            if data is None or data.z_k.size == 0:
+            data = self._structural_geometry_for_records(isotope, window)
+            if data is None or data.row_count == 0:
                 diagnostics[isotope] = {
                     "candidate_count": int(pool_all.shape[0]),
                     "sampled_candidate_count": int(pool.shape[0]),
@@ -2543,21 +4188,15 @@ class RotatingShieldPFEstimator:
                 sources=pool,
                 strengths=np.ones(pool.shape[0], dtype=float),
             )
-            variances = measurement_vector(
-                data.observation_variances,
-                data.z_k.size,
-                "observation_variances",
-                min_value=1.0,
+            stats = self._response_design_observability_stats(
+                np.asarray(candidate_counts, dtype=float),
+                eps=eps,
             )
-            whitened = np.asarray(candidate_counts, dtype=float) / np.sqrt(
-                variances[:, None]
-            )
-            stats = self._response_design_observability_stats(whitened, eps=eps)
             stats.update(
                 {
                     "candidate_count": int(pool_all.shape[0]),
                     "sampled_candidate_count": int(pool.shape[0]),
-                    "measurement_count": int(data.z_k.size),
+                    "measurement_count": data.row_count,
                     "surface_counts": surface_counts,
                     "window": None if window is None else int(window),
                 }
@@ -2565,69 +4204,109 @@ class RotatingShieldPFEstimator:
             diagnostics[isotope] = stats
         return diagnostics
 
-    def _run_isotope_structural_update(
+    def surface_atlas_area_quadrature(
         self,
-        task: tuple[
-            str,
-            IsotopeParticleFilter,
-            MeasurementData | None,
-        ],
-    ) -> None:
-        """Run one isotope's PF-native structural update."""
-        _isotope, filt, evidence_data = task
-        filt.apply_structural_moves(evidence_data)
+        *,
+        max_points: int,
+        maximum_hausdorff_bound_m: float,
+    ) -> SurfaceAtlasQuadrature:
+        """Return every chart center with its exact physical chart area.
 
-    def _structural_update_worker_count(self, task_count: int) -> int:
-        """Return the worker count for independent per-isotope structural updates."""
-        if task_count <= 1 or not bool(self.pf_config.parallel_isotope_updates):
-            return 1
-        configured = self.pf_config.parallel_isotope_workers
-        if configured is None:
-            configured = os.cpu_count() or 1
-        return max(1, min(int(configured), int(task_count)))
+        A finite area-quantile sample can omit small charts entirely and create
+        an exploration absorbing state. Production coverage therefore uses one
+        center per continuous chart and fails before planning when its explicit
+        budget or chart-center Hausdorff bound cannot cover the atlas.
+        """
+        if not self.filters:
+            raise RuntimeError(
+                "Surface-atlas coverage requires initialized PF filters."
+            )
+        self._assert_joint_surface_atlas_alignment()
+        atlases = [
+            filt._structural_rj_surface_atlas
+            for filt in self.filters.values()
+        ]
+        if any(atlas is None for atlas in atlases):
+            raise RuntimeError(
+                "Surface-atlas coverage requires a continuous surface atlas."
+            )
+        atlas = atlases[0]
+        if atlas is None:
+            raise RuntimeError("Continuous surface atlas is unavailable.")
+        return build_complete_surface_atlas_quadrature(
+            atlas,
+            max_points=int(max_points),
+            maximum_hausdorff_bound_m=float(
+                maximum_hausdorff_bound_m
+            ),
+        )
 
-    def _apply_structural_moves(self) -> None:
-        """Apply per-isotope structural updates using all measurement evidence."""
-        structural_start = time.perf_counter()
-        tasks: list[
-            tuple[
-                str,
-                IsotopeParticleFilter,
-                MeasurementData | None,
-            ]
-        ] = []
-        for iso, filt in self.filters.items():
-            structural_data = self._measurement_data_for_iso(iso, None)
-            tasks.append((iso, filt, structural_data))
-        worker_count = self._structural_update_worker_count(len(tasks))
-        self.last_structural_update_workers = int(worker_count)
-        if worker_count <= 1:
-            for task in tasks:
-                self._run_isotope_structural_update(task)
-            self.last_structural_update_wall_s = time.perf_counter() - structural_start
-            return
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            list(executor.map(self._run_isotope_structural_update, tasks))
-        self.last_structural_update_wall_s = time.perf_counter() - structural_start
+    def posterior_point_estimate(self) -> Dict[str, PFPointEstimate]:
+        """Return deterministic posterior summaries for every isotope.
+
+        The pure runtime subclass overrides this method to select one aligned
+        joint-cardinality stratum and one common representative particle row.
+        Keeping all report consumers on this virtual method prevents stopping
+        and visualization from silently reverting to independent isotope
+        marginals.
+        """
+        estimates: Dict[str, PFPointEstimate] = {}
+        for isotope, filt in self.filters.items():
+            filt.validate_continuous_surface_states()
+            atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+            estimates[isotope] = posterior_point_estimate_from_states(
+                [particle.state for particle in filt.continuous_particles],
+                np.asarray(filt.continuous_weights, dtype=float),
+                max_cardinality=self.pf_config.max_sources,
+                positions_by_state=[
+                    filt.continuous_state_positions(particle.state)
+                    for particle in filt.continuous_particles
+                ],
+                surface_chart_ids_by_state=(
+                    None
+                    if atlas is None
+                    else [
+                        np.asarray(
+                            particle.state.surface_chart_ids,
+                            dtype=np.int64,
+                        )
+                        for particle in filt.continuous_particles
+                    ]
+                ),
+                surface_uv_by_state=(
+                    None
+                    if atlas is None
+                    else [
+                        np.asarray(
+                            particle.state.surface_uv,
+                            dtype=np.float64,
+                        )
+                        for particle in filt.continuous_particles
+                    ]
+                ),
+                surface_coordinate_path_distance=(
+                    None
+                    if atlas is None
+                    else atlas.surface_coordinate_path_distance_upper_bound_m
+                ),
+            )
+        return estimates
 
     def estimates(
         self,
     ) -> Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]]:
         """Return the canonical MAP-cardinality PF posterior projection."""
         estimates: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
-        for isotope, filt in self.filters.items():
-            point_estimate = posterior_point_estimate_from_states(
-                [particle.state for particle in filt.continuous_particles],
-                np.asarray(filt.continuous_weights, dtype=float),
-                max_cardinality=self.pf_config.max_sources,
-                position_projector=filt._project_positions_to_source_prior,
-            )
+        for isotope, point_estimate in self.posterior_point_estimate().items():
             positions = np.asarray(
-                [mode.position_mean_xyz for mode in point_estimate.modes],
+                [mode.position_medoid_xyz for mode in point_estimate.modes],
                 dtype=float,
             ).reshape(-1, 3)
             strengths = np.asarray(
-                [mode.strength_mean_cps_1m for mode in point_estimate.modes],
+                [
+                    mode.strength_representative_cps_1m
+                    for mode in point_estimate.modes
+                ],
                 dtype=float,
             )
             estimates[isotope] = (
@@ -2643,7 +4322,7 @@ class RotatingShieldPFEstimator:
         *,
         strict: bool = True,
     ) -> NDArray[np.object_]:
-        """Return exact finite-dictionary surface kinds for one isotope."""
+        """Return authoritative continuous-surface kinds for one isotope."""
         filt = self.filters.get(str(isotope))
         if filt is None:
             raise KeyError(f"Unknown PF isotope: {isotope}")
@@ -2651,6 +4330,12 @@ class RotatingShieldPFEstimator:
             np.asarray(positions, dtype=np.float64),
             strict=strict,
         )
+
+    def _posterior_reporting_particle_indices(
+        self,
+    ) -> NDArray[np.int64] | None:
+        """Return a shared posterior-report stratum or all rows by default."""
+        return None
 
     def posterior_source_uncertainty(
         self,
@@ -2674,11 +4359,33 @@ class RotatingShieldPFEstimator:
         Gaussian-equivalent covariance summary rather than an empirical credible
         region.
         """
+        point_estimate_map = self.posterior_point_estimate()
         estimate_map = (
-            self.estimates() if reported_estimates is None else dict(reported_estimates)
+            {
+                isotope: (
+                    np.asarray(
+                        [
+                            mode.position_medoid_xyz
+                            for mode in point_estimate.modes
+                        ],
+                        dtype=np.float64,
+                    ).reshape(-1, 3),
+                    np.asarray(
+                        [
+                            mode.strength_representative_cps_1m
+                            for mode in point_estimate.modes
+                        ],
+                        dtype=np.float64,
+                    ),
+                )
+                for isotope, point_estimate in point_estimate_map.items()
+            }
+            if reported_estimates is None
+            else dict(reported_estimates)
         )
         radius = 0.8 if match_radius_m is None else float(match_radius_m)
         environment = self._source_prior_environment()
+        reporting_indices = self._posterior_reporting_particle_indices()
         output: Dict[str, List[Dict[str, Any]]] = {}
         for isotope, estimate in estimate_map.items():
             positions = np.asarray(estimate[0], dtype=float)
@@ -2698,28 +4405,115 @@ class RotatingShieldPFEstimator:
             if filt is None or not filt.continuous_particles:
                 packed_positions = np.zeros((0, 0, 3), dtype=float)
                 packed_mask = np.zeros((0, 0), dtype=bool)
+                packed_chart_ids = np.zeros((0, 0), dtype=np.int64)
+                packed_surface_uv = np.zeros((0, 0, 2), dtype=np.float64)
                 weights = np.zeros(0, dtype=float)
+                atlas = None
             else:
-                from pf import gpu_utils
-                import torch
-
-                report_states = [
-                    particle.state for particle in filt.continuous_particles
-                ]
-                positions_tensor, _, _, mask_tensor = gpu_utils.pack_states(
-                    report_states,
-                    device=torch.device("cpu"),
-                    dtype=torch.float64,
+                (
+                    packed_positions,
+                    _,
+                    packed_mask,
+                    packed_chart_ids,
+                    packed_surface_uv,
+                ) = (
+                    filt._packed_continuous_surface_state_arrays()
                 )
-                packed_positions = positions_tensor.detach().cpu().numpy()
-                packed_mask = mask_tensor.detach().cpu().numpy().astype(bool)
                 weights = np.asarray(filt.continuous_weights, dtype=float)
+                atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+                if atlas is None:
+                    raise RuntimeError(
+                        "Posterior uncertainty requires the continuous surface "
+                        "atlas."
+                    )
+                if reporting_indices is not None:
+                    indices = np.asarray(
+                        reporting_indices,
+                        dtype=np.int64,
+                    ).reshape(-1)
+                    if (
+                        indices.size == 0
+                        or np.any(indices < 0)
+                        or np.any(indices >= weights.size)
+                    ):
+                        raise RuntimeError(
+                            "Posterior uncertainty received an invalid shared "
+                            "reporting stratum."
+                        )
+                    packed_positions = packed_positions[indices]
+                    packed_mask = packed_mask[indices]
+                    packed_chart_ids = packed_chart_ids[indices]
+                    packed_surface_uv = packed_surface_uv[indices]
+                    reporting_mass = float(np.sum(weights[indices]))
+                    if (
+                        not np.isfinite(reporting_mass)
+                        or reporting_mass <= 0.0
+                    ):
+                        raise RuntimeError(
+                            "Posterior reporting stratum has no probability mass."
+                        )
+                    weights = validated_probability_distribution(
+                        weights[indices] / reporting_mass,
+                        name="posterior reporting-stratum weights",
+                    )
             packed_surface_kinds = np.full(packed_mask.shape, None, dtype=object)
             if np.any(packed_mask):
                 packed_surface_kinds[packed_mask] = filt.structural_surface_kinds(
                     packed_positions[packed_mask],
                     strict=True,
                 )
+            reported_chart_ids = np.zeros(
+                positions.shape[0],
+                dtype=np.int64,
+            )
+            reported_surface_uv = np.zeros(
+                (positions.shape[0], 2),
+                dtype=np.float64,
+            )
+            if positions.shape[0] > 0:
+                if atlas is None:
+                    raise RuntimeError(
+                        "Reported continuous-surface modes require an atlas."
+                    )
+                point_estimate = point_estimate_map.get(isotope)
+                point_positions = np.asarray(
+                    []
+                    if point_estimate is None
+                    else [
+                        mode.position_medoid_xyz
+                        for mode in point_estimate.modes
+                    ],
+                    dtype=np.float64,
+                ).reshape(-1, 3)
+                point_modes_have_coordinates = bool(
+                    point_estimate is not None
+                    and len(point_estimate.modes) == positions.shape[0]
+                    and np.array_equal(point_positions, positions)
+                    and all(
+                        mode.surface_chart_id is not None
+                        and mode.surface_uv is not None
+                        for mode in point_estimate.modes
+                    )
+                )
+                if point_modes_have_coordinates and point_estimate is not None:
+                    reported_chart_ids = np.asarray(
+                        [
+                            int(mode.surface_chart_id)
+                            for mode in point_estimate.modes
+                        ],
+                        dtype=np.int64,
+                    )
+                    reported_surface_uv = np.asarray(
+                        [
+                            mode.surface_uv
+                            for mode in point_estimate.modes
+                        ],
+                        dtype=np.float64,
+                    )
+                else:
+                    reported_chart_ids, reported_surface_uv = (
+                        atlas.locate_positions(positions)
+                    )
 
             diagnostics = posterior_mode_uncertainty_batched(
                 packed_positions,
@@ -2727,11 +4521,37 @@ class RotatingShieldPFEstimator:
                 weights,
                 positions,
                 packed_surface_kinds=packed_surface_kinds,
+                packed_surface_chart_ids=(
+                    None if atlas is None else packed_chart_ids
+                ),
+                packed_surface_uv=(
+                    None if atlas is None else packed_surface_uv
+                ),
+                reported_surface_chart_ids=(
+                    None if atlas is None else reported_chart_ids
+                ),
+                reported_surface_uv=(
+                    None if atlas is None else reported_surface_uv
+                ),
+                surface_coordinate_path_distance=(
+                    None
+                    if atlas is None
+                    else atlas.surface_coordinate_path_distance_upper_bound_m
+                ),
                 environment=environment,
                 obstacle_grid=self.obstacle_grid,
                 obstacle_height_m=self.obstacle_height_m,
                 match_radius_m=radius,
                 surface_tolerance_m=surface_tolerance_m,
+                posterior_reference_mass=(
+                    1.0
+                    if point_estimate_map.get(isotope) is None
+                    else float(
+                        point_estimate_map[
+                            isotope
+                        ].selected_stratum_mass
+                    )
+                ),
             )
             for mode_index, diagnostic in enumerate(diagnostics):
                 diagnostic["reported_strength_cps_1m"] = float(strengths[mode_index])
@@ -2760,12 +4580,15 @@ class RotatingShieldPFEstimator:
         diagnostics: Dict[str, Dict[str, Any]] = {}
         eps = 1e-12
         k = max(0, int(top_k))
+        posterior_estimates = self.estimates() if include_estimates else {}
         for iso, filt in self.filters.items():
             if not filt.continuous_particles:
                 diagnostics[iso] = {
                     "ess_pre": 0.0,
                     "resampled": False,
                     "ess_post": None,
+                    "current_ess": 0.0,
+                    "current_ess_ratio": 0.0,
                     "particle_count": 0,
                     "resample_count": int(getattr(filt, "last_resample_count", 0)),
                     "birth_count": int(getattr(filt, "last_birth_count", 0)),
@@ -2773,8 +4596,13 @@ class RotatingShieldPFEstimator:
                     "structural_timing_s": dict(
                         getattr(filt, "last_structural_timing_s", {})
                     ),
+                    "transition_weight_mass": {},
                     "temper_steps": [],
                     "temper_resamples": 0,
+                    "temper_min_ess": None,
+                    "unique_ancestor_count": None,
+                    "station_unique_ancestor_count": None,
+                    "cumulative_unique_ancestor_count": None,
                     "r_mean": 0.0,
                     "r_var": 0.0,
                     "r_weighted_mean": 0.0,
@@ -2782,24 +4610,48 @@ class RotatingShieldPFEstimator:
                     "r_probability_by_count": {},
                     "r_particle_count_by_count": {},
                     "map": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
-                    "mmse": (np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)),
+                    "posterior": (
+                        np.zeros((0, 3), dtype=float),
+                        np.zeros(0, dtype=float),
+                    ),
                     "top_k": [],
                 }
                 continue
             weights = np.asarray(filt.continuous_weights, dtype=float)
             total = float(np.sum(weights))
-            if total > 0.0:
-                weights = weights / total
-            elif weights.size:
-                weights = np.full(weights.size, 1.0 / float(weights.size), dtype=float)
-            r_vals = np.array(
-                [p.state.num_sources for p in filt.continuous_particles], dtype=float
+            if (
+                weights.size != len(filt.continuous_particles)
+                or not np.isfinite(total)
+                or total <= 0.0
+            ):
+                raise RuntimeError(
+                    "Step diagnostics require valid normalized PF weights."
+                )
+            weights = weights / total
+            current_ess = float(1.0 / max(np.sum(weights**2), eps))
+            current_ess_ratio = current_ess / float(weights.size)
+            maximum_cardinality = self.pf_config.max_sources
+            r_int = np.fromiter(
+                (
+                    validated_state_cardinality(
+                        particle.state,
+                        name=f"{iso} particle[{index}]",
+                        max_cardinality=maximum_cardinality,
+                    )
+                    for index, particle in enumerate(
+                        filt.continuous_particles
+                    )
+                ),
+                dtype=np.int64,
+                count=len(filt.continuous_particles),
             )
-            if weights.size != r_vals.size and r_vals.size:
-                weights = np.full(r_vals.size, 1.0 / float(r_vals.size), dtype=float)
+            r_vals = r_int.astype(np.float64)
+            if weights.size != r_vals.size:
+                raise RuntimeError(
+                    "Step diagnostics require one weight per PF particle."
+                )
             r_mean = float(np.mean(r_vals)) if r_vals.size else 0.0
             r_var = float(np.var(r_vals)) if r_vals.size else 0.0
-            r_int = r_vals.astype(int, copy=False)
             r_weighted_mean = float(np.sum(weights * r_vals)) if r_vals.size else 0.0
             r_weighted_var = (
                 float(np.sum(weights * (r_vals - r_weighted_mean) ** 2))
@@ -2822,30 +4674,28 @@ class RotatingShieldPFEstimator:
             resampled = bool(getattr(filt, "last_resample_ess", False))
             ess_post = getattr(filt, "last_ess_post", None)
             particle_count = int(len(filt.continuous_particles))
-            best_state = filt.best_particle().state
-            best_source_count = max(0, int(best_state.num_sources))
-            map_positions = best_state.positions[:best_source_count].copy()
-            map_strengths = best_state.strengths[:best_source_count].copy()
             if include_estimates:
-                try:
-                    mmse_positions, mmse_strengths = filt.estimate()
-                except RuntimeError:
-                    mmse_positions = np.zeros((0, 3), dtype=float)
-                    mmse_strengths = np.zeros(0, dtype=float)
+                posterior_positions, posterior_strengths = posterior_estimates[iso]
             else:
-                mmse_positions = np.zeros((0, 3), dtype=float)
-                mmse_strengths = np.zeros(0, dtype=float)
+                posterior_positions = np.zeros((0, 3), dtype=float)
+                posterior_strengths = np.zeros(0, dtype=float)
             top_entries: List[Dict[str, Any]] = []
             if k > 0 and weights.size:
                 order = np.argsort(weights)[::-1][:k]
                 for idx in order:
                     state = filt.continuous_particles[int(idx)].state
-                    source_count = max(0, int(state.num_sources))
+                    source_count = validated_state_cardinality(
+                        state,
+                        name=f"{iso} particle[{int(idx)}]",
+                        max_cardinality=maximum_cardinality,
+                    )
                     top_entries.append(
                         {
                             "weight": float(weights[idx]),
                             "num_sources": source_count,
-                            "positions": state.positions[:source_count].copy(),
+                            "positions": filt.continuous_state_positions(
+                                state
+                            )[:source_count],
                             "strengths": state.strengths[:source_count].copy(),
                         }
                     )
@@ -2853,6 +4703,8 @@ class RotatingShieldPFEstimator:
                 "ess_pre": float(ess_pre),
                 "resampled": resampled,
                 "ess_post": ess_post,
+                "current_ess": current_ess,
+                "current_ess_ratio": current_ess_ratio,
                 "particle_count": particle_count,
                 "resample_count": int(getattr(filt, "last_resample_count", 0)),
                 "birth_count": int(getattr(filt, "last_birth_count", 0)),
@@ -2860,16 +4712,41 @@ class RotatingShieldPFEstimator:
                 "structural_timing_s": dict(
                     getattr(filt, "last_structural_timing_s", {})
                 ),
+                "transition_weight_mass": dict(
+                    getattr(
+                        filt,
+                        "last_structural_transition_weight_mass",
+                        {},
+                    )
+                ),
                 "temper_steps": list(getattr(filt, "last_temper_steps", [])),
                 "temper_resamples": int(getattr(filt, "last_temper_resample_count", 0)),
+                "temper_min_ess": getattr(filt, "last_temper_min_ess", None),
+                "unique_ancestor_count": getattr(
+                    filt,
+                    "last_unique_ancestor_count",
+                    None,
+                ),
+                "station_unique_ancestor_count": getattr(
+                    filt,
+                    "last_station_unique_ancestor_count",
+                    None,
+                ),
+                "cumulative_unique_ancestor_count": getattr(
+                    filt,
+                    "last_cumulative_unique_ancestor_count",
+                    None,
+                ),
                 "r_mean": r_mean,
                 "r_var": r_var,
                 "r_weighted_mean": r_weighted_mean,
                 "r_weighted_var": r_weighted_var,
                 "r_probability_by_count": r_probability_by_count,
                 "r_particle_count_by_count": r_particle_count_by_count,
-                "map": (map_positions, map_strengths),
-                "mmse": (mmse_positions, mmse_strengths),
+                "posterior": (
+                    posterior_positions,
+                    posterior_strengths,
+                ),
                 "top_k": top_entries,
             }
         return diagnostics
@@ -2879,1259 +4756,304 @@ class RotatingShieldPFEstimator:
         """Return the number of shield orientation normals."""
         return self.normals.shape[0]
 
-    def count_likelihood_spec_for_isotope(
-        self,
-        isotope: str,
-    ) -> CountLikelihoodSpec:
-        """Return the normalized runtime count-likelihood spec for an isotope."""
-        filt = self.filters[str(isotope)]
-        return CountLikelihoodSpec(**filt._count_likelihood_kwargs())
-
     @staticmethod
-    def _sample_planning_count_observations_np(
-        selected_lambdas: NDArray[np.float64],
-        predictive_variance: NDArray[np.float64] | float,
-        *,
-        spec: CountLikelihoodSpec,
-        rng: np.random.Generator,
-        epsilon: float = 1.0e-12,
+    def _normalized_stopping_weights(
+        filt: IsotopeParticleFilter,
     ) -> NDArray[np.float64]:
-        """Sample non-negative future counts from the configured planning model."""
-        lambdas = np.maximum(np.asarray(selected_lambdas, dtype=float), epsilon)
-        if spec.model == "poisson":
-            return np.asarray(rng.poisson(lambdas), dtype=float)
-        scale = np.sqrt(
-            np.maximum(np.asarray(predictive_variance, dtype=float), epsilon)
-        )
-        if spec.model == "gaussian":
-            observations = rng.normal(loc=lambdas, scale=scale)
-        else:
-            df = max(float(spec.student_t_df), 1.0 + epsilon)
-            observations = lambdas + scale * rng.standard_t(
-                df,
-                size=lambdas.shape,
+        """Return one filter's valid normalized posterior weights."""
+        particle_count = len(filt.continuous_particles)
+        weights = np.asarray(filt.continuous_weights, dtype=float).reshape(-1)
+        if weights.size != particle_count:
+            raise RuntimeError(
+                "Stopping diagnostics require one weight per PF particle."
             )
-        return np.maximum(np.asarray(observations, dtype=float), 0.0)
+        if (
+            weights.size == 0
+            or np.any(~np.isfinite(weights))
+            or np.any(weights < 0.0)
+        ):
+            raise RuntimeError(
+                "Stopping diagnostics require finite nonnegative PF weights."
+            )
+        total = float(np.sum(weights))
+        if not np.isfinite(total) or total <= 0.0:
+            raise RuntimeError(
+                "Stopping diagnostics require positive posterior weight mass."
+            )
+        return weights / total
 
-    @staticmethod
-    def _sample_planning_count_observations_torch(
-        selected_lambdas: "torch.Tensor",
-        predictive_variance: "torch.Tensor",
-        *,
-        spec: CountLikelihoodSpec,
-        epsilon: float = 1.0e-12,
-    ) -> "torch.Tensor":
-        """Return the Torch equivalent of planning count observation sampling."""
-        import torch
-
-        lambdas = torch.clamp(selected_lambdas.to(dtype=torch.float64), min=epsilon)
-        if spec.model == "poisson":
-            return torch.poisson(lambdas)
-        scale = torch.sqrt(
-            torch.clamp(
-                predictive_variance.to(device=lambdas.device, dtype=torch.float64),
-                min=epsilon,
-            )
-        )
-        if spec.model == "gaussian":
-            observations = lambdas + scale * torch.randn_like(lambdas)
-        else:
-            df = max(float(spec.student_t_df), 1.0 + epsilon)
-            distribution = torch.distributions.StudentT(
-                torch.as_tensor(df, device=lambdas.device, dtype=torch.float64)
-            )
-            noise = distribution.sample(lambdas.shape)
-            observations = lambdas + scale * noise
-        return torch.clamp(observations, min=0.0)
-
-    @staticmethod
-    def _planning_eig_from_lambdas_np(
-        lambdas_ap: NDArray[np.float64],
-        weights_p: NDArray[np.float64],
-        *,
-        spec: CountLikelihoodSpec,
-        num_samples: int,
-        rng: np.random.Generator,
-        observations_as: NDArray[np.float64] | None = None,
-        epsilon: float = 1.0e-12,
-    ) -> NDArray[np.float64]:
-        """Return batched action EIG using the configured count likelihood."""
-        lambdas = np.maximum(np.asarray(lambdas_ap, dtype=float), epsilon)
-        if lambdas.ndim == 1:
-            lambdas = lambdas.reshape(1, -1)
-        if lambdas.ndim != 2:
-            raise ValueError("lambdas_ap must have shape action x particle.")
-        weights = np.maximum(np.asarray(weights_p, dtype=float).reshape(-1), 0.0)
-        if weights.size != lambdas.shape[1]:
-            raise ValueError("weights_p must have one value per particle.")
-        weight_sum = float(np.sum(weights))
-        if weight_sum <= epsilon:
-            weights = np.full(weights.size, 1.0 / max(weights.size, 1), dtype=float)
-        else:
-            weights = weights / weight_sum
-        log_weights = np.log(weights + epsilon)
-        h_prior = -float(np.sum(weights * log_weights))
-        action_count = int(lambdas.shape[0])
-        if observations_as is None:
-            sample_count = int(num_samples)
-            if sample_count <= 0:
-                return np.full(action_count, h_prior, dtype=float)
-            sample_indices = rng.choice(
-                weights.size,
-                size=(action_count, sample_count),
-                replace=True,
-                p=weights,
-            )
-            selected = np.take_along_axis(lambdas, sample_indices, axis=1)
-            predictive_variance = predictive_count_likelihood_variance(
-                selected,
-                spec=spec,
-                epsilon=epsilon,
-            )
-            observations = (
-                RotatingShieldPFEstimator._sample_planning_count_observations_np(
-                    selected,
-                    predictive_variance,
-                    spec=spec,
-                    rng=rng,
-                    epsilon=epsilon,
-                )
-            )
-        else:
-            observations = np.asarray(observations_as, dtype=float)
-            if observations.ndim == 1 and action_count == 1:
-                observations = observations.reshape(1, -1)
-            if observations.ndim != 2 or observations.shape[0] != action_count:
-                raise ValueError("observations_as must have shape action x sample.")
-            if observations.shape[1] == 0:
-                return np.full(action_count, h_prior, dtype=float)
-        likelihood_terms = count_log_likelihood_terms_np(
-            observations[:, :, None],
-            lambdas[:, None, :],
-            spec=spec,
-            epsilon=epsilon,
-        )
-        log_posterior = log_weights[None, None, :] + likelihood_terms
-        log_posterior -= logsumexp(log_posterior, axis=2, keepdims=True)
-        posterior = np.exp(log_posterior)
-        h_post = -np.sum(
-            posterior * np.log(posterior + epsilon),
-            axis=2,
-        )
-        return np.full(action_count, h_prior, dtype=float) - np.mean(h_post, axis=1)
-
-    @staticmethod
-    def _planning_eig_from_lambdas_torch(
-        lambdas_ap: "torch.Tensor",
-        weights_p: "torch.Tensor",
-        *,
-        spec: CountLikelihoodSpec,
-        num_samples: int,
-        observations_as: "torch.Tensor | None" = None,
-        epsilon: float = 1.0e-12,
-    ) -> "torch.Tensor":
-        """Return Torch action EIG equivalent to the batched NumPy helper."""
-        import torch
-
-        lambdas = torch.clamp(lambdas_ap.to(dtype=torch.float64), min=epsilon)
-        if lambdas.ndim == 1:
-            lambdas = lambdas.reshape(1, -1)
-        if lambdas.ndim != 2:
-            raise ValueError("lambdas_ap must have shape action x particle.")
-        weights = torch.clamp(
-            weights_p.to(device=lambdas.device, dtype=torch.float64).reshape(-1),
-            min=0.0,
-        )
-        if int(weights.numel()) != int(lambdas.shape[1]):
-            raise ValueError("weights_p must have one value per particle.")
-        weight_sum = torch.sum(weights)
-        if float(weight_sum.detach().cpu().item()) <= epsilon:
-            weights = torch.full_like(weights, 1.0 / max(int(weights.numel()), 1))
-        else:
-            weights = weights / weight_sum
-        log_weights = torch.log(weights + epsilon)
-        h_prior = -torch.sum(weights * log_weights)
-        action_count = int(lambdas.shape[0])
-        if observations_as is None:
-            sample_count = int(num_samples)
-            if sample_count <= 0:
-                return torch.full(
-                    (action_count,),
-                    float(h_prior.detach().cpu().item()),
-                    device=lambdas.device,
-                    dtype=torch.float64,
-                )
-            sample_indices = torch.multinomial(
-                weights.expand(action_count, -1),
-                sample_count,
-                replacement=True,
-            )
-            selected = torch.gather(lambdas, 1, sample_indices)
-            predictive_variance = predictive_count_likelihood_variance_torch(
-                selected,
-                spec=spec,
-                epsilon=epsilon,
-            )
-            observations = (
-                RotatingShieldPFEstimator._sample_planning_count_observations_torch(
-                    selected,
-                    predictive_variance,
-                    spec=spec,
-                    epsilon=epsilon,
-                )
-            )
-        else:
-            observations = observations_as.to(
-                device=lambdas.device,
-                dtype=torch.float64,
-            )
-            if observations.ndim == 1 and action_count == 1:
-                observations = observations.reshape(1, -1)
-            if observations.ndim != 2 or int(observations.shape[0]) != action_count:
-                raise ValueError("observations_as must have shape action x sample.")
-            if int(observations.shape[1]) == 0:
-                return h_prior.expand(action_count).clone()
-        likelihood_terms = count_log_likelihood_terms_torch(
-            observations.unsqueeze(2),
-            lambdas.unsqueeze(1),
-            spec=spec,
-            epsilon=epsilon,
-        )
-        log_posterior = log_weights.view(1, 1, -1) + likelihood_terms
-        log_posterior = log_posterior - torch.logsumexp(
-            log_posterior,
-            dim=2,
-            keepdim=True,
-        )
-        posterior = torch.exp(log_posterior)
-        h_post = -torch.sum(
-            posterior * torch.log(posterior + epsilon),
-            dim=2,
-        )
-        return h_prior - torch.mean(h_post, dim=1)
-
-    @staticmethod
-    def _expected_strength_uncertainty_from_lambdas_np(
-        lambdas_p: NDArray[np.float64],
-        weights_p: NDArray[np.float64],
-        strengths_pm: NDArray[np.float64],
-        *,
-        spec: CountLikelihoodSpec,
-        num_samples: int,
-        rng: np.random.Generator,
-        epsilon: float = 1.0e-12,
-    ) -> float:
-        """Return batched expected posterior strength variance for one action."""
-        lambdas = np.maximum(np.asarray(lambdas_p, dtype=float).reshape(-1), epsilon)
-        weights = np.maximum(np.asarray(weights_p, dtype=float).reshape(-1), 0.0)
-        strengths = np.asarray(strengths_pm, dtype=float)
-        if strengths.ndim != 2 or strengths.shape[0] != lambdas.size:
-            raise ValueError("strengths_pm must have one row per particle.")
-        if weights.size != lambdas.size:
-            raise ValueError("weights_p must have one value per particle.")
-        sample_count = int(num_samples)
-        if sample_count <= 0 or strengths.size == 0:
-            return 0.0
-        weight_sum = float(np.sum(weights))
-        if weight_sum <= epsilon:
-            weights = np.full(weights.size, 1.0 / max(weights.size, 1), dtype=float)
-        else:
-            weights = weights / weight_sum
-        sample_indices = rng.choice(
-            weights.size,
-            size=sample_count,
-            replace=True,
-            p=weights,
-        )
-        selected_lambdas = lambdas[sample_indices]
-        predictive_variance = predictive_count_likelihood_variance(
-            selected_lambdas,
-            spec=spec,
-            epsilon=epsilon,
-        )
-        observations = RotatingShieldPFEstimator._sample_planning_count_observations_np(
-            selected_lambdas,
-            predictive_variance,
-            spec=spec,
-            rng=rng,
-            epsilon=epsilon,
-        )
-        likelihood_terms = count_log_likelihood_terms_np(
-            observations[:, None],
-            lambdas[None, :],
-            spec=spec,
-            epsilon=epsilon,
-        )
-        log_posterior = np.log(weights + epsilon)[None, :] + likelihood_terms
-        log_posterior -= logsumexp(log_posterior, axis=1, keepdims=True)
-        posterior = np.exp(log_posterior)
-        posterior_mean = posterior @ strengths
-        posterior_second = posterior @ (strengths * strengths)
-        posterior_variance = np.maximum(
-            posterior_second - posterior_mean * posterior_mean,
-            0.0,
-        )
-        return float(np.mean(np.sum(posterior_variance, axis=1)))
-
-    def orientation_expected_information_gain(
+    def credible_surface_radii(
         self,
-        pose_idx: int,
-        RFe: NDArray[np.float64],
-        RPb: NDArray[np.float64],
-        live_time_s: float = 1.0,
-        num_samples: int | None = None,
-        alpha_by_isotope: Dict[str, float] | None = None,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None = None,
-        rng: np.random.Generator | None = None,
-        detector_pos: NDArray[np.float64] | None = None,
-    ) -> float:
-        """
-        Monte-Carlo approximation of EIG (Eq. 3.44) for a Fe/Pb orientation pair.
-
-        - Uses continuous particles and ContinuousKernel expected counts (Eq. 3.41).
-        - For each isotope h: IG_h = H(w_h) - E_z[H(w'_h(z; RFe, RPb))].
-        - Global IG = Σ_h α_h IG_h, with α_h uniform if not provided.
-        - If detector_pos is provided, pose_idx is ignored.
-        """
-        if detector_pos is None:
-            if self.kernel_cache is None:
-                self._ensure_kernel_cache()
-            detector_pos = self.kernel_cache.poses[pose_idx]
-        detector_pos = np.asarray(detector_pos, dtype=float)
-        rng = rng or np.random.default_rng()
-        num_samples = (
-            self.pf_config.eig_num_samples if num_samples is None else num_samples
-        )
-        eps = 1e-12
-        fe_idx = octant_index_from_rotation(RFe)
-        pb_idx = octant_index_from_rotation(RPb)
-        if not self._can_use_gpu():
-            return self._orientation_expected_information_gain_cpu(
-                pose_idx=pose_idx,
-                detector_pos=detector_pos,
-                fe_idx=fe_idx,
-                pb_idx=pb_idx,
-                live_time_s=live_time_s,
-                num_samples=int(num_samples),
-                alpha_by_isotope=alpha_by_isotope,
-                particles_by_isotope=particles_by_isotope,
-                rng=rng,
-                eps=eps,
-            )
-        kernel = self._continuous_kernel()
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        # normalize alphas
-        alpha_sum = sum(alphas.values()) or 1.0
-        alphas = {k: v / alpha_sum for k, v in alphas.items()}
-        self._gpu_enabled()
-        from pf import gpu_utils as gpu_mod
-        import torch as torch_mod
-
-        gpu_utils = gpu_mod
-        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        torch = torch_mod
-
-        def _compute_lam_torch(
-            states: Sequence[IsotopeState], isotope: str
-        ) -> "torch.Tensor":
-            """Compute expected counts for a state subset on the torch backend."""
-            if not states:
-                return torch.zeros(0, device=device, dtype=dtype)
-            positions, strengths, backgrounds, mask = gpu_utils.pack_states(
-                states, device=device, dtype=dtype
-            )
-            return kernel.expected_counts_pair_for_packed_states_torch(
-                isotope=isotope,
-                detector_pos=detector_pos,
-                positions=positions,
-                strengths=strengths,
-                backgrounds=backgrounds,
-                mask=mask,
-                fe_index=fe_idx,
-                pb_index=pb_idx,
-                live_time_s=live_time_s,
-                source_scale=self.response_scale_for_isotope(
-                    isotope,
-                    fe_index=fe_idx,
-                    pb_index=pb_idx,
-                ),
-                device=device,
-                dtype=dtype,
-            )
-
-        total_ig = 0.0
-        for iso, filt in self.filters.items():
-            if particles_by_isotope is not None and iso in particles_by_isotope:
-                states, weights = particles_by_isotope[iso]
-            else:
-                if not filt.continuous_particles:
-                    continue
-                states = [p.state for p in filt.continuous_particles]
-                weights = filt.continuous_weights
-            if not states:
-                continue
-            weights = np.asarray(weights, dtype=float)
-            weights = weights / max(np.sum(weights), eps)
-            lam_t = _compute_lam_torch(states, iso)
-            weights_t = torch.as_tensor(weights, device=device, dtype=dtype)
-            weight_sum = torch.sum(weights_t)
-            if float(weight_sum) <= 0.0:
-                weights_t = torch.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
-            else:
-                weights_t = weights_t / weight_sum
-            ig_h = float(
-                self._planning_eig_from_lambdas_torch(
-                    lam_t,
-                    weights_t,
-                    spec=self.count_likelihood_spec_for_isotope(iso),
-                    num_samples=int(num_samples),
-                    epsilon=eps,
-                )[0]
-                .detach()
-                .cpu()
-                .item()
-            )
-            total_ig += alphas.get(iso, 0.0) * ig_h
-        return float(total_ig)
-
-    def orientation_expected_information_gain_grid(
-        self,
-        pose_idx: int,
-        *,
-        live_time_s: float = 1.0,
-        num_samples: int | None = None,
-        alpha_by_isotope: Dict[str, float] | None = None,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None = None,
-    ) -> NDArray[np.float64]:
-        """
-        Compute MC-EIG for all Fe/Pb orientation pairs using shared lambdas.
-
-        This evaluates the same likelihood-entropy estimator as
-        ``orientation_expected_information_gain`` but avoids recomputing the
-        continuous expected-count kernel separately for every orientation pair.
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        num_orients = int(self.num_orientations)
-        num_pairs = num_orients * num_orients
-        if not self._can_use_gpu():
-            detector_pos = np.asarray(
-                self.kernel_cache.poses[int(pose_idx)],
-                dtype=float,
-            )
-            sample_count = (
-                self.pf_config.eig_num_samples
-                if num_samples is None
-                else int(num_samples)
-            )
-            eps = 1.0e-12
-            alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-            alpha_sum = sum(float(value) for value in alphas.values()) or 1.0
-            alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
-            rng = np.random.default_rng()
-            scores = np.zeros(num_pairs, dtype=float)
-            for iso, filt in self.filters.items():
-                if particles_by_isotope is not None and iso in particles_by_isotope:
-                    states, weights = particles_by_isotope[iso]
-                else:
-                    if not filt.continuous_particles:
-                        continue
-                    states = [particle.state for particle in filt.continuous_particles]
-                    weights = filt.continuous_weights
-                if not states:
-                    continue
-                lambdas = self.expected_counts_all_pairs_for_states_at_detector(
-                    isotope=iso,
-                    detector_pos=detector_pos,
-                    live_time_s=float(live_time_s),
-                    states=states,
-                )
-                scores += float(alphas.get(iso, 0.0)) * (
-                    self._planning_eig_from_lambdas_np(
-                        lambdas,
-                        np.asarray(weights, dtype=float),
-                        spec=self.count_likelihood_spec_for_isotope(iso),
-                        num_samples=sample_count,
-                        rng=rng,
-                        epsilon=eps,
-                    )
-                )
-            return scores.reshape(num_orients, num_orients)
-
-        detector_pos = np.asarray(self.kernel_cache.poses[int(pose_idx)], dtype=float)
-        num_samples = (
-            self.pf_config.eig_num_samples if num_samples is None else num_samples
-        )
-        eps = 1e-12
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        alpha_sum = sum(float(v) for v in alphas.values()) or 1.0
-        alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
-        self._gpu_enabled()
-        from pf import gpu_utils
-        import torch
-
-        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        iso_data: Dict[
-            str,
-            tuple["torch.Tensor", "torch.Tensor", CountLikelihoodSpec],
-        ] = {}
-        for iso, filt in self.filters.items():
-            if particles_by_isotope is not None and iso in particles_by_isotope:
-                states, weights = particles_by_isotope[iso]
-            else:
-                if not filt.continuous_particles:
-                    continue
-                states = [p.state for p in filt.continuous_particles]
-                weights = filt.continuous_weights
-            if not states:
-                continue
-            weights_arr = np.asarray(weights, dtype=float)
-            weight_sum = float(np.sum(weights_arr))
-            if weight_sum <= eps:
-                weights_arr = np.ones(len(states), dtype=float) / max(len(states), 1)
-            else:
-                weights_arr = weights_arr / weight_sum
-            lambdas_np = self.expected_counts_all_pairs_for_states_at_detector(
-                isotope=iso,
-                detector_pos=detector_pos,
-                live_time_s=float(live_time_s),
-                states=states,
-            )
-            lam_all = torch.as_tensor(lambdas_np, device=device, dtype=dtype)
-            weights_t = torch.as_tensor(weights_arr, device=device, dtype=dtype)
-            weight_sum_t = torch.sum(weights_t)
-            if float(weight_sum_t.detach().cpu().item()) <= 0.0:
-                weights_t = torch.full_like(weights_t, 1.0 / max(weights_t.numel(), 1))
-            else:
-                weights_t = weights_t / weight_sum_t
-            iso_data[iso] = (
-                lam_all,
-                weights_t,
-                self.count_likelihood_spec_for_isotope(iso),
-            )
-        if not iso_data:
-            return np.zeros((num_orients, num_orients), dtype=float)
-
-        scores_t = torch.zeros(num_pairs, device=device, dtype=torch.float64)
-        for iso, (lam_all, weights_t, spec) in iso_data.items():
-            scores_t = scores_t + float(alphas.get(iso, 0.0)) * (
-                self._planning_eig_from_lambdas_torch(
-                    lam_all,
-                    weights_t,
-                    spec=spec,
-                    num_samples=int(num_samples),
-                    epsilon=eps,
-                )
-            )
-        return scores_t.detach().cpu().numpy().reshape(num_orients, num_orients)
-
-    def _orientation_expected_information_gain_cpu(
-        self,
-        *,
-        pose_idx: int,
-        detector_pos: NDArray[np.float64],
-        fe_idx: int,
-        pb_idx: int,
-        live_time_s: float,
-        num_samples: int,
-        alpha_by_isotope: Dict[str, float] | None,
-        particles_by_isotope: Dict[str, Tuple[List[IsotopeState], NDArray[np.float64]]]
-        | None,
-        rng: np.random.Generator,
-        eps: float,
-    ) -> float:
-        """Compute orientation EIG on CPU using the same expected-count kernel."""
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        alpha_sum = sum(float(value) for value in alphas.values()) or 1.0
-        alphas = {key: float(value) / alpha_sum for key, value in alphas.items()}
-        total_ig = 0.0
-        for iso, filt in self.filters.items():
-            if particles_by_isotope is not None and iso in particles_by_isotope:
-                states, weights = particles_by_isotope[iso]
-            else:
-                if not filt.continuous_particles:
-                    continue
-                states = [p.state for p in filt.continuous_particles]
-                weights = filt.continuous_weights
-            if not states:
-                continue
-            weights_arr = np.asarray(weights, dtype=float)
-            weights_arr = weights_arr / max(float(np.sum(weights_arr)), eps)
-            lam = self.expected_counts_pair_for_states_at_detector(
-                isotope=iso,
-                detector_pos=detector_pos,
-                fe_index=int(fe_idx),
-                pb_index=int(pb_idx),
-                live_time_s=float(live_time_s),
-                states=states,
-            )
-            lam = np.maximum(np.asarray(lam, dtype=float).reshape(-1), eps)
-            ig_h = float(
-                self._planning_eig_from_lambdas_np(
-                    lam,
-                    weights_arr,
-                    spec=self.count_likelihood_spec_for_isotope(iso),
-                    num_samples=int(num_samples),
-                    rng=rng,
-                    epsilon=eps,
-                )[0]
-            )
-            total_ig += alphas.get(iso, 0.0) * ig_h
-        return float(total_ig)
-
-    def expected_uncertainty_after_rotation(
-        self,
-        pose_xyz: NDArray[np.float64],
-        live_time_per_rot_s: float,
-        tau_ig: float,
-        tmax_s: float,
-        n_rollouts: int = 64,
-        orient_selection: str = "IG",
-        return_debug: bool = False,
-        rng_seed: int | None = None,
-    ) -> float | Tuple[float, Dict[str, Any]]:
-        """
-        Estimate E[U_after-rotation | pose_xyz] by Monte Carlo rollouts.
-
-        This method has no side effects on the estimator state. Rotation policy:
-        - choose the next orientation by maximizing IG
-        - stop if max IG < tau_ig
-        - stop if accumulated live time reaches tmax_s
-
-        rng_seed can be set to make rollouts deterministic for debugging.
-        """
-        detector_pos = np.asarray(pose_xyz, dtype=float)
-        if detector_pos.shape != (3,):
-            raise ValueError("pose_xyz must be shape (3,).")
-        if orient_selection.lower() != "ig":
-            raise ValueError("Only orient_selection='IG' is supported.")
-        n_rollouts = int(n_rollouts)
-        use_mean_measurement = n_rollouts <= 0
-        rollouts = max(1, n_rollouts)
-        # Planning rollouts must never advance or reseed the global NumPy stream
-        # used by the sequential PF.  Otherwise a live planner call between two
-        # observations makes same-seed MeasurementLog replay diverge.
-        rng = (
-            np.random.default_rng()
-            if rng_seed is None
-            else np.random.default_rng(int(rng_seed))
-        )
-        from measurement.shielding import generate_octant_rotation_matrices
-
-        RFe_candidates = generate_octant_rotation_matrices()
-        RPb_candidates = generate_octant_rotation_matrices()
-        num_fe = len(RFe_candidates)
-        num_pb = len(RPb_candidates)
-        alphas = self.pf_config.alpha_weights
-        eig_samples = (
-            self.pf_config.planning_eig_samples
-            if self.pf_config.planning_eig_samples is not None
-            else self.pf_config.eig_num_samples
-        )
-        rollout_particles = self.pf_config.planning_rollout_particles
-        if rollout_particles is None:
-            rollout_particles = self.pf_config.planning_particles
-        rollout_method = (
-            self.pf_config.planning_rollout_method or self.pf_config.planning_method
-        )
-
-        fast_result = self._expected_uncertainty_after_rotation_fast(
-            detector_pos=detector_pos,
-            live_time_per_rot_s=live_time_per_rot_s,
-            tau_ig=tau_ig,
-            tmax_s=tmax_s,
-            rollouts=rollouts,
-            eig_samples=eig_samples,
-            alpha_by_isotope=alphas,
-            rollout_particles=rollout_particles,
-            rollout_method=rollout_method,
-            use_mean_measurement=use_mean_measurement,
-            rng=rng,
-            return_debug=return_debug,
-        )
-        if fast_result is not None:
-            return fast_result
-
-        def _select_best_orientation(
-            estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator
-        ) -> Tuple[int, int, float]:
-            """Return the (fe_idx, pb_idx) pair with the maximum EIG at the given pose."""
-            best_ig = -np.inf
-            best_fe = 0
-            best_pb = 0
-            particles_by_iso = None
-            if rollout_particles is not None and rollout_particles > 0:
-                particles_by_iso = estimator.planning_particles(
-                    max_particles=int(rollout_particles),
-                    method=rollout_method,
-                    rng=rng_local,
-                )
-            for fe_idx in range(num_fe):
-                for pb_idx in range(num_pb):
-                    ig_val = estimator.orientation_expected_information_gain(
-                        pose_idx=0,
-                        RFe=RFe_candidates[fe_idx],
-                        RPb=RPb_candidates[pb_idx],
-                        live_time_s=live_time_per_rot_s,
-                        num_samples=eig_samples,
-                        alpha_by_isotope=alphas,
-                        particles_by_isotope=particles_by_iso,
-                        rng=rng_local,
-                        detector_pos=detector_pos,
-                    )
-                    if ig_val > best_ig:
-                        best_ig = ig_val
-                        best_fe = fe_idx
-                        best_pb = pb_idx
-            return best_fe, best_pb, float(best_ig)
-
-        def _simulate_measurement(
-            estimator: "RotatingShieldPFEstimator",
-            fe_idx: int,
-            pb_idx: int,
-            rng_local: np.random.Generator,
-        ) -> Dict[str, float]:
-            """Simulate isotope-wise observations from each runtime count model."""
-            z_k: Dict[str, float] = {}
-            for iso, filt in estimator.filters.items():
-                if not filt.continuous_particles:
-                    z_k[iso] = 0.0
-                    continue
-                lam = filt._continuous_expected_counts_pair_at_pose(
-                    detector_pos=detector_pos,
-                    fe_index=fe_idx,
-                    pb_index=pb_idx,
-                    live_time_s=live_time_per_rot_s,
-                )
-                if lam.size == 0:
-                    z_k[iso] = 0.0
-                    continue
-                weights = filt.continuous_weights
-                if use_mean_measurement:
-                    z_k[iso] = float(np.sum(weights * lam))
-                else:
-                    idx = int(rng_local.choice(len(lam), p=weights))
-                    spec = estimator.count_likelihood_spec_for_isotope(iso)
-                    selected_lambda = np.asarray(lam[idx], dtype=float)
-                    predictive_variance = predictive_count_likelihood_variance(
-                        selected_lambda,
-                        spec=spec,
-                    )
-                    z_k[iso] = float(
-                        estimator._sample_planning_count_observations_np(
-                            selected_lambda,
-                            predictive_variance,
-                            spec=spec,
-                            rng=rng_local,
-                        )
-                    )
-            return z_k
-
-        def _run_once(
-            estimator: "RotatingShieldPFEstimator", rng_local: np.random.Generator
-        ) -> Tuple[float, Dict[str, Any]]:
-            """Run a single rotation rollout and return uncertainty plus debug metadata."""
-            elapsed = 0.0
-            rotations = 0
-            iterations: List[Dict[str, Any]] = []
-            while elapsed < tmax_s:
-                fe_idx, pb_idx, ig_val = _select_best_orientation(estimator, rng_local)
-                iterations.append(
-                    {
-                        "fe_idx": fe_idx,
-                        "pb_idx": pb_idx,
-                        "ig": ig_val,
-                        "elapsed": elapsed,
-                    }
-                )
-                if ig_val < tau_ig:
-                    break
-                z_k = _simulate_measurement(estimator, fe_idx, pb_idx, rng_local)
-                for iso, val in z_k.items():
-                    if iso not in estimator.filters:
-                        continue
-                    estimator.filters[iso].update_continuous_pair_at_pose(
-                        z_obs=val,
-                        detector_pos=detector_pos,
-                        fe_index=fe_idx,
-                        pb_index=pb_idx,
-                        live_time_s=live_time_per_rot_s,
-                    )
-                elapsed += live_time_per_rot_s
-                rotations += 1
-            return estimator.global_uncertainty(), {
-                "iterations": iterations,
-                "elapsed": elapsed,
-                "num_rotations": rotations,
-            }
-
-        u_vals: List[float] = []
-        debug_rollouts: List[Dict[str, Any]] = []
-        for _ in range(rollouts):
-            estimator_copy = copy.deepcopy(self)
-            u_val, debug = _run_once(estimator_copy, rng)
-            u_vals.append(u_val)
-            debug_rollouts.append(debug)
-        mean_u = float(np.mean(u_vals)) if u_vals else 0.0
-        if return_debug:
-            debug_payload = {"rollouts": debug_rollouts, "u_vals": u_vals}
-            return mean_u, debug_payload
-        return mean_u
-
-    def _expected_uncertainty_after_rotation_fast(
-        self,
-        detector_pos: NDArray[np.float64],
-        live_time_per_rot_s: float,
-        tau_ig: float,
-        tmax_s: float,
-        rollouts: int,
-        eig_samples: int,
-        alpha_by_isotope: Dict[str, float] | None,
-        rollout_particles: int | None,
-        rollout_method: str | None,
-        use_mean_measurement: bool,
-        rng: np.random.Generator,
-        return_debug: bool,
-    ) -> float | Tuple[float, Dict[str, Any]] | None:
-        """
-        Fast GPU rollout evaluation using precomputed lambdas and index-based updates.
-
-        Returns None when the fast path cannot be used.
-        """
-        if not self.pf_config.use_fast_gpu_rollout:
-            return None
-        if not self.pf_config.use_gpu:
-            return None
-        self._gpu_enabled()
-        from pf import gpu_utils
-        import torch
-        from measurement.shielding import generate_octant_rotation_matrices
-
-        RFe_candidates = generate_octant_rotation_matrices()
-        RPb_candidates = generate_octant_rotation_matrices()
-        num_fe = len(RFe_candidates)
-        num_pb = len(RPb_candidates)
-        fe_indices = np.repeat(np.arange(num_fe), num_pb)
-        pb_indices = np.tile(np.arange(num_pb), num_fe)
-        eps = 1e-12
-        alphas = alpha_by_isotope or {iso: 1.0 for iso in self.filters}
-        alpha_sum = sum(alphas.values()) or 1.0
-        alphas = {k: v / alpha_sum for k, v in alphas.items()}
-        device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-        dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-        planning_subset = self.planning_particles(
-            max_particles=rollout_particles,
-            method=rollout_method,
-            rng=rng,
-        )
-
-        iso_data: Dict[str, Dict[str, Any]] = {}
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
-            if iso in planning_subset and planning_subset[iso][0]:
-                states, weights = planning_subset[iso]
-            else:
-                states = [p.state for p in filt.continuous_particles]
-                weights = np.asarray(filt.continuous_weights, dtype=float)
-            weights = np.asarray(weights, dtype=float)
-            if weights.size == 0 or not states:
-                continue
-            weights = weights / max(np.sum(weights), eps)
-            positions, strengths, backgrounds, mask = gpu_utils.pack_states(
-                states, device=device, dtype=dtype
-            )
-            lam_all = filt.continuous_kernel.expected_counts_all_pairs_for_packed_states_torch(
-                isotope=iso,
-                detector_pos=detector_pos,
-                positions=positions,
-                strengths=strengths,
-                backgrounds=backgrounds,
-                mask=mask,
-                live_time_s=live_time_per_rot_s,
-                source_scale=self.response_scales_for_measurements(
-                    iso,
-                    fe_indices,
-                    pb_indices,
-                ),
-                device=device,
-                dtype=dtype,
-            )
-            iso_data[iso] = {
-                "lam": lam_all,
-                "strengths": strengths,
-                "weights": weights,
-                "num_particles": weights.size,
-                "resample_threshold": filt.config.resample_threshold,
-                "likelihood_spec": self.count_likelihood_spec_for_isotope(iso),
-            }
-        if not iso_data:
-            return 0.0 if not return_debug else (0.0, {"rollouts": [], "u_vals": []})
-
-        def _select_subset(
-            weights: NDArray[np.float64],
-            indices: NDArray[np.int64],
-            max_particles: int | None,
-            method: str | None,
-            rng_local: np.random.Generator,
-        ) -> Tuple[NDArray[np.int64], NDArray[np.float64]]:
-            """Return subset indices and normalized weights for EIG evaluation."""
-            if (
-                max_particles is None
-                or max_particles <= 0
-                or max_particles >= len(weights)
-            ):
-                return indices, weights
-            method = method or "top_weight"
-            if method == "top_weight":
-                sel = np.argsort(weights)[::-1][:max_particles]
-                sel_weights = weights[sel]
-                sel_weights = sel_weights / max(np.sum(sel_weights), eps)
-                return indices[sel], sel_weights
-            if method == "resample":
-                sel = rng_local.choice(len(weights), size=max_particles, p=weights)
-                sel_weights = np.ones(max_particles, dtype=float) / max(
-                    max_particles, 1
-                )
-                return indices[sel], sel_weights
-            raise ValueError(f"Unknown planning particle selection method: {method}")
-
-        def _ig_scores_from_lam(
-            lam_all: "torch.Tensor",
-            subset_indices: NDArray[np.int64],
-            subset_weights: NDArray[np.float64],
-            num_samples: int,
-            spec: CountLikelihoodSpec,
-        ) -> "torch.Tensor":
-            """Compute model-aware IG for all orientations from cached lambdas."""
-            idx_t = torch.as_tensor(
-                subset_indices, device=lam_all.device, dtype=torch.long
-            )
-            lam_sel = torch.index_select(lam_all, 1, idx_t)
-            weights_t = torch.as_tensor(
-                subset_weights, device=lam_all.device, dtype=lam_all.dtype
-            )
-            return self._planning_eig_from_lambdas_torch(
-                lam_sel,
-                weights_t,
-                spec=spec,
-                num_samples=int(num_samples),
-                epsilon=eps,
-            )
-
-        def _update_weights(
-            lam_curr: NDArray[np.float64],
-            weights: NDArray[np.float64],
-            z_obs: float,
-            spec: CountLikelihoodSpec,
-        ) -> NDArray[np.float64]:
-            """Update rollout weights using the configured count likelihood."""
-            likelihood_terms = count_log_likelihood_terms_np(
-                np.asarray(z_obs, dtype=float),
-                lam_curr,
-                spec=spec,
-                epsilon=eps,
-            )
-            logw = np.log(weights + eps) + likelihood_terms
-            logw -= np.max(logw)
-            w = np.exp(logw)
-            total = np.sum(w)
-            if total <= 0.0:
-                return np.ones_like(weights) / max(len(weights), 1)
-            return w / total
-
-        u_vals: List[float] = []
-        debug_rollouts: List[Dict[str, Any]] = []
-        for _ in range(int(rollouts)):
-            weights_by_iso: Dict[str, NDArray[np.float64]] = {}
-            indices_by_iso: Dict[str, NDArray[np.int64]] = {}
-            for iso, data in iso_data.items():
-                n_particles = int(data["num_particles"])
-                weights_by_iso[iso] = data["weights"].copy()
-                indices_by_iso[iso] = np.arange(n_particles, dtype=int)
-            elapsed = 0.0
-            iterations: List[Dict[str, Any]] = []
-            while elapsed < tmax_s:
-                total_ig: "torch.Tensor" | None = None
-                for iso, data in iso_data.items():
-                    weights = weights_by_iso[iso]
-                    indices = indices_by_iso[iso]
-                    if weights.size == 0:
-                        continue
-                    subset_idx, subset_w = _select_subset(
-                        weights=weights,
-                        indices=indices,
-                        max_particles=rollout_particles,
-                        method=rollout_method,
-                        rng_local=rng,
-                    )
-                    if subset_w.size == 0:
-                        continue
-                    ig_scores = _ig_scores_from_lam(
-                        lam_all=data["lam"],
-                        subset_indices=subset_idx,
-                        subset_weights=subset_w,
-                        num_samples=int(eig_samples),
-                        spec=data["likelihood_spec"],
-                    )
-                    weight = float(alphas.get(iso, 0.0))
-                    ig_scores = ig_scores * weight
-                    if total_ig is None:
-                        total_ig = ig_scores
-                    else:
-                        total_ig = total_ig + ig_scores
-                if total_ig is None:
-                    break
-                best_orient = int(torch.argmax(total_ig).item())
-                best_ig = float(total_ig[best_orient].detach().cpu().item())
-                iterations.append(
-                    {
-                        "fe_idx": int(fe_indices[best_orient]),
-                        "pb_idx": int(pb_indices[best_orient]),
-                        "ig": best_ig,
-                        "elapsed": elapsed,
-                    }
-                )
-                if best_ig < tau_ig:
-                    break
-                for iso, data in iso_data.items():
-                    weights = weights_by_iso[iso]
-                    indices = indices_by_iso[iso]
-                    if weights.size == 0:
-                        continue
-                    idx_t = torch.as_tensor(indices, device=device, dtype=torch.long)
-                    lam_curr_t = torch.index_select(data["lam"][best_orient], 0, idx_t)
-                    lam_curr = lam_curr_t.detach().cpu().numpy()
-                    if lam_curr.size == 0:
-                        continue
-                    if use_mean_measurement:
-                        z_obs = float(np.sum(weights * lam_curr))
-                    else:
-                        idx = int(rng.choice(len(lam_curr), p=weights))
-                        spec = data["likelihood_spec"]
-                        selected_lambda = np.asarray(lam_curr[idx], dtype=float)
-                        predictive_variance = predictive_count_likelihood_variance(
-                            selected_lambda,
-                            spec=spec,
-                            epsilon=eps,
-                        )
-                        z_obs = float(
-                            self._sample_planning_count_observations_np(
-                                selected_lambda,
-                                predictive_variance,
-                                spec=spec,
-                                rng=rng,
-                                epsilon=eps,
-                            )
-                        )
-                    weights = _update_weights(
-                        lam_curr,
-                        weights,
-                        z_obs,
-                        data["likelihood_spec"],
-                    )
-                    ess = 1.0 / max(np.sum(weights**2), eps)
-                    if ess < float(data["resample_threshold"]) * len(weights):
-                        resampled = systematic_resample(
-                            np.log(weights + eps),
-                            rng=rng,
-                        )
-                        indices = indices[resampled]
-                        weights = np.ones_like(weights) / max(len(weights), 1)
-                    weights_by_iso[iso] = weights
-                    indices_by_iso[iso] = indices
-                elapsed += live_time_per_rot_s
-            total_u = 0.0
-            for iso, data in iso_data.items():
-                weights = weights_by_iso[iso]
-                indices = indices_by_iso[iso]
-                if weights.size == 0:
-                    continue
-                idx_t = torch.as_tensor(indices, device=device, dtype=torch.long)
-                strengths_t = torch.index_select(data["strengths"], 0, idx_t)
-                weights_t = torch.as_tensor(weights, device=device, dtype=dtype)
-                weights_t = weights_t / torch.sum(weights_t)
-                mean = torch.sum(weights_t[:, None] * strengths_t, dim=0)
-                var = torch.sum(weights_t[:, None] * (strengths_t - mean) ** 2, dim=0)
-                total_u += float(torch.sum(var).detach().cpu().item())
-            u_vals.append(total_u)
-            debug_rollouts.append(
-                {
-                    "iterations": iterations,
-                    "elapsed": elapsed,
-                    "num_rotations": len(iterations),
-                }
-            )
-        mean_u = float(np.mean(u_vals)) if u_vals else 0.0
-        if return_debug:
-            debug_payload = {"rollouts": debug_rollouts, "u_vals": u_vals}
-            return mean_u, debug_payload
-        return mean_u
-
-    def estimate_change_norm(self) -> float:
-        """
-        Return ||Δs|| + ||Δq|| between the last two estimates (Sec. 3.6 convergence check).
-        """
-        if len(self.history_estimates) < 2:
-            return float("inf")
-        prev = self.history_estimates[-2]
-        curr = self.history_estimates[-1]
-        diff = 0.0
-        for iso in self.isotopes:
-            prev_pos, prev_str = prev.get(iso, (None, None))
-            curr_pos, curr_str = curr.get(iso, (None, None))
-            if prev_pos is None or curr_pos is None:
-                continue
-            m = min(len(prev_pos), len(curr_pos))
-            if m > 0:
-                diff += float(np.linalg.norm(prev_pos[:m] - curr_pos[:m]))
-                diff += float(np.linalg.norm(prev_str[:m] - curr_str[:m]))
-        return diff
-
-    def global_uncertainty(self) -> float:
-        """
-        Return global uncertainty U = Σ_h Σ_j Var(q_{h,j}) (Sec. 3.6).
-        """
-        total = 0.0
-        for iso, filt in self.filters.items():
-            if not filt.continuous_particles:
-                continue
-            self._gpu_enabled()
-            from pf import gpu_utils
-            import torch
-
-            device = gpu_utils.resolve_device(self.pf_config.gpu_device)
-            dtype = gpu_utils.resolve_dtype(self.pf_config.gpu_dtype)
-            states = [p.state for p in filt.continuous_particles]
-            _, strengths_t, _, _ = gpu_utils.pack_states(
-                states, device=device, dtype=dtype
-            )
-            weights = torch.as_tensor(
-                filt.continuous_weights, device=device, dtype=dtype
-            )
-            weight_sum = torch.sum(weights)
-            if float(weight_sum) <= 0.0:
-                weights = torch.full_like(weights, 1.0 / max(weights.numel(), 1))
-            else:
-                weights = weights / weight_sum
-            mean = torch.sum(weights[:, None] * strengths_t, dim=0)
-            var = torch.sum(weights[:, None] * (strengths_t - mean) ** 2, dim=0)
-            total += float(torch.sum(var).detach().cpu().item())
-        return total
-
-    def credible_region_volumes(
-        self, confidence: float = 0.95
+        confidence: float = 0.95,
     ) -> Dict[str, List[float]]:
-        """
-        Compute 3D positional credible region volumes for each isotope/source (Sec. 3.5).
+        """Return conservative path radii along connected physical surfaces.
 
-        For each source index m (up to max_r across particles), compute weighted mean/cov
-        of positions and return ellipsoid volume using chi-square threshold. Used by
-        should_stop_shield_rotation/should_stop_exploration to enforce small positional
-        uncertainty before declaring convergence.
+        Each radius is computed inside the MAP-cardinality stratum after
+        deterministic source alignment.  Its center is an actual posterior
+        surface state. Same-chart and one-portal paths are evaluated directly;
+        longer paths use a realizable portal-graph path. Disconnected posterior
+        mass makes the radius infinite. This fail-closed statistic cannot
+        collapse merely because a broad posterior lies on a two-dimensional
+        wall, floor, or ceiling.
         """
-        volumes: Dict[str, List[float]] = {}
-        chi2_thresh = float(chi2.ppf(confidence, df=3))
-        for iso, filt in self.filters.items():
-            vols: List[float] = []
+        probability = float(confidence)
+        if not np.isfinite(probability) or not 0.0 < probability <= 1.0:
+            raise ValueError("confidence must be in (0, 1].")
+        radii: Dict[str, List[float]] = {}
+        point_estimates = self.posterior_point_estimate()
+        for isotope, filt in self.filters.items():
             if not filt.continuous_particles:
-                volumes[iso] = vols
+                radii[isotope] = []
                 continue
-            w = filt.continuous_weights
-            max_r = max(
-                (p.state.num_sources for p in filt.continuous_particles), default=0
+            atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+            if atlas is None:
+                raise RuntimeError(
+                    "Surface convergence requires a continuous surface atlas."
+                )
+            filt.validate_continuous_surface_states()
+            estimate = point_estimates.get(isotope)
+            if estimate is None:
+                raise RuntimeError(
+                    "Canonical posterior report omitted an initialized isotope."
+                )
+            if np.isclose(probability, 0.95, rtol=0.0, atol=1.0e-15):
+                radii[isotope] = [
+                    (
+                        float("inf")
+                        if mode.credible_surface_path_radius_95_m is None
+                        else float(mode.credible_surface_path_radius_95_m)
+                    )
+                    for mode in estimate.modes
+                ]
+                continue
+
+            # The reporting contract stores the 95% radius.  Other confidence
+            # levels are intentionally unavailable here instead of being
+            # inferred from a Gaussian ellipsoid on a non-Euclidean surface.
+            raise ValueError(
+                "credible_surface_radii currently supports confidence=0.95 only."
             )
-            for j in range(max_r):
-                positions = []
-                weights = []
-                for wi, p in zip(w, filt.continuous_particles):
-                    if p.state.num_sources > j:
-                        positions.append(p.state.positions[j])
-                        weights.append(wi)
-                if not positions:
-                    continue
-                pos_arr = np.vstack(positions)
-                weights_arr = np.asarray(weights)
-                weights_arr = weights_arr / max(np.sum(weights_arr), 1e-12)
-                mean = np.sum(weights_arr[:, None] * pos_arr, axis=0)
-                centered = pos_arr - mean
-                cov = centered.T @ (centered * weights_arr[:, None])
-                # Ellipsoid volume = 4/3 π sqrt(det(cov * chi2_thresh))
-                det_val = np.linalg.det(cov * chi2_thresh)
-                if det_val < 0:
-                    vol = 0.0
-                else:
-                    vol = float((4.0 / 3.0) * np.pi * np.sqrt(det_val + 1e-12))
-                vols.append(vol)
-            volumes[iso] = vols
-        return volumes
+        return radii
 
-    def should_stop_shield_rotation(
+    def _latest_joint_station_innovation(
         self,
-        pose_idx: int,
-        ig_threshold: float = 1e-3,
-        change_tol: float = 1e-2,
-        uncertainty_tol: float = 1e-3,
-        live_time_s: float = 1.0,
-    ) -> bool:
-        """
-        Stop shield rotation when convergence criteria are met (Sec. 3.5–3.6).
+    ) -> Dict[str, float | int | bool | None]:
+        """Return strict renewal-total and conditional-mark innovation gates."""
+        if not self._joint_station_history:
+            return {
+                "available": False,
+                "passed": False,
+                "view_count": 0,
+                "dimension": 0,
+                "renewal_total_max_abs_z": None,
+                "renewal_total_within_confidence": False,
+                "conditional_mark_pearson": None,
+                "conditional_mark_degrees_of_freedom": 0,
+                "conditional_mark_tail_probability": None,
+                "confidence": float(
+                    self.pf_config.converge_innovation_confidence
+                ),
+            }
+        station = self._joint_station_history[-1]
+        weights = self._strict_joint_particle_weights()
+        components = tuple(
+            value.detach().cpu().numpy().astype(np.float64, copy=False)
+            for value in self._joint_station_transport_components_torch(
+                station
+            )
+        )
+        raw_result = dict(
+            self._full_spectrum_model().posterior_predictive_innovation_numpy(
+                station.spectrum_vb,
+                components[0],
+                components[1],
+                components[2],
+                station.live_times_s,
+                weights,
+                confidence=float(
+                    self.pf_config.converge_innovation_confidence
+                ),
+            )
+        )
+        required_raw = {
+            "renewal_total_max_abs_z",
+            "renewal_total_within_confidence",
+            "conditional_mark_pearson",
+            "conditional_mark_degrees_of_freedom",
+            "conditional_mark_tail_probability",
+            "confidence",
+        }
+        if set(raw_result) != required_raw:
+            raise RuntimeError(
+                "Full-spectrum innovation returned an incompatible diagnostic "
+                "schema."
+            )
+        confidence = float(raw_result["confidence"])
+        total_z = float(raw_result["renewal_total_max_abs_z"])
+        mark_pearson = float(raw_result["conditional_mark_pearson"])
+        mark_degrees = raw_result["conditional_mark_degrees_of_freedom"]
+        mark_tail_raw = raw_result["conditional_mark_tail_probability"]
+        if (
+            not np.isfinite(confidence)
+            or not np.isclose(
+                confidence,
+                float(self.pf_config.converge_innovation_confidence),
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+            or not np.isfinite(total_z)
+            or total_z < 0.0
+            or type(raw_result["renewal_total_within_confidence"]) is not bool
+            or not np.isfinite(mark_pearson)
+            or mark_pearson < 0.0
+            or isinstance(mark_degrees, (bool, np.bool_))
+            or not isinstance(mark_degrees, (int, np.integer))
+        ):
+            raise RuntimeError(
+                "Full-spectrum innovation contains invalid diagnostics."
+            )
+        mark_tail: float | None
+        if mark_tail_raw is None:
+            mark_tail = None
+        else:
+            mark_tail = float(mark_tail_raw)
+            if (
+                not np.isfinite(mark_tail)
+                or mark_tail < 0.0
+                or mark_tail > 1.0
+            ):
+                raise RuntimeError(
+                    "Full-spectrum conditional-mark tail probability is invalid."
+                )
+        mark_passed = bool(
+            mark_tail is not None
+            and mark_tail + 1.0e-15 >= 1.0 - confidence
+        )
+        total_passed = bool(
+            raw_result["renewal_total_within_confidence"]
+        )
+        return {
+            "available": True,
+            "passed": bool(total_passed and mark_passed),
+            "view_count": int(station.spectrum_vb.shape[0]),
+            "dimension": int(station.spectrum_vb.size),
+            "renewal_total_max_abs_z": total_z,
+            "renewal_total_within_confidence": total_passed,
+            "conditional_mark_pearson": mark_pearson,
+            "conditional_mark_degrees_of_freedom": int(mark_degrees),
+            "conditional_mark_tail_probability": mark_tail,
+            "confidence": confidence,
+        }
 
-        - max IG_k(φ) below threshold
-        - estimate change ||Δs|| + ||Δq|| < change_tol
-        - global uncertainty U below threshold
-        """
-        if self.kernel_cache is None:
-            self._ensure_kernel_cache()
-        if len(self.history_estimates) < 2:
-            return False
-        ig_grid = self.orientation_expected_information_gain_grid(
-            pose_idx=pose_idx,
-            live_time_s=live_time_s,
-        )
-        max_ig = float(np.max(ig_grid)) if ig_grid.size else 0.0
-        dwell_time = sum(
-            rec.live_time_s for rec in self.measurements if rec.pose_idx == pose_idx
-        )
-        # Credible region volumes check (Sec. 3.5)
-        volumes = self.credible_region_volumes()
-        max_volume = 0.0
-        for vols in volumes.values():
-            if vols:
-                max_volume = max(max_volume, max(vols))
-        return (
-            (max_ig < ig_threshold)
-            and (self.estimate_change_norm() < change_tol)
-            and (self.global_uncertainty() < uncertainty_tol)
-            and (max_volume < self.pf_config.credible_volume_threshold)
-            or (dwell_time >= self.pf_config.max_dwell_time_s)
-        )
-
-    def should_stop_exploration(
-        self,
-        ig_threshold: float = 5e-4,
-        change_tol: float = 5e-3,
-        uncertainty_tol: float = 5e-4,
-        live_time_s: float = 1.0,
-    ) -> bool:
-        """
-        Stop the overall exploration (Sec. 3.6) based on IG and uncertainty convergence.
-
-        - Max IG at the last pose is small
-        - Estimate change is small
-        - Global uncertainty U is small
-        """
-        if not self.poses:
-            return False
-        last_pose_idx = len(self.poses) - 1
-        return self.should_stop_shield_rotation(
-            pose_idx=last_pose_idx,
-            ig_threshold=ig_threshold,
-            change_tol=change_tol,
-            uncertainty_tol=uncertainty_tol,
-            live_time_s=live_time_s,
-        )
+    def posterior_convergence_diagnostics(self) -> Dict[str, Any]:
+        """Return fail-closed PF convergence gates without using simulation truth."""
+        isotope_diagnostics: Dict[str, Dict[str, Any]] = {}
+        all_ready = True
+        joint_innovation = self._latest_joint_station_innovation()
+        point_estimates = self.posterior_point_estimate()
+        for isotope, filt in self.filters.items():
+            if not filt.continuous_particles:
+                isotope_diagnostics[isotope] = {
+                    "ready": False,
+                    "reason": "missing_particles",
+                }
+                all_ready = False
+                continue
+            weights = self._normalized_stopping_weights(filt)
+            particle_count = int(weights.size)
+            ess = float(1.0 / np.sum(weights**2))
+            ess_ratio = ess / float(particle_count)
+            atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+            if atlas is None:
+                raise RuntimeError(
+                    "Surface convergence requires a continuous surface atlas."
+                )
+            filt.validate_continuous_surface_states()
+            point_estimate = point_estimates.get(isotope)
+            if point_estimate is None:
+                raise RuntimeError(
+                    "Canonical posterior report omitted an initialized isotope."
+                )
+            distribution = {
+                int(cardinality): float(mass)
+                for cardinality, mass in point_estimate.cardinality_distribution.items()
+            }
+            map_probability = float(point_estimate.selected_stratum_mass)
+            cardinality_mean = float(
+                sum(
+                    float(cardinality) * mass
+                    for cardinality, mass in distribution.items()
+                )
+            )
+            cardinality_variance = float(
+                sum(
+                    mass * (float(cardinality) - cardinality_mean) ** 2
+                    for cardinality, mass in distribution.items()
+                )
+            )
+            maximum_cardinality = int(filt.config.max_sources or 0)
+            boundary_mass = float(distribution.get(maximum_cardinality, 0.0))
+            radii = [
+                (
+                    None
+                    if mode.credible_surface_path_radius_95_m is None
+                    else float(mode.credible_surface_path_radius_95_m)
+                )
+                for mode in point_estimate.modes
+            ]
+            connected_masses = [
+                float(mode.surface_connected_mass)
+                for mode in point_estimate.modes
+            ]
+            maximum_radius = (
+                None
+                if any(radius is None for radius in radii)
+                else max(
+                    (float(radius) for radius in radii if radius is not None),
+                    default=0.0,
+                )
+            )
+            gates = {
+                "current_ess": bool(
+                    ess_ratio >= self.pf_config.converge_min_ess_ratio
+                ),
+                "cardinality_confidence": bool(
+                    map_probability
+                    >= self.pf_config.converge_cardinality_min_probability
+                    and cardinality_variance
+                    <= self.pf_config.converge_cardinality_var_max
+                ),
+                "cardinality_not_at_upper_boundary": bool(
+                    not filt.config.variable_cardinality
+                    or boundary_mass
+                    <= self.pf_config.converge_max_cardinality_boundary_mass
+                ),
+                "surface_radius": bool(
+                    maximum_radius is not None
+                    and maximum_radius
+                    <= self.pf_config.credible_surface_radius_threshold_m
+                ),
+                "innovation": bool(joint_innovation["passed"]),
+            }
+            ready = bool(all(gates.values()))
+            isotope_diagnostics[isotope] = {
+                "ready": ready,
+                "current_ess": ess,
+                "particle_count": particle_count,
+                "current_ess_ratio": ess_ratio,
+                "cardinality_distribution": distribution,
+                "map_cardinality_probability": map_probability,
+                "cardinality_variance": cardinality_variance,
+                "maximum_cardinality_boundary_mass": boundary_mass,
+                "credible_surface_radii_95_m": radii,
+                "surface_connected_masses": connected_masses,
+                "maximum_credible_surface_radius_95_m": maximum_radius,
+                "innovation": dict(joint_innovation),
+                "gates": gates,
+            }
+            all_ready &= ready
+        return {
+            "ready": bool(isotope_diagnostics) and all_ready,
+            "metric": "surface_path_upper_bound_credible_distance",
+            "isotopes": isotope_diagnostics,
+        }

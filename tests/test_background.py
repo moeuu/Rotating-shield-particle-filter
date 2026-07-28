@@ -1,14 +1,18 @@
-"""バックグラウンド形状と低エネルギー優位性のテスト。"""
+"""Background-shape tests for the sole raw full-spectrum contract."""
 
 import numpy as np
 
-from measurement.model import EnvironmentConfig, PointSource
-from spectrum.pipeline import SpectralDecomposer
-from spectrum.response_matrix import default_background_shape
+from spectrum.response_matrix import (
+    NATIVE_GEANT4_BIN_WIDTH_KEV,
+    NATIVE_GEANT4_ENERGY_MAX_KEV,
+    NATIVE_GEANT4_ENERGY_MIN_KEV,
+    default_background_shape,
+    native_geant4_background_shape,
+)
 
 
-def test_background_shape_basic():
-    """バックグラウンド形状が閾値以下で0となり低エネルギーに重みがあることを確認。"""
+def test_background_shape_basic() -> None:
+    """The diagnostic background shape is normalized and low-energy weighted."""
     energy_axis = np.linspace(0.0, 1500.0, 1501)
     bg = default_background_shape(energy_axis)
     assert bg.shape == energy_axis.shape
@@ -19,19 +23,20 @@ def test_background_shape_basic():
     assert low_band > high_band
 
 
-def test_background_makes_low_energy_dominant():
-    """合成スペクトルで低エネルギーの平均が中エネルギーより大きいことを確認。"""
-    dec = SpectralDecomposer()
-    env = EnvironmentConfig()
-    sources = [
-        PointSource("Cs-137", position=(5.0, 10.0, 5.0), intensity_cps_1m=20000.0),
-        PointSource("Co-60", position=(5.0, 11.0, 5.0), intensity_cps_1m=20000.0),
-    ]
-    spectrum, _ = dec.simulate_spectrum(
-        sources, environment=env, acquisition_time=20.0, rng=None, dead_time_s=0.0
+def test_native_background_matches_the_production_axis() -> None:
+    """The native background law is a probability vector on the exact axis."""
+    axis = np.arange(
+        NATIVE_GEANT4_ENERGY_MIN_KEV,
+        NATIVE_GEANT4_ENERGY_MAX_KEV + NATIVE_GEANT4_BIN_WIDTH_KEV,
+        NATIVE_GEANT4_BIN_WIDTH_KEV,
+        dtype=np.float64,
     )
-    energy_axis = dec.energy_axis
-    mean_80_200 = spectrum[(energy_axis >= 80.0) & (energy_axis < 200.0)].mean()
-    mean_400_800 = spectrum[(energy_axis >= 400.0) & (energy_axis < 800.0)].mean()
-    # チューニング後は低エネルギー優位が緩和される可能性があるため、比率で確認
-    assert mean_80_200 > 0.25 * mean_400_800
+    shape = native_geant4_background_shape(
+        axis,
+        NATIVE_GEANT4_BIN_WIDTH_KEV,
+    )
+
+    assert shape.dtype == np.float64
+    assert shape.shape == axis.shape
+    assert np.all(shape >= 0.0)
+    assert np.isclose(float(np.sum(shape)), 1.0)

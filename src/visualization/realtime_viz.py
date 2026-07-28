@@ -19,9 +19,6 @@ from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from measurement.obstacles import ObstacleGrid
-from pf.posterior import posterior_point_estimate_from_states
-
-
 @dataclass
 class PFFrame:
     """
@@ -33,14 +30,12 @@ class PFFrame:
     - robot_orientation: optional robot orientation (e.g., quaternion or R)
     - RFe, RPb: rotation matrices for iron/lead shields (3x3)
     - duration: acquisition time T_k
-    - counts_by_isotope: z_{k,h} from spectrum unfolding (Sec. 2.5.7)
     - particle_positions: isotope -> source-slot sample positions (N_points, 3)
     - particle_weights: isotope -> source-slot sample weights (N_points,)
     - estimated_sources: isotope -> (N_est, 3)
     - estimated_strengths: isotope -> (N_est,)
     - path_waypoints_xyz: optional obstacle-aware robot path segment (M, 3)
-    - spectrum_energy_keV/spectrum_counts: optional processed spectrum display data
-    - spectrum_components_by_isotope: isotope -> per-bin fitted isotope contribution
+    - spectrum_energy_keV/spectrum_counts: optional raw native spectrum data
     """
 
     step_index: int
@@ -50,7 +45,6 @@ class PFFrame:
     RFe: NDArray[np.float64]
     RPb: NDArray[np.float64]
     duration: float
-    counts_by_isotope: Dict[str, float]
     particle_positions: Dict[str, NDArray[np.float64]]
     particle_weights: Dict[str, NDArray[np.float64]]
     estimated_sources: Dict[str, NDArray[np.float64]]
@@ -58,7 +52,6 @@ class PFFrame:
     path_waypoints_xyz: Optional[NDArray[np.float64]] = None
     spectrum_energy_keV: Optional[NDArray[np.float64]] = None
     spectrum_counts: Optional[NDArray[np.float64]] = None
-    spectrum_components_by_isotope: Optional[Dict[str, NDArray[np.float64]]] = None
     particle_representative_positions: Optional[Dict[str, NDArray[np.float64]]] = None
     particle_representative_weights: Optional[Dict[str, NDArray[np.float64]]] = None
 
@@ -154,13 +147,19 @@ DEFAULT_ISOTOPE_COLORS = {
 
 
 def _normalize_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Return normalized weights with a uniform fallback when the sum is zero."""
+    """Return validated normalized posterior weights."""
     w = np.asarray(weights, dtype=float)
     if w.size == 0:
         return w
+    if np.any(~np.isfinite(w)) or np.any(w < 0.0):
+        raise ValueError(
+            "PF visualization requires finite nonnegative posterior weights."
+        )
     total = float(np.sum(w))
-    if total <= 0.0:
-        return np.ones_like(w) / w.size
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(
+            "PF visualization requires strictly positive posterior mass."
+        )
     return w / total
 
 
@@ -231,73 +230,67 @@ def _extend_trajectory_history(
         history.append(point.copy())
 
 
-def _existence_probabilities(states: Sequence[Any], weights: NDArray[np.float64], max_r: int) -> NDArray[np.float64]:
-    """Return per-slot existence probabilities for a list of particle states."""
-    if max_r <= 0 or not states:
-        return np.zeros(0, dtype=float)
-    w = _normalize_weights(weights)
-    probs = np.zeros(max_r, dtype=float)
-    for wi, st in zip(w, states):
-        num_sources = int(getattr(st, "num_sources", 0))
-        if num_sources > 0:
-            probs[:num_sources] += wi
-    return probs
-
-
 def _format_pos(pos: NDArray[np.float64]) -> str:
     """Format a position vector with two decimal places."""
     coords = ", ".join(f"{val:.2f}" for val in np.asarray(pos, dtype=float).ravel())
     return f"[{coords}]"
 
 
-def _filter_estimates(
-    positions: NDArray[np.float64],
-    strengths: NDArray[np.float64],
-    slot_valid: NDArray[np.bool_],
-    existence_probs: NDArray[np.float64],
-    min_strength: float | None,
-    min_existence_prob: float | None,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Filter estimates by strength and existence probability thresholds."""
-    if strengths.size == 0:
-        return positions, strengths
-    mask = slot_valid.copy() if slot_valid.size else np.ones(strengths.shape[0], dtype=bool)
-    mask_strength = np.ones(strengths.shape[0], dtype=bool)
-    mask_exist = np.ones(strengths.shape[0], dtype=bool)
-    if min_existence_prob is not None and existence_probs.size:
-        mask_exist = existence_probs[: strengths.shape[0]] >= min_existence_prob
-    if min_strength is not None:
-        mask_strength = strengths >= min_strength
-    mask = mask & mask_exist & mask_strength
-    if not np.any(mask) and min_existence_prob is not None and existence_probs.size:
-        idx = int(np.argmax(existence_probs[: strengths.shape[0]]))
-        if min_strength is None or strengths[idx] >= float(min_strength):
-            mask = np.zeros_like(mask, dtype=bool)
-            mask[idx] = True
-    return positions[mask], strengths[mask]
-
-
-def _active_display_positions(state: Any) -> NDArray[np.float64]:
-    """Return the active source positions stored in one PF particle."""
+def _active_display_positions(
+    particle_filter: Any,
+    state: Any,
+) -> NDArray[np.float64]:
+    """Resolve and validate active positions from the continuous surface state."""
     num_sources = max(0, int(getattr(state, "num_sources", 0)))
-    raw_positions = np.asarray(
-        getattr(state, "positions", np.zeros((0, 3), dtype=float)),
-        dtype=float,
+    if num_sources <= 0:
+        return np.zeros((0, 3), dtype=float)
+    resolver = getattr(particle_filter, "continuous_state_positions", None)
+    if not callable(resolver):
+        raise RuntimeError(
+            "PF visualization requires the continuous surface-state resolver."
+        )
+    positions = np.asarray(resolver(state), dtype=float)
+    if (
+        positions.shape != (num_sources, 3)
+        or np.any(~np.isfinite(positions))
+    ):
+        raise RuntimeError(
+            "PF visualization received an invalid continuous surface state."
+        )
+    return positions
+
+
+def _active_surface_source_medoid(
+    active_positions: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return one existing active source nearest the discrete XYZ medoid.
+
+    This helper is only for the compact particle-cloud display. Selecting an
+    existing source keeps every marker on the continuous surface; averaging
+    source coordinates could create a marker inside an obstacle or in free
+    space.
+    """
+    positions = np.asarray(active_positions, dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] == 0:
+        raise ValueError(
+            "An active particle representative requires finite XYZ sources."
+        )
+    if np.any(~np.isfinite(positions)):
+        raise ValueError(
+            "An active particle representative requires finite XYZ sources."
+        )
+    pairwise = np.linalg.norm(
+        positions[:, None, :] - positions[None, :, :],
+        axis=2,
     )
-    if num_sources <= 0 or raw_positions.size == 0:
-        return np.zeros((0, 3), dtype=float)
-    positions = raw_positions.reshape((-1, 3))
-    count = min(num_sources, positions.shape[0])
-    if count <= 0:
-        return np.zeros((0, 3), dtype=float)
-    return positions[:count]
+    return positions[int(np.argmin(np.sum(pairwise, axis=1)))].copy()
 
 
 class RealTimePFVisualizer:
     """
     Simple matplotlib-based 3D visualizer for the PF state.
 
-    - update(frame) redraws particles, estimates, counts, and label panel.
+    - update(frame) redraws particles, estimates, and the joint-PF label panel.
     - save_final(path) saves the current figure.
     - save_estimates_only(path) saves a view with only estimate markers visible.
     """
@@ -333,7 +326,6 @@ class RealTimePFVisualizer:
         true_sources: Optional[Dict[str, NDArray[np.float64]]] = None,
         true_strengths: Optional[Dict[str, float | Sequence[float]]] = None,
         obstacle_grid: ObstacleGrid | None = None,
-        show_counts: bool = True,
     ) -> None:
         """Initialize the visualizer and optional obstacle overlay."""
         self.isotopes = isotopes
@@ -341,21 +333,12 @@ class RealTimePFVisualizer:
         self.true_sources = true_sources or {}
         self.true_strengths = true_strengths or {}
         self.obstacle_grid = obstacle_grid
-        self.show_counts = show_counts
         self._fig_width = self._BASE_FIGSIZE[0]
         self._fig_height = self._BASE_FIGSIZE[1]
         layout = self._layout_geometry()
         self.fig = plt.figure(figsize=layout.fig_size)
-        if self.show_counts:
-            self.ax3d = self.fig.add_axes(layout.pf_pos, projection="3d")
-            if layout.counts_pos is None:
-                raise ValueError("Counts axis position missing for counts layout.")
-            self.ax_counts = self.fig.add_axes(layout.counts_pos)
-            self.ax_labels = self.fig.add_axes(layout.labels_pos)
-        else:
-            self.ax3d = self.fig.add_axes(layout.pf_pos, projection="3d")
-            self.ax_counts = None
-            self.ax_labels = self.fig.add_axes(layout.labels_pos)
+        self.ax3d = self.fig.add_axes(layout.pf_pos, projection="3d")
+        self.ax_labels = self.fig.add_axes(layout.labels_pos)
         cmap = plt.get_cmap("tab10")
         self.colors = {}
         for i, iso in enumerate(isotopes):
@@ -386,11 +369,6 @@ class RealTimePFVisualizer:
         self._robot_artist = None
         self._traj_line = None
         self._shield_arrows: Dict[str, Any] = {}
-        self._counts_bars = None
-        # Pre-create bar containers with zeros
-        if self.ax_counts is not None and self.isotopes:
-            zeros = [0.0 for _ in self.isotopes]
-            self._counts_bars = self.ax_counts.bar(self.isotopes, zeros, color=[self.colors.get(n, "gray") for n in self.isotopes])
         self._traj_history: list[NDArray[np.float64]] = []
         self._last_frame: PFFrame | None = None
         self._true_artists: list = []
@@ -474,15 +452,8 @@ class RealTimePFVisualizer:
         top = self._VERTICAL_LAYOUT["top"]
         pf_height = max(top - bottom, 0.0)
         pf_pos = (left, bottom, pf_width, pf_height)
-        if self.show_counts:
-            labels_height = pf_height * self._VERTICAL_LAYOUT["labels_frac"]
-            counts_height = pf_height * self._VERTICAL_LAYOUT["counts_frac"]
-            counts_bottom = bottom + labels_height
-            counts_pos = (side_left, counts_bottom, side_width, counts_height)
-            labels_pos = (side_left, bottom, side_width, labels_height)
-        else:
-            counts_pos = None
-            labels_pos = (side_left, bottom, side_width, pf_height)
+        counts_pos = None
+        labels_pos = (side_left, bottom, side_width, pf_height)
         return LayoutGeometry(
             fig_size=(fig_width, fig_height),
             pf_pos=pf_pos,
@@ -614,9 +585,6 @@ class RealTimePFVisualizer:
         self.ax3d.set_ylabel("y [m]")
         self.ax3d.set_zlabel("z [m]")
         self.ax3d.set_yticks(np.arange(ymin, ymax + 1e-6, 2.0))
-        if self.ax_counts is not None:
-            self.ax_counts.set_ylabel("Counts")
-            self.ax_counts.set_title("Isotope-wise counts")
         self._tune_axis_style()
         self._ensure_x_label()
         self._draw_room_bounds()
@@ -657,12 +625,7 @@ class RealTimePFVisualizer:
         self.fig.set_size_inches(*layout.fig_size, forward=True)
         if self.ax3d is not None:
             self.ax3d.set_position(layout.pf_pos)
-        if self.show_counts and self.ax_counts is not None and self.ax_labels is not None:
-            if layout.counts_pos is None:
-                raise ValueError("Counts axis position missing for counts layout.")
-            self.ax_counts.set_position(layout.counts_pos)
-            self.ax_labels.set_position(layout.labels_pos)
-        elif self.ax_labels is not None:
+        if self.ax_labels is not None:
             self.ax_labels.set_position(layout.labels_pos)
 
     def _legend_lines(self) -> List[Tuple[str, str, str, str]]:
@@ -1224,23 +1187,6 @@ class RealTimePFVisualizer:
         self._ensure_x_label()
         self._update_x_label_position()
         self._position_all_estimate_texts()
-        # Counts bar (reuse)
-        if self.ax_counts is not None and frame.counts_by_isotope:
-            names = list(frame.counts_by_isotope.keys())
-            vals = [frame.counts_by_isotope[n] for n in names]
-            # Update pre-created bars in the same order as isotopes; fallback if new isotope appears
-            name_to_idx = {n: i for i, n in enumerate(self.isotopes)}
-            for bar in self._counts_bars:
-                bar.set_height(0.0)
-            for n, v in zip(names, vals):
-                if n in name_to_idx:
-                    self._counts_bars[name_to_idx[n]].set_height(v)
-                else:
-                    # new isotope -> append a bar
-                    new_bar = self.ax_counts.bar([n], [v], color=self.colors.get(n, "gray"))[0]
-                    self._counts_bars.append(new_bar)
-            self.ax_counts.set_ylabel("Counts")
-            self.ax_counts.set_title("Unfolded counts z_{k,h}")
         self._update_labels(frame)
         self.fig.canvas.draw_idle()
 
@@ -1486,7 +1432,7 @@ class CUISplitPFVisualizer:
     <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png"></section>
     <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png"></section>
     <section><h2>Particle filter 3D</h2><img id="pf" src="latest_pf_3d.png"></section>
-    <section class="wide"><h2>Processed spectrum decomposition</h2><img id="spectrum" src="latest_spectrum.png"></section>
+    <section class="wide"><h2>Raw native full spectrum</h2><img id="spectrum" src="latest_spectrum.png"></section>
   </main>
   <script>
     function refresh() {
@@ -1737,10 +1683,8 @@ class CUISplitPFVisualizer:
                 .reshape((-1, 3))
                 .shape[0]
             )
-            count_value = float(frame.counts_by_isotope.get(iso, 0.0))
             lines.append(
-                f"{iso}: truth={truth_count} estimate={est_count} "
-                f"latest_count={count_value:.1f}"
+                f"{iso}: truth={truth_count} estimate={est_count}"
             )
         return "\n".join(lines)
 
@@ -2005,13 +1949,15 @@ class CUISplitPFVisualizer:
         w = np.asarray(weights, dtype=float)
         if pts.size == 0:
             return np.zeros((0, 3), dtype=float), np.zeros(0, dtype=float)
+        if w.shape != (pts.shape[0],):
+            raise ValueError(
+                "PF visualization requires one posterior weight per displayed "
+                "particle."
+            )
         if self.max_particles_per_isotope is None or pts.shape[0] <= self.max_particles_per_isotope:
             return pts, w
-        if w.size != pts.shape[0]:
-            indices = np.linspace(0, pts.shape[0] - 1, self.max_particles_per_isotope, dtype=int)
-        else:
-            indices = np.argsort(w)[::-1][: self.max_particles_per_isotope]
-        return pts[indices], w[indices] if w.size == pts.shape[0] else np.zeros(indices.size)
+        indices = np.argsort(w)[::-1][: self.max_particles_per_isotope]
+        return pts[indices], w[indices]
 
     def _particle_style(
         self,
@@ -2254,7 +2200,7 @@ class CUISplitPFVisualizer:
         )
         self._format_pf_axis(
             ax_representatives,
-            f"PF particle active-source centroids (N={representative_count})",
+            f"PF particle active-source medoids (N={representative_count})",
         )
         fig.suptitle(
             f"Particle filter 3D - {self._frame_progress_label(frame)}",
@@ -2274,7 +2220,7 @@ class CUISplitPFVisualizer:
         plt.close(fig)
 
     def _save_spectrum(self, frame: PFFrame, output_path: Path) -> None:
-        """Save the current processed spectrum with fitted isotope areas."""
+        """Save the current raw native full-spectrum observation."""
         energy = getattr(frame, "spectrum_energy_keV", None)
         counts = getattr(frame, "spectrum_counts", None)
         if energy is None or counts is None:
@@ -2286,43 +2232,17 @@ class CUISplitPFVisualizer:
         size = min(energy_arr.size, counts_arr.size)
         energy_arr = energy_arr[:size]
         counts_arr = np.clip(counts_arr[:size], a_min=0.0, a_max=None)
-        components = getattr(frame, "spectrum_components_by_isotope", None) or {}
         fig, ax = plt.subplots(figsize=(10.0, 4.8))
-        stack_values: list[NDArray[np.float64]] = []
-        stack_labels: list[str] = []
-        stack_colors: list[object] = []
-        for iso in self.isotopes:
-            comp_raw = components.get(iso)
-            if comp_raw is None:
-                continue
-            comp = np.clip(
-                np.asarray(comp_raw, dtype=float)[:size],
-                a_min=0.0,
-                a_max=None,
-            )
-            if comp.size != size or float(np.sum(comp)) <= 0.0:
-                continue
-            stack_values.append(comp)
-            stack_labels.append(f"{iso} photopeak={float(np.sum(comp)):.1f}")
-            stack_colors.append(self.colors.get(iso, "gray"))
-        if stack_values:
-            ax.stackplot(
-                energy_arr,
-                stack_values,
-                labels=stack_labels,
-                colors=stack_colors,
-                alpha=0.45,
-            )
         ax.plot(
             energy_arr,
             counts_arr,
             color="black",
             linewidth=1.0,
-            label="processed spectrum",
+            label="raw native detector spectrum",
         )
         ax.set_xlabel("Energy [keV]")
         ax.set_ylabel("Counts / bin")
-        ax.set_title(f"Spectrum decomposition - {self._frame_progress_label(frame)}")
+        ax.set_title(f"Full spectrum - {self._frame_progress_label(frame)}")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper right", fontsize=8)
         fig.tight_layout()
@@ -2426,44 +2346,40 @@ class AsyncCUISplitPFVisualizer:
 
 def build_frame_from_pf(
     pf,
-    measurement,
     step_index: int,
     time_sec: float,
     *,
-    estimate_mode: str = "mmse",
-    min_est_strength: float | None = None,
-    min_existence_prob: float | None = None,
-    estimated_override: Dict[str, Tuple[NDArray[np.float64], NDArray[np.float64]]] | None = None,
+    detector_position: NDArray[np.float64],
+    live_time_s: float,
+    RFe: NDArray[np.float64] | None = None,
+    RPb: NDArray[np.float64] | None = None,
+    spectrum_energy_keV: NDArray[np.float64] | None = None,
+    spectrum_counts: NDArray[np.int64] | None = None,
 ) -> PFFrame:
     """
-    Construct a PFFrame snapshot from the sequential PF and one measurement.
+    Construct a PFFrame snapshot from the joint PF and raw spectrum.
 
     Args:
         pf: Sequential estimator exposing ``filters`` and ``estimate_all()``.
-        measurement: Measurement with counts_by_isotope, pose_idx/orient_idx/RFe/RPb (optional)
         step_index: integer step
         time_sec: cumulative time in seconds
-        estimate_mode: "mmse" for weighted mean or "map" for max-weight particle
-        min_est_strength: optional minimum strength threshold for displayed estimates
-        min_existence_prob: optional minimum existence probability for displayed estimates
-        estimated_override: optional precomputed estimates keyed by isotope
+        detector_position: Physical detector XYZ used by the likelihood.
+        live_time_s: Fixed observation live time in seconds.
+        RFe: Iron-shield world rotation.
+        RPb: Lead-shield world rotation.
+        spectrum_energy_keV: Native incident-energy bin axis.
+        spectrum_counts: Raw nonnegative native histogram.
     """
-    est: Dict[str, object] = {}
-    if estimated_override is None:
-        if hasattr(pf, "estimate_all"):
-            est = pf.estimate_all()
-        else:
-            est = pf.estimates()  # type: ignore[attr-defined]
+    if hasattr(pf, "estimate_all"):
+        est: Dict[str, object] = pf.estimate_all()
+    else:
+        est = pf.estimates()  # type: ignore[attr-defined]
     particle_positions: Dict[str, NDArray[np.float64]] = {}
     particle_weights: Dict[str, NDArray[np.float64]] = {}
     particle_representative_positions: Dict[str, NDArray[np.float64]] = {}
     particle_representative_weights: Dict[str, NDArray[np.float64]] = {}
     estimated_sources: Dict[str, NDArray[np.float64]] = {}
     estimated_strengths: Dict[str, NDArray[np.float64]] = {}
-
-    mode = estimate_mode.lower()
-    if mode not in {"mmse", "map"}:
-        raise ValueError(f"Unknown estimate_mode: {estimate_mode}")
 
     for iso, filt in pf.filters.items():
         positions: list[NDArray[np.float64]] = []
@@ -2474,11 +2390,11 @@ def build_frame_from_pf(
         cont_weights = getattr(filt, "continuous_weights", np.zeros(0))
         if cont_particles and len(cont_weights) == len(cont_particles):
             for p, w in zip(cont_particles, cont_weights):
-                active_positions = _active_display_positions(p.state)
+                active_positions = _active_display_positions(filt, p.state)
                 if active_positions.size == 0:
                     continue
                 representative_positions.append(
-                    np.mean(active_positions.reshape((-1, 3)), axis=0),
+                    _active_surface_source_medoid(active_positions),
                 )
                 representative_weights.append(float(w))
                 for pos in active_positions:
@@ -2495,118 +2411,75 @@ def build_frame_from_pf(
             representative_weights,
             dtype=float,
         )
-        if estimated_override is not None and iso in estimated_override:
-            est_pos_raw, est_str_raw = estimated_override[iso]
-            est_pos = np.asarray(est_pos_raw, dtype=float)
-            est_str = np.asarray(est_str_raw, dtype=float)
-            if min_est_strength is not None and est_str.size:
-                mask = est_str >= min_est_strength
-                est_pos = est_pos[mask]
-                est_str = est_str[mask]
-            estimated_sources[iso] = est_pos
-            estimated_strengths[iso] = est_str
-        elif cont_particles and len(cont_weights) == len(cont_particles):
-            states = [p.state for p in cont_particles]
-            weights_arr = np.asarray(cont_weights, dtype=float)
-            if mode == "map":
-                best = max(cont_particles, key=lambda p: p.log_weight).state
-                best_r = int(getattr(best, "num_sources", 0))
-                if best_r <= 0:
-                    est_pos = np.zeros((0, 3), dtype=float)
-                    est_str = np.zeros(0, dtype=float)
-                else:
-                    est_pos = best.positions[:best_r].copy()
-                    est_str = best.strengths[:best_r].copy()
-                exist_probs_full = (
-                    _existence_probabilities(states, weights_arr, best_r)
-                    if min_existence_prob is not None and best_r > 0
-                    else np.zeros(0, dtype=float)
-                )
-                exist_probs = exist_probs_full[: est_str.shape[0]] if exist_probs_full.size else np.zeros(0)
-                slot_valid = np.ones(len(est_str), dtype=bool)
-                est_pos, est_str = _filter_estimates(
-                    est_pos,
-                    est_str,
-                    slot_valid,
-                    exist_probs,
-                    min_strength=min_est_strength,
-                    min_existence_prob=min_existence_prob,
-                )
+        if iso in est:
+            value = est[iso]
+            if hasattr(value, "positions"):
+                est_pos = np.asarray(value.positions, dtype=float)
+                est_str = np.asarray(value.strengths, dtype=float)
+            elif isinstance(value, tuple) and len(value) == 2:
+                est_pos = np.asarray(value[0], dtype=float)
+                est_str = np.asarray(value[1], dtype=float)
             else:
-                projector = getattr(
-                    filt,
-                    "_project_positions_to_source_prior",
-                    None,
+                raise TypeError(
+                    "PF estimate_all() must return (positions, strengths) "
+                    f"for isotope {iso}."
                 )
-                point_estimate = posterior_point_estimate_from_states(
-                    states,
-                    weights_arr,
-                    max_cardinality=getattr(
-                        getattr(filt, "config", None),
-                        "max_sources",
-                        None,
-                    ),
-                    position_projector=projector if callable(projector) else None,
-                )
-                est_pos = np.asarray(
-                    [mode.position_mean_xyz for mode in point_estimate.modes],
-                    dtype=float,
-                ).reshape(-1, 3)
-                est_str = np.asarray(
-                    [
-                        mode.strength_mean_cps_1m
-                        for mode in point_estimate.modes
-                    ],
-                    dtype=float,
-                )
-                if min_est_strength is not None and est_str.size:
-                    strength_mask = est_str >= min_est_strength
-                    est_pos = est_pos[strength_mask]
-                    est_str = est_str[strength_mask]
-            estimated_sources[iso] = est_pos
-            estimated_strengths[iso] = est_str
         else:
-            if iso in est:
-                val = est[iso]
-                if hasattr(val, "positions"):
-                    est_pos = val.positions
-                    est_str = val.strengths
-                elif isinstance(val, tuple) and len(val) == 2:
-                    est_pos = val[0]
-                    est_str = val[1]
-                else:
-                    est_pos = np.zeros((0, 3))
-                    est_str = np.zeros(0)
-            else:
-                est_pos = np.zeros((0, 3))
-                est_str = np.zeros(0)
-            if min_est_strength is not None and est_str.size:
-                mask = est_str >= min_est_strength
-                est_pos = est_pos[mask]
-                est_str = est_str[mask]
-            estimated_sources[iso] = est_pos
-            estimated_strengths[iso] = est_str
+            est_pos = np.zeros((0, 3), dtype=float)
+            est_str = np.zeros(0, dtype=float)
+        est_pos = np.asarray(est_pos, dtype=float).reshape(-1, 3)
+        est_str = np.asarray(est_str, dtype=float).reshape(-1)
+        if est_pos.shape[0] != est_str.shape[0]:
+            raise ValueError(
+                "PF estimate_all() must return one strength per estimated "
+                f"source for isotope {iso}."
+            )
+        if np.any(~np.isfinite(est_pos)) or np.any(~np.isfinite(est_str)):
+            raise ValueError(
+                f"PF estimate_all() returned non-finite values for {iso}."
+            )
+        estimated_sources[iso] = est_pos
+        estimated_strengths[iso] = est_str
 
-    RFe = getattr(measurement, "RFe", np.eye(3))
-    RPb = getattr(measurement, "RPb", np.eye(3))
-    if getattr(measurement, "detector_position", None) is not None:
-        robot_pos = np.asarray(measurement.detector_position, dtype=float)
-    else:
-        robot_pos = np.zeros(3)
+    robot_pos = np.asarray(detector_position, dtype=float)
+    if robot_pos.shape != (3,) or np.any(~np.isfinite(robot_pos)):
+        raise ValueError("detector_position must be a finite XYZ vector.")
+    duration = float(live_time_s)
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("live_time_s must be finite and positive.")
+    rotation_fe = (
+        np.eye(3, dtype=float)
+        if RFe is None
+        else np.asarray(RFe, dtype=float)
+    )
+    rotation_pb = (
+        np.eye(3, dtype=float)
+        if RPb is None
+        else np.asarray(RPb, dtype=float)
+    )
 
     return PFFrame(
         step_index=step_index,
         time=time_sec,
         robot_position=robot_pos,
         robot_orientation=None,
-        RFe=RFe,
-        RPb=RPb,
-        duration=measurement.live_time_s,
-        counts_by_isotope=measurement.counts_by_isotope,
+        RFe=rotation_fe,
+        RPb=rotation_pb,
+        duration=duration,
         particle_positions=particle_positions,
         particle_weights=particle_weights,
         estimated_sources=estimated_sources,
         estimated_strengths=estimated_strengths,
+        spectrum_energy_keV=(
+            None
+            if spectrum_energy_keV is None
+            else np.asarray(spectrum_energy_keV, dtype=float)
+        ),
+        spectrum_counts=(
+            None
+            if spectrum_counts is None
+            else np.asarray(spectrum_counts, dtype=np.int64)
+        ),
         particle_representative_positions=particle_representative_positions,
         particle_representative_weights=particle_representative_weights,
     )

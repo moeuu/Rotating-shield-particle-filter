@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Dict, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
+from measurement.surface_charts import surface_chart_geometry_sha256
 from pf.estimator import (
     RotatingShieldPFConfig,
     RotatingShieldPFEstimator as _PFEstimatorCore,
@@ -15,8 +15,11 @@ from pf.estimator import (
 from pf.posterior import (
     PFPointEstimate,
     PFPosteriorSnapshot,
+    align_surface_modes_batched,
     cardinality_distribution_from_states,
     posterior_point_estimate_from_states,
+    surface_configuration_medoid_distance_batched,
+    validated_probability_distribution,
 )
 from pf.profiles import (
     PURE_PF_SCHEMA_VERSION,
@@ -24,33 +27,15 @@ from pf.profiles import (
     resolve_structural_transition_provenance,
 )
 from pf.provenance import canonical_json_bytes, repository_commit, sha256_json
+from pf.structural_rj import (
+    TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY,
+    truncated_poisson_cardinality_probabilities,
+    validate_cardinality_prior_policy,
+)
 
 
 class PurePFBoundaryError(RuntimeError):
     """Signal a violation of the sequential PF result contract."""
-
-
-def _ordered_surface_dictionary_sha256(
-    centers_xyz: NDArray[np.float64],
-    areas_m2: NDArray[np.float64],
-) -> str:
-    """Hash ordered patch centers and areas using a stable binary encoding."""
-    digest = hashlib.sha256()
-    digest.update(b"pure-pf-surface-centers-areas-float64-le-v1\0")
-    arrays = (
-        (b"centers_xyz\0", np.asarray(centers_xyz, dtype="<f8")),
-        (b"areas_m2\0", np.asarray(areas_m2, dtype="<f8")),
-    )
-    for label, values in arrays:
-        contiguous = np.ascontiguousarray(values)
-        shape = np.asarray(
-            (contiguous.ndim, *contiguous.shape),
-            dtype="<u8",
-        )
-        digest.update(label)
-        digest.update(shape.tobytes(order="C"))
-        digest.update(contiguous.tobytes(order="C"))
-    return digest.hexdigest()
 
 
 def _resolved_cardinality_prior(
@@ -65,29 +50,44 @@ def _resolved_cardinality_prior(
         return (), (), "unbounded_support_unavailable"
     support = tuple(range(int(max_sources) + 1))
     configured = config.structural_cardinality_prior_probs
+    policy = validate_cardinality_prior_policy(
+        config.structural_cardinality_prior_policy,
+        has_explicit_probabilities=configured is not None,
+    )
     if configured is None:
-        probability = 1.0 / float(len(support))
+        if policy != TRUNCATED_POISSON_CARDINALITY_PRIOR_POLICY:
+            raise PurePFBoundaryError(
+                "Resolved implicit cardinality prior has the wrong policy."
+            )
+        probabilities = truncated_poisson_cardinality_probabilities(
+            int(max_sources),
+            float(config.structural_cardinality_prior_mean),
+        )
+        probabilities = validated_probability_distribution(
+            probabilities,
+            name="resolved truncated-Poisson cardinality prior",
+        )
         return (
             support,
-            tuple(probability for _ in support),
-            "uniform_default",
+            tuple(float(value) for value in probabilities),
+            "truncated_poisson_surface_process",
         )
     probabilities = np.asarray(configured, dtype=float).reshape(-1)
     if probabilities.size != len(support):
         raise PurePFBoundaryError(
             "Structural cardinality prior length differs from resolved support."
         )
-    total = float(np.sum(probabilities))
     if (
         not np.all(np.isfinite(probabilities))
         or np.any(probabilities <= 0.0)
-        or not np.isfinite(total)
-        or total <= 0.0
     ):
         raise PurePFBoundaryError(
             "Structural cardinality prior must contain finite positive mass."
         )
-    normalized = probabilities / total
+    normalized = validated_probability_distribution(
+        probabilities,
+        name="resolved explicit cardinality prior",
+    )
     return support, tuple(float(value) for value in normalized), "explicit"
 
 
@@ -99,7 +99,7 @@ class PurePFEstimator(_PFEstimatorCore):
     def __init__(
         self,
         *,
-        measurement_log_schema_version: int = 1,
+        measurement_log_schema_version: int = 2,
         config_hash: str | None = None,
         resolved_config_hash: str | None = None,
         measurement_log_sha256: str = "unavailable",
@@ -112,7 +112,7 @@ class PurePFEstimator(_PFEstimatorCore):
             pure_config = RotatingShieldPFConfig()
             kwargs["pf_config"] = pure_config
         capabilities = apply_profile_to_config(pure_config)
-        super().__init__(**kwargs)
+        super().__init__(random_seed=random_seed, **kwargs)
         if apply_profile_to_config(self.pf_config) != capabilities:
             raise PurePFBoundaryError(
                 "PF capabilities changed during estimator initialization."
@@ -121,10 +121,10 @@ class PurePFEstimator(_PFEstimatorCore):
         if (
             isinstance(measurement_log_schema_version, bool)
             or not isinstance(measurement_log_schema_version, int)
-            or measurement_log_schema_version != 1
+            or measurement_log_schema_version != 2
         ):
             raise ValueError(
-                "PurePFEstimator supports MeasurementLog schema version 1."
+                "PurePFEstimator supports MeasurementLog schema version 2 only."
             )
         self.measurement_log_schema_version = measurement_log_schema_version
         self.resolved_config_hash = (
@@ -139,7 +139,6 @@ class PurePFEstimator(_PFEstimatorCore):
         )
         self.repository_commit = repository_commit()
         self.measurement_log_sha256 = str(measurement_log_sha256)
-        self.random_seed = int(random_seed)
 
     @property
     def estimator_variant(self) -> str:
@@ -186,49 +185,50 @@ class PurePFEstimator(_PFEstimatorCore):
         configured_isotopes = sorted(
             {str(isotope) for isotope in self.isotopes}
         )
-        dictionary_groups: dict[str, dict[str, Any]] = {}
+        atlas_groups: dict[str, dict[str, Any]] = {}
         missing_isotopes: list[str] = []
         for isotope in configured_isotopes:
             filt = self.filters.get(isotope)
-            patches = (
+            atlas = (
                 None
                 if filt is None
-                else getattr(filt, "_structural_rj_surface_patches", None)
+                else getattr(filt, "_structural_rj_surface_atlas", None)
             )
-            if patches is None:
+            chart_geometry = (
+                getattr(atlas, "geometry", None)
+                if atlas is not None
+                else None
+            )
+            if chart_geometry is None:
                 missing_isotopes.append(isotope)
                 continue
-            centers = np.asarray(patches.centers_xyz, dtype=float)
-            areas = np.asarray(patches.areas_m2, dtype=float)
-            dictionary_hash = _ordered_surface_dictionary_sha256(
-                centers,
-                areas,
-            )
-            group = dictionary_groups.setdefault(
-                dictionary_hash,
+            areas = np.asarray(chart_geometry.areas_m2, dtype=float)
+            atlas_hash = surface_chart_geometry_sha256(chart_geometry)
+            group = atlas_groups.setdefault(
+                atlas_hash,
                 {
-                    "ordered_centers_areas_sha256": dictionary_hash,
-                    "patch_count": int(patches.patch_count),
+                    "surface_atlas_contract_sha256": atlas_hash,
+                    "chart_count": int(chart_geometry.chart_count),
                     "total_area_m2": float(np.sum(areas, dtype=np.float64)),
-                    "geometry_metadata": dict(patches.geometry_metadata),
+                    "geometry_metadata": dict(chart_geometry.geometry_metadata),
                     "isotopes": [],
                 },
             )
             group["isotopes"].append(isotope)
-        if not dictionary_groups:
-            dictionary_status = "not_initialized"
-            dictionaries_identical: bool | None = None
+        if not atlas_groups:
+            atlas_status = "not_initialized"
+            atlases_identical: bool | None = None
         elif missing_isotopes:
-            dictionary_status = "partially_initialized"
-            dictionaries_identical = False if len(dictionary_groups) > 1 else None
+            atlas_status = "partially_initialized"
+            atlases_identical = False if len(atlas_groups) > 1 else None
         else:
-            dictionary_status = "complete"
-            dictionaries_identical = len(dictionary_groups) == 1
-        grouped_dictionaries = sorted(
-            dictionary_groups.values(),
-            key=lambda item: str(item["ordered_centers_areas_sha256"]),
+            atlas_status = "complete"
+            atlases_identical = len(atlas_groups) == 1
+        grouped_atlases = sorted(
+            atlas_groups.values(),
+            key=lambda item: str(item["surface_atlas_contract_sha256"]),
         )
-        for group in grouped_dictionaries:
+        for group in grouped_atlases:
             group["isotopes"] = sorted(str(value) for value in group["isotopes"])
 
         birth_weight = float(self.pf_config.structural_rj_birth_probability)
@@ -237,12 +237,18 @@ class PurePFEstimator(_PFEstimatorCore):
         interior_birth = birth_weight / interior_total if interior_total > 0.0 else 0.0
         interior_death = death_weight / interior_total if interior_total > 0.0 else 0.0
         max_cardinality = None if not support else int(support[-1])
+        spectrum_model = self._full_spectrum_model()
+        full_spectrum_hash = getattr(
+            spectrum_model,
+            "contract_hash_sha256",
+            None,
+        )
         manifest_completeness = (
             "complete"
-            if dictionary_status in {"complete", "not_applicable"}
+            if atlas_status in {"complete", "not_applicable"}
             else (
                 "partial"
-                if dictionary_status == "partially_initialized"
+                if atlas_status == "partially_initialized"
                 else "config_only"
             )
         )
@@ -259,15 +265,50 @@ class PurePFEstimator(_PFEstimatorCore):
             "within_cardinality_kernel_exact_mh": True,
             "structural_kernel_exact_rj": variable_cardinality,
             "structural_kernel_family": (
-                "area_weighted_surface_birth_death_rj_mh"
+                "continuous_surface_birth_death_split_merge_rj_mh"
                 if variable_cardinality
                 else "fixed_cardinality_surface_position_strength_mh"
             ),
+            "joint_observation_likelihood": {
+                "isotope_order": list(self.joint_isotope_order()),
+                "vector_layout": "view_major_then_energy_bin",
+                "family": (
+                    "geometry_conditioned_joint_full_spectrum_generative"
+                ),
+                "statistical_covariance_semantics": (
+                    "candidate_complete_statistical_poisson_plus_model"
+                ),
+                "statistical_covariance_usage": "exactly_once",
+                "projected_isotope_count_likelihood": False,
+                "source_transport_layout": (
+                    "particle_view_source_slot_positive_line"
+                ),
+                "transport_feature_order": list(
+                    spectrum_model.transport_feature_order
+                ),
+                "shared_background_owned_by_generative_model": True,
+                "full_spectrum_contract_hash_sha256": full_spectrum_hash,
+            },
             "cardinality_prior": {
                 "support": [int(value) for value in support],
                 "probabilities": [float(value) for value in probabilities],
                 "configuration_source": prior_source,
+                "policy_name": str(
+                    self.pf_config.structural_cardinality_prior_policy
+                ),
+                "truncated_poisson_mean_sources_per_isotope": (
+                    float(self.pf_config.structural_cardinality_prior_mean)
+                    if prior_source == "truncated_poisson_surface_process"
+                    else None
+                ),
+                "fixed_before_observation": True,
                 "applies_independently_per_isotope": True,
+            },
+            "joint_particle_initialization": {
+                "proposal": "direct_independent_isotope_product_prior_iid",
+                "common_outer_weights": "uniform",
+                "isotope_cardinalities_coupled_by_row": False,
+                "per_isotope_stratified_marginal_weights_reused": False,
             },
             "strength_prior": {
                 "kind": "bounded_uniform",
@@ -278,28 +319,38 @@ class PurePFEstimator(_PFEstimatorCore):
                     self.pf_config.strength_prior_max_cps_1m
                 ),
                 "units": "detector_cps_1m",
-                "unit_definition": ("expected_net_detector_count_rate_at_1m"),
+                "unit_definition": (
+                    "expected_pre_dead_time_detector_pulse_rate_at_1m"
+                ),
                 "used_for_initialization": True,
                 "shared_by_initialization_and_state_moves": True,
             },
-            "surface_set_prior": {
+            "surface_position_prior": {
                 "support": "environment_surface",
-                "semantics": "area_product_distinct_patch_sets",
-                "probability_mass": (
-                    "product(patch_area_m2)/elementary_symmetric_normalizer(K)"
+                "semantics": (
+                    "iid_uniform_physical_surface_area_canonical_unordered"
                 ),
                 "used_for_initialization": True,
-                "canonical_strictly_increasing_patch_indices": True,
-                "duplicate_patch_indices_allowed": False,
-                "patch_spacing_m": float(self.pf_config.structural_rj_patch_spacing_m),
-                "dictionary_hash_encoding": (
-                    "ordered_centers_xyz_and_areas_m2_float64_little_endian_v1"
+                "canonical_order": "surface_chart_id_then_continuous_u_v",
+                "canonical_density_factor": "K_factorial",
+                "same_chart_sources_allowed": True,
+                "continuous_uv_support": True,
+                "chart_max_edge_m": float(
+                    self.pf_config.structural_rj_surface_chart_max_edge_m
                 ),
-                "dictionary_status": dictionary_status,
+                "chart_tessellation_role": (
+                    "coordinates_continuous_max_edge_topology_only"
+                ),
+                "support_quantization": False,
+                "continuous_coordinates_within_each_chart": True,
+                "atlas_hash_encoding": (
+                    "ordered_complete_chart_geometry_canonical_little_endian_v1"
+                ),
+                "atlas_status": atlas_status,
                 "configured_isotopes": configured_isotopes,
                 "missing_isotopes": sorted(missing_isotopes),
-                "dictionaries_identical_across_isotopes": (dictionaries_identical),
-                "dictionary_groups": grouped_dictionaries,
+                "atlases_identical_across_isotopes": (atlases_identical),
+                "atlas_groups": grouped_atlases,
             },
             "rj_move_kernel": {
                 "enabled": True,
@@ -323,20 +374,97 @@ class PurePFEstimator(_PFEstimatorCore):
                     self.pf_config.structural_rj_position_move_probability
                 ),
                 "position_move_proposal": (
-                    "area_weighted_conditional_prior_independence"
+                    "joint_state_independent_surface_and_chart_conditional_"
+                    "strength_independence_mh"
                 ),
+                "position_proposal_prior_component_probability": float(
+                    self.pf_config
+                    .structural_rj_position_proposal_prior_weight
+                ),
+                "position_proposal_data_component": (
+                    "background_whitened_non_target_line_subspace_"
+                    "matched_filter_v1"
+                ),
+                "position_proposal_alignment_residual": (
+                    "observed_full_spectrum_minus_shared_model_background_"
+                    "after_fixed_non_target_line_subspace_projection"
+                ),
+                "position_proposal_alignment_response": (
+                    "target_isotope_positive_transport_lines_only_at_chart_"
+                    "centers_for_proposal_scoring"
+                ),
+                "position_proposal_state_dependence": (
+                    "observations_target_beta_and_immutable_known_model_only_"
+                    "never_current_particle_population"
+                ),
+                "position_proposal_chart_conditional": (
+                    "continuous_uniform_unit_square_uv"
+                ),
+                "position_proposal_full_support": True,
+                "position_proposal_fixed_per_structural_sweep": True,
+                "position_proposal_reverse_density": (
+                    "same_state_independent_mixture_for_all_directions"
+                ),
+                "position_proposal_target_response": (
+                    "direct_continuous_xyz_kernel_without_chart_interpolation"
+                ),
+                "strength_proposal": (
+                    "bounded_uniform_prior_plus_chart_conditional_truncated_"
+                    "normal_mixture"
+                ),
+                "strength_proposal_prior_component_probability": float(
+                    self.pf_config
+                    .structural_rj_strength_proposal_prior_weight
+                ),
+                "strength_proposal_sigma_fraction": float(
+                    self.pf_config
+                    .structural_rj_strength_proposal_sigma_fraction
+                ),
+                "strength_proposal_grid_size": int(
+                    self.pf_config.structural_rj_strength_proposal_grid_size
+                ),
+                "proposal_score_cache": {
+                    "unit": "isotope_station_chart_strength_grid",
+                    "stores_spectra_or_particle_state": False,
+                    "maximum_bytes": int(
+                        self.pf_config
+                        .structural_rj_proposal_score_cache_max_bytes
+                    ),
+                },
                 "local_position_move_attempt_probability": float(
                     self.pf_config.structural_rj_local_position_move_probability
                 ),
                 "local_position_move_proposal": (
-                    "uniform_unoccupied_physical_surface_neighbor"
+                    "gaussian_tangent_geodesic_via_shared_edge_portals"
                 ),
                 "local_position_reverse_correction": (
-                    "forward_available_degree_over_reverse_available_degree"
+                    "log_source_chart_area_over_destination_chart_area"
                 ),
-                "global_position_move_retained_for_irreducibility": True,
+                "local_position_physical_area_jacobian": 1.0,
+                "local_position_invalid_trace": (
+                    "explicit_self_transition_without_redraw"
+                ),
+                "local_position_sigma_m": float(
+                    self.pf_config.structural_rj_local_position_sigma_m
+                ),
+                "global_joint_position_strength_move_retained_for_"
+                "irreducibility": True,
                 "strength_move_attempt_probability": float(
                     self.pf_config.structural_rj_strength_move_probability
+                ),
+                "split_merge_attempt_probability": float(
+                    self.pf_config.structural_rj_split_merge_probability
+                ),
+                "split_merge_direction_weights": {
+                    "split": float(
+                        self.pf_config.structural_rj_split_probability
+                    ),
+                    "merge": float(
+                        self.pf_config.structural_rj_merge_probability
+                    ),
+                },
+                "split_merge_strength_map": (
+                    "strength_transfer_with_exact_total_strength_jacobian"
                 ),
                 "boundary_normalization": {
                     "rule": ("renormalize_admissible_birth_death_direction_weights"),
@@ -352,8 +480,24 @@ class PurePFEstimator(_PFEstimatorCore):
                     ),
                 },
                 "dimension_matching": {
-                    "absolute_jacobian_determinant": 1.0,
-                    "log_absolute_jacobian_determinant": 0.0,
+                    "birth_death": {
+                        "absolute_jacobian_determinant": 1.0,
+                        "log_absolute_jacobian_determinant": 0.0,
+                    },
+                    "split": {
+                        "absolute_jacobian_determinant": "total_strength",
+                        "log_absolute_jacobian_determinant": (
+                            "log_total_strength"
+                        ),
+                    },
+                    "merge": {
+                        "absolute_jacobian_determinant": (
+                            "1_over_merged_total_strength"
+                        ),
+                        "log_absolute_jacobian_determinant": (
+                            "minus_log_merged_total_strength"
+                        ),
+                    },
                 },
             },
         }
@@ -370,16 +514,319 @@ class PurePFEstimator(_PFEstimatorCore):
             )
         return result
 
+    def _joint_cardinality_partition(
+        self,
+    ) -> tuple[
+        tuple[str, ...],
+        NDArray[np.float64],
+        NDArray[np.int64],
+        NDArray[np.int64],
+        NDArray[np.int64],
+        NDArray[np.float64],
+    ]:
+        """Return the strict aligned-particle partition by joint K tuple."""
+        if not self.filters:
+            raise PurePFBoundaryError(
+                "Joint cardinality mass requires initialized isotope filters."
+            )
+        isotope_order = self.joint_isotope_order()
+        self._assert_joint_particle_alignment()
+        particle_count = len(
+            self.filters[isotope_order[0]].continuous_particles
+        )
+        weights = validated_probability_distribution(
+            self.filters[isotope_order[0]].continuous_weights,
+            name="aligned joint PF particle weights",
+        )
+        cardinalities = np.column_stack(
+            [
+                np.asarray(
+                    [
+                        particle.state.num_sources
+                        for particle in self.filters[
+                            isotope
+                        ].continuous_particles
+                    ],
+                    dtype=np.int64,
+                )
+                for isotope in isotope_order
+            ]
+        )
+        if cardinalities.shape != (particle_count, len(isotope_order)):
+            raise PurePFBoundaryError(
+                "Aligned joint PF cardinalities have an invalid shape."
+            )
+        if (
+            np.any(cardinalities < 0)
+            or np.any(cardinalities > int(self.pf_config.max_sources or 0))
+        ):
+            raise PurePFBoundaryError(
+                "Aligned joint PF cardinalities lie outside configured support."
+            )
+        joint_cardinality_vectors, inverse = np.unique(
+            cardinalities,
+            axis=0,
+            return_inverse=True,
+        )
+        joint_mass = validated_probability_distribution(
+            np.bincount(
+                inverse,
+                weights=weights,
+                minlength=joint_cardinality_vectors.shape[0],
+            ),
+            name="joint cardinality posterior mass",
+        )
+        return (
+            isotope_order,
+            weights,
+            cardinalities,
+            joint_cardinality_vectors,
+            np.asarray(inverse, dtype=np.int64),
+            joint_mass,
+        )
+
+    def posterior_joint_cardinality_distribution(
+        self,
+    ) -> dict[tuple[int, ...], float]:
+        """Return posterior mass over joint K tuples in ``joint_isotope_order``."""
+        if not self.filters:
+            return {}
+        (
+            _isotope_order,
+            _weights,
+            _cardinalities,
+            joint_cardinality_vectors,
+            _inverse,
+            joint_mass,
+        ) = self._joint_cardinality_partition()
+        return {
+            tuple(int(value) for value in vector): float(mass)
+            for vector, mass in zip(
+                joint_cardinality_vectors,
+                joint_mass,
+                strict=True,
+            )
+        }
+
+    def _joint_map_cardinality_selection(
+        self,
+    ) -> tuple[
+        tuple[str, ...],
+        NDArray[np.float64],
+        NDArray[np.int64],
+        NDArray[np.int64],
+        float,
+    ]:
+        """Return the deterministic joint-MAP stratum and its posterior mass."""
+        (
+            isotope_order,
+            weights,
+            _cardinalities,
+            joint_cardinality_vectors,
+            inverse,
+            joint_mass,
+        ) = self._joint_cardinality_partition()
+        maximum_mass = float(np.max(joint_mass))
+        tied_vectors = np.flatnonzero(
+            np.isclose(
+                joint_mass,
+                maximum_mass,
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+        )
+        joint_vector_index = int(tied_vectors[0])
+        selected_indices = np.flatnonzero(
+            inverse == joint_vector_index
+        ).astype(np.int64, copy=False)
+        return (
+            isotope_order,
+            weights,
+            joint_cardinality_vectors,
+            selected_indices,
+            maximum_mass,
+        )
+
+    def _posterior_reporting_particle_indices(
+        self,
+    ) -> NDArray[np.int64] | None:
+        """Keep uncertainty summaries in the canonical joint-MAP stratum."""
+        if not self.filters:
+            return None
+        return self._joint_map_cardinality_selection()[3].copy()
+
     def posterior_point_estimate(self) -> dict[str, PFPointEstimate]:
-        """Return deterministic PF point estimates and uncertainty."""
+        """Return one coherent joint-particle configuration and uncertainty."""
+        if not self.filters:
+            return {}
+        (
+            isotope_order,
+            weights,
+            joint_cardinality_vectors,
+            selected_indices,
+            maximum_mass,
+        ) = self._joint_map_cardinality_selection()
+        selected_cardinality_vector = np.asarray(
+            [
+                self.filters[isotope].continuous_particles[
+                    int(selected_indices[0])
+                ].state.num_sources
+                for isotope in isotope_order
+            ],
+            dtype=np.int64,
+        )
+        matching_vectors = np.flatnonzero(
+            np.all(
+                joint_cardinality_vectors
+                == selected_cardinality_vector[None, :],
+                axis=1,
+            )
+        )
+        if matching_vectors.size != 1:
+            raise PurePFBoundaryError(
+                "Joint-MAP cardinality stratum has no unique support vector."
+            )
+        joint_vector_index = int(matching_vectors[0])
+        selected_weights = validated_probability_distribution(
+            weights[selected_indices] / maximum_mass,
+            name="selected joint-cardinality conditional weights",
+        )
+        joint_configuration_distance = np.zeros(
+            selected_indices.size,
+            dtype=np.float64,
+        )
+        for isotope_index, isotope in enumerate(isotope_order):
+            cardinality = int(
+                joint_cardinality_vectors[
+                    joint_vector_index,
+                    isotope_index,
+                ]
+            )
+            if cardinality == 0:
+                continue
+            filt = self.filters[isotope]
+            atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+            if atlas is None:
+                raise PurePFBoundaryError(
+                    "Joint posterior reporting requires the shared continuous "
+                    "surface atlas."
+                )
+            selected_states = [
+                filt.continuous_particles[
+                    int(index)
+                ].state
+                for index in selected_indices
+            ]
+            positions = np.stack(
+                [
+                    np.asarray(
+                        filt.continuous_state_positions(state)[:cardinality],
+                        dtype=np.float64,
+                    )
+                    for state in selected_states
+                ],
+                axis=0,
+            )
+            strengths = np.stack(
+                [
+                    np.asarray(
+                        state.strengths[:cardinality],
+                        dtype=np.float64,
+                    )
+                    for state in selected_states
+                ],
+                axis=0,
+            )
+            chart_ids = np.stack(
+                [
+                    np.asarray(
+                        state.surface_chart_ids[:cardinality],
+                        dtype=np.int64,
+                    )
+                    for state in selected_states
+                ],
+                axis=0,
+            )
+            surface_uv = np.stack(
+                [
+                    np.asarray(
+                        state.surface_uv[:cardinality],
+                        dtype=np.float64,
+                    )
+                    for state in selected_states
+                ],
+                axis=0,
+            )
+            (
+                _,
+                _,
+                aligned_chart_ids,
+                aligned_surface_uv,
+            ) = align_surface_modes_batched(
+                positions,
+                strengths,
+                chart_ids,
+                surface_uv,
+                selected_weights,
+                atlas.surface_coordinate_path_distance_upper_bound_m,
+            )
+            joint_configuration_distance += (
+                surface_configuration_medoid_distance_batched(
+                    aligned_chart_ids,
+                    aligned_surface_uv,
+                    selected_weights,
+                    atlas.surface_coordinate_path_distance_upper_bound_m,
+                )
+            )
+        minimum_distance = float(np.min(joint_configuration_distance))
+        tied_rows = np.flatnonzero(
+            np.isclose(
+                joint_configuration_distance,
+                minimum_distance,
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+        )
+        representative_local_index = int(
+            tied_rows[np.argmax(selected_weights[tied_rows])]
+        )
+        representative_particle_index = int(
+            selected_indices[representative_local_index]
+        )
         result: dict[str, PFPointEstimate] = {}
-        for isotope, filt in self.filters.items():
+        for isotope in isotope_order:
+            filt = self.filters[isotope]
             states = [particle.state for particle in filt.continuous_particles]
+            atlas = getattr(filt, "_structural_rj_surface_atlas", None)
+            filt.validate_continuous_surface_states()
+            if atlas is None:
+                raise PurePFBoundaryError(
+                    "Pure-PF reporting requires a continuous surface atlas."
+                )
             result[str(isotope)] = posterior_point_estimate_from_states(
                 states,
-                np.asarray(filt.continuous_weights, dtype=float),
+                weights,
                 max_cardinality=self.pf_config.max_sources,
-                position_projector=filt._project_positions_to_source_prior,
+                positions_by_state=[
+                    filt.continuous_state_positions(state)
+                    for state in states
+                ],
+                surface_chart_ids_by_state=[
+                    np.asarray(state.surface_chart_ids, dtype=np.int64)
+                    for state in states
+                ],
+                surface_uv_by_state=[
+                    np.asarray(state.surface_uv, dtype=np.float64)
+                    for state in states
+                ],
+                surface_coordinate_path_distance=(
+                    atlas.surface_coordinate_path_distance_upper_bound_m
+                ),
+                selected_particle_indices=selected_indices,
+                representative_particle_index=(
+                    representative_particle_index
+                ),
+                selected_stratum_mass=maximum_mass,
             )
         return result
 
@@ -423,11 +870,14 @@ class PurePFEstimator(_PFEstimatorCore):
                 continue
             result[isotope] = (
                 np.asarray(
-                    [mode.position_mean_xyz for mode in point_estimate.modes],
+                    [mode.position_medoid_xyz for mode in point_estimate.modes],
                     dtype=float,
                 ),
                 np.asarray(
-                    [mode.strength_mean_cps_1m for mode in point_estimate.modes],
+                    [
+                        mode.strength_representative_cps_1m
+                        for mode in point_estimate.modes
+                    ],
                     dtype=float,
                 ),
             )
@@ -441,6 +891,8 @@ class PurePFEstimator(_PFEstimatorCore):
 
     def serialized_state(self) -> bytes:
         """Return canonical bytes for causality and determinism tests."""
+        if self.filters:
+            self._assert_joint_particle_alignment()
         isotope_payload: dict[str, Any] = {}
         for isotope, filt in sorted(self.filters.items()):
             particles: list[dict[str, Any]] = []
@@ -449,30 +901,36 @@ class PurePFEstimator(_PFEstimatorCore):
                 particles.append(
                     {
                         "log_weight": float(particle.log_weight),
+                        "joint_row_identity": (
+                            None
+                            if particle.joint_row_identity is None
+                            else particle.joint_row_identity.to_dict()
+                        ),
                         "num_sources": int(state.num_sources),
-                        "positions": np.asarray(state.positions, dtype=float),
                         "strengths": np.asarray(state.strengths, dtype=float),
-                        "background": float(state.background),
+                        "surface_chart_ids": np.asarray(
+                            state.surface_chart_ids,
+                            dtype=np.int64,
+                        ),
+                        "surface_uv": np.asarray(
+                            state.surface_uv,
+                            dtype=np.float64,
+                        ),
                     }
                 )
             isotope_payload[str(isotope)] = particles
         measurement_history = [
             {
-                "z_k": measurement.z_k,
+                "spectrum_counts_b": measurement.spectrum_counts_b,
                 "pose_idx": int(measurement.pose_idx),
                 "fe_index": measurement.fe_index,
                 "pb_index": measurement.pb_index,
                 "detector_position_xyz_m": measurement.detector_position_xyz_m,
                 "live_time_s": float(measurement.live_time_s),
-                "z_variance_k": measurement.z_variance_k,
-                "z_covariance_k": measurement.z_covariance_k,
                 "station_sequence_id": measurement.station_sequence_id,
                 "station_view_index": measurement.station_view_index,
-                "runtime_likelihood_route_by_isotope": (
-                    measurement.runtime_likelihood_route_by_isotope
-                ),
-                "station_view_covariance_by_isotope": (
-                    measurement.station_view_covariance_by_isotope
+                "generative_contract_hash_sha256": (
+                    measurement.generative_contract_hash_sha256
                 ),
             }
             for measurement in self.measurements
@@ -490,6 +948,39 @@ class PurePFEstimator(_PFEstimatorCore):
                 ],
                 "measurement_history_sha256": sha256_json(measurement_history),
                 "pure_pf_schema_version": PURE_PF_SCHEMA_VERSION,
+                "joint_row_identity_contract": {
+                    "schema_version": 1,
+                    "root_sha256": self._joint_row_identity_root_sha256,
+                    "generation": self._joint_row_generation,
+                    "cumulative_lineage_ids": (
+                        None
+                        if self._joint_cumulative_lineage_ids is None
+                        else np.asarray(
+                            self._joint_cumulative_lineage_ids,
+                            dtype=np.int64,
+                        )
+                    ),
+                },
+                "rng_provenance": self.rng_provenance,
+                "rng_states": {
+                    "joint": self._joint_random_generator.bit_generator.state,
+                    "isotope_conditionals": {
+                        str(isotope): filt._random_generator.bit_generator.state
+                        for isotope, filt in sorted(self.filters.items())
+                    },
+                },
+                "full_spectrum_generative_contract": {
+                    "contract_hash_sha256": (
+                        self._full_spectrum_model().contract_hash_sha256
+                    ),
+                    "energy_axis_keV": np.asarray(
+                        self._full_spectrum_model().energy_axis_keV,
+                        dtype=np.float64,
+                    ),
+                    "transport_feature_order": list(
+                        self._full_spectrum_model().transport_feature_order
+                    ),
+                },
                 "isotopes": isotope_payload,
             }
         )

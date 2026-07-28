@@ -11,10 +11,13 @@ from numpy.typing import NDArray
 from scipy.optimize import linear_sum_assignment
 
 from measurement.source_surfaces import SOURCE_SURFACE_REPORT_LABELS
+from measurement.surface_charts import surface_chart_geometry_sha256
+from pf.surface_atlas import ContinuousSurfaceAtlas
 
 POSITION_ERROR_TARGET_M = 0.5
 SURFACE_LABELS = SOURCE_SURFACE_REPORT_LABELS
 ROOM_SURFACE_LABELS = ("floor", "wall", "ceiling")
+PROBABILITY_ROUNDOFF_ATOL = 1.0e-12
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,21 @@ def _non_negative_finite(value: Any, *, name: str) -> float:
     if not np.isfinite(numeric) or numeric < 0.0:
         raise ValueError(f"{name} must be finite and non-negative.")
     return numeric
+
+
+def _unit_interval_probability(value: Any, *, name: str) -> float:
+    """Return a probability, clipping only floating-point boundary roundoff."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite and in [0, 1].") from exc
+    if (
+        not np.isfinite(numeric)
+        or numeric < -PROBABILITY_ROUNDOFF_ATOL
+        or numeric > 1.0 + PROBABILITY_ROUNDOFF_ATOL
+    ):
+        raise ValueError(f"{name} must be finite and in [0, 1].")
+    return float(np.clip(numeric, 0.0, 1.0))
 
 
 def _extract_strength(obj: Any) -> float | None:
@@ -131,6 +149,38 @@ def _pairwise_distances(
     return distances
 
 
+def _pairwise_surface_path_distances(
+    gt: Sequence[Source],
+    est: Sequence[Source],
+    surface_atlas: ContinuousSurfaceAtlas,
+) -> NDArray[np.float64]:
+    """Return pairwise intrinsic distances on one authoritative surface atlas."""
+    if not gt or not est:
+        return np.zeros((len(gt), len(est)), dtype=np.float64)
+    gt_positions = np.vstack([source.pos for source in gt])
+    est_positions = np.vstack([source.pos for source in est])
+    gt_chart_ids, gt_uv = surface_atlas.locate_positions(gt_positions)
+    est_chart_ids, est_uv = surface_atlas.locate_positions(est_positions)
+    distances = np.asarray(
+        surface_atlas.surface_coordinate_path_distance_upper_bound_m(
+            gt_chart_ids[:, None],
+            gt_uv[:, None, :],
+            est_chart_ids[None, :],
+            est_uv[None, :, :],
+        ),
+        dtype=np.float64,
+    )
+    if (
+        distances.shape != (len(gt), len(est))
+        or np.any(np.isnan(distances))
+        or np.any(distances < 0.0)
+    ):
+        raise ValueError(
+            "Surface-atlas source distances must be nonnegative or infinity."
+        )
+    return distances
+
+
 def _hungarian_assignment(cost: NDArray[np.float64]) -> List[Tuple[int, int]]:
     """Return deterministic minimal-cost Hungarian assignment pairs."""
     if cost.size == 0:
@@ -152,8 +202,10 @@ def _gated_distance_assignment(
         raise ValueError("distances must be a two-dimensional matrix.")
     if distance_matrix.size == 0:
         return []
-    if np.any(~np.isfinite(distance_matrix)) or np.any(distance_matrix < 0.0):
-        raise ValueError("distances must be finite and non-negative.")
+    if np.any(np.isnan(distance_matrix)) or np.any(distance_matrix < 0.0):
+        raise ValueError(
+            "distances must be non-negative finite values or infinity."
+        )
     radius = _non_negative_finite(radius_m, name="matching radius")
     valid = distance_matrix <= radius
     assignment_count = min(distance_matrix.shape)
@@ -979,9 +1031,10 @@ def _uncertainty_coverage_summary(
         if mass_raw is None:
             missing_mass_count += 1
             continue
-        mass = float(mass_raw)
-        if not np.isfinite(mass) or not 0.0 <= mass <= 1.0:
-            raise ValueError("Posterior existence mass must be finite and in [0, 1].")
+        mass = _unit_interval_probability(
+            mass_raw,
+            name="Posterior existence mass",
+        )
         existence_probabilities.append(mass)
         existence_labels.append(int(est_index in matched_est))
     unmatched_truth_count = int(len(gt) - matched_count)
@@ -1063,6 +1116,7 @@ def _isotope_confusion_summary(
     est_by_iso: Mapping[str, Sequence[Source]],
     *,
     match_radius_m: float,
+    surface_atlas: ContinuousSurfaceAtlas | None = None,
 ) -> Dict[str, Any]:
     """Return global spatial matching and the resulting isotope confusion matrix."""
     isotopes = sorted(set(gt_by_iso) | set(est_by_iso))
@@ -1082,11 +1136,17 @@ def _isotope_confusion_summary(
     }
     matrix["false_positive"] = {prediction: 0 for prediction in (*isotopes, "missed")}
     if gt_flat and est_flat:
-        gt_positions = np.vstack([source.pos for _, source in gt_flat])
-        est_positions = np.vstack([source.pos for _, source in est_flat])
-        distances = np.linalg.norm(
-            gt_positions[:, None, :] - est_positions[None, :, :],
-            axis=2,
+        distances = (
+            _pairwise_distances(
+                [source for _, source in gt_flat],
+                [source for _, source in est_flat],
+            )
+            if surface_atlas is None
+            else _pairwise_surface_path_distances(
+                [source for _, source in gt_flat],
+                [source for _, source in est_flat],
+                surface_atlas,
+            )
         )
         assignments = _gated_distance_assignment(
             distances,
@@ -1128,19 +1188,17 @@ def compute_metrics(
     *,
     match_radius_m: float,
     distance_thresholds_m: Sequence[float] = (0.5, 1.0, 2.0, 3.0),
-    match_strength_weight: float = 2.0,
-    match_distance_weight: float = 1.0,
-    outside_radius_penalty: float = 1e3,
     close_pair_distance_m: float = 2.0,
     close_pair_min_estimated_separation_m: float = 0.5,
     uncertainty_by_iso: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    surface_atlas: ContinuousSurfaceAtlas | None = None,
 ) -> Dict[str, Any]:
-    """Compute distance-gated source, surface, and uncertainty metrics.
+    """Compute surface-gated source, Cartesian, and uncertainty metrics.
 
-    The standard association is predeclared as a distance-only maximum-cardinality
-    gated Hungarian match.  The same association is used for both position and
-    strength errors.  Historical strength-weight arguments remain accepted for
-    API compatibility but do not influence the standard association.
+    Production evaluation supplies the exact PF/truth surface atlas and uses
+    intrinsic surface-path distance for the standard maximum-cardinality gate.
+    Cartesian XYZ error remains reported as a secondary localization metric.
+    Tests and explicitly atlas-free callers retain Euclidean association.
     """
     eps = 1e-12
     match_radius = _non_negative_finite(match_radius_m, name="match_radius_m")
@@ -1156,25 +1214,12 @@ def compute_metrics(
         _non_negative_finite(value, name="distance threshold")
         for value in distance_thresholds_m
     ]
-    legacy_parameters = {
-        "match_strength_weight": _non_negative_finite(
-            match_strength_weight,
-            name="match_strength_weight",
-        ),
-        "match_distance_weight": _non_negative_finite(
-            match_distance_weight,
-            name="match_distance_weight",
-        ),
-        "outside_radius_penalty": _non_negative_finite(
-            outside_radius_penalty,
-            name="outside_radius_penalty",
-        ),
-    }
     isotopes = sorted(set(gt_by_iso.keys()) | set(est_by_iso.keys()))
     metrics: Dict[str, Dict[str, Any]] = {}
     normalized_gt: Dict[str, List[Source]] = {}
     normalized_est: Dict[str, List[Source]] = {}
     global_position_errors: List[float] = []
+    global_surface_path_errors: List[float] = []
     global_xy_errors: List[float] = []
     global_z_errors: List[float] = []
     global_abs_strength_errors: List[float] = []
@@ -1209,22 +1254,52 @@ def compute_metrics(
         est = _normalize_sources(est_by_iso.get(iso, []))
         normalized_gt[iso] = gt
         normalized_est[iso] = est
-        dist = _pairwise_distances(gt, est)
-        assigned_all_pairs = _hungarian_assignment(dist)
-        matched_pairs = _gated_distance_assignment(dist, radius_m=match_radius)
-        matched = [(i, j, float(dist[i, j])) for i, j in matched_pairs]
+        euclidean_dist = _pairwise_distances(gt, est)
+        association_dist = (
+            euclidean_dist
+            if surface_atlas is None
+            else _pairwise_surface_path_distances(
+                gt,
+                est,
+                surface_atlas,
+            )
+        )
+        assigned_all_pairs = _hungarian_assignment(euclidean_dist)
+        matched_pairs = _gated_distance_assignment(
+            association_dist,
+            radius_m=match_radius,
+        )
+        matched = [
+            (i, j, float(association_dist[i, j]))
+            for i, j in matched_pairs
+        ]
         assigned_all_details = [
             {
                 "gt_index": int(i),
                 "est_index": int(j),
-                "distance": float(dist[i, j]),
-                "within_radius": bool(float(dist[i, j]) <= match_radius),
+                "distance": float(euclidean_dist[i, j]),
+                "surface_path_distance": (
+                    None
+                    if surface_atlas is None
+                    else (
+                        None
+                        if not np.isfinite(association_dist[i, j])
+                        else float(association_dist[i, j])
+                    )
+                ),
+                "within_radius": bool(
+                    float(association_dist[i, j]) <= match_radius
+                ),
             }
             for i, j in assigned_all_pairs
         ]
         fp = max(0, len(est) - len(matched))
         fn = max(0, len(gt) - len(matched))
-        pos_errors = [d for _, _, d in matched]
+        surface_path_errors = [d for _, _, d in matched]
+        pos_errors = [
+            float(euclidean_dist[i, j])
+            for i, j, _ in matched
+        ]
         localized_tp = int(len(matched))
         localized_fp = max(0, len(est) - localized_tp)
         localized_fn = max(0, len(gt) - localized_tp)
@@ -1239,7 +1314,8 @@ def compute_metrics(
         rel_errors: List[float] = []
         signed_rel_errors: List[float] = []
         match_details: List[Dict[str, Any]] = []
-        for i, j, d in matched:
+        for i, j, surface_distance in matched:
+            d = float(euclidean_dist[i, j])
             q_true = float(gt[i].strength)
             q_hat = float(est[j].strength)
             abs_err = abs(q_hat - q_true)
@@ -1258,6 +1334,12 @@ def compute_metrics(
                     "gt_index": i,
                     "est_index": j,
                     "distance": d,
+                    "surface_path_distance": surface_distance,
+                    "matching_distance": (
+                        "intrinsic_surface_path_upper_bound_m"
+                        if surface_atlas is not None
+                        else "euclidean_3d_m"
+                    ),
                     "xy_distance": xy_err,
                     "z_abs_error": z_err,
                     "within_radius": True,
@@ -1273,7 +1355,7 @@ def compute_metrics(
         hotspot_summary = _hotspot_distance_summary(gt, est)
         if gt and est:
             global_hotspot_distances.extend(
-                float(value) for value in np.min(dist, axis=0)
+                float(value) for value in np.min(euclidean_dist, axis=0)
             )
         close_pair_summary = _close_pair_separation_summary(
             gt,
@@ -1342,10 +1424,13 @@ def compute_metrics(
             "threshold_counts": _threshold_count_summary(
                 gt_count=len(gt),
                 est_count=len(est),
-                distances=dist,
+                distances=association_dist,
                 thresholds_m=thresholds,
             ),
             "position_error": _position_error_summary(pos_errors),
+            "surface_path_error": _position_error_summary(
+                surface_path_errors
+            ),
             "xy_error": _summary_stats(xy_errors),
             "z_abs_error": _summary_abs(z_errors),
             "hotspot_to_ground_truth_distance": hotspot_summary,
@@ -1360,6 +1445,7 @@ def compute_metrics(
             "assigned_all_matches": assigned_all_details,
         }
         global_position_errors.extend(pos_errors)
+        global_surface_path_errors.extend(surface_path_errors)
         global_xy_errors.extend(xy_errors)
         global_z_errors.extend(z_errors)
         global_abs_strength_errors.extend(abs_errors)
@@ -1566,6 +1652,9 @@ def compute_metrics(
     global_summary = {
         "available": bool(isotopes),
         "position_error": _position_error_summary(global_position_errors),
+        "surface_path_error": _position_error_summary(
+            global_surface_path_errors
+        ),
         "xy_error": _summary_stats(global_xy_errors),
         "z_abs_error": _summary_abs(global_z_errors),
         "hotspot_to_ground_truth_distance": {
@@ -1698,6 +1787,7 @@ def compute_metrics(
             normalized_gt,
             normalized_est,
             match_radius_m=match_radius,
+            surface_atlas=surface_atlas,
         ),
     }
     return {
@@ -1707,7 +1797,22 @@ def compute_metrics(
         "close_pair_min_estimated_separation_m": close_pair_minimum,
         "matching_policy": {
             "algorithm": "maximum_cardinality_distance_only_gated_hungarian",
-            "distance": "euclidean_3d_m",
+            "distance": (
+                "intrinsic_surface_path_upper_bound_m"
+                if surface_atlas is not None
+                else "euclidean_3d_m"
+            ),
+            "cartesian_xyz_error_reported_separately": True,
+            "primary_localization_accuracy_metric": (
+                "surface_path_error"
+                if surface_atlas is not None
+                else "position_error"
+            ),
+            "surface_atlas_sha256": (
+                None
+                if surface_atlas is None
+                else surface_chart_geometry_sha256(surface_atlas.geometry)
+            ),
             "strength_used_for_assignment": False,
             "outside_radius_behavior": "unmatched",
             "standard_match_radius_m": match_radius,
@@ -1716,7 +1821,6 @@ def compute_metrics(
             "assigned_all_interpretation": (
                 "optional ungated distance-only diagnostic; excluded from standard errors"
             ),
-            "legacy_assignment_parameters_ignored": legacy_parameters,
         },
         "global": global_summary,
         "isotopes": metrics,
@@ -1739,6 +1843,7 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
         counts = data["counts"]
         assigned = counts.get("assigned", None)
         pos_err = data["position_error"]
+        surface_err = data.get("surface_path_error", {})
         abs_err = data["intensity_abs_error"]
         rel_err = data["intensity_rel_error_pct"]
         print(f"\n[Isotope: {iso}]")
@@ -1750,7 +1855,15 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
             f"TP={counts['matched']}, FP={counts['fp']}, FN={counts['fn']}"
         )
         print(
-            "  Position error [m]: "
+            "  Surface-path error [m] (primary): "
+            f"mean={_format_value(surface_err.get('mean'))}, "
+            f"median={_format_value(surface_err.get('median'))}, "
+            f"p95={_format_value(surface_err.get('p95'))}, "
+            f"rmse={_format_value(surface_err.get('rmse'))}, "
+            f"max={_format_value(surface_err.get('max'))}"
+        )
+        print(
+            "  Cartesian position error [m] (secondary): "
             f"mean={_format_value(pos_err['mean'])}, "
             f"median={_format_value(pos_err['median'])}, "
             f"p95={_format_value(pos_err.get('p95'))}, "
@@ -1767,9 +1880,9 @@ def print_metrics_report(metrics: Dict[str, Any]) -> None:
             f"z_p95={_format_value(z_err.get('p95'))}"
         )
         print(
-            "  Position target [m]: "
-            f"<={_format_value(pos_err.get('target_m'))}, "
-            f"within_target={pos_err.get('within_target')}"
+            "  Surface-path target [m]: "
+            f"<={_format_value(surface_err.get('target_m'))}, "
+            f"within_target={surface_err.get('within_target')}"
         )
         threshold_counts = data.get("threshold_counts", {})
         if threshold_counts:

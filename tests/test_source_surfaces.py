@@ -6,22 +6,22 @@ import numpy as np
 import pytest
 
 from measurement.model import EnvironmentConfig
-from measurement.continuous_kernels import segment_box_intersection_length_m
 from measurement.obstacles import ObstacleGrid
 from measurement.source_surfaces import (
-    _segment_path_lengths_through_boxes_m,
-    build_surface_candidate_sources,
+    _build_source_surface_atlas,
     generate_surface_sources,
-    is_ground_observable_source_position,
     is_allowed_source_surface_position,
-    project_positions_to_allowed_surfaces,
     source_surface_kind_counts,
     source_surface_kind,
     source_surface_kinds,
-    surface_observable_fractions,
-    surface_response_observability_diagnostics,
     transport_interior_mask,
+    validate_area_uniform_source_config,
 )
+from measurement.surface_charts import (
+    build_surface_chart_geometry,
+    sample_continuous_surface_positions,
+)
+from pf.surface_atlas import ContinuousSurfaceAtlas
 
 
 def test_generate_surface_sources_never_places_sources_in_air_or_obstacles() -> None:
@@ -78,6 +78,20 @@ def test_generate_surface_sources_samples_random_intensity_range() -> None:
     assert len({round(value, 6) for value in strengths}) > 1
 
 
+@pytest.mark.parametrize("count", (0, -1, True, 1.5))
+def test_generate_surface_sources_rejects_invalid_count(count: object) -> None:
+    """Invalid truth cardinality must not silently become one source."""
+    with pytest.raises((TypeError, ValueError), match="positive integer"):
+        generate_surface_sources(
+            env=EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0),
+            obstacle_grid=None,
+            isotopes=("Cs-137",),
+            intensity_cps_1m=30000.0,
+            rng=np.random.default_rng(123),
+            count=count,
+        )
+
+
 def test_generate_surface_sources_rejects_synthetic_obstacle_surfaces() -> None:
     """Truth generation should fail when physical obstacle faces are unknown."""
     env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
@@ -98,263 +112,190 @@ def test_generate_surface_sources_rejects_synthetic_obstacle_surfaces() -> None:
         )
 
 
-def test_generate_surface_sources_separates_same_isotope_sources() -> None:
-    """Random source generation should space repeated isotopes apart."""
-    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
-    min_distance_m = 3.0
-    sources = generate_surface_sources(
-        env=env,
-        obstacle_grid=None,
-        isotopes=("Cs-137", "Cs-137", "Co-60", "Cs-137", "Co-60"),
-        intensity_cps_1m=30000.0,
-        rng=np.random.default_rng(20260603),
-        count=5,
-        preferred_max_z_m=None,
-        same_isotope_min_distance_m=min_distance_m,
-    )
-
-    for isotope in {"Cs-137", "Co-60"}:
-        positions = np.asarray(
-            [source.position for source in sources if source.isotope == isotope],
-            dtype=float,
-        )
-        for left in range(positions.shape[0]):
-            for right in range(left + 1, positions.shape[0]):
-                distance = float(np.linalg.norm(positions[left] - positions[right]))
-                assert distance >= min_distance_m - 1.0e-9
+@pytest.mark.parametrize(
+    "removed_key",
+    (
+        "random_source_preferred_max_z_m",
+        "random_source_max_ceiling_sources",
+        "random_source_visibility_filter",
+        "random_source_response_observability_filter",
+        "random_source_same_isotope_min_distance_m",
+    ),
+)
+def test_area_uniform_source_config_rejects_truth_selection(
+    removed_key: str,
+) -> None:
+    """Every legacy source-selection key should fail even at a neutral value."""
+    with pytest.raises(ValueError, match="were removed"):
+        validate_area_uniform_source_config({removed_key: None})
 
 
-def test_generate_surface_sources_defaults_do_not_prefer_low_surfaces() -> None:
-    """Default truth generation should not cap ceilings or prefer low z."""
-    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
-    sources = generate_surface_sources(
-        env=env,
-        obstacle_grid=None,
-        isotopes=("Cs-137", "Co-60", "Eu-154"),
-        intensity_cps_1m=30000.0,
-        rng=np.random.default_rng(20260530),
-        count=120,
-    )
-    positions = np.asarray([source.position for source in sources], dtype=float)
-    counts = source_surface_kind_counts(positions, env, None)
-
-    assert counts["ceiling"] > 1
-    assert float(np.max(positions[:, 2])) > 5.0
-
-
-def test_generate_surface_sources_ceiling_cap_without_low_z_preference() -> None:
-    """Ceiling caps should be independent from the preferred-height filter."""
-    env = EnvironmentConfig(size_x=10.0, size_y=20.0, size_z=10.0)
-    sources = generate_surface_sources(
-        env=env,
-        obstacle_grid=None,
-        isotopes=("Cs-137",),
-        intensity_cps_1m=30000.0,
-        rng=np.random.default_rng(11),
-        count=120,
-        max_ceiling_sources=0,
-        preferred_max_z_m=None,
-    )
-    positions = np.asarray([source.position for source in sources], dtype=float)
-    counts = source_surface_kind_counts(positions, env, None)
-
-    assert counts["ceiling"] == 0
-
-
-def test_surface_observable_fraction_rejects_obstacle_top_sources() -> None:
-    """Visibility screening should reject sources hidden by their support obstacle."""
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(4, 4),
-        blocked_cells=((1, 1),),
-        transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.0),),
-    )
-    measurement_points = np.array(
-        [
-            [ix + 0.5, iy + 0.5, 0.5]
-            for ix in range(4)
-            for iy in range(4)
-            if grid.is_cell_free((ix, iy))
-        ],
-        dtype=float,
-    )
-    positions = np.array(
-        [
-            [1.5, 1.5, 1.0],
-            [0.5, 0.5, 0.0],
-            [1.0, 1.5, 0.5],
-        ],
-        dtype=float,
-    )
-
-    fractions = surface_observable_fractions(
-        positions,
-        grid,
-        measurement_points,
-        obstacle_height_m=1.0,
-        detector_height_m=0.5,
-    )
-
-    assert fractions[0] < 0.1
-    assert fractions[1] > 0.5
-    assert fractions[2] > fractions[0]
-    assert not is_ground_observable_source_position(
-        positions[0],
-        grid,
-        measurement_points,
-        min_visible_fraction=0.5,
-        obstacle_height_m=1.0,
-    )
-
-
-def test_batched_visibility_path_lengths_match_scalar_box_intersections() -> None:
-    """Batched source-visibility geometry should match the scalar box oracle."""
-    sources = np.array(
-        [
-            [0.0, 0.5, 0.5],
-            [1.5, 1.5, 1.0],
-        ],
-        dtype=float,
-    )
-    detectors = np.array(
-        [
-            [3.0, 0.5, 0.5],
-            [0.5, 3.0, 0.5],
-        ],
-        dtype=float,
-    )
-    boxes = np.array(
-        [
-            [1.0, 0.0, 0.0, 2.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0, 2.0, 2.0, 1.0],
-        ],
-        dtype=float,
-    )
-
-    batched = _segment_path_lengths_through_boxes_m(
-        sources,
-        detectors,
-        boxes,
-        box_chunk_size=1,
-    )
-    scalar = np.zeros_like(batched)
-    for source_index, source in enumerate(sources):
-        for detector_index, detector in enumerate(detectors):
-            scalar[source_index, detector_index] = sum(
-                segment_box_intersection_length_m(source, detector, box)
-                for box in boxes
+def test_area_uniform_source_config_has_one_valid_measure() -> None:
+    """The source-position measure should be fixed rather than tunable."""
+    assert validate_area_uniform_source_config({}) == "continuous_area_uniform"
+    for invalid in (
+        "chart_uniform",
+        " Continuous_Area_Uniform ",
+        "CONTINUOUS_AREA_UNIFORM",
+    ):
+        with pytest.raises(ValueError, match="continuous_area_uniform"):
+            validate_area_uniform_source_config(
+                {"random_source_surface_sampling_measure": invalid}
             )
 
-    assert np.allclose(batched, scalar)
+
+@pytest.mark.parametrize(
+    "isotopes",
+    (
+        "Cs-137",
+        (137,),
+        ("Cs-137", ""),
+    ),
+)
+def test_generate_surface_sources_rejects_coerced_isotopes(
+    isotopes: object,
+) -> None:
+    """Truth isotope identities must never be inferred by string conversion."""
+    with pytest.raises(TypeError, match="isotopes"):
+        generate_surface_sources(
+            env=EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0),
+            obstacle_grid=None,
+            isotopes=isotopes,  # type: ignore[arg-type]
+            intensity_cps_1m=30_000.0,
+            rng=np.random.default_rng(123),
+            count=1,
+        )
 
 
-def test_generate_surface_sources_respects_ground_visibility_filter() -> None:
-    """Random source generation should avoid mostly occluded surface locations."""
-    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+@pytest.mark.parametrize(
+    "intensity",
+    ("30000", True, ("10000", 20_000.0)),
+)
+def test_generate_surface_sources_rejects_coerced_strengths(
+    intensity: object,
+) -> None:
+    """Truth strengths must retain exact detector-cps@1m numeric semantics."""
+    with pytest.raises(TypeError, match="real number"):
+        generate_surface_sources(
+            env=EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0),
+            obstacle_grid=None,
+            isotopes=("Cs-137",),
+            intensity_cps_1m=intensity,  # type: ignore[arg-type]
+            rng=np.random.default_rng(123),
+            count=1,
+        )
+
+
+def test_generate_surface_sources_matches_physical_surface_area_ratios() -> None:
+    """Truth surface-kind frequencies should follow physical area alone."""
+    env = EnvironmentConfig(size_x=4.0, size_y=5.0, size_z=3.0)
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
-        grid_shape=(4, 4),
+        grid_shape=(4, 5),
         blocked_cells=((1, 1),),
-        transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.0),),
+        transport_boxes_m=((1.0, 1.0, 0.0, 2.0, 2.0, 1.5),),
     )
-    measurement_points = np.array(
-        [
-            [ix + 0.5, iy + 0.5, 0.5]
-            for ix in range(4)
-            for iy in range(4)
-            if grid.is_cell_free((ix, iy))
-        ],
-        dtype=float,
-    )
-
+    sample_count = 40_000
     sources = generate_surface_sources(
         env=env,
         obstacle_grid=grid,
+        isotopes=("Cs-137", "Co-60", "Eu-154"),
+        intensity_cps_1m=30000.0,
+        rng=np.random.default_rng(2026072701),
+        count=sample_count,
+        obstacle_height_m=1.5,
+    )
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    kinds = source_surface_kinds(
+        positions,
+        env,
+        grid,
+        obstacle_height_m=1.5,
+    )
+    atlas = _build_source_surface_atlas(
+        env,
+        grid,
+        obstacle_height_m=1.5,
+    )
+    atlas_kinds = np.asarray(atlas.kinds, dtype=object)
+    total_area = float(np.sum(atlas.areas_m2))
+    for kind in sorted(set(atlas.kinds)):
+        expected = float(np.sum(atlas.areas_m2[atlas_kinds == kind])) / total_area
+        observed = float(np.mean(kinds == kind))
+        assert observed == pytest.approx(expected, abs=0.012)
+    assert np.any(kinds == "ceiling")
+    assert np.any(kinds == "obstacle_top")
+    assert np.any(kinds == "obstacle_side")
+
+
+def test_generate_surface_sources_returns_continuous_independent_coordinates() -> None:
+    """Truth positions should not be quantized to atlas chart centers."""
+    env = EnvironmentConfig(size_x=4.0, size_y=5.0, size_z=3.0)
+    sources = generate_surface_sources(
+        env=env,
+        obstacle_grid=None,
         isotopes=("Cs-137",),
         intensity_cps_1m=30000.0,
-        rng=np.random.default_rng(12),
-        count=30,
-        obstacle_height_m=1.0,
-        visibility_measurement_points=measurement_points,
-        visibility_min_fraction=0.5,
-        visibility_detector_height_m=0.5,
-        visibility_batch_size=64,
-        visibility_max_attempts_per_source=1024,
+        rng=np.random.default_rng(2026072702),
+        count=200,
     )
-    fractions = surface_observable_fractions(
-        np.asarray([source.position for source in sources], dtype=float),
-        grid,
-        measurement_points,
-        obstacle_height_m=1.0,
-        detector_height_m=0.5,
-    )
+    positions = np.asarray([source.position for source in sources], dtype=float)
+    atlas = _build_source_surface_atlas(env, None, obstacle_height_m=2.0)
+    deltas = positions[:, None, :] - atlas.centers_xyz[None, :, :]
+    nearest_center_distance = np.min(np.linalg.norm(deltas, axis=2), axis=1)
 
-    assert len(sources) == 30
-    assert np.min(fractions) >= 0.5
-    assert not any(
-        source_surface_kind(source.position, env, grid, obstacle_height_m=1.0)
-        == "obstacle_top"
-        for source in sources
-    )
+    assert np.all(nearest_center_distance > 1.0e-10)
+    assert np.unique(np.round(positions, decimals=10), axis=0).shape[0] == 200
 
 
-def test_surface_response_observability_diagnostics_are_batched() -> None:
-    """Response observability screening should expose source-set conditioning."""
+def test_truth_and_pf_atlases_have_identical_continuous_surface_support() -> None:
+    """Chart max_edge_m must change topology only, never PF surface support."""
+    env = EnvironmentConfig(size_x=5.0, size_y=4.0, size_z=3.0)
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
-        grid_shape=(5, 5),
-        blocked_cells=(),
+        grid_shape=(5, 4),
+        blocked_cells=((1, 1), (3, 2)),
+        transport_boxes_m=(
+            (1.0, 1.0, 0.0, 2.0, 2.0, 1.5),
+            (3.1, 2.1, 0.4, 3.8, 2.8, 2.2),
+        ),
     )
-    measurement_points = np.array(
-        [
-            [0.5, 0.5, 0.5],
-            [4.5, 0.5, 0.5],
-            [0.5, 4.5, 0.5],
-            [4.5, 4.5, 0.5],
-        ],
-        dtype=float,
-    )
-    separated = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [5.0, 5.0, 3.0],
-        ],
-        dtype=float,
-    )
-    duplicated = np.array(
-        [
-            [1.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0],
-        ],
-        dtype=float,
-    )
-
-    separated_stats = surface_response_observability_diagnostics(
-        separated,
+    truth_rectangles = _build_source_surface_atlas(
+        env,
         grid,
-        measurement_points,
-        obstacle_height_m=1.0,
+        obstacle_height_m=2.0,
     )
-    duplicated_stats = surface_response_observability_diagnostics(
-        duplicated,
+    pf_rectangles = build_surface_chart_geometry(
+        env,
         grid,
-        measurement_points,
-        isotopes=("Cs-137", "Cs-137"),
-        obstacle_height_m=1.0,
+        max_edge_m=0.73,
+        obstacle_height_m=2.0,
     )
+    truth_kinds = np.asarray(truth_rectangles.kinds, dtype=object)
+    pf_kinds = np.asarray(pf_rectangles.kinds, dtype=object)
+    for kind in sorted(set(truth_rectangles.kinds) | set(pf_rectangles.kinds)):
+        truth_area = float(
+            np.sum(truth_rectangles.areas_m2[truth_kinds == kind])
+        )
+        pf_area = float(np.sum(pf_rectangles.areas_m2[pf_kinds == kind]))
+        assert pf_area == pytest.approx(truth_area, rel=1.0e-12, abs=1.0e-12)
 
-    assert separated_stats["source_count"] == 2
-    assert separated_stats["reference_point_count"] == 4
-    assert float(separated_stats["condition_number"]) >= 1.0
-    assert float(separated_stats["max_pairwise_correlation"]) < 0.999
-    assert float(duplicated_stats["max_pairwise_correlation"]) > 0.999999
-    assert int(duplicated_stats["same_isotope_pair_count"]) == 1
-    assert (
-        float(duplicated_stats["same_isotope_max_pairwise_correlation"])
-        > 0.999999
+    truth_positions, _ = sample_continuous_surface_positions(
+        truth_rectangles,
+        2_000,
+        np.random.default_rng(2026072703),
+    )
+    pf_atlas = ContinuousSurfaceAtlas(pf_rectangles)
+    chart_ids, uv = pf_atlas.locate_positions(truth_positions)
+    reconstructed = pf_atlas.positions_xyz(chart_ids, uv)
+
+    assert np.allclose(
+        reconstructed,
+        truth_positions,
+        rtol=0.0,
+        atol=1.0e-9,
     )
 
 
@@ -366,6 +307,7 @@ def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:
         cell_size=1.0,
         grid_shape=(10, 20),
         blocked_cells=((3, 4),),
+        transport_boxes_m=((3.0, 4.0, 0.0, 4.0, 5.0, 2.0),),
     )
 
     assert source_surface_kind((5.0, 5.0, 5.0), env, grid) is None
@@ -374,6 +316,32 @@ def test_source_surface_kind_rejects_air_and_obstacle_interior() -> None:
     assert source_surface_kind((3.0, 4.5, 1.0), env, grid) == "obstacle_side"
     assert source_surface_kind((1.5, 1.5, 0.0), env, grid) == "floor"
     assert source_surface_kind((5.0, 20.0, 4.0), env, grid) == "wall"
+
+
+def test_blocked_cells_do_not_invent_source_surfaces_without_geometry() -> None:
+    """Navigation occupancy must not create synthetic source-support faces."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((2, 2),),
+    )
+
+    kinds = source_surface_kinds(
+        np.asarray(
+            [
+                (2.5, 2.5, 1.0),
+                (2.0, 2.5, 0.5),
+                (2.5, 2.5, 0.0),
+            ],
+            dtype=float,
+        ),
+        env,
+        grid,
+    )
+
+    assert kinds.tolist() == [None, None, "floor"]
 
 
 def test_transport_component_interior_is_not_allowed_source_support() -> None:
@@ -405,6 +373,43 @@ def test_transport_component_interior_is_not_allowed_source_support() -> None:
     assert is_allowed_source_surface_position((1.2, 1.5, 0.8), env, grid)
 
 
+def test_transport_solids_hide_room_interfaces_from_source_support() -> None:
+    """A solid-room interface must not be classified as an exposed surface."""
+    env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((0, 1), (2, 2)),
+    ).with_transport_model(
+        boxes_m=(
+            (0.0, 1.0, 0.8, 0.9, 2.0, 1.8),
+            (2.0, 2.0, 2.2, 3.0, 3.0, 3.0),
+        ),
+        mu_by_isotope={"Cs-137": (0.1, 0.1)},
+    )
+    points = np.asarray(
+        [
+            (0.0, 1.5, 1.3),
+            (2.5, 2.5, 3.0),
+            (0.9, 1.5, 1.3),
+            (2.5, 2.5, 2.2),
+        ],
+        dtype=float,
+    )
+
+    kinds = source_surface_kinds(points, env, grid)
+
+    assert kinds.tolist() == [
+        None,
+        None,
+        "obstacle_side",
+        "obstacle_bottom",
+    ]
+    assert not is_allowed_source_surface_position(points[0], env, grid)
+    assert not is_allowed_source_surface_position(points[1], env, grid)
+
+
 def test_source_surface_kinds_matches_scalar_classification() -> None:
     """Vectorized surface classification should match the scalar oracle."""
     env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
@@ -413,6 +418,7 @@ def test_source_surface_kinds_matches_scalar_classification() -> None:
         cell_size=1.0,
         grid_shape=(4, 4),
         blocked_cells=((2, 2),),
+        transport_boxes_m=((2.0, 2.0, 0.0, 3.0, 3.0, 1.0),),
     )
     points = np.array(
         [
@@ -454,68 +460,28 @@ def test_source_surface_kinds_matches_scalar_classification() -> None:
     assert counts["off_surface"] == 2
 
 
-def test_build_surface_candidate_sources_only_returns_allowed_surfaces() -> None:
-    """Surface candidate generation should cover known room and obstacle surfaces."""
-    env = EnvironmentConfig(size_x=2.0, size_y=2.0, size_z=2.0)
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(2, 2),
-        blocked_cells=((1, 1),),
-    )
-
-    candidates = build_surface_candidate_sources(
-        env,
-        grid,
-        spacing=(0.5, 0.5, 0.5),
-        obstacle_height_m=1.0,
-    )
-
-    assert candidates.shape[1] == 3
-    assert candidates.shape[0] > 0
-    assert not np.any(np.all(np.isclose(candidates, (1.5, 1.5, 0.0)), axis=1))
-    kinds = {
-        source_surface_kind(point, env, grid, obstacle_height_m=1.0)
-        for point in candidates
-    }
-    assert None not in kinds
-    assert "wall" in kinds
-    assert "floor" in kinds
-    assert "ceiling" in kinds
-    assert "obstacle_top" in kinds or "obstacle_side" in kinds
-
-
-def test_project_positions_to_allowed_surfaces_uses_nearest_known_surface() -> None:
-    """Position projection should snap off-surface positions to allowed surfaces."""
+@pytest.mark.parametrize(
+    "tolerance",
+    (-1.0, float("nan"), float("inf"), True, "1e-6"),
+)
+def test_source_surface_tolerance_fails_instead_of_clamping(
+    tolerance: object,
+) -> None:
+    """Invalid surface tolerances must not silently change source support."""
     env = EnvironmentConfig(size_x=4.0, size_y=4.0, size_z=3.0)
-    grid = ObstacleGrid(
-        origin=(0.0, 0.0),
-        cell_size=1.0,
-        grid_shape=(4, 4),
-        blocked_cells=((2, 2),),
-    )
-    positions = np.array(
-        [
-            [2.5, 2.5, 0.6],
-            [3.9, 2.0, 1.0],
-            [1.2, 1.4, 1.4],
-        ],
-        dtype=float,
-    )
 
-    projected = project_positions_to_allowed_surfaces(
-        positions,
-        env,
-        grid,
-        obstacle_height_m=1.0,
-    )
-
-    assert projected.shape == positions.shape
-    assert np.allclose(projected[0], [2.5, 2.5, 1.0])
-    for point in projected:
-        assert is_allowed_source_surface_position(
-            point,
+    with pytest.raises((TypeError, ValueError), match="tolerance_m"):
+        source_surface_kinds(
+            np.asarray([[0.0, 1.0, 1.0]], dtype=float),
             env,
-            grid,
-            obstacle_height_m=1.0,
+            tolerance_m=tolerance,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", (True, 1, None))
+def test_area_uniform_measure_requires_an_exact_string(value: object) -> None:
+    """Truth sampling must not stringify a malformed selection measure."""
+    with pytest.raises(TypeError, match="JSON string"):
+        validate_area_uniform_source_config(
+            {"random_source_surface_sampling_measure": value}
         )

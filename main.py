@@ -128,6 +128,12 @@ def _resolve_run_settings(
         matplotlib_live = True
     if args.no_live or args.headless:
         matplotlib_live = False
+    default_backend = str(defaults["sim_backend"])
+    if args.sim_backend is not None and sim_backend != default_backend:
+        parser.error(
+            f"--mode {run_mode} requires --sim-backend {default_backend}; "
+            f"got {sim_backend}. Select the matching explicit mode instead."
+        )
     return run_mode, sim_backend, sim_config, matplotlib_live
 
 
@@ -406,44 +412,6 @@ def main() -> None:
         help="Disable obstacles during pose selection and visualization.",
     )
     parser.add_argument(
-        "--ig-threshold-mode",
-        type=str,
-        default="relative_pose",
-        choices=("absolute", "relative_max", "relative_pose"),
-        help="IG threshold mode: absolute or relative to max IG.",
-    )
-    parser.add_argument(
-        "--ig-threshold-rel",
-        type=float,
-        default=0.02,
-        help="Relative IG threshold fraction for dynamic modes.",
-    )
-    parser.add_argument(
-        "--ig-threshold-min",
-        type=float,
-        default=None,
-        help="Minimum IG threshold floor (defaults to config value).",
-    )
-    parser.add_argument(
-        "--detect-threshold-abs",
-        type=float,
-        default=30.0,
-        help="Absolute detection threshold for peak-matched activity (counts).",
-    )
-    parser.add_argument(
-        "--detect-threshold",
-        dest="detect_threshold_abs",
-        type=float,
-        default=argparse.SUPPRESS,
-        help="Alias for --detect-threshold-abs.",
-    )
-    parser.add_argument(
-        "--detect-threshold-rel",
-        type=float,
-        default=0.2,
-        help="Relative detection threshold as a fraction of max peak-matched activity.",
-    )
-    parser.add_argument(
         "--eval-match-radius",
         type=float,
         default=0.5,
@@ -478,10 +446,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--temper-max-resamples",
+        "--max-temper-steps",
         type=int,
-        default=2,
-        help="Max resamples per observation during tempering (default: 2).",
+        default=None,
+        help="Override the maximum number of ESS-preserving SMC temperature steps.",
+    )
+    parser.add_argument(
+        "--min-delta-beta",
+        type=float,
+        default=None,
+        help="Override the minimum accepted SMC temperature increment.",
+    )
+    parser.add_argument(
+        "--target-ess-ratio",
+        type=float,
+        default=None,
+        help="Override the ESS fraction maintained through beta=1.",
     )
     parser.add_argument(
         "--sim-backend",
@@ -542,106 +522,19 @@ def main() -> None:
         "--measurement-time-s",
         type=float,
         default=DEFAULT_MEASUREMENT_TIME_S,
-        help=(
-            "Fixed dwell time, or adaptive dwell cap, per measurement in seconds. "
-            "Use <=0 with --adaptive-dwell for no dwell cap."
-        ),
-    )
-    parser.add_argument(
-        "--adaptive-dwell",
-        action="store_true",
-        help="Acquire spectra in chunks and stop when isotope counts are reliable.",
-    )
-    parser.add_argument(
-        "--adaptive-dwell-chunk-s",
-        type=float,
-        default=2.0,
-        help="Geant4 dwell duration for each adaptive chunk in seconds.",
-    )
-    parser.add_argument(
-        "--adaptive-min-dwell-s",
-        type=float,
-        default=2.0,
-        help="Minimum accumulated live time before adaptive early stopping.",
-    )
-    parser.add_argument(
-        "--adaptive-ready-min-counts",
-        type=float,
-        default=100.0,
-        help="Minimum extracted count per detected isotope before stopping.",
-    )
-    parser.add_argument(
-        "--adaptive-ready-min-isotopes",
-        type=int,
-        default=1,
-        help="Required detected isotope count for adaptive dwell readiness.",
-    )
-    parser.add_argument(
-        "--adaptive-ready-min-snr",
-        type=float,
-        default=0.0,
-        help=(
-            "Optional minimum isotope-count SNR for adaptive dwell readiness; "
-            "0 uses the count threshold only."
-        ),
-    )
-    parser.add_argument(
-        "--pose-min-observation-counts",
-        type=float,
-        default=None,
-        help=(
-            "Minimum posterior-predicted counts per isotope used as a soft "
-            "constraint in next-pose selection. Defaults to the strength-prior "
-            "count floor; use 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--pose-min-observation-penalty-scale",
-        type=float,
-        default=1.0,
-        help="Relative weight of the all-isotope pose observability constraint.",
-    )
-    parser.add_argument(
-        "--pose-min-observation-aggregate",
-        choices=("max", "mean"),
-        default="max",
-        help="Aggregate shield-orientation predicted counts for pose observability.",
+        help="Fixed predeclared live time per measurement in seconds.",
     )
     parser.add_argument(
         "--path-planner",
-        choices=("one_step", "dss_pp"),
+        choices=("dss_pp",),
         default=None,
-        help="Next-pose planner: original one-step selector or DSS-PP.",
-    )
-    parser.add_argument(
-        "--dss-horizon",
-        type=int,
-        default=None,
-        help="DSS-PP receding-horizon length.",
-    )
-    parser.add_argument(
-        "--dss-beam-width",
-        type=int,
-        default=None,
-        help="DSS-PP beam width.",
+        help="Next-pose planner. Pure runtime supports joint DSS-PP only.",
     )
     parser.add_argument(
         "--dss-program-length",
         type=int,
         default=None,
         help="Number of shield postures in each DSS-PP measurement program.",
-    )
-    parser.add_argument(
-        "--dss-signature-weight",
-        type=float,
-        default=None,
-        help="DSS-PP shield-signature separation weight.",
-    )
-    parser.add_argument(
-        "--dss-differential-weight",
-        type=float,
-        default=None,
-        help="DSS-PP differential-observability penalty weight.",
     )
     parser.add_argument(
         "--dss-rotation-weight",
@@ -671,12 +564,6 @@ def main() -> None:
         type=int,
         default=None,
         help="Monte Carlo samples used for planning EIG estimates.",
-    )
-    parser.add_argument(
-        "--planning-rollout-particles",
-        type=int,
-        default=None,
-        help="Particle cap used for planning rollouts.",
     )
     parser.add_argument(
         "--notify",
@@ -748,6 +635,15 @@ def main() -> None:
         parser,
     )
     runtime_config = load_runtime_config(sim_config_path)
+    configured_backend = runtime_config.get("backend")
+    if (
+        not isinstance(configured_backend, str)
+        or configured_backend.strip().lower() != sim_backend
+    ):
+        parser.error(
+            "Simulation config backend must exactly match the selected runtime: "
+            f"selected={sim_backend!r}, configured={configured_backend!r}."
+        )
     measurement_log_output = _resolve_measurement_log_output(
         args.measurement_log_output,
         runtime_config,
@@ -758,28 +654,43 @@ def main() -> None:
         args.variable_cardinality,
         sim_config_path,
     )
-    pf_overrides: dict[str, object] = {
-        "max_resamples_per_observation": args.temper_max_resamples,
-    }
+    pf_overrides: dict[str, object] = {}
+    if args.max_temper_steps is not None:
+        if args.max_temper_steps < 1:
+            parser.error("--max-temper-steps must be positive.")
+        pf_overrides["max_temper_steps"] = int(args.max_temper_steps)
+    if args.min_delta_beta is not None:
+        if not 0.0 < args.min_delta_beta <= 1.0:
+            parser.error("--min-delta-beta must lie in (0, 1].")
+        pf_overrides["min_delta_beta"] = float(args.min_delta_beta)
+    if args.target_ess_ratio is not None:
+        if not 0.0 < args.target_ess_ratio < 1.0:
+            parser.error("--target-ess-ratio must lie in (0, 1).")
+        pf_overrides["target_ess_ratio"] = float(args.target_ess_ratio)
     if args.max_sources is not None:
+        if args.max_sources < 1:
+            parser.error("--max-sources must be positive.")
         pf_overrides["max_sources"] = int(args.max_sources)
     if args.rotations_per_pose is not None:
-        pf_overrides["orientation_k"] = max(1, int(args.rotations_per_pose))
-        pf_overrides["min_rotations_per_pose"] = max(1, int(args.rotations_per_pose))
+        if not 1 <= args.rotations_per_pose <= 64:
+            parser.error("--rotations-per-pose must lie in [1, 64].")
+        pf_overrides["orientation_k"] = int(args.rotations_per_pose)
+        pf_overrides["min_rotations_per_pose"] = int(args.rotations_per_pose)
     if args.min_rotations_per_pose is not None:
-        pf_overrides["min_rotations_per_pose"] = max(
-            0,
-            int(args.min_rotations_per_pose),
+        if not 0 <= args.min_rotations_per_pose <= 64:
+            parser.error("--min-rotations-per-pose must lie in [0, 64].")
+        pf_overrides["min_rotations_per_pose"] = int(
+            args.min_rotations_per_pose
         )
     if args.planning_eig_samples is not None:
-        pf_overrides["planning_eig_samples"] = max(1, int(args.planning_eig_samples))
-    if args.planning_rollout_particles is not None:
-        pf_overrides["planning_rollout_particles"] = max(
-            1,
-            int(args.planning_rollout_particles),
+        if args.planning_eig_samples < 1:
+            parser.error("--planning-eig-samples must be positive.")
+        pf_overrides["planning_eig_samples"] = int(
+            args.planning_eig_samples
         )
     sources = None
     source_generation_mode = "demo"
+    source_config_provenance: Mapping[str, object] | None = None
     source_config_token = str(args.source_config).strip().lower() if args.source_config else ""
     source_config_explicit = _source_config_was_explicit()
     if source_config_token in RANDOM_SOURCE_CONFIG_TOKENS or (
@@ -791,14 +702,19 @@ def main() -> None:
         source_path = Path(args.source_config)
         if not source_path.is_absolute():
             source_path = (ROOT / source_path).resolve()
-        if source_path.exists():
-            try:
-                sources = load_sources_from_json(source_path)
-                print(f"Loaded {len(sources)} sources from {source_path}")
-            except (OSError, ValueError) as exc:
-                print(f"Failed to load sources from {source_path}: {exc}")
-        else:
-            print(f"Source config not found: {source_path}. Using built-in demo sources.")
+        if not source_path.is_file():
+            parser.error(f"Source config is not a readable file: {source_path}")
+        try:
+            loaded_source_config = load_sources_from_json(
+                source_path,
+                repository_root=ROOT,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"Failed to load source config {source_path}: {exc}")
+        sources = list(loaded_source_config.sources)
+        source_generation_mode = "provided_file"
+        source_config_provenance = dict(loaded_source_config.provenance)
+        print(f"Loaded {len(sources)} sources from {source_path}")
     print(
         "Execution mode: "
         f"{run_mode} (backend={sim_backend}, "
@@ -821,11 +737,6 @@ def main() -> None:
         max_steps=args.max_steps,
         max_poses=args.max_poses,
         sources=sources,
-        detect_threshold_abs=args.detect_threshold_abs,
-        detect_threshold_rel=args.detect_threshold_rel,
-        ig_threshold_mode=args.ig_threshold_mode,
-        ig_threshold_rel=args.ig_threshold_rel,
-        ig_threshold_min=args.ig_threshold_min,
         environment_mode=args.environment_mode,
         obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
         obstacle_seed=args.obstacle_seed,
@@ -850,23 +761,11 @@ def main() -> None:
         nominal_motion_speed_m_s=args.robot_speed,
         rotation_overhead_s=args.rotation_overhead_s,
         measurement_time_s=args.measurement_time_s,
-        adaptive_dwell=args.adaptive_dwell,
-        adaptive_dwell_chunk_s=args.adaptive_dwell_chunk_s,
-        adaptive_min_dwell_s=args.adaptive_min_dwell_s,
-        adaptive_ready_min_counts=args.adaptive_ready_min_counts,
-        adaptive_ready_min_isotopes=args.adaptive_ready_min_isotopes,
-        adaptive_ready_min_snr=args.adaptive_ready_min_snr,
-        pose_min_observation_counts=args.pose_min_observation_counts,
-        pose_min_observation_penalty_scale=args.pose_min_observation_penalty_scale,
-        pose_min_observation_aggregate=args.pose_min_observation_aggregate,
         path_planner=args.path_planner,
-        dss_horizon=args.dss_horizon,
-        dss_beam_width=args.dss_beam_width,
         dss_program_length=args.dss_program_length,
-        dss_signature_weight=args.dss_signature_weight,
-        dss_differential_weight=args.dss_differential_weight,
         dss_rotation_weight=args.dss_rotation_weight,
         source_generation_mode=source_generation_mode,
+        source_config_provenance=source_config_provenance,
         random_source_seed=args.source_seed,
         random_source_count=args.random_source_count,
         random_source_isotopes=args.random_source_isotopes,

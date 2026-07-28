@@ -1,10 +1,15 @@
 """Tests for evaluation metrics matching and counts."""
 
 import json
+import math
 
 import pytest
 
 from evaluation_metrics import compute_metrics, save_metrics_json
+from measurement.model import EnvironmentConfig
+from measurement.obstacles import ObstacleGrid
+from measurement.surface_charts import build_surface_chart_geometry
+from pf.surface_atlas import ContinuousSurfaceAtlas
 
 
 def test_compute_metrics_counts_with_gate() -> None:
@@ -33,6 +38,68 @@ def test_compute_metrics_counts_with_gate() -> None:
     assert len(metrics["isotopes"]["Cs-137"]["matches"]) == 1
     assert metrics["matching_policy"]["strength_used_for_assignment"] is False
     assert metrics["matching_policy"]["outside_radius_behavior"] == "unmatched"
+
+
+def test_intrinsic_gate_rejects_thin_obstacle_opposite_face_false_pass() -> None:
+    """Cartesian-near opposite faces must be separated by their surface path."""
+    environment = EnvironmentConfig(size_x=3.0, size_y=3.0, size_z=3.0)
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(3, 3),
+        blocked_cells=((1, 1),),
+        transport_boxes_m=((1.0, 1.0, 0.0, 1.1, 2.0, 2.0),),
+    )
+    atlas = ContinuousSurfaceAtlas(
+        build_surface_chart_geometry(
+            environment,
+            obstacle_grid,
+            max_edge_m=0.5,
+        )
+    )
+    truth = {
+        "Cs-137": [
+            {
+                "pos": [1.0, 1.5, 1.0],
+                "strength": 100.0,
+                "surface_kind": "obstacle_side",
+            }
+        ]
+    }
+    estimate = {
+        "Cs-137": [
+            {
+                "pos": [1.1, 1.5, 1.0],
+                "strength": 100.0,
+                "surface_kind": "obstacle_side",
+            }
+        ]
+    }
+
+    cartesian = compute_metrics(
+        truth,
+        estimate,
+        match_radius_m=0.5,
+    )
+    intrinsic = compute_metrics(
+        truth,
+        estimate,
+        match_radius_m=0.5,
+        surface_atlas=atlas,
+    )
+
+    assert cartesian["isotopes"]["Cs-137"]["counts"]["matched"] == 1
+    assert intrinsic["isotopes"]["Cs-137"]["counts"]["matched"] == 0
+    assert intrinsic["matching_policy"]["distance"] == (
+        "intrinsic_surface_path_upper_bound_m"
+    )
+    assert intrinsic["matching_policy"][
+        "primary_localization_accuracy_metric"
+    ] == "surface_path_error"
+    assigned = intrinsic["isotopes"]["Cs-137"]["assigned_all_matches"][0]
+    assert assigned["distance"] == pytest.approx(0.1)
+    assert assigned["surface_path_distance"] > 0.5
+    assert assigned["within_radius"] is False
 
 
 def test_threshold_matching_is_recomputed_without_strength_cost() -> None:
@@ -429,6 +496,62 @@ def test_uncertainty_coverage_counts_misses_and_excludes_bad_references() -> Non
     existence = coverage["existence_mass_calibration"]
     assert existence["evaluable_count"] == 2
     assert existence["brier_score"] == pytest.approx(0.505)
+
+
+def test_existence_mass_accepts_only_unit_interval_roundoff() -> None:
+    """Existence calibration should clip roundoff but reject invalid mass."""
+    gt_by_iso = {"Cs-137": [{"pos": [0.0, 0.0, 0.0], "strength": 1.0}]}
+    est_by_iso = {"Cs-137": [{"pos": [0.0, 0.0, 0.0], "strength": 1.0}]}
+    common = {
+        "mode_index": 0,
+        "reference_consistent": True,
+        "posterior_support_available": True,
+        "weighted_mean_xyz_m": [0.0, 0.0, 0.0],
+        "z_quantiles_m": {"q05": 0.0, "q50": 0.0, "q95": 0.0},
+        "ellipsoid_90": {
+            "semi_axis_lengths_m": [0.0, 0.0, 0.0],
+            "orientation_matrix_xyz_by_axis": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+    }
+    rounded = {
+        "Cs-137": [
+            {
+                **common,
+                "existence_mass": math.nextafter(1.0, math.inf),
+            }
+        ]
+    }
+
+    metrics = compute_metrics(
+        gt_by_iso,
+        est_by_iso,
+        match_radius_m=0.5,
+        uncertainty_by_iso=rounded,
+    )
+    calibration = metrics["isotopes"]["Cs-137"]["uncertainty_coverage"][
+        "existence_mass_calibration"
+    ]
+    assert calibration["brier_score"] == 0.0
+
+    invalid = {
+        "Cs-137": [
+            {
+                **common,
+                "existence_mass": 1.0 + 1.0e-6,
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="finite and in"):
+        compute_metrics(
+            gt_by_iso,
+            est_by_iso,
+            match_radius_m=0.5,
+            uncertainty_by_iso=invalid,
+        )
 
 
 def test_global_cardinality_and_empty_availability_are_explicit() -> None:

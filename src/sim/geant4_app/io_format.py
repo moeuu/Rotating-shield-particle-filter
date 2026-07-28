@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from measurement.source_boundary import (
+    SURFACE_EMISSION_EPSILON_M,
+    surface_source_runtime_contract_sha256,
+)
 from sim.geant4_app.scene_export import ExportedGeant4Scene
+from sim.shield_geometry import require_no_angle_attenuation
 
 if TYPE_CHECKING:
     from sim.geant4_app.engine import Geant4StepRequest
@@ -16,10 +21,28 @@ if TYPE_CHECKING:
 def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
     """Write an exported Geant4 scene into a line-oriented text format."""
     output_path = Path(path)
+    source_contract_sha256 = surface_source_runtime_contract_sha256(
+        [
+            {
+                "isotope": source.isotope,
+                "position": list(source.anchor_position_xyz),
+                "transport_position": list(source.position_xyz),
+                "intensity_cps_1m": float(source.intensity_cps_1m),
+                "surface_chart_id": source.surface_chart_id,
+                "surface_uv": list(source.surface_uv),
+                "surface_normal": list(source.surface_normal_xyz),
+                "surface_emission_policy_sha256": (
+                    source.surface_emission_policy_sha256
+                ),
+            }
+            for source in scene.sources
+        ]
+    )
     lines: list[str] = [
         _format_line(
             "SCENE",
             scene_hash=scene.scene_hash,
+            surface_source_contract_sha256=source_contract_sha256,
             usd_path=scene.usd_path or "-",
             room_x=scene.room_size_xyz[0],
             room_y=scene.room_size_xyz[1],
@@ -47,6 +70,9 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
         ),
     ]
     for shield_name, shield in (("fe", scene.fe_shield), ("pb", scene.pb_shield)):
+        if shield is None:
+            continue
+        require_no_angle_attenuation(shield.use_angle_attenuation)
         lines.append(
             _format_line(
                 "SHIELD",
@@ -57,7 +83,7 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                 outer_radius_m=shield.outer_radius_m,
                 thickness_m=shield.thickness_cm / 100.0,
                 thickness_cm=shield.thickness_cm,
-                use_angle_attenuation=int(bool(shield.use_angle_attenuation)),
+                use_angle_attenuation=0,
                 sx="-" if shield.size_xyz is None else shield.size_xyz[0],
                 sy="-" if shield.size_xyz is None else shield.size_xyz[1],
                 sz="-" if shield.size_xyz is None else shield.size_xyz[2],
@@ -76,6 +102,51 @@ def write_scene_file(scene: ExportedGeant4Scene, path: str | Path) -> None:
                 y=source.position_xyz[1],
                 z=source.position_xyz[2],
                 intensity_cps_1m=source.intensity_cps_1m,
+                anchor_x=(
+                    source.position_xyz[0]
+                    if source.anchor_position_xyz is None
+                    else source.anchor_position_xyz[0]
+                ),
+                anchor_y=(
+                    source.position_xyz[1]
+                    if source.anchor_position_xyz is None
+                    else source.anchor_position_xyz[1]
+                ),
+                anchor_z=(
+                    source.position_xyz[2]
+                    if source.anchor_position_xyz is None
+                    else source.anchor_position_xyz[2]
+                ),
+                surface_chart_id=(
+                    "-"
+                    if source.surface_chart_id is None
+                    else source.surface_chart_id
+                ),
+                surface_u=(
+                    "-" if source.surface_uv is None else source.surface_uv[0]
+                ),
+                surface_v=(
+                    "-" if source.surface_uv is None else source.surface_uv[1]
+                ),
+                surface_normal_x=(
+                    "-"
+                    if source.surface_normal_xyz is None
+                    else source.surface_normal_xyz[0]
+                ),
+                surface_normal_y=(
+                    "-"
+                    if source.surface_normal_xyz is None
+                    else source.surface_normal_xyz[1]
+                ),
+                surface_normal_z=(
+                    "-"
+                    if source.surface_normal_xyz is None
+                    else source.surface_normal_xyz[2]
+                ),
+                surface_emission_epsilon_m=SURFACE_EMISSION_EPSILON_M,
+                surface_emission_policy_sha256=(
+                    source.surface_emission_policy_sha256 or "-"
+                ),
             )
         )
     for volume in scene.static_volumes:

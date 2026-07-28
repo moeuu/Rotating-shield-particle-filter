@@ -8,8 +8,6 @@ from measurement.continuous_kernels import (
     finite_sphere_geometric_term,
     geometric_term,
     segment_rotated_octant_shell_path_length_cm_torch,
-    transport_response_coefficients_from_payload,
-    transport_response_feature_caps_from_payload,
 )
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
@@ -20,28 +18,45 @@ from measurement.shielding import (
 from measurement.continuous_kernels import expected_counts_single_isotope
 
 
-def test_transport_response_rejects_historical_coefficient_aliases() -> None:
-    """Transport-response files must use canonical schema-v1 coefficient names."""
-    with pytest.raises(ValueError, match="Unsupported tau_coefficients"):
-        transport_response_coefficients_from_payload(
-            {"tau_coefficients": {"shield_tau": 0.1}}
-        )
+@pytest.mark.parametrize(
+    ("kwargs", "error_type"),
+    [
+        ({"shield_geometry_model": "nominal_tvl"}, ValueError),
+        ({"shield_geometry_model": "spherical_octant"}, ValueError),
+        ({"use_angle_attenuation": True}, ValueError),
+        ({"use_angle_attenuation": 1}, TypeError),
+        ({"thickness_fe_cm": "2.0"}, TypeError),
+        ({"thickness_pb_cm": -1.0}, ValueError),
+    ],
+)
+def test_shield_params_reject_retired_or_coerced_physics(
+    kwargs: dict[str, object],
+    error_type: type[Exception],
+) -> None:
+    """Shield parameters must expose only the shared Geant4 geometry."""
+    with pytest.raises(error_type):
+        ShieldParams(**kwargs)
 
 
-def test_transport_response_rejects_historical_feature_cap_aliases() -> None:
-    """Transport-response files must use canonical feature-cap names."""
-    with pytest.raises(ValueError, match="Unsupported tau_feature_caps"):
-        transport_response_feature_caps_from_payload(
-            {"tau_feature_caps": {"shield_tau": 1.0}}
-        )
-
-
-def test_transport_response_rejects_historical_feature_caps_wrapper() -> None:
-    """Transport-response files must not accept the old feature_caps wrapper."""
-    with pytest.raises(ValueError, match="feature_caps is retired"):
-        transport_response_feature_caps_from_payload(
-            {"feature_caps": {"shield": 1.0}}
-        )
+@pytest.mark.parametrize(
+    ("kwargs", "error_type"),
+    [
+        ({"detector_radius_m": "0.04"}, TypeError),
+        ({"detector_radius_m": -0.04}, ValueError),
+        ({"detector_aperture_samples": 1.5}, TypeError),
+        ({"detector_aperture_samples": 0}, ValueError),
+        ({"detector_aperture_sampling": "cone"}, ValueError),
+        ({"source_extent_radius_m": 0.05, "source_extent_samples": 1}, ValueError),
+        ({"use_gpu": 1}, TypeError),
+    ],
+)
+def test_continuous_kernel_rejects_implicit_runtime_coercions(
+    kwargs: dict[str, object],
+    error_type: type[Exception],
+) -> None:
+    """Continuous physics configuration must fail before inference changes."""
+    with pytest.raises(error_type):
+        ContinuousKernel(**kwargs)
 
 
 def test_geometric_term_inverse_square() -> None:
@@ -246,127 +261,502 @@ def test_line_resolved_obstacle_attenuation_uses_line_mu_values() -> None:
     assert blocked == pytest.approx(free * expected_ratio, rel=1e-12)
 
 
-def test_transport_response_terms_reconstruct_kernel_with_aperture() -> None:
-    """Calibration terms should match the aperture-averaged runtime kernel."""
+def _line_resolved_full_physics_kernel(*, use_gpu: bool) -> ContinuousKernel:
+    """Return a small line-resolved kernel exercising every transport term."""
     grid = ObstacleGrid(
         origin=(0.0, 0.0),
         cell_size=1.0,
         grid_shape=(1, 1),
         blocked_cells=((0, 0),),
     ).with_transport_model(
-        boxes_m=((0.2, 0.2, 0.2, 0.8, 0.8, 0.8),),
-        mu_by_isotope={"TestIso": (0.01,)},
-        line_mu_by_isotope={"TestIso": ((0.01,), (0.025,))},
-    )
-    line_mu = {
-        "TestIso": (
-            {"weight": 0.4, "fe": 0.05, "pb": 0.08},
-            {"weight": 0.6, "fe": 0.09, "pb": 0.12},
-        )
-    }
-    transport_model = {
-        "enabled": True,
-        "by_isotope": {
-            "TestIso": {
-                "scale": 1.1,
-                "tau_coefficients": {
-                    "shield": 0.03,
-                    "obstacle": -0.02,
-                    "shield_squared": 0.0,
-                    "obstacle_squared": 0.0,
-                    "shield_obstacle": 0.01,
-                },
-                "min_log_scale": -2.0,
-                "max_log_scale": 2.0,
-            }
+        boxes_m=((0.2, 0.2, 0.0, 0.8, 0.8, 2.0),),
+        mu_by_isotope={"TestIso": (0.015,)},
+        line_mu_by_isotope={
+            "TestIso": ((0.01,), (0.025,), (0.04,))
         },
-    }
-    kernel = ContinuousKernel(
+    )
+    return ContinuousKernel(
         mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
         shield_params=ShieldParams(
             mu_fe=0.0,
             mu_pb=0.0,
             thickness_fe_cm=2.0,
-            thickness_pb_cm=1.0,
+            thickness_pb_cm=1.5,
+            buildup_fe_coeff=0.05,
+            buildup_pb_coeff=0.03,
         ),
         obstacle_grid=grid,
+        obstacle_buildup_coeff=0.02,
         detector_radius_m=0.04,
-        detector_aperture_radius_m=0.03,
-        detector_aperture_samples=9,
-        line_mu_by_isotope=line_mu,
-        transport_response_model=transport_model,
-        use_gpu=False,
-    )
-    detector = np.array([0.0, 0.0, 0.0], dtype=float)
-    source = np.array([1.0, 1.0, 1.0], dtype=float)
-
-    terms = kernel.transport_response_terms_pair("TestIso", detector, source, 7, 5)
-    reconstructed = sum(float(term["kernel"]) for term in terms)
-    direct = kernel.kernel_value_pair("TestIso", detector, source, 7, 5)
-
-    assert len(terms) == 9
-    assert reconstructed == pytest.approx(direct, rel=1.0e-12, abs=1.0e-12)
-    assert any(float(term["obstacle_tau_feature"]) > 0.0 for term in terms)
-    assert any(float(term["shield_tau_feature"]) > 0.0 for term in terms)
-
-
-def test_transport_response_base_terms_reconstruct_capped_base_kernel() -> None:
-    """Base calibration terms should match capped no-sidecar runtime counts."""
-    isotope = "TestIso"
-    shield_params = ShieldParams(
-        mu_fe=0.0,
-        mu_pb=0.0,
-        thickness_fe_cm=2.0,
-        thickness_pb_cm=0.0,
-        buildup_fe_coeff=30.0,
-    )
-    line_mu = {isotope: ({"weight": 1.0, "fe": 0.05, "pb": 0.0},)}
-    transport_model = {
-        "enabled": True,
-        "by_isotope": {
-            isotope: {
-                "scale": 2.0,
-                "tau_coefficients": {},
-                "min_log_scale": -5.0,
-                "max_log_scale": 5.0,
-            }
+        detector_aperture_radius_m=0.025,
+        detector_aperture_samples=5,
+        source_extent_radius_m=0.05,
+        source_extent_samples=3,
+        line_mu_by_isotope={
+            "TestIso": (
+                {"weight": 0.2, "fe": 0.04, "pb": 0.07},
+                {"weight": 0.3, "fe": 0.08, "pb": 0.11},
+                {"weight": 0.5, "fe": 0.13, "pb": 0.18},
+            )
         },
-    }
-    base_kernel = ContinuousKernel(
-        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
-        shield_params=shield_params,
-        line_mu_by_isotope=line_mu,
-        use_gpu=False,
-    )
-    response_kernel = ContinuousKernel(
-        mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
-        shield_params=shield_params,
-        line_mu_by_isotope=line_mu,
-        transport_response_model=transport_model,
-        use_gpu=False,
-    )
-    detector = np.zeros(3, dtype=float)
-    source = np.array([1.0, 1.0, 1.0], dtype=float)
-
-    terms = response_kernel.transport_response_terms_pair(
-        isotope,
-        detector,
-        source,
-        7,
-        0,
+        use_gpu=use_gpu,
+        gpu_device="cpu",
+        gpu_dtype="float64",
     )
 
-    assert sum(float(term["uncapped_kernel"]) for term in terms) > sum(
-        float(term["base_kernel"]) for term in terms
+
+def _line_resolved_inputs() -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Return deterministic detector/source/pair arrays for line API tests."""
+    return (
+        np.asarray([[0.0, 0.0, 1.0], [1.8, 1.7, 1.2]], dtype=np.float64),
+        np.asarray(
+            [[1.0, 1.0, 1.0], [-0.8, 0.4, 0.7], [2.4, 0.2, 1.4]],
+            dtype=np.float64,
+        ),
+        np.asarray([0, 3], dtype=np.int64),
+        np.asarray([7, 2], dtype=np.int64),
     )
-    assert sum(float(term["base_kernel"]) for term in terms) == pytest.approx(
-        base_kernel.kernel_value_pair(isotope, detector, source, 7, 0),
-        rel=1.0e-12,
+
+
+def test_matched_row_kernel_apis_match_cpu_and_torch_batches() -> None:
+    """Sparse matched-row APIs must preserve the serial physical kernel."""
+    pytest.importorskip("torch")
+    detectors = np.asarray(
+        [
+            [0.0, 0.0, 1.0],
+            [1.8, 1.7, 1.2],
+            [-0.5, 0.3, 0.8],
+        ],
+        dtype=np.float64,
     )
-    assert sum(float(term["kernel"]) for term in terms) == pytest.approx(
-        response_kernel.kernel_value_pair(isotope, detector, source, 7, 0),
-        rel=1.0e-12,
+    sources = np.asarray(
+        [
+            [1.0, 1.0, 1.0],
+            [-0.8, 0.4, 0.7],
+            [2.4, 0.2, 1.4],
+        ],
+        dtype=np.float64,
     )
+    fe_indices = np.asarray([0, 3, 7], dtype=np.int64)
+    pb_indices = np.asarray([7, 2, 0], dtype=np.int64)
+    cpu = _line_resolved_full_physics_kernel(use_gpu=False)
+    torch_cpu = _line_resolved_full_physics_kernel(use_gpu=True)
+
+    selected_serial = np.asarray(
+        [
+            cpu.kernel_value_pair(
+                "TestIso",
+                detector,
+                source,
+                int(fe_index),
+                int(pb_index),
+            )
+            for detector, source, fe_index, pb_index in zip(
+                detectors,
+                sources,
+                fe_indices,
+                pb_indices,
+                strict=True,
+            )
+        ],
+        dtype=np.float64,
+    )
+    selected_cpu = cpu.kernel_values_selected_pairs_for_detector_source_pairs(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        chunk_size=1,
+    )
+    selected_torch = (
+        torch_cpu.kernel_values_selected_pairs_for_detector_source_pairs(
+            "TestIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            chunk_size=2,
+        )
+    )
+    unshielded_cpu = (
+        cpu.kernel_values_unshielded_for_detector_source_pairs(
+            "TestIso",
+            detectors,
+            sources,
+            chunk_size=1,
+        )
+    )
+    unshielded_torch = (
+        torch_cpu.kernel_values_unshielded_for_detector_source_pairs(
+            "TestIso",
+            detectors,
+            sources,
+            chunk_size=2,
+        )
+    )
+
+    assert selected_cpu == pytest.approx(
+        selected_serial,
+        rel=5.0e-13,
+        abs=5.0e-13,
+    )
+    assert selected_torch == pytest.approx(
+        selected_cpu,
+        rel=5.0e-12,
+        abs=5.0e-12,
+    )
+    assert unshielded_torch == pytest.approx(
+        unshielded_cpu,
+        rel=5.0e-12,
+        abs=5.0e-12,
+    )
+
+
+def test_line_kernel_shape_order_and_weighted_aggregate_identity() -> None:
+    """Selected line means must be distinct and reconstruct the full kernel."""
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    all_indices = np.asarray([0, 1, 2], dtype=np.int64)
+
+    line_values = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        all_indices,
+        chunk_size=2,
+    )
+    aggregate = kernel.kernel_values_selected_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        chunk_size=2,
+    )
+    weights = kernel.line_branching_weights("TestIso", all_indices)
+
+    assert line_values.shape == (2, 3, 3)
+    np.testing.assert_allclose(
+        np.einsum("psl,l->ps", line_values, weights),
+        aggregate,
+        rtol=3.0e-13,
+        atol=3.0e-14,
+    )
+    assert not np.allclose(line_values[..., 0], line_values[..., 2])
+    reversed_values = (
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            "TestIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            np.asarray([2, 0], dtype=np.int64),
+        )
+    )
+    np.testing.assert_array_equal(reversed_values[..., 0], line_values[..., 2])
+    np.testing.assert_array_equal(reversed_values[..., 1], line_values[..., 0])
+
+
+def test_line_kernel_returns_source_equivalent_means_before_branching() -> None:
+    """An unattenuated line estimator must predict source count, not line count."""
+    kernel = ContinuousKernel(
+        mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
+        shield_params=ShieldParams(
+            mu_fe=0.0,
+            mu_pb=0.0,
+            thickness_fe_cm=0.0,
+            thickness_pb_cm=0.0,
+        ),
+        line_mu_by_isotope={
+            "TestIso": (
+                {"weight": 0.1, "fe": 0.0, "pb": 0.0},
+                {"weight": 0.9, "fe": 0.0, "pb": 0.0},
+            )
+        },
+        use_gpu=False,
+    )
+    values = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float64),
+        np.asarray([[1.0, 0.0, 0.0]], dtype=np.float64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int64),
+    )
+
+    np.testing.assert_allclose(values, np.ones((1, 1, 2)), rtol=0.0, atol=1.0e-15)
+
+
+def test_line_kernel_cpu_and_torch_float64_are_equivalent() -> None:
+    """Torch float64 batching must match NumPy for every selected line."""
+    pytest.importorskip("torch")
+    cpu = _line_resolved_full_physics_kernel(use_gpu=False)
+    torch_kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    indices = np.asarray([0, 2], dtype=np.int64)
+
+    expected = cpu.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
+    )
+    actual = torch_kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-10, atol=2.0e-12)
+
+
+def test_line_transport_components_preserve_existing_total_kernel() -> None:
+    """Spectral components must preserve the production scalar line response."""
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    indices = np.asarray([0, 1, 2], dtype=np.int64)
+
+    expected = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
+    )
+    components = (
+        kernel.line_transport_components_selected_pairs_for_detectors(
+            "TestIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            indices,
+            chunk_size=2,
+        )
+    )
+
+    np.testing.assert_array_equal(components.total_kernel, expected)
+    assert components.total_kernel.shape == (2, 3, 3)
+    assert np.all(components.uncollided_kernel >= 0.0)
+    total_tau = (
+        components.tau_fe
+        + components.tau_pb
+        + components.tau_obstacle
+    )
+    assert np.any(total_tau > 0.0)
+    assert np.all(components.distance_m > 0.0)
+
+
+def test_line_transport_components_cpu_and_torch_are_equivalent() -> None:
+    """Every spectral transport feature must share the CPU/GPU physics."""
+    pytest.importorskip("torch")
+    cpu = _line_resolved_full_physics_kernel(use_gpu=False)
+    torch_kernel = _line_resolved_full_physics_kernel(use_gpu=True)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    indices = np.asarray([0, 2], dtype=np.int64)
+
+    expected = cpu.line_transport_components_selected_pairs_for_detectors(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=2,
+    )
+    actual = (
+        torch_kernel.line_transport_components_selected_pairs_for_detectors(
+            "TestIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            indices,
+            chunk_size=2,
+        )
+    )
+
+    for field_name in (
+        "total_kernel",
+        "uncollided_kernel",
+        "tau_fe",
+        "tau_pb",
+        "tau_obstacle",
+        "distance_m",
+    ):
+        np.testing.assert_allclose(
+            getattr(actual, field_name),
+            getattr(expected, field_name),
+            rtol=2.0e-10,
+            atol=2.0e-12,
+        )
+
+
+@pytest.mark.parametrize(
+    ("indices", "error_type", "message"),
+    [
+        (np.asarray([], dtype=np.int64), ValueError, "non-empty"),
+        (np.asarray([0.5]), ValueError, "exact integer"),
+        (np.asarray([0, 0]), ValueError, "duplicates"),
+        (np.asarray([3]), IndexError, "outside"),
+        (np.asarray([-1]), IndexError, "outside"),
+    ],
+)
+def test_line_kernel_rejects_invalid_positive_line_indices(
+    indices: np.ndarray,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    """The line event basis must fail fast instead of being reindexed."""
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+
+    with pytest.raises(error_type, match=message):
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            "TestIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            indices,
+        )
+
+
+def test_line_kernel_rejects_missing_basis_and_invalid_pair_shape() -> None:
+    """Missing physics metadata and pair-array mismatches must not fall back."""
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    missing = ContinuousKernel(use_gpu=False)
+    with pytest.raises(ValueError, match="No positive line-resolved"):
+        missing.kernel_values_selected_pairs_for_detectors_by_line(
+            "MissingIso",
+            detectors,
+            sources,
+            fe_indices,
+            pb_indices,
+            np.asarray([0], dtype=np.int64),
+        )
+
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    with pytest.raises(ValueError, match="matching lengths"):
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            "TestIso",
+            detectors,
+            sources,
+            np.asarray([0], dtype=np.int64),
+            pb_indices,
+            np.asarray([0], dtype=np.int64),
+        )
+    with pytest.raises(IndexError, match="orientation index"):
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            "TestIso",
+            detectors,
+            sources,
+            np.asarray([0, 8], dtype=np.int64),
+            pb_indices,
+            np.asarray([0], dtype=np.int64),
+        )
+
+
+@pytest.mark.parametrize("use_gpu", (False, True))
+@pytest.mark.parametrize("bad_index", (-1, 8))
+def test_selected_pair_kernels_reject_wrapped_orientation_indices(
+    use_gpu: bool,
+    bad_index: int,
+) -> None:
+    """CPU, Torch, and line kernels must not reinterpret corrupt pair IDs."""
+    if use_gpu:
+        pytest.importorskip("torch")
+    kernel = _line_resolved_full_physics_kernel(use_gpu=use_gpu)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    invalid_fe = fe_indices.copy()
+    invalid_fe[0] = int(bad_index)
+
+    with pytest.raises(IndexError, match=r"must lie in \[0, 8\)"):
+        kernel.kernel_values_selected_pairs_for_detectors(
+            "TestIso",
+            detectors,
+            sources,
+            invalid_fe,
+            pb_indices,
+        )
+    with pytest.raises(IndexError, match=r"must lie in \[0, 8\)"):
+        kernel.kernel_values_selected_pairs_for_detectors_by_line(
+            "TestIso",
+            detectors,
+            sources,
+            invalid_fe,
+            pb_indices,
+            np.asarray([0, 2], dtype=np.int64),
+        )
+
+
+def test_line_kernel_exact_input_cache_avoids_recomputation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated exact requests must reuse physics while protecting cache data."""
+    kernel = _line_resolved_full_physics_kernel(use_gpu=False)
+    detectors, sources, fe_indices, pb_indices = _line_resolved_inputs()
+    original = (
+        kernel._kernel_values_selected_pairs_for_detector_source_numpy_chunk
+    )
+    calls = 0
+
+    def tracked(*args: object, **kwargs: object) -> np.ndarray:
+        """Count production NumPy line batches and delegate unchanged."""
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        kernel,
+        "_kernel_values_selected_pairs_for_detector_source_numpy_chunk",
+        tracked,
+    )
+    indices = np.asarray([0, 1], dtype=np.int64)
+    first = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors,
+        sources,
+        fe_indices,
+        pb_indices,
+        indices,
+        chunk_size=100,
+    )
+    first[0, 0, 0] = -1.0
+    second = kernel.kernel_values_selected_pairs_for_detectors_by_line(
+        "TestIso",
+        detectors.copy(),
+        sources.copy(),
+        fe_indices.copy(),
+        pb_indices.copy(),
+        indices.copy(),
+        chunk_size=1,
+    )
+
+    assert calls == 1
+    assert kernel.line_response_cache_misses == 1
+    assert kernel.line_response_cache_hits == 1
+    assert second[0, 0, 0] >= 0.0
+    kernel.clear_line_response_cache()
+    assert kernel.line_response_cache_hits == 0
+    assert kernel.line_response_cache_misses == 0
 
 
 def test_cpu_attenuation_uses_explicit_aperture_radius_without_count_radius() -> None:
@@ -1109,18 +1499,8 @@ def test_kernel_values_selected_pairs_for_detectors_matches_cpu_pairs() -> None:
             buildup_fe_coeff=0.2,
             buildup_pb_coeff=0.1,
         ),
-        ShieldParams(
-            mu_fe=0.0,
-            mu_pb=0.0,
-            thickness_fe_cm=2.0,
-            thickness_pb_cm=1.0,
-            buildup_fe_coeff=0.2,
-            buildup_pb_coeff=0.1,
-            shield_geometry_model="nominal_tvl",
-            use_angle_attenuation=True,
-        ),
     ],
-    ids=["spherical-octant", "angle-dependent"],
+    ids=["spherical-octant"],
 )
 def test_cpu_batched_selected_pairs_matches_scalar_oracle_with_full_physics(
     shield_params: ShieldParams,
@@ -1145,26 +1525,6 @@ def test_cpu_batched_selected_pairs_matches_scalar_oracle_with_full_physics(
             {"weight": 0.6, "fe": 0.09, "pb": 0.12},
         )
     }
-    transport_model = {
-        "enabled": True,
-        "by_isotope": {
-            "TestIso": {
-                "scale": 1.1,
-                "scale_by_pair": {"7": 1.2, "26": 0.9},
-                "tau_coefficients": {
-                    "shield": 0.03,
-                    "obstacle": -0.02,
-                    "shield_obstacle": 0.01,
-                    "fe": 0.015,
-                    "pb": -0.01,
-                    "distance": 0.005,
-                    "distance_shield": 0.002,
-                },
-                "min_log_scale": -2.0,
-                "max_log_scale": 2.0,
-            }
-        },
-    }
     kernel = ContinuousKernel(
         mu_by_isotope={"TestIso": {"fe": 0.0, "pb": 0.0}},
         shield_params=shield_params,
@@ -1175,7 +1535,6 @@ def test_cpu_batched_selected_pairs_matches_scalar_oracle_with_full_physics(
         source_extent_radius_m=0.08,
         source_extent_samples=5,
         line_mu_by_isotope=line_mu,
-        transport_response_model=transport_model,
         use_gpu=False,
     )
     detectors = np.array(
@@ -1247,22 +1606,10 @@ def test_cpu_batched_selected_pairs_matches_scalar_oracle_with_full_physics(
     )
 
 
-def test_torch_transport_response_uses_sampled_source_extent_distance() -> None:
-    """Torch kernels should match NumPy distance features for source-extent rays."""
+def test_torch_source_extent_rays_match_numpy() -> None:
+    """Torch kernels should match NumPy for sampled source-extent rays."""
     torch = pytest.importorskip("torch")
     isotope = "TestIso"
-    transport_model = {
-        "enabled": True,
-        "by_isotope": {
-            isotope: {
-                "scale": 1.0,
-                "scale_by_pair": {"7": 1.15, "26": 0.85},
-                "tau_coefficients": {"distance": 0.7},
-                "min_log_scale": -10.0,
-                "max_log_scale": 10.0,
-            }
-        },
-    }
     kernel = ContinuousKernel(
         mu_by_isotope={isotope: {"fe": 0.0, "pb": 0.0}},
         shield_params=ShieldParams(mu_fe=0.0, mu_pb=0.0),
@@ -1271,7 +1618,6 @@ def test_torch_transport_response_uses_sampled_source_extent_distance() -> None:
         detector_aperture_samples=5,
         source_extent_radius_m=0.5,
         source_extent_samples=5,
-        transport_response_model=transport_model,
         use_gpu=True,
         gpu_device="cpu",
         gpu_dtype="float64",
@@ -1514,6 +1860,175 @@ def test_kernel_values_all_pairs_cuda_matches_cpu_with_obstacles_and_aperture() 
     gpu_values = gpu_kernel.kernel_values_all_pairs("Cs-137", detector, sources)
 
     assert gpu_values == pytest.approx(cpu_values, rel=1.0e-10, abs=1.0e-10)
+
+
+def test_unshielded_batch_equals_best_pair_for_finite_ray_bundles() -> None:
+    """Unshielded finite-ray response must equal the best physical pair."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1)),
+    )
+    detectors = np.asarray(
+        [[2.3, 2.4, 1.2], [3.4, 0.7, 0.8]],
+        dtype=float,
+    )
+    sources = np.asarray(
+        [
+            [0.2, 0.3, 0.9],
+            [0.4, 3.5, 1.6],
+            [3.6, 3.2, 0.4],
+        ],
+        dtype=float,
+    )
+    kernel = ContinuousKernel(
+        obstacle_grid=grid,
+        obstacle_mu_by_isotope={"Cs-137": 0.17},
+        use_gpu=False,
+        detector_radius_m=0.038,
+        detector_aperture_samples=7,
+        source_extent_radius_m=0.08,
+        source_extent_samples=5,
+    )
+
+    unshielded = kernel.kernel_values_unshielded_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        chunk_size=2,
+    )
+    all_pairs = kernel.kernel_values_all_pairs_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        chunk_size=2,
+    )
+
+    np.testing.assert_allclose(
+        unshielded,
+        np.max(all_pairs, axis=1),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_unshielded_torch_cpu_matches_numpy_with_obstacles_and_aperture() -> None:
+    """Torch-batched unshielded kernels must match the NumPy physical path."""
+    pytest.importorskip("torch")
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detectors = np.asarray(
+        [[2.2, 2.2, 1.0], [3.2, 1.4, 1.1]],
+        dtype=float,
+    )
+    sources = np.asarray(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    common = {
+        "obstacle_grid": grid,
+        "obstacle_mu_by_isotope": {"Cs-137": 0.17},
+        "detector_radius_m": 0.038,
+        "detector_aperture_samples": 7,
+        "source_extent_radius_m": 0.08,
+        "source_extent_samples": 5,
+    }
+    numpy_kernel = ContinuousKernel(use_gpu=False, **common)
+    torch_kernel = ContinuousKernel(
+        use_gpu=True,
+        gpu_device="cpu",
+        gpu_dtype="float64",
+        **common,
+    )
+
+    numpy_values = numpy_kernel.kernel_values_unshielded_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        chunk_size=3,
+    )
+    torch_values = torch_kernel.kernel_values_unshielded_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+        chunk_size=3,
+    )
+
+    np.testing.assert_allclose(
+        torch_values,
+        numpy_values,
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
+
+
+def test_unshielded_cuda_matches_numpy_with_obstacles_and_aperture() -> None:
+    """CUDA-batched unshielded kernels must match the NumPy physical path."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(4, 4),
+        blocked_cells=((1, 1), (2, 1), (1, 2)),
+    )
+    detectors = np.asarray(
+        [[2.2, 2.2, 1.0], [3.2, 1.4, 1.1]],
+        dtype=float,
+    )
+    sources = np.asarray(
+        [
+            [0.2, 0.2, 1.0],
+            [0.5, 3.5, 1.0],
+            [3.5, 0.5, 1.0],
+            [4.5, 2.0, 1.0],
+        ],
+        dtype=float,
+    )
+    common = {
+        "obstacle_grid": grid,
+        "obstacle_mu_by_isotope": {"Cs-137": 0.17},
+        "detector_radius_m": 0.038,
+        "detector_aperture_samples": 7,
+        "source_extent_radius_m": 0.08,
+        "source_extent_samples": 5,
+    }
+    numpy_kernel = ContinuousKernel(use_gpu=False, **common)
+    cuda_kernel = ContinuousKernel(
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+        **common,
+    )
+
+    numpy_values = numpy_kernel.kernel_values_unshielded_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+    )
+    cuda_values = cuda_kernel.kernel_values_unshielded_for_detectors(
+        "Cs-137",
+        detectors,
+        sources,
+    )
+
+    np.testing.assert_allclose(
+        cuda_values,
+        numpy_values,
+        rtol=1.0e-10,
+        atol=1.0e-10,
+    )
 
 
 def test_kernel_values_all_pairs_for_detectors_cuda_matches_cpu() -> None:

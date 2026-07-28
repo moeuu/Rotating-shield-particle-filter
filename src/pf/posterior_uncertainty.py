@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +14,7 @@ from measurement.source_surfaces import (
     SOURCE_SURFACE_REPORT_LABELS,
     source_surface_kinds,
 )
+from pf.posterior import validated_probability
 
 SURFACE_KINDS = SOURCE_SURFACE_REPORT_LABELS
 ELLIPSOID_INTERPRETATION = "gaussian_equivalent_covariance_ellipsoid"
@@ -46,16 +47,19 @@ def _normalized_particle_weights(
     weights: NDArray[np.float64],
     num_particles: int,
 ) -> NDArray[np.float64]:
-    """Return finite normalized particle weights, falling back to uniform."""
+    """Return normalized particle weights or fail on an invalid posterior."""
     values = np.asarray(weights, dtype=float).reshape(-1)
     if values.size != int(num_particles):
         raise ValueError("particle_weights must have one value per particle.")
     if values.size == 0:
         return values
-    values = np.where(np.isfinite(values) & (values > 0.0), values, 0.0)
+    if np.any(~np.isfinite(values)):
+        raise ValueError("particle_weights must all be finite.")
+    if np.any(values < 0.0):
+        raise ValueError("particle_weights must all be nonnegative.")
     total = float(np.sum(values))
-    if total <= 0.0:
-        return np.full(values.size, 1.0 / values.size, dtype=float)
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("particle_weights must have a finite positive sum.")
     return values / total
 
 
@@ -132,19 +136,38 @@ def posterior_mode_uncertainty_batched(
     reported_positions: NDArray[np.float64],
     *,
     packed_surface_kinds: NDArray[np.object_] | None = None,
+    packed_surface_chart_ids: NDArray[np.int64] | None = None,
+    packed_surface_uv: NDArray[np.float64] | None = None,
+    reported_surface_chart_ids: NDArray[np.int64] | None = None,
+    reported_surface_uv: NDArray[np.float64] | None = None,
+    surface_coordinate_path_distance: Callable[
+        [
+            NDArray[np.int64],
+            NDArray[np.float64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+        ],
+        NDArray[np.float64],
+    ]
+    | None = None,
     environment: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None = None,
     obstacle_height_m: float = 2.0,
     match_radius_m: float = 0.8,
     surface_tolerance_m: float = 1.0e-5,
+    posterior_reference_mass: float = 1.0,
 ) -> list[dict[str, Any]]:
     """Return JSON-safe posterior 3-D diagnostics for reported source modes.
 
     Each valid particle source slot is assigned to its nearest reported mode if
-    it lies within ``match_radius_m``.  If a particle has multiple slots assigned
-    to one mode, only the closest slot contributes.  ``existence_mass`` is the
-    total particle mass containing such a match; all remaining statistics are
-    conditional on that mode existing.
+    it lies within ``match_radius_m``.  Continuous PF reports supply chart/UV
+    states and an intrinsic surface-path callback, so nearby opposite faces and
+    disconnected components cannot match through free space.  If a particle has
+    multiple slots assigned to one mode, only the closest slot contributes.
+    ``conditional_support_mass`` is measured inside the selected reporting
+    stratum. ``existence_mass`` multiplies it by ``posterior_reference_mass`` so
+    a low-probability joint-cardinality stratum cannot be reported as certain.
+    All remaining statistics are conditional on that mode existing.
 
     The ellipsoid axes are sorted from longest to shortest.  Columns of
     ``orientation_matrix_xyz_by_axis`` are their corresponding unit vectors in
@@ -174,12 +197,67 @@ def posterior_mode_uncertainty_batched(
         raise ValueError("reported_positions must have shape (M, 3).")
     if np.any(~np.isfinite(modes)):
         raise ValueError("reported_positions must contain only finite values.")
+    coordinate_inputs = (
+        packed_surface_chart_ids,
+        packed_surface_uv,
+        reported_surface_chart_ids,
+        reported_surface_uv,
+        surface_coordinate_path_distance,
+    )
+    surface_coordinates_active = all(
+        value is not None for value in coordinate_inputs
+    )
+    if any(value is not None for value in coordinate_inputs) and not (
+        surface_coordinates_active
+    ):
+        raise ValueError(
+            "Intrinsic uncertainty matching requires packed/reported chart IDs, "
+            "UV, and the surface-distance callback together."
+        )
+    packed_chart_ids: NDArray[np.int64] | None = None
+    packed_uv: NDArray[np.float64] | None = None
+    reported_chart_ids: NDArray[np.int64] | None = None
+    reported_uv: NDArray[np.float64] | None = None
+    if surface_coordinates_active:
+        packed_chart_ids = np.asarray(
+            packed_surface_chart_ids,
+            dtype=np.int64,
+        )
+        packed_uv = np.asarray(packed_surface_uv, dtype=np.float64)
+        reported_chart_ids = np.asarray(
+            reported_surface_chart_ids,
+            dtype=np.int64,
+        ).reshape(-1)
+        reported_uv = np.asarray(reported_surface_uv, dtype=np.float64)
+        if packed_chart_ids.shape != mask.shape:
+            raise ValueError(
+                "packed_surface_chart_ids must have shape (P, S)."
+            )
+        if packed_uv.shape != mask.shape + (2,):
+            raise ValueError(
+                "packed_surface_uv must have shape (P, S, 2)."
+            )
+        if reported_chart_ids.shape != (modes.shape[0],):
+            raise ValueError(
+                "reported_surface_chart_ids must have shape (M,)."
+            )
+        if reported_uv.shape != (modes.shape[0], 2):
+            raise ValueError(
+                "reported_surface_uv must have shape (M, 2)."
+            )
     radius = float(match_radius_m)
     if not np.isfinite(radius) or radius < 0.0:
         raise ValueError("match_radius_m must be finite and non-negative.")
     tolerance = float(surface_tolerance_m)
     if not np.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError("surface_tolerance_m must be finite and non-negative.")
+    reference_mass = float(posterior_reference_mass)
+    if (
+        not np.isfinite(reference_mass)
+        or reference_mass < 0.0
+        or reference_mass > 1.0
+    ):
+        raise ValueError("posterior_reference_mass must lie in [0, 1].")
 
     num_particles, num_slots = positions.shape[:2]
     num_modes = modes.shape[0]
@@ -190,12 +268,52 @@ def posterior_mode_uncertainty_batched(
         _empty_mode_diagnostic(mode_index, modes[mode_index])
         for mode_index in range(num_modes)
     ]
+    matching_distance = (
+        "intrinsic_surface_path_upper_bound_m"
+        if surface_coordinates_active
+        else "euclidean_3d_m"
+    )
+    for diagnostic in empty:
+        diagnostic["matching_distance"] = matching_distance
+        diagnostic["match_radius_m"] = radius
+        diagnostic["posterior_reference_mass"] = reference_mass
+        diagnostic["conditional_support_mass"] = 0.0
     if num_particles == 0 or num_slots == 0:
         return empty
 
     valid_slots = mask & np.all(np.isfinite(positions), axis=2)
     differences = positions[:, :, None, :] - modes[None, None, :, :]
-    distances = np.linalg.norm(differences, axis=3)
+    if (
+        surface_coordinates_active
+        and packed_chart_ids is not None
+        and packed_uv is not None
+        and reported_chart_ids is not None
+        and reported_uv is not None
+        and surface_coordinate_path_distance is not None
+    ):
+        distances = np.asarray(
+            surface_coordinate_path_distance(
+                reported_chart_ids[None, None, :],
+                reported_uv[None, None, :, :],
+                packed_chart_ids[:, :, None],
+                packed_uv[:, :, None, :],
+            ),
+            dtype=np.float64,
+        )
+        if distances.shape != (
+            num_particles,
+            num_slots,
+            num_modes,
+        ):
+            raise ValueError(
+                "surface_coordinate_path_distance returned an unexpected shape."
+            )
+        if np.any(np.isnan(distances)) or np.any(distances < 0.0):
+            raise ValueError(
+                "Intrinsic surface distances must be nonnegative or infinity."
+            )
+    else:
+        distances = np.linalg.norm(differences, axis=3)
     distances = np.where(valid_slots[:, :, None], distances, np.inf)
     nearest_modes = np.argmin(distances, axis=2)
     mode_indices = np.arange(num_modes, dtype=int)
@@ -224,13 +342,30 @@ def posterior_mode_uncertainty_batched(
             None,
         )
 
-    existence_mass = np.einsum("p,pm->m", weights, matched, optimize=True)
+    raw_conditional_existence_mass = np.einsum(
+        "p,pm->m",
+        weights,
+        matched,
+        optimize=True,
+    )
+    conditional_existence_mass = np.fromiter(
+        (
+            validated_probability(
+                value,
+                name=f"conditional mode existence mass[{index}]",
+            )
+            for index, value in enumerate(raw_conditional_existence_mass)
+        ),
+        dtype=np.float64,
+        count=raw_conditional_existence_mass.size,
+    )
+    existence_mass = reference_mass * conditional_existence_mass
     joint_weights = weights[:, None] * matched
     conditional_weights = np.divide(
         joint_weights,
-        existence_mass[None, :],
+        conditional_existence_mass[None, :],
         out=np.zeros_like(joint_weights),
-        where=existence_mass[None, :] > 0.0,
+        where=conditional_existence_mass[None, :] > 0.0,
     )
     means = np.einsum(
         "pm,pmi->mi",
@@ -290,7 +425,7 @@ def posterior_mode_uncertainty_batched(
         optimize=True,
     )
     surface_totals = np.sum(surface_probabilities, axis=1)
-    supported_modes = existence_mass > 0.0
+    supported_modes = conditional_existence_mass > 0.0
     invalid_supported_surface = supported_modes & (
         ~np.isfinite(surface_totals) | (surface_totals <= 0.0)
     )
@@ -315,12 +450,18 @@ def posterior_mode_uncertainty_batched(
 
     diagnostics: list[dict[str, Any]] = []
     for mode_index in range(num_modes):
-        if existence_mass[mode_index] <= 0.0:
+        if conditional_existence_mass[mode_index] <= 0.0:
             diagnostics.append(empty[mode_index])
             continue
         diagnostics.append(
             {
                 "mode_index": int(mode_index),
+                "matching_distance": matching_distance,
+                "match_radius_m": radius,
+                "posterior_reference_mass": reference_mass,
+                "conditional_support_mass": float(
+                    conditional_existence_mass[mode_index]
+                ),
                 "reported_position_xyz_m": [
                     float(value) for value in modes[mode_index]
                 ],

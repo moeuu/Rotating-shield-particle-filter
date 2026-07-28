@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import math
+from numbers import Real
 from typing import Any
 
 from sim.isaacsim_app.observation_model import (
@@ -67,6 +69,136 @@ class StageVisualRule:
     emissive_scale: float = 0.0
 
 
+def _json_boolean(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool | None,
+) -> bool | None:
+    """Return an exact JSON boolean or an explicitly nullable value."""
+    value = payload.get(key, default)
+    if value is None and default is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a JSON boolean.")
+    return value
+
+
+def _json_integer(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+) -> int:
+    """Return a bounded exact JSON integer."""
+    value = payload.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be a JSON integer.")
+    if value < minimum:
+        raise ValueError(f"{key} must be at least {minimum}.")
+    return value
+
+
+def _finite_number(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    """Return a finite JSON number satisfying its physical domain."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a JSON number.")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    if strictly_positive and parsed <= 0.0:
+        raise ValueError(f"{field_name} must be positive.")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _numeric_vector3(
+    value: object,
+    *,
+    field_name: str,
+    strictly_positive: bool = False,
+) -> tuple[float, float, float]:
+    """Return a finite three-number JSON array."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{field_name} must be a three-element array.")
+    parsed = tuple(
+        _finite_number(
+            component,
+            field_name=field_name,
+            strictly_positive=strictly_positive,
+        )
+        for component in value
+    )
+    return parsed
+
+
+def _nonempty_string(value: object, *, field_name: str) -> str:
+    """Return an exact nonempty string."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a nonempty string.")
+    return value
+
+
+def _detector_model_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a strict detector model without implicit scalar coercion."""
+    raw = payload.get("detector_model", {})
+    if not isinstance(raw, Mapping):
+        raise ValueError("detector_model must be a JSON object.")
+    allowed = {
+        "crystal_radius_m",
+        "crystal_length_m",
+        "housing_thickness_m",
+        "crystal_shape",
+        "crystal_material",
+        "housing_material",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            "Unsupported detector_model settings: "
+            + ", ".join(str(key) for key in unknown)
+        )
+    result = dict(raw)
+    for key in ("crystal_radius_m", "crystal_length_m"):
+        if key in result:
+            result[key] = _finite_number(
+                result[key],
+                field_name=f"detector_model.{key}",
+                strictly_positive=True,
+            )
+    if "housing_thickness_m" in result:
+        result["housing_thickness_m"] = _finite_number(
+            result["housing_thickness_m"],
+            field_name="detector_model.housing_thickness_m",
+            minimum=0.0,
+        )
+    if "crystal_shape" in result:
+        shape = _nonempty_string(
+            result["crystal_shape"],
+            field_name="detector_model.crystal_shape",
+        )
+        if shape != "sphere":
+            raise ValueError(
+                "detector_model.crystal_shape must be 'sphere'; the runtime "
+                "detector geometry is spherical."
+            )
+    for key in ("crystal_material", "housing_material"):
+        if key in result:
+            result[key] = _nonempty_string(
+                result[key],
+                field_name=f"detector_model.{key}",
+            )
+    return result
+
+
 @dataclass(frozen=True)
 class IsaacSimAppConfig:
     """Collect sidecar configuration relevant to the Isaac Sim app."""
@@ -101,56 +233,131 @@ class IsaacSimAppConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "IsaacSimAppConfig":
         """Normalize a JSON config payload into a strongly typed object."""
-        payload = {} if data is None else dict(data)
+        if data is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(data, Mapping):
+            payload = dict(data)
+        else:
+            raise TypeError("Isaac Sim app config must be a mapping or None.")
         extra_args = payload.get("extra_args", ())
         if not isinstance(extra_args, (list, tuple)):
             raise ValueError("extra_args must be a list of strings.")
+        if any(not isinstance(value, str) or not value for value in extra_args):
+            raise ValueError("extra_args entries must be nonempty strings.")
         fe_shield_size = payload.get("fe_shield_size_xyz", (0.25, 0.08, 0.25))
         pb_shield_size = payload.get("pb_shield_size_xyz", (0.25, 0.08, 0.25))
         stage_material_rules_payload = payload.get("stage_material_rules", ())
         if not isinstance(stage_material_rules_payload, (list, tuple)):
             raise ValueError("stage_material_rules must be a list of objects.")
-        detector_model_payload = payload.get("detector_model", {})
-        if detector_model_payload is None:
-            detector_model_payload = {}
-        if not isinstance(detector_model_payload, Mapping):
-            raise ValueError("detector_model must be an object.")
-        stage_material_rules = tuple(
-            StageMaterialRule(
-                path_prefix=str(entry["path_prefix"]),
-                material=str(entry["material"]),
+        stage_material_rules_list: list[StageMaterialRule] = []
+        seen_material_prefixes: set[str] = set()
+        for index, entry in enumerate(stage_material_rules_payload):
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "path_prefix",
+                "material",
+            }:
+                raise ValueError(
+                    f"stage_material_rules[{index}] must contain exactly "
+                    "path_prefix and material."
+                )
+            path_prefix = _nonempty_string(
+                entry["path_prefix"],
+                field_name=f"stage_material_rules[{index}].path_prefix",
             )
-            for entry in stage_material_rules_payload
+            material = _nonempty_string(
+                entry["material"],
+                field_name=f"stage_material_rules[{index}].material",
+            )
+            if path_prefix in seen_material_prefixes:
+                raise ValueError("stage_material_rules path prefixes must be unique.")
+            seen_material_prefixes.add(path_prefix)
+            stage_material_rules_list.append(
+                StageMaterialRule(
+                    path_prefix=path_prefix,
+                    material=material,
+                )
+            )
+        stage_material_rules = tuple(stage_material_rules_list)
+        renderer = _nonempty_string(
+            payload.get("renderer", "RayTracedLighting"),
+            field_name="renderer",
         )
+        usd_path = payload.get("usd_path")
+        if usd_path is not None:
+            usd_path = _nonempty_string(usd_path, field_name="usd_path")
         return cls(
-            headless=bool(payload.get("headless", True)),
-            renderer=str(payload.get("renderer", "RayTracedLighting")),
-            usd_path=None if payload.get("usd_path") in (None, "") else str(payload["usd_path"]),
-            detector_height_m=float(payload.get("detector_height_m", 0.5)),
-            obstacle_height_m=float(payload.get("obstacle_height_m", 2.0)),
-            fe_shield_size_xyz=tuple(float(value) for value in fe_shield_size),
-            pb_shield_size_xyz=tuple(float(value) for value in pb_shield_size),
-            scatter_gain=float(payload.get("scatter_gain", 0.03)),
-            detector_model=dict(detector_model_payload),
+            headless=_json_boolean(payload, "headless", default=True),
+            renderer=renderer,
+            usd_path=usd_path,
+            detector_height_m=_finite_number(
+                payload.get("detector_height_m", 0.5),
+                field_name="detector_height_m",
+                strictly_positive=True,
+            ),
+            obstacle_height_m=_finite_number(
+                payload.get("obstacle_height_m", 2.0),
+                field_name="obstacle_height_m",
+                strictly_positive=True,
+            ),
+            fe_shield_size_xyz=_numeric_vector3(
+                fe_shield_size,
+                field_name="fe_shield_size_xyz",
+                strictly_positive=True,
+            ),
+            pb_shield_size_xyz=_numeric_vector3(
+                pb_shield_size,
+                field_name="pb_shield_size_xyz",
+                strictly_positive=True,
+            ),
+            scatter_gain=_finite_number(
+                payload.get("scatter_gain", 0.03),
+                field_name="scatter_gain",
+                minimum=0.0,
+            ),
+            detector_model=_detector_model_payload(payload),
             shield_thickness=resolve_shield_thickness_config(payload),
-            robot_motion_speed_m_s=float(payload.get("robot_motion_speed_m_s", 0.5)),
-            robot_ground_z_m=float(payload.get("robot_ground_z_m", 0.0)),
-            robot_animation_dt_s=float(payload.get("robot_animation_dt_s", 0.2)),
-            robot_animation_time_scale=float(payload.get("robot_animation_time_scale", 0.0)),
-            robot_max_animation_steps=int(payload.get("robot_max_animation_steps", 200)),
+            robot_motion_speed_m_s=_finite_number(
+                payload.get("robot_motion_speed_m_s", 0.5),
+                field_name="robot_motion_speed_m_s",
+                strictly_positive=True,
+            ),
+            robot_ground_z_m=_finite_number(
+                payload.get("robot_ground_z_m", 0.0),
+                field_name="robot_ground_z_m",
+            ),
+            robot_animation_dt_s=_finite_number(
+                payload.get("robot_animation_dt_s", 0.2),
+                field_name="robot_animation_dt_s",
+                strictly_positive=True,
+            ),
+            robot_animation_time_scale=_finite_number(
+                payload.get("robot_animation_time_scale", 0.0),
+                field_name="robot_animation_time_scale",
+                minimum=0.0,
+            ),
+            robot_max_animation_steps=_json_integer(
+                payload,
+                "robot_max_animation_steps",
+                default=200,
+                minimum=1,
+            ),
             camera_gesture_bindings=_parse_camera_gesture_bindings(payload),
             initial_camera=_parse_initial_camera_config(payload),
             lighting=_parse_lighting_config(payload),
-            preserve_viewport_on_reset=bool(payload.get("preserve_viewport_on_reset", False)),
+            preserve_viewport_on_reset=_json_boolean(
+                payload,
+                "preserve_viewport_on_reset",
+                default=False,
+            ),
             pf_visualization=PFSceneVisualizationConfig.from_mapping(payload),
-            author_obstacle_prims=(
-                None
-                if payload.get("author_obstacle_prims") is None
-                else bool(payload.get("author_obstacle_prims"))
+            author_obstacle_prims=_json_boolean(
+                payload,
+                "author_obstacle_prims",
+                default=None,
             ),
             stage_visual_rules=_parse_stage_visual_rules(payload),
             stage_material_rules=stage_material_rules,
-            extra_args=tuple(str(value) for value in extra_args),
+            extra_args=tuple(extra_args),
         )
 
 
@@ -279,7 +486,9 @@ class IsaacSimApplication:
         stage_backend: StageBackend | None = None,
     ) -> None:
         """Create the application and initialize the requested backend."""
-        self.use_mock = bool(use_mock)
+        if not isinstance(use_mock, bool):
+            raise ValueError("use_mock must be a boolean.")
+        self.use_mock = use_mock
         self.config = IsaacSimAppConfig.from_dict(app_config)
         self.scene = SceneDescription()
         self.scene_builder: SceneBuilder | None = None
@@ -396,6 +605,7 @@ class IsaacSimApplication:
             stage_material_rules=self.stage_material_rules,
             scatter_gain=self.config.scatter_gain,
             detector_model=self.config.detector_model,
+            shield_thickness=self.config.shield_thickness,
         )
         self.observation_model.reset(scene)
         self._configure_stage_view_helpers()

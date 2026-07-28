@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacle_assets import (
+    KnownObstacleInstance,
+    ObstacleComponent,
     _aluminum_equipment_frame_components,
     _concrete_jersey_barrier_components,
     _pipe_rack_components,
@@ -17,6 +20,8 @@ from measurement.obstacle_assets import (
     known_obstacle_transport_model,
     known_obstacle_traversability_rects,
     material_mu_cm_inv,
+    obstacle_instances_from_dicts,
+    obstacle_instances_to_dicts,
     room_boundary_transport_components,
 )
 from measurement.obstacles import ObstacleGrid
@@ -55,6 +60,87 @@ def test_manchester_assets_provide_hollow_transport_components() -> None:
     assert len(rects) == len(grid.blocked_cells)
     assert set(mu_by_isotope) >= {"Cs-137", "Co-60", "Eu-154"}
     assert len(mu_by_isotope["Cs-137"]) == len(boxes_m)
+
+
+def _valid_obstacle_instance_payload() -> dict[str, object]:
+    """Return one complete serialized known-obstacle payload."""
+    instance = KnownObstacleInstance(
+        name="Obstacle_0",
+        template="test_box",
+        footprint_xy=(0.0, 1.0, 0.0, 1.0),
+        footprint_cells=((0, 0),),
+        components=(
+            ObstacleComponent(
+                name="solid",
+                center_xyz=(0.5, 0.5, 0.5),
+                size_xyz=(0.5, 0.5, 1.0),
+                material="concrete",
+            ),
+        ),
+    )
+    return obstacle_instances_to_dicts((instance,))[0]
+
+
+def test_known_obstacle_manifest_roundtrip_is_exact() -> None:
+    """Known obstacle manifests should preserve collision and transport geometry."""
+    payload = _valid_obstacle_instance_payload()
+
+    instances = obstacle_instances_from_dicts([payload])
+
+    assert obstacle_instances_to_dicts(instances) == [payload]
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid"),
+    (
+        (("name",), 1),
+        (("template",), ""),
+        (("footprint_xy",), ("0.0", 1.0, 0.0, 1.0)),
+        (("footprint_xy",), (0.0, 0.0, 0.0, 1.0)),
+        (("footprint_cells",), []),
+        (("footprint_cells",), [[0.0, 0]]),
+        (("components",), []),
+        (("components", 0, "name"), 1),
+        (("components", 0, "center_xyz"), [0.5, float("nan"), 0.5]),
+        (("components", 0, "size_xyz"), [0.0, 0.5, 1.0]),
+        (("components", 0, "material"), True),
+    ),
+)
+def test_known_obstacle_manifest_rejects_fail_open_values(
+    path: tuple[object, ...],
+    invalid: object,
+) -> None:
+    """Malformed instance geometry must not suppress all authored obstacles."""
+    payload = _valid_obstacle_instance_payload()
+    target: object = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = invalid
+
+    with pytest.raises(ValueError):
+        obstacle_instances_from_dicts([payload])
+
+
+def test_known_obstacle_manifest_rejects_unknown_fields_and_names() -> None:
+    """Manifest aliases and duplicate prim paths must fail before scene authoring."""
+    payload = _valid_obstacle_instance_payload()
+    unknown = dict(payload)
+    unknown["component"] = unknown.pop("components")
+    with pytest.raises(ValueError, match="schema mismatch"):
+        obstacle_instances_from_dicts([unknown])
+
+    duplicate = _valid_obstacle_instance_payload()
+    with pytest.raises(ValueError, match="names must be unique"):
+        obstacle_instances_from_dicts([payload, duplicate])
+
+
+def test_known_obstacle_component_must_stay_inside_footprint() -> None:
+    """Planner footprint and transport geometry must describe the same object."""
+    payload = _valid_obstacle_instance_payload()
+    payload["components"][0]["center_xyz"] = [1.0, 0.5, 0.5]
+
+    with pytest.raises(ValueError, match="outside footprint"):
+        obstacle_instances_from_dicts([payload])
 
 
 def test_manchester_assets_provide_line_transport_components() -> None:
@@ -117,7 +203,12 @@ def test_environment_transport_model_can_include_room_boundaries() -> None:
         rng_seed=6,
     )
     obstacle_boxes, _ = known_obstacle_transport_model(instances)
-    boxes_m, mu_by_isotope, line_mu_by_isotope = environment_transport_model(
+    (
+        boxes_m,
+        mu_by_isotope,
+        line_mu_by_isotope,
+        line_compton_mu_by_isotope,
+    ) = environment_transport_model(
         instances,
         room_size_xyz=(1.0, 1.0, 3.0),
         include_room_boundaries=True,
@@ -127,6 +218,11 @@ def test_environment_transport_model_can_include_room_boundaries() -> None:
     assert set(mu_by_isotope) >= {"Cs-137", "Co-60", "Eu-154"}
     assert len(mu_by_isotope["Cs-137"]) == len(boxes_m)
     assert len(line_mu_by_isotope["Cs-137"][0]) == len(boxes_m)
+    assert len(line_compton_mu_by_isotope["Cs-137"][0]) == len(boxes_m)
+    assert np.all(
+        np.asarray(line_compton_mu_by_isotope["Cs-137"])
+        <= np.asarray(line_mu_by_isotope["Cs-137"]) * (1.0 + 1.0e-12)
+    )
 
 
 def test_known_obstacle_templates_have_non_overlapping_transport_boxes() -> None:

@@ -11,14 +11,21 @@ import pytest
 from baselines.ral_ablation.config_factory import (
     DEFAULT_ABLATION_CASES,
     DEFAULT_ABLATION_VARIANTS,
+    DEFAULT_BASE_CONFIG,
     DEFAULT_CUI_SPLIT_VIEW_DIR,
     _load_json,
     _source_generation_options,
     _validate_ral_transport_sampling,
+    _variant_config,
     build_ablation_plan,
 )
 from baselines.ral_ablation.path_policies import select_baseline_next_pose
 from baselines.ral_ablation.shield_policies import select_baseline_shield_program
+from measurement.source_boundary import (
+    SURFACE_SOURCE_RUNTIME_KEYS,
+    surface_emission_policy_sha256,
+    surface_source_runtime_contract_sha256,
+)
 from pf.defaults import DEFAULT_MAX_SOURCES_PER_ISOTOPE
 from pf.estimator import RotatingShieldPFConfig
 from pf.particle_filter import PFConfig
@@ -45,80 +52,93 @@ def test_pf_max_sources_default_is_shared() -> None:
 
 
 def test_ral_source_generation_defaults_are_unconditioned() -> None:
-    """Missing optional placement constraints should preserve area-uniform draws."""
+    """Source generation should expose physical geometry options only."""
     options = _source_generation_options({})
 
-    assert options["visibility_filter"] is False
-    assert options["visibility_min_fraction"] == pytest.approx(0.0)
-    assert options["max_ceiling_sources"] is None
-    assert options["preferred_max_z_m"] is None
-    assert options["same_isotope_min_distance_m"] == pytest.approx(0.0)
     assert options["obstacle_height_m"] == pytest.approx(2.0)
     assert options["include_room_boundaries"] is False
     assert options["room_boundary_thickness_m"] == pytest.approx(0.1)
-
-
-def test_ral_transport_sampling_requires_explicit_accelerated_mode() -> None:
-    """RA-L generation should label full histories and fail closed on thinning."""
-    assert _validate_ral_transport_sampling({}) == "full_unit_weight"
-    with np.testing.assert_raises_regex(
-        ValueError,
-        "accelerated_weighted_transport_enable=true",
-    ):
-        _validate_ral_transport_sampling({"primary_sampling_fraction": 0.02})
-
-
-def test_ral_transport_sampling_accepts_labeled_detector_cps_thinning() -> None:
-    """The user-authorized accelerated mode should remain explicit and scoped."""
-    config = {
-        "primary_sampling_fraction": 0.02,
-        "accelerated_weighted_transport_enable": True,
-        "source_rate_model": "detector_cps_1m",
-        "target_sampled_primaries": 1500000,
-    }
-    assert _validate_ral_transport_sampling(config) == "budgeted_weighted_transport"
-    config["source_rate_model"] = "isotropic_emission_equivalent"
-    with np.testing.assert_raises_regex(ValueError, "detector_cps_1m"):
-        _validate_ral_transport_sampling(config)
-
-
-def test_ral_transport_sampling_rejects_invalid_history_budget() -> None:
-    """A sampled-primary budget must be positive and explicitly accelerated."""
-    with pytest.raises(ValueError, match="target_sampled_primaries"):
-        _validate_ral_transport_sampling(
-            {
-                "primary_sampling_fraction": 0.2,
-                "accelerated_weighted_transport_enable": True,
-                "target_sampled_primaries": 0,
-            }
-        )
-    with pytest.raises(ValueError, match="accelerated_weighted_transport_enable"):
-        _validate_ral_transport_sampling({"target_sampled_primaries": 1_500_000})
+    assert options["structural_rj_surface_chart_max_edge_m"] == pytest.approx(
+        1.0
+    )
 
 
 @pytest.mark.parametrize(
-    "invalid_target",
-    [True, 1.5, 1_500_000.0, "1500000"],
+    "removed_key",
+    (
+        "random_source_preferred_max_z_m",
+        "random_source_max_ceiling_sources",
+        "random_source_visibility_filter",
+        "random_source_response_observability_filter",
+        "random_source_same_isotope_min_distance_m",
+    ),
 )
-def test_ral_transport_sampling_requires_json_integer_history_budget(
-    invalid_target: object,
+def test_ral_source_generation_rejects_removed_selection_keys(
+    removed_key: str,
 ) -> None:
-    """RA-L generation should enforce the runtime's JSON-integer budget type."""
-    with pytest.raises(ValueError, match="positive JSON integer"):
-        _validate_ral_transport_sampling(
-            {
-                "primary_sampling_fraction": 1.0,
-                "accelerated_weighted_transport_enable": True,
-                "source_rate_model": "detector_cps_1m",
-                "target_sampled_primaries": invalid_target,
-            }
+    """Legacy truth-selection knobs should fail before generating a layout."""
+    with pytest.raises(ValueError, match="were removed"):
+        _source_generation_options({removed_key: None})
+
+
+def test_ral_transport_sampling_requires_full_unit_weight_histories() -> None:
+    """RA-L generation should label only full unit-weight native histories."""
+    assert _validate_ral_transport_sampling({}) == "full_unit_weight"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"backend": "analytic"},
+        {"engine_mode": "in_process"},
+    ],
+)
+def test_ral_variant_rejects_non_native_backend(
+    override: dict[str, object],
+) -> None:
+    """Paper variants cannot switch away from native external Geant4."""
+    base_config = _load_json(DEFAULT_BASE_CONFIG)
+    base_config.update(override)
+
+    with pytest.raises(ValueError, match="backend='geant4'"):
+        _variant_config(
+            base_config,
+            base_config_path=DEFAULT_BASE_CONFIG,
+            case=DEFAULT_ABLATION_CASES[0],
+            variant=DEFAULT_ABLATION_VARIANTS[0],
+            seed=1234,
+            output_tag="invalid_backend",
         )
 
 
-def test_ral_base_config_loader_resolves_accelerated_inheritance(
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"primary_sampling_fraction": 0.02}, "primary_sampling_fraction=1.0"),
+        (
+            {"accelerated_weighted_transport_enable": True},
+            "accelerated_weighted_transport_enable=false",
+        ),
+        ({"target_sampled_primaries": 1_500_000}, "target_sampled_primaries=null"),
+        (
+            {"source_rate_model": "isotropic_emission_equivalent"},
+            "source_rate_model=detector_cps_1m",
+        ),
+    ],
+)
+def test_ral_transport_sampling_rejects_every_shortcut(
+    override: dict[str, object],
+    message: str,
+) -> None:
+    """Thinning, weighting, history caps, and alternate rates are all retired."""
+    with pytest.raises(ValueError, match=message):
+        _validate_ral_transport_sampling(override)
+
+
+def test_ral_base_config_loader_exposes_and_rejects_inherited_thinning(
     tmp_path: Path,
 ) -> None:
-    """A compact accelerated child config should retain its standard parent."""
+    """Inherited acceleration must remain visible to the fail-closed validator."""
     parent_path = tmp_path / "parent.json"
     child_path = tmp_path / "accelerated.json"
     parent_path.write_text(
@@ -127,7 +147,12 @@ def test_ral_base_config_loader_resolves_accelerated_inheritance(
                 "thread_count": 32,
                 "source_rate_model": "detector_cps_1m",
                 "primary_sampling_fraction": 1.0,
-                "pf_count_likelihood": {"count_likelihood_model": "student_t"},
+                "full_spectrum_generative_model_path": (
+                    "results/spectrum_validation/"
+                    "geometry_conditioned_full_spectrum_approved.json"
+                ),
+                "full_spectrum_generative_model_file_sha256": "1" * 64,
+                "full_spectrum_contract_hash_sha256": "2" * 64,
             }
         ),
         encoding="utf-8",
@@ -144,49 +169,9 @@ def test_ral_base_config_loader_resolves_accelerated_inheritance(
     )
     resolved = _load_json(child_path)
     assert resolved["thread_count"] == 32
-    assert resolved["pf_count_likelihood"]["count_likelihood_model"] == "student_t"
-    assert _validate_ral_transport_sampling(resolved) == "weighted_thinning"
-
-
-def test_ablation_plan_preserves_accelerated_transport_provenance(
-    tmp_path: Path,
-) -> None:
-    """Generated accelerated RAL configs should stay explicit and guarded."""
-    root = Path(__file__).resolve().parents[1]
-    entries = build_ablation_plan(
-        base_config_path=(
-            root
-            / "configs"
-            / "geant4"
-            / "accelerated_weighted_external_no_isaac_32threads.json"
-        ),
-        output_dir=tmp_path,
-        seeds=(1234,),
-        cases=DEFAULT_ABLATION_CASES[:1],
-        variants=DEFAULT_ABLATION_VARIANTS[:1],
-        intensity_cps_1m=30000.0,
-        output_tag_suffix="weighted_budget1500k_test",
-    )
-    payload = json.loads(entries[0].config_path.read_text(encoding="utf-8"))
-    assert payload["thread_count"] == 32
-    assert payload["primary_sampling_fraction"] == pytest.approx(1.0)
-    assert payload["target_sampled_primaries"] == pytest.approx(1500000.0)
-    assert payload["accelerated_weighted_transport_enable"] is True
-    assert (
-        payload["pf_count_likelihood"]["observation_count_variance_semantics"]
-        == "complete_statistical"
-    )
-    assert payload["pf_shield_contrast_likelihood"]["enabled"] is False
-    assert payload["pf_shield_view_ratio_likelihood"]["enabled"] is False
-    assert payload["metadata"]["ral_transport_history_mode"] == (
-        "budgeted_weighted_transport"
-    )
-    assert payload["metadata"]["ral_accelerated_transport_exception"] is True
-    assert payload["metadata"]["ral_target_sampled_primaries"] == 1_500_000
-    assert payload["measurement_log_run_id"].endswith(
-        "_weighted_budget1500k_test"
-    )
-    assert entries[0].command[-1].endswith("_weighted_budget1500k_test")
+    assert resolved["full_spectrum_contract_hash_sha256"] == "2" * 64
+    with pytest.raises(ValueError, match="primary_sampling_fraction=1.0"):
+        _validate_ral_transport_sampling(resolved)
 
 
 def test_round_robin_shield_policy_advances_by_pose() -> None:
@@ -230,6 +215,8 @@ def test_explicit_shield_program_rotation_limit_is_strict_for_baselines() -> Non
         )
         == 8
     )
+
+
 def test_passive_serpentine_path_policy_selects_candidate_near_waypoint() -> None:
     """Passive path baseline should select by geometry, not PF information."""
     candidates = np.asarray(
@@ -255,7 +242,7 @@ def test_passive_serpentine_path_policy_selects_candidate_near_waypoint() -> Non
 
 
 def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
-    """Ablation factory should write source/config files with baseline-only keys."""
+    """The factory should emit only the four declared paper configurations."""
     entries = build_ablation_plan(
         output_dir=tmp_path,
         seeds=(1234,),
@@ -264,38 +251,51 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         intensity_cps_1m=30000.0,
     )
     by_variant = {entry.variant: entry for entry in entries}
-    assert "proposed" in by_variant
-    assert "fixed_shield" in by_variant
-    assert "baseline_passive_no_shield" in by_variant
-    assert "baseline_passive_equal_time_no_shield" in by_variant
-    assert "baseline_passive_fixed_shield_single_view" in by_variant
-    assert "baseline_onestep_fixed_shield" in by_variant
-    assert "eig_only_path" in by_variant
-    assert "no_obstacle_signature" in by_variant
-    assert "no_pf_obstacle_attenuation" in by_variant
-    fixed_config = json.loads(by_variant["fixed_shield"].config_path.read_text())
+    assert tuple(by_variant) == (
+        "proposed",
+        "baseline_passive_equal_time_no_shield",
+        "round_robin_shield",
+        "eig_only_path",
+    )
+    assert len(entries) == 4
+
     proposed_config = json.loads(by_variant["proposed"].config_path.read_text())
     round_robin = json.loads(by_variant["round_robin_shield"].config_path.read_text())
     assert proposed_config["primary_sampling_fraction"] == 1.0
     assert proposed_config["thread_count"] > 1
-    assert proposed_config["response_poisson_low_snr_suppress_count"] is False
-    assert proposed_config["precision_diagnostic_particle_log_limit"] == 0
+    assert "response_poisson_low_snr_suppress_count" not in proposed_config
+    assert "precision_diagnostic_particle_log_limit" not in proposed_config
     assert (
-        proposed_config["precision_diagnostic_full_spectrum_response_enable"] is False
+        "precision_diagnostic_full_spectrum_response_enable"
+        not in proposed_config
     )
     assert proposed_config["surface_observability_diagnostic_candidates"] == 0
     for entry in entries:
         generated = json.loads(entry.config_path.read_text())
+        assert generated["backend"] == "geant4"
+        assert generated["engine_mode"] == "external"
         assert generated["pure_pf_schema_version"] == 1
         assert generated["estimator_profile"] == "pf_strict"
         assert generated["variable_cardinality"] is True
+        assert generated["primary_sampling_fraction"] == pytest.approx(1.0)
+        assert generated["accelerated_weighted_transport_enable"] is False
+        assert generated["target_sampled_primaries"] is None
         assert generated["pf_strength_prior_min_cps_1m"] == pytest.approx(300000.0)
         assert generated["pf_strength_prior_max_cps_1m"] == pytest.approx(2000000.0)
-        assert float(generated["structural_rj_patch_spacing_m"]) > 0.0
+        assert float(generated["structural_rj_surface_chart_max_edge_m"]) > 0.0
         assert float(generated["structural_rj_move_probability"]) > 0.0
-        assert len(generated["structural_cardinality_prior_probs"]) == (
-            int(generated["pf_max_sources"]) + 1
+        assert float(generated["structural_cardinality_prior_mean"]) > 0.0
+        generated_metadata = generated["metadata"]
+        assert generated_metadata["ral_transport_history_mode"] == (
+            "full_unit_weight"
         )
+        assert generated_metadata["ral_accelerated_transport"] is False
+        assert generated_metadata["ral_primary_sampling_fraction"] == pytest.approx(
+            1.0
+        )
+        assert generated_metadata["ral_primary_history_weight"] == pytest.approx(1.0)
+        assert generated_metadata["ral_target_sampled_primaries"] is None
+
     assert round_robin["orientation_k"] == proposed_config["orientation_k"]
     assert (
         round_robin["min_rotations_per_pose"]
@@ -308,48 +308,15 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert round_robin["strict_planned_shield_program"] is True
     assert round_robin["baseline_shield_policy"]["name"] == "round_robin"
     assert "baseline_path_policy" not in round_robin
-    assert fixed_config["baseline_shield_policy"]["name"] == "fixed"
-    assert fixed_config["cui_split_view_dir"] == DEFAULT_CUI_SPLIT_VIEW_DIR
-    assert fixed_config["usd_path"].endswith("/configs/isaacsim/demo_room.usda")
-    assert Path(fixed_config["usd_path"]).is_absolute()
-    assert fixed_config["random_environment_base_usd_path"].endswith(
+
+    assert proposed_config["cui_split_view_dir"] == DEFAULT_CUI_SPLIT_VIEW_DIR
+    assert proposed_config["usd_path"].endswith("/configs/isaacsim/demo_room.usda")
+    assert Path(proposed_config["usd_path"]).is_absolute()
+    assert proposed_config["random_environment_base_usd_path"].endswith(
         "/configs/isaacsim/demo_room.usda"
     )
-    assert Path(fixed_config["random_environment_base_usd_path"]).is_absolute()
-    no_shield = json.loads(by_variant["no_shield"].config_path.read_text())
-    assert no_shield["shield_transmission_target"] == 1.0
-    assert no_shield["shield_thickness_scale"] == 0.0
-    assert no_shield["orientation_k"] == 1
-    assert no_shield["min_rotations_per_pose"] == 1
-    assert no_shield["dss_pp"]["program_length"] == 1
-    obstacle_off = json.loads(
-        by_variant["no_obstacle_signature"].config_path.read_text()
-    )
-    assert obstacle_off["dss_pp"]["environment_signature_weight"] == 0.0
-    assert obstacle_off["dss_pp"]["occlusion_boundary_weight"] == 0.0
-    assert obstacle_off["dss_pp"]["vertical_environment_signature_weight"] == 0.0
-    pf_obstacle_off = json.loads(
-        by_variant["no_pf_obstacle_attenuation"].config_path.read_text()
-    )
-    assert pf_obstacle_off["pf_obstacle_attenuation"] is False
-    assert pf_obstacle_off["author_obstacle_prims"] is True
-    assert pf_obstacle_off["dss_pp"]["environment_signature_weight"] > 0.0
-    passive_no_shield = json.loads(
-        by_variant["baseline_passive_no_shield"].config_path.read_text()
-    )
-    assert passive_no_shield["shield_transmission_target"] == 1.0
-    assert passive_no_shield["shield_thickness_scale"] == 0.0
-    assert passive_no_shield["orientation_k"] == 1
-    assert passive_no_shield["min_rotations_per_pose"] == 1
-    assert passive_no_shield["dss_pp"]["program_length"] == 1
-    assert passive_no_shield["baseline_path_policy"]["name"] == "passive_serpentine"
-    assert passive_no_shield["baseline_shield_policy"]["name"] == "fixed"
-    assert passive_no_shield["thread_count"] >= 1
-    assert passive_no_shield["python_worker_count"] >= 1
-    assert passive_no_shield["pose_selection_workers"] >= 1
-    assert passive_no_shield["parallel_isotope_updates"] is False
-    assert passive_no_shield["parallel_isotope_workers"] >= 1
-    assert passive_no_shield["dss_pp"]["program_eval_workers"] >= 1
+    assert Path(proposed_config["random_environment_base_usd_path"]).is_absolute()
+
     passive_equal_time = json.loads(
         by_variant["baseline_passive_equal_time_no_shield"].config_path.read_text()
     )
@@ -366,50 +333,22 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert passive_equal_time["baseline_path_policy"]["name"] == "passive_serpentine"
     assert passive_equal_time["baseline_shield_policy"]["name"] == "fixed"
+    assert passive_equal_time["thread_count"] >= 1
+    assert passive_equal_time["python_worker_count"] >= 1
+    assert passive_equal_time["pose_selection_workers"] >= 1
+
     eig_only = json.loads(by_variant["eig_only_path"].config_path.read_text())
-    assert eig_only["dss_pp"]["signature_weight"] == 0.0
-    assert eig_only["dss_pp"]["temporal_separation_weight"] == 0.0
-    assert eig_only["dss_pp"]["environment_signature_weight"] == 0.0
-    assert eig_only["dss_pp"]["elevation_signature_weight"] == 0.0
-    assert eig_only["dss_pp"]["correlation_reduction_weight"] == 0.0
-    single_view = json.loads(
-        by_variant["baseline_passive_fixed_shield_single_view"].config_path.read_text()
-    )
-    assert single_view["orientation_k"] == 1
-    assert single_view["min_rotations_per_pose"] == 1
-    assert single_view["dss_pp"]["program_length"] == 1
-    assert single_view["baseline_path_policy"]["name"] == "passive_serpentine"
-    assert single_view["baseline_shield_policy"]["name"] == "fixed"
-    one_step_fixed = json.loads(
-        by_variant["baseline_onestep_fixed_shield"].config_path.read_text()
-    )
-    assert one_step_fixed["path_planner"] == "one_step"
-    assert one_step_fixed["baseline_shield_policy"]["name"] == "fixed"
-    assert "one_step_pose_eval_use_gpu" not in one_step_fixed
-    one_step_no_shield = json.loads(
-        by_variant["baseline_onestep_no_shield"].config_path.read_text()
-    )
-    assert one_step_no_shield["path_planner"] == "one_step"
-    assert "one_step_pose_eval_use_gpu" not in one_step_no_shield
-    assert one_step_no_shield["shield_transmission_target"] == 1.0
-    assert one_step_no_shield["shield_thickness_scale"] == 0.0
-    assert one_step_no_shield["orientation_k"] == 1
-    assert one_step_no_shield["min_rotations_per_pose"] == 1
-    assert one_step_no_shield["dss_pp"]["program_length"] == 1
-    one_step_path = json.loads(by_variant["one_step_path"].config_path.read_text())
-    assert one_step_path["path_planner"] == "one_step"
-    assert one_step_path["strict_planned_shield_program"] is True
-    assert "one_step_pose_eval_use_gpu" not in one_step_path
-    assert one_step_path["orientation_k"] == proposed_config["orientation_k"]
-    assert (
-        one_step_path["min_rotations_per_pose"]
-        == proposed_config["min_rotations_per_pose"]
-    )
-    assert (
-        one_step_path["dss_pp"]["program_length"]
-        == proposed_config["dss_pp"]["program_length"]
-    )
-    assert "baseline_shield_policy" not in one_step_path
+    for key in (
+        "coverage_weight",
+        "bearing_diversity_weight",
+        "frontier_weight",
+        "local_orbit_weight",
+        "elevation_condition_weight",
+        "revisit_penalty_weight",
+        "turn_smoothness_weight",
+    ):
+        assert eig_only["dss_pp"][key] == 0.0
+
     source_payload = json.loads(by_variant["proposed"].source_path.read_text())
     assert len(source_payload["sources"]) == DEFAULT_ABLATION_CASES[0].source_count
     isotope_counts: dict[str, int] = {}
@@ -417,23 +356,53 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         isotope_counts[source["isotope"]] = isotope_counts.get(source["isotope"], 0) + 1
     assert isotope_counts == {"Cs-137": 4, "Co-60": 3, "Eu-154": 2}
     source_metadata = source_payload["metadata"]
-    assert source_metadata["source_surface_sampling_schema_version"] == 1
-    assert source_metadata["sampling_measure"] == "continuous_area_uniform"
-    assert (
-        source_metadata["surface_geometry"]
-        == "runtime_transport_component_union"
-    )
-    assert source_metadata["visibility_filter"] is False
-    assert source_metadata["visibility_min_fraction"] == pytest.approx(0.0)
-    assert source_metadata["max_ceiling_sources"] is None
-    assert source_metadata["preferred_max_z_m"] is None
-    assert source_metadata["same_isotope_min_distance_m"] == pytest.approx(0.0)
+    assert source_metadata["source_surface_sampling_schema_version"] == 3
+    assert {
+        "sampling": source_metadata["sampling"],
+        "sampling_measure": source_metadata["sampling_measure"],
+        "surface_geometry": source_metadata["surface_geometry"],
+        "selection_conditioning": source_metadata["selection_conditioning"],
+    } == {
+        "sampling": "continuous area-uniform physical-surface placement",
+        "sampling_measure": "continuous_area_uniform",
+        "surface_geometry": "runtime_transport_component_union",
+        "selection_conditioning": "none_physical_area_only",
+    }
     assert source_metadata["obstacle_height_m"] == pytest.approx(2.0)
     assert source_metadata["include_room_boundaries"] is True
-    assert proposed_config["pf_max_sources"] == 5
-    assert proposed_config["structural_cardinality_prior_probs"] == pytest.approx(
-        [1.0 / 6.0] * 6
+    assert (
+        source_metadata["surface_emission_policy_sha256"]
+        == surface_emission_policy_sha256()
     )
+    assert len(source_metadata["surface_atlas_contract_sha256"]) == 64
+    assert all(
+        set(source) == SURFACE_SOURCE_RUNTIME_KEYS
+        for source in source_payload["sources"]
+    )
+    assert (
+        source_metadata["surface_source_runtime_contract_sha256"]
+        == surface_source_runtime_contract_sha256(source_payload["sources"])
+    )
+    removed_truth_selection_keys = {
+        "random_source_preferred_max_z_m",
+        "random_source_max_ceiling_sources",
+        "random_source_visibility_filter",
+        "random_source_response_observability_filter",
+        "random_source_same_isotope_min_distance_m",
+    }
+    assert removed_truth_selection_keys.isdisjoint(source_metadata)
+    position_values = [
+        float(value)
+        for source in source_payload["sources"]
+        for value in source["position"]
+    ]
+    assert any(
+        abs(value - round(value, 6)) > 1e-12
+        for value in position_values
+    )
+
+    assert proposed_config["pf_max_sources"] == 5
+    assert proposed_config["structural_cardinality_prior_mean"] == pytest.approx(2.0)
     assert proposed_config["measurement_log_output_dir"] == (
         "results/ral_ablation/measurement_logs/"
         "mix9_multi_isotope_cardinality_proposed_seed_1234"
@@ -458,9 +427,9 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     )
     assert (
         "--rotation-overhead-s"
-        in by_variant["baseline_passive_no_shield_single_view"].command
+        in by_variant["baseline_passive_equal_time_no_shield"].command
     )
     assert (
         f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"
-        in by_variant["baseline_passive_no_shield_single_view"].command
+        in by_variant["baseline_passive_equal_time_no_shield"].command
     )

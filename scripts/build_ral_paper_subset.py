@@ -6,9 +6,17 @@ import argparse
 from collections.abc import Mapping, Sequence
 import csv
 from pathlib import Path
+import shlex
 import stat
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from sim.runtime import load_runtime_config  # noqa: E402
+
 DEFAULT_FULL_MANIFEST = ROOT / "results" / "ral_ablation" / "manifest.csv"
 DEFAULT_SUBSET_MANIFEST = (
     ROOT / "results" / "ral_ablation" / "ral_paper_subset_manifest.csv"
@@ -23,6 +31,101 @@ CORE_VARIANTS = (
     "eig_only_path",
 )
 MANIFEST_FIELDS = ("case", "variant", "seed", "config_path", "source_path", "command")
+_MODE_FLAGS = frozenset(
+    {
+        "--mode",
+        "--gui",
+        "--cui",
+        "--python-gui",
+        "--geant4-isaacsim-gui",
+        "--python-cui",
+        "--geant4-cui",
+        "--standard-geant4-full",
+        "--sim-backend",
+    }
+)
+
+
+def _required_option_value(tokens: Sequence[str], option: str) -> str:
+    """Return one required, uniquely specified CLI option value."""
+    values: list[str] = []
+    for index, token in enumerate(tokens):
+        if token == option:
+            if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+                raise ValueError(f"RA-L command {option} requires one value.")
+            values.append(tokens[index + 1])
+        elif token.startswith(f"{option}="):
+            values.append(token.split("=", 1)[1])
+    if len(values) != 1 or not values[0]:
+        raise ValueError(
+            f"RA-L command requires exactly one {option}; got {len(values)}."
+        )
+    return values[0]
+
+
+def _validated_full_simulation_command(row: Mapping[str, str]) -> str:
+    """Return one shell-safe canonical RA-L Geant4 command or fail closed."""
+    command = str(row["command"])
+    if "\n" in command or "\r" in command:
+        raise ValueError("RA-L command must occupy exactly one line.")
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"RA-L command is not valid shell syntax: {exc}") from exc
+    if tokens[:4] != ["uv", "run", "python", "main.py"]:
+        raise ValueError(
+            "RA-L command must start with 'uv run python main.py'."
+        )
+    if tokens.count("--full-simulation") != 1:
+        raise ValueError(
+            "RA-L paper commands require exactly one --full-simulation flag."
+        )
+    conflicting_flags = sorted(
+        {
+            token.split("=", 1)[0]
+            for token in tokens[4:]
+            if token.split("=", 1)[0] in _MODE_FLAGS
+        }
+    )
+    if conflicting_flags:
+        raise ValueError(
+            "RA-L full-simulation command contains conflicting mode/backend "
+            f"flags: {conflicting_flags}."
+        )
+    expected_values = {
+        "--sim-config": str(row["config_path"]),
+        "--source-config": str(row["source_path"]),
+        "--output-tag": (
+            f"{row['case']}_{row['variant']}_seed_{row['seed']}"
+        ),
+    }
+    for option, expected in expected_values.items():
+        actual = _required_option_value(tokens, option)
+        if Path(actual).as_posix() != Path(expected).as_posix():
+            raise ValueError(
+                f"RA-L command {option}={actual!r} does not match manifest "
+                f"value {expected!r}."
+            )
+    return shlex.join(tokens)
+
+
+def _validate_geant4_config(row: Mapping[str, str]) -> None:
+    """Require the selected paper config to resolve to native external Geant4."""
+    config_path = Path(str(row["config_path"])).expanduser()
+    if not config_path.is_absolute():
+        config_path = ROOT / config_path
+    config_path = config_path.resolve()
+    if not config_path.is_file():
+        raise ValueError(f"RA-L config does not exist: {config_path}.")
+    config = load_runtime_config(config_path)
+    if (
+        str(config.get("backend", "")).strip().lower() != "geant4"
+        or str(config.get("engine_mode", "")).strip().lower() != "external"
+    ):
+        raise ValueError(
+            "RA-L paper configs require backend='geant4' and "
+            f"engine_mode='external': {config_path}."
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -115,6 +218,8 @@ def select_paper_subset(
     if missing:
         formatted = ", ".join(f"{case}:{variant}" for case, variant in missing)
         raise ValueError(f"Full manifest is missing paper-subset entries: {formatted}")
+    for row in selected:
+        row["command"] = _validated_full_simulation_command(row)
     return selected
 
 
@@ -138,7 +243,7 @@ def write_run_script(path: Path, rows: Sequence[Mapping[str, str]]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    lines.extend(row["command"] for row in rows)
+    lines.extend(_validated_full_simulation_command(row) for row in rows)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     mode = path.stat().st_mode
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -154,6 +259,8 @@ def build_subset(
     """Build and write the compact RA-L paper subset."""
     rows = _read_manifest(manifest_path)
     selected = select_paper_subset(rows, seed=seed)
+    for row in selected:
+        _validate_geant4_config(row)
     write_manifest(subset_manifest_path, selected)
     write_run_script(run_script_path, selected)
     return selected

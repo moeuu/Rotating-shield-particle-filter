@@ -90,7 +90,9 @@ class StrengthPrior:
         rng: np.random.Generator | None = None,
     ) -> FloatResult:
         """Draw scalar or batched strengths from the physical prior."""
-        generator = np.random.default_rng() if rng is None else rng
+        if rng is None:
+            raise ValueError("Strength-prior sampling requires an explicit RNG.")
+        generator = rng
         if not isinstance(generator, np.random.Generator):
             raise TypeError("rng must be a numpy.random.Generator.")
         sampled = generator.uniform(self.minimum, self.maximum, size=size)

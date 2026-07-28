@@ -1,38 +1,31 @@
 """Differential Shield-Signature Path Planning.
 
-DSS-PP plans over a joint robot-pose and shield-program action. The module
-uses the same PF expected-count kernel as the online estimator; it does not
-generate spectra or replace Geant4 transport.
+DSS-PP plans over a joint robot-pose and shield-program action. It samples
+future spectra from the same validated generative model and evaluates them
+with the same sole full-spectrum likelihood used by the online PF.
 """
 
 from __future__ import annotations
 
-import os
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Sequence, cast
+import time
+from typing import Any, Callable, Mapping, Sequence, cast
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import logsumexp
+from scipy.spatial import cKDTree
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.detector_geometry import DEFAULT_PF_DETECTOR_APERTURE_SAMPLES
-from pf.estimator import RotatingShieldPFEstimator
-from pf.likelihood import (
-    CountLikelihoodSpec,
-    OBSERVATION_COUNT_VARIANCE_ADDITIONAL,
-    count_log_likelihood_terms_np,
-    expected_counts_per_source,
-    predictive_count_likelihood_variance,
+from pf.estimator import JointPlanningParticles, RotatingShieldPFEstimator
+from pf.full_spectrum import validate_full_spectrum_model
+from pf.posterior import (
+    validated_probability,
+    validated_probability_distribution,
 )
+from pf.randomness import named_random_generator, named_stream_seed
 from planning.candidate_generation import sample_low_discrepancy_heights
-from planning.pose_selection import (
-    _auto_scale_observation_penalty,
-    _minimum_observation_feasible_mask,
-    estimate_lambda_cost,
-    minimum_observation_shortfall,
-)
 from planning.traversability import shortest_grid_path_length
 from runtime_defaults import (
     DEFAULT_MEASUREMENT_TIME_S,
@@ -41,9 +34,36 @@ from runtime_defaults import (
 )
 
 
-_DSS_PP_POSE_EVAL_CONTEXT: dict[str, object] | None = None
 _DSS_PP_PATH_LENGTH_CACHE: dict[tuple[object, ...], float] = {}
 _DSS_PP_PATH_LENGTH_CACHE_MAX = 20000
+
+
+def estimate_lambda_cost(
+    information_gains: NDArray[np.float64],
+    motion_costs: NDArray[np.float64],
+    *,
+    method: str = "range",
+    scale: float = 1.0,
+    eps: float = 1.0e-12,
+) -> float:
+    """Scale motion cost to the spread of exact joint information gain."""
+    gains = np.asarray(information_gains, dtype=float).reshape(-1)
+    costs = np.asarray(motion_costs, dtype=float).reshape(-1)
+    gains = gains[np.isfinite(gains)]
+    costs = costs[np.isfinite(costs)]
+    if gains.size == 0 or costs.size == 0:
+        return 0.0
+    if method == "range":
+        gain_scale = float(np.ptp(gains))
+        cost_scale = float(np.ptp(costs))
+    elif method == "iqr":
+        gain_scale = float(np.quantile(gains, 0.75) - np.quantile(gains, 0.25))
+        cost_scale = float(np.quantile(costs, 0.75) - np.quantile(costs, 0.25))
+    else:
+        raise ValueError(f"Unknown lambda_cost method: {method}")
+    if gain_scale <= float(eps) or cost_scale <= float(eps):
+        return 0.0
+    return float(scale) * gain_scale / cost_scale
 
 
 @dataclass(frozen=True)
@@ -64,55 +84,36 @@ class SignatureMode:
     strength_cps_1m: float
     weight: float
     spread_m: float
+    isotope_presence_probability: float | None = None
+    surface_chart_id: int | None = None
+    surface_uv: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
 class DSSPPConfig:
     """Configuration for Differential Shield-Signature Path Planning."""
 
-    horizon: int = 2
-    beam_width: int = 8
     max_programs: int = 40
     program_length: int = 2
     mode_cluster_radius_m: float = 1.5
-    max_modes_per_isotope: int = 4
+    max_modes_per_isotope: int = 5
     planning_particles: int | None = None
     planning_method: str | None = None
     live_time_s: float = DEFAULT_MEASUREMENT_TIME_S
-    primary_history_weight: float = 1.0
-    target_sampled_primaries: float | None = None
-    transport_detector_radius_m: float | None = None
     lambda_eig: float = 1.0
-    lambda_signature: float = 1.0
     lambda_distance: float | None = None
     lambda_time: float = 0.0
     lambda_rotation: float = 0.15
-    lambda_dose: float = 0.0
     lambda_coverage: float = 0.0
     lambda_bearing_diversity: float = 0.0
     lambda_frontier: float = 0.0
     lambda_turn_smoothness: float = 0.0
-    lambda_temporal_separation: float = 0.0
-    lambda_count_utility: float = 0.0
     lambda_local_orbit: float = 0.0
-    lambda_station_condition: float = 0.0
-    lambda_correlation_reduction: float = 0.0
-    lambda_isotope_balance: float = 0.0
-    lambda_environment_signature: float = 0.0
-    lambda_occlusion_boundary: float = 0.0
-    lambda_elevation_signature: float = 0.0
     lambda_elevation_condition: float = 0.0
-    lambda_vertical_environment_signature: float = 0.0
-    eta_observation: float = 1.0
-    eta_differential: float = 1.0
-    eta_count_balance: float = 0.5
     eta_revisit: float = 0.0
-    min_observation_counts: float = 0.0
-    enforce_min_observation: bool = True
-    signature_std_min_counts: float = 1.0
-    count_variance_floor: float = 1.0
     coverage_radius_m: float = 3.0
-    coverage_grid_max_cells: int = 5000
+    coverage_surface_quadrature_max_points: int = 65536
+    coverage_surface_max_hausdorff_m: float = 0.75
     coverage_floor_quantile: float = 0.0
     coverage_floor_weight: float = 0.0
     min_station_separation_m: float = 0.0
@@ -123,69 +124,202 @@ class DSSPPConfig:
     max_augmented_candidates: int = 256
     ring_radii_m: tuple[float, ...] = (2.0, 3.5, 5.0)
     ring_angles: int = 12
-    count_utility_saturation_counts: float = 250.0
     local_orbit_sigma_m: float = 0.75
-    station_condition_ridge: float = 1.0e-3
-    station_condition_min_singular_weight: float = 0.0
-    station_condition_inverse_condition_weight: float = 0.0
-    station_condition_coherence_weight: float = 0.0
-    environment_contrast_threshold: float = 0.25
-    environment_signature_score_clip: float = 3.0
-    occlusion_boundary_step_m: float = 0.5
     elevation_pair_z_scale_m: float = 2.0
     elevation_pair_xy_scale_m: float = 4.0
     elevation_angle_threshold_deg: float = 15.0
-    rng_seed: int | None = 0
-    eig_candidate_limit: int | None = 8
-    temporal_cover_weight: float = 1.0
-    temporal_logdet_weight: float = 0.25
-    temporal_decorrelation_weight: float = 0.5
-    temporal_pair_contrast_threshold: float = 0.25
-    temporal_logdet_ridge: float = 1.0e-3
-    temporal_cover_programs: int = 1
-    temporal_cover_beam_width: int = 4
-    program_eval_workers: int | None = None
-    candidate_preselect_enable: bool = True
-    candidate_preselect_min: int = 32
-    candidate_preselect_multiplier: int = 8
-    remaining_budget_guidance: bool = False
-    remaining_station_estimate: int | None = None
-    remaining_budget_urgency_stations: int = 4
-    remaining_route_weight: float = 0.0
-    remaining_route_distance_weight: float = 0.5
-    remaining_route_revisit_weight: float = 1.0
-    remaining_route_turn_weight: float = 0.75
-    remaining_route_backtrack_weight: float = 1.0
-    remaining_route_coverage_weight: float = 0.5
-    remaining_route_frontier_weight: float = 0.5
     forced_program_pair_ids: tuple[int, ...] | None = None
     diagnostic_ranked_node_limit: int = 64
+    exact_eig_action_limit: int = 32
+    exact_eig_coverage_reserve: int = 4
+    exact_eig_program_diversity_reserve: int = 4
+    proxy_memory_budget_bytes: int = 256 * 1024 * 1024
+    proxy_planning_particles: int = 16
+    proxy_eig_samples: int = 2
 
     def __post_init__(self) -> None:
-        """Validate transport statistics used for future observations."""
-        history_weight = float(self.primary_history_weight)
-        if not np.isfinite(history_weight) or history_weight < 1.0:
-            raise ValueError("primary_history_weight must be finite and at least 1.0.")
-        if self.target_sampled_primaries is not None:
-            target = float(self.target_sampled_primaries)
-            if not np.isfinite(target) or target <= 0.0:
-                raise ValueError(
-                    "target_sampled_primaries must be finite and positive."
+        """Validate every planner field before it can affect observations."""
+
+        def _integer(
+            value: object,
+            name: str,
+            *,
+            minimum: int,
+        ) -> int:
+            """Return one exact integer above an inclusive lower bound."""
+            if isinstance(value, bool) or not isinstance(
+                value,
+                (int, np.integer),
+            ):
+                raise ValueError(f"{name} must be an integer.")
+            resolved = int(value)
+            if resolved < minimum:
+                raise ValueError(f"{name} must be at least {minimum}.")
+            return resolved
+
+        def _number(
+            value: object,
+            name: str,
+            *,
+            minimum: float,
+            maximum: float | None = None,
+            strict_minimum: bool = False,
+            strict_maximum: bool = False,
+        ) -> float:
+            """Return one finite numeric planner value inside its domain."""
+            if isinstance(value, bool) or not isinstance(
+                value,
+                (int, float, np.integer, np.floating),
+            ):
+                raise ValueError(f"{name} must be numeric.")
+            resolved = float(value)
+            if not np.isfinite(resolved):
+                raise ValueError(f"{name} must be finite.")
+            below = resolved <= minimum if strict_minimum else resolved < minimum
+            if below:
+                relation = "greater than" if strict_minimum else "at least"
+                raise ValueError(f"{name} must be {relation} {minimum}.")
+            if maximum is not None:
+                above = (
+                    resolved >= maximum
+                    if strict_maximum
+                    else resolved > maximum
                 )
-        if self.transport_detector_radius_m is not None:
-            radius = float(self.transport_detector_radius_m)
-            if not np.isfinite(radius) or radius < 0.0:
+                if above:
+                    relation = "less than" if strict_maximum else "at most"
+                    raise ValueError(f"{name} must be {relation} {maximum}.")
+            return resolved
+
+        positive_integer_fields = {
+            "max_programs": self.max_programs,
+            "program_length": self.program_length,
+            "max_modes_per_isotope": self.max_modes_per_isotope,
+            "coverage_surface_quadrature_max_points": (
+                self.coverage_surface_quadrature_max_points
+            ),
+            "detector_aperture_samples": self.detector_aperture_samples,
+            "max_augmented_candidates": self.max_augmented_candidates,
+            "exact_eig_action_limit": self.exact_eig_action_limit,
+            "proxy_memory_budget_bytes": self.proxy_memory_budget_bytes,
+            "proxy_eig_samples": self.proxy_eig_samples,
+        }
+        for name, value in positive_integer_fields.items():
+            _integer(value, name, minimum=1)
+        _integer(self.ring_angles, "ring_angles", minimum=4)
+        _integer(
+            self.proxy_planning_particles,
+            "proxy_planning_particles",
+            minimum=2,
+        )
+        for name, value in {
+            "diagnostic_ranked_node_limit": self.diagnostic_ranked_node_limit,
+            "exact_eig_coverage_reserve": self.exact_eig_coverage_reserve,
+            "exact_eig_program_diversity_reserve": (
+                self.exact_eig_program_diversity_reserve
+            ),
+        }.items():
+            _integer(value, name, minimum=0)
+        if self.planning_particles is not None:
+            _integer(
+                self.planning_particles,
+                "planning_particles",
+                minimum=2,
+            )
+        if self.planning_method not in {None, "resample", "top_weight"}:
+            raise ValueError(
+                "planning_method must be None, 'resample', or 'top_weight'."
+            )
+        if not isinstance(self.augment_candidates, bool):
+            raise ValueError("augment_candidates must be a boolean.")
+
+        nonnegative_fields = {
+            "lambda_eig": self.lambda_eig,
+            "lambda_time": self.lambda_time,
+            "lambda_rotation": self.lambda_rotation,
+            "lambda_coverage": self.lambda_coverage,
+            "lambda_bearing_diversity": self.lambda_bearing_diversity,
+            "lambda_frontier": self.lambda_frontier,
+            "lambda_turn_smoothness": self.lambda_turn_smoothness,
+            "lambda_local_orbit": self.lambda_local_orbit,
+            "lambda_elevation_condition": self.lambda_elevation_condition,
+            "eta_revisit": self.eta_revisit,
+            "coverage_radius_m": self.coverage_radius_m,
+            "coverage_floor_weight": self.coverage_floor_weight,
+            "min_station_separation_m": self.min_station_separation_m,
+            "rotation_overhead_s": self.rotation_overhead_s,
+        }
+        if self.lambda_distance is not None:
+            nonnegative_fields["lambda_distance"] = self.lambda_distance
+        for name, value in nonnegative_fields.items():
+            _number(value, name, minimum=0.0)
+
+        positive_fields = {
+            "mode_cluster_radius_m": self.mode_cluster_radius_m,
+            "live_time_s": self.live_time_s,
+            "coverage_surface_max_hausdorff_m": (
+                self.coverage_surface_max_hausdorff_m
+            ),
+            "robot_speed_m_s": self.robot_speed_m_s,
+            "local_orbit_sigma_m": self.local_orbit_sigma_m,
+            "elevation_pair_z_scale_m": self.elevation_pair_z_scale_m,
+            "elevation_pair_xy_scale_m": self.elevation_pair_xy_scale_m,
+        }
+        for name, value in positive_fields.items():
+            _number(value, name, minimum=0.0, strict_minimum=True)
+        _number(
+            self.elevation_angle_threshold_deg,
+            "elevation_angle_threshold_deg",
+            minimum=0.0,
+            maximum=180.0,
+            strict_minimum=True,
+        )
+        _number(
+            self.coverage_floor_quantile,
+            "coverage_floor_quantile",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if not self.ring_radii_m:
+            raise ValueError("ring_radii_m must not be empty.")
+        for index, radius in enumerate(self.ring_radii_m):
+            _number(
+                radius,
+                f"ring_radii_m[{index}]",
+                minimum=0.0,
+                strict_minimum=True,
+            )
+        if self.forced_program_pair_ids is not None:
+            pair_ids = tuple(
+                _integer(value, "forced_program_pair_ids", minimum=0)
+                for value in self.forced_program_pair_ids
+            )
+            if not pair_ids:
                 raise ValueError(
-                    "transport_detector_radius_m must be finite and non-negative."
+                    "forced_program_pair_ids must contain at least one pair."
                 )
+            if len(set(pair_ids)) != len(pair_ids):
+                raise ValueError(
+                    "forced_program_pair_ids must not contain duplicates."
+                )
+        if (
+            int(self.exact_eig_coverage_reserve)
+            + int(self.exact_eig_program_diversity_reserve)
+            > int(self.exact_eig_action_limit)
+        ):
+            raise ValueError(
+                "Exact-EIG reserve counts must fit within exact_eig_action_limit."
+            )
 
 
 @dataclass(frozen=True)
-class _SignatureFutureStatisticsBatch:
-    """Store candidate-batched transport statistics for signature scoring."""
+class _JointProgramSpectrumComponents:
+    """Store source-resolved full-spectrum inputs for aligned PF particles."""
 
-    primary_history_weights_by_isotope: dict[str, NDArray[np.float64]]
-    background_counts_by_isotope: dict[str, NDArray[np.float64]]
+    total_pnvsl: NDArray[np.float64]
+    uncollided_pnvsl: NDArray[np.float64]
+    features_pnvslf: NDArray[np.float64]
+    live_times_v: NDArray[np.float64]
+    contract_hash_sha256: str
 
 
 @dataclass(frozen=True)
@@ -198,37 +332,19 @@ class DSSPPNode:
     score: float
     static_score: float
     distance_weight: float
-    observation_penalty_weight: float
     information_gain: float
-    signature_score: float
-    temporal_separation_score: float
-    observation_penalty: float
-    count_balance_penalty: float
-    differential_penalty: float
-    dose_score: float
-    count_utility: float
     coverage_gain: float
     revisit_penalty: float
     bearing_diversity_gain: float
     frontier_gain: float
     turn_penalty: float
     local_orbit_gain: float
-    station_condition_gain: float
-    correlation_reduction_gain: float
-    isotope_balance_gain: float
-    environment_signature_score: float
-    occlusion_boundary_gain: float
-    elevation_signature_score: float
     elevation_condition_gain: float
-    vertical_environment_signature_score: float
-    remaining_route_pressure: float = 0.0
-    remaining_route_penalty: float = 0.0
-    remaining_route_gain: float = 0.0
 
 
 @dataclass(frozen=True)
 class DSSPPResult:
-    """Return the selected receding-horizon DSS-PP action."""
+    """Return the selected one-step DSS-PP action."""
 
     next_pose: NDArray[np.float64]
     next_pose_index: int
@@ -236,6 +352,23 @@ class DSSPPResult:
     score: float
     sequence: tuple[DSSPPNode, ...]
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _PendingDSSPPNode:
+    """Store geometry-only terms before exact joint EIG evaluation."""
+
+    pose_index: int
+    pose_xyz: NDArray[np.float64]
+    program: ShieldProgram
+    static_score: float
+    coverage_gain: float
+    revisit_penalty: float
+    bearing_diversity_gain: float
+    frontier_gain: float
+    turn_penalty: float
+    local_orbit_gain: float
+    elevation_condition_gain: float
 
 
 def _node_diagnostic_payload(node: DSSPPNode, rank: int) -> dict[str, object]:
@@ -250,34 +383,14 @@ def _node_diagnostic_payload(node: DSSPPNode, rank: int) -> dict[str, object]:
         "score": float(node.score),
         "static_score": float(node.static_score),
         "distance_weight": float(node.distance_weight),
-        "observation_penalty_weight": float(node.observation_penalty_weight),
         "information_gain": float(node.information_gain),
-        "signature_score": float(node.signature_score),
-        "temporal_separation_score": float(node.temporal_separation_score),
-        "elevation_signature_score": float(node.elevation_signature_score),
-        "observation_penalty": float(node.observation_penalty),
-        "count_balance_penalty": float(node.count_balance_penalty),
-        "differential_penalty": float(node.differential_penalty),
-        "dose_score": float(node.dose_score),
-        "count_utility": float(node.count_utility),
         "coverage_gain": float(node.coverage_gain),
         "revisit_penalty": float(node.revisit_penalty),
         "bearing_diversity_gain": float(node.bearing_diversity_gain),
         "frontier_gain": float(node.frontier_gain),
         "turn_penalty": float(node.turn_penalty),
         "local_orbit_gain": float(node.local_orbit_gain),
-        "station_condition_gain": float(node.station_condition_gain),
-        "correlation_reduction_gain": float(node.correlation_reduction_gain),
-        "isotope_balance_gain": float(node.isotope_balance_gain),
-        "environment_signature_score": float(node.environment_signature_score),
-        "occlusion_boundary_gain": float(node.occlusion_boundary_gain),
         "elevation_condition_gain": float(node.elevation_condition_gain),
-        "vertical_environment_signature_score": float(
-            node.vertical_environment_signature_score
-        ),
-        "remaining_route_pressure": float(node.remaining_route_pressure),
-        "remaining_route_penalty": float(node.remaining_route_penalty),
-        "remaining_route_gain": float(node.remaining_route_gain),
     }
 
 
@@ -287,8 +400,21 @@ def _mode_diagnostic_payload(mode: SignatureMode, index: int) -> dict[str, objec
         "index": int(index),
         "pos": [float(value) for value in np.asarray(mode.position_xyz, dtype=float)],
         "q": float(mode.strength_cps_1m),
-        "weight": float(mode.weight),
+        "marginal_existence_probability": float(mode.weight),
+        "isotope_presence_probability": _isotope_presence_probability(
+            [mode]
+        ),
         "spread_m": float(mode.spread_m),
+        "surface_chart_id": (
+            None
+            if mode.surface_chart_id is None
+            else int(mode.surface_chart_id)
+        ),
+        "surface_uv": (
+            None
+            if mode.surface_uv is None
+            else [float(value) for value in mode.surface_uv]
+        ),
     }
 
 
@@ -302,20 +428,11 @@ def _component_leader_payloads(
     selectors: dict[str, Any] = {
         "score": lambda node: float(node.score),
         "information_gain": lambda node: float(node.information_gain),
-        "signature": lambda node: float(node.signature_score),
-        "temporal_separation": lambda node: float(node.temporal_separation_score),
-        "elevation_separation": lambda node: float(node.elevation_signature_score),
         "coverage": lambda node: float(node.coverage_gain),
-        "count_utility": lambda node: float(node.count_utility),
-        "correlation_reduction": lambda node: float(node.correlation_reduction_gain),
-        "isotope_balance": lambda node: float(node.isotope_balance_gain),
-        "obstacle_signature": lambda node: float(node.environment_signature_score),
-        "vertical_obstacle_signature": lambda node: float(
-            node.vertical_environment_signature_score
-        ),
-        "remaining_route": lambda node: (
-            float(node.remaining_route_gain) - float(node.remaining_route_penalty)
-        ),
+        "bearing_diversity": lambda node: float(node.bearing_diversity_gain),
+        "frontier": lambda node: float(node.frontier_gain),
+        "local_orbit": lambda node: float(node.local_orbit_gain),
+        "elevation_condition": lambda node: float(node.elevation_condition_gain),
     }
     leaders: dict[str, dict[str, object]] = {}
     for name, selector in selectors.items():
@@ -332,45 +449,186 @@ def _component_leader_payloads(
 
 
 def _normalise_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Return normalized nonnegative weights with a uniform fallback."""
+    """Return normalized weights and fail on an invalid posterior contract."""
     arr = np.asarray(weights, dtype=float).ravel()
     if arr.size == 0:
         return arr
-    arr = np.maximum(arr, 0.0)
+    if np.any(~np.isfinite(arr)) or np.any(arr < 0.0):
+        raise ValueError("Posterior weights must be finite and nonnegative.")
     total = float(np.sum(arr))
-    if total <= 0.0:
-        return np.ones(arr.size, dtype=float) / float(arr.size)
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("Posterior weights must contain positive mass.")
     return arr / total
 
 
-def _pair_id(fe_index: int, pb_index: int, num_orients: int) -> int:
-    """Return the flattened orientation-pair id."""
-    return int(fe_index) * int(num_orients) + int(pb_index)
+def _posterior_mode_weights(
+    weights: NDArray[np.float64] | Sequence[float],
+) -> NDArray[np.float64]:
+    """Return marginal existence probabilities without erasing source count."""
+    arr = np.asarray(weights, dtype=object).reshape(-1)
+    return np.fromiter(
+        (
+            validated_probability(
+                value,
+                name=f"Mode existence probability[{index}]",
+            )
+            for index, value in enumerate(arr)
+        ),
+        dtype=np.float64,
+        count=arr.size,
+    )
+
+
+def _isotope_presence_probability(
+    modes: Sequence[SignatureMode],
+) -> float | None:
+    """Return the shared PF probability that an isotope has at least one source."""
+    if not modes:
+        return None
+    configured = [
+        mode.isotope_presence_probability
+        for mode in modes
+        if mode.isotope_presence_probability is not None
+    ]
+    if not configured:
+        return validated_probability(
+            sum(
+                validated_probability(
+                    mode.weight,
+                    name=(
+                        "Implicit signature source-mode probability"
+                        f"[{index}]"
+                    ),
+                )
+                for index, mode in enumerate(modes)
+            ),
+            name="Implicit signature-isotope presence probability",
+        )
+    if len(configured) != len(modes):
+        raise ValueError(
+            "Modes for one isotope cannot mix explicit and implicit presence."
+        )
+    values = np.asarray(configured, dtype=object).reshape(-1)
+    values = np.fromiter(
+        (
+            validated_probability(
+                value,
+                name=f"Signature isotope presence probability[{index}]",
+            )
+            for index, value in enumerate(values)
+        ),
+        dtype=np.float64,
+        count=values.size,
+    )
+    if not np.allclose(values, values[:1], rtol=0.0, atol=1.0e-12):
+        raise ValueError(
+            "Modes for one isotope must share one presence probability."
+        )
+    return float(values[0])
+
+
+def _flattened_posterior_mode_weights(
+    modes_by_isotope: dict[str, list[SignatureMode]],
+) -> NDArray[np.float64]:
+    """Return concatenated mode masses while preserving each isotope's K=0 mass."""
+    blocks = [
+        _posterior_mode_weights([mode.weight for mode in modes])
+        for modes in modes_by_isotope.values()
+        if modes
+    ]
+    return np.concatenate(blocks) if blocks else np.zeros(0, dtype=float)
+
+
+def _presence_weighted_rows(
+    rows: Sequence[NDArray[np.float64]],
+    presence_masses: Sequence[float],
+    *,
+    population_size: int,
+) -> NDArray[np.float64]:
+    """Average feature rows without renormalizing away absent-isotope mass."""
+    if not rows:
+        return np.zeros(0, dtype=float)
+    stacked = np.vstack([np.asarray(row, dtype=float) for row in rows])
+    raw_masses = np.asarray(presence_masses, dtype=object)
+    masses = np.fromiter(
+        (
+            validated_probability(
+                value,
+                name=f"Feature-row presence probability[{index}]",
+            )
+            for index, value in enumerate(raw_masses)
+        ),
+        dtype=np.float64,
+        count=raw_masses.size,
+    )
+    if masses.shape != (stacked.shape[0],):
+        raise ValueError("Presence masses must match feature rows.")
+    if (
+        isinstance(population_size, bool)
+        or not isinstance(population_size, (int, np.integer))
+        or int(population_size) <= 0
+    ):
+        raise ValueError("population_size must be a positive integer.")
+    denominator = int(population_size)
+    return np.sum(stacked * masses[:, None], axis=0) / float(denominator)
+
+
+def _planning_rng(
+    rng: np.random.Generator | None,
+) -> np.random.Generator:
+    """Return the caller-owned persistent planning generator."""
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("DSS planning requires an explicit persistent RNG.")
+    return rng
+
+
+def _validate_mode_capacity(
+    estimator: RotatingShieldPFEstimator,
+    config: DSSPPConfig,
+) -> int:
+    """Require the planner mode capacity to cover every PF source slot."""
+    try:
+        pf_config = estimator.pf_config
+        configured_max_sources = pf_config.max_sources
+    except AttributeError as error:
+        raise TypeError(
+            "DSS planning requires an estimator with an explicit PF config."
+        ) from error
+    if configured_max_sources is None:
+        raise ValueError("DSS planning requires a finite PF max_sources value.")
+    pf_max_sources = int(configured_max_sources)
+    if pf_max_sources <= 0:
+        raise ValueError("PF max_sources must be a positive integer.")
+    configured = int(config.max_modes_per_isotope)
+    if pf_max_sources > 0 and configured < pf_max_sources:
+        raise ValueError(
+            "max_modes_per_isotope must be at least the PF max_sources "
+            f"({configured} < {pf_max_sources})."
+        )
+    return pf_max_sources
+
+
+def _validate_eig_likelihood_contract(
+    estimator: RotatingShieldPFEstimator,
+    config: DSSPPConfig,
+) -> None:
+    """Require the exact full-spectrum model used by the joint PF."""
+    if float(config.lambda_eig) <= 0.0:
+        return
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    if not callable(getattr(model, "cross_log_likelihood_numpy", None)):
+        raise RuntimeError(
+            "DSS EIG requires vectorized full-spectrum cross likelihoods."
+        )
+    if not callable(getattr(estimator, "planning_joint_particles", None)):
+        raise RuntimeError("DSS EIG requires aligned joint PF particles.")
 
 
 def _pair_indices(pair_id: int, num_orients: int) -> tuple[int, int]:
     """Return Fe and Pb indices from a flattened pair id."""
     return int(pair_id) // int(num_orients), int(pair_id) % int(num_orients)
-
-
-def _opposite_indices(normals: NDArray[np.float64]) -> list[int]:
-    """Return the approximately opposite octant index for each normal."""
-    normal_arr = np.asarray(normals, dtype=float)
-    opposite: list[int] = []
-    for normal in normal_arr:
-        dots = normal_arr @ normal
-        opposite.append(int(np.argmin(dots)))
-    return opposite
-
-
-def _cycle_program_pairs(pair_ids: Sequence[int], length: int) -> tuple[int, ...]:
-    """Return a non-empty pair-id sequence repeated to the requested length."""
-    base = tuple(int(pair_id) for pair_id in pair_ids)
-    target = max(1, int(length))
-    if not base:
-        return tuple()
-    repeats = int(np.ceil(target / float(len(base))))
-    return (base * repeats)[:target]
 
 
 def build_shield_program_library(
@@ -379,93 +637,153 @@ def build_shield_program_library(
     program_length: int = 2,
     max_programs: int = 40,
 ) -> list[ShieldProgram]:
-    """Build bearing, material, occlusion, and vertical shield programs."""
+    """Build balanced, repetition-free programs covering every Fe/Pb pair."""
     normal_arr = np.asarray(normals, dtype=float)
-    if normal_arr.ndim != 2 or normal_arr.shape[1] != 3:
+    if (
+        normal_arr.ndim != 2
+        or normal_arr.shape[1] != 3
+        or np.any(~np.isfinite(normal_arr))
+    ):
         raise ValueError("normals must be shaped (N, 3).")
     num_orients = int(normal_arr.shape[0])
     if num_orients <= 0:
-        return []
-    length = max(1, int(program_length))
-    opposite = _opposite_indices(normal_arr)
-    programs: list[ShieldProgram] = []
-    for idx in range(num_orients):
-        opp = opposite[idx]
-        blocked = _pair_id(idx, idx, num_orients)
-        unblocked = _pair_id(opp, opp, num_orients)
-        fe_only = _pair_id(idx, opp, num_orients)
-        pb_only = _pair_id(opp, idx, num_orients)
-        programs.append(
-            ShieldProgram(
-                name=f"bearing_split_{idx}",
-                pair_ids=_cycle_program_pairs((blocked, unblocked), length),
-                kind="bearing_split",
+        raise ValueError("normals must contain at least one orientation.")
+    if (
+        isinstance(program_length, bool)
+        or not isinstance(program_length, (int, np.integer))
+        or int(program_length) <= 0
+    ):
+        raise ValueError("program_length must be a positive integer.")
+    if (
+        isinstance(max_programs, bool)
+        or not isinstance(max_programs, (int, np.integer))
+        or int(max_programs) <= 0
+    ):
+        raise ValueError("max_programs must be a positive integer.")
+    length = int(program_length)
+    pair_count = num_orients * num_orients
+    if length > pair_count:
+        raise ValueError(
+            "program_length cannot exceed the number of unique Fe/Pb pairs."
+        )
+    if num_orients == 8 and length == 8:
+        orientation_axis = np.arange(num_orients, dtype=np.int64)
+        slopes = orientation_axis[
+            np.gcd(orientation_axis, num_orients) == 1
+        ]
+        latin_pb = (
+            slopes[:, None, None] * orientation_axis[None, None, :]
+            + orientation_axis[None, :, None]
+        ) % num_orients
+        latin_pairs = (
+            orientation_axis[None, None, :] * num_orients + latin_pb
+        ).reshape(-1, num_orients)
+        fixed_fe_pairs = (
+            orientation_axis[:, None] * num_orients
+            + orientation_axis[None, :]
+        )
+        fixed_pb_pairs = (
+            orientation_axis[None, :] * num_orients
+            + orientation_axis[:, None]
+        )
+        pair_matrix = np.concatenate(
+            (latin_pairs, fixed_fe_pairs, fixed_pb_pairs),
+            axis=0,
+        )
+        partition_names = tuple(
+            [f"latin_slope_{int(slope)}" for slope in slopes]
+            + ["fixed_fe", "fixed_pb"]
+        )
+        required_programs = len(partition_names) * num_orients
+        if int(max_programs) < required_programs:
+            raise ValueError(
+                "max_programs is too small for the canonical balanced "
+                "multi-partition shield library "
+                f"({int(max_programs)} < {required_programs})."
             )
+        program_names = tuple(
+            f"{partition_name}_{program_index:02d}"
+            for partition_name in partition_names
+            for program_index in range(num_orients)
         )
-        programs.append(
+        programs = [
             ShieldProgram(
-                name=f"material_split_{idx}",
-                pair_ids=_cycle_program_pairs((fe_only, pb_only), length),
-                kind="material_split",
+                name=program_name,
+                pair_ids=tuple(int(pair_id) for pair_id in pair_row),
+                kind="all_pair_balanced_multi_partition",
             )
-        )
-        programs.append(
-            ShieldProgram(
-                name=f"occlusion_test_{idx}",
-                pair_ids=_cycle_program_pairs((unblocked, blocked, fe_only), length),
-                kind="occlusion_test",
+            for program_name, pair_row in zip(
+                program_names,
+                pair_matrix,
+                strict=True,
             )
+        ]
+        pair_occurrences = np.bincount(
+            pair_matrix.reshape(-1),
+            minlength=pair_count,
         )
-    up_idx = int(np.argmax(normal_arr[:, 2]))
-    down_idx = int(np.argmin(normal_arr[:, 2]))
-    programs.append(
-        ShieldProgram(
-            name="vertical_split_up_down",
-            pair_ids=_cycle_program_pairs(
-                (
-                    _pair_id(up_idx, up_idx, num_orients),
-                    _pair_id(down_idx, down_idx, num_orients),
-                ),
-                length,
-            ),
-            kind="vertical_split",
+        if (
+            np.any(np.diff(np.sort(pair_matrix, axis=1), axis=1) == 0)
+            or np.any(pair_occurrences <= 0)
+            or int(np.max(pair_occurrences) - np.min(pair_occurrences)) != 0
+        ):
+            raise RuntimeError(
+                "Canonical shield partitions must be repetition-free and "
+                "pair-frequency balanced."
+            )
+        return programs
+
+    required_programs = int(np.ceil(pair_count / float(length)))
+    if int(max_programs) < required_programs:
+        raise ValueError(
+            "max_programs is too small to expose every Fe/Pb pair without "
+            f"within-program repetition ({int(max_programs)} < "
+            f"{required_programs})."
         )
+
+    # Latin-diagonal order makes every Fe and Pb orientation occur uniformly
+    # before the sequence is split into fixed-size station programs.
+    orientation_axis = np.arange(num_orients, dtype=np.int64)
+    ordered_pairs = (
+        orientation_axis[None, :] * num_orients
+        + (
+            orientation_axis[None, :]
+            + orientation_axis[:, None]
+        )
+        % num_orients
+    ).reshape(-1)
+    program_pair_indices = (
+        np.arange(required_programs * length, dtype=np.int64) % pair_count
     )
-    programs.append(
-        ShieldProgram(
-            name="vertical_material_split_up_down",
-            pair_ids=_cycle_program_pairs(
-                (
-                    _pair_id(up_idx, down_idx, num_orients),
-                    _pair_id(down_idx, up_idx, num_orients),
-                ),
-                length,
-            ),
-            kind="vertical_material_split",
-        )
+    pair_matrix = ordered_pairs[program_pair_indices].reshape(
+        required_programs,
+        length,
     )
-    for idx in range(num_orients):
-        opp = opposite[idx]
-        programs.append(
-            ShieldProgram(
-                name=f"elevation_bearing_split_{idx}",
-                pair_ids=_cycle_program_pairs(
-                    (
-                        _pair_id(idx, up_idx, num_orients),
-                        _pair_id(opp, down_idx, num_orients),
-                        _pair_id(up_idx, idx, num_orients),
-                        _pair_id(down_idx, opp, num_orients),
-                    ),
-                    length,
-                ),
-                kind="elevation_bearing_split",
-            )
+    if np.any(np.diff(np.sort(pair_matrix, axis=1), axis=1) == 0):
+        raise RuntimeError(
+            "Balanced shield construction produced a repeated pair."
         )
-    deduped: dict[tuple[int, ...], ShieldProgram] = {}
-    for program in programs:
-        if program.pair_ids:
-            deduped.setdefault(program.pair_ids, program)
-    return list(deduped.values())[: max(1, int(max_programs))]
+    programs = [
+        ShieldProgram(
+            name=f"all_pair_balanced_{program_index:02d}",
+            pair_ids=tuple(int(pair_id) for pair_id in pair_row),
+            kind="all_pair_balanced",
+        )
+        for program_index, pair_row in enumerate(pair_matrix)
+    ]
+    pair_occurrences = np.bincount(
+        pair_matrix.reshape(-1),
+        minlength=pair_count,
+    )
+    if (
+        np.any(pair_occurrences <= 0)
+        or int(np.max(pair_occurrences) - np.min(pair_occurrences)) > 1
+    ):
+        raise RuntimeError(
+            "Balanced shield programs must cover every pair with frequencies "
+            "differing by at most one."
+        )
+    return programs
 
 
 def _continuous_kernel_for_estimator(
@@ -479,69 +797,413 @@ def _continuous_kernel_for_estimator(
     )
 
 
-def _response_scales_for_all_pairs(
-    estimator: RotatingShieldPFEstimator,
-    isotope: str,
-    num_orients: int,
-) -> NDArray[np.float64]:
-    """Return source-response scales for every Fe/Pb shield pair."""
-    pair_ids = np.arange(max(int(num_orients), 1) ** 2, dtype=int)
-    fe_indices = pair_ids // max(int(num_orients), 1)
-    pb_indices = pair_ids % max(int(num_orients), 1)
-    return estimator.response_scales_for_measurements(
-        isotope,
-        fe_indices.astype(np.int64, copy=False),
-        pb_indices.astype(np.int64, copy=False),
+def _weighted_surface_medoid_index(
+    positions_xyz: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    *,
+    surface_path_distance: Callable[
+        [NDArray[np.float64], NDArray[np.float64]],
+        NDArray[np.float64],
+    ]
+    | None,
+    surface_chart_ids: NDArray[np.int64] | None = None,
+    surface_uv: NDArray[np.float64] | None = None,
+    surface_coordinate_path_distance: Callable[
+        [
+            NDArray[np.int64],
+            NDArray[np.float64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+        ],
+        NDArray[np.float64],
+    ]
+    | None = None,
+    row_chunk_size: int = 256,
+) -> int:
+    """Return the weighted medoid index using intrinsic surface distance."""
+    positions = np.asarray(positions_xyz, dtype=float).reshape(-1, 3)
+    sample_weights = _normalise_weights(np.asarray(weights, dtype=float).reshape(-1))
+    if positions.shape[0] != sample_weights.size or positions.shape[0] == 0:
+        raise ValueError("Surface medoid inputs must contain matching samples.")
+    if positions.shape[0] == 1:
+        return 0
+    coordinate_inputs = (
+        surface_chart_ids,
+        surface_uv,
+        surface_coordinate_path_distance,
     )
+    coordinates_active = all(value is not None for value in coordinate_inputs)
+    if any(value is not None for value in coordinate_inputs) and not coordinates_active:
+        raise ValueError(
+            "Surface medoids require chart IDs, UV, and the coordinate-distance "
+            "function together."
+        )
+    chart_ids: NDArray[np.int64] | None = None
+    uv: NDArray[np.float64] | None = None
+    if coordinates_active:
+        raw_chart_ids = np.asarray(surface_chart_ids)
+        if not np.issubdtype(raw_chart_ids.dtype, np.integer):
+            raise TypeError("surface_chart_ids must contain integers.")
+        chart_ids = raw_chart_ids.astype(np.int64, copy=False).reshape(-1)
+        uv = np.asarray(surface_uv, dtype=np.float64)
+        if (
+            chart_ids.shape != (positions.shape[0],)
+            or uv.shape != (positions.shape[0], 2)
+            or np.any(~np.isfinite(uv))
+        ):
+            raise ValueError(
+                "Surface medoid coordinates must match the position samples."
+            )
+    if (
+        isinstance(row_chunk_size, bool)
+        or not isinstance(row_chunk_size, (int, np.integer))
+        or int(row_chunk_size) <= 0
+    ):
+        raise ValueError("row_chunk_size must be a positive integer.")
+    medoid_costs = np.empty(positions.shape[0], dtype=float)
+    chunk_size = int(row_chunk_size)
+    for start in range(0, positions.shape[0], chunk_size):
+        stop = min(start + chunk_size, positions.shape[0])
+        if coordinates_active:
+            assert chart_ids is not None
+            assert uv is not None
+            assert surface_coordinate_path_distance is not None
+            distance_matrix = np.asarray(
+                surface_coordinate_path_distance(
+                    chart_ids[start:stop, None],
+                    uv[start:stop, None, :],
+                    chart_ids[None, :],
+                    uv[None, :, :],
+                ),
+                dtype=float,
+            )
+        else:
+            left = np.repeat(positions[start:stop], positions.shape[0], axis=0)
+            right = np.tile(positions, (stop - start, 1))
+            if surface_path_distance is None:
+                distance_rows = np.linalg.norm(left - right, axis=1)
+            else:
+                distance_rows = np.asarray(
+                    surface_path_distance(left, right),
+                    dtype=float,
+                ).reshape(-1)
+            distance_matrix = distance_rows.reshape(
+                stop - start,
+                positions.shape[0],
+            )
+        if (
+            distance_matrix.shape
+            != (stop - start, positions.shape[0])
+            or np.any(np.isnan(distance_matrix))
+            or np.any(distance_matrix < 0.0)
+        ):
+            raise RuntimeError(
+                "Surface medoid calculation returned invalid distances."
+            )
+        medoid_costs[start:stop] = distance_matrix @ sample_weights
+    minimum_cost = float(np.min(medoid_costs))
+    tied = np.flatnonzero(
+        np.isclose(medoid_costs, minimum_cost, rtol=0.0, atol=1.0e-12)
+    )
+    return int(tied[np.argmax(sample_weights[tied])])
 
 
 def _cluster_source_samples(
     isotope: str,
-    positions: list[NDArray[np.float64]],
-    strengths: list[float],
-    weights: list[float],
+    positions: Sequence[NDArray[np.float64]] | NDArray[np.float64],
+    strengths: Sequence[float] | NDArray[np.float64],
+    weights: Sequence[float] | NDArray[np.float64],
     *,
     radius_m: float,
     max_modes: int,
+    particle_ids: Sequence[int] | None = None,
+    isotope_presence_probability: float | None = None,
+    surface_path_distance: Callable[
+        [NDArray[np.float64], NDArray[np.float64]],
+        NDArray[np.float64],
+    ]
+    | None = None,
+    surface_chart_ids: Sequence[int] | NDArray[np.int64] | None = None,
+    surface_uv: Sequence[Sequence[float]] | NDArray[np.float64] | None = None,
+    surface_coordinate_path_distance: Callable[
+        [
+            NDArray[np.int64],
+            NDArray[np.float64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+        ],
+        NDArray[np.float64],
+    ]
+    | None = None,
 ) -> list[SignatureMode]:
-    """Cluster weighted posterior source samples into signature modes."""
-    if not positions:
+    """Cluster source samples into marginal-existence surface modes.
+
+    Samples from the same PF particle contribute to a cluster's existence only
+    once and may never occupy the same cluster. Thus simultaneous nearby
+    sources remain distinct rather than being collapsed into one strong mode.
+    Production callers use intrinsic surface-path distances, preventing
+    ambient-near points on disconnected or folded surfaces from being merged.
+    """
+    if len(positions) == 0:
         return []
     pos_arr = np.asarray(positions, dtype=float)
     str_arr = np.asarray(strengths, dtype=float)
-    w_arr = _normalise_weights(np.asarray(weights, dtype=float))
+    w_arr = np.asarray(weights, dtype=float).reshape(-1)
+    if (
+        pos_arr.ndim != 2
+        or pos_arr.shape[1] != 3
+        or str_arr.shape != (pos_arr.shape[0],)
+        or w_arr.shape != (pos_arr.shape[0],)
+    ):
+        raise ValueError(
+            "Mode samples must have matching position, strength, and weight."
+        )
+    if not np.all(np.isfinite(pos_arr)) or not np.all(np.isfinite(str_arr)):
+        raise ValueError("Mode sample positions and strengths must be finite.")
+    if not np.all(np.isfinite(w_arr)) or np.any(w_arr < 0.0):
+        raise ValueError("Mode sample weights must be finite and nonnegative.")
+    resolved_radius = float(radius_m)
+    if not np.isfinite(resolved_radius) or resolved_radius <= 0.0:
+        raise ValueError("radius_m must be finite and positive.")
+    if (
+        isinstance(max_modes, bool)
+        or not isinstance(max_modes, (int, np.integer))
+        or int(max_modes) <= 0
+    ):
+        raise ValueError("max_modes must be a positive integer.")
+    # ``max_modes`` is the PF's simultaneous source-slot capacity.  Marginal
+    # posterior clustering can legitimately produce more spatial modes than
+    # any one particle contains, so it must never be used as a truncation cap.
+    _ = int(max_modes)
+    coordinate_inputs = (
+        surface_chart_ids,
+        surface_uv,
+        surface_coordinate_path_distance,
+    )
+    coordinates_active = all(value is not None for value in coordinate_inputs)
+    if any(value is not None for value in coordinate_inputs) and not coordinates_active:
+        raise ValueError(
+            "Surface clustering requires chart IDs, UV, and the coordinate-"
+            "distance function together."
+        )
+    chart_id_arr: NDArray[np.int64] | None = None
+    surface_uv_arr: NDArray[np.float64] | None = None
+    if coordinates_active:
+        raw_chart_ids = np.asarray(surface_chart_ids)
+        if not np.issubdtype(raw_chart_ids.dtype, np.integer):
+            raise TypeError("surface_chart_ids must contain integers.")
+        chart_id_arr = raw_chart_ids.astype(np.int64, copy=False).reshape(-1)
+        surface_uv_arr = np.asarray(surface_uv, dtype=np.float64)
+        if (
+            chart_id_arr.shape != (pos_arr.shape[0],)
+            or surface_uv_arr.shape != (pos_arr.shape[0], 2)
+            or np.any(chart_id_arr < 0)
+            or np.any(~np.isfinite(surface_uv_arr))
+            or np.any(surface_uv_arr < 0.0)
+            or np.any(surface_uv_arr > 1.0)
+        ):
+            raise ValueError(
+                "Surface chart coordinates must match every source sample."
+            )
+    if particle_ids is None:
+        particle_id_arr = np.arange(pos_arr.shape[0], dtype=np.int64)
+    else:
+        particle_id_arr = np.asarray(particle_ids, dtype=np.int64).reshape(-1)
+        if particle_id_arr.shape != (pos_arr.shape[0],):
+            raise ValueError("particle_ids must contain one ID per source sample.")
+        if np.any(particle_id_arr < 0):
+            raise ValueError("particle_ids must be nonnegative.")
+    if float(np.sum(w_arr)) <= 0.0:
+        return []
+    if isotope_presence_probability is None:
+        resolved_presence = validated_probability(
+            float(np.sum(w_arr)),
+            name="Implicit clustered-isotope presence probability",
+        )
+    else:
+        resolved_presence = validated_probability(
+            isotope_presence_probability,
+            name="Clustered-isotope presence probability",
+        )
     order = np.argsort(w_arr)[::-1]
     clusters: list[list[int]] = []
     centers: list[NDArray[np.float64]] = []
+    center_chart_ids: list[int] = []
+    center_surface_uv: list[NDArray[np.float64]] = []
+    cluster_particle_ids: list[set[int]] = []
     for idx in order:
         pos = pos_arr[int(idx)]
+        particle_id = int(particle_id_arr[int(idx)])
         assigned = False
-        for cluster_idx, center in enumerate(centers):
-            if float(np.linalg.norm(pos - center)) <= float(radius_m):
-                clusters[cluster_idx].append(int(idx))
-                cluster_weights = w_arr[clusters[cluster_idx]]
-                centers[cluster_idx] = np.average(
-                    pos_arr[clusters[cluster_idx]],
-                    axis=0,
-                    weights=cluster_weights,
+        if centers:
+            if coordinates_active:
+                assert chart_id_arr is not None
+                assert surface_uv_arr is not None
+                assert surface_coordinate_path_distance is not None
+                center_distances = np.asarray(
+                    surface_coordinate_path_distance(
+                        np.full(
+                            len(centers),
+                            chart_id_arr[int(idx)],
+                            dtype=np.int64,
+                        ),
+                        np.broadcast_to(
+                            surface_uv_arr[int(idx)],
+                            (len(centers), 2),
+                        ),
+                        np.asarray(center_chart_ids, dtype=np.int64),
+                        np.asarray(center_surface_uv, dtype=np.float64),
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+            elif surface_path_distance is None:
+                center_array = np.asarray(centers, dtype=float).reshape(-1, 3)
+                center_distances = np.linalg.norm(
+                    center_array - pos[None, :],
+                    axis=1,
                 )
+            else:
+                center_array = np.asarray(centers, dtype=float).reshape(-1, 3)
+                center_distances = np.asarray(
+                    surface_path_distance(
+                        np.broadcast_to(pos, center_array.shape),
+                        center_array,
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+                if (
+                    center_distances.shape != (len(centers),)
+                    or np.any(np.isnan(center_distances))
+                    or np.any(center_distances < 0.0)
+                ):
+                    raise RuntimeError(
+                        "Surface mode clustering returned invalid path distances."
+                    )
+        else:
+            center_distances = np.zeros(0, dtype=float)
+        for cluster_idx, distance in enumerate(center_distances):
+            if particle_id in cluster_particle_ids[cluster_idx]:
+                continue
+            if float(distance) <= resolved_radius:
+                clusters[cluster_idx].append(int(idx))
+                cluster_particle_ids[cluster_idx].add(particle_id)
                 assigned = True
                 break
         if not assigned:
             clusters.append([int(idx)])
             centers.append(pos.copy())
+            if coordinates_active:
+                assert chart_id_arr is not None
+                assert surface_uv_arr is not None
+                center_chart_ids.append(int(chart_id_arr[int(idx)]))
+                center_surface_uv.append(surface_uv_arr[int(idx)].copy())
+            cluster_particle_ids.append({particle_id})
     modes: list[SignatureMode] = []
     for cluster in clusters:
         cluster_weights = w_arr[cluster]
-        cluster_weight_sum = float(np.sum(cluster_weights))
-        if cluster_weight_sum <= 0.0:
+        cluster_particle_ids = particle_id_arr[cluster]
+        particle_order = np.argsort(cluster_particle_ids, kind="stable")
+        sorted_particle_ids = cluster_particle_ids[particle_order]
+        group_starts = np.flatnonzero(
+            np.concatenate(
+                (
+                    np.asarray([True]),
+                    sorted_particle_ids[1:] != sorted_particle_ids[:-1],
+                )
+            )
+        )
+        sorted_particle_weights = cluster_weights[particle_order]
+        particle_weight_max = np.maximum.reduceat(
+            sorted_particle_weights,
+            group_starts,
+        )
+        particle_weight_min = np.minimum.reduceat(
+            sorted_particle_weights,
+            group_starts,
+        )
+        if not np.allclose(
+            particle_weight_max,
+            particle_weight_min,
+            rtol=0.0,
+            atol=1.0e-15,
+        ):
+            raise ValueError(
+                "All source samples from one PF particle must share its weight."
+            )
+        cluster_existence = float(np.sum(particle_weight_max))
+        if cluster_existence <= 0.0:
             continue
-        center = np.average(pos_arr[cluster], axis=0, weights=cluster_weights)
-        strength = float(np.average(str_arr[cluster], weights=cluster_weights))
+        cluster_existence = validated_probability(
+            cluster_existence,
+            name="Cluster existence probability",
+        )
+        representative_local_index = _weighted_surface_medoid_index(
+            pos_arr[cluster],
+            cluster_weights,
+            surface_path_distance=surface_path_distance,
+            surface_chart_ids=(
+                None if chart_id_arr is None else chart_id_arr[cluster]
+            ),
+            surface_uv=(
+                None if surface_uv_arr is None else surface_uv_arr[cluster]
+            ),
+            surface_coordinate_path_distance=surface_coordinate_path_distance,
+        )
+        representative = pos_arr[cluster[representative_local_index]].copy()
+        strength = float(
+            np.sum(str_arr[cluster] * cluster_weights)
+            / cluster_existence
+        )
+        if not np.isfinite(strength) or strength <= 0.0:
+            raise RuntimeError(
+                "A supported posterior source mode must have positive strength."
+            )
+        if coordinates_active:
+            assert chart_id_arr is not None
+            assert surface_uv_arr is not None
+            assert surface_coordinate_path_distance is not None
+            representative_sample_index = int(
+                cluster[representative_local_index]
+            )
+            representative_distances = np.asarray(
+                surface_coordinate_path_distance(
+                    np.full(
+                        len(cluster),
+                        chart_id_arr[representative_sample_index],
+                        dtype=np.int64,
+                    ),
+                    np.broadcast_to(
+                        surface_uv_arr[representative_sample_index],
+                        (len(cluster), 2),
+                    ),
+                    chart_id_arr[cluster],
+                    surface_uv_arr[cluster],
+                ),
+                dtype=float,
+            ).reshape(-1)
+        elif surface_path_distance is None:
+            representative_distances = np.linalg.norm(
+                pos_arr[cluster] - representative[None, :],
+                axis=1,
+            )
+        else:
+            representative_distances = np.asarray(
+                surface_path_distance(
+                    np.broadcast_to(representative, (len(cluster), 3)),
+                    pos_arr[cluster],
+                ),
+                dtype=float,
+            ).reshape(-1)
+        if (
+            representative_distances.shape != (len(cluster),)
+            or np.any(np.isnan(representative_distances))
+            or np.any(representative_distances < 0.0)
+        ):
+            raise RuntimeError("Surface mode spread returned invalid path distances.")
         spread = float(
             np.sqrt(
                 np.average(
-                    np.sum((pos_arr[cluster] - center[None, :]) ** 2, axis=1),
+                    representative_distances * representative_distances,
                     weights=cluster_weights,
                 )
             )
@@ -549,14 +1211,48 @@ def _cluster_source_samples(
         modes.append(
             SignatureMode(
                 isotope=isotope,
-                position_xyz=center.astype(float),
-                strength_cps_1m=max(strength, 0.0),
-                weight=cluster_weight_sum,
+                position_xyz=representative.astype(float),
+                strength_cps_1m=strength,
+                weight=cluster_existence,
                 spread_m=spread,
+                isotope_presence_probability=resolved_presence,
+                surface_chart_id=(
+                    None
+                    if chart_id_arr is None
+                    else int(
+                        chart_id_arr[
+                            int(cluster[representative_local_index])
+                        ]
+                    )
+                ),
+                surface_uv=(
+                    None
+                    if surface_uv_arr is None
+                    else tuple(
+                        float(value)
+                        for value in surface_uv_arr[
+                            int(cluster[representative_local_index])
+                        ]
+                    )
+                ),
             )
         )
     modes.sort(key=lambda mode: mode.weight, reverse=True)
-    return modes[: max(1, int(max_modes))]
+    represented_source_mass = float(
+        np.sum([float(mode.weight) for mode in modes], dtype=np.float64)
+    )
+    expected_source_mass = float(np.sum(w_arr, dtype=np.float64))
+    if not np.isclose(
+        represented_source_mass,
+        expected_source_mass,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "Surface-mode clustering failed to preserve posterior expected "
+            "source-count mass."
+        )
+    return modes
 
 
 def extract_signature_modes(
@@ -565,47 +1261,268 @@ def extract_signature_modes(
     max_particles: int | None = None,
     method: str | None = None,
     mode_cluster_radius_m: float = 1.5,
-    max_modes_per_isotope: int = 4,
+    max_modes_per_isotope: int = 5,
+    rng: np.random.Generator | None = None,
+    particles_by_isotope: dict[
+        str,
+        tuple[Sequence[object], NDArray[np.float64]],
+    ]
+    | None = None,
+    joint_particles: JointPlanningParticles | None = None,
 ) -> dict[str, list[SignatureMode]]:
-    """Extract isotope-wise source modes with their native PF posterior mass."""
-    particles = estimator.planning_particles(
-        max_particles=max_particles,
-        method=method,
-    )
+    """Extract isotope-wise modes while preserving native joint-PF mass.
+
+    Production planning passes ``joint_particles`` so particle/source slots are
+    validated and packed with array operations. ``particles_by_isotope`` is
+    retained only for small deterministic oracles that expose state objects.
+    """
+    planning_rng = _planning_rng(rng)
+    if particles_by_isotope is not None and joint_particles is not None:
+        raise ValueError(
+            "Provide either particles_by_isotope or joint_particles, not both."
+        )
+    if particles_by_isotope is None and joint_particles is None:
+        particles = estimator.planning_particles(
+            max_particles=max_particles,
+            method=method,
+            rng=planning_rng,
+        )
+    else:
+        particles = particles_by_isotope
+    if joint_particles is not None:
+        if tuple(str(value) for value in joint_particles.isotope_order) != tuple(
+            str(value) for value in estimator.isotopes
+        ):
+            raise ValueError(
+                "Joint mode snapshot isotope order differs from the estimator."
+            )
+        joint_weights = _normalise_weights(
+            np.asarray(joint_particles.weights_n, dtype=np.float64)
+        )
+        joint_particle_count = int(joint_weights.size)
+        joint_particle_ids_n1 = np.arange(
+            joint_particle_count,
+            dtype=np.int64,
+        )[:, None]
     modes_by_isotope: dict[str, list[SignatureMode]] = {}
     eps = 1e-12
     for isotope in estimator.isotopes:
-        positions: list[NDArray[np.float64]] = []
-        strengths: list[float] = []
-        sample_weights: list[float] = []
-        if isotope in particles:
+        if joint_particles is not None:
+            isotope_key = str(isotope)
+            try:
+                packed_positions_nk3 = np.asarray(
+                    joint_particles.positions_nk3_by_isotope[isotope_key],
+                    dtype=np.float64,
+                )
+                packed_strengths_nk = np.asarray(
+                    joint_particles.strengths_nk_by_isotope[isotope_key],
+                    dtype=np.float64,
+                )
+                packed_mask_nk = np.asarray(
+                    joint_particles.source_mask_nk_by_isotope[isotope_key],
+                    dtype=bool,
+                )
+                packed_chart_ids_nk = np.asarray(
+                    joint_particles.surface_chart_ids_nk_by_isotope[
+                        isotope_key
+                    ]
+                )
+                packed_surface_uv_nk2 = np.asarray(
+                    joint_particles.surface_uv_nk2_by_isotope[isotope_key],
+                    dtype=np.float64,
+                )
+            except KeyError as error:
+                raise ValueError(
+                    "Joint mode snapshot is missing an estimator isotope."
+                ) from error
+            expected_slots = packed_mask_nk.shape
+            if (
+                packed_mask_nk.ndim != 2
+                or packed_positions_nk3.shape != expected_slots + (3,)
+                or packed_strengths_nk.shape != expected_slots
+                or packed_chart_ids_nk.shape != expected_slots
+                or not np.issubdtype(
+                    packed_chart_ids_nk.dtype,
+                    np.integer,
+                )
+                or packed_surface_uv_nk2.shape != expected_slots + (2,)
+                or expected_slots[0] != joint_particle_count
+                or np.any(~np.isfinite(packed_positions_nk3))
+                or np.any(~np.isfinite(packed_strengths_nk))
+                or np.any(~np.isfinite(packed_surface_uv_nk2))
+                or np.any(packed_strengths_nk[packed_mask_nk] <= 0.0)
+                or np.any(packed_strengths_nk[~packed_mask_nk] != 0.0)
+                or np.any(packed_chart_ids_nk[packed_mask_nk] < 0)
+                or np.any(packed_surface_uv_nk2[packed_mask_nk] < 0.0)
+                or np.any(packed_surface_uv_nk2[packed_mask_nk] > 1.0)
+            ):
+                raise ValueError(
+                    "Joint mode snapshot contains invalid packed source arrays."
+                )
+            positions = packed_positions_nk3[packed_mask_nk]
+            strengths = packed_strengths_nk[packed_mask_nk]
+            sample_chart_ids = packed_chart_ids_nk[
+                packed_mask_nk
+            ].astype(np.int64, copy=False)
+            sample_surface_uv = packed_surface_uv_nk2[packed_mask_nk]
+            broadcast_weights_nk = np.broadcast_to(
+                joint_weights[:, None],
+                expected_slots,
+            )
+            sample_weights = broadcast_weights_nk[packed_mask_nk]
+            broadcast_particle_ids_nk = np.broadcast_to(
+                joint_particle_ids_n1,
+                expected_slots,
+            )
+            sample_particle_ids = broadcast_particle_ids_nk[packed_mask_nk]
+            isotope_presence_probability = float(
+                np.sum(
+                    joint_weights[np.any(packed_mask_nk, axis=1)],
+                    dtype=np.float64,
+                )
+            )
+        else:
+            positions_list: list[NDArray[np.float64]] = []
+            strengths_list: list[float] = []
+            sample_weights_list: list[float] = []
+            sample_particle_ids_list: list[int] = []
+            sample_chart_ids_list: list[int] = []
+            sample_surface_uv_list: list[NDArray[np.float64]] = []
+            isotope_presence_probability = 0.0
+            if particles is None or isotope not in particles:
+                positions = np.zeros((0, 3), dtype=np.float64)
+                strengths = np.zeros(0, dtype=np.float64)
+                sample_weights = np.zeros(0, dtype=np.float64)
+                sample_particle_ids = np.zeros(0, dtype=np.int64)
+                sample_chart_ids = None
+                sample_surface_uv = None
+                modes_by_isotope[isotope] = []
+                continue
             states, weights = particles[isotope]
             norm_weights = _normalise_weights(np.asarray(weights, dtype=float))
-            for state, particle_weight in zip(states, norm_weights):
+            for particle_index, (state, particle_weight) in enumerate(
+                zip(states, norm_weights)
+            ):
                 num_sources = int(state.num_sources)
                 if num_sources <= 0:
                     continue
-                state_strengths = np.maximum(
-                    np.asarray(state.strengths[:num_sources], dtype=float),
-                    0.0,
+                isotope_presence_probability += float(particle_weight)
+                state_strengths = np.asarray(
+                    state.strengths[:num_sources],
+                    dtype=float,
                 )
+                if (
+                    state_strengths.shape != (num_sources,)
+                    or np.any(~np.isfinite(state_strengths))
+                    or np.any(state_strengths <= 0.0)
+                ):
+                    raise ValueError(
+                        "A positive-cardinality PF state must contain one "
+                        "finite positive strength per source."
+                    )
                 total_strength = float(np.sum(state_strengths))
                 if total_strength <= eps:
-                    rel_strengths = np.ones(num_sources, dtype=float) / float(
-                        num_sources
+                    raise ValueError(
+                        "A positive-cardinality PF state must contain positive "
+                        "source strength."
                     )
-                else:
-                    rel_strengths = state_strengths / total_strength
-                for pos, strength, rel_strength in zip(
-                    state.positions[:num_sources],
-                    state_strengths,
-                    rel_strengths,
+                particle_filter = estimator.filters[str(isotope)]
+                state_positions = np.asarray(
+                    particle_filter.continuous_state_positions(state),
+                    dtype=float,
+                )
+                if state_positions.shape != (num_sources, 3):
+                    raise ValueError(
+                        "A positive-cardinality PF state must resolve to one "
+                        "continuous surface position per source."
+                    )
+                state_chart_ids = np.asarray(
+                    state.surface_chart_ids,
+                )
+                state_surface_uv = np.asarray(
+                    state.surface_uv,
+                    dtype=np.float64,
+                )
+                if (
+                    not np.issubdtype(state_chart_ids.dtype, np.integer)
+                    or state_chart_ids.shape != (num_sources,)
+                    or state_surface_uv.shape != (num_sources, 2)
+                    or np.any(state_chart_ids < 0)
+                    or np.any(~np.isfinite(state_surface_uv))
+                    or np.any(state_surface_uv < 0.0)
+                    or np.any(state_surface_uv > 1.0)
                 ):
-                    positions.append(np.asarray(pos, dtype=float))
-                    strengths.append(float(strength))
-                    sample_weights.append(
-                        float(particle_weight) * float(rel_strength)
+                    raise ValueError(
+                        "A positive-cardinality PF state must retain one "
+                        "authoritative chart/UV coordinate per source."
                     )
+                for pos, strength, chart_id, source_uv in zip(
+                    state_positions,
+                    state_strengths,
+                    state_chart_ids,
+                    state_surface_uv,
+                ):
+                    positions_list.append(np.asarray(pos, dtype=float))
+                    strengths_list.append(float(strength))
+                    sample_weights_list.append(float(particle_weight))
+                    sample_particle_ids_list.append(int(particle_index))
+                    sample_chart_ids_list.append(int(chart_id))
+                    sample_surface_uv_list.append(
+                        np.asarray(source_uv, dtype=np.float64)
+                    )
+            positions = np.asarray(positions_list, dtype=np.float64).reshape(-1, 3)
+            strengths = np.asarray(strengths_list, dtype=np.float64)
+            sample_weights = np.asarray(sample_weights_list, dtype=np.float64)
+            sample_particle_ids = np.asarray(
+                sample_particle_ids_list,
+                dtype=np.int64,
+            )
+            sample_chart_ids = np.asarray(
+                sample_chart_ids_list,
+                dtype=np.int64,
+            )
+            sample_surface_uv = np.asarray(
+                sample_surface_uv_list,
+                dtype=np.float64,
+            ).reshape(-1, 2)
+        coordinate_distance = None
+        if isinstance(estimator, RotatingShieldPFEstimator):
+            atlas = estimator.filters[
+                str(isotope)
+            ]._structural_rj_surface_atlas
+            if atlas is None:
+                raise RuntimeError(
+                    "Production mode extraction requires a continuous surface "
+                    "atlas."
+                )
+            if sample_chart_ids is None or sample_surface_uv is None:
+                raise RuntimeError(
+                    "Production mode extraction requires authoritative chart "
+                    "coordinates for every source sample."
+                )
+            decoded_positions = np.asarray(
+                atlas.positions_xyz(
+                    sample_chart_ids,
+                    sample_surface_uv,
+                ),
+                dtype=np.float64,
+            ).reshape(-1, 3)
+            if (
+                decoded_positions.shape != positions.shape
+                or not np.allclose(
+                    decoded_positions,
+                    positions,
+                    rtol=0.0,
+                    atol=1.0e-10,
+                )
+            ):
+                raise RuntimeError(
+                    "Planner XYZ positions differ from their authoritative "
+                    "continuous surface chart coordinates."
+                )
+            coordinate_distance = (
+                atlas.surface_coordinate_path_distance_upper_bound_m
+            )
         modes = _cluster_source_samples(
             isotope,
             positions,
@@ -613,25 +1530,268 @@ def extract_signature_modes(
             sample_weights,
             radius_m=mode_cluster_radius_m,
             max_modes=max_modes_per_isotope,
+            particle_ids=np.asarray(sample_particle_ids, dtype=np.int64),
+            isotope_presence_probability=isotope_presence_probability,
+            surface_path_distance=(
+                None
+                if not isinstance(estimator, RotatingShieldPFEstimator)
+                else estimator.filters[
+                    str(isotope)
+                ]._structural_rj_surface_atlas.surface_path_distance_upper_bound_m
+            ),
+            surface_chart_ids=(
+                None if coordinate_distance is None else sample_chart_ids
+            ),
+            surface_uv=(
+                None if coordinate_distance is None else sample_surface_uv
+            ),
+            surface_coordinate_path_distance=coordinate_distance,
         )
         modes_by_isotope[isotope] = modes
     return modes_by_isotope
 
 
-def _is_free(map_api: object | None, point: NDArray[np.float64]) -> bool:
-    """Return True when point is in free space according to map_api."""
-    if map_api is None:
-        return True
-    if callable(map_api):
-        return bool(map_api(point))
-    for attr in ("is_free", "is_free_space", "is_free_cell"):
-        fn = getattr(map_api, attr, None)
-        if callable(fn):
-            try:
-                return bool(fn(point))
-            except TypeError:
-                continue
-    return True
+def _official_signature_modes(
+    estimator: RotatingShieldPFEstimator,
+    *,
+    max_modes_per_isotope: int,
+) -> tuple[dict[str, list[SignatureMode]], dict[str, object]]:
+    """Return the official point projection for read-only consistency checks.
+
+    Candidate geometry and exact EIG use the full aligned joint posterior with
+    unconditional mass. These joint-MAP modes are diagnostic only and must
+    never restrict candidate generation or erase the K=0 posterior mass.
+    """
+    point_estimates = estimator.posterior_point_estimate()
+    isotope_order_getter = getattr(estimator, "joint_isotope_order", None)
+    isotope_order = (
+        tuple(str(value) for value in isotope_order_getter())
+        if callable(isotope_order_getter)
+        else tuple(sorted(str(value) for value in estimator.isotopes))
+    )
+    if set(point_estimates) != set(isotope_order):
+        raise RuntimeError(
+            "Official PF point estimates do not match planner isotopes."
+        )
+    modes_by_isotope: dict[str, list[SignatureMode]] = {}
+    cardinality_vector: list[int] = []
+    stratum_masses: list[float] = []
+    medoids_by_isotope: dict[str, list[list[float]]] = {}
+    for isotope in isotope_order:
+        point_estimate = point_estimates[isotope]
+        raw_map_cardinality = point_estimate.map_cardinality
+        if isinstance(raw_map_cardinality, (bool, np.bool_)) or not isinstance(
+            raw_map_cardinality,
+            (int, np.integer),
+        ):
+            raise ValueError("Official PF cardinality must be an integer.")
+        map_cardinality = int(raw_map_cardinality)
+        if map_cardinality < 0:
+            raise ValueError("Official PF cardinality cannot be negative.")
+        if map_cardinality > int(max_modes_per_isotope):
+            raise ValueError(
+                "Official PF cardinality exceeds planner mode capacity."
+            )
+        if len(point_estimate.modes) != map_cardinality:
+            raise RuntimeError(
+                "Official PF mode count differs from its MAP cardinality."
+            )
+        cardinality_vector.append(map_cardinality)
+        selected_mass = validated_probability(
+            point_estimate.selected_stratum_mass,
+            name=f"Official joint-MAP stratum mass[{isotope}]",
+        )
+        stratum_masses.append(selected_mass)
+        distribution: dict[int, object] = {}
+        for raw_cardinality, mass in (
+            point_estimate.cardinality_distribution.items()
+        ):
+            if isinstance(raw_cardinality, (bool, np.bool_)) or not isinstance(
+                raw_cardinality,
+                (int, np.integer),
+            ):
+                raise ValueError(
+                    "Official PF cardinality-distribution keys must be integers."
+                )
+            cardinality = int(raw_cardinality)
+            if cardinality < 0:
+                raise ValueError(
+                    "Official PF cardinality-distribution keys must be "
+                    "nonnegative."
+                )
+            distribution[cardinality] = mass
+        distribution_values = validated_probability_distribution(
+            [
+                distribution[cardinality]
+                for cardinality in sorted(distribution)
+            ],
+            name=f"Official cardinality distribution[{isotope}]",
+        )
+        distribution_keys = sorted(distribution)
+        presence_probability = validated_probability(
+            float(
+                np.sum(
+                    distribution_values[
+                        np.asarray(distribution_keys, dtype=np.int64) > 0
+                    ]
+                )
+            ),
+            name=f"Official isotope presence probability[{isotope}]",
+        )
+        isotope_modes: list[SignatureMode] = []
+        medoid_rows: list[list[float]] = []
+        for mode in point_estimate.modes:
+            medoid = np.asarray(
+                mode.position_medoid_xyz,
+                dtype=np.float64,
+            ).reshape(3)
+            if np.any(~np.isfinite(medoid)):
+                raise ValueError("Official PF surface medoid must be finite.")
+            strength = float(mode.strength_representative_cps_1m)
+            if not np.isfinite(strength) or strength <= 0.0:
+                raise ValueError(
+                    "Official PF source strength must be finite and positive."
+                )
+            mode_mass = validated_probability(
+                mode.posterior_mass,
+                name=f"Official source-mode mass[{isotope}]",
+            )
+            if not np.isclose(
+                mode_mass,
+                selected_mass,
+                rtol=0.0,
+                atol=1.0e-12,
+            ):
+                raise RuntimeError(
+                    "Official source mode and joint-MAP stratum masses differ."
+                )
+            surface_radius = mode.credible_surface_path_radius_95_m
+            spread = (
+                float(mode.credible_radius_95_m)
+                if surface_radius is None
+                else float(surface_radius)
+            )
+            if not np.isfinite(spread) or spread < 0.0:
+                raise ValueError("Official PF source spread must be nonnegative.")
+            isotope_modes.append(
+                SignatureMode(
+                    isotope=isotope,
+                    position_xyz=medoid.copy(),
+                    strength_cps_1m=strength,
+                    weight=mode_mass,
+                    spread_m=spread,
+                    isotope_presence_probability=presence_probability,
+                    surface_chart_id=(
+                        None
+                        if mode.surface_chart_id is None
+                        else int(mode.surface_chart_id)
+                    ),
+                    surface_uv=(
+                        None
+                        if mode.surface_uv is None
+                        else tuple(
+                            float(value) for value in mode.surface_uv
+                        )
+                    ),
+                )
+            )
+            medoid_rows.append([float(value) for value in medoid])
+        modes_by_isotope[isotope] = isotope_modes
+        medoids_by_isotope[isotope] = medoid_rows
+    if stratum_masses and not np.allclose(
+        stratum_masses,
+        stratum_masses[:1],
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "Official isotope reports do not share one joint-MAP stratum mass."
+        )
+    joint_distribution_getter = getattr(
+        estimator,
+        "posterior_joint_cardinality_distribution",
+        None,
+    )
+    joint_distribution: dict[tuple[int, ...], float] | None = None
+    if callable(joint_distribution_getter):
+        raw_joint_distribution = joint_distribution_getter()
+        if not isinstance(raw_joint_distribution, Mapping) or not (
+            raw_joint_distribution
+        ):
+            raise RuntimeError("Official joint cardinality distribution is empty.")
+        joint_entries: list[tuple[tuple[int, ...], object]] = []
+        for raw_vector, mass in raw_joint_distribution.items():
+            if (
+                not isinstance(raw_vector, tuple)
+                or len(raw_vector) != len(isotope_order)
+                or any(
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                    or int(value) < 0
+                    for value in raw_vector
+                )
+            ):
+                raise ValueError(
+                    "Official joint cardinality keys must be nonnegative "
+                    "integer tuples matching the isotope order."
+                )
+            joint_entries.append(
+                (
+                    tuple(int(value) for value in raw_vector),
+                    mass,
+                )
+            )
+        joint_masses = validated_probability_distribution(
+            [mass for _, mass in joint_entries],
+            name="Official joint cardinality distribution",
+        )
+        joint_distribution = {
+            vector: float(mass)
+            for (vector, _), mass in zip(
+                joint_entries,
+                joint_masses,
+                strict=True,
+            )
+        }
+        maximum_mass = max(joint_distribution.values())
+        tied_vectors = sorted(
+            vector
+            for vector, mass in joint_distribution.items()
+            if np.isclose(
+                mass,
+                maximum_mass,
+                rtol=0.0,
+                atol=1.0e-15,
+            )
+        )
+        official_vector = tuple(cardinality_vector)
+        if not tied_vectors or official_vector != tied_vectors[0]:
+            raise RuntimeError(
+                "Planner cardinality vector differs from the official joint MAP."
+            )
+        if stratum_masses and not np.isclose(
+            stratum_masses[0],
+            maximum_mass,
+            rtol=0.0,
+            atol=1.0e-12,
+        ):
+            raise RuntimeError(
+                "Planner stratum mass differs from the official joint MAP."
+            )
+    diagnostics: dict[str, object] = {
+        "source": "official_joint_map_posterior_projection",
+        "isotope_order": list(isotope_order),
+        "joint_map_cardinality_vector": list(cardinality_vector),
+        "joint_map_stratum_mass": (
+            float(stratum_masses[0]) if stratum_masses else 0.0
+        ),
+        "position_representative": "common_joint_particle_surface_medoid",
+        "medoids_by_isotope": medoids_by_isotope,
+        "verified_against_joint_cardinality_distribution": bool(
+            joint_distribution is not None
+        ),
+    }
+    return modes_by_isotope, diagnostics
 
 
 def _free_space_mask_batch(
@@ -652,26 +1812,78 @@ def _free_space_mask_batch(
         if mask.size != points.shape[0]:
             raise ValueError("Batched free-space checker returned the wrong length.")
         return mask
-    return np.fromiter(
-        (_is_free(map_api, point) for point in points),
-        dtype=bool,
-        count=points.shape[0],
+    raise TypeError(
+        "Production planning maps must provide is_free_batch or "
+        "is_free_space_batch; unknown workspace APIs cannot be treated as free."
     )
 
 
-def _cell_center(
-    map_api: object, cell: tuple[int, int], z_value: float
+def _cell_centers_batch(
+    map_api: object,
+    cells_xy: NDArray[np.int64] | Sequence[Sequence[int]],
+    z_value: float,
 ) -> NDArray[np.float64]:
-    """Return the world-space center of a map cell."""
-    fn = getattr(map_api, "cell_center", None)
-    if callable(fn):
-        x_val, y_val = fn(cell)
+    """Return world-space centers for an integer map-cell batch."""
+    raw_cells = np.asarray(cells_xy)
+    if raw_cells.size == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    if (
+        raw_cells.ndim != 2
+        or raw_cells.shape[1] != 2
+        or not np.issubdtype(raw_cells.dtype, np.integer)
+        or np.any(raw_cells < 0)
+    ):
+        raise ValueError("Map cells must be a nonnegative N x 2 integer array.")
+    cells = raw_cells.astype(np.int64, copy=False)
+    if (
+        isinstance(z_value, (bool, np.bool_))
+        or not isinstance(
+            z_value,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(float(z_value))
+    ):
+        raise ValueError("Map cell-center height must be finite.")
+    center_batch = getattr(map_api, "cell_centers_batch", None)
+    if callable(center_batch):
+        xy_centers = np.asarray(center_batch(cells), dtype=np.float64)
     else:
-        origin = getattr(map_api, "origin", (0.0, 0.0))
-        cell_size = float(getattr(map_api, "cell_size", 1.0))
-        x_val = float(origin[0]) + (float(cell[0]) + 0.5) * cell_size
-        y_val = float(origin[1]) + (float(cell[1]) + 0.5) * cell_size
-    return np.array([float(x_val), float(y_val), float(z_value)], dtype=float)
+        if not hasattr(map_api, "origin") or not hasattr(map_api, "cell_size"):
+            raise TypeError(
+                "A planning grid without cell_centers_batch must define "
+                "origin and cell_size for vectorized center construction."
+            )
+        origin = np.asarray(map_api.origin, dtype=np.float64)
+        cell_size = getattr(map_api, "cell_size")
+        if (
+            origin.shape != (2,)
+            or np.any(~np.isfinite(origin))
+            or isinstance(cell_size, (bool, np.bool_))
+            or not isinstance(
+                cell_size,
+                (int, float, np.integer, np.floating),
+            )
+            or not np.isfinite(float(cell_size))
+            or float(cell_size) <= 0.0
+        ):
+            raise ValueError("Map cell-center geometry is invalid.")
+        xy_centers = (
+            origin[None, :]
+            + (cells.astype(np.float64) + 0.5) * float(cell_size)
+        )
+    if (
+        xy_centers.shape != (cells.shape[0], 2)
+        or np.any(~np.isfinite(xy_centers))
+    ):
+        raise ValueError(
+            "cell_centers_batch must return one finite xy center per cell."
+        )
+    return np.column_stack(
+        (
+            xy_centers,
+            np.full(cells.shape[0], float(z_value), dtype=np.float64),
+        )
+    )
 
 
 def _bounds_filter(
@@ -685,14 +1897,22 @@ def _bounds_filter(
         return np.zeros((0, 3), dtype=float)
     if point_array.ndim != 2 or point_array.shape[1] != 3:
         raise ValueError("points must be shape (N, 3).")
-    mask = np.all(np.isfinite(point_array), axis=1)
+    if np.any(~np.isfinite(point_array)):
+        raise ValueError("Candidate points must contain finite coordinates.")
+    mask = np.ones(point_array.shape[0], dtype=bool)
     if bounds_xyz is None:
         lo = None
         hi = None
     else:
         lo = np.asarray(bounds_xyz[0], dtype=float)
         hi = np.asarray(bounds_xyz[1], dtype=float)
-        if lo.shape != (3,) or hi.shape != (3,):
+        if (
+            lo.shape != (3,)
+            or hi.shape != (3,)
+            or np.any(~np.isfinite(lo))
+            or np.any(~np.isfinite(hi))
+            or np.any(hi < lo)
+        ):
             raise ValueError("bounds_xyz must contain two (3,) arrays.")
         mask &= np.all((point_array >= lo) & (point_array <= hi), axis=1)
     if not np.any(mask):
@@ -738,13 +1958,22 @@ def augment_candidate_stations(
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
     config: DSSPPConfig,
     continuous_height_bounds_m: tuple[float, float] | None = None,
+    rng: np.random.Generator | None = None,
 ) -> NDArray[np.float64]:
     """Add posterior-ring, occlusion-boundary, and cross-bearing candidates."""
+    planning_rng = _planning_rng(rng)
     base = np.asarray(candidate_poses_xyz, dtype=float)
-    if base.ndim != 2 or base.shape[1] != 3:
+    current_pose = np.asarray(current_pose_xyz, dtype=np.float64)
+    if (
+        base.ndim != 2
+        or base.shape[1] != 3
+        or np.any(~np.isfinite(base))
+    ):
         raise ValueError("candidate_poses_xyz must be shape (N, 3).")
-    z_value = float(current_pose_xyz[2])
-    generated: list[NDArray[np.float64]] = [row.copy() for row in base]
+    if current_pose.shape != (3,) or np.any(~np.isfinite(current_pose)):
+        raise ValueError("current_pose_xyz must be a finite three-vector.")
+    z_value = float(current_pose[2])
+    generated_batches: list[NDArray[np.float64]] = [base.copy()]
     all_modes = [
         mode
         for modes in modes_by_isotope.values()
@@ -752,100 +1981,168 @@ def augment_candidate_stations(
         if mode.weight > 0.0
     ]
     all_modes.sort(key=lambda mode: mode.weight, reverse=True)
-    top_modes = all_modes[: max(1, int(config.max_modes_per_isotope) * 2)]
+    augmentation_capacity = int(config.max_augmented_candidates)
+    if len(all_modes) > augmentation_capacity:
+        raise ValueError(
+            "Posterior geometry contains more material surface modes than the "
+            "explicit candidate-augmentation capacity "
+            f"({len(all_modes)} > {augmentation_capacity}); increase "
+            "max_augmented_candidates instead of silently dropping modes."
+        )
     angles = np.linspace(
         0.0,
         2.0 * np.pi,
-        num=max(4, int(config.ring_angles)),
+        num=int(config.ring_angles),
         endpoint=False,
     )
-    for mode in top_modes:
-        for radius in config.ring_radii_m:
-            for angle in angles:
-                point = np.array(
-                    [
-                        mode.position_xyz[0] + float(radius) * np.cos(angle),
-                        mode.position_xyz[1] + float(radius) * np.sin(angle),
-                        z_value,
-                    ],
-                    dtype=float,
+    mode_positions = (
+        np.vstack(
+            [
+                np.asarray(mode.position_xyz, dtype=np.float64).reshape(3)
+                for mode in all_modes
+            ]
+        )
+        if all_modes
+        else np.zeros((0, 3), dtype=np.float64)
+    )
+    radii = np.asarray(config.ring_radii_m, dtype=np.float64)
+    if mode_positions.size and radii.size:
+        unit_xy = np.column_stack((np.cos(angles), np.sin(angles)))
+        ring_xy_by_mode = (
+            mode_positions[:, None, None, :2]
+            + radii[None, :, None, None]
+            * unit_xy[None, None, :, :]
+        )
+        # Interleave modes before applying the explicit augmentation budget.
+        # Consequently every material mode contributes one proposal before a
+        # second proposal is taken from any mode.
+        ring_xy = np.transpose(
+            ring_xy_by_mode,
+            (1, 2, 0, 3),
+        ).reshape(-1, 2)
+        generated_batches.append(
+            np.column_stack(
+                (
+                    ring_xy,
+                    np.full(ring_xy.shape[0], z_value, dtype=np.float64),
                 )
-                generated.append(point)
+            )
+        )
     cells = getattr(map_api, "traversable_cells", None)
     if cells is None and hasattr(map_api, "blocked_cells"):
-        blocked = set(getattr(map_api, "blocked_cells"))
-        grid_shape = getattr(map_api, "grid_shape", (0, 0))
-        free_neighbors: set[tuple[int, int]] = set()
-        for ix, iy in blocked:
-            for nb in ((ix - 1, iy), (ix + 1, iy), (ix, iy - 1), (ix, iy + 1)):
-                if 0 <= nb[0] < grid_shape[0] and 0 <= nb[1] < grid_shape[1]:
-                    if nb not in blocked:
-                        free_neighbors.add(nb)
-        cells = tuple(sorted(free_neighbors))
+        raw_blocked = np.asarray(tuple(getattr(map_api, "blocked_cells")))
+        grid_shape = np.asarray(getattr(map_api, "grid_shape", (0, 0)))
+        if raw_blocked.size:
+            if (
+                raw_blocked.ndim != 2
+                or raw_blocked.shape[1] != 2
+                or not np.issubdtype(raw_blocked.dtype, np.integer)
+                or grid_shape.shape != (2,)
+                or not np.issubdtype(grid_shape.dtype, np.integer)
+                or np.any(grid_shape <= 0)
+            ):
+                raise ValueError(
+                    "blocked_cells and grid_shape must define a valid "
+                    "integer planning grid."
+                )
+            blocked = raw_blocked.astype(np.int64, copy=False)
+            neighbor_offsets = np.asarray(
+                ((-1, 0), (1, 0), (0, -1), (0, 1)),
+                dtype=np.int64,
+            )
+            neighbors = (
+                blocked[:, None, :] + neighbor_offsets[None, :, :]
+            ).reshape(-1, 2)
+            in_bounds = np.all(
+                (neighbors >= 0) & (neighbors < grid_shape[None, :]),
+                axis=1,
+            )
+            neighbors = np.unique(neighbors[in_bounds], axis=0)
+            grid_width = int(grid_shape[1])
+            blocked_ids = blocked[:, 0] * grid_width + blocked[:, 1]
+            neighbor_ids = neighbors[:, 0] * grid_width + neighbors[:, 1]
+            cells = neighbors[~np.isin(neighbor_ids, blocked_ids)]
+        else:
+            cells = np.zeros((0, 2), dtype=np.int64)
     if cells is not None:
-        boundary_points = [
-            _cell_center(map_api, tuple(cell), z_value) for cell in cells
-        ]
-        if top_modes:
-            ref = top_modes[0].position_xyz
-            boundary_points.sort(key=lambda pt: float(np.linalg.norm(pt - ref)))
-        generated.extend(
-            boundary_points[: max(0, int(config.max_augmented_candidates) // 2)]
-        )
+        raw_cells = np.asarray(tuple(cells))
+        if raw_cells.size:
+            boundary_points = _cell_centers_batch(
+                map_api,
+                raw_cells,
+                z_value,
+            )
+            if mode_positions.size:
+                distances = np.linalg.norm(
+                    boundary_points - mode_positions[0][None, :],
+                    axis=1,
+                )
+                boundary_points = boundary_points[
+                    np.argsort(distances, kind="stable")
+                ]
+            generated_batches.append(
+                boundary_points[
+                    : int(config.max_augmented_candidates) // 2
+                ]
+            )
     coverage_points = _free_cell_centers(
         map_api,
         z_value=z_value,
-        max_cells=max(0, int(config.max_augmented_candidates)),
+        max_cells=int(config.max_augmented_candidates),
         bounds_xyz=bounds_xyz,
     )
     if coverage_points.size:
-        if visited_poses_xyz is not None:
-            visited = np.asarray(visited_poses_xyz, dtype=float)
-            if visited.ndim == 1 and visited.size == 3:
-                visited = visited.reshape(1, 3)
-            if visited.ndim == 2 and visited.shape[1] == 3 and visited.size:
-                distances = np.linalg.norm(
-                    coverage_points[:, None, :2] - visited[None, :, :2],
-                    axis=2,
-                )
-                order = np.argsort(np.min(distances, axis=1))[::-1]
-                coverage_points = coverage_points[order]
-        generated.extend(
-            [
-                point.copy()
-                for point in coverage_points[
-                    : max(0, int(config.max_augmented_candidates) // 2)
-                ]
-            ]
+        visited = _pose_matrix_or_empty(visited_poses_xyz)
+        if visited.size:
+            distances = np.linalg.norm(
+                coverage_points[:, None, :2] - visited[None, :, :2],
+                axis=2,
+            )
+            order = np.argsort(np.min(distances, axis=1))[::-1]
+            coverage_points = coverage_points[order]
+        generated_batches.append(
+            coverage_points[
+                : int(config.max_augmented_candidates) // 2
+            ].copy()
         )
-    if visited_poses_xyz is not None and top_modes:
-        visited = np.asarray(visited_poses_xyz, dtype=float)
-        if visited.ndim == 2 and visited.shape[1] == 3:
-            for mode in top_modes:
-                prior_angles = [
-                    _bearing_angle_xy(mode.position_xyz, pose) for pose in visited
-                ]
-                for base_angle in prior_angles:
-                    for offset in (0.5 * np.pi, -0.5 * np.pi, np.pi):
-                        angle = base_angle + offset
-                        for radius in config.ring_radii_m:
-                            generated.append(
-                                np.array(
-                                    [
-                                        mode.position_xyz[0]
-                                        + float(radius) * np.cos(angle),
-                                        mode.position_xyz[1]
-                                        + float(radius) * np.sin(angle),
-                                        z_value,
-                                    ],
-                                    dtype=float,
-                                )
-                            )
-    generated_array = (
-        np.vstack(generated).astype(float)
-        if generated
-        else np.zeros((0, 3), dtype=float)
-    )
+    visited = _pose_matrix_or_empty(visited_poses_xyz)
+    if visited.size and mode_positions.size and radii.size:
+        bearing_delta = (
+            visited[None, :, :2] - mode_positions[:, None, :2]
+        )
+        prior_angles = np.arctan2(
+            bearing_delta[:, :, 1],
+            bearing_delta[:, :, 0],
+        )
+        bearing_offsets = np.asarray(
+            (0.5 * np.pi, -0.5 * np.pi, np.pi),
+            dtype=np.float64,
+        )
+        bearing_angles = (
+            prior_angles[:, :, None] + bearing_offsets[None, None, :]
+        )
+        bearing_unit_xy = np.stack(
+            (np.cos(bearing_angles), np.sin(bearing_angles)),
+            axis=-1,
+        )
+        bearing_xy = (
+            mode_positions[:, None, None, None, :2]
+            + bearing_unit_xy[:, :, :, None, :]
+            * radii[None, None, None, :, None]
+        ).reshape(-1, 2)
+        generated_batches.append(
+            np.column_stack(
+                (
+                    bearing_xy,
+                    np.full(
+                        bearing_xy.shape[0],
+                        z_value,
+                        dtype=np.float64,
+                    ),
+                )
+            )
+        )
+    generated_array = np.concatenate(generated_batches, axis=0)
     if continuous_height_bounds_m is not None:
         lower_z = float(continuous_height_bounds_m[0])
         upper_z = float(continuous_height_bounds_m[1])
@@ -864,329 +2161,15 @@ def augment_candidate_stations(
                 )
         augmented_count = int(generated_array.shape[0] - base.shape[0])
         if augmented_count > 0:
-            height_rng = np.random.default_rng(config.rng_seed)
             generated_array[base.shape[0] :, 2] = sample_low_discrepancy_heights(
-                height_rng,
+                planning_rng,
                 (lower_z, upper_z),
                 augmented_count,
             )
     filtered = _bounds_filter(generated_array, bounds_xyz, map_api)
     deduped = _dedupe_points(filtered)
-    limit = max(base.shape[0], int(config.max_augmented_candidates))
+    limit = base.shape[0] + augmentation_capacity
     return deduped[:limit]
-
-
-def _expected_signature(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    mode: SignatureMode,
-    pose_xyz: NDArray[np.float64],
-    program: ShieldProgram,
-    num_orients: int,
-    live_time_s: float,
-) -> NDArray[np.float64]:
-    """Return a source-mode shield-signature count vector."""
-    values: list[float] = []
-    for pair_id in program.pair_ids:
-        fe_index, pb_index = _pair_indices(pair_id, num_orients)
-        source_scale = estimator.response_scale_for_isotope(
-            mode.isotope,
-            fe_index=fe_index,
-            pb_index=pb_index,
-        )
-        kernel_value = kernel.kernel_value_pair(
-            isotope=mode.isotope,
-            detector_pos=pose_xyz,
-            source_pos=mode.position_xyz,
-            fe_index=fe_index,
-            pb_index=pb_index,
-        )
-        count = (
-            float(live_time_s)
-            * float(mode.strength_cps_1m)
-            * float(source_scale)
-            * float(kernel_value)
-        )
-        values.append(max(count, 0.0))
-    return np.asarray(values, dtype=float)
-
-
-def _build_pair_signature_cache(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> dict[str, tuple[NDArray[np.float64], list[float]]]:
-    """Precompute single-posture signatures for every Fe/Pb orientation pair."""
-    num_orients = int(estimator.num_orientations)
-    num_pairs = num_orients * num_orients
-    cache: dict[str, tuple[NDArray[np.float64], list[float]]] = {}
-    for isotope in estimator.isotopes:
-        modes = modes_by_isotope.get(isotope, [])
-        if not modes:
-            cache[isotope] = (np.zeros((num_pairs, 0), dtype=float), [])
-            continue
-        mode_positions = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float).reshape(3) for mode in modes]
-        )
-        mode_strengths = np.asarray(
-            [float(mode.strength_cps_1m) for mode in modes],
-            dtype=float,
-        )
-        source_scales = _response_scales_for_all_pairs(
-            estimator,
-            isotope,
-            num_orients,
-        )
-        try:
-            kernel_values = kernel.kernel_values_all_pairs(
-                isotope=isotope,
-                detector_pos=pose_xyz,
-                sources=mode_positions,
-            )
-        except RuntimeError:
-            kernel_values = np.asarray(
-                [
-                    [
-                        kernel.kernel_value_pair(
-                            isotope=isotope,
-                            detector_pos=pose_xyz,
-                            source_pos=mode.position_xyz,
-                            fe_index=fe_index,
-                            pb_index=pb_index,
-                        )
-                        for mode in modes
-                    ]
-                    for pair_id in range(num_pairs)
-                    for fe_index, pb_index in (_pair_indices(pair_id, num_orients),)
-                ],
-                dtype=float,
-            )
-        if kernel_values.shape != (num_pairs, len(modes)):
-            matrix = np.zeros((num_pairs, len(modes)), dtype=float)
-            for mode_idx, mode in enumerate(modes):
-                for pair_id in range(num_pairs):
-                    fe_index, pb_index = _pair_indices(pair_id, num_orients)
-                    matrix[pair_id, mode_idx] = kernel.kernel_value_pair(
-                        isotope=isotope,
-                        detector_pos=pose_xyz,
-                        source_pos=mode.position_xyz,
-                        fe_index=fe_index,
-                        pb_index=pb_index,
-                    )
-            kernel_values = matrix
-        matrix = np.maximum(
-            float(config.live_time_s)
-            * source_scales[:, None]
-            * kernel_values
-            * mode_strengths[None, :],
-            0.0,
-        )
-        cache[isotope] = (matrix, [float(mode.weight) for mode in modes])
-    return cache
-
-
-def _build_pair_signature_caches_for_poses(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    poses_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> list[dict[str, tuple[NDArray[np.float64], list[float]]]]:
-    """Precompute all-pair shield signatures for every candidate pose."""
-    pose_arr = np.asarray(poses_xyz, dtype=float)
-    if pose_arr.ndim != 2 or pose_arr.shape[1] != 3:
-        raise ValueError("poses_xyz must be shaped (P, 3).")
-    num_orients = int(estimator.num_orientations)
-    num_pairs = num_orients * num_orients
-    caches: list[dict[str, tuple[NDArray[np.float64], list[float]]]] = [
-        {} for _ in range(pose_arr.shape[0])
-    ]
-    for isotope in estimator.isotopes:
-        modes = modes_by_isotope.get(isotope, [])
-        if not modes:
-            for cache in caches:
-                cache[isotope] = (np.zeros((num_pairs, 0), dtype=float), [])
-            continue
-        mode_positions = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float).reshape(3) for mode in modes]
-        )
-        mode_strengths = np.asarray(
-            [float(mode.strength_cps_1m) for mode in modes],
-            dtype=float,
-        )
-        source_scales = _response_scales_for_all_pairs(
-            estimator,
-            isotope,
-            num_orients,
-        )
-        try:
-            kernel_values = kernel.kernel_values_all_pairs_for_detectors(
-                isotope=isotope,
-                detector_positions=pose_arr,
-                sources=mode_positions,
-            )
-        except RuntimeError:
-            kernel_values = np.stack(
-                [
-                    kernel.kernel_values_all_pairs(
-                        isotope=isotope,
-                        detector_pos=pose,
-                        sources=mode_positions,
-                    )
-                    for pose in pose_arr
-                ],
-                axis=0,
-            )
-        expected_shape = (pose_arr.shape[0], num_pairs, len(modes))
-        if kernel_values.shape != expected_shape:
-            fallback = np.zeros(expected_shape, dtype=float)
-            for pose_idx, pose in enumerate(pose_arr):
-                for mode_idx, mode in enumerate(modes):
-                    for pair_id in range(num_pairs):
-                        fe_index, pb_index = _pair_indices(pair_id, num_orients)
-                        fallback[pose_idx, pair_id, mode_idx] = (
-                            kernel.kernel_value_pair(
-                                isotope=isotope,
-                                detector_pos=pose,
-                                source_pos=mode.position_xyz,
-                                fe_index=fe_index,
-                                pb_index=pb_index,
-                            )
-                        )
-            kernel_values = fallback
-        matrices = np.maximum(
-            float(config.live_time_s)
-            * source_scales[None, :, None]
-            * kernel_values
-            * mode_strengths[None, None, :],
-            0.0,
-        )
-        weights = [float(mode.weight) for mode in modes]
-        for pose_idx, cache in enumerate(caches):
-            cache[isotope] = (matrices[pose_idx], weights)
-    return caches
-
-
-def _score_program_from_pair_cache(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    modes_by_isotope: dict[str, list[SignatureMode]] | None = None,
-    program: ShieldProgram,
-    config: DSSPPConfig,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> tuple[float, float, float, float, float, float, float, float]:
-    """Score a shield program from cached single-posture signatures."""
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(v) for v in isotope_weights.values()) or 1.0
-    pair_ids = np.asarray(program.pair_ids, dtype=int)
-    signature_total = 0.0
-    temporal_total = 0.0
-    elevation_total = 0.0
-    differential_terms: list[float] = []
-    observation_counts: dict[str, float] = {}
-    balance_counts: dict[str, float] = {}
-    dose_score = 0.0
-    for isotope in estimator.isotopes:
-        matrix, weights = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        signatures: list[NDArray[np.float64]] = []
-        if matrix.size and pair_ids.size:
-            clipped_pair_ids = np.clip(pair_ids, 0, matrix.shape[0] - 1)
-            signatures = [
-                np.asarray(matrix[clipped_pair_ids, mode_idx], dtype=float)
-                for mode_idx in range(matrix.shape[1])
-            ]
-        if signatures:
-            isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-            modes_for_isotope = (modes_by_isotope or {}).get(isotope, [])
-            history_weight, background_counts = (
-                _signature_statistics_for_isotope_at_pose(
-                    future_statistics,
-                    isotope,
-                    pose_index=pose_index,
-                    mode_count=len(signatures),
-                    config=config,
-                )
-            )
-            signature_total += isotope_weight * _signature_separation_score(
-                signatures,
-                variance_floor=config.count_variance_floor,
-                likelihood_spec=_count_likelihood_spec_for_isotope(
-                    estimator,
-                    isotope,
-                ),
-                primary_history_weight=history_weight,
-                background_counts=background_counts,
-            )
-            temporal_total += (
-                isotope_weight
-                * _temporal_separation_score_from_signatures(
-                    signatures,
-                    weights,
-                    config=config,
-                )
-            )
-            elevation_total += (
-                isotope_weight
-                * _elevation_signature_score_from_signatures(
-                    signatures,
-                    weights,
-                    modes_for_isotope,
-                    config=config,
-                )
-            )
-            mean_signature = _weighted_mean_signature(signatures, weights)
-            observation_counts[isotope] = (
-                float(np.max(mean_signature)) if mean_signature.size else 0.0
-            )
-            balance_counts[isotope] = (
-                float(np.sum(mean_signature)) if mean_signature.size else 0.0
-            )
-            dose_score += float(np.sum(mean_signature))
-            signature_std = (
-                float(np.std(mean_signature)) if mean_signature.size else 0.0
-            )
-        else:
-            observation_counts[isotope] = 0.0
-            balance_counts[isotope] = 0.0
-            signature_std = 0.0
-        min_std = max(float(config.signature_std_min_counts), 0.0)
-        if min_std > 0.0:
-            shortfall = max(0.0, 1.0 - signature_std / min_std)
-            differential_terms.append(shortfall * shortfall)
-    observation_penalty = minimum_observation_shortfall(
-        observation_counts,
-        min_counts=float(config.min_observation_counts),
-    )
-    differential_penalty = (
-        float(np.mean(differential_terms)) if differential_terms else 0.0
-    )
-    count_balance_penalty = _count_balance_penalty(balance_counts)
-    count_utility = _saturated_count_utility(
-        balance_counts,
-        saturation_counts=float(config.count_utility_saturation_counts),
-    )
-    return (
-        signature_total,
-        temporal_total,
-        elevation_total,
-        observation_penalty,
-        count_balance_penalty,
-        differential_penalty,
-        dose_score,
-        count_utility,
-    )
 
 
 def _program_pair_id_matrix(
@@ -1195,14 +2178,33 @@ def _program_pair_id_matrix(
     """Return a padded pair-id matrix for a set of shield programs."""
     if not programs:
         return np.zeros((0, 0), dtype=np.int64)
-    max_length = max(len(program.pair_ids) for program in programs)
+    pair_rows = tuple(
+        np.asarray(program.pair_ids, dtype=np.int64) for program in programs
+    )
+    lengths = np.fromiter(
+        (row.size for row in pair_rows),
+        dtype=np.int64,
+        count=len(pair_rows),
+    )
+    max_length = int(np.max(lengths, initial=0))
     if max_length <= 0:
         return np.zeros((len(programs), 0), dtype=np.int64)
     matrix = np.zeros((len(programs), max_length), dtype=np.int64)
-    for row_idx, program in enumerate(programs):
-        pair_ids = np.asarray(program.pair_ids, dtype=np.int64)
-        if pair_ids.size:
-            matrix[row_idx, : pair_ids.size] = pair_ids
+    total_values = int(np.sum(lengths))
+    flat_values = np.concatenate(pair_rows)
+    row_indices = np.repeat(
+        np.arange(len(programs), dtype=np.int64),
+        lengths,
+    )
+    starts = np.cumsum(
+        np.concatenate(
+            (np.zeros(1, dtype=np.int64), lengths[:-1])
+        ),
+        dtype=np.int64,
+    )
+    row_starts = np.repeat(starts, lengths)
+    column_indices = np.arange(total_values, dtype=np.int64) - row_starts
+    matrix[row_indices, column_indices] = flat_values
     return matrix
 
 
@@ -1224,12 +2226,7 @@ def _finite_sphere_geometric_terms_batched(
     *,
     detector_radius_m: float,
 ) -> NDArray[np.float64]:
-    """Return native-equivalent detector-cps geometry for batched positions.
-
-    Detectors are shaped ``(D, 3)`` and sources ``(..., 3)``. The result is
-    shaped ``(D, ...)``. This is the vectorized NumPy equivalent of Geant4's
-    ``DetectorCpsGeometryScale`` and the PF finite-sphere geometric term.
-    """
+    """Return finite-sphere detector geometry for batched positions."""
     detectors = np.asarray(detector_positions, dtype=float)
     sources = np.asarray(source_positions, dtype=float)
     if detectors.ndim != 2 or detectors.shape[1] != 3:
@@ -1237,655 +2234,842 @@ def _finite_sphere_geometric_terms_batched(
     if sources.ndim < 2 or sources.shape[-1] != 3:
         raise ValueError("source_positions must end in a three-vector dimension.")
     source_shape = sources.shape[:-1]
-    delta = detectors.reshape((detectors.shape[0],) + (1,) * len(source_shape) + (3,))
+    delta = detectors.reshape(
+        (detectors.shape[0],) + (1,) * len(source_shape) + (3,)
+    )
     delta = delta - sources.reshape((1,) + source_shape + (3,))
     distance = np.linalg.norm(delta, axis=-1)
-    radius = max(float(detector_radius_m), 0.0)
+    radius = float(detector_radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("detector_radius_m must be finite and nonnegative.")
     if radius <= 0.0:
         scale = np.zeros_like(distance, dtype=float)
         positive = np.square(distance) > 1.0e-12
         scale[positive] = 1.0 / np.square(distance[positive])
         return scale
     effective_distance = np.maximum(distance, radius)
-    ratio = np.clip(radius / np.maximum(effective_distance, 1.0e-12), 0.0, 1.0)
-    fraction = 0.5 * (1.0 - np.sqrt(np.maximum(1.0 - np.square(ratio), 0.0)))
+    ratio = np.clip(
+        radius / np.maximum(effective_distance, 1.0e-12),
+        0.0,
+        1.0,
+    )
+    fraction = 0.5 * (
+        1.0 - np.sqrt(np.maximum(1.0 - np.square(ratio), 0.0))
+    )
     reference_distance = max(1.0, radius)
     reference_ratio = min(radius / reference_distance, 1.0)
     reference_fraction = max(
-        0.5 * (1.0 - float(np.sqrt(max(1.0 - reference_ratio * reference_ratio, 0.0)))),
+        0.5
+        * (
+            1.0
+            - float(
+                np.sqrt(max(1.0 - reference_ratio * reference_ratio, 0.0))
+            )
+        ),
         1.0e-12,
     )
     scale = fraction / reference_fraction
     return np.where(distance > 1.0e-12, scale, 0.0)
 
 
-def _expected_detector_equivalent_primaries_for_states_at_detectors(
-    detector_positions: NDArray[np.float64],
-    states: Sequence[object],
-    *,
-    detector_radius_m: float,
-    live_time_s: float,
+def _information_gain_from_log_likelihood(
+    log_likelihood_psn: NDArray[np.float64],
+    weights_n: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return unthinned detector-equivalent primaries by detector and state.
-
-    Variable-length state objects require a small packing pass. All expensive
-    detector, particle, and source-slot geometry is evaluated in one NumPy
-    batch. Shield, obstacle, response-regression, and background terms are
-    intentionally excluded because native history allocation precedes them.
-    """
-    detectors = np.asarray(detector_positions, dtype=float)
-    if detectors.ndim != 2 or detectors.shape[1] != 3:
-        raise ValueError("detector_positions must be shaped (D, 3).")
-    state_count = len(states)
-    if state_count == 0:
-        return np.zeros((detectors.shape[0], 0), dtype=float)
-    source_counts = np.asarray(
-        [
-            min(
-                max(int(getattr(state, "num_sources", 0)), 0),
-                len(np.asarray(getattr(state, "positions", ()))),
-                len(np.asarray(getattr(state, "strengths", ()))),
-            )
-            for state in states
-        ],
-        dtype=int,
-    )
-    max_sources = int(np.max(source_counts, initial=0))
-    if max_sources <= 0 or detectors.shape[0] == 0:
-        return np.zeros((detectors.shape[0], state_count), dtype=float)
-    positions = np.zeros((state_count, max_sources, 3), dtype=float)
-    strengths = np.zeros((state_count, max_sources), dtype=float)
-    for state_index, (state, source_count) in enumerate(zip(states, source_counts)):
-        count = int(source_count)
-        if count <= 0:
-            continue
-        positions[state_index, :count] = np.asarray(
-            getattr(state, "positions"),
-            dtype=float,
-        )[:count]
-        strengths[state_index, :count] = np.maximum(
-            np.asarray(getattr(state, "strengths"), dtype=float)[:count],
-            0.0,
+    """Return program mutual information from sampled particle likelihoods."""
+    log_likelihood = np.asarray(log_likelihood_psn, dtype=float)
+    weights = _normalise_weights(np.asarray(weights_n, dtype=float))
+    if log_likelihood.ndim != 3:
+        raise ValueError(
+            "log_likelihood_psn must be shaped (program, sample, particle)."
         )
-    geometry = _finite_sphere_geometric_terms_batched(
-        detectors,
-        positions,
-        detector_radius_m=detector_radius_m,
+    if weights.shape != (log_likelihood.shape[2],):
+        raise ValueError("weights_n must match the particle dimension.")
+    if np.any(np.isnan(log_likelihood)) or np.any(
+        np.isposinf(log_likelihood)
+    ):
+        raise ValueError(
+            "Program likelihoods may be finite or minus infinity only."
+        )
+    positive_prior = weights > 0.0
+    if not np.any(positive_prior):
+        raise ValueError("Program EIG requires positive posterior mass.")
+    active_likelihood = log_likelihood[:, :, positive_prior]
+    active_weights = weights[positive_prior]
+    log_prior = np.log(active_weights)[None, None, :]
+    log_joint = active_likelihood + log_prior
+    log_evidence = logsumexp(log_joint, axis=2, keepdims=True)
+    if np.any(~np.isfinite(log_evidence)):
+        raise RuntimeError(
+            "A predictive DSS observation is outside every positive-mass "
+            "PF state."
+        )
+    posterior = np.exp(log_joint - log_evidence)
+    kl_terms = np.zeros_like(posterior)
+    np.multiply(
+        posterior,
+        active_likelihood - log_evidence,
+        out=kl_terms,
+        where=posterior > 0.0,
     )
-    expected = float(live_time_s) * np.einsum(
-        "dns,ns->dn",
-        geometry,
-        strengths,
-        optimize=True,
-    )
-    return np.maximum(expected, 0.0)
+    kl_samples = np.sum(kl_terms, axis=2)
+    information_gain = np.mean(kl_samples, axis=1)
+    if np.any(~np.isfinite(information_gain)):
+        raise ValueError("Program mutual information must be finite.")
+    numerical_tolerance = 1.0e-10
+    if np.any(information_gain < -numerical_tolerance):
+        raise RuntimeError(
+            "Program mutual information became materially negative; the "
+            "joint likelihood or posterior weights are inconsistent."
+        )
+    return np.maximum(information_gain, 0.0)
 
 
-def _effective_primary_history_weights(
-    expected_unthinned_primaries: NDArray[np.float64] | float,
-    *,
-    minimum_history_weight: float,
-    target_sampled_primaries: float | None,
-) -> NDArray[np.float64]:
-    """Return native-equivalent effective weights under a sampled-history budget.
-
-    ``minimum_history_weight`` is the inverse of the configured maximum
-    sampling fraction. When a target is set, the effective sampling fraction
-    is ``min(max_fraction, target / expected_unthinned)`` with the native
-    lower bound of ``1e-6``.
-    """
-    expected = np.maximum(
-        np.asarray(expected_unthinned_primaries, dtype=float),
-        0.0,
-    )
-    minimum_weight = float(minimum_history_weight)
-    if not np.isfinite(minimum_weight) or minimum_weight < 1.0:
-        raise ValueError("minimum_history_weight must be finite and at least 1.0.")
-    if target_sampled_primaries is None:
-        return np.full(expected.shape, minimum_weight, dtype=float)
-    target = float(target_sampled_primaries)
-    if not np.isfinite(target) or target <= 0.0:
-        raise ValueError("target_sampled_primaries must be finite and positive.")
-    maximum_fraction = 1.0 / minimum_weight
-    fraction = np.full(expected.shape, maximum_fraction, dtype=float)
-    positive = expected > 0.0
-    fraction[positive] = np.minimum(
-        maximum_fraction,
-        target / expected[positive],
-    )
-    fraction = np.clip(fraction, 1.0e-6, 1.0)
-    return 1.0 / fraction
-
-
-def _transport_detector_radius_m(
-    estimator: RotatingShieldPFEstimator,
-    *,
-    config: DSSPPConfig,
+def _finite_sample_information_gain_upper_bound(
+    weights_n: NDArray[np.float64],
 ) -> float:
-    """Return the physical crystal radius used by native history budgeting."""
-    configured_radius = config.transport_detector_radius_m
-    radius = (
-        float(getattr(estimator, "detector_radius_m", 0.0))
-        if configured_radius is None
-        else float(configured_radius)
+    """Bound every sampled posterior KL by the smallest positive prior mass.
+
+    The entropy of the prior bounds the *expected* mutual information, but it
+    does not bound a finite Monte Carlo average: an unusually diagnostic draw
+    from a rare particle can have KL larger than the prior entropy. For any
+    posterior supported on the positive-prior particles,
+    ``KL(q || p) <= -log(min(p))``. This looser bound is therefore safe for the
+    actual finite-sample EIG objective used by adaptive action expansion.
+    """
+    weights = _normalise_weights(np.asarray(weights_n, dtype=np.float64))
+    positive = weights[weights > 0.0]
+    if positive.size == 0:
+        raise ValueError("Program EIG requires positive posterior mass.")
+    return float(-np.log(np.min(positive)))
+
+
+
+def _joint_program_action_layout(
+    programs_by_pose: Sequence[Sequence[ShieldProgram]],
+) -> tuple[
+    list[ShieldProgram],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.bool_],
+    NDArray[np.int64],
+]:
+    """Return one flattened action table for all candidate poses."""
+    counts = np.asarray(
+        [len(programs) for programs in programs_by_pose],
+        dtype=np.int64,
     )
-    if not np.isfinite(radius) or radius < 0.0:
-        raise ValueError("Transport detector radius must be finite and non-negative.")
-    return radius
+    offsets = np.concatenate(
+        [np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64)]
+    )
+    flattened = [
+        program
+        for programs in programs_by_pose
+        for program in programs
+    ]
+    pose_indices = np.repeat(
+        np.arange(len(programs_by_pose), dtype=np.int64),
+        counts,
+    )
+    pair_ids = _program_pair_id_matrix(flattened)
+    view_mask = _program_view_mask(
+        flattened,
+        max_length=int(pair_ids.shape[1]) if pair_ids.ndim == 2 else 0,
+    )
+    return flattened, pose_indices, pair_ids, view_mask, offsets
 
 
-def _candidate_primary_history_weights_by_isotope(
+
+def _full_spectrum_joint_program_components(
     estimator: RotatingShieldPFEstimator,
     detector_positions: NDArray[np.float64],
-    particles_by_isotope: dict[
-        str,
-        tuple[Sequence[object], NDArray[np.float64]],
-    ],
+    programs: Sequence[ShieldProgram],
+    joint_particles: JointPlanningParticles,
+    *,
+    live_time_s: float,
+    detector_aperture_samples: int,
+) -> _JointProgramSpectrumComponents:
+    """Build batched source-resolved inputs for the shared spectrum model."""
+    detectors = np.asarray(detector_positions, dtype=np.float64)
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or np.any(~np.isfinite(detectors))
+        or len(programs) != int(detectors.shape[0])
+        or not programs
+    ):
+        raise ValueError(
+            "Full-spectrum DSS actions require one finite detector position "
+            "per nonempty shield program."
+        )
+    view_count = len(programs[0].pair_ids)
+    if view_count <= 0 or any(
+        len(program.pair_ids) != view_count for program in programs
+    ):
+        raise ValueError(
+            "One full-spectrum DSS batch requires equal nonzero view counts."
+        )
+    resolved_live_time = float(live_time_s)
+    if not np.isfinite(resolved_live_time) or resolved_live_time <= 0.0:
+        raise ValueError("DSS live_time_s must be finite and positive.")
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    isotope_order = tuple(str(value) for value in joint_particles.isotope_order)
+    if isotope_order != tuple(sorted(str(value) for value in estimator.isotopes)):
+        raise ValueError(
+            "Joint planning isotope order must equal the estimator order."
+        )
+    particle_weights = _normalise_weights(
+        np.asarray(joint_particles.weights_n, dtype=np.float64)
+    )
+    particle_count = int(particle_weights.size)
+    line_identity = tuple(model.line_identity)
+    line_count = len(line_identity)
+    feature_order = tuple(str(value) for value in model.transport_feature_order)
+    if feature_order != ("tau_fe", "tau_pb", "tau_obstacle", "distance_m"):
+        raise ValueError("DSS and PF transport feature orders differ.")
+    slot_counts = {
+        isotope: int(
+            np.asarray(
+                joint_particles.strengths_nk_by_isotope[isotope],
+                dtype=np.float64,
+            ).shape[1]
+        )
+        for isotope in isotope_order
+    }
+    source_slot_count = int(sum(slot_counts.values()))
+    action_count = int(detectors.shape[0])
+    flattened_view_count = action_count * view_count
+    total_flat = np.zeros(
+        (
+            flattened_view_count,
+            particle_count,
+            source_slot_count,
+            line_count,
+        ),
+        dtype=np.float64,
+    )
+    uncollided_flat = np.zeros_like(total_flat)
+    features_flat = np.zeros(
+        total_flat.shape + (len(feature_order),),
+        dtype=np.float64,
+    )
+    pair_ids = _program_pair_id_matrix(programs)
+    orientation_count = int(estimator.num_orientations)
+    if (
+        pair_ids.shape != (action_count, view_count)
+        or np.any(pair_ids < 0)
+        or np.any(pair_ids >= orientation_count**2)
+    ):
+        raise ValueError("DSS shield program contains an invalid pair id.")
+    fe_indices = (pair_ids.reshape(-1) // orientation_count).astype(
+        np.int64,
+        copy=False,
+    )
+    pb_indices = (pair_ids.reshape(-1) % orientation_count).astype(
+        np.int64,
+        copy=False,
+    )
+    active_detectors = np.repeat(detectors, view_count, axis=0)
+    if (
+        isinstance(detector_aperture_samples, bool)
+        or not isinstance(detector_aperture_samples, (int, np.integer))
+        or int(detector_aperture_samples) < 1
+    ):
+        raise ValueError("detector_aperture_samples must be a positive integer.")
+    kernel = _continuous_kernel_for_estimator(
+        estimator,
+        detector_aperture_samples=int(detector_aperture_samples),
+    )
+    particle_axis = np.arange(particle_count, dtype=np.int64)
+    flat_view_axis = np.arange(flattened_view_count, dtype=np.int64)
+    slot_offset = 0
+    for isotope in isotope_order:
+        positions = np.asarray(
+            joint_particles.positions_nk3_by_isotope[isotope],
+            dtype=np.float64,
+        )
+        raw_chart_ids = np.asarray(
+            joint_particles.surface_chart_ids_nk_by_isotope[isotope],
+        )
+        surface_uv = np.asarray(
+            joint_particles.surface_uv_nk2_by_isotope[isotope],
+            dtype=np.float64,
+        )
+        strengths = np.asarray(
+            joint_particles.strengths_nk_by_isotope[isotope],
+            dtype=np.float64,
+        )
+        source_mask = np.asarray(
+            joint_particles.source_mask_nk_by_isotope[isotope],
+            dtype=bool,
+        )
+        slot_count = slot_counts[isotope]
+        if (
+            positions.shape != (particle_count, slot_count, 3)
+            or strengths.shape != (particle_count, slot_count)
+            or source_mask.shape != strengths.shape
+            or not np.issubdtype(raw_chart_ids.dtype, np.integer)
+            or raw_chart_ids.shape != strengths.shape
+            or surface_uv.shape != strengths.shape + (2,)
+            or np.any(~np.isfinite(positions))
+            or np.any(~np.isfinite(surface_uv))
+            or np.any(~np.isfinite(strengths))
+            or np.any(strengths < 0.0)
+            or np.any(strengths[~source_mask] != 0.0)
+        ):
+            raise ValueError(
+                "Joint full-spectrum planning particles contain an invalid "
+                f"state for {isotope!r}."
+            )
+        global_line_indices = np.asarray(
+            [
+                index
+                for index, metadata in enumerate(line_identity)
+                if str(metadata["isotope"]) == isotope
+            ],
+            dtype=np.int64,
+        )
+        local_line_indices = np.asarray(
+            [
+                int(line_identity[int(index)]["transport_line_index"])
+                for index in global_line_indices
+            ],
+            dtype=np.int64,
+        )
+        branching_weights = np.asarray(
+            [
+                float(line_identity[int(index)]["branching_weight"])
+                for index in global_line_indices
+            ],
+            dtype=np.float64,
+        )
+        if (
+            global_line_indices.size == 0
+            or np.any(local_line_indices < 0)
+            or np.any(~np.isfinite(branching_weights))
+            or np.any(branching_weights <= 0.0)
+        ):
+            raise RuntimeError(
+                f"Full-spectrum model has no valid positive line for {isotope!r}."
+            )
+        configured_branching = kernel.line_branching_weights(
+            isotope,
+            local_line_indices,
+        )
+        if not np.allclose(
+            configured_branching,
+            branching_weights,
+            rtol=1.0e-12,
+            atol=1.0e-15,
+        ):
+            raise RuntimeError(
+                "DSS, PF, and spectrum-model branching weights differ for "
+                f"{isotope!r}."
+            )
+        if slot_count == 0:
+            continue
+        chart_ids = np.asarray(raw_chart_ids, dtype=np.int64)
+        transport_positions = positions.copy()
+        if np.any(source_mask):
+            transport_positions[source_mask] = (
+                estimator.surface_transport_positions(
+                    isotope,
+                    positions[source_mask],
+                    chart_ids[source_mask],
+                    surface_uv[source_mask],
+                )
+            )
+        components = (
+            kernel.line_transport_components_selected_pairs_for_detectors(
+                isotope=isotope,
+                detector_positions=active_detectors,
+                sources=transport_positions.reshape(
+                    particle_count * slot_count,
+                    3,
+                ),
+                fe_indices=fe_indices,
+                pb_indices=pb_indices,
+                positive_line_indices=local_line_indices,
+            )
+        )
+        expected_local_shape = (
+            flattened_view_count,
+            particle_count,
+            slot_count,
+            int(global_line_indices.size),
+        )
+
+        def _local_component(field_name: str) -> NDArray[np.float64]:
+            """Return one validated reshaped physical component."""
+            values = np.asarray(
+                getattr(components, field_name),
+                dtype=np.float64,
+            ).reshape(expected_local_shape)
+            if np.any(~np.isfinite(values)) or np.any(values < 0.0):
+                raise RuntimeError(
+                    f"Full-spectrum component {field_name!r} is invalid."
+                )
+            return values
+
+        total_local = _local_component("total_kernel")
+        uncollided_local = _local_component("uncollided_kernel")
+        tau_fe = _local_component("tau_fe")
+        tau_pb = _local_component("tau_pb")
+        tau_obstacle = _local_component("tau_obstacle")
+        distance_m = _local_component("distance_m")
+        source_scale = (
+            strengths[None, :, :, None]
+            * source_mask[None, :, :, None]
+            * branching_weights[None, None, None, :]
+        )
+        total_local *= source_scale
+        uncollided_local *= source_scale
+        local_features = np.stack(
+            (tau_fe, tau_pb, tau_obstacle, distance_m),
+            axis=-1,
+        )
+        source_slots = np.arange(
+            slot_offset,
+            slot_offset + slot_count,
+            dtype=np.int64,
+        )
+        target = np.ix_(
+            flat_view_axis,
+            particle_axis,
+            source_slots,
+            global_line_indices,
+        )
+        total_flat[target] = total_local
+        uncollided_flat[target] = uncollided_local
+        feature_target = np.ix_(
+            flat_view_axis,
+            particle_axis,
+            source_slots,
+            global_line_indices,
+            np.arange(len(feature_order), dtype=np.int64),
+        )
+        features_flat[feature_target] = local_features
+        slot_offset += slot_count
+    output_shape = (
+        action_count,
+        view_count,
+        particle_count,
+        source_slot_count,
+        line_count,
+    )
+    total = total_flat.reshape(output_shape).transpose(0, 2, 1, 3, 4)
+    uncollided = uncollided_flat.reshape(output_shape).transpose(
+        0,
+        2,
+        1,
+        3,
+        4,
+    )
+    features = features_flat.reshape(
+        output_shape + (len(feature_order),)
+    ).transpose(0, 2, 1, 3, 4, 5)
+    if np.any(uncollided > total + 1.0e-10):
+        raise RuntimeError(
+            "Full-spectrum DSS transport violates uncollided <= total."
+        )
+    return _JointProgramSpectrumComponents(
+        total_pnvsl=np.ascontiguousarray(total),
+        uncollided_pnvsl=np.ascontiguousarray(uncollided),
+        features_pnvslf=np.ascontiguousarray(features),
+        live_times_v=np.full(
+            view_count,
+            resolved_live_time,
+            dtype=np.float64,
+        ),
+        contract_hash_sha256=str(model.contract_hash_sha256),
+    )
+
+
+def _program_information_proxy_for_poses(
+    estimator: RotatingShieldPFEstimator,
+    detector_positions: NDArray[np.float64],
+    programs: Sequence[ShieldProgram],
     *,
     config: DSSPPConfig,
-) -> dict[str, NDArray[np.float64]]:
-    """Return candidate-by-particle history weights for every isotope.
-
-    Each isotope particle is combined with posterior weighted-mean primary
-    demand from the other isotopes. This preserves state-specific budget noise
-    without constructing the Cartesian product of independent isotope PFs.
-    """
-    detectors = np.asarray(detector_positions, dtype=float)
-    minimum_weight = float(config.primary_history_weight)
-    if config.target_sampled_primaries is None:
-        return {
-            isotope: np.full(
-                (detectors.shape[0], len(states)),
-                minimum_weight,
-                dtype=float,
-            )
-            for isotope, (states, _) in particles_by_isotope.items()
-        }
-    expected_by_isotope: dict[str, NDArray[np.float64]] = {}
-    mean_by_isotope: dict[str, NDArray[np.float64]] = {}
-    detector_radius = _transport_detector_radius_m(estimator, config=config)
-    for isotope, (states, raw_weights) in particles_by_isotope.items():
-        expected = _expected_detector_equivalent_primaries_for_states_at_detectors(
-            detectors,
-            states,
-            detector_radius_m=detector_radius,
-            live_time_s=float(config.live_time_s),
-        )
-        expected_by_isotope[isotope] = expected
-        weights = _normalise_weights(np.asarray(raw_weights, dtype=float))
-        if weights.size != expected.shape[1]:
-            raise ValueError("Planning particle weights must match the state count.")
-        mean_by_isotope[isotope] = np.einsum(
-            "dn,n->d",
-            expected,
-            weights,
-            optimize=True,
-        )
-    if mean_by_isotope:
-        total_mean = np.sum(np.stack(tuple(mean_by_isotope.values()), axis=0), axis=0)
-    else:
-        total_mean = np.zeros(detectors.shape[0], dtype=float)
-    output: dict[str, NDArray[np.float64]] = {}
-    for isotope, expected in expected_by_isotope.items():
-        expected_total = (
-            expected + total_mean[:, None] - mean_by_isotope[isotope][:, None]
-        )
-        output[isotope] = _effective_primary_history_weights(
-            expected_total,
-            minimum_history_weight=minimum_weight,
-            target_sampled_primaries=config.target_sampled_primaries,
-        )
+    joint_particles: JointPlanningParticles,
+    rng: np.random.Generator,
+    eig_call_seed: int,
+    diagnostics: dict[str, object] | None = None,
+) -> NDArray[np.float64]:
+    """Return reduced-posterior EIG using the exact PF spectrum law."""
+    detectors = np.asarray(detector_positions, dtype=np.float64)
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or np.any(~np.isfinite(detectors))
+    ):
+        raise ValueError("Proxy detector positions must be finite and shaped Px3.")
+    if not programs:
+        return np.zeros((detectors.shape[0], 0), dtype=np.float64)
+    gains_by_pose = _program_information_gains_for_poses(
+        estimator,
+        detectors,
+        [list(programs) for _ in range(detectors.shape[0])],
+        config=config,
+        rng=rng,
+        joint_particles=joint_particles,
+        diagnostics=diagnostics,
+        sample_count_override=config.proxy_eig_samples,
+        eig_call_seed=eig_call_seed,
+        memory_budget_bytes_override=config.proxy_memory_budget_bytes,
+    )
+    output = np.vstack(gains_by_pose)
+    if output.shape != (detectors.shape[0], len(programs)):
+        raise RuntimeError("Full-spectrum proxy returned an invalid action layout.")
+    if np.any(~np.isfinite(output)) or np.any(output < 0.0):
+        raise RuntimeError("Program information ranking proxies are invalid.")
     return output
 
 
-def _signature_future_statistics_for_poses(
+def _full_spectrum_information_gain(
     estimator: RotatingShieldPFEstimator,
-    detector_positions: NDArray[np.float64],
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    particles_by_isotope: dict[
-        str,
-        tuple[Sequence[object], NDArray[np.float64]],
-    ],
+    components: _JointProgramSpectrumComponents,
+    particle_weights: NDArray[np.float64],
     *,
-    config: DSSPPConfig,
-) -> _SignatureFutureStatisticsBatch:
-    """Return candidate-batched history weights and unit-Poisson backgrounds.
+    sample_count: int,
+    rng: np.random.Generator,
+    use_gpu: bool,
+    gpu_device: str,
+    latent_particle_indices: NDArray[np.int64] | None = None,
+    action_seeds_a: NDArray[np.int64] | None = None,
+) -> NDArray[np.float64]:
+    """Estimate full-spectrum mutual information with bounded action scheduling.
 
-    A signature mode represents one marginal source rather than a complete PF
-    state. For dynamic history allocation, its unthinned primary demand
-    replaces the weighted-mean marginal-mode demand inside the posterior mean
-    demand of all complete isotope states. Thus the average mode demand remains
-    equal to the complete-state prediction while individual modes retain their
-    candidate-specific geometry. No Cartesian product of isotope PFs is built.
+    Transport and cross-likelihood tensors are batched. The generative model
+    schedules one canonically seeded predictive draw stream per action. Caller
+    batching changes only the execution schedule, not any action's physics,
+    likelihood, posterior sample, or random stream.
     """
-    detectors = np.asarray(detector_positions, dtype=float)
-    if detectors.ndim != 2 or detectors.shape[1] != 3:
-        raise ValueError("detector_positions must be shaped (D, 3).")
-    detector_count = detectors.shape[0]
-    background_counts_by_isotope: dict[str, NDArray[np.float64]] = {}
-    state_mean_primaries_by_isotope: dict[str, NDArray[np.float64]] = {}
-    detector_radius = _transport_detector_radius_m(estimator, config=config)
-    for isotope, (states, raw_weights) in particles_by_isotope.items():
-        weights = _normalise_weights(np.asarray(raw_weights, dtype=float))
-        if weights.size != len(states):
-            raise ValueError("Planning particle weights must match the state count.")
-        backgrounds = np.asarray(
-            [max(float(getattr(state, "background", 0.0)), 0.0) for state in states],
-            dtype=float,
-        )
-        mean_background_rate = (
-            float(np.dot(weights, backgrounds)) if weights.size else 0.0
-        )
-        background_counts_by_isotope[str(isotope)] = np.full(
-            detector_count,
-            float(config.live_time_s) * mean_background_rate,
-            dtype=float,
-        )
-        if config.target_sampled_primaries is None:
-            continue
-        expected = _expected_detector_equivalent_primaries_for_states_at_detectors(
-            detectors,
-            states,
-            detector_radius_m=detector_radius,
-            live_time_s=float(config.live_time_s),
-        )
-        state_mean_primaries_by_isotope[str(isotope)] = np.einsum(
-            "dn,n->d",
-            expected,
-            weights,
-            optimize=True,
-        )
-    if state_mean_primaries_by_isotope:
-        total_state_mean = np.sum(
-            np.stack(tuple(state_mean_primaries_by_isotope.values()), axis=0),
-            axis=0,
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    if str(model.contract_hash_sha256) != str(
+        components.contract_hash_sha256
+    ):
+        raise RuntimeError("DSS spectrum components use a different model hash.")
+    total = np.asarray(components.total_pnvsl, dtype=np.float64)
+    uncollided = np.asarray(components.uncollided_pnvsl, dtype=np.float64)
+    features = np.asarray(components.features_pnvslf, dtype=np.float64)
+    live_times = np.asarray(components.live_times_v, dtype=np.float64)
+    if (
+        total.ndim != 5
+        or uncollided.shape != total.shape
+        or features.shape != total.shape + (4,)
+        or live_times.shape != (total.shape[2],)
+    ):
+        raise ValueError("DSS full-spectrum component shapes are inconsistent.")
+    action_count, particle_count = total.shape[:2]
+    action_seeds = None
+    if action_seeds_a is not None:
+        action_seeds = np.asarray(action_seeds_a)
+        if (
+            action_seeds.ndim != 1
+            or action_seeds.shape != (action_count,)
+            or not np.issubdtype(action_seeds.dtype, np.integer)
+        ):
+            raise ValueError(
+                "action_seeds_a must contain one integer seed per DSS action."
+            )
+    weights = _normalise_weights(
+        np.asarray(particle_weights, dtype=np.float64)
+    )
+    if weights.shape != (particle_count,):
+        raise ValueError("DSS particle weights do not match spectrum states.")
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, (int, np.integer))
+        or int(sample_count) <= 0
+    ):
+        raise ValueError("sample_count must be a positive integer.")
+    resolved_sample_count = int(sample_count)
+    if latent_particle_indices is None:
+        latent_indices = rng.choice(
+            particle_count,
+            size=resolved_sample_count,
+            replace=True,
+            p=weights,
         )
     else:
-        total_state_mean = np.zeros(detector_count, dtype=float)
-    history_weights_by_isotope: dict[str, NDArray[np.float64]] = {}
-    isotope_names = tuple(
-        dict.fromkeys(
-            tuple(str(value) for value in getattr(estimator, "isotopes", ()))
-            + tuple(str(value) for value in modes_by_isotope)
-            + tuple(str(value) for value in particles_by_isotope)
-        )
+        latent_indices = np.asarray(
+            latent_particle_indices,
+            dtype=np.int64,
+        ).reshape(-1)
+        if (
+            latent_indices.shape != (resolved_sample_count,)
+            or np.any(latent_indices < 0)
+            or np.any(latent_indices >= particle_count)
+        ):
+            raise ValueError(
+                "DSS latent_particle_indices must contain one valid common "
+                "posterior-particle index per predictive sample."
+            )
+    truth_total = total[:, latent_indices]
+    truth_uncollided = uncollided[:, latent_indices]
+    truth_features = features[:, latent_indices]
+    predictive = np.asarray(
+        model.sample_predictive_numpy(
+            truth_total,
+            truth_uncollided,
+            truth_features,
+            live_times,
+            sample_count=1,
+            rng=rng,
+            action_seeds_a=action_seeds,
+        ),
+        dtype=np.float64,
     )
-    for isotope in isotope_names:
-        modes = modes_by_isotope.get(isotope, [])
-        if isotope not in background_counts_by_isotope:
-            background_counts_by_isotope[isotope] = np.zeros(
-                detector_count,
-                dtype=float,
-            )
-        if not modes:
-            history_weights_by_isotope[isotope] = np.zeros(
-                (detector_count, 0),
-                dtype=float,
-            )
-            continue
-        if config.target_sampled_primaries is None:
-            history_weights_by_isotope[isotope] = np.full(
-                (detector_count, len(modes)),
-                float(config.primary_history_weight),
-                dtype=float,
-            )
-            continue
-        mode_positions = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float).reshape(3) for mode in modes]
-        )
-        mode_strengths = np.maximum(
-            np.asarray([mode.strength_cps_1m for mode in modes], dtype=float),
-            0.0,
-        )
-        mode_primaries = float(config.live_time_s) * (
-            _finite_sphere_geometric_terms_batched(
-                detectors,
-                mode_positions,
-                detector_radius_m=detector_radius,
-            )
-            * mode_strengths[None, :]
-        )
-        mode_weights = _normalise_weights(
-            np.asarray([mode.weight for mode in modes], dtype=float)
-        )
-        marginal_mode_mean = np.einsum(
-            "dm,m->d",
-            mode_primaries,
-            mode_weights,
-            optimize=True,
-        )
-        if isotope not in state_mean_primaries_by_isotope:
-            marginal_mode_mean = np.zeros_like(marginal_mode_mean)
-        expected_total = np.maximum(
-            total_state_mean[:, None] + mode_primaries - marginal_mode_mean[:, None],
-            0.0,
-        )
-        history_weights_by_isotope[isotope] = _effective_primary_history_weights(
-            expected_total,
-            minimum_history_weight=float(config.primary_history_weight),
-            target_sampled_primaries=config.target_sampled_primaries,
-        )
-    return _SignatureFutureStatisticsBatch(
-        primary_history_weights_by_isotope=history_weights_by_isotope,
-        background_counts_by_isotope=background_counts_by_isotope,
+    expected_predictive_shape = (
+        action_count,
+        resolved_sample_count,
+        1,
+        int(total.shape[2]),
+        int(np.asarray(model.energy_axis_keV).size),
     )
-
-
-def _signature_statistics_for_isotope_at_pose(
-    statistics: _SignatureFutureStatisticsBatch | None,
-    isotope: str,
-    *,
-    pose_index: int,
-    mode_count: int,
-    config: DSSPPConfig,
-) -> tuple[NDArray[np.float64], float]:
-    """Return mode weights and background counts for one isotope and pose."""
-    if statistics is None:
-        return (
-            np.full(mode_count, float(config.primary_history_weight), dtype=float),
-            0.0,
+    if predictive.shape != expected_predictive_shape:
+        raise RuntimeError(
+            "Full-spectrum predictive sampler returned an invalid DSS shape."
         )
-    history = np.asarray(
-        statistics.primary_history_weights_by_isotope.get(
-            isotope,
-            np.zeros((0, 0), dtype=float),
-        ),
-        dtype=float,
-    )
-    background = np.asarray(
-        statistics.background_counts_by_isotope.get(
-            isotope,
-            np.zeros(0, dtype=float),
-        ),
-        dtype=float,
-    ).reshape(-1)
-    index = int(pose_index)
-    if history.ndim != 2 or index < 0 or index >= history.shape[0]:
-        raise ValueError("Signature history statistics do not contain the pose.")
-    if history.shape[1] != int(mode_count):
-        raise ValueError("Signature history statistics do not match the modes.")
-    if index >= background.size:
-        raise ValueError("Signature background statistics do not contain the pose.")
-    return history[index], max(float(background[index]), 0.0)
+    observations = np.ascontiguousarray(predictive[:, :, 0])
+    if bool(use_gpu):
+        import torch
 
-
-def _primary_history_weight_diagnostics_at_pose(
-    estimator: RotatingShieldPFEstimator,
-    detector_position: NDArray[np.float64],
-    *,
-    config: DSSPPConfig,
-    particles_by_isotope: dict[
-        str,
-        tuple[Sequence[object], NDArray[np.float64]],
-    ]
-    | None = None,
-) -> dict[str, object]:
-    """Return effective history-weight diagnostics for one selected pose."""
-    minimum_weight = float(config.primary_history_weight)
-    payload: dict[str, object] = {
-        "mode": (
-            "candidate_particle_budget"
-            if config.target_sampled_primaries is not None
-            else "fixed_fraction"
-        ),
-        "minimum": minimum_weight,
-        "median": minimum_weight,
-        "maximum": minimum_weight,
-        "maximum_sampling_fraction": 1.0 / minimum_weight,
-        "target_sampled_primaries": (
-            None
-            if config.target_sampled_primaries is None
-            else float(config.target_sampled_primaries)
-        ),
-        "by_isotope": {},
-    }
-    if config.target_sampled_primaries is None:
-        return payload
-    if particles_by_isotope is None:
-        particles_by_isotope = cast(
-            dict[str, tuple[Sequence[object], NDArray[np.float64]]],
-            estimator.planning_particles(
-                max_particles=config.planning_particles,
-                method=config.planning_method,
-                rng=np.random.default_rng(config.rng_seed),
+        cross_likelihood = getattr(model, "cross_log_likelihood_torch", None)
+        if not callable(cross_likelihood):
+            raise RuntimeError(
+                "GPU DSS requires vectorized full-spectrum Torch cross likelihood."
+            )
+        device = torch.device(str(gpu_device))
+        log_likelihood = np.asarray(
+            cross_likelihood(
+                torch.as_tensor(
+                    observations,
+                    dtype=torch.float64,
+                    device=device,
+                ),
+                torch.as_tensor(total, dtype=torch.float64, device=device),
+                torch.as_tensor(uncollided, dtype=torch.float64, device=device),
+                torch.as_tensor(features, dtype=torch.float64, device=device),
+                torch.as_tensor(live_times, dtype=torch.float64, device=device),
+            )
+            .detach()
+            .cpu()
+            .numpy(),
+            dtype=np.float64,
+        )
+    else:
+        cross_likelihood = getattr(model, "cross_log_likelihood_numpy", None)
+        if not callable(cross_likelihood):
+            raise RuntimeError(
+                "DSS requires vectorized full-spectrum cross likelihoods."
+            )
+        log_likelihood = np.asarray(
+            cross_likelihood(
+                observations,
+                total,
+                uncollided,
+                features,
+                live_times,
             ),
+            dtype=np.float64,
         )
-    weights_by_isotope = _candidate_primary_history_weights_by_isotope(
-        estimator,
-        np.asarray(detector_position, dtype=float).reshape(1, 3),
-        particles_by_isotope,
-        config=config,
+    expected_log_shape = (
+        action_count,
+        resolved_sample_count,
+        particle_count,
     )
-    flattened: list[NDArray[np.float64]] = []
-    by_isotope: dict[str, dict[str, float]] = {}
-    for isotope, values in weights_by_isotope.items():
-        finite = np.asarray(values, dtype=float)
-        finite = finite[np.isfinite(finite)]
-        if finite.size == 0:
-            continue
-        flattened.append(finite)
-        by_isotope[str(isotope)] = {
-            "minimum": float(np.min(finite)),
-            "median": float(np.median(finite)),
-            "maximum": float(np.max(finite)),
-        }
-    payload["by_isotope"] = by_isotope
-    if flattened:
-        combined = np.concatenate(flattened)
-        payload.update(
+    if log_likelihood.shape != expected_log_shape:
+        raise RuntimeError(
+            "Full-spectrum cross likelihood returned an invalid DSS shape."
+        )
+    return _information_gain_from_log_likelihood(log_likelihood, weights)
+
+
+def _dss_eig_action_batch_size(
+    model: object,
+    *,
+    action_count: int,
+    particle_count: int,
+    sample_count: int,
+    source_slot_count: int,
+    view_count: int,
+    line_count: int,
+    feature_count: int,
+    memory_budget_bytes: int,
+    diagnostics: dict[str, int] | None = None,
+) -> int:
+    """Return a conservative action batch using the model workspace contract."""
+    counts = {
+        "action_count": action_count,
+        "particle_count": particle_count,
+        "sample_count": sample_count,
+        "source_slot_count": source_slot_count,
+        "view_count": view_count,
+        "line_count": line_count,
+        "feature_count": feature_count,
+        "memory_budget_bytes": memory_budget_bytes,
+    }
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, np.integer))
+        or int(value) <= 0
+        for value in counts.values()
+    ):
+        raise ValueError("DSS EIG batch dimensions and memory budget must be positive.")
+    estimator = getattr(
+        model,
+        "estimate_cross_likelihood_working_set_bytes",
+        None,
+    )
+    if not callable(estimator):
+        raise RuntimeError(
+            "The full-spectrum model must publish an exact likelihood "
+            "working-set estimate for DSS batching."
+        )
+    model_working_set = int(
+        estimator(
+            num_actions=int(action_count),
+            num_samples=int(sample_count),
+            num_particles=int(particle_count),
+            num_isotopes=int(source_slot_count),
+            num_views=int(view_count),
+            dtype_bytes=np.dtype(np.float64).itemsize,
+        )
+    )
+    if model_working_set <= 0:
+        raise RuntimeError(
+            "The full-spectrum likelihood returned an invalid working-set estimate."
+        )
+    energy_axis = np.asarray(getattr(model, "energy_axis_keV", ()))
+    if energy_axis.ndim != 1 or energy_axis.size <= 0:
+        raise RuntimeError("The full-spectrum model has no valid energy axis.")
+    float_bytes = np.dtype(np.float64).itemsize
+    transport_per_action = (
+        int(particle_count)
+        * int(view_count)
+        * int(source_slot_count)
+        * int(line_count)
+        * (2 + int(feature_count))
+        * float_bytes
+    )
+    predictive_per_action = (
+        int(sample_count)
+        * int(view_count)
+        * int(energy_axis.size)
+        * float_bytes
+    )
+    likelihood_output_per_action = (
+        int(sample_count) * int(particle_count) * float_bytes
+    )
+    # Account for NumPy storage, Torch device copies, and allocator overlap.
+    persistent_per_action = 3 * (
+        transport_per_action
+        + predictive_per_action
+        + likelihood_output_per_action
+    )
+    available_for_actions = int(memory_budget_bytes) - model_working_set
+    if available_for_actions < persistent_per_action:
+        raise MemoryError(
+            "DSS EIG memory budget cannot hold the model workspace and one "
+            "action without violating the declared limit."
+        )
+    selected_batch_size = min(
+        int(action_count),
+        int(available_for_actions // persistent_per_action),
+    )
+    if diagnostics is not None:
+        diagnostics.update(
             {
-                "minimum": float(np.min(combined)),
-                "median": float(np.median(combined)),
-                "maximum": float(np.max(combined)),
+                "requested_action_count": int(action_count),
+                "particle_count": int(particle_count),
+                "sample_count": int(sample_count),
+                "source_slot_count": int(source_slot_count),
+                "view_count": int(view_count),
+                "line_count": int(line_count),
+                "feature_count": int(feature_count),
+                "energy_bin_count": int(energy_axis.size),
+                "memory_budget_bytes": int(memory_budget_bytes),
+                "model_working_set_bytes": int(model_working_set),
+                "transport_per_action_bytes": int(transport_per_action),
+                "predictive_per_action_bytes": int(predictive_per_action),
+                "likelihood_output_per_action_bytes": int(
+                    likelihood_output_per_action
+                ),
+                "persistent_per_action_bytes": int(persistent_per_action),
+                "available_for_actions_bytes": int(available_for_actions),
+                "initial_action_batch_size": int(selected_batch_size),
             }
         )
-    return payload
+    return int(selected_batch_size)
 
 
-def _future_observation_variance_argument(
-    mean_counts: NDArray[np.float64],
-    *,
-    spec: CountLikelihoodSpec,
-    primary_history_weight: NDArray[np.float64] | float,
-    background_counts: NDArray[np.float64] | float = 0.0,
-) -> NDArray[np.float64]:
-    """Return transport variance to pass to the future count likelihood.
-
-    Source histories carry constant weight ``w``, whereas native background
-    events remain ordinary unit-weight Poisson draws. The complete statistical
-    variance is therefore ``w * source_mean + background_mean``. The
-    ``additional`` mode already contributes one candidate Poisson term for the
-    total mean, so only ``(w - 1) * source_mean`` is supplied. Existing model
-    floors remain separate likelihood terms.
-    """
-    mean = np.maximum(np.asarray(mean_counts, dtype=float), 0.0)
-    background = np.maximum(np.asarray(background_counts, dtype=float), 0.0)
-    try:
-        background = np.broadcast_to(background, mean.shape)
-    except ValueError as exc:
-        raise ValueError("background_counts must broadcast to mean_counts") from exc
-    source_mean = np.maximum(mean - background, 0.0)
-    history_weight = np.asarray(primary_history_weight, dtype=float)
-    if np.any(~np.isfinite(history_weight)) or np.any(history_weight < 1.0):
-        raise ValueError("primary_history_weight must be finite and at least 1.0.")
-    try:
-        history_weight = np.broadcast_to(history_weight, mean.shape)
-    except ValueError as exc:
-        raise ValueError(
-            "primary_history_weight must broadcast to mean_counts"
-        ) from exc
-    if spec.model == "poisson":
-        if np.any(history_weight > 1.0 + 1.0e-12):
-            raise ValueError(
-                "Weighted-history future observations require gaussian or "
-                "student_t planning likelihood."
-            )
-        return np.zeros_like(mean, dtype=float)
-    if spec.observation_count_variance_semantics == (
-        OBSERVATION_COUNT_VARIANCE_ADDITIONAL
+def _is_dss_eig_memory_error(error: BaseException) -> bool:
+    """Return whether an exception represents host or accelerator exhaustion."""
+    if isinstance(error, MemoryError):
+        return True
+    error_type = type(error)
+    if (
+        error_type.__name__ == "OutOfMemoryError"
+        and error_type.__module__.startswith("torch")
     ):
-        return source_mean * np.maximum(history_weight - 1.0, 0.0)
-    return source_mean * history_weight + background
+        return True
+    return "out of memory" in str(error).lower()
 
 
-def _future_predictive_count_variance(
-    mean_counts: NDArray[np.float64],
-    *,
-    spec: CountLikelihoodSpec,
-    primary_history_weight: NDArray[np.float64] | float,
-    background_counts: NDArray[np.float64] | float = 0.0,
-) -> NDArray[np.float64]:
-    """Return likelihood-matched future variance including weighted histories."""
-    mean = np.maximum(np.asarray(mean_counts, dtype=float), 0.0)
-    observation_variance = _future_observation_variance_argument(
-        mean,
-        spec=spec,
-        primary_history_weight=primary_history_weight,
-        background_counts=background_counts,
-    )
-    return predictive_count_likelihood_variance(
-        mean,
-        spec=spec,
-        observation_count_variance=observation_variance,
-    )
-
-
-def _draw_program_future_counts(
-    truth_lambdas_pvs: NDArray[np.float64],
-    predictive_variance_pvs: NDArray[np.float64],
-    *,
-    spec: CountLikelihoodSpec,
-    rng: np.random.Generator,
-) -> NDArray[np.float64]:
-    """Draw batched future counts from the configured PF observation family."""
-    truth = np.maximum(np.asarray(truth_lambdas_pvs, dtype=float), 0.0)
-    variance = np.maximum(
-        np.asarray(predictive_variance_pvs, dtype=float),
-        1.0e-12,
-    )
-    if spec.model == "poisson":
-        return rng.poisson(truth).astype(float, copy=False)
-    scale = np.sqrt(variance)
-    if spec.model == "gaussian":
-        noise = rng.normal(size=truth.shape)
-    else:
-        noise = rng.standard_t(
-            df=max(float(spec.student_t_df), 1.0 + 1.0e-12),
-            size=truth.shape,
-        )
-    return np.maximum(truth + scale * noise, 0.0)
-
-
-def _program_information_gain_from_lambdas(
-    lambdas_pvn: NDArray[np.float64],
-    weights_n: NDArray[np.float64],
-    view_mask_pv: NDArray[np.bool_],
-    *,
-    spec: CountLikelihoodSpec,
-    num_samples: int,
-    rng: np.random.Generator,
-    primary_history_weight: NDArray[np.float64] | float = 1.0,
-    background_counts_n: NDArray[np.float64] | None = None,
-) -> NDArray[np.float64]:
-    """Return joint-view mutual information for every program in one batch.
-
-    Each latent future draw fixes one transport observation covariance, just
-    as a runtime measurement supplies one particle-independent covariance to
-    the PF. Candidate particles retain their own means and model-discrepancy
-    terms, but they must not replace that supplied covariance with covariance
-    predicted from the candidate state.
-    """
-    lambdas = np.maximum(np.asarray(lambdas_pvn, dtype=float), 1.0e-12)
-    weights = _normalise_weights(np.asarray(weights_n, dtype=float))
-    mask = np.asarray(view_mask_pv, dtype=bool)
-    if lambdas.ndim != 3:
-        raise ValueError("lambdas_pvn must be shaped (program, view, particle).")
-    if mask.shape != lambdas.shape[:2]:
-        raise ValueError("view_mask_pv must match the program and view dimensions.")
-    if weights.size != lambdas.shape[2]:
-        raise ValueError("weights_n must match the particle dimension.")
-    program_count, _, particle_count = lambdas.shape
-    if program_count == 0 or particle_count < 2 or not np.any(mask):
-        return np.zeros(program_count, dtype=float)
-
-    sample_count = max(int(num_samples), 1)
-    history_weight = np.asarray(primary_history_weight, dtype=float)
+def _release_dss_gpu_cache() -> None:
+    """Release unused Torch cache blocks after a recoverable DSS OOM."""
     try:
-        history_weight = np.broadcast_to(
-            history_weight,
-            (program_count, lambdas.shape[1], particle_count),
+        import torch
+    except ImportError:
+        return
+    if bool(torch.cuda.is_available()):
+        torch.cuda.empty_cache()
+
+
+def _dss_accelerator_memory_snapshot(
+    *,
+    use_gpu: bool,
+    gpu_device: str,
+) -> dict[str, object]:
+    """Return read-only accelerator memory diagnostics for exact DSS EIG."""
+    if not bool(use_gpu):
+        return {
+            "enabled": False,
+            "device": "cpu",
+        }
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError(
+            "GPU DSS EIG was requested but Torch is unavailable."
+        ) from error
+    device = torch.device(str(gpu_device))
+    if device.type != "cuda":
+        return {
+            "enabled": True,
+            "device": str(device),
+            "cuda": False,
+        }
+    if not bool(torch.cuda.is_available()):
+        raise RuntimeError(
+            "GPU DSS EIG was requested but CUDA is unavailable."
         )
-    except ValueError as exc:
-        raise ValueError(
-            "primary_history_weight must be scalar or broadcast to "
-            "(program, view, particle)."
-        ) from exc
-    if background_counts_n is None:
-        background_by_particle = np.zeros(particle_count, dtype=float)
-    else:
-        background_by_particle = np.maximum(
-            np.asarray(background_counts_n, dtype=float).reshape(-1),
-            0.0,
-        )
-        if background_by_particle.size != particle_count:
-            raise ValueError("background_counts_n must match the particle dimension.")
-    latent_indices = rng.choice(
-        particle_count,
-        size=sample_count,
-        replace=True,
-        p=weights,
-    )
-    truth = lambdas[:, :, latent_indices]
-    truth_background = background_by_particle[latent_indices][None, None, :]
-    truth_history_weight = history_weight[:, :, latent_indices]
-    predictive_variance = _future_predictive_count_variance(
-        truth,
-        spec=spec,
-        primary_history_weight=truth_history_weight,
-        background_counts=truth_background,
-    )
-    observations = _draw_program_future_counts(
-        truth,
-        predictive_variance,
-        spec=spec,
-        rng=rng,
-    )
-    truth_observation_variance = _future_observation_variance_argument(
-        truth,
-        spec=spec,
-        primary_history_weight=truth_history_weight,
-        background_counts=truth_background,
-    )
-    supplied_observation_variance = np.broadcast_to(
-        truth_observation_variance[:, :, :, None],
-        (program_count, lambdas.shape[1], sample_count, particle_count),
-    )
-    log_terms = count_log_likelihood_terms_np(
-        observations[:, :, :, None],
-        lambdas[:, :, None, :],
-        spec=spec,
-        observation_count_variance=supplied_observation_variance,
-    )
-    log_likelihood = np.sum(
-        log_terms * mask[:, :, None, None],
-        axis=1,
-    )
-    log_prior = np.log(np.maximum(weights, 1.0e-300))[None, None, :]
-    log_joint = log_likelihood + log_prior
-    max_log_joint = np.max(log_joint, axis=2, keepdims=True)
-    log_evidence = max_log_joint + np.log(
-        np.sum(np.exp(log_joint - max_log_joint), axis=2, keepdims=True)
-    )
-    posterior = np.exp(log_joint - log_evidence)
-    kl_samples = np.sum(
-        posterior * (log_joint - log_evidence - log_prior),
-        axis=2,
-    )
-    information_gain = np.mean(kl_samples, axis=1)
-    return np.maximum(
-        np.where(np.isfinite(information_gain), information_gain, 0.0),
-        0.0,
-    )
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {
+        "enabled": True,
+        "device": str(device),
+        "cuda": True,
+        "free_bytes": int(free_bytes),
+        "total_bytes": int(total_bytes),
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+    }
 
 
 def _program_information_gains_for_poses(
@@ -1894,619 +3078,293 @@ def _program_information_gains_for_poses(
     programs_by_pose: Sequence[Sequence[ShieldProgram]],
     *,
     config: DSSPPConfig,
-    rng_seed: int | None,
-    particles_by_isotope: dict[
-        str,
-        tuple[Sequence[object], NDArray[np.float64]],
-    ]
-    | None = None,
+    rng: np.random.Generator,
+    joint_particles: JointPlanningParticles | None = None,
+    diagnostics: dict[str, object] | None = None,
+    sample_count_override: int | None = None,
+    eig_call_seed: int | None = None,
+    memory_budget_bytes_override: int | None = None,
 ) -> list[NDArray[np.float64]]:
-    """Return joint-program EIGs using one shared posterior particle subset."""
-    filters = estimator.filters
+    """Return shared full-spectrum EIG for every candidate/program action."""
     pf_config = estimator.pf_config
-    isotopes = tuple(estimator.isotopes)
-    if not isotopes or any(isotope not in filters for isotope in isotopes):
+    isotopes = tuple(sorted(str(value) for value in estimator.isotopes))
+    if not isotopes or any(
+        isotope not in estimator.filters for isotope in isotopes
+    ):
         raise RuntimeError(
             "Pure PF planning requires one initialized filter per isotope."
         )
-
-    detectors = np.asarray(detector_positions, dtype=float)
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    detectors = np.asarray(detector_positions, dtype=np.float64)
     if detectors.size == 0:
-        detectors = np.zeros((0, 3), dtype=float)
-    if detectors.ndim != 2 or detectors.shape[1] != 3:
-        raise ValueError("detector_positions must be shaped (pose, 3).")
+        detectors = np.zeros((0, 3), dtype=np.float64)
+    if (
+        detectors.ndim != 2
+        or detectors.shape[1] != 3
+        or np.any(~np.isfinite(detectors))
+    ):
+        raise ValueError("detector_positions must be finite and shaped Px3.")
     if len(programs_by_pose) != detectors.shape[0]:
         raise ValueError("programs_by_pose must match detector_positions.")
-    outputs = [np.zeros(len(programs), dtype=float) for programs in programs_by_pose]
+    outputs = [
+        np.zeros(len(programs), dtype=np.float64)
+        for programs in programs_by_pose
+    ]
     if detectors.shape[0] == 0:
         return outputs
-
-    rng = np.random.default_rng(rng_seed)
-    if particles_by_isotope is None:
-        particles_by_isotope = cast(
-            dict[str, tuple[Sequence[object], NDArray[np.float64]]],
-            estimator.planning_particles(
-                max_particles=config.planning_particles,
-                method=config.planning_method,
-                rng=rng,
-            ),
-        )
-    candidate_history_weights = _candidate_primary_history_weights_by_isotope(
-        estimator,
-        detectors,
-        particles_by_isotope,
-        config=config,
-    )
-    alpha_weights = getattr(pf_config, "alpha_weights", None) or {
-        isotope: 1.0 for isotope in isotopes
-    }
-    alpha_sum = sum(float(alpha_weights.get(isotope, 1.0)) for isotope in isotopes)
-    alpha_sum = max(float(alpha_sum), 1.0e-12)
-    configured_samples = getattr(pf_config, "planning_eig_samples", None)
-    if configured_samples is None:
-        configured_samples = getattr(pf_config, "eig_num_samples", 50)
-    # Bound the largest detector/source/pair tensor while still amortizing the
-    # shared spherical-octant and obstacle-response evaluation across poses.
-    pose_chunk_size = min(8, max(1, int(detectors.shape[0])))
-    for isotope in isotopes:
-        subset = particles_by_isotope.get(isotope)
-        if subset is None:
-            continue
-        states, weights = subset
-        if len(states) < 2:
-            continue
-        background_counts = float(config.live_time_s) * np.asarray(
-            [max(float(state.background), 0.0) for state in states],
-            dtype=float,
-        )
-        filt = filters[isotope]
-        spec = filt.count_likelihood_spec()
-        isotope_weight = float(alpha_weights.get(isotope, 1.0)) / alpha_sum
-        for chunk_start in range(0, detectors.shape[0], pose_chunk_size):
-            chunk_stop = min(chunk_start + pose_chunk_size, detectors.shape[0])
-            all_pair_lambdas = (
-                estimator.expected_counts_all_pairs_for_states_at_detectors(
-                    isotope=isotope,
-                    detector_positions=detectors[chunk_start:chunk_stop],
-                    live_time_s=float(config.live_time_s),
-                    states=states,
-                )
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("DSS EIG requires an explicit numpy random generator.")
+    if eig_call_seed is None:
+        resolved_eig_call_seed = int(
+            rng.integers(
+                0,
+                np.iinfo(np.int64).max,
+                endpoint=False,
+                dtype=np.int64,
             )
-            expected_shape = (
-                chunk_stop - chunk_start,
-                int(estimator.num_orientations) ** 2,
-            )
-            if (
-                all_pair_lambdas.ndim != 3
-                or all_pair_lambdas.shape[:2] != expected_shape
-            ):
-                raise RuntimeError(
-                    "Batched planning response has an unexpected shape: "
-                    f"{all_pair_lambdas.shape}."
-                )
-            for local_index, pose_index in enumerate(range(chunk_start, chunk_stop)):
-                programs = programs_by_pose[pose_index]
-                pair_ids = _program_pair_id_matrix(programs)
-                if pair_ids.size == 0:
-                    continue
-                if np.any(pair_ids < 0) or np.any(
-                    pair_ids >= all_pair_lambdas.shape[1]
-                ):
-                    raise ValueError("Shield program contains an out-of-range pair id.")
-                view_mask = _program_view_mask(
-                    programs,
-                    max_length=pair_ids.shape[1],
-                )
-                isotope_gain = _program_information_gain_from_lambdas(
-                    all_pair_lambdas[local_index, pair_ids, :],
-                    np.asarray(weights, dtype=float),
-                    view_mask,
-                    spec=spec,
-                    num_samples=int(configured_samples),
-                    rng=rng,
-                    primary_history_weight=candidate_history_weights[isotope][
-                        pose_index
-                    ],
-                    background_counts_n=background_counts,
-                )
-                outputs[pose_index] += isotope_weight * isotope_gain
-    return [np.maximum(values, 0.0) for values in outputs]
-def _batched_signature_separation_scores(
-    raw_counts: NDArray[np.float64],
-    *,
-    variance_floor: float,
-    likelihood_spec: CountLikelihoodSpec,
-    primary_history_weight: NDArray[np.float64] | float = 1.0,
-    background_counts: NDArray[np.float64] | float = 0.0,
-) -> NDArray[np.float64]:
-    """Return likelihood-matched signature scores for many programs."""
-    raw = np.maximum(np.asarray(raw_counts, dtype=float), 0.0)
-    if raw.ndim != 3 or raw.shape[0] == 0 or raw.shape[2] < 2:
-        return np.zeros(raw.shape[0] if raw.ndim >= 1 else 0, dtype=float)
-    mode_count = raw.shape[2]
-    history_weight = np.asarray(primary_history_weight, dtype=float)
-    if history_weight.ndim == 0:
-        history_weight = np.full(mode_count, float(history_weight), dtype=float)
+        )
+    elif (
+        isinstance(eig_call_seed, bool)
+        or not isinstance(eig_call_seed, (int, np.integer))
+        or int(eig_call_seed) < 0
+    ):
+        raise ValueError("eig_call_seed must be a nonnegative integer.")
     else:
-        history_weight = history_weight.reshape(-1)
-        if history_weight.size != mode_count:
-            raise ValueError(
-                "primary_history_weight must be scalar or match signature modes."
-            )
-    background = np.maximum(np.asarray(background_counts, dtype=float), 0.0)
-    try:
-        background = np.broadcast_to(background, raw.shape[:2])
-    except ValueError as exc:
-        raise ValueError(
-            "background_counts must be scalar or match program views."
-        ) from exc
-    pair_i, pair_j = np.triu_indices(raw.shape[2], k=1)
-    if pair_i.size == 0:
-        return np.zeros(raw.shape[0], dtype=float)
-    left = raw[:, :, pair_i]
-    right = raw[:, :, pair_j]
-    background_by_pair = background[:, :, None]
-    spec = likelihood_spec
-    variance = np.maximum(
-        _future_predictive_count_variance(
-            left + background_by_pair,
-            spec=spec,
-            primary_history_weight=history_weight[pair_i],
-            background_counts=background_by_pair,
+        resolved_eig_call_seed = int(eig_call_seed)
+    if joint_particles is None:
+        joint_particles = estimator.planning_joint_particles(
+            max_particles=config.planning_particles,
+            method=config.planning_method,
+            rng=rng,
         )
-        + _future_predictive_count_variance(
-            right + background_by_pair,
-            spec=spec,
-            primary_history_weight=history_weight[pair_j],
-            background_counts=background_by_pair,
+    if tuple(joint_particles.isotope_order) != isotopes:
+        raise ValueError("Joint planning snapshot isotope order is inconsistent.")
+    if int(np.asarray(joint_particles.weights_n).size) < 2:
+        return outputs
+    configured_samples = (
+        pf_config.planning_eig_samples
+        if sample_count_override is None
+        else sample_count_override
+    )
+    if (
+        isinstance(configured_samples, bool)
+        or not isinstance(configured_samples, (int, np.integer))
+        or int(configured_samples) <= 0
+    ):
+        raise ValueError("DSS EIG sample count must be a positive integer.")
+    snapshot_index = len(estimator.measurements)
+    use_gpu = bool(pf_config.use_gpu)
+    gpu_device = str(pf_config.gpu_device)
+    accelerator_memory_before = _dss_accelerator_memory_snapshot(
+        use_gpu=use_gpu,
+        gpu_device=gpu_device,
+    )
+    flattened_programs, action_pose_indices, pair_ids, view_mask, offsets = (
+        _joint_program_action_layout(programs_by_pose)
+    )
+    if not flattened_programs:
+        return outputs
+    action_lengths = np.sum(view_mask, axis=1, dtype=np.int64)
+    flattened_gains = np.zeros(len(flattened_programs), dtype=np.float64)
+    particle_count = int(np.asarray(joint_particles.weights_n).size)
+    source_slot_count = int(
+        sum(
+            np.asarray(
+                joint_particles.strengths_nk_by_isotope[isotope]
+            ).shape[1]
+            for isotope in isotopes
+        )
+    )
+    line_count = len(tuple(model.line_identity))
+    feature_count = len(tuple(model.transport_feature_order))
+    memory_budget_bytes = (
+        256 * 1024 * 1024
+        if memory_budget_bytes_override is None
+        else memory_budget_bytes_override
+    )
+    if (
+        isinstance(memory_budget_bytes, bool)
+        or not isinstance(memory_budget_bytes, (int, np.integer))
+        or int(memory_budget_bytes) <= 0
+    ):
+        raise ValueError("DSS EIG memory budget must be a positive integer.")
+    memory_budget_bytes = int(memory_budget_bytes)
+    sample_count = int(configured_samples)
+    latent_rng = named_random_generator(
+        resolved_eig_call_seed,
+        "dss_pp",
+        "joint_full_spectrum_eig",
+        int(snapshot_index),
+        "common_latent_particles",
+    )
+    common_latent_indices = latent_rng.choice(
+        particle_count,
+        size=sample_count,
+        replace=True,
+        p=_normalise_weights(
+            np.asarray(joint_particles.weights_n, dtype=np.float64)
         ),
-        max(float(variance_floor), 1.0e-12),
-    )
-    distances = np.sum((left - right) * (left - right) / variance, axis=1)
-    scores = np.min(distances, axis=1)
-    return np.maximum(scores, 0.0)
-
-
-def _batched_temporal_separation_scores(
-    raw_counts: NDArray[np.float64],
-    mode_weights: NDArray[np.float64],
-    *,
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return scalar-equivalent temporal separation scores for many programs."""
-    raw = np.maximum(np.asarray(raw_counts, dtype=float), 0.0)
-    if raw.ndim != 3 or raw.shape[0] == 0:
-        return np.zeros(raw.shape[0] if raw.ndim >= 1 else 0, dtype=float)
-    program_count, program_length, mode_count = raw.shape
-    if program_length == 0 or mode_count < 2:
-        return np.zeros(program_count, dtype=float)
-    totals = np.sum(raw, axis=1)
-    active = totals > 1.0e-12
-    active_counts = np.sum(active, axis=1)
-    if not np.any(active_counts >= 2):
-        return np.zeros(program_count, dtype=float)
-
-    weights = np.asarray(mode_weights, dtype=float).ravel()
-    if weights.size != mode_count:
-        weights = np.ones(mode_count, dtype=float) / float(mode_count)
-    weights = np.maximum(weights, 0.0)
-    row_weights = weights[None, :] * active
-    row_weight_sums = np.sum(row_weights, axis=1, keepdims=True)
-    row_weights = np.divide(
-        row_weights,
-        row_weight_sums,
-        out=np.zeros_like(row_weights),
-        where=row_weight_sums > 0.0,
-    )
-
-    normalized = np.divide(
-        raw,
-        totals[:, None, :],
-        out=np.zeros_like(raw),
-        where=totals[:, None, :] > 0.0,
-    )
-    pair_i, pair_j = np.triu_indices(mode_count, k=1)
-    if pair_i.size == 0:
-        return np.zeros(program_count, dtype=float)
-    eps = 1.0e-12
-    threshold = max(float(config.temporal_pair_contrast_threshold), eps)
-    log_matrix = np.log(normalized + eps)
-    pair_weights = np.sqrt(
-        np.maximum(row_weights[:, pair_i] * row_weights[:, pair_j], 0.0),
-    )
-    contrasts = np.max(
-        np.abs(log_matrix[:, :, pair_i] - log_matrix[:, :, pair_j]),
-        axis=1,
-    )
-    useful_contrast = np.minimum(1.0, contrasts / threshold)
-    covered = np.sum(pair_weights * useful_contrast, axis=1)
-    total_pair_weight = np.sum(pair_weights, axis=1)
-    cover = np.divide(
-        covered,
-        total_pair_weight,
-        out=np.zeros(program_count, dtype=float),
-        where=total_pair_weight > 0.0,
-    )
-    cover = np.clip(cover, 0.0, 1.0)
-
-    floor = max(float(config.count_variance_floor), 1.0e-12)
-    row_variance = np.maximum(np.sum(normalized, axis=2), floor)
-    whitened = normalized / np.sqrt(row_variance[:, :, None])
-    weighted = whitened * np.sqrt(np.maximum(row_weights, 0.0))[:, None, :]
-    gram = (
-        np.einsum("plm,pln->pmn", weighted, weighted)
-        + max(float(config.temporal_logdet_ridge), eps)
-        * np.eye(mode_count, dtype=float)[None, :, :]
-    )
-    signs, logdets = np.linalg.slogdet(gram)
-    baselines = float(mode_count) * np.log(
-        max(float(config.temporal_logdet_ridge), eps),
-    )
-    logdet_scores = np.where(
-        signs > 0,
-        np.maximum(logdets - baselines, 0.0),
-        0.0,
-    )
-
-    left = normalized[:, :, pair_i]
-    right = normalized[:, :, pair_j]
-    variance = np.maximum(left + right, floor)
-    weighted_left = left / np.sqrt(variance)
-    weighted_right = right / np.sqrt(variance)
-    numerators = np.sum(weighted_left * weighted_right, axis=1)
-    denominators = np.linalg.norm(weighted_left, axis=1) * np.linalg.norm(
-        weighted_right, axis=1
-    )
-    correlations = np.divide(
-        numerators,
-        denominators,
-        out=np.zeros_like(numerators),
-        where=denominators > 0.0,
-    )
-    correlations = np.where(denominators > 0.0, correlations, -np.inf)
-    max_corr = np.max(correlations, axis=1)
-    max_corr = np.where(np.isfinite(max_corr), max_corr, 0.0)
-    max_corr = np.clip(max_corr, 0.0, 1.0)
-    decorrelation = 1.0 - max_corr
-    scores = (
-        float(config.temporal_cover_weight) * cover
-        + float(config.temporal_logdet_weight) * decorrelation * np.log1p(logdet_scores)
-        + float(config.temporal_decorrelation_weight) * decorrelation
-    )
-    scores = np.where(active_counts >= 2, scores, 0.0)
-    return np.maximum(scores, 0.0)
-
-
-def _batched_count_balance_penalties(
-    counts_by_program_isotope: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return count-balance penalties for many program rows."""
-    values = np.maximum(np.asarray(counts_by_program_isotope, dtype=float), 0.0)
-    if values.ndim != 2 or values.shape[1] <= 1:
-        return np.zeros(values.shape[0] if values.ndim >= 1 else 0, dtype=float)
-    totals = np.sum(values, axis=1, keepdims=True)
-    probabilities = np.divide(
-        values,
-        totals,
-        out=np.zeros_like(values),
-        where=totals > 0.0,
-    )
-    positive = probabilities > 0.0
-    entropy_terms = np.zeros_like(probabilities)
-    entropy_terms[positive] = probabilities[positive] * np.log(
-        probabilities[positive],
-    )
-    entropy = -np.sum(entropy_terms, axis=1)
-    normalized_entropy = entropy / max(float(np.log(values.shape[1])), 1.0e-12)
-    penalties = np.clip(1.0 - normalized_entropy, 0.0, 1.0)
-    penalties = np.where(totals.ravel() > 0.0, penalties, 1.0)
-    return penalties
-
-
-def _score_programs_from_pair_cache(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    modes_by_isotope: dict[str, list[SignatureMode]] | None = None,
-    programs: Sequence[ShieldProgram],
-    config: DSSPPConfig,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
-    """Score many shield programs from cached signatures without changing math."""
-    if not programs:
-        empty = np.zeros(0, dtype=float)
-        return empty, empty, empty, empty, empty, empty, empty, empty
-    pair_matrix = _program_pair_id_matrix(programs)
-    program_count = len(programs)
-    signature_total = np.zeros(program_count, dtype=float)
-    temporal_total = np.zeros(program_count, dtype=float)
-    elevation_total = np.zeros(program_count, dtype=float)
-    differential_terms: list[NDArray[np.float64]] = []
-    observation_counts: list[NDArray[np.float64]] = []
-    balance_counts: list[NDArray[np.float64]] = []
-    dose_score = np.zeros(program_count, dtype=float)
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    for isotope in estimator.isotopes:
-        matrix, weights_raw = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        if matrix.size and pair_matrix.size:
-            clipped_ids = np.clip(pair_matrix, 0, matrix.shape[0] - 1)
-            raw = np.maximum(matrix[clipped_ids, :], 0.0)
-        else:
-            raw = np.zeros((program_count, pair_matrix.shape[1], 0), dtype=float)
-        if raw.shape[2] > 0:
-            weights = _normalise_weights(np.asarray(weights_raw, dtype=float))
-            if weights.size != raw.shape[2]:
-                weights = np.ones(raw.shape[2], dtype=float) / float(raw.shape[2])
-            isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-            modes_for_isotope = (modes_by_isotope or {}).get(isotope, [])
-            history_weight, background_counts = (
-                _signature_statistics_for_isotope_at_pose(
-                    future_statistics,
-                    isotope,
-                    pose_index=pose_index,
-                    mode_count=raw.shape[2],
-                    config=config,
-                )
+    ).astype(np.int64, copy=False)
+    action_seeds = np.asarray(
+        [
+            named_stream_seed(
+                resolved_eig_call_seed,
+                "dss_pp",
+                "joint_full_spectrum_eig",
+                int(snapshot_index),
+                "canonical_action",
+                *(float(value).hex() for value in detectors[int(pose_index)]),
+                "pairs",
+                *(int(pair_id) for pair_id in program.pair_ids),
             )
-            signature_total += isotope_weight * _batched_signature_separation_scores(
-                raw,
-                variance_floor=float(config.count_variance_floor),
-                likelihood_spec=_count_likelihood_spec_for_isotope(
-                    estimator,
-                    isotope,
-                ),
-                primary_history_weight=history_weight,
-                background_counts=background_counts,
+            & ((1 << 63) - 1)
+            for pose_index, program in zip(
+                action_pose_indices,
+                flattened_programs,
             )
-            temporal_total += isotope_weight * _batched_temporal_separation_scores(
-                raw,
-                weights,
-                config=config,
-            )
-            elevation_total += isotope_weight * _batched_elevation_signature_scores(
-                raw,
-                weights,
-                modes_for_isotope,
-                config=config,
-            )
-            mean_signature = np.sum(raw * weights[None, None, :], axis=2)
-            observation = (
-                np.max(mean_signature, axis=1)
-                if mean_signature.shape[1] > 0
-                else np.zeros(program_count, dtype=float)
-            )
-            balance = np.sum(mean_signature, axis=1)
-            dose_score += balance
-            signature_std = (
-                np.std(mean_signature, axis=1)
-                if mean_signature.shape[1] > 0
-                else np.zeros(program_count, dtype=float)
-            )
-        else:
-            observation = np.zeros(program_count, dtype=float)
-            balance = np.zeros(program_count, dtype=float)
-            signature_std = np.zeros(program_count, dtype=float)
-        observation_counts.append(observation)
-        balance_counts.append(balance)
-        min_std = max(float(config.signature_std_min_counts), 0.0)
-        if min_std > 0.0:
-            shortfall = np.maximum(0.0, 1.0 - signature_std / min_std)
-            differential_terms.append(shortfall * shortfall)
-    observation_matrix = (
-        np.stack(observation_counts, axis=1)
-        if observation_counts
-        else np.zeros((program_count, 0), dtype=float)
+        ],
+        dtype=np.int64,
     )
-    balance_matrix = (
-        np.stack(balance_counts, axis=1)
-        if balance_counts
-        else np.zeros((program_count, 0), dtype=float)
-    )
-    min_counts = float(config.min_observation_counts)
-    if min_counts <= 0.0:
-        observation_penalty = np.zeros(program_count, dtype=float)
-    elif observation_matrix.shape[1] == 0:
-        observation_penalty = np.ones(program_count, dtype=float)
-    else:
-        shortfalls = np.maximum(0.0, 1.0 - observation_matrix / min_counts)
-        observation_penalty = np.mean(shortfalls * shortfalls, axis=1)
-    differential_penalty = (
-        np.mean(np.stack(differential_terms, axis=1), axis=1)
-        if differential_terms
-        else np.zeros(program_count, dtype=float)
-    )
-    count_balance_penalty = _batched_count_balance_penalties(balance_matrix)
-    saturation = max(float(config.count_utility_saturation_counts), 1.0e-12)
-    if balance_matrix.shape[1] == 0:
-        count_utility = np.zeros(program_count, dtype=float)
-    else:
-        utilities = 1.0 - np.exp(-np.maximum(balance_matrix, 0.0) / saturation)
-        count_utility = np.mean(np.clip(utilities, 0.0, 1.0), axis=1)
-    return (
-        signature_total,
-        temporal_total,
-        elevation_total,
-        observation_penalty,
-        count_balance_penalty,
-        differential_penalty,
-        dose_score,
-        count_utility,
-    )
-
-
-def _temporal_scores_programs_from_pair_cache(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    programs: Sequence[ShieldProgram],
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return temporal separation scores for many programs from cached pairs."""
-    if not programs:
-        return np.zeros(0, dtype=float)
-    pair_matrix = _program_pair_id_matrix(programs)
-    if pair_matrix.size == 0:
-        return np.zeros(len(programs), dtype=float)
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    temporal_total = np.zeros(len(programs), dtype=float)
-    for isotope in estimator.isotopes:
-        matrix, weights_raw = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        if not matrix.size or matrix.shape[1] < 2:
-            continue
-        clipped_ids = np.clip(pair_matrix, 0, matrix.shape[0] - 1)
-        raw = np.maximum(matrix[clipped_ids, :], 0.0)
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        temporal_total += isotope_weight * _batched_temporal_separation_scores(
-            raw,
-            np.asarray(weights_raw, dtype=float),
-            config=config,
-        )
-    return temporal_total
-
-
-def _temporal_score_program_from_pair_cache(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    program: ShieldProgram,
-    config: DSSPPConfig,
-) -> float:
-    """Return only the temporal separation term from cached pair signatures."""
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    pair_ids = np.asarray(program.pair_ids, dtype=int)
-    if pair_ids.size == 0:
-        return 0.0
-    temporal_total = 0.0
-    for isotope in estimator.isotopes:
-        matrix, weights = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        if not matrix.size or matrix.shape[1] < 2:
-            continue
-        clipped_pair_ids = np.clip(pair_ids, 0, matrix.shape[0] - 1)
-        signatures = [
-            np.asarray(matrix[clipped_pair_ids, mode_idx], dtype=float)
-            for mode_idx in range(matrix.shape[1])
+    memory_contracts: list[dict[str, int]] = []
+    attempted_action_batch_sizes: list[int] = []
+    successful_action_batch_sizes: list[int] = []
+    oom_retry_events: list[dict[str, int]] = []
+    for view_count_raw in np.unique(action_lengths):
+        view_count = int(view_count_raw)
+        selected_actions = np.flatnonzero(action_lengths == view_count)
+        if view_count <= 0:
+            raise ValueError("Every DSS shield program must contain a view.")
+        action_detectors = detectors[
+            action_pose_indices[selected_actions]
         ]
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        temporal_total += isotope_weight * _temporal_separation_score_from_signatures(
-            signatures,
-            weights,
-            config=config,
+        action_pairs = pair_ids[selected_actions, :view_count]
+        lexicographic_keys = tuple(
+            [
+                action_pairs[:, column]
+                for column in range(view_count - 1, -1, -1)
+            ]
+            + [
+                action_detectors[:, 2],
+                action_detectors[:, 1],
+                action_detectors[:, 0],
+            ]
         )
-    return float(temporal_total)
-
-
-def _weighted_mean_signature(
-    signatures: list[NDArray[np.float64]],
-    weights: list[float],
-) -> NDArray[np.float64]:
-    """Return the weighted mean signature vector."""
-    if not signatures:
-        return np.zeros(0, dtype=float)
-    sig_arr = np.vstack(signatures)
-    weight_arr = _normalise_weights(np.asarray(weights, dtype=float))
-    return np.sum(weight_arr[:, None] * sig_arr, axis=0)
-
-
-def _count_likelihood_spec_for_isotope(
-    estimator: RotatingShieldPFEstimator,
-    isotope: str,
-) -> CountLikelihoodSpec:
-    """Resolve the isotope-specific PF likelihood used by DSS diagnostics."""
-    filt = estimator.filters.get(isotope)
-    if filt is None:
-        raise KeyError(f"Pure PF filter is missing for isotope {isotope!r}.")
-    return filt.count_likelihood_spec()
-
-
-def _signature_separation_score(
-    signatures: list[NDArray[np.float64]],
-    *,
-    variance_floor: float,
-    likelihood_spec: CountLikelihoodSpec,
-    primary_history_weight: NDArray[np.float64] | float = 1.0,
-    background_counts: NDArray[np.float64] | float = 0.0,
-) -> float:
-    """Return the vectorized worst-pair shield-signature separation."""
-    if len(signatures) < 2:
-        return 0.0
-    raw = np.stack(
-        [np.asarray(signature, dtype=float) for signature in signatures],
-        axis=1,
-    )[None, :, :]
-    return float(
-        _batched_signature_separation_scores(
-            raw,
-            variance_floor=variance_floor,
-            likelihood_spec=likelihood_spec,
-            primary_history_weight=primary_history_weight,
-            background_counts=background_counts,
-        )[0]
-    )
-
-
-def _pairwise_contrast_cover_score(
-    response_matrix: NDArray[np.float64],
-    mode_weights: NDArray[np.float64],
-    *,
-    contrast_threshold: float,
-) -> float:
-    """Return the weighted fraction of mode pairs separated by any posture."""
-    matrix = np.maximum(np.asarray(response_matrix, dtype=float), 0.0)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] < 2:
-        return 0.0
-    weights = _normalise_weights(np.asarray(mode_weights, dtype=float))
-    if weights.size != matrix.shape[1]:
-        weights = np.ones(matrix.shape[1], dtype=float) / float(matrix.shape[1])
-    eps = 1.0e-12
-    threshold = max(float(contrast_threshold), eps)
-    log_matrix = np.log(matrix + eps)
-    pair_i, pair_j = np.triu_indices(matrix.shape[1], k=1)
-    if pair_i.size == 0:
-        return 0.0
-    pair_weights = np.sqrt(
-        np.maximum(weights[pair_i] * weights[pair_j], 0.0),
-    )
-    positive = pair_weights > 0.0
-    if not np.any(positive):
-        return 0.0
-    contrasts = np.max(
-        np.abs(log_matrix[:, pair_i[positive]] - log_matrix[:, pair_j[positive]]),
-        axis=0,
-    )
-    useful_contrast = np.minimum(1.0, contrasts / threshold)
-    covered = float(np.sum(pair_weights[positive] * useful_contrast))
-    total_weight = float(np.sum(pair_weights[positive]))
-    if total_weight <= 0.0:
-        return 0.0
-    return float(np.clip(covered / total_weight, 0.0, 1.0))
+        selected_actions = selected_actions[
+            np.lexsort(lexicographic_keys)
+        ]
+        memory_contract: dict[str, int] = {}
+        action_batch_size = _dss_eig_action_batch_size(
+            model,
+            action_count=int(selected_actions.size),
+            particle_count=particle_count,
+            sample_count=sample_count,
+            source_slot_count=max(source_slot_count, 1),
+            view_count=view_count,
+            line_count=max(line_count, 1),
+            feature_count=max(feature_count, 1),
+            memory_budget_bytes=memory_budget_bytes,
+            diagnostics=memory_contract,
+        )
+        memory_contracts.append(memory_contract)
+        action_start = 0
+        while action_start < int(selected_actions.size):
+            action_stop = min(
+                action_start + action_batch_size,
+                int(selected_actions.size),
+            )
+            action_indices = selected_actions[action_start:action_stop]
+            attempted_action_batch_sizes.append(int(action_indices.size))
+            action_rng = named_random_generator(
+                resolved_eig_call_seed,
+                "dss_pp",
+                "joint_full_spectrum_eig",
+                int(snapshot_index),
+                "action_seeded_sampler_fallback",
+            )
+            try:
+                components = _full_spectrum_joint_program_components(
+                    estimator,
+                    detectors[action_pose_indices[action_indices]],
+                    [flattened_programs[int(index)] for index in action_indices],
+                    joint_particles,
+                    live_time_s=float(config.live_time_s),
+                    detector_aperture_samples=int(
+                        config.detector_aperture_samples
+                    ),
+                )
+                flattened_gains[action_indices] = (
+                    _full_spectrum_information_gain(
+                        estimator,
+                        components,
+                        np.asarray(
+                            joint_particles.weights_n,
+                            dtype=np.float64,
+                        ),
+                        sample_count=sample_count,
+                        rng=action_rng,
+                        use_gpu=use_gpu,
+                        gpu_device=gpu_device,
+                        latent_particle_indices=common_latent_indices,
+                        action_seeds_a=action_seeds[action_indices],
+                    )
+                )
+            except Exception as error:
+                if not _is_dss_eig_memory_error(error):
+                    raise
+                if action_stop - action_start <= 1:
+                    raise RuntimeError(
+                        "DSS exact EIG exhausted memory for one action even "
+                        "after batch reduction."
+                    ) from error
+                _release_dss_gpu_cache()
+                reduced_action_batch_size = max(
+                    1,
+                    (action_stop - action_start) // 2,
+                )
+                oom_retry_events.append(
+                    {
+                        "view_count": int(view_count),
+                        "failed_action_batch_size": int(
+                            action_stop - action_start
+                        ),
+                        "retry_action_batch_size": int(
+                            reduced_action_batch_size
+                        ),
+                    }
+                )
+                action_batch_size = int(reduced_action_batch_size)
+                continue
+            successful_action_batch_sizes.append(int(action_indices.size))
+            action_start = action_stop
+    for pose_index in range(int(detectors.shape[0])):
+        action_start = int(offsets[pose_index])
+        action_stop = int(offsets[pose_index + 1])
+        outputs[pose_index] = np.asarray(
+            flattened_gains[action_start:action_stop],
+            dtype=np.float64,
+        )
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "backend": "torch" if use_gpu else "numpy",
+                "gpu_device": str(gpu_device) if use_gpu else "cpu",
+                "memory_budget_bytes": int(memory_budget_bytes),
+                "accelerator_memory_before": accelerator_memory_before,
+                "accelerator_memory_after": _dss_accelerator_memory_snapshot(
+                    use_gpu=use_gpu,
+                    gpu_device=gpu_device,
+                ),
+                "memory_contracts": memory_contracts,
+                "attempted_action_batch_sizes": attempted_action_batch_sizes,
+                "successful_action_batch_sizes": successful_action_batch_sizes,
+                "oom_retry_count": int(len(oom_retry_events)),
+                "oom_retry_events": oom_retry_events,
+                "cpu_fallback_used": False,
+            }
+        )
+    return outputs
 
 
 def _elevation_pair_indices_and_weights(
@@ -2522,15 +3380,15 @@ def _elevation_pair_indices_and_weights(
         return empty_idx, empty_idx, np.zeros(0, dtype=float)
     weights = _normalise_weights(np.asarray(mode_weights, dtype=float))
     if weights.size != mode_count:
-        weights = np.ones(mode_count, dtype=float) / float(mode_count)
+        raise ValueError("mode_weights must contain one value per mode.")
     positions = np.vstack(
         [np.asarray(mode.position_xyz, dtype=float).reshape(3) for mode in modes]
     )
     left, right = np.triu_indices(mode_count, k=1)
     z_delta = np.abs(positions[left, 2] - positions[right, 2])
     xy_delta = np.linalg.norm(positions[left, :2] - positions[right, :2], axis=1)
-    z_scale = max(float(config.elevation_pair_z_scale_m), 1.0e-9)
-    xy_scale = max(float(config.elevation_pair_xy_scale_m), 1.0e-9)
+    z_scale = float(config.elevation_pair_z_scale_m)
+    xy_scale = float(config.elevation_pair_xy_scale_m)
     z_factor = z_delta / (z_delta + z_scale)
     xy_factor = xy_scale / (xy_delta + xy_scale)
     posterior_factor = np.sqrt(np.maximum(weights[left] * weights[right], 0.0))
@@ -2541,541 +3399,6 @@ def _elevation_pair_indices_and_weights(
         right[valid].astype(np.int64, copy=False),
         pair_weights[valid].astype(float, copy=False),
     )
-
-
-def _batched_elevation_signature_scores(
-    response_by_program: NDArray[np.float64],
-    mode_weights: NDArray[np.float64],
-    modes: Sequence[SignatureMode],
-    *,
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return height-weighted temporal shield separability for many programs."""
-    responses = np.maximum(np.asarray(response_by_program, dtype=float), 0.0)
-    if responses.ndim != 3 or responses.shape[2] < 2:
-        return np.zeros(responses.shape[0] if responses.ndim >= 1 else 0, dtype=float)
-    if len(modes) != responses.shape[2]:
-        return np.zeros(responses.shape[0], dtype=float)
-    left, right, pair_weights = _elevation_pair_indices_and_weights(
-        modes,
-        np.asarray(mode_weights, dtype=float),
-        config=config,
-    )
-    if left.size == 0:
-        return np.zeros(responses.shape[0], dtype=float)
-    log_responses = np.log1p(responses)
-    contrast = np.linalg.norm(
-        log_responses[:, :, left] - log_responses[:, :, right],
-        axis=1,
-    ) / np.sqrt(max(responses.shape[1], 1))
-    threshold = max(float(config.temporal_pair_contrast_threshold), 1.0e-12)
-    pair_scores = np.minimum(contrast / threshold, 1.0)
-    return np.sum(pair_scores * pair_weights.reshape(1, -1), axis=1) / max(
-        float(np.sum(pair_weights)),
-        1.0e-12,
-    )
-
-
-def _elevation_signature_score_from_signatures(
-    signatures: Sequence[NDArray[np.float64]],
-    mode_weights: Sequence[float],
-    modes: Sequence[SignatureMode],
-    *,
-    config: DSSPPConfig,
-) -> float:
-    """Return height-weighted temporal shield separability for one program."""
-    if len(signatures) < 2 or len(signatures) != len(modes):
-        return 0.0
-    response_matrix = np.stack(
-        [np.asarray(signature, dtype=float) for signature in signatures]
-    ).T
-    response = response_matrix.reshape(
-        1,
-        response_matrix.shape[0],
-        response_matrix.shape[1],
-    )
-    scores = _batched_elevation_signature_scores(
-        response,
-        np.asarray(mode_weights, dtype=float),
-        modes,
-        config=config,
-    )
-    return float(scores[0]) if scores.size else 0.0
-
-
-def _pairwise_cover_objective(
-    signature_scores: NDArray[np.float64] | None,
-    temporal_scores: NDArray[np.float64],
-    elevation_scores: NDArray[np.float64],
-    *,
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return the cover-search objective for pairwise source ambiguity."""
-    signature = (
-        np.zeros_like(np.asarray(temporal_scores, dtype=float))
-        if signature_scores is None
-        else np.maximum(np.asarray(signature_scores, dtype=float), 0.0)
-    )
-    temporal = np.maximum(np.asarray(temporal_scores, dtype=float), 0.0)
-    elevation = np.maximum(np.asarray(elevation_scores, dtype=float), 0.0)
-    if signature.shape != temporal.shape:
-        signature = np.zeros_like(temporal)
-    if elevation.shape != temporal.shape:
-        elevation = np.zeros_like(temporal)
-    signature_weight = max(float(config.lambda_signature), 0.0)
-    temporal_weight = max(float(config.lambda_temporal_separation), 0.0)
-    elevation_weight = max(float(config.lambda_elevation_signature), 0.0)
-    if signature_weight <= 0.0 and temporal_weight <= 0.0 and elevation_weight <= 0.0:
-        temporal_weight = 1.0
-    return (
-        signature_weight * signature
-        + temporal_weight * temporal
-        + elevation_weight * elevation
-    )
-
-
-def _response_logdet_score(
-    response_matrix: NDArray[np.float64],
-    mode_weights: NDArray[np.float64],
-    *,
-    ridge: float,
-    variance_floor: float,
-) -> float:
-    """Return a D-optimality score for temporal shield response columns."""
-    matrix = np.maximum(np.asarray(response_matrix, dtype=float), 0.0)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] < 2:
-        return 0.0
-    weights = _normalise_weights(np.asarray(mode_weights, dtype=float))
-    if weights.size != matrix.shape[1]:
-        weights = np.ones(matrix.shape[1], dtype=float) / float(matrix.shape[1])
-    row_variance = np.maximum(
-        np.sum(matrix, axis=1), max(float(variance_floor), 1.0e-12)
-    )
-    whitened = matrix / np.sqrt(row_variance[:, None])
-    weighted = whitened * np.sqrt(np.maximum(weights, 0.0))[None, :]
-    ridge_val = max(float(ridge), 1.0e-12)
-    gram = weighted.T @ weighted + ridge_val * np.eye(matrix.shape[1], dtype=float)
-    sign, logdet = np.linalg.slogdet(gram)
-    if sign <= 0 or not np.isfinite(logdet):
-        return 0.0
-    baseline = float(matrix.shape[1]) * float(np.log(ridge_val))
-    return max(float(logdet - baseline), 0.0)
-
-
-def _maximum_response_correlation(
-    response_matrix: NDArray[np.float64],
-    *,
-    variance_floor: float,
-) -> float:
-    """Return the largest Poisson-whitened cosine between mode responses."""
-    matrix = np.maximum(np.asarray(response_matrix, dtype=float), 0.0)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] < 2:
-        return 0.0
-    floor = max(float(variance_floor), 1.0e-12)
-    pair_i, pair_j = np.triu_indices(matrix.shape[1], k=1)
-    if pair_i.size == 0:
-        return 0.0
-    left = matrix[:, pair_i]
-    right = matrix[:, pair_j]
-    variance = np.maximum(left + right, floor)
-    weighted_left = left / np.sqrt(variance)
-    weighted_right = right / np.sqrt(variance)
-    numerators = np.sum(weighted_left * weighted_right, axis=0)
-    denominators = np.linalg.norm(weighted_left, axis=0) * np.linalg.norm(
-        weighted_right, axis=0
-    )
-    valid = denominators > 0.0
-    if not np.any(valid):
-        return 0.0
-    max_corr = float(np.max(numerators[valid] / denominators[valid]))
-    return float(np.clip(max_corr, 0.0, 1.0))
-
-
-def _pairwise_distance_correlation_payload(
-    response_matrix: NDArray[np.float64],
-    variance_by_row: NDArray[np.float64] | None,
-    *,
-    variance_floor: float,
-    threshold: float,
-) -> dict[str, object]:
-    """Return vectorized source-pair separation diagnostics for one response matrix."""
-    matrix = np.maximum(np.asarray(response_matrix, dtype=float), 0.0)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] < 2:
-        return {
-            "left_indices": [],
-            "right_indices": [],
-            "distances": [],
-            "correlations": [],
-            "min_separation": 0.0,
-            "max_correlation": 0.0,
-            "unresolved_pairs": 0,
-        }
-    left_idx, right_idx = np.triu_indices(matrix.shape[1], k=1)
-    left = matrix[:, left_idx]
-    right = matrix[:, right_idx]
-    if variance_by_row is None:
-        variance = np.maximum(left + right, float(variance_floor))
-    else:
-        row_variance = np.maximum(
-            np.asarray(variance_by_row, dtype=float).reshape(-1),
-            float(variance_floor),
-        )
-        if row_variance.size != matrix.shape[0]:
-            row_variance = np.full(matrix.shape[0], float(variance_floor), dtype=float)
-        variance = row_variance[:, None]
-    variance = np.maximum(variance, 1.0e-12)
-    diff = left - right
-    distances = np.sum((diff * diff) / variance, axis=0)
-    weighted_left = left / np.sqrt(variance)
-    weighted_right = right / np.sqrt(variance)
-    numerators = np.sum(weighted_left * weighted_right, axis=0)
-    denominators = np.linalg.norm(weighted_left, axis=0) * np.linalg.norm(
-        weighted_right, axis=0
-    )
-    correlations = np.divide(
-        numerators,
-        denominators,
-        out=np.zeros_like(numerators, dtype=float),
-        where=denominators > 0.0,
-    )
-    correlations = np.clip(correlations, 0.0, 1.0)
-    return {
-        "left_indices": [int(value) for value in left_idx],
-        "right_indices": [int(value) for value in right_idx],
-        "distances": [float(value) for value in distances],
-        "correlations": [float(value) for value in correlations],
-        "min_separation": float(np.min(distances)) if distances.size else 0.0,
-        "max_correlation": float(np.max(correlations)) if correlations.size else 0.0,
-        "unresolved_pairs": int(np.count_nonzero(distances < float(threshold))),
-    }
-
-
-def _pairwise_stat_value(
-    payload: dict[str, object],
-    key: str,
-    pair_index: int,
-    default: float = 0.0,
-) -> float:
-    """Return one pair statistic from a pairwise diagnostic payload."""
-    values = payload.get(key, [])
-    if not isinstance(values, Sequence) or pair_index >= len(values):
-        return float(default)
-    return float(values[pair_index])
-
-
-def _mode_pair_geometry_payload(
-    left_mode: SignatureMode,
-    right_mode: SignatureMode,
-    pose_xyz: NDArray[np.float64],
-) -> dict[str, float]:
-    """Return bearing and elevation separation for a source-mode pair."""
-    pose = np.asarray(pose_xyz, dtype=float).reshape(3)
-    left_delta = pose - np.asarray(left_mode.position_xyz, dtype=float).reshape(3)
-    right_delta = pose - np.asarray(right_mode.position_xyz, dtype=float).reshape(3)
-    left_bearing = float(np.arctan2(left_delta[1], left_delta[0]))
-    right_bearing = float(np.arctan2(right_delta[1], right_delta[0]))
-    bearing_delta = _angle_distance_rad(left_bearing, right_bearing)
-    left_horizontal = max(float(np.linalg.norm(left_delta[:2])), 1.0e-12)
-    right_horizontal = max(float(np.linalg.norm(right_delta[:2])), 1.0e-12)
-    left_elevation = float(np.arctan2(left_delta[2], left_horizontal))
-    right_elevation = float(np.arctan2(right_delta[2], right_horizontal))
-    elevation_delta = abs(left_elevation - right_elevation)
-    return {
-        "bearing_delta_deg": float(np.rad2deg(bearing_delta)),
-        "elevation_delta_deg": float(np.rad2deg(elevation_delta)),
-    }
-
-
-def _program_pairwise_ambiguity_diagnostics(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    kernel: ContinuousKernel,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    program: ShieldProgram,
-    config: DSSPPConfig,
-    max_pairs: int = 3,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> dict[str, dict[str, object]]:
-    """Return selected-program diagnostics for the hardest same-isotope mode pairs."""
-    if not program.pair_ids:
-        return {}
-    pose = np.asarray(pose_xyz, dtype=float).reshape(3)
-    pair_cache = _build_pair_signature_cache(
-        kernel=kernel,
-        estimator=estimator,
-        modes_by_isotope=modes_by_isotope,
-        pose_xyz=pose,
-        config=config,
-    )
-    threshold = max(float(config.count_variance_floor), 1.0e-12)
-    separation_threshold = max(float(config.temporal_pair_contrast_threshold), 1.0)
-    payload: dict[str, dict[str, object]] = {}
-    for isotope, modes in modes_by_isotope.items():
-        active_modes = [mode for mode in modes if float(mode.weight) > 0.0]
-        if len(active_modes) < 2:
-            continue
-        matrix, mode_weights_raw = pair_cache.get(
-            isotope,
-            (np.zeros((0, 0), dtype=float), []),
-        )
-        if matrix.ndim != 2 or matrix.shape[1] != len(active_modes):
-            continue
-        pair_ids = np.clip(
-            np.asarray(program.pair_ids, dtype=int),
-            0,
-            max(matrix.shape[0] - 1, 0),
-        )
-        program_response = np.maximum(matrix[pair_ids, :], 0.0)
-        mode_weights = _normalise_weights(np.asarray(mode_weights_raw, dtype=float))
-        if mode_weights.size != program_response.shape[1]:
-            mode_weights = np.full(
-                program_response.shape[1],
-                1.0 / float(program_response.shape[1]),
-                dtype=float,
-            )
-        history_weight, background_counts = _signature_statistics_for_isotope_at_pose(
-            future_statistics,
-            isotope,
-            pose_index=pose_index,
-            mode_count=program_response.shape[1],
-            config=config,
-        )
-        program_variance = np.maximum(
-            np.einsum(
-                "vm,m->v",
-                _future_predictive_count_variance(
-                    program_response + background_counts,
-                    spec=_count_likelihood_spec_for_isotope(estimator, isotope),
-                    primary_history_weight=history_weight,
-                    background_counts=background_counts,
-                ),
-                mode_weights,
-                optimize=True,
-            ),
-            threshold,
-        )
-        before_response = np.zeros((0, len(active_modes)), dtype=float)
-        before_variance = np.zeros(0, dtype=float)
-        data = estimator._measurement_data_for_iso(isotope, window=None)
-        if data is not None and data.z_k.size:
-            before_response = expected_counts_per_source(
-                kernel=kernel,
-                isotope=isotope,
-                detector_positions=data.detector_positions,
-                sources=np.vstack([mode.position_xyz for mode in active_modes]),
-                strengths=np.asarray(
-                    [max(float(mode.strength_cps_1m), 0.0) for mode in active_modes],
-                    dtype=float,
-                ),
-                live_times=data.live_times,
-                fe_indices=data.fe_indices,
-                pb_indices=data.pb_indices,
-                source_scale=estimator.response_scales_for_measurements(
-                    isotope,
-                    data.fe_indices,
-                    data.pb_indices,
-                ),
-            )
-            before_response = np.maximum(before_response, 0.0)
-            before_variance = np.maximum(data.observation_variances, threshold)
-        combined_response = np.vstack([before_response, program_response])
-        combined_variance = np.concatenate([before_variance, program_variance])
-        before_stats = _pairwise_distance_correlation_payload(
-            before_response,
-            before_variance,
-            variance_floor=threshold,
-            threshold=separation_threshold,
-        )
-        program_stats = _pairwise_distance_correlation_payload(
-            program_response,
-            program_variance,
-            variance_floor=threshold,
-            threshold=separation_threshold,
-        )
-        combined_stats = _pairwise_distance_correlation_payload(
-            combined_response,
-            combined_variance,
-            variance_floor=threshold,
-            threshold=separation_threshold,
-        )
-        distances = np.asarray(combined_stats.get("distances", []), dtype=float)
-        correlations = np.asarray(combined_stats.get("correlations", []), dtype=float)
-        left_indices = list(combined_stats.get("left_indices", []))
-        right_indices = list(combined_stats.get("right_indices", []))
-        if distances.size == 0:
-            continue
-        order = np.lexsort((-correlations, distances))
-        pair_details: list[dict[str, object]] = []
-        for rank, pair_pos in enumerate(order[: max(0, int(max_pairs))], start=1):
-            left_idx = int(left_indices[int(pair_pos)])
-            right_idx = int(right_indices[int(pair_pos)])
-            left_mode = active_modes[left_idx]
-            right_mode = active_modes[right_idx]
-            detail = {
-                "rank": int(rank),
-                "left_mode": _mode_diagnostic_payload(left_mode, left_idx),
-                "right_mode": _mode_diagnostic_payload(right_mode, right_idx),
-                "before_separation": _pairwise_stat_value(
-                    before_stats,
-                    "distances",
-                    int(pair_pos),
-                ),
-                "program_separation": _pairwise_stat_value(
-                    program_stats,
-                    "distances",
-                    int(pair_pos),
-                ),
-                "combined_separation": _pairwise_stat_value(
-                    combined_stats,
-                    "distances",
-                    int(pair_pos),
-                ),
-                "combined_correlation": _pairwise_stat_value(
-                    combined_stats,
-                    "correlations",
-                    int(pair_pos),
-                ),
-                "program_left_response": [
-                    float(value) for value in program_response[:, left_idx]
-                ],
-                "program_right_response": [
-                    float(value) for value in program_response[:, right_idx]
-                ],
-            }
-            detail.update(_mode_pair_geometry_payload(left_mode, right_mode, pose))
-            pair_details.append(detail)
-        payload[str(isotope)] = {
-            "mode_count": int(len(active_modes)),
-            "program_pair_ids": [int(value) for value in program.pair_ids],
-            "before_measurements": int(before_response.shape[0]),
-            "program_measurements": int(program_response.shape[0]),
-            "before_min_separation": float(before_stats["min_separation"]),
-            "before_max_correlation": float(before_stats["max_correlation"]),
-            "before_unresolved_pairs": int(before_stats["unresolved_pairs"]),
-            "program_min_separation": float(program_stats["min_separation"]),
-            "program_max_correlation": float(program_stats["max_correlation"]),
-            "program_unresolved_pairs": int(program_stats["unresolved_pairs"]),
-            "combined_min_separation": float(combined_stats["min_separation"]),
-            "combined_max_correlation": float(combined_stats["max_correlation"]),
-            "combined_unresolved_pairs": int(combined_stats["unresolved_pairs"]),
-            "bottleneck_pairs": pair_details,
-        }
-    return payload
-
-
-def _temporal_separation_score_from_signatures(
-    signatures: list[NDArray[np.float64]],
-    weights: list[float],
-    *,
-    config: DSSPPConfig,
-) -> float:
-    """Score a shield program by same-isotope temporal-code separability."""
-    if len(signatures) < 2:
-        return 0.0
-    raw_matrix = np.column_stack(
-        [np.maximum(np.asarray(sig, dtype=float).ravel(), 0.0) for sig in signatures]
-    )
-    if raw_matrix.ndim != 2 or raw_matrix.shape[0] == 0 or raw_matrix.shape[1] < 2:
-        return 0.0
-    scores = _batched_temporal_separation_scores(
-        raw_matrix.reshape(1, raw_matrix.shape[0], raw_matrix.shape[1]),
-        np.asarray(weights, dtype=float),
-        config=config,
-    )
-    return float(scores[0]) if scores.size else 0.0
-
-
-def _count_balance_penalty(counts: dict[str, float]) -> float:
-    """Return an isotope-agnostic penalty for single-isotope dominated programs."""
-    values = np.asarray(
-        [max(float(value), 0.0) for value in counts.values()],
-        dtype=float,
-    )
-    if values.size <= 1:
-        return 0.0
-    total = float(np.sum(values))
-    if total <= 0.0:
-        return 1.0
-    probabilities = values / total
-    positive = probabilities > 0.0
-    entropy = -float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
-    normalized_entropy = entropy / max(float(np.log(values.size)), 1e-12)
-    return float(np.clip(1.0 - normalized_entropy, 0.0, 1.0))
-
-
-def _saturated_count_utility(
-    counts: dict[str, float],
-    *,
-    saturation_counts: float,
-) -> float:
-    """Return a bounded utility for usable counts without rewarding raw proximity."""
-    values = np.asarray(
-        [max(float(value), 0.0) for value in counts.values()],
-        dtype=float,
-    )
-    if values.size == 0:
-        return 0.0
-    saturation = max(float(saturation_counts), 1.0e-12)
-    utilities = 1.0 - np.exp(-values / saturation)
-    return float(np.mean(np.clip(utilities, 0.0, 1.0)))
-
-
-def _mode_visibility_proxy(
-    mode: SignatureMode,
-    pose_xyz: NDArray[np.float64],
-    *,
-    live_time_s: float,
-    saturation_counts: float,
-) -> float:
-    """Return a bounded inverse-square visibility proxy for planning heuristics."""
-    pose = np.asarray(pose_xyz, dtype=float).reshape(3)
-    distance = max(float(np.linalg.norm(pose - mode.position_xyz)), 0.25)
-    expected = (
-        float(live_time_s)
-        * max(float(mode.strength_cps_1m), 0.0)
-        / (distance * distance)
-    )
-    saturation = max(float(saturation_counts), 1.0e-12)
-    return float(np.clip(1.0 - np.exp(-expected / saturation), 0.0, 1.0))
-
-
-def _local_orbit_gain(
-    candidate_pose_xyz: NDArray[np.float64],
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    *,
-    config: DSSPPConfig,
-) -> float:
-    """Return a gain for near-source annular viewpoints rather than source chasing."""
-    radii = tuple(
-        float(radius) for radius in config.ring_radii_m if float(radius) > 0.0
-    )
-    if not radii:
-        return 0.0
-    candidate = np.asarray(candidate_pose_xyz, dtype=float).reshape(3)
-    sigma = max(float(config.local_orbit_sigma_m), 1.0e-6)
-    gains: list[float] = []
-    weights: list[float] = []
-    for modes in modes_by_isotope.values():
-        for mode in modes:
-            if float(mode.weight) <= 0.0:
-                continue
-            distance = float(np.linalg.norm(candidate[:2] - mode.position_xyz[:2]))
-            radial_error = min(abs(distance - radius) for radius in radii)
-            radial_gain = float(np.exp(-0.5 * (radial_error / sigma) ** 2))
-            visibility = _mode_visibility_proxy(
-                mode,
-                candidate,
-                live_time_s=float(config.live_time_s),
-                saturation_counts=float(config.count_utility_saturation_counts),
-            )
-            gains.append(radial_gain * visibility)
-            weights.append(float(mode.weight))
-    if not gains:
-        return 0.0
-    weight_arr = _normalise_weights(np.asarray(weights, dtype=float))
-    return float(np.sum(weight_arr * np.asarray(gains, dtype=float)))
 
 
 def _local_orbit_gains_batch(
@@ -3105,13 +3428,7 @@ def _local_orbit_gains_batch(
     mode_positions = np.vstack(
         [np.asarray(mode.position_xyz, dtype=float) for mode in modes]
     )
-    mode_strengths = np.asarray(
-        [max(float(mode.strength_cps_1m), 0.0) for mode in modes],
-        dtype=float,
-    )
-    mode_weights = _normalise_weights(
-        np.asarray([float(mode.weight) for mode in modes], dtype=float)
-    )
+    mode_weights = _flattened_posterior_mode_weights(modes_by_isotope)
     xy_distances = np.linalg.norm(
         candidates[:, None, :2] - mode_positions[None, :, :2],
         axis=2,
@@ -3119,592 +3436,15 @@ def _local_orbit_gains_batch(
     radial_error = np.min(
         np.abs(xy_distances[:, :, None] - radii[None, None, :]), axis=2
     )
-    sigma = max(float(config.local_orbit_sigma_m), 1.0e-6)
+    sigma = float(config.local_orbit_sigma_m)
     radial_gain = np.exp(-0.5 * (radial_error / sigma) ** 2)
-    distances_3d = np.maximum(
-        np.linalg.norm(candidates[:, None, :] - mode_positions[None, :, :], axis=2),
-        0.25,
+    isotope_count = len(modes_by_isotope)
+    if isotope_count <= 0:
+        raise ValueError("modes_by_isotope must contain configured isotopes.")
+    return (
+        np.sum(radial_gain * mode_weights.reshape(1, -1), axis=1)
+        / float(isotope_count)
     )
-    expected = (
-        float(config.live_time_s)
-        * mode_strengths.reshape(1, -1)
-        / (distances_3d * distances_3d)
-    )
-    saturation = max(float(config.count_utility_saturation_counts), 1.0e-12)
-    visibility = np.clip(1.0 - np.exp(-expected / saturation), 0.0, 1.0)
-    return np.sum(radial_gain * visibility * mode_weights.reshape(1, -1), axis=1)
-
-
-def _station_response_matrix(
-    poses_xyz: NDArray[np.float64],
-    modes: Sequence[SignatureMode],
-    *,
-    live_time_s: float,
-    kernel: ContinuousKernel | None = None,
-    estimator: RotatingShieldPFEstimator | None = None,
-    isotope: str | None = None,
-) -> NDArray[np.float64]:
-    """Return a station-response design matrix for planning."""
-    pose_arr = np.asarray(poses_xyz, dtype=float)
-    if pose_arr.ndim == 1 and pose_arr.size == 3:
-        pose_arr = pose_arr.reshape(1, 3)
-    if pose_arr.ndim != 2 or pose_arr.shape[1] != 3 or not modes:
-        return np.zeros((0, 0), dtype=float)
-    if kernel is not None and estimator is not None and isotope is not None:
-        return _station_response_matrix_from_kernel(
-            pose_arr,
-            modes,
-            live_time_s=live_time_s,
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-    matrix = np.zeros((pose_arr.shape[0], len(modes)), dtype=float)
-    for mode_idx, mode in enumerate(modes):
-        deltas = pose_arr - mode.position_xyz[None, :]
-        distances = np.maximum(np.linalg.norm(deltas, axis=1), 0.25)
-        matrix[:, mode_idx] = (
-            float(live_time_s)
-            * max(float(mode.strength_cps_1m), 0.0)
-            / (distances * distances)
-        )
-    return matrix
-
-
-def _station_response_matrix_from_kernel(
-    pose_arr: NDArray[np.float64],
-    modes: Sequence[SignatureMode],
-    *,
-    live_time_s: float,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    isotope: str,
-) -> NDArray[np.float64]:
-    """Return pair-averaged station responses from the shared PF kernel."""
-    if pose_arr.shape[0] == 0:
-        return np.zeros((0, len(modes)), dtype=float)
-    mode_positions = np.vstack(
-        [np.asarray(mode.position_xyz, dtype=float).reshape(3) for mode in modes]
-    )
-    mode_strengths = np.asarray(
-        [max(float(mode.strength_cps_1m), 0.0) for mode in modes],
-        dtype=float,
-    )
-    num_orients = int(len(getattr(kernel, "orientations", estimator.normals)))
-    num_pairs = max(num_orients, 1) * max(num_orients, 1)
-    source_scales = _response_scales_for_all_pairs(estimator, isotope, num_orients)
-    if source_scales.size != num_pairs:
-        source_scales = np.ones(num_pairs, dtype=float)
-    try:
-        kernel_values = kernel.kernel_values_all_pairs_for_detectors(
-            isotope=isotope,
-            detector_positions=pose_arr,
-            sources=mode_positions,
-        )
-    except RuntimeError:
-        kernel_values = np.stack(
-            [
-                kernel.kernel_values_all_pairs(
-                    isotope=isotope,
-                    detector_pos=pose,
-                    sources=mode_positions,
-                )
-                for pose in pose_arr
-            ],
-            axis=0,
-        )
-    expected_shape = (pose_arr.shape[0], num_pairs, len(modes))
-    if kernel_values.shape != expected_shape:
-        raise ValueError(
-            "shared station response kernel returned shape "
-            f"{kernel_values.shape}, expected {expected_shape}."
-        )
-    pair_counts = np.maximum(kernel_values, 0.0) * np.maximum(
-        source_scales, 0.0
-    ).reshape(1, num_pairs, 1)
-    return np.maximum(
-        float(live_time_s)
-        * np.mean(pair_counts, axis=1)
-        * mode_strengths.reshape(1, -1),
-        0.0,
-    )
-
-
-def _station_condition_logdet(
-    matrix: NDArray[np.float64],
-    *,
-    ridge: float,
-) -> float:
-    """Return a column-normalized D-optimal station-design score."""
-    design = np.maximum(np.asarray(matrix, dtype=float), 0.0)
-    if design.ndim != 2 or design.shape[0] == 0 or design.shape[1] < 2:
-        return 0.0
-    column_norms = np.linalg.norm(design, axis=0)
-    active = column_norms > 1.0e-12
-    if int(np.count_nonzero(active)) < 2:
-        return 0.0
-    normalized = design[:, active] / column_norms[active][None, :]
-    ridge_val = max(float(ridge), 1.0e-12)
-    gram = normalized.T @ normalized + ridge_val * np.eye(
-        int(np.count_nonzero(active)),
-        dtype=float,
-    )
-    sign, logdet = np.linalg.slogdet(gram)
-    if sign <= 0 or not np.isfinite(logdet):
-        return 0.0
-    baseline = float(np.count_nonzero(active)) * float(np.log(ridge_val))
-    return max(float(logdet - baseline), 0.0)
-
-
-def _station_design_quality(
-    matrix: NDArray[np.float64],
-    *,
-    config: DSSPPConfig,
-) -> float:
-    """Return the configured conditioning quality of a response design."""
-    design = np.maximum(np.asarray(matrix, dtype=float), 0.0)
-    if design.ndim != 2 or design.shape[0] == 0 or design.shape[1] < 2:
-        return 0.0
-    column_norms = np.linalg.norm(design, axis=0)
-    active = column_norms > 1.0e-12
-    if int(np.count_nonzero(active)) < 2:
-        return 0.0
-    normalized = design[:, active] / column_norms[active][None, :]
-    gram = normalized.T @ normalized
-    eigvals = np.linalg.eigvalsh(0.5 * (gram + gram.T))
-    eigvals = np.maximum(np.asarray(eigvals, dtype=float), 0.0)
-    if eigvals.size == 0:
-        return 0.0
-    max_eig = max(float(np.max(eigvals)), 1.0e-24)
-    min_eig = max(float(np.min(eigvals)), 0.0)
-    min_singular = float(np.sqrt(min_eig))
-    inverse_condition = 0.0
-    if min_eig > 1.0e-24:
-        inverse_condition = float(np.sqrt(min_eig / max_eig))
-    corr = _max_column_correlation_from_normalized_gram(gram)
-    coherence_quality = 1.0 - float(np.clip(corr, 0.0, 1.0))
-    return float(
-        _station_condition_logdet(
-            design,
-            ridge=float(config.station_condition_ridge),
-        )
-        + float(config.station_condition_min_singular_weight) * min_singular
-        + float(config.station_condition_inverse_condition_weight) * inverse_condition
-        + float(config.station_condition_coherence_weight) * coherence_quality
-    )
-
-
-def _max_column_correlation_from_normalized_gram(
-    gram: NDArray[np.float64],
-) -> float:
-    """Return max off-diagonal coherence from a normalized Gram matrix."""
-    arr = np.asarray(gram, dtype=float)
-    if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[0] != arr.shape[1]:
-        return 1.0
-    corr = np.clip(np.abs(arr.copy()), 0.0, 1.0)
-    np.fill_diagonal(corr, 0.0)
-    return float(np.max(corr))
-
-
-def _station_condition_logdet_batch(
-    *,
-    before_matrix: NDArray[np.float64],
-    candidate_rows: NDArray[np.float64],
-    ridge: float,
-) -> NDArray[np.float64]:
-    """Return station-condition logdet scores after adding each candidate row."""
-    rows = np.maximum(np.asarray(candidate_rows, dtype=float), 0.0)
-    if rows.ndim != 2:
-        raise ValueError("candidate_rows must be shaped (N, M).")
-    if rows.shape[1] < 2 or rows.shape[0] == 0:
-        return np.zeros(rows.shape[0], dtype=float)
-    before = np.maximum(np.asarray(before_matrix, dtype=float), 0.0)
-    if before.ndim != 2 or before.shape[1] != rows.shape[1]:
-        before = np.zeros((0, rows.shape[1]), dtype=float)
-    before_cross = (
-        before.T @ before
-        if before.size
-        else np.zeros((rows.shape[1], rows.shape[1]), dtype=float)
-    )
-    before_norm_sq = (
-        np.sum(before * before, axis=0)
-        if before.size
-        else np.zeros(rows.shape[1], dtype=float)
-    )
-    norm_sq = before_norm_sq.reshape(1, -1) + rows * rows
-    active = norm_sq > 1.0e-24
-    active_counts = np.count_nonzero(active, axis=1)
-    denom = np.sqrt(norm_sq[:, :, None] * norm_sq[:, None, :])
-    cross = before_cross.reshape(1, rows.shape[1], rows.shape[1]) + np.einsum(
-        "ni,nj->nij",
-        rows,
-        rows,
-    )
-    normalized = np.divide(
-        cross,
-        denom,
-        out=np.zeros_like(cross),
-        where=denom > 0.0,
-    )
-    ridge_val = max(float(ridge), 1.0e-12)
-    gram = normalized + ridge_val * np.eye(rows.shape[1], dtype=float).reshape(
-        1,
-        rows.shape[1],
-        rows.shape[1],
-    )
-    signs, logdets = np.linalg.slogdet(gram)
-    baselines = active_counts.astype(float) * float(np.log(ridge_val))
-    scores = np.where(
-        (active_counts >= 2) & (signs > 0.0) & np.isfinite(logdets),
-        logdets - baselines,
-        0.0,
-    )
-    return np.maximum(scores, 0.0)
-
-
-def _station_design_quality_batch(
-    *,
-    before_matrix: NDArray[np.float64],
-    candidate_rows: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return configured conditioning quality after adding candidate rows."""
-    rows = np.maximum(np.asarray(candidate_rows, dtype=float), 0.0)
-    if rows.ndim != 2:
-        raise ValueError("candidate_rows must be shaped (N, M).")
-    if rows.shape[0] == 0:
-        return np.zeros(0, dtype=float)
-    if rows.shape[1] < 2:
-        return np.zeros(rows.shape[0], dtype=float)
-    logdet = _station_condition_logdet_batch(
-        before_matrix=before_matrix,
-        candidate_rows=rows,
-        ridge=float(config.station_condition_ridge),
-    )
-    if (
-        float(config.station_condition_min_singular_weight) <= 0.0
-        and float(config.station_condition_inverse_condition_weight) <= 0.0
-        and float(config.station_condition_coherence_weight) <= 0.0
-    ):
-        return logdet
-    before = np.maximum(np.asarray(before_matrix, dtype=float), 0.0)
-    if before.ndim != 2 or before.shape[1] != rows.shape[1]:
-        before = np.zeros((0, rows.shape[1]), dtype=float)
-    before_cross = (
-        before.T @ before
-        if before.size
-        else np.zeros((rows.shape[1], rows.shape[1]), dtype=float)
-    )
-    before_norm_sq = (
-        np.sum(before * before, axis=0)
-        if before.size
-        else np.zeros(rows.shape[1], dtype=float)
-    )
-    cross = before_cross.reshape(1, rows.shape[1], rows.shape[1]) + np.einsum(
-        "ni,nj->nij",
-        rows,
-        rows,
-    )
-    norm_sq = before_norm_sq.reshape(1, -1) + rows * rows
-    denom = np.sqrt(norm_sq[:, :, None] * norm_sq[:, None, :])
-    normalized = np.divide(
-        cross,
-        denom,
-        out=np.zeros_like(cross, dtype=float),
-        where=denom > 0.0,
-    )
-    eigvals = np.linalg.eigvalsh(0.5 * (normalized + np.swapaxes(normalized, 1, 2)))
-    eigvals = np.maximum(np.asarray(eigvals, dtype=float), 0.0)
-    max_eig = np.maximum(np.max(eigvals, axis=1), 1.0e-24)
-    min_eig = np.maximum(np.min(eigvals, axis=1), 0.0)
-    min_singular = np.sqrt(min_eig)
-    inverse_condition = np.divide(
-        np.sqrt(min_eig),
-        np.sqrt(max_eig),
-        out=np.zeros_like(min_eig, dtype=float),
-        where=min_eig > 1.0e-24,
-    )
-    diag = np.arange(rows.shape[1])
-    coherence_matrix = np.clip(np.abs(normalized), 0.0, 1.0)
-    coherence_matrix[:, diag, diag] = 0.0
-    coherence_quality = 1.0 - np.max(coherence_matrix, axis=(1, 2))
-    active_counts = np.count_nonzero(norm_sq > 1.0e-24, axis=1)
-    quality = (
-        logdet
-        + float(config.station_condition_min_singular_weight) * min_singular
-        + float(config.station_condition_inverse_condition_weight) * inverse_condition
-        + float(config.station_condition_coherence_weight) * coherence_quality
-    )
-    quality[active_counts < 2] = 0.0
-    return np.maximum(np.where(np.isfinite(quality), quality, 0.0), 0.0)
-
-
-def _station_condition_gain(
-    candidate_pose_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    *,
-    config: DSSPPConfig,
-    kernel: ContinuousKernel | None = None,
-    estimator: RotatingShieldPFEstimator | None = None,
-) -> float:
-    """Return the added response-matrix conditioning from one candidate station."""
-    candidate = np.asarray(candidate_pose_xyz, dtype=float).reshape(1, 3)
-    visited = np.zeros((0, 3), dtype=float)
-    if visited_poses_xyz is not None:
-        visited = np.asarray(visited_poses_xyz, dtype=float)
-        if visited.ndim == 1 and visited.size == 3:
-            visited = visited.reshape(1, 3)
-        if visited.ndim != 2 or visited.shape[1] != 3:
-            visited = np.zeros((0, 3), dtype=float)
-    gains: list[float] = []
-    weights: list[float] = []
-    for isotope, modes in modes_by_isotope.items():
-        active = [mode for mode in modes if float(mode.weight) > 0.0]
-        if len(active) < 2:
-            continue
-        before = _station_response_matrix(
-            visited,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        after = _station_response_matrix(
-            np.vstack([visited, candidate]) if visited.size else candidate,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        before_score = _station_design_quality(before, config=config)
-        after_score = _station_design_quality(after, config=config)
-        gains.append(max(after_score - before_score, 0.0))
-        weights.append(float(sum(mode.weight for mode in active)))
-    if not gains:
-        return 0.0
-    weight_arr = _normalise_weights(np.asarray(weights, dtype=float))
-    return float(np.sum(weight_arr * np.asarray(gains, dtype=float)))
-
-
-def _station_condition_gains_batch(
-    candidate_poses_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    *,
-    config: DSSPPConfig,
-    kernel: ContinuousKernel | None = None,
-    estimator: RotatingShieldPFEstimator | None = None,
-) -> NDArray[np.float64]:
-    """Return response-matrix conditioning gains for many candidate stations."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    if candidates.shape[0] == 0:
-        return np.zeros(0, dtype=float)
-    visited = _pose_matrix_or_empty(visited_poses_xyz)
-    gain_rows: list[NDArray[np.float64]] = []
-    weight_values: list[float] = []
-    for isotope, modes in modes_by_isotope.items():
-        active = [mode for mode in modes if float(mode.weight) > 0.0]
-        if len(active) < 2:
-            continue
-        before = _station_response_matrix(
-            visited,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        candidate_rows = _station_response_matrix(
-            candidates,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        before_score = _station_design_quality(before, config=config)
-        after_scores = _station_design_quality_batch(
-            before_matrix=before,
-            candidate_rows=candidate_rows,
-            config=config,
-        )
-        gain_rows.append(np.maximum(after_scores - before_score, 0.0))
-        weight_values.append(float(sum(mode.weight for mode in active)))
-    if not gain_rows:
-        return np.zeros(candidates.shape[0], dtype=float)
-    weights = _normalise_weights(np.asarray(weight_values, dtype=float))
-    stacked = np.vstack(gain_rows)
-    return np.sum(stacked * weights.reshape(-1, 1), axis=0)
-
-
-def _max_column_correlation_from_design(
-    matrix: NDArray[np.float64],
-) -> float:
-    """Return the maximum normalized column correlation of a response design."""
-    design = np.maximum(np.asarray(matrix, dtype=float), 0.0)
-    if design.ndim != 2 or design.shape[0] == 0 or design.shape[1] < 2:
-        return 1.0
-    norm_sq = np.sum(design * design, axis=0)
-    active = norm_sq > 1.0e-24
-    if int(np.count_nonzero(active)) < 2:
-        return 1.0
-    active_design = design[:, active]
-    active_norm_sq = norm_sq[active]
-    cross = active_design.T @ active_design
-    denom = np.sqrt(active_norm_sq[:, None] * active_norm_sq[None, :])
-    corr = np.divide(
-        cross,
-        denom,
-        out=np.zeros_like(cross, dtype=float),
-        where=denom > 0.0,
-    )
-    np.fill_diagonal(corr, 0.0)
-    return float(np.clip(np.max(corr), 0.0, 1.0))
-
-
-def _max_column_correlation_after_candidate_batch(
-    *,
-    before_matrix: NDArray[np.float64],
-    candidate_rows: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return max column correlation after appending each candidate row."""
-    rows = np.maximum(np.asarray(candidate_rows, dtype=float), 0.0)
-    if rows.ndim != 2:
-        raise ValueError("candidate_rows must be shaped (N, M).")
-    if rows.shape[0] == 0:
-        return np.zeros(0, dtype=float)
-    if rows.shape[1] < 2:
-        return np.ones(rows.shape[0], dtype=float)
-    before = np.maximum(np.asarray(before_matrix, dtype=float), 0.0)
-    if before.ndim != 2 or before.shape[1] != rows.shape[1]:
-        before = np.zeros((0, rows.shape[1]), dtype=float)
-    before_cross = (
-        before.T @ before
-        if before.size
-        else np.zeros((rows.shape[1], rows.shape[1]), dtype=float)
-    )
-    before_norm_sq = (
-        np.sum(before * before, axis=0)
-        if before.size
-        else np.zeros(rows.shape[1], dtype=float)
-    )
-    cross = before_cross.reshape(1, rows.shape[1], rows.shape[1]) + np.einsum(
-        "ni,nj->nij",
-        rows,
-        rows,
-    )
-    norm_sq = before_norm_sq.reshape(1, -1) + rows * rows
-    denom = np.sqrt(norm_sq[:, :, None] * norm_sq[:, None, :])
-    corr = np.divide(
-        cross,
-        denom,
-        out=np.zeros_like(cross, dtype=float),
-        where=denom > 0.0,
-    )
-    diagonal = np.arange(rows.shape[1])
-    corr[:, diagonal, diagonal] = 0.0
-    active_counts = np.count_nonzero(norm_sq > 1.0e-24, axis=1)
-    max_corr = np.max(np.clip(corr, 0.0, 1.0), axis=(1, 2))
-    max_corr[active_counts < 2] = 1.0
-    return max_corr
-
-
-def _station_correlation_reduction_gains_batch(
-    candidate_poses_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    *,
-    config: DSSPPConfig,
-    kernel: ContinuousKernel | None = None,
-    estimator: RotatingShieldPFEstimator | None = None,
-) -> NDArray[np.float64]:
-    """Return candidate gains for reducing same-isotope response correlation."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    if candidates.shape[0] == 0:
-        return np.zeros(0, dtype=float)
-    visited = _pose_matrix_or_empty(visited_poses_xyz)
-    gain_rows: list[NDArray[np.float64]] = []
-    weight_values: list[float] = []
-    for isotope, modes in modes_by_isotope.items():
-        active = [mode for mode in modes if float(mode.weight) > 0.0]
-        if len(active) < 2:
-            continue
-        before = _station_response_matrix(
-            visited,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        candidate_rows = _station_response_matrix(
-            candidates,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        before_corr = _max_column_correlation_from_design(before)
-        after_corr = _max_column_correlation_after_candidate_batch(
-            before_matrix=before,
-            candidate_rows=candidate_rows,
-        )
-        gain_rows.append(np.maximum(before_corr - after_corr, 0.0))
-        weight_values.append(float(sum(mode.weight for mode in active)))
-    if not gain_rows:
-        return np.zeros(candidates.shape[0], dtype=float)
-    weights = _normalise_weights(np.asarray(weight_values, dtype=float))
-    stacked = np.vstack(gain_rows)
-    return np.sum(stacked * weights.reshape(-1, 1), axis=0)
-
-
-def _isotope_balance_gains_batch(
-    candidate_poses_xyz: NDArray[np.float64],
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    *,
-    config: DSSPPConfig,
-    kernel: ContinuousKernel | None = None,
-    estimator: RotatingShieldPFEstimator | None = None,
-) -> NDArray[np.float64]:
-    """Return gains that favor stations observing every modeled isotope."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    if candidates.shape[0] == 0:
-        return np.zeros(0, dtype=float)
-    utility_rows: list[NDArray[np.float64]] = []
-    saturation = max(float(config.count_utility_saturation_counts), 1.0e-12)
-    for isotope, modes in modes_by_isotope.items():
-        active = [mode for mode in modes if float(mode.weight) > 0.0]
-        if not active:
-            continue
-        response = _station_response_matrix(
-            candidates,
-            active,
-            live_time_s=float(config.live_time_s),
-            kernel=kernel,
-            estimator=estimator,
-            isotope=isotope,
-        )
-        mode_weights = _normalise_weights(
-            np.asarray([float(mode.weight) for mode in active], dtype=float)
-        )
-        expected = np.sum(response * mode_weights.reshape(1, -1), axis=1)
-        utility_rows.append(1.0 - np.exp(-np.maximum(expected, 0.0) / saturation))
-    if not utility_rows:
-        return np.zeros(candidates.shape[0], dtype=float)
-    utilities = np.clip(np.vstack(utility_rows), 0.0, 1.0)
-    weakest = np.min(utilities, axis=0)
-    mean_utility = np.mean(utilities, axis=0)
-    return np.clip(0.75 * weakest + 0.25 * mean_utility, 0.0, 1.0)
 
 
 def _elevation_condition_gains_batch(
@@ -3720,7 +3460,7 @@ def _elevation_condition_gains_batch(
     gains = np.zeros(candidates.shape[0], dtype=float)
     if candidates.shape[0] == 0:
         return gains
-    threshold = np.deg2rad(max(float(config.elevation_angle_threshold_deg), 1.0e-6))
+    threshold = np.deg2rad(float(config.elevation_angle_threshold_deg))
     isotope_weight_values: list[float] = []
     isotope_gain_rows: list[NDArray[np.float64]] = []
     for modes in modes_by_isotope.values():
@@ -3750,674 +3490,38 @@ def _elevation_condition_gains_batch(
             1.0e-12,
         )
         isotope_gain_rows.append(row)
-        isotope_weight_values.append(float(sum(mode.weight for mode in active)))
+        isotope_weight_values.append(
+            float(_isotope_presence_probability(active) or 0.0)
+        )
     if not isotope_gain_rows:
         return gains
-    isotope_weights = _normalise_weights(np.asarray(isotope_weight_values, dtype=float))
-    stacked = np.vstack(isotope_gain_rows)
-    return np.sum(stacked * isotope_weights.reshape(-1, 1), axis=0)
-
-
-def _environment_log_attenuation_values(
-    *,
-    kernel: ContinuousKernel,
-    isotope: str,
-    modes: Sequence[SignatureMode],
-    pose_xyz: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return obstacle-only log-transmission values for posterior modes."""
-    pose = np.asarray(pose_xyz, dtype=float).reshape(3)
-    values = [
-        kernel.obstacle_log_attenuation_pair(
-            isotope=isotope,
-            source_pos=mode.position_xyz,
-            detector_pos=pose,
-        )
-        for mode in modes
-    ]
-    return np.asarray(values, dtype=float)
-
-
-def _environment_signature_score(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> float:
-    """Return obstacle-only separation between currently confusable modes."""
-    if kernel.obstacle_boxes_m().size == 0:
-        return 0.0
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    threshold = max(float(config.environment_contrast_threshold), 1.0e-12)
-    total = 0.0
-    for isotope in estimator.isotopes:
-        modes = [
-            mode
-            for mode in modes_by_isotope.get(isotope, [])
-            if float(mode.weight) > 0.0
-        ]
-        if len(modes) < 2:
-            continue
-        values = _environment_log_attenuation_values(
-            kernel=kernel,
-            isotope=isotope,
-            modes=modes,
-            pose_xyz=pose_xyz,
-        )
-        weights = _normalise_weights(
-            np.asarray([mode.weight for mode in modes], dtype=float)
-        )
-        pair_score = 0.0
-        pair_weight_sum = 0.0
-        for left_idx in range(values.size):
-            for right_idx in range(left_idx + 1, values.size):
-                pair_weight = float(
-                    np.sqrt(max(weights[left_idx] * weights[right_idx], 0.0))
-                )
-                if pair_weight <= 0.0:
-                    continue
-                contrast = abs(float(values[left_idx] - values[right_idx]))
-                pair_score += pair_weight * min(contrast / threshold, 1.0)
-                pair_weight_sum += pair_weight
-        if pair_weight_sum <= 0.0:
-            continue
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        total += isotope_weight * float(pair_score / pair_weight_sum)
-    return max(float(total), 0.0)
-
-
-def _environment_signature_scores_batch(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    poses_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return obstacle signature separation for many candidate detector poses."""
-    poses = np.asarray(poses_xyz, dtype=float)
-    if poses.ndim != 2 or poses.shape[1] != 3:
-        raise ValueError("poses_xyz must be shaped (N, 3).")
-    scores = np.zeros(poses.shape[0], dtype=float)
-    boxes = kernel.obstacle_boxes_m()
-    if boxes.size == 0 or poses.shape[0] == 0:
-        return scores
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    threshold = max(float(config.environment_contrast_threshold), 1.0e-12)
-    for isotope in estimator.isotopes:
-        modes = [
-            mode
-            for mode in modes_by_isotope.get(isotope, [])
-            if float(mode.weight) > 0.0
-        ]
-        if len(modes) < 2:
-            continue
-        sources = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float) for mode in modes]
-        )
-        values = kernel.obstacle_log_attenuation_matrix(
-            isotope=isotope,
-            sources_xyz=sources,
-            detector_poses_xyz=poses,
-        )
-        weights = _normalise_weights(
-            np.asarray([mode.weight for mode in modes], dtype=float)
-        )
-        left, right = np.triu_indices(values.shape[1], k=1)
-        if left.size == 0:
-            continue
-        pair_weights = np.sqrt(np.maximum(weights[left] * weights[right], 0.0))
-        valid = pair_weights > 0.0
-        if not np.any(valid):
-            continue
-        left = left[valid]
-        right = right[valid]
-        pair_weights = pair_weights[valid]
-        contrast = np.abs(values[:, left] - values[:, right])
-        pair_scores = np.sum(
-            np.minimum(contrast / threshold, 1.0) * pair_weights.reshape(1, -1),
-            axis=1,
-        ) / max(float(np.sum(pair_weights)), 1.0e-12)
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        scores += isotope_weight * pair_scores
-    return np.maximum(scores, 0.0)
-
-
-def _vertical_environment_signature_scores_batch(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    poses_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return obstacle attenuation contrast for vertically ambiguous modes."""
-    poses = np.asarray(poses_xyz, dtype=float)
-    if poses.ndim != 2 or poses.shape[1] != 3:
-        raise ValueError("poses_xyz must be shaped (N, 3).")
-    scores = np.zeros(poses.shape[0], dtype=float)
-    boxes = kernel.obstacle_boxes_m()
-    if boxes.size == 0 or poses.shape[0] == 0:
-        return scores
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    threshold = max(float(config.environment_contrast_threshold), 1.0e-12)
-    for isotope in estimator.isotopes:
-        modes = [
-            mode
-            for mode in modes_by_isotope.get(isotope, [])
-            if float(mode.weight) > 0.0
-        ]
-        if len(modes) < 2:
-            continue
-        weights = _normalise_weights(
-            np.asarray([float(mode.weight) for mode in modes], dtype=float)
-        )
-        left, right, pair_weights = _elevation_pair_indices_and_weights(
-            modes,
-            weights,
-            config=config,
-        )
-        if left.size == 0:
-            continue
-        sources = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float) for mode in modes]
-        )
-        values = kernel.obstacle_log_attenuation_matrix(
-            isotope=isotope,
-            sources_xyz=sources,
-            detector_poses_xyz=poses,
-        )
-        contrast = np.abs(values[:, left] - values[:, right])
-        pair_scores = np.minimum(contrast / threshold, 1.0)
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        scores += (
-            isotope_weight
-            * np.sum(
-                pair_scores * pair_weights.reshape(1, -1),
-                axis=1,
-            )
-            / max(float(np.sum(pair_weights)), 1.0e-12)
-        )
-    return np.maximum(scores, 0.0)
-
-
-def _occlusion_boundary_gain(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> float:
-    """Return a gain for poses near obstacle-shadow transition boundaries."""
-    if kernel.obstacle_boxes_m().size == 0:
-        return 0.0
-    step = max(float(config.occlusion_boundary_step_m), 0.0)
-    if step <= 0.0:
-        return 0.0
-    pose = np.asarray(pose_xyz, dtype=float).reshape(3)
-    offsets = np.asarray(
-        [
-            [0.0, 0.0, 0.0],
-            [step, 0.0, 0.0],
-            [-step, 0.0, 0.0],
-            [0.0, step, 0.0],
-            [0.0, -step, 0.0],
-        ],
-        dtype=float,
+    return _presence_weighted_rows(
+        isotope_gain_rows,
+        isotope_weight_values,
+        population_size=len(modes_by_isotope),
     )
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    threshold = max(float(config.environment_contrast_threshold), 1.0e-12)
-    total = 0.0
-    for isotope in estimator.isotopes:
-        modes = [
-            mode
-            for mode in modes_by_isotope.get(isotope, [])
-            if float(mode.weight) > 0.0
-        ]
-        if not modes:
-            continue
-        mode_gains: list[float] = []
-        mode_weights: list[float] = []
-        for mode in modes:
-            values = [
-                kernel.obstacle_log_attenuation_pair(
-                    isotope=isotope,
-                    source_pos=mode.position_xyz,
-                    detector_pos=pose + offset,
-                )
-                for offset in offsets
-            ]
-            spread = max(values) - min(values)
-            mode_gains.append(min(float(spread) / threshold, 1.0))
-            mode_weights.append(float(mode.weight))
-        if not mode_gains:
-            continue
-        weights = _normalise_weights(np.asarray(mode_weights, dtype=float))
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        total += isotope_weight * float(
-            np.sum(weights * np.asarray(mode_gains, dtype=float))
-        )
-    return max(float(total), 0.0)
-
-
-def _occlusion_boundary_gains_batch(
-    *,
-    kernel: ContinuousKernel,
-    estimator: RotatingShieldPFEstimator,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    poses_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> NDArray[np.float64]:
-    """Return obstacle-boundary gains for many candidate detector poses."""
-    poses = np.asarray(poses_xyz, dtype=float)
-    if poses.ndim != 2 or poses.shape[1] != 3:
-        raise ValueError("poses_xyz must be shaped (N, 3).")
-    gains = np.zeros(poses.shape[0], dtype=float)
-    boxes = kernel.obstacle_boxes_m()
-    if boxes.size == 0 or poses.shape[0] == 0:
-        return gains
-    step = max(float(config.occlusion_boundary_step_m), 0.0)
-    if step <= 0.0:
-        return gains
-    offsets = np.asarray(
-        [
-            [0.0, 0.0, 0.0],
-            [step, 0.0, 0.0],
-            [-step, 0.0, 0.0],
-            [0.0, step, 0.0],
-            [0.0, -step, 0.0],
-        ],
-        dtype=float,
-    )
-    offset_poses = (poses[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
-    isotope_weights = estimator.pf_config.alpha_weights or {
-        isotope: 1.0 for isotope in estimator.isotopes
-    }
-    alpha_sum = sum(float(value) for value in isotope_weights.values()) or 1.0
-    threshold = max(float(config.environment_contrast_threshold), 1.0e-12)
-    for isotope in estimator.isotopes:
-        modes = [
-            mode
-            for mode in modes_by_isotope.get(isotope, [])
-            if float(mode.weight) > 0.0
-        ]
-        if not modes:
-            continue
-        sources = np.vstack(
-            [np.asarray(mode.position_xyz, dtype=float) for mode in modes]
-        )
-        values = kernel.obstacle_log_attenuation_matrix(
-            isotope=isotope,
-            sources_xyz=sources,
-            detector_poses_xyz=offset_poses,
-        )
-        values = values.reshape(poses.shape[0], offsets.shape[0], len(modes))
-        spread = np.max(values, axis=1) - np.min(values, axis=1)
-        mode_gains = np.minimum(spread / threshold, 1.0)
-        weights = _normalise_weights(
-            np.asarray([mode.weight for mode in modes], dtype=float)
-        )
-        isotope_weight = float(isotope_weights.get(isotope, 1.0)) / alpha_sum
-        gains += isotope_weight * np.sum(mode_gains * weights.reshape(1, -1), axis=1)
-    return np.maximum(gains, 0.0)
-
-
-def _score_program(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    kernel: ContinuousKernel,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    program: ShieldProgram,
-    config: DSSPPConfig,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> tuple[float, float, float, float, float, float, float, float, float]:
-    """Return scalar components through the standard batched cache path."""
-    pair_cache = _build_pair_signature_cache(
-        kernel=kernel,
-        estimator=estimator,
-        modes_by_isotope=modes_by_isotope,
-        pose_xyz=pose_xyz,
-        config=config,
-    )
-    rows = _score_programs_from_pair_cache(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        modes_by_isotope=modes_by_isotope,
-        programs=[program],
-        config=config,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    return tuple(float(values[0]) for values in rows)  # type: ignore[return-value]
-
-
-def _pairwise_contrast_cover_programs(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    kernel: ContinuousKernel,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]] | None = None,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> list[ShieldProgram]:
-    """Build pose-specific pairwise-cover programs from all shield pairs."""
-    if (
-        float(config.lambda_signature) <= 0.0
-        and float(config.lambda_temporal_separation) <= 0.0
-        and float(config.lambda_elevation_signature) <= 0.0
-    ):
-        return []
-    max_programs = max(0, int(config.temporal_cover_programs))
-    if max_programs <= 0:
-        return []
-    has_multi_mode = any(len(modes) >= 2 for modes in modes_by_isotope.values())
-    if not has_multi_mode:
-        return []
-    num_orients = int(estimator.num_orientations)
-    program_length = max(1, int(config.program_length))
-    all_pairs = tuple(range(num_orients * num_orients))
-    beam_width = max(1, int(config.temporal_cover_beam_width))
-    if pair_cache is None:
-        pair_cache = _build_pair_signature_cache(
-            kernel=kernel,
-            estimator=estimator,
-            modes_by_isotope=modes_by_isotope,
-            pose_xyz=pose_xyz,
-            config=config,
-        )
-    beam: list[tuple[tuple[int, ...], float]] = [(tuple(), 0.0)]
-    for _ in range(program_length):
-        candidate_sequences: list[tuple[int, ...]] = []
-        for prefix, _score in beam:
-            used = set(prefix)
-            candidate_sequences.extend(
-                tuple(prefix + (int(pair_id),))
-                for pair_id in all_pairs
-                if int(pair_id) not in used
-            )
-        if not candidate_sequences:
-            break
-        if pair_cache is not None:
-            candidate_programs = [
-                ShieldProgram(
-                    name="pairwise_contrast_probe",
-                    pair_ids=sequence,
-                    kind="pairwise_contrast_cover",
-                )
-                for sequence in candidate_sequences
-            ]
-            signature_scores, temporal_scores, elevation_scores, _, _, _, _, _ = (
-                _score_programs_from_pair_cache(
-                    estimator=estimator,
-                    pair_cache=pair_cache,
-                    modes_by_isotope=modes_by_isotope,
-                    programs=candidate_programs,
-                    config=config,
-                    future_statistics=future_statistics,
-                    pose_index=pose_index,
-                )
-            )
-            objective_scores = _pairwise_cover_objective(
-                signature_scores,
-                temporal_scores,
-                elevation_scores,
-                config=config,
-            )
-        else:
-            objective_values: list[float] = []
-            for sequence in candidate_sequences:
-                program = ShieldProgram(
-                    name="pairwise_contrast_probe",
-                    pair_ids=sequence,
-                    kind="pairwise_contrast_cover",
-                )
-                score_row = _score_program(
-                    estimator=estimator,
-                    kernel=kernel,
-                    modes_by_isotope=modes_by_isotope,
-                    pose_xyz=pose_xyz,
-                    program=program,
-                    config=config,
-                    future_statistics=future_statistics,
-                    pose_index=pose_index,
-                )
-                objective_score = float(
-                    _pairwise_cover_objective(
-                        np.asarray([score_row[0]], dtype=float),
-                        np.asarray([score_row[1]], dtype=float),
-                        np.asarray([score_row[2]], dtype=float),
-                        config=config,
-                    )[0]
-                )
-                objective_values.append(objective_score)
-            objective_scores = np.asarray(objective_values, dtype=float)
-        finite = np.isfinite(objective_scores) & (objective_scores > 0.0)
-        if not np.any(finite):
-            break
-        valid_indices = np.flatnonzero(finite)
-        order = valid_indices[np.argsort(objective_scores[valid_indices])[::-1]]
-        next_beam: list[tuple[tuple[int, ...], float]] = []
-        seen: set[tuple[int, ...]] = set()
-        for idx in order:
-            sequence = candidate_sequences[int(idx)]
-            if sequence in seen:
-                continue
-            seen.add(sequence)
-            next_beam.append((sequence, float(objective_scores[int(idx)])))
-            if len(next_beam) >= beam_width:
-                break
-        beam = next_beam
-        if not beam:
-            break
-    ranked = [
-        (sequence, score)
-        for sequence, score in beam
-        if sequence and np.isfinite(score) and float(score) > 0.0
-    ]
-    ranked.sort(key=lambda item: float(item[1]), reverse=True)
-    return [
-        ShieldProgram(
-            name=f"pairwise_contrast_cover_{rank + 1}_{len(sequence)}",
-            pair_ids=tuple(sequence),
-            kind="pairwise_contrast_cover",
-        )
-        for rank, (sequence, _score) in enumerate(ranked[:max_programs])
-    ]
-
-
-def _greedy_pairwise_contrast_program(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    kernel: ContinuousKernel,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    config: DSSPPConfig,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]] | None = None,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> ShieldProgram | None:
-    """Build the best pose-specific pairwise-cover shield program."""
-    programs = _pairwise_contrast_cover_programs(
-        estimator=estimator,
-        kernel=kernel,
-        modes_by_isotope=modes_by_isotope,
-        pose_xyz=pose_xyz,
-        config=config,
-        pair_cache=pair_cache,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    if not programs:
-        return None
-    return programs[0]
-
-
-def _batch_program_score_rows(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]],
-    modes_by_isotope: dict[str, list[SignatureMode]] | None = None,
-    programs: Sequence[ShieldProgram],
-    config: DSSPPConfig,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> list[tuple[float, float, float, float, float, float, float, float]]:
-    """Return program score tuples in the same order as the input programs."""
-    (
-        signature_scores,
-        temporal_scores,
-        elevation_scores,
-        observation_penalties,
-        count_balance_penalties,
-        differential_penalties,
-        dose_scores,
-        count_utilities,
-    ) = _score_programs_from_pair_cache(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        modes_by_isotope=modes_by_isotope,
-        programs=programs,
-        config=config,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    return [
-        (
-            float(signature_scores[index]),
-            float(temporal_scores[index]),
-            float(elevation_scores[index]),
-            float(observation_penalties[index]),
-            float(count_balance_penalties[index]),
-            float(differential_penalties[index]),
-            float(dose_scores[index]),
-            float(count_utilities[index]),
-        )
-        for index in range(len(programs))
-    ]
-
-
-def _programs_for_pose(
-    *,
-    estimator: RotatingShieldPFEstimator,
-    kernel: ContinuousKernel,
-    modes_by_isotope: dict[str, list[SignatureMode]],
-    pose_xyz: NDArray[np.float64],
-    base_programs: Sequence[ShieldProgram],
-    config: DSSPPConfig,
-    include_pose_specific_cover: bool = True,
-    pair_cache: dict[str, tuple[NDArray[np.float64], list[float]]] | None = None,
-    future_statistics: _SignatureFutureStatisticsBatch | None = None,
-    pose_index: int = 0,
-) -> list[ShieldProgram]:
-    """Return base programs plus pose-specific temporal-code programs."""
-    programs = list(base_programs)
-    if not include_pose_specific_cover:
-        return programs
-    cover_programs = _pairwise_contrast_cover_programs(
-        estimator=estimator,
-        kernel=kernel,
-        modes_by_isotope=modes_by_isotope,
-        pose_xyz=pose_xyz,
-        config=config,
-        pair_cache=pair_cache,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    if not cover_programs:
-        return programs
-    seen = {tuple(program.pair_ids) for program in programs}
-    for cover_program in cover_programs:
-        key = tuple(cover_program.pair_ids)
-        if key not in seen:
-            seen.add(key)
-            programs.append(cover_program)
-    return programs
 
 
 def _static_station_program_score(
     *,
-    signature_score: float,
-    temporal_separation_score: float,
-    elevation_signature_score: float,
-    count_utility: float,
-    count_balance_penalty: float,
-    differential_penalty: float,
-    dose_score: float,
     coverage_norm: float,
     revisit_penalty: float,
     bearing_gain: float,
     frontier_gain: float,
     turn_penalty: float,
     local_orbit_gain: float,
-    station_condition_gain: float,
-    correlation_reduction_gain: float,
-    isotope_balance_gain: float,
-    environment_signature_score: float,
-    occlusion_boundary_gain: float,
     elevation_condition_gain: float,
-    vertical_environment_signature_score: float,
-    remaining_route_pressure: float,
-    remaining_route_penalty: float,
-    remaining_route_gain: float,
     coverage_floor: float,
     config: DSSPPConfig,
 ) -> float:
-    """Return the non-transition score for one station-program pair."""
+    """Return geometry, route, and coverage utility without count reuse."""
     return float(
-        float(config.lambda_signature) * float(np.log1p(max(signature_score, 0.0)))
-        + float(config.lambda_temporal_separation)
-        * float(np.log1p(max(temporal_separation_score, 0.0)))
-        + float(config.lambda_elevation_signature)
-        * float(np.log1p(max(elevation_signature_score, 0.0)))
-        + float(config.lambda_coverage) * float(coverage_norm)
+        float(config.lambda_coverage) * float(coverage_norm)
         + float(config.lambda_bearing_diversity) * float(bearing_gain)
         + float(config.lambda_frontier) * float(frontier_gain)
-        + float(config.lambda_count_utility) * float(count_utility)
         + float(config.lambda_local_orbit) * float(local_orbit_gain)
-        + float(config.lambda_station_condition)
-        * float(np.log1p(max(station_condition_gain, 0.0)))
-        + float(config.lambda_correlation_reduction)
-        * float(np.log1p(max(correlation_reduction_gain, 0.0)))
-        + float(config.lambda_isotope_balance) * float(isotope_balance_gain)
         + float(config.lambda_elevation_condition)
         * float(np.log1p(max(elevation_condition_gain, 0.0)))
-        + float(config.lambda_environment_signature)
-        * _normalized_environment_signature_score(
-            environment_signature_score,
-            config=config,
-        )
-        + float(config.lambda_vertical_environment_signature)
-        * _normalized_environment_signature_score(
-            vertical_environment_signature_score,
-            config=config,
-        )
-        + float(config.lambda_occlusion_boundary)
-        * float(np.log1p(max(occlusion_boundary_gain, 0.0)))
-        + float(config.remaining_route_weight)
-        * float(remaining_route_pressure)
-        * (float(remaining_route_gain) - float(remaining_route_penalty))
-        - float(config.lambda_dose) * float(dose_score)
-        - float(config.eta_count_balance) * float(count_balance_penalty)
-        - float(config.eta_differential) * float(differential_penalty)
         - float(config.eta_revisit) * float(revisit_penalty)
         - float(config.lambda_turn_smoothness) * float(turn_penalty)
         - float(config.coverage_floor_weight)
@@ -4425,52 +3529,15 @@ def _static_station_program_score(
     )
 
 
-def _normalized_environment_signature_score(
-    score: float | NDArray[np.float64],
-    *,
-    config: DSSPPConfig,
-) -> float | NDArray[np.float64]:
-    """
-    Return a clipped 0..1 obstacle-signature score for weak planner biasing.
-
-    The raw obstacle signature can be very large near occlusion boundaries.  The
-    planner should treat it as a bounded tie-breaker, not as a replacement for
-    count observability, shield-signature separation, or traversability costs.
-    """
-    raw = np.log1p(np.maximum(np.asarray(score, dtype=float), 0.0))
-    clip = max(float(config.environment_signature_score_clip), 1.0e-12)
-    denom = max(float(np.log1p(clip)), 1.0e-12)
-    normalized = np.clip(raw / denom, 0.0, 1.0)
-    if np.ndim(score) == 0:
-        return float(normalized)
-    return normalized
-
-
 def _evaluate_pose_index_from_context(
     pose_index_value: int,
-) -> tuple[int, float, list[tuple[Any, ...]], list[float], list[float]]:
-    """Evaluate all shield programs for one candidate station from worker context."""
-    context = _DSS_PP_POSE_EVAL_CONTEXT
-    if context is None:
-        raise RuntimeError("DSS-PP pose evaluation context is not initialized.")
+    context: Mapping[str, object],
+) -> tuple[int, float, list[_PendingDSSPPNode]]:
+    """Materialize all program nodes for one already-vectorized station."""
     pose_index = int(pose_index_value)
     candidate_poses = np.asarray(context["candidate_poses"], dtype=float)
     path_lengths = np.asarray(context["path_lengths"], dtype=float)
-    pair_caches_by_pose = cast(
-        list[dict[str, tuple[NDArray[np.float64], list[float]]]],
-        context["pair_caches_by_pose"],
-    )
-    future_statistics = cast(
-        _SignatureFutureStatisticsBatch,
-        context["signature_future_statistics"],
-    )
     programs = cast(Sequence[ShieldProgram], context["programs"])
-    estimator = cast(RotatingShieldPFEstimator, context["estimator"])
-    kernel = cast(ContinuousKernel, context["kernel"])
-    modes_by_isotope = cast(
-        dict[str, list[SignatureMode]],
-        context["modes_by_isotope"],
-    )
     config = cast(DSSPPConfig, context["config"])
     coverage_norm = np.asarray(context["coverage_norm"], dtype=float)
     coverage_raw = np.asarray(context["coverage_raw"], dtype=float)
@@ -4479,48 +3546,13 @@ def _evaluate_pose_index_from_context(
     frontier_gains = np.asarray(context["frontier_gains"], dtype=float)
     turn_penalties = np.asarray(context["turn_penalties"], dtype=float)
     local_orbit_gains = np.asarray(context["local_orbit_gains"], dtype=float)
-    station_condition_gains = np.asarray(
-        context["station_condition_gains"],
-        dtype=float,
-    )
-    correlation_reduction_gains = np.asarray(
-        context["correlation_reduction_gains"],
-        dtype=float,
-    )
-    isotope_balance_gains = np.asarray(
-        context["isotope_balance_gains"],
-        dtype=float,
-    )
     elevation_condition_gains = np.asarray(
         context["elevation_condition_gains"],
         dtype=float,
     )
-    environment_signature_scores = np.asarray(
-        context["environment_signature_scores"],
-        dtype=float,
-    )
-    vertical_environment_signature_scores = np.asarray(
-        context["vertical_environment_signature_scores"],
-        dtype=float,
-    )
-    occlusion_boundary_gains = np.asarray(
-        context["occlusion_boundary_gains"],
-        dtype=float,
-    )
-    remaining_route_pressure = float(context["remaining_route_pressure"])
-    remaining_route_penalties = np.asarray(
-        context["remaining_route_penalties"],
-        dtype=float,
-    )
-    remaining_route_gains = np.asarray(
-        context["remaining_route_gains"],
-        dtype=float,
-    )
     coverage_floor = float(context["coverage_floor"])
 
-    local_pending: list[tuple[Any, ...]] = []
-    local_scores: list[float] = []
-    local_observation_penalties: list[float] = []
+    local_pending: list[_PendingDSSPPNode] = []
     local_cheap_score = -np.inf
     pose = candidate_poses[pose_index]
     if not np.isfinite(path_lengths[pose_index]):
@@ -4528,155 +3560,57 @@ def _evaluate_pose_index_from_context(
             pose_index,
             local_cheap_score,
             local_pending,
-            local_scores,
-            local_observation_penalties,
         )
-    pair_cache = pair_caches_by_pose[pose_index]
-    pose_programs = _programs_for_pose(
-        estimator=estimator,
-        kernel=kernel,
-        modes_by_isotope=modes_by_isotope,
-        pose_xyz=pose,
-        base_programs=programs,
-        config=config,
-        include_pose_specific_cover=config.forced_program_pair_ids is None,
-        pair_cache=pair_cache,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    program_score_rows = _batch_program_score_rows(
-        estimator=estimator,
-        pair_cache=pair_cache,
-        modes_by_isotope=modes_by_isotope,
-        programs=pose_programs,
-        config=config,
-        future_statistics=future_statistics,
-        pose_index=pose_index,
-    )
-    # Exact joint-view EIG is filled only for the shortlisted poses after all
-    # cheap station-program terms have been evaluated.
-    program_information_gains = np.zeros(len(pose_programs), dtype=float)
-    for program_index, (program, score_row) in enumerate(
-        zip(pose_programs, program_score_rows)
-    ):
-        (
-            signature_score,
-            temporal_separation_score,
-            elevation_signature_score,
-            observation_penalty,
-            count_balance_penalty,
-            differential_penalty,
-            dose_score,
-            count_utility,
-        ) = score_row
+    # Every candidate program is compared by the exact joint EIG below.  The
+    # static term is deliberately restricted to geometry, route, and coverage
+    # so the same prospective counts cannot be scored a second time.
+    for program in programs:
         static_score = _static_station_program_score(
-            signature_score=signature_score,
-            temporal_separation_score=temporal_separation_score,
-            elevation_signature_score=elevation_signature_score,
-            count_utility=count_utility,
-            count_balance_penalty=count_balance_penalty,
-            differential_penalty=differential_penalty,
-            dose_score=dose_score,
             coverage_norm=float(coverage_norm[pose_index]),
             revisit_penalty=float(revisit_penalties[pose_index]),
             bearing_gain=float(bearing_gains[pose_index]),
             frontier_gain=float(frontier_gains[pose_index]),
             turn_penalty=float(turn_penalties[pose_index]),
             local_orbit_gain=float(local_orbit_gains[pose_index]),
-            station_condition_gain=float(station_condition_gains[pose_index]),
-            correlation_reduction_gain=float(correlation_reduction_gains[pose_index]),
-            isotope_balance_gain=float(isotope_balance_gains[pose_index]),
             elevation_condition_gain=float(elevation_condition_gains[pose_index]),
-            environment_signature_score=float(environment_signature_scores[pose_index]),
-            vertical_environment_signature_score=float(
-                vertical_environment_signature_scores[pose_index]
-            ),
-            occlusion_boundary_gain=float(occlusion_boundary_gains[pose_index]),
-            remaining_route_pressure=remaining_route_pressure,
-            remaining_route_penalty=float(remaining_route_penalties[pose_index]),
-            remaining_route_gain=float(remaining_route_gains[pose_index]),
             coverage_floor=coverage_floor,
             config=config,
         )
         local_cheap_score = max(float(local_cheap_score), float(static_score))
-        local_scores.append(static_score)
-        local_observation_penalties.append(observation_penalty)
         local_pending.append(
-            (
-                pose_index,
-                pose.copy(),
-                program,
-                float(program_information_gains[program_index]),
-                signature_score,
-                temporal_separation_score,
-                elevation_signature_score,
-                observation_penalty,
-                count_balance_penalty,
-                differential_penalty,
-                dose_score,
-                count_utility,
-                float(coverage_raw[pose_index]),
-                float(revisit_penalties[pose_index]),
-                float(bearing_gains[pose_index]),
-                float(frontier_gains[pose_index]),
-                float(turn_penalties[pose_index]),
-                float(local_orbit_gains[pose_index]),
-                float(station_condition_gains[pose_index]),
-                float(correlation_reduction_gains[pose_index]),
-                float(isotope_balance_gains[pose_index]),
-                float(elevation_condition_gains[pose_index]),
-                float(environment_signature_scores[pose_index]),
-                float(vertical_environment_signature_scores[pose_index]),
-                float(occlusion_boundary_gains[pose_index]),
-                remaining_route_pressure,
-                float(remaining_route_penalties[pose_index]),
-                float(remaining_route_gains[pose_index]),
+            _PendingDSSPPNode(
+                pose_index=pose_index,
+                pose_xyz=pose.copy(),
+                program=program,
+                static_score=float(static_score),
+                coverage_gain=float(coverage_raw[pose_index]),
+                revisit_penalty=float(revisit_penalties[pose_index]),
+                bearing_diversity_gain=float(bearing_gains[pose_index]),
+                frontier_gain=float(frontier_gains[pose_index]),
+                turn_penalty=float(turn_penalties[pose_index]),
+                local_orbit_gain=float(local_orbit_gains[pose_index]),
+                elevation_condition_gain=float(
+                    elevation_condition_gains[pose_index]
+                ),
             )
         )
     return (
         pose_index,
         local_cheap_score,
         local_pending,
-        local_scores,
-        local_observation_penalties,
     )
 
 
-def _evaluate_pose_indices_parallel(
+def _materialize_pose_nodes(
     eval_indices: Sequence[int],
     *,
     context: dict[str, object],
-    worker_count: int,
-) -> list[tuple[int, float, list[tuple[Any, ...]], list[float], list[float]]]:
-    """Evaluate pose-program scores using process workers when available."""
-    global _DSS_PP_POSE_EVAL_CONTEXT
-    indices = [int(index) for index in eval_indices]
-    previous_context = _DSS_PP_POSE_EVAL_CONTEXT
-    _DSS_PP_POSE_EVAL_CONTEXT = context
-    try:
-        if int(worker_count) <= 1 or len(indices) <= 1:
-            return [_evaluate_pose_index_from_context(index) for index in indices]
-        max_workers = min(len(indices), max(1, int(worker_count)))
-        if os.name == "posix":
-            try:
-                fork_context = mp.get_context("fork")
-                with ProcessPoolExecutor(
-                    max_workers=max_workers,
-                    mp_context=fork_context,
-                ) as executor:
-                    return list(
-                        executor.map(
-                            _evaluate_pose_index_from_context,
-                            indices,
-                            chunksize=1,
-                        )
-                    )
-            except Exception:
-                pass
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(_evaluate_pose_index_from_context, indices))
-    finally:
-        _DSS_PP_POSE_EVAL_CONTEXT = previous_context
+) -> list[tuple[int, float, list[_PendingDSSPPNode]]]:
+    """Materialize nodes after all numerical candidate terms were batched."""
+    return [
+        _evaluate_pose_index_from_context(int(index), context)
+        for index in eval_indices
+    ]
 
 
 def _node_path_length(
@@ -4859,28 +3793,31 @@ def _free_cell_centers(
             max_cells=max_cells,
         )
     traversable_cells = getattr(map_api, "traversable_cells", None)
-    if traversable_cells is not None:
-        cells = [tuple(cell) for cell in traversable_cells]
-    else:
-        is_free_cell = getattr(map_api, "is_free_cell", None)
-        if not callable(is_free_cell):
-            is_free_cell = getattr(map_api, "is_cell_free", None)
-        if not callable(is_free_cell):
-            return np.zeros((0, 3), dtype=float)
-        cells = [
-            (ix, iy)
-            for ix in range(int(grid_shape[0]))
-            for iy in range(int(grid_shape[1]))
-            if bool(is_free_cell((ix, iy)))
-        ]
-    if not cells:
+    if traversable_cells is None:
         return np.zeros((0, 3), dtype=float)
+    raw_cells = np.asarray(tuple(traversable_cells))
+    if raw_cells.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    if (
+        raw_cells.ndim != 2
+        or raw_cells.shape[1] != 2
+        or not np.issubdtype(raw_cells.dtype, np.integer)
+        or np.any(raw_cells < 0)
+    ):
+        raise ValueError(
+            "traversable_cells must be a nonnegative N x 2 integer array."
+        )
+    cells = raw_cells.astype(np.int64, copy=False)
     max_count = max(0, int(max_cells))
-    if max_count > 0 and len(cells) > max_count:
-        indices = np.linspace(0, len(cells) - 1, max_count, dtype=int)
-        cells = [cells[int(idx)] for idx in indices]
-    centers = [_cell_center(map_api, tuple(cell), z_value) for cell in cells]
-    return np.vstack(centers).astype(float)
+    if max_count > 0 and cells.shape[0] > max_count:
+        indices = np.linspace(
+            0,
+            cells.shape[0] - 1,
+            max_count,
+            dtype=np.int64,
+        )
+        cells = cells[indices]
+    return _cell_centers_batch(map_api, cells, z_value)
 
 
 def _bounds_cell_centers(
@@ -4921,15 +3858,17 @@ def _coverage_gain_fraction(
     visited_poses_xyz: NDArray[np.float64] | None,
     radius_m: float,
 ) -> float:
-    """Return newly covered free-space fraction for a candidate station."""
+    """Return newly covered three-dimensional surface-support fraction."""
     centers = np.asarray(cell_centers_xyz, dtype=float)
     if centers.size == 0:
         return 0.0
-    radius = max(float(radius_m), 0.0)
+    radius = float(radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("radius_m must be finite and nonnegative.")
     if radius <= 0.0:
         return 0.0
     candidate = np.asarray(candidate_pose_xyz, dtype=float).reshape(3)
-    candidate_dist = np.linalg.norm(centers[:, :2] - candidate[None, :2], axis=1)
+    candidate_dist = np.linalg.norm(centers - candidate[None, :], axis=1)
     candidate_covered = candidate_dist <= radius
     if not np.any(candidate_covered):
         return 0.0
@@ -4940,7 +3879,7 @@ def _coverage_gain_fraction(
             visited = visited.reshape(1, 3)
         if visited.ndim == 2 and visited.shape[1] == 3 and visited.size:
             visited_dist = np.linalg.norm(
-                centers[:, None, :2] - visited[None, :, :2],
+                centers[:, None, :] - visited[None, :, :],
                 axis=2,
             )
             visited_covered = np.min(visited_dist, axis=1) <= radius
@@ -4949,58 +3888,21 @@ def _coverage_gain_fraction(
 
 
 def _pose_matrix_or_empty(poses_xyz: NDArray[np.float64] | None) -> NDArray[np.float64]:
-    """Return poses as an N x 3 array or an empty array if invalid."""
+    """Return finite poses as an N x 3 array or an empty absent history."""
     if poses_xyz is None:
         return np.zeros((0, 3), dtype=float)
     poses = np.asarray(poses_xyz, dtype=float)
     if poses.ndim == 1 and poses.size == 3:
         poses = poses.reshape(1, 3)
-    if poses.ndim != 2 or poses.shape[1] != 3 or poses.size == 0:
+    if poses.ndim == 2 and poses.shape == (0, 3):
         return np.zeros((0, 3), dtype=float)
+    if (
+        poses.ndim != 2
+        or poses.shape[1] != 3
+        or np.any(~np.isfinite(poses))
+    ):
+        raise ValueError("visited_poses_xyz must be finite and shaped (N, 3).")
     return poses
-
-
-def _height_partner_mask_batch(
-    candidate_poses_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    *,
-    reference_pose_xyz: NDArray[np.float64] | None = None,
-    xy_tolerance_m: float = 1.0e-9,
-    z_tolerance_m: float = 1.0e-9,
-    min_z_separation_m: float = 0.0,
-) -> NDArray[np.bool_]:
-    """Return unvisited height mates of the current reference station."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    visited = _pose_matrix_or_empty(visited_poses_xyz)
-    if candidates.shape[0] == 0 or visited.size == 0:
-        return np.zeros(candidates.shape[0], dtype=bool)
-    xy_tolerance = max(float(xy_tolerance_m), 0.0)
-    z_tolerance = max(float(z_tolerance_m), 0.0)
-    min_z_separation = max(float(min_z_separation_m), 0.0)
-    diffs = candidates[:, None, :] - visited[None, :, :]
-    xy_distances = np.linalg.norm(diffs[:, :, :2], axis=2)
-    z_distances = np.abs(diffs[:, :, 2])
-    same_xy = xy_distances <= xy_tolerance
-    same_height = z_distances <= z_tolerance
-    exact_action_visited = np.any(same_xy & same_height, axis=1)
-    reference = (
-        visited[-1]
-        if reference_pose_xyz is None
-        else np.asarray(reference_pose_xyz, dtype=float).reshape(3)
-    )
-    reference_xy_distances = np.linalg.norm(
-        candidates[:, :2] - reference[None, :2],
-        axis=1,
-    )
-    reference_z_distances = np.abs(candidates[:, 2] - reference[2])
-    return (
-        (reference_xy_distances <= xy_tolerance)
-        & (reference_z_distances > z_tolerance)
-        & (reference_z_distances >= min_z_separation)
-        & ~exact_action_visited
-    )
 
 
 def _coverage_gain_fractions_batch(
@@ -5010,26 +3912,28 @@ def _coverage_gain_fractions_batch(
     visited_poses_xyz: NDArray[np.float64] | None,
     radius_m: float,
 ) -> NDArray[np.float64]:
-    """Return newly covered free-space fractions for many candidate stations."""
+    """Return area-sampled 3-D surface coverage gains for candidate stations."""
     centers = np.asarray(cell_centers_xyz, dtype=float)
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     if candidates.ndim != 2 or candidates.shape[1] != 3:
         raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
     if centers.size == 0 or candidates.shape[0] == 0:
         return np.zeros(candidates.shape[0], dtype=float)
-    radius = max(float(radius_m), 0.0)
+    radius = float(radius_m)
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("radius_m must be finite and nonnegative.")
     if radius <= 0.0:
         return np.zeros(candidates.shape[0], dtype=float)
     visited = _pose_matrix_or_empty(visited_poses_xyz)
     visited_covered = np.zeros(centers.shape[0], dtype=bool)
     if visited.size:
         visited_dist = np.linalg.norm(
-            centers[:, None, :2] - visited[None, :, :2],
+            centers[:, None, :] - visited[None, :, :],
             axis=2,
         )
         visited_covered = np.min(visited_dist, axis=1) <= radius
     candidate_dist = np.linalg.norm(
-        candidates[:, None, :2] - centers[None, :, :2],
+        candidates[:, None, :] - centers[None, :, :],
         axis=2,
     )
     newly_covered = (candidate_dist <= radius) & ~visited_covered.reshape(1, -1)
@@ -5038,44 +3942,196 @@ def _coverage_gain_fractions_batch(
     )
 
 
-def _station_revisit_penalty(
-    candidate_pose_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
+def _response_equivalent_surface_coverage_masks(
     *,
-    min_separation_m: float,
-    reference_pose_xyz: NDArray[np.float64] | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
-) -> float:
-    """Return a normalized penalty for selecting a near-visited station."""
-    min_sep = max(float(min_separation_m), 0.0)
-    if min_sep <= 0.0 or visited_poses_xyz is None:
-        return 0.0
-    visited = np.asarray(visited_poses_xyz, dtype=float)
-    if visited.ndim == 1 and visited.size == 3:
-        visited = visited.reshape(1, 3)
-    if visited.ndim != 2 or visited.shape[1] != 3 or visited.size == 0:
-        return 0.0
-    candidate = np.asarray(candidate_pose_xyz, dtype=float).reshape(3)
-    if bool(
-        _height_partner_mask_batch(
-            candidate.reshape(1, 3),
-            visited,
-            reference_pose_xyz=reference_pose_xyz,
-            xy_tolerance_m=height_partner_xy_tolerance_m,
-            z_tolerance_m=height_partner_z_tolerance_m,
-            min_z_separation_m=height_partner_min_z_separation_m,
-        )[0]
-    ):
-        return 0.0
-    min_dist = float(
-        np.min(np.linalg.norm(visited[:, :2] - candidate[None, :2], axis=1))
+    kernel: ContinuousKernel,
+    estimator: RotatingShieldPFEstimator,
+    surface_points_xyz: NDArray[np.float64],
+    candidate_poses_xyz: NDArray[np.float64],
+    reference_radius_m: float,
+) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+    """Return candidate and visited-station surface-coverage masks.
+
+    Coverage is deliberately a shield-independent spatial exploration term:
+    both prospective and visited detector stations use the same finite-detector
+    distance-plus-obstacle response before Fe/Pb attenuation. Shield-specific
+    evidence is evaluated exactly once by the joint full-spectrum EIG. Keeping
+    both sides of this coverage state on the same contract prevents a station
+    from being repeatedly rewarded as "new" merely because its executed shield
+    pair differs from the optimistic candidate calculation.
+    """
+    surfaces = np.asarray(surface_points_xyz, dtype=float)
+    candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    if surfaces.ndim != 2 or surfaces.shape[1] != 3:
+        raise ValueError("surface_points_xyz must be shaped (S, 3).")
+    if candidates.ndim != 2 or candidates.shape[1] != 3:
+        raise ValueError("candidate_poses_xyz must be shaped (C, 3).")
+    isotope_names = tuple(str(value) for value in estimator.isotopes)
+    if not isotope_names:
+        raise ValueError("Surface observability requires configured isotopes.")
+    radius = float(reference_radius_m)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("reference_radius_m must be finite and positive.")
+    detector_radius = float(kernel.detector_radius_m)
+    reference = float(
+        _finite_sphere_geometric_terms_batched(
+            np.zeros((1, 3), dtype=float),
+            np.asarray([[radius, 0.0, 0.0]], dtype=float),
+            detector_radius_m=detector_radius,
+        )[0, 0]
     )
-    if min_dist >= min_sep:
-        return 0.0
-    shortfall = 1.0 - min_dist / max(min_sep, 1e-12)
-    return float(shortfall * shortfall)
+    if not np.isfinite(reference) or reference <= 0.0:
+        raise RuntimeError("Surface observability reference response is invalid.")
+    if surfaces.shape[0] == 0:
+        return (
+            np.zeros((candidates.shape[0], 0), dtype=bool),
+            np.zeros(0, dtype=bool),
+        )
+
+    candidate_pairs = cKDTree(candidates).sparse_distance_matrix(
+        cKDTree(surfaces),
+        max_distance=float(np.nextafter(radius, np.inf)),
+        output_type="coo_matrix",
+    )
+    candidate_rows = np.asarray(candidate_pairs.row, dtype=np.int64)
+    candidate_surface_ids = np.asarray(
+        candidate_pairs.col,
+        dtype=np.int64,
+    )
+    candidate_pair_covered = np.ones(
+        candidate_rows.size,
+        dtype=bool,
+    )
+    for isotope in isotope_names:
+        values = np.asarray(
+            kernel.kernel_values_unshielded_for_detector_source_pairs(
+                isotope=isotope,
+                detector_positions=candidates[candidate_rows],
+                sources=surfaces[candidate_surface_ids],
+            ),
+            dtype=np.float64,
+        ).reshape(-1)
+        if (
+            values.shape != (candidate_rows.size,)
+            or np.any(~np.isfinite(values))
+            or np.any(values < 0.0)
+        ):
+            raise RuntimeError(
+                "Surface observability kernel returned invalid matched "
+                "unshielded values."
+            )
+        candidate_pair_covered &= values >= reference
+    candidate_covered = np.zeros(
+        (candidates.shape[0], surfaces.shape[0]),
+        dtype=bool,
+    )
+    candidate_covered[
+        candidate_rows[candidate_pair_covered],
+        candidate_surface_ids[candidate_pair_covered],
+    ] = True
+
+    records = tuple(estimator.measurements)
+    if not records:
+        acquired_covered = np.zeros(surfaces.shape[0], dtype=bool)
+    else:
+        acquired_detectors = np.unique(
+            np.asarray(
+                [record.detector_position_xyz_m for record in records],
+                dtype=float,
+            ).reshape(-1, 3),
+            axis=0,
+        )
+        if np.any(~np.isfinite(acquired_detectors)):
+            raise ValueError(
+                "Acquired detector positions must contain finite coordinates."
+            )
+        acquired_pairs = cKDTree(acquired_detectors).sparse_distance_matrix(
+            cKDTree(surfaces),
+            max_distance=float(np.nextafter(radius, np.inf)),
+            output_type="coo_matrix",
+        )
+        acquired_rows = np.asarray(acquired_pairs.row, dtype=np.int64)
+        acquired_surface_ids = np.asarray(
+            acquired_pairs.col,
+            dtype=np.int64,
+        )
+        acquired_min_best = np.full(surfaces.shape[0], np.inf, dtype=float)
+        for isotope in isotope_names:
+            isotope_best = np.zeros(surfaces.shape[0], dtype=float)
+            values = np.asarray(
+                kernel.kernel_values_unshielded_for_detector_source_pairs(
+                    isotope=isotope,
+                    detector_positions=acquired_detectors[acquired_rows],
+                    sources=surfaces[acquired_surface_ids],
+                ),
+                dtype=np.float64,
+            ).reshape(-1)
+            if (
+                values.shape != (acquired_rows.size,)
+                or np.any(~np.isfinite(values))
+                or np.any(values < 0.0)
+            ):
+                raise RuntimeError(
+                    "Surface observability kernel returned invalid matched "
+                    "unshielded acquired-station values."
+                )
+            np.maximum.at(
+                isotope_best,
+                acquired_surface_ids,
+                values,
+            )
+            acquired_min_best = np.minimum(
+                acquired_min_best,
+                isotope_best / reference,
+            )
+        acquired_covered = acquired_min_best >= 1.0
+    return candidate_covered, acquired_covered
+
+
+def _response_equivalent_surface_coverage_gains(
+    *,
+    kernel: ContinuousKernel,
+    estimator: RotatingShieldPFEstimator,
+    surface_points_xyz: NDArray[np.float64],
+    surface_area_weights_m2: NDArray[np.float64],
+    candidate_poses_xyz: NDArray[np.float64],
+    reference_radius_m: float,
+) -> NDArray[np.float64]:
+    """Return new physically observable surface-area fractions by candidate."""
+    candidate_covered, acquired_covered = (
+        _response_equivalent_surface_coverage_masks(
+            kernel=kernel,
+            estimator=estimator,
+            surface_points_xyz=surface_points_xyz,
+            candidate_poses_xyz=candidate_poses_xyz,
+            reference_radius_m=reference_radius_m,
+        )
+    )
+    if candidate_covered.shape[1] == 0:
+        return np.zeros(candidate_covered.shape[0], dtype=float)
+    area_weights = np.asarray(
+        surface_area_weights_m2,
+        dtype=np.float64,
+    ).reshape(-1)
+    if (
+        area_weights.shape != (candidate_covered.shape[1],)
+        or np.any(~np.isfinite(area_weights))
+        or np.any(area_weights <= 0.0)
+    ):
+        raise ValueError(
+            "Surface coverage requires one finite positive physical area "
+            "weight per quadrature point."
+        )
+    total_area = float(np.sum(area_weights, dtype=np.float64))
+    if not np.isfinite(total_area) or total_area <= 0.0:
+        raise ValueError("Surface coverage total physical area must be positive.")
+    newly_covered = candidate_covered & ~acquired_covered[None, :]
+    return np.einsum(
+        "cs,s->c",
+        newly_covered,
+        area_weights,
+        optimize=True,
+    ) / total_area
 
 
 def _station_revisit_penalties_batch(
@@ -5083,35 +4139,27 @@ def _station_revisit_penalties_batch(
     visited_poses_xyz: NDArray[np.float64] | None,
     *,
     min_separation_m: float,
-    reference_pose_xyz: NDArray[np.float64] | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
 ) -> NDArray[np.float64]:
     """Return revisit penalties for many candidate stations."""
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
     if candidates.ndim != 2 or candidates.shape[1] != 3:
         raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
     penalties = np.zeros(candidates.shape[0], dtype=float)
-    min_sep = max(float(min_separation_m), 0.0)
+    min_sep = float(min_separation_m)
+    if not np.isfinite(min_sep) or min_sep < 0.0:
+        raise ValueError(
+            "min_separation_m must be finite and nonnegative."
+        )
     visited = _pose_matrix_or_empty(visited_poses_xyz)
     if min_sep <= 0.0 or visited.size == 0 or candidates.shape[0] == 0:
         return penalties
     distances = np.linalg.norm(
-        candidates[:, None, :2] - visited[None, :, :2],
+        candidates[:, None, :] - visited[None, :, :],
         axis=2,
     )
     min_dist = np.min(distances, axis=1)
     shortfall = 1.0 - min_dist / max(min_sep, 1.0e-12)
-    height_partners = _height_partner_mask_batch(
-        candidates,
-        visited,
-        reference_pose_xyz=reference_pose_xyz,
-        xy_tolerance_m=height_partner_xy_tolerance_m,
-        z_tolerance_m=height_partner_z_tolerance_m,
-        min_z_separation_m=height_partner_min_z_separation_m,
-    )
-    active = (min_dist < min_sep) & ~height_partners
+    active = min_dist < min_sep
     penalties[active] = shortfall[active] * shortfall[active]
     return penalties
 
@@ -5168,11 +4216,15 @@ def _bearing_diversity_gain(
                     )
             novelty_gain = float(np.mean(novelty_terms)) if novelty_terms else 0.0
         gains.append(0.5 * float(pair_gain) + 0.5 * float(novelty_gain))
-        weights.append(float(sum(mode.weight for mode in active)))
+        weights.append(float(_isotope_presence_probability(active) or 0.0))
     if not gains:
         return 0.0
-    weight_arr = _normalise_weights(np.asarray(weights, dtype=float))
-    return float(np.sum(weight_arr * np.asarray(gains, dtype=float)))
+    weighted = _presence_weighted_rows(
+        [np.asarray([gain], dtype=float) for gain in gains],
+        weights,
+        population_size=len(modes_by_isotope),
+    )
+    return float(weighted[0])
 
 
 def _bearing_diversity_gains_batch(
@@ -5215,33 +4267,31 @@ def _bearing_diversity_gains_batch(
         if visited.size:
             prior_deltas = visited[:, None, :2] - positions[None, :, :2]
             prior_angles = np.arctan2(prior_deltas[:, :, 1], prior_deltas[:, :, 0])
-            novelty_terms = []
-            for mode_idx in range(len(active)):
-                distances = (
-                    np.abs(
-                        np.arctan2(
-                            np.sin(
-                                candidate_angles[:, mode_idx, None]
-                                - prior_angles[None, :, mode_idx]
-                            ),
-                            np.cos(
-                                candidate_angles[:, mode_idx, None]
-                                - prior_angles[None, :, mode_idx]
-                            ),
-                        )
+            bearing_differences = (
+                candidate_angles[:, :, None]
+                - np.transpose(prior_angles, (1, 0))[None, :, :]
+            )
+            distances = (
+                np.abs(
+                    np.arctan2(
+                        np.sin(bearing_differences),
+                        np.cos(bearing_differences),
                     )
-                    / np.pi
                 )
-                novelty_terms.append(np.min(distances, axis=1))
-            if novelty_terms:
-                novelty_gain = np.mean(np.vstack(novelty_terms), axis=0)
+                / np.pi
+            )
+            novelty_gain = np.mean(np.min(distances, axis=2), axis=1)
         total_gains.append(0.5 * pair_gain + 0.5 * novelty_gain)
-        total_weights.append(float(sum(mode.weight for mode in active)))
+        total_weights.append(
+            float(_isotope_presence_probability(active) or 0.0)
+        )
     if not total_gains:
         return np.zeros(candidates.shape[0], dtype=float)
-    weights = _normalise_weights(np.asarray(total_weights, dtype=float))
-    stacked = np.vstack(total_gains)
-    return np.sum(stacked * weights.reshape(-1, 1), axis=0)
+    return _presence_weighted_rows(
+        total_gains,
+        total_weights,
+        population_size=len(modes_by_isotope),
+    )
 
 
 def _frontier_band_gain(
@@ -5261,7 +4311,7 @@ def _frontier_band_gain(
         return 0.0
     candidate = np.asarray(candidate_pose_xyz, dtype=float).reshape(3)
     nearest = float(
-        np.min(np.linalg.norm(visited[:, :2] - candidate[None, :2], axis=1))
+        np.min(np.linalg.norm(visited - candidate[None, :], axis=1))
     )
     return float(np.exp(-(((nearest - target) / target) ** 2)))
 
@@ -5281,7 +4331,7 @@ def _frontier_band_gains_batch(
     if visited.size == 0 or candidates.shape[0] == 0:
         return np.zeros(candidates.shape[0], dtype=float)
     distances = np.linalg.norm(
-        candidates[:, None, :2] - visited[None, :, :2],
+        candidates[:, None, :] - visited[None, :, :],
         axis=2,
     )
     nearest = np.min(distances, axis=1)
@@ -5304,13 +4354,15 @@ def _route_turn_penalty(
     current = np.asarray(current_pose_xyz, dtype=float).reshape(3)
     if (
         visited.shape[0] >= 2
-        and float(np.linalg.norm(visited[-1, :2] - current[:2])) < 1.0e-6
+        and float(np.linalg.norm(visited[-1] - current)) < 1.0e-6
     ):
         previous = visited[-2]
     else:
         previous = visited[-1]
-    prev_vec = current[:2] - previous[:2]
-    next_vec = np.asarray(candidate_pose_xyz, dtype=float).reshape(3)[:2] - current[:2]
+    prev_vec = current - previous
+    next_vec = (
+        np.asarray(candidate_pose_xyz, dtype=float).reshape(3) - current
+    )
     prev_norm = float(np.linalg.norm(prev_vec))
     next_norm = float(np.linalg.norm(next_vec))
     if prev_norm <= 1.0e-9 or next_norm <= 1.0e-9:
@@ -5337,214 +4389,23 @@ def _route_turn_penalties_batch(
     current = np.asarray(current_pose_xyz, dtype=float).reshape(3)
     if (
         visited.shape[0] >= 2
-        and float(np.linalg.norm(visited[-1, :2] - current[:2])) < 1.0e-6
+        and float(np.linalg.norm(visited[-1] - current)) < 1.0e-6
     ):
         previous = visited[-2]
     else:
         previous = visited[-1]
-    prev_vec = current[:2] - previous[:2]
+    prev_vec = current - previous
     prev_norm = float(np.linalg.norm(prev_vec))
-    next_vecs = candidates[:, :2] - current[None, :2]
+    next_vecs = candidates - current[None, :]
     next_norms = np.linalg.norm(next_vecs, axis=1)
     active = (prev_norm > 1.0e-9) & (next_norms > 1.0e-9)
     if not np.any(active):
         return penalties
-    dots = np.sum(next_vecs[active] * prev_vec.reshape(1, 2), axis=1) / (
+    dots = np.sum(next_vecs[active] * prev_vec.reshape(1, 3), axis=1) / (
         prev_norm * next_norms[active]
     )
     penalties[active] = 0.5 * (1.0 - np.clip(dots, -1.0, 1.0))
     return penalties
-
-
-def _remaining_budget_pressure(config: DSSPPConfig) -> float:
-    """Return a 0..1 route-efficiency pressure from remaining station budget."""
-    if not bool(config.remaining_budget_guidance):
-        return 0.0
-    if float(config.remaining_route_weight) <= 0.0:
-        return 0.0
-    if config.remaining_station_estimate is None:
-        return 0.0
-    remaining = max(0, int(config.remaining_station_estimate))
-    if remaining <= 0:
-        return 0.0
-    urgency = max(1, int(config.remaining_budget_urgency_stations))
-    pressure = (float(urgency) + 1.0 - float(remaining)) / float(urgency)
-    return float(np.clip(pressure, 0.0, 1.0))
-
-
-def _route_regression_penalties_batch(
-    candidate_poses_xyz: NDArray[np.float64],
-    current_pose_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    *,
-    radius_m: float,
-) -> NDArray[np.float64]:
-    """Return penalties for moving back near older visited stations."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    penalties = np.zeros(candidates.shape[0], dtype=float)
-    radius = max(float(radius_m), 1.0e-12)
-    visited = _pose_matrix_or_empty(visited_poses_xyz)
-    if visited.shape[0] <= 1 or candidates.shape[0] == 0:
-        return penalties
-    current = np.asarray(current_pose_xyz, dtype=float).reshape(3)
-    current_dist = np.linalg.norm(visited[:, :2] - current[None, :2], axis=1)
-    older = visited[current_dist > max(0.25 * radius, 1.0e-6)]
-    if older.size == 0:
-        return penalties
-    distances = np.linalg.norm(
-        candidates[:, None, :2] - older[None, :, :2],
-        axis=2,
-    )
-    nearest = np.min(distances, axis=1)
-    active = nearest < radius
-    shortfall = 1.0 - nearest[active] / radius
-    penalties[active] = shortfall * shortfall
-    return penalties
-
-
-def _remaining_route_terms_batch(
-    *,
-    candidate_poses_xyz: NDArray[np.float64],
-    current_pose_xyz: NDArray[np.float64],
-    visited_poses_xyz: NDArray[np.float64] | None,
-    path_lengths: NDArray[np.float64],
-    coverage_norm: NDArray[np.float64],
-    revisit_penalties: NDArray[np.float64],
-    frontier_gains: NDArray[np.float64],
-    turn_penalties: NDArray[np.float64],
-    config: DSSPPConfig,
-) -> tuple[float, NDArray[np.float64], NDArray[np.float64]]:
-    """Return remaining-budget route pressure, penalties, and gains in batch."""
-    candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    pressure = _remaining_budget_pressure(config)
-    if candidates.ndim != 2 or candidates.shape[1] != 3:
-        raise ValueError("candidate_poses_xyz must be shaped (N, 3).")
-    zeros = np.zeros(candidates.shape[0], dtype=float)
-    if pressure <= 0.0 or candidates.shape[0] == 0:
-        return pressure, zeros, zeros
-    nominal_step = max(
-        float(config.min_station_separation_m),
-        float(config.coverage_radius_m),
-        1.0,
-    )
-    remaining = max(1, int(config.remaining_station_estimate or 1))
-    path_arr = np.asarray(path_lengths, dtype=float)
-    distance_penalty = np.divide(
-        path_arr,
-        nominal_step * float(remaining),
-        out=np.zeros_like(path_arr, dtype=float),
-        where=np.isfinite(path_arr),
-    )
-    distance_penalty = np.clip(distance_penalty, 0.0, 2.0)
-    coverage_arr = np.clip(np.asarray(coverage_norm, dtype=float), 0.0, 1.0)
-    backtrack_penalty = _route_regression_penalties_batch(
-        candidates,
-        current_pose_xyz,
-        visited_poses_xyz,
-        radius_m=2.0 * nominal_step,
-    )
-    penalty = (
-        float(config.remaining_route_distance_weight) * distance_penalty
-        + float(config.remaining_route_revisit_weight)
-        * np.asarray(revisit_penalties, dtype=float)
-        + float(config.remaining_route_turn_weight)
-        * np.asarray(turn_penalties, dtype=float)
-        + float(config.remaining_route_backtrack_weight) * backtrack_penalty
-        + float(config.remaining_route_coverage_weight) * (1.0 - coverage_arr)
-    )
-    gain = float(config.remaining_route_coverage_weight) * coverage_arr + float(
-        config.remaining_route_frontier_weight
-    ) * np.asarray(frontier_gains, dtype=float)
-    penalty[~np.isfinite(path_arr)] = np.inf
-    return pressure, np.maximum(penalty, 0.0), np.maximum(gain, 0.0)
-
-
-def _program_evaluation_pose_indices(
-    *,
-    path_lengths: NDArray[np.float64],
-    coverage_norm: NDArray[np.float64],
-    revisit_penalties: NDArray[np.float64],
-    bearing_gains: NDArray[np.float64],
-    frontier_gains: NDArray[np.float64],
-    turn_penalties: NDArray[np.float64],
-    local_orbit_gains: NDArray[np.float64],
-    station_condition_gains: NDArray[np.float64],
-    correlation_reduction_gains: NDArray[np.float64],
-    isotope_balance_gains: NDArray[np.float64],
-    environment_signature_scores: NDArray[np.float64],
-    occlusion_boundary_gains: NDArray[np.float64],
-    elevation_condition_gains: NDArray[np.float64],
-    vertical_environment_signature_scores: NDArray[np.float64],
-    remaining_route_pressure: float,
-    remaining_route_penalties: NDArray[np.float64],
-    remaining_route_gains: NDArray[np.float64],
-    lambda_distance: float,
-    config: DSSPPConfig,
-) -> NDArray[np.int64]:
-    """Return candidate indices that merit full shield-program evaluation."""
-    count = int(path_lengths.size)
-    if count == 0:
-        return np.zeros(0, dtype=np.int64)
-    eig_limit = int(config.eig_candidate_limit or 0)
-    multiplier = max(1, int(config.candidate_preselect_multiplier))
-    target = max(
-        max(1, int(config.candidate_preselect_min)),
-        int(config.beam_width) * multiplier,
-        eig_limit * multiplier if eig_limit > 0 else 0,
-        int(config.max_programs),
-    )
-    if count <= target:
-        return np.arange(count, dtype=np.int64)
-    finite = np.isfinite(path_lengths)
-    if not np.any(finite):
-        return np.zeros(0, dtype=np.int64)
-    finite_lengths = path_lengths[finite]
-    length_scale = max(float(np.max(finite_lengths)), 1.0e-12)
-    cheap_score = (
-        float(config.lambda_coverage) * np.asarray(coverage_norm, dtype=float)
-        + float(config.lambda_bearing_diversity)
-        * np.asarray(bearing_gains, dtype=float)
-        + float(config.lambda_frontier) * np.asarray(frontier_gains, dtype=float)
-        + float(config.lambda_local_orbit) * np.asarray(local_orbit_gains, dtype=float)
-        + float(config.lambda_station_condition)
-        * np.log1p(np.maximum(np.asarray(station_condition_gains, dtype=float), 0.0))
-        + float(config.lambda_correlation_reduction)
-        * np.log1p(
-            np.maximum(np.asarray(correlation_reduction_gains, dtype=float), 0.0)
-        )
-        + float(config.lambda_isotope_balance)
-        * np.asarray(isotope_balance_gains, dtype=float)
-        + float(config.lambda_elevation_condition)
-        * np.log1p(np.maximum(np.asarray(elevation_condition_gains, dtype=float), 0.0))
-        + float(config.lambda_environment_signature)
-        * _normalized_environment_signature_score(
-            environment_signature_scores,
-            config=config,
-        )
-        + float(config.lambda_vertical_environment_signature)
-        * _normalized_environment_signature_score(
-            vertical_environment_signature_scores,
-            config=config,
-        )
-        + float(config.lambda_occlusion_boundary)
-        * np.log1p(np.maximum(np.asarray(occlusion_boundary_gains, dtype=float), 0.0))
-        + float(config.remaining_route_weight)
-        * float(remaining_route_pressure)
-        * (
-            np.asarray(remaining_route_gains, dtype=float)
-            - np.asarray(remaining_route_penalties, dtype=float)
-        )
-        - float(config.eta_revisit) * np.asarray(revisit_penalties, dtype=float)
-        - float(config.lambda_turn_smoothness) * np.asarray(turn_penalties, dtype=float)
-        - float(lambda_distance) * np.asarray(path_lengths, dtype=float) / length_scale
-    )
-    cheap_score[~finite] = -np.inf
-    selected_count = min(count, target)
-    order = np.argsort(cheap_score)[::-1]
-    selected = order[:selected_count]
-    return np.asarray(selected[np.isfinite(cheap_score[selected])], dtype=np.int64)
 
 
 def _filter_station_separation(
@@ -5552,37 +4413,35 @@ def _filter_station_separation(
     visited_poses_xyz: NDArray[np.float64] | None,
     *,
     min_separation_m: float,
-    reference_pose_xyz: NDArray[np.float64] | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
 ) -> tuple[NDArray[np.float64], int]:
-    """Remove near-revisited stations when at least one unvisited option exists."""
-    min_sep = max(float(min_separation_m), 0.0)
+    """Remove every station that violates the generic 3-D separation rule."""
+    min_sep = float(min_separation_m)
+    if not np.isfinite(min_sep) or min_sep < 0.0:
+        raise ValueError(
+            "min_separation_m must be finite and nonnegative."
+        )
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
+    if (
+        candidates.ndim != 2
+        or candidates.shape[1] != 3
+        or np.any(~np.isfinite(candidates))
+    ):
+        raise ValueError(
+            "candidate_poses_xyz must be finite and shaped (N, 3)."
+        )
     if candidates.size == 0 or min_sep <= 0.0 or visited_poses_xyz is None:
         return candidates, 0
-    visited = np.asarray(visited_poses_xyz, dtype=float)
-    if visited.ndim == 1 and visited.size == 3:
-        visited = visited.reshape(1, 3)
-    if visited.ndim != 2 or visited.shape[1] != 3 or visited.size == 0:
+    visited = _pose_matrix_or_empty(visited_poses_xyz)
+    if visited.size == 0:
         return candidates, 0
     distances = np.linalg.norm(
-        candidates[:, None, :2] - visited[None, :, :2],
+        candidates[:, None, :] - visited[None, :, :],
         axis=2,
     )
-    height_partners = _height_partner_mask_batch(
-        candidates,
-        visited,
-        reference_pose_xyz=reference_pose_xyz,
-        xy_tolerance_m=height_partner_xy_tolerance_m,
-        z_tolerance_m=height_partner_z_tolerance_m,
-        min_z_separation_m=height_partner_min_z_separation_m,
-    )
-    keep = (np.min(distances, axis=1) >= min_sep) | height_partners
-    if not np.any(keep):
-        return candidates, 0
+    keep = np.min(distances, axis=1) >= min_sep
     removed = int(np.count_nonzero(~keep))
+    if not np.any(keep):
+        return np.zeros((0, 3), dtype=float), removed
     return candidates[keep], removed
 
 
@@ -5631,7 +4490,7 @@ def _compose_transition_score(
     path_length = _node_path_length(map_api, previous_pose_xyz, node.pose_xyz)
     if not np.isfinite(path_length):
         return -float("inf"), float("inf")
-    travel_time = path_length / max(float(config.robot_speed_m_s), 1e-9)
+    travel_time = path_length / float(config.robot_speed_m_s)
     time_cost = travel_time + len(node.program.pair_ids) * (
         float(config.rotation_overhead_s) + float(config.live_time_s)
     )
@@ -5645,9 +4504,163 @@ def _compose_transition_score(
         - float(node.distance_weight) * float(path_length)
         - float(config.lambda_time) * float(time_cost)
         - float(config.lambda_rotation) * float(rotation_cost)
-        - float(node.observation_penalty_weight) * float(node.observation_penalty)
     )
     return float(score), float(path_length)
+
+
+def _stable_descending_indices(values: NDArray[np.float64]) -> NDArray[np.int64]:
+    """Return deterministic descending indices with source order as tie-break."""
+    scores = np.asarray(values, dtype=np.float64).reshape(-1)
+    if np.any(~np.isfinite(scores)):
+        raise ValueError("Shortlist scores must be finite.")
+    return np.lexsort(
+        (
+            np.arange(scores.size, dtype=np.int64),
+            -scores,
+        )
+    ).astype(np.int64, copy=False)
+
+
+def _exact_eig_shortlist(
+    pending: Sequence[_PendingDSSPPNode],
+    programs: Sequence[ShieldProgram],
+    proxy_information_scores_pp: NDArray[np.float64],
+    *,
+    config: DSSPPConfig,
+) -> tuple[NDArray[np.int64], NDArray[np.float64], dict[str, int]]:
+    """Choose a fixed-budget exact-EIG set with coverage and program reserves."""
+    pending_nodes = list(pending)
+    if not pending_nodes:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.float64),
+            {
+                "global": 0,
+                "coverage": 0,
+                "program_diversity": 0,
+            },
+        )
+    proxy = np.asarray(proxy_information_scores_pp, dtype=np.float64)
+    if (
+        proxy.ndim != 2
+        or proxy.shape[1] != len(programs)
+        or np.any(~np.isfinite(proxy))
+        or np.any(proxy < 0.0)
+    ):
+        raise ValueError("Proxy information scores have an invalid shape.")
+    program_index = {
+        (
+            str(program.name),
+            tuple(int(value) for value in program.pair_ids),
+            str(program.kind),
+        ): index
+        for index, program in enumerate(programs)
+    }
+    if len(program_index) != len(programs):
+        raise ValueError("DSS shield programs must be unique.")
+    ranking_scores = np.zeros(len(pending_nodes), dtype=np.float64)
+    pending_program_indices = np.zeros(len(pending_nodes), dtype=np.int64)
+    for index, item in enumerate(pending_nodes):
+        key = (
+            str(item.program.name),
+            tuple(int(value) for value in item.program.pair_ids),
+            str(item.program.kind),
+        )
+        resolved_program_index = program_index.get(key)
+        if resolved_program_index is None:
+            raise RuntimeError("Pending DSS node references an unknown program.")
+        if int(item.pose_index) < 0 or int(item.pose_index) >= proxy.shape[0]:
+            raise IndexError("Pending DSS node references an unknown pose.")
+        pending_program_indices[index] = int(resolved_program_index)
+        ranking_scores[index] = (
+            float(item.static_score)
+            + float(config.lambda_eig)
+            * float(proxy[int(item.pose_index), int(resolved_program_index)])
+        )
+    limit = min(int(config.exact_eig_action_limit), len(pending_nodes))
+    if limit == len(pending_nodes):
+        return (
+            np.arange(len(pending_nodes), dtype=np.int64),
+            ranking_scores,
+            {
+                "global": int(limit),
+                "coverage": 0,
+                "program_diversity": 0,
+            },
+        )
+    selected: set[int] = set()
+    category_counts = {
+        "global": 0,
+        "coverage": 0,
+        "program_diversity": 0,
+    }
+
+    coverage_candidates: list[int] = []
+    for pose_index in sorted({int(item.pose_index) for item in pending_nodes}):
+        pose_rows = np.asarray(
+            [
+                index
+                for index, item in enumerate(pending_nodes)
+                if int(item.pose_index) == pose_index
+            ],
+            dtype=np.int64,
+        )
+        pose_best = pose_rows[
+            _stable_descending_indices(ranking_scores[pose_rows])[0]
+        ]
+        coverage_candidates.append(int(pose_best))
+    coverage_candidates.sort(
+        key=lambda index: (
+            -float(pending_nodes[index].coverage_gain),
+            -float(ranking_scores[index]),
+            int(index),
+        )
+    )
+    for index in coverage_candidates[
+        : int(config.exact_eig_coverage_reserve)
+    ]:
+        if len(selected) >= limit:
+            break
+        selected.add(int(index))
+        category_counts["coverage"] += 1
+
+    program_candidates: list[int] = []
+    for resolved_program_index in range(len(programs)):
+        program_rows = np.flatnonzero(
+            pending_program_indices == resolved_program_index
+        )
+        if program_rows.size == 0:
+            continue
+        best = program_rows[
+            _stable_descending_indices(ranking_scores[program_rows])[0]
+        ]
+        program_candidates.append(int(best))
+    program_candidates.sort(
+        key=lambda index: (-float(ranking_scores[index]), int(index))
+    )
+    for index in program_candidates[
+        : int(config.exact_eig_program_diversity_reserve)
+    ]:
+        if len(selected) >= limit:
+            break
+        if int(index) not in selected:
+            selected.add(int(index))
+            category_counts["program_diversity"] += 1
+
+    for index_raw in _stable_descending_indices(ranking_scores):
+        if len(selected) >= limit:
+            break
+        index = int(index_raw)
+        if index not in selected:
+            selected.add(index)
+            category_counts["global"] += 1
+    ordered = np.asarray(
+        sorted(selected, key=lambda index: (-ranking_scores[index], index)),
+        dtype=np.int64,
+    )
+    if ordered.size != limit:
+        raise RuntimeError("Exact-EIG shortlist did not fill its fixed budget.")
+    return ordered, ranking_scores, category_counts
 
 
 def _build_nodes(
@@ -5662,14 +4675,13 @@ def _build_nodes(
     map_api: object | None,
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
     config: DSSPPConfig,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
-) -> list[DSSPPNode]:
-    """Evaluate all station-program nodes for the first horizon layer."""
+    rng: np.random.Generator,
+    joint_particles: JointPlanningParticles,
+) -> tuple[list[DSSPPNode], dict[str, object]]:
+    """Shortlist all actions cheaply, then exactly evaluate a fixed subset."""
     kernel = _continuous_kernel_for_estimator(
         estimator,
-        detector_aperture_samples=max(1, int(config.detector_aperture_samples)),
+        detector_aperture_samples=int(config.detector_aperture_samples),
     )
     candidate_poses = np.asarray(candidate_poses_xyz, dtype=float)
     if candidate_poses.ndim != 2 or candidate_poses.shape[1] != 3:
@@ -5680,18 +4692,69 @@ def _build_nodes(
         current_pose_xyz,
         candidate_poses,
     )
-    free_cell_centers = _free_cell_centers(
-        map_api,
-        z_value=float(current_pose_xyz[2]),
-        max_cells=int(config.coverage_grid_max_cells),
-        bounds_xyz=bounds_xyz,
+    surface_quadrature_builder = getattr(
+        estimator,
+        "surface_atlas_area_quadrature",
+        None,
     )
-    coverage_raw = _coverage_gain_fractions_batch(
-        cell_centers_xyz=free_cell_centers,
-        candidate_poses_xyz=candidate_poses,
-        visited_poses_xyz=visited_poses_xyz,
-        radius_m=float(config.coverage_radius_m),
-    )
+    coverage_quadrature_diagnostics: dict[str, object] | None = None
+    if callable(surface_quadrature_builder):
+        surface_quadrature = surface_quadrature_builder(
+            max_points=int(config.coverage_surface_quadrature_max_points),
+            maximum_hausdorff_bound_m=float(
+                config.coverage_surface_max_hausdorff_m
+            ),
+        )
+        surface_coverage_points = np.asarray(
+            surface_quadrature.positions_s3,
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        surface_area_weights_m2 = np.asarray(
+            surface_quadrature.area_weights_m2_s,
+            dtype=np.float64,
+        ).reshape(-1)
+        coverage_raw = _response_equivalent_surface_coverage_gains(
+            kernel=kernel,
+            estimator=estimator,
+            surface_points_xyz=surface_coverage_points,
+            surface_area_weights_m2=surface_area_weights_m2,
+            candidate_poses_xyz=candidate_poses,
+            reference_radius_m=float(config.coverage_radius_m),
+        )
+        diagnostics_getter = getattr(
+            surface_quadrature,
+            "diagnostics",
+            None,
+        )
+        if not callable(diagnostics_getter):
+            raise TypeError(
+                "Surface quadrature must expose completeness diagnostics."
+            )
+        coverage_quadrature_diagnostics = dict(diagnostics_getter())
+        coverage_support = (
+            "complete_chart_center_area_weighted_unshielded_station_coverage"
+        )
+    elif isinstance(estimator, RotatingShieldPFEstimator):
+        raise RuntimeError(
+            "Production DSS coverage requires the PF continuous physical "
+            "surface atlas; an XY/free-cell fallback is forbidden."
+        )
+    else:
+        # A small deterministic oracle remains available only to unit-test
+        # score composition without constructing a production estimator.
+        surface_coverage_points = _free_cell_centers(
+            map_api,
+            z_value=float(current_pose_xyz[2]),
+            max_cells=int(config.coverage_surface_quadrature_max_points),
+            bounds_xyz=bounds_xyz,
+        )
+        coverage_raw = _coverage_gain_fractions_batch(
+            cell_centers_xyz=surface_coverage_points,
+            candidate_poses_xyz=candidate_poses,
+            visited_poses_xyz=visited_poses_xyz,
+            radius_m=float(config.coverage_radius_m),
+        )
+        coverage_support = "test_only_free_cell_fallback_3d"
     coverage_norm = coverage_raw.copy()
     max_coverage = float(np.max(coverage_norm)) if coverage_norm.size else 0.0
     if max_coverage > 0.0:
@@ -5708,17 +4771,13 @@ def _build_nodes(
             coverage_floor = float(
                 np.quantile(
                     positive_coverage,
-                    np.clip(coverage_floor_quantile, 0.0, 1.0),
+                    coverage_floor_quantile,
                 )
             )
     revisit_penalties = _station_revisit_penalties_batch(
         candidate_poses,
         visited_poses_xyz,
         min_separation_m=float(config.min_station_separation_m),
-        reference_pose_xyz=current_pose_xyz,
-        height_partner_xy_tolerance_m=height_partner_xy_tolerance_m,
-        height_partner_z_tolerance_m=height_partner_z_tolerance_m,
-        height_partner_min_z_separation_m=height_partner_min_z_separation_m,
     )
     bearing_gains = _bearing_diversity_gains_batch(
         candidate_poses,
@@ -5744,170 +4803,19 @@ def _build_nodes(
         modes_by_isotope,
         config=config,
     )
-    station_condition_gains = _station_condition_gains_batch(
-        candidate_poses,
-        visited_poses_xyz,
-        modes_by_isotope,
-        config=config,
-        kernel=kernel,
-        estimator=estimator,
-    )
-    correlation_reduction_gains = _station_correlation_reduction_gains_batch(
-        candidate_poses,
-        visited_poses_xyz,
-        modes_by_isotope,
-        config=config,
-        kernel=kernel,
-        estimator=estimator,
-    )
-    isotope_balance_gains = _isotope_balance_gains_batch(
-        candidate_poses,
-        modes_by_isotope,
-        config=config,
-        kernel=kernel,
-        estimator=estimator,
-    )
     elevation_condition_gains = _elevation_condition_gains_batch(
         candidate_poses,
         modes_by_isotope,
         config=config,
     )
-    environment_signature_scores = _environment_signature_scores_batch(
-        kernel=kernel,
-        estimator=estimator,
-        modes_by_isotope=modes_by_isotope,
-        poses_xyz=candidate_poses,
-        config=config,
-    )
-    vertical_environment_signature_scores = (
-        _vertical_environment_signature_scores_batch(
-            kernel=kernel,
-            estimator=estimator,
-            modes_by_isotope=modes_by_isotope,
-            poses_xyz=candidate_poses,
-            config=config,
-        )
-    )
-    occlusion_boundary_gains = _occlusion_boundary_gains_batch(
-        kernel=kernel,
-        estimator=estimator,
-        modes_by_isotope=modes_by_isotope,
-        poses_xyz=candidate_poses,
-        config=config,
-    )
-    (
-        remaining_route_pressure,
-        remaining_route_penalties,
-        remaining_route_gains,
-    ) = _remaining_route_terms_batch(
-        candidate_poses_xyz=candidate_poses,
-        current_pose_xyz=current_pose_xyz,
-        visited_poses_xyz=visited_poses_xyz,
-        path_lengths=path_lengths,
-        coverage_norm=coverage_norm,
-        revisit_penalties=revisit_penalties,
-        frontier_gains=frontier_gains,
-        turn_penalties=turn_penalties,
-        config=config,
-    )
-    finite_path = np.isfinite(path_lengths)
-    if config.lambda_distance is None:
-        lambda_distance = estimate_lambda_cost(
-            -info_gains,
-            path_lengths[finite_path] if np.any(finite_path) else path_lengths,
-            method="range",
-        )
-    else:
-        lambda_distance = float(config.lambda_distance)
-    if bool(config.candidate_preselect_enable):
-        selected_indices = _program_evaluation_pose_indices(
-            path_lengths=path_lengths,
-            coverage_norm=coverage_norm,
-            revisit_penalties=revisit_penalties,
-            bearing_gains=bearing_gains,
-            frontier_gains=frontier_gains,
-            turn_penalties=turn_penalties,
-            local_orbit_gains=local_orbit_gains,
-            station_condition_gains=station_condition_gains,
-            correlation_reduction_gains=correlation_reduction_gains,
-            isotope_balance_gains=isotope_balance_gains,
-            environment_signature_scores=environment_signature_scores,
-            occlusion_boundary_gains=occlusion_boundary_gains,
-            elevation_condition_gains=elevation_condition_gains,
-            vertical_environment_signature_scores=vertical_environment_signature_scores,
-            remaining_route_pressure=remaining_route_pressure,
-            remaining_route_penalties=remaining_route_penalties,
-            remaining_route_gains=remaining_route_gains,
-            lambda_distance=lambda_distance,
-            config=config,
-        )
-        if selected_indices.size:
-            candidate_poses = candidate_poses[selected_indices]
-            info_gains = info_gains[selected_indices]
-            path_lengths = path_lengths[selected_indices]
-            coverage_raw = coverage_raw[selected_indices]
-            coverage_norm = coverage_norm[selected_indices]
-            revisit_penalties = revisit_penalties[selected_indices]
-            bearing_gains = bearing_gains[selected_indices]
-            frontier_gains = frontier_gains[selected_indices]
-            turn_penalties = turn_penalties[selected_indices]
-            local_orbit_gains = local_orbit_gains[selected_indices]
-            station_condition_gains = station_condition_gains[selected_indices]
-            correlation_reduction_gains = correlation_reduction_gains[selected_indices]
-            isotope_balance_gains = isotope_balance_gains[selected_indices]
-            elevation_condition_gains = elevation_condition_gains[selected_indices]
-            environment_signature_scores = environment_signature_scores[
-                selected_indices
-            ]
-            vertical_environment_signature_scores = (
-                vertical_environment_signature_scores[selected_indices]
-            )
-            occlusion_boundary_gains = occlusion_boundary_gains[selected_indices]
-            remaining_route_penalties = remaining_route_penalties[selected_indices]
-            remaining_route_gains = remaining_route_gains[selected_indices]
     evaluation_pose_indices = np.arange(candidate_poses.shape[0], dtype=np.int64)
     raw_nodes: list[DSSPPNode] = []
-    static_scores: list[float] = []
-    observation_penalties: list[float] = []
-    cheap_pose_scores = np.full(candidate_poses.shape[0], -np.inf, dtype=float)
-    pending: list[tuple[Any, ...]] = []
-    planning_particles_by_isotope = cast(
-        dict[str, tuple[Sequence[object], NDArray[np.float64]]],
-        estimator.planning_particles(
-            max_particles=config.planning_particles,
-            method=config.planning_method,
-            rng=np.random.default_rng(config.rng_seed),
-        ),
-    )
-    signature_future_statistics = _signature_future_statistics_for_poses(
-        estimator,
-        candidate_poses,
-        modes_by_isotope,
-        planning_particles_by_isotope,
-        config=config,
-    )
-    pair_caches_by_pose = _build_pair_signature_caches_for_poses(
-        kernel=kernel,
-        estimator=estimator,
-        modes_by_isotope=modes_by_isotope,
-        poses_xyz=candidate_poses,
-        config=config,
-    )
+    pending: list[_PendingDSSPPNode] = []
     eval_indices = [int(idx) for idx in evaluation_pose_indices]
-    worker_cfg = config.program_eval_workers
-    if worker_cfg is None:
-        worker_count = min(len(eval_indices), max(1, os.cpu_count() or 1))
-    else:
-        worker_count = min(len(eval_indices), max(1, int(worker_cfg)))
     pose_eval_context: dict[str, object] = {
         "candidate_poses": candidate_poses,
         "path_lengths": path_lengths,
-        "pair_caches_by_pose": pair_caches_by_pose,
-        "signature_future_statistics": signature_future_statistics,
         "programs": programs,
-        "estimator": estimator,
-        "kernel": kernel,
-        "modes_by_isotope": modes_by_isotope,
         "config": config,
         "coverage_norm": coverage_norm,
         "coverage_raw": coverage_raw,
@@ -5916,71 +4824,158 @@ def _build_nodes(
         "frontier_gains": frontier_gains,
         "turn_penalties": turn_penalties,
         "local_orbit_gains": local_orbit_gains,
-        "station_condition_gains": station_condition_gains,
-        "correlation_reduction_gains": correlation_reduction_gains,
-        "isotope_balance_gains": isotope_balance_gains,
         "elevation_condition_gains": elevation_condition_gains,
-        "environment_signature_scores": environment_signature_scores,
-        "vertical_environment_signature_scores": vertical_environment_signature_scores,
-        "occlusion_boundary_gains": occlusion_boundary_gains,
-        "remaining_route_pressure": float(remaining_route_pressure),
-        "remaining_route_penalties": remaining_route_penalties,
-        "remaining_route_gains": remaining_route_gains,
         "coverage_floor": float(coverage_floor),
+        "coverage_support": coverage_support,
+        "coverage_quadrature": coverage_quadrature_diagnostics,
     }
-    pose_results = _evaluate_pose_indices_parallel(
+    pose_results = _materialize_pose_nodes(
         eval_indices,
         context=pose_eval_context,
-        worker_count=worker_count,
     )
     for (
-        pose_index,
-        local_cheap_score,
+        _pose_index,
+        _local_cheap_score,
         local_pending,
-        local_scores,
-        local_observation_penalties,
     ) in pose_results:
         if local_pending:
-            cheap_pose_scores[int(pose_index)] = max(
-                float(cheap_pose_scores[int(pose_index)]),
-                float(local_cheap_score),
-            )
             pending.extend(local_pending)
-            static_scores.extend(local_scores)
-            observation_penalties.extend(local_observation_penalties)
     if not pending:
-        return []
-    if float(config.lambda_eig) > 0.0:
-        valid_pose_indices = np.flatnonzero(
-            np.isfinite(cheap_pose_scores) & np.isfinite(path_lengths)
+        return [], {
+            "total_action_count": 0,
+            "proxy_action_count": 0,
+            "exact_action_count": 0,
+        }
+    total_action_count = len(pending)
+    proxy_wall_s = 0.0
+    exact_wall_s = 0.0
+    proxy_information_scores = np.zeros(
+        (candidate_poses.shape[0], len(programs)),
+        dtype=np.float64,
+    )
+    shortlist_indices = np.arange(total_action_count, dtype=np.int64)
+    proxy_ranking_scores = np.asarray(
+        [float(item.static_score) for item in pending],
+        dtype=np.float64,
+    )
+    shortlist_category_counts = {
+        "global": int(total_action_count),
+        "coverage": 0,
+        "program_diversity": 0,
+    }
+    proxy_action_count = 0
+    proxy_particle_count = 0
+    proxy_eig_runtime_diagnostics: dict[str, object] = {}
+    exact_eig_runtime_rounds: list[dict[str, object]] = []
+    exact_eig_seed = int(
+        rng.integers(
+            0,
+            np.iinfo(np.int64).max,
+            endpoint=False,
+            dtype=np.int64,
         )
-        eig_limit = config.eig_candidate_limit
-        if eig_limit is None or int(eig_limit) <= 0:
-            selected_pose_indices = valid_pose_indices
-        else:
-            limit = min(int(eig_limit), int(valid_pose_indices.size))
-            order = np.argsort(cheap_pose_scores[valid_pose_indices])[::-1]
-            selected_pose_indices = valid_pose_indices[order[:limit]]
+    )
+    if (
+        float(config.lambda_eig) > 0.0
+        and total_action_count > int(config.exact_eig_action_limit)
+    ):
+        proxy_joint_particles = estimator.planning_joint_particles(
+            max_particles=int(config.proxy_planning_particles),
+            method="top_weight",
+        )
+        proxy_particle_count = int(
+            np.asarray(proxy_joint_particles.weights_n).size
+        )
+        proxy_started = time.perf_counter()
+        proxy_information_scores = (
+            _program_information_proxy_for_poses(
+                estimator,
+                candidate_poses,
+                programs,
+                config=config,
+                joint_particles=proxy_joint_particles,
+                rng=rng,
+                eig_call_seed=exact_eig_seed,
+                diagnostics=proxy_eig_runtime_diagnostics,
+            )
+        )
+        proxy_wall_s = float(time.perf_counter() - proxy_started)
+        proxy_action_count = int(total_action_count)
+        (
+            shortlist_indices,
+            proxy_ranking_scores,
+            shortlist_category_counts,
+        ) = _exact_eig_shortlist(
+            pending,
+            programs,
+            proxy_information_scores,
+            config=config,
+        )
+    initial_indices = (
+        np.asarray(shortlist_indices, dtype=np.int64)
+        if float(config.lambda_eig) > 0.0
+        else np.arange(total_action_count, dtype=np.int64)
+    )
+    proxy_order = _stable_descending_indices(proxy_ranking_scores)
+    remaining_order = proxy_order[
+        ~np.isin(proxy_order, initial_indices, assume_unique=False)
+    ]
+    evaluation_order = np.concatenate((initial_indices, remaining_order))
+    if (
+        np.unique(evaluation_order).size != total_action_count
+        or np.any(evaluation_order < 0)
+        or np.any(evaluation_order >= total_action_count)
+    ):
+        raise RuntimeError("Adaptive exact-EIG ordering lost a DSS action.")
 
+    program_information_gains = np.full(
+        len(pending),
+        np.nan,
+        dtype=np.float64,
+    )
+    evaluated_pending_indices = np.zeros(0, dtype=np.int64)
+
+    def _evaluate_exact_indices(
+        new_indices: NDArray[np.int64],
+    ) -> None:
+        """Evaluate one adaptive action batch under a fixed common RNG stream."""
+        nonlocal exact_wall_s
+        if new_indices.size == 0:
+            return
         pending_indices_by_pose: dict[int, list[int]] = {}
-        for pending_index, item in enumerate(pending):
-            pending_indices_by_pose.setdefault(int(item[0]), []).append(pending_index)
+        for pending_index_raw in new_indices:
+            pending_index = int(pending_index_raw)
+            item = pending[pending_index]
+            pending_indices_by_pose.setdefault(
+                int(item.pose_index),
+                [],
+            ).append(pending_index)
 
-        eig_indices = [int(index) for index in selected_pose_indices]
+        eig_indices = sorted(pending_indices_by_pose)
         batched_programs = [
             [
-                pending[index][2]
+                pending[index].program
                 for index in pending_indices_by_pose.get(pose_index, [])
             ]
             for pose_index in eig_indices
         ]
+        round_diagnostics: dict[str, object] = {}
+        exact_started = time.perf_counter()
         batched_gains = _program_information_gains_for_poses(
             estimator,
             candidate_poses[eig_indices],
             batched_programs,
             config=config,
-            rng_seed=config.rng_seed,
+            rng=rng,
+            joint_particles=joint_particles,
+            diagnostics=round_diagnostics,
+            eig_call_seed=exact_eig_seed,
         )
+        round_wall_s = float(time.perf_counter() - exact_started)
+        exact_wall_s += round_wall_s
+        round_diagnostics["wall_s"] = round_wall_s
+        round_diagnostics["action_count"] = int(new_indices.size)
+        exact_eig_runtime_rounds.append(round_diagnostics)
         eig_results = [
             (
                 pose_index,
@@ -5989,216 +4984,341 @@ def _build_nodes(
             )
             for pose_index, values in zip(eig_indices, batched_gains)
         ]
-        for pose_index, pending_indices, values in eig_results:
+        for _pose_index, pending_indices, values in eig_results:
             if values.size != len(pending_indices):
                 raise RuntimeError(
-                    "Program EIG result does not match the shortlisted programs."
+                    "Program EIG result does not match the evaluated programs."
                 )
-            info_gains[int(pose_index)] = float(np.max(values)) if values.size else 0.0
-            for pending_index, value in zip(pending_indices, values):
-                item = pending[pending_index]
-                pending[pending_index] = (
-                    *item[:3],
-                    float(value),
-                    *item[4:],
-                )
-        static_scores = [
-            float(score) + float(config.lambda_eig) * float(item[3])
-            for score, item in zip(static_scores, pending)
-        ]
-    obs_arr = np.asarray(observation_penalties, dtype=float)
-    feasible_mask = _minimum_observation_feasible_mask(
-        obs_arr,
-        float(config.min_observation_counts),
+            for pending_index, value in zip(
+                pending_indices,
+                values,
+                strict=True,
+            ):
+                program_information_gains[pending_index] = float(value)
+
+    normalized_joint_weights = _normalise_weights(
+        np.asarray(joint_particles.weights_n, dtype=np.float64)
     )
-    if bool(config.enforce_min_observation) and np.any(feasible_mask):
-        keep_indices = [
-            idx for idx, feasible in enumerate(feasible_mask) if bool(feasible)
-        ]
-        pending = [pending[idx] for idx in keep_indices]
-        static_scores = [static_scores[idx] for idx in keep_indices]
-        observation_penalties = [observation_penalties[idx] for idx in keep_indices]
-        obs_arr = np.asarray(observation_penalties, dtype=float)
-    obs_weight = _auto_scale_observation_penalty(
-        np.asarray(static_scores, dtype=float),
-        obs_arr,
-        scale=float(config.eta_observation),
+    positive_joint_weights = normalized_joint_weights[
+        normalized_joint_weights > 0.0
+    ]
+    particle_entropy = float(
+        -np.sum(positive_joint_weights * np.log(positive_joint_weights))
     )
-    for item, base_score, observation_penalty in zip(
-        pending,
-        static_scores,
-        observation_penalties,
-    ):
-        (
-            pose_index,
-            pose,
-            program,
-            program_information_gain,
-            signature_score,
-            temporal_separation_score,
-            elevation_signature_score,
-            _obs_penalty,
-            count_balance_penalty,
-            differential_penalty,
-            dose_score,
-            count_utility,
-            coverage_gain,
-            revisit_penalty,
-            bearing_gain,
-            frontier_gain,
-            turn_penalty,
-            local_orbit_gain,
-            station_condition_gain,
-            correlation_reduction_gain,
-            isotope_balance_gain,
-            elevation_condition_gain,
-            environment_signature_score,
-            vertical_environment_signature_score,
-            occlusion_boundary_gain,
-            remaining_route_pressure,
-            remaining_route_penalty,
-            remaining_route_gain,
-        ) = item
-        info_gain = float(program_information_gain)
-        placeholder_node = DSSPPNode(
-            pose_index=int(pose_index),
-            pose_xyz=pose,
-            program=program,
-            score=0.0,
-            static_score=float(base_score),
-            distance_weight=float(lambda_distance),
-            observation_penalty_weight=float(obs_weight),
-            information_gain=float(info_gain),
-            signature_score=float(signature_score),
-            temporal_separation_score=float(temporal_separation_score),
-            elevation_signature_score=float(elevation_signature_score),
-            observation_penalty=float(observation_penalty),
-            count_balance_penalty=float(count_balance_penalty),
-            differential_penalty=float(differential_penalty),
-            dose_score=float(dose_score),
-            count_utility=float(count_utility),
-            coverage_gain=float(coverage_gain),
-            revisit_penalty=float(revisit_penalty),
-            bearing_diversity_gain=float(bearing_gain),
-            frontier_gain=float(frontier_gain),
-            turn_penalty=float(turn_penalty),
-            local_orbit_gain=float(local_orbit_gain),
-            station_condition_gain=float(station_condition_gain),
-            correlation_reduction_gain=float(correlation_reduction_gain),
-            isotope_balance_gain=float(isotope_balance_gain),
-            elevation_condition_gain=float(elevation_condition_gain),
-            environment_signature_score=float(environment_signature_score),
-            vertical_environment_signature_score=float(
-                vertical_environment_signature_score
-            ),
-            occlusion_boundary_gain=float(occlusion_boundary_gain),
-            remaining_route_pressure=float(remaining_route_pressure),
-            remaining_route_penalty=float(remaining_route_penalty),
-            remaining_route_gain=float(remaining_route_gain),
-        )
-        score, _ = _compose_transition_score(
-            node=placeholder_node,
-            previous_pose_xyz=current_pose_xyz,
-            previous_pair_id=current_pair_id,
-            estimator=estimator,
-            map_api=map_api,
-            config=config,
-        )
-        raw_nodes.append(
-            DSSPPNode(
-                pose_index=int(pose_index),
-                pose_xyz=pose,
-                program=program,
-                score=score,
-                static_score=float(base_score),
-                distance_weight=float(lambda_distance),
-                observation_penalty_weight=float(obs_weight),
-                information_gain=float(info_gain),
-                signature_score=float(signature_score),
-                temporal_separation_score=float(temporal_separation_score),
-                elevation_signature_score=float(elevation_signature_score),
-                observation_penalty=float(observation_penalty),
-                count_balance_penalty=float(count_balance_penalty),
-                differential_penalty=float(differential_penalty),
-                dose_score=float(dose_score),
-                count_utility=float(count_utility),
-                coverage_gain=float(coverage_gain),
-                revisit_penalty=float(revisit_penalty),
-                bearing_diversity_gain=float(bearing_gain),
-                frontier_gain=float(frontier_gain),
-                turn_penalty=float(turn_penalty),
-                local_orbit_gain=float(local_orbit_gain),
-                station_condition_gain=float(station_condition_gain),
-                correlation_reduction_gain=float(correlation_reduction_gain),
-                isotope_balance_gain=float(isotope_balance_gain),
-                elevation_condition_gain=float(elevation_condition_gain),
-                environment_signature_score=float(environment_signature_score),
-                vertical_environment_signature_score=float(
-                    vertical_environment_signature_score
-                ),
-                occlusion_boundary_gain=float(occlusion_boundary_gain),
-                remaining_route_pressure=float(remaining_route_pressure),
-                remaining_route_penalty=float(remaining_route_penalty),
-                remaining_route_gain=float(remaining_route_gain),
+    finite_sample_eig_upper = _finite_sample_information_gain_upper_bound(
+        normalized_joint_weights
+    )
+    excluded_universal_upper = float("inf")
+    evaluated_objective_lower = -float("inf")
+    shortlist_bound_certified = False
+    adaptive_round_count = 0
+    next_evaluation_offset = 0
+    while next_evaluation_offset < total_action_count:
+        adaptive_round_count += 1
+        next_stop = (
+            initial_indices.size
+            if next_evaluation_offset == 0
+            else min(
+                next_evaluation_offset + int(config.exact_eig_action_limit),
+                total_action_count,
             )
         )
-    raw_nodes.sort(key=lambda node: node.score, reverse=True)
-    return raw_nodes
+        if next_stop <= next_evaluation_offset:
+            raise RuntimeError("Adaptive exact-EIG batch made no progress.")
+        new_indices = evaluation_order[next_evaluation_offset:next_stop]
+        if float(config.lambda_eig) > 0.0:
+            _evaluate_exact_indices(new_indices)
+        else:
+            program_information_gains[new_indices] = 0.0
+        next_evaluation_offset = int(next_stop)
+        evaluated_pending_indices = evaluation_order[:next_evaluation_offset]
 
+        info_gains.fill(0.0)
+        for pending_index_raw in evaluated_pending_indices:
+            pending_index = int(pending_index_raw)
+            item = pending[pending_index]
+            info_gains[int(item.pose_index)] = max(
+                float(info_gains[int(item.pose_index)]),
+                float(program_information_gains[pending_index]),
+            )
+        finite_path = np.isfinite(path_lengths)
+        if config.lambda_distance is None:
+            evaluated_pose_mask = np.zeros(
+                candidate_poses.shape[0],
+                dtype=bool,
+            )
+            evaluated_pose_mask[
+                np.asarray(
+                    sorted(
+                        {
+                            int(pending[int(index)].pose_index)
+                            for index in evaluated_pending_indices
+                        }
+                    ),
+                    dtype=np.int64,
+                )
+            ] = True
+            lambda_distance = estimate_lambda_cost(
+                info_gains[finite_path & evaluated_pose_mask],
+                path_lengths[finite_path & evaluated_pose_mask],
+                method="range",
+            )
+        else:
+            lambda_distance = float(config.lambda_distance)
 
-def _beam_search_sequence(
-    nodes: Sequence[DSSPPNode],
-    *,
-    current_pose_xyz: NDArray[np.float64],
-    current_pair_id: int | None,
-    estimator: RotatingShieldPFEstimator,
-    map_api: object | None,
-    config: DSSPPConfig,
-) -> tuple[DSSPPNode, ...]:
-    """Return a receding-horizon node sequence using beam search."""
-    if not nodes:
-        return tuple()
-    horizon = max(1, int(config.horizon))
-    beam_width = max(1, int(config.beam_width))
-    beam: list[tuple[float, tuple[DSSPPNode, ...], NDArray[np.float64], int | None]] = [
-        (0.0, tuple(), np.asarray(current_pose_xyz, dtype=float), current_pair_id)
-    ]
-    expansion_nodes = list(nodes[: max(beam_width * 4, beam_width)])
-    for _depth in range(horizon):
-        next_beam: list[
-            tuple[float, tuple[DSSPPNode, ...], NDArray[np.float64], int | None]
-        ] = []
-        for cumulative, sequence, prev_pose, prev_pair in beam:
-            for node in expansion_nodes:
-                transition_score, path_len = _compose_transition_score(
-                    node=node,
-                    previous_pose_xyz=prev_pose,
-                    previous_pair_id=prev_pair,
-                    estimator=estimator,
-                    map_api=map_api,
-                    config=config,
+        raw_nodes = []
+        for pending_index_raw in evaluated_pending_indices:
+            pending_index = int(pending_index_raw)
+            item = pending[pending_index]
+            info_gain = float(program_information_gains[pending_index])
+            base_score = (
+                float(item.static_score)
+                + float(config.lambda_eig) * info_gain
+            )
+            placeholder_node = DSSPPNode(
+                pose_index=int(item.pose_index),
+                pose_xyz=item.pose_xyz,
+                program=item.program,
+                score=0.0,
+                static_score=float(base_score),
+                distance_weight=float(lambda_distance),
+                information_gain=float(info_gain),
+                coverage_gain=float(item.coverage_gain),
+                revisit_penalty=float(item.revisit_penalty),
+                bearing_diversity_gain=float(item.bearing_diversity_gain),
+                frontier_gain=float(item.frontier_gain),
+                turn_penalty=float(item.turn_penalty),
+                local_orbit_gain=float(item.local_orbit_gain),
+                elevation_condition_gain=float(
+                    item.elevation_condition_gain
+                ),
+            )
+            score, _ = _compose_transition_score(
+                node=placeholder_node,
+                previous_pose_xyz=current_pose_xyz,
+                previous_pair_id=current_pair_id,
+                estimator=estimator,
+                map_api=map_api,
+                config=config,
+            )
+            raw_nodes.append(
+                DSSPPNode(
+                    **{
+                        **placeholder_node.__dict__,
+                        "score": float(score),
+                    }
                 )
-                if not np.isfinite(path_len):
-                    continue
-                score = cumulative + transition_score
-                next_pair = (
-                    node.program.pair_ids[-1] if node.program.pair_ids else prev_pair
-                )
-                next_beam.append(
-                    (
-                        score,
-                        sequence + (node,),
-                        node.pose_xyz,
-                        int(next_pair) if next_pair is not None else None,
-                    )
-                )
-        if not next_beam:
+            )
+        raw_nodes.sort(key=lambda node: node.score, reverse=True)
+
+        excluded_mask = np.ones(total_action_count, dtype=bool)
+        excluded_mask[evaluated_pending_indices] = False
+        if not np.any(excluded_mask):
+            excluded_universal_upper = -float("inf")
+            shortlist_bound_certified = True
             break
-        next_beam.sort(key=lambda item: item[0], reverse=True)
-        beam = next_beam[:beam_width]
-    if not beam:
-        return tuple(nodes[:1])
-    return beam[0][1]
+        if config.lambda_distance is None:
+            # Auto-scaled distance changes with unseen EIG values, so no safe
+            # finite lower/upper objective bracket exists before exhaustion.
+            continue
+        evaluated_lower_scores: list[float] = []
+        for index_raw in evaluated_pending_indices:
+            item = pending[int(index_raw)]
+            lower_node = DSSPPNode(
+                pose_index=int(item.pose_index),
+                pose_xyz=item.pose_xyz,
+                program=item.program,
+                score=0.0,
+                static_score=float(item.static_score),
+                distance_weight=float(lambda_distance),
+                information_gain=0.0,
+                coverage_gain=float(item.coverage_gain),
+                revisit_penalty=float(item.revisit_penalty),
+                bearing_diversity_gain=float(item.bearing_diversity_gain),
+                frontier_gain=float(item.frontier_gain),
+                turn_penalty=float(item.turn_penalty),
+                local_orbit_gain=float(item.local_orbit_gain),
+                elevation_condition_gain=float(
+                    item.elevation_condition_gain
+                ),
+            )
+            lower_score, _ = _compose_transition_score(
+                node=lower_node,
+                previous_pose_xyz=current_pose_xyz,
+                previous_pair_id=current_pair_id,
+                estimator=estimator,
+                map_api=map_api,
+                config=config,
+            )
+            evaluated_lower_scores.append(float(lower_score))
+        evaluated_objective_lower = float(max(evaluated_lower_scores))
+        excluded_upper_scores: list[float] = []
+        for index_raw in np.flatnonzero(excluded_mask):
+            item = pending[int(index_raw)]
+            upper_node = DSSPPNode(
+                pose_index=int(item.pose_index),
+                pose_xyz=item.pose_xyz,
+                program=item.program,
+                score=0.0,
+                static_score=(
+                    float(item.static_score)
+                    + float(config.lambda_eig) * finite_sample_eig_upper
+                ),
+                distance_weight=float(lambda_distance),
+                information_gain=float(finite_sample_eig_upper),
+                coverage_gain=float(item.coverage_gain),
+                revisit_penalty=float(item.revisit_penalty),
+                bearing_diversity_gain=float(item.bearing_diversity_gain),
+                frontier_gain=float(item.frontier_gain),
+                turn_penalty=float(item.turn_penalty),
+                local_orbit_gain=float(item.local_orbit_gain),
+                elevation_condition_gain=float(
+                    item.elevation_condition_gain
+                ),
+            )
+            upper_score, _ = _compose_transition_score(
+                node=upper_node,
+                previous_pose_xyz=current_pose_xyz,
+                previous_pair_id=current_pair_id,
+                estimator=estimator,
+                map_api=map_api,
+                config=config,
+            )
+            excluded_upper_scores.append(float(upper_score))
+        excluded_universal_upper = float(max(excluded_upper_scores))
+        shortlist_bound_certified = bool(
+            evaluated_objective_lower
+            >= excluded_universal_upper - 1.0e-12
+        )
+        if shortlist_bound_certified:
+            break
+
+    best_exact_score = (
+        float(raw_nodes[0].score)
+        if raw_nodes
+        else -float("inf")
+    )
+    winner_exceeds_universal_excluded_bound = shortlist_bound_certified
+    selected_pending_index = -1
+    if raw_nodes:
+        for index_raw in evaluated_pending_indices:
+            index = int(index_raw)
+            if (
+                int(pending[index].pose_index) == int(raw_nodes[0].pose_index)
+                and pending[index].program == raw_nodes[0].program
+            ):
+                selected_pending_index = index
+                break
+        if selected_pending_index < 0:
+            raise RuntimeError("Selected exact-EIG node lost its pending identity.")
+    proxy_order = _stable_descending_indices(proxy_ranking_scores)
+    proxy_rank = (
+        int(
+            np.flatnonzero(proxy_order == selected_pending_index)[0]
+            + 1
+        )
+        if selected_pending_index >= 0
+        else 0
+    )
+    model = validate_full_spectrum_model(
+        estimator.full_spectrum_generative_model
+    )
+    sample_count = int(estimator.pf_config.planning_eig_samples)
+    particle_count = int(np.asarray(joint_particles.weights_n).size)
+    view_count = max((len(program.pair_ids) for program in programs), default=0)
+    energy_bin_count = int(np.asarray(model.energy_axis_keV).size)
+    exact_action_count = (
+        int(evaluated_pending_indices.size)
+        if float(config.lambda_eig) > 0.0
+        else 0
+    )
+    diagnostics: dict[str, object] = {
+        "total_action_count": int(total_action_count),
+        "proxy_action_count": int(proxy_action_count),
+        "proxy_particle_count": int(proxy_particle_count),
+        "proxy_eig_samples": int(config.proxy_eig_samples),
+        "shared_full_spectrum_detector_aperture_samples": int(
+            config.detector_aperture_samples
+        ),
+        "exact_action_count": int(exact_action_count),
+        "exact_eig_action_limit": int(config.exact_eig_action_limit),
+        "adaptive_exact_eig_round_count": int(adaptive_round_count),
+        "adaptive_exact_eig_exhausted_all_actions": bool(
+            exact_action_count == total_action_count
+        ),
+        "shortlist_category_counts": dict(shortlist_category_counts),
+        "proxy_wall_s": float(proxy_wall_s),
+        "exact_eig_wall_s": float(exact_wall_s),
+        "proxy_eig_runtime": dict(proxy_eig_runtime_diagnostics),
+        "exact_eig_runtime": {
+            "rounds": list(exact_eig_runtime_rounds),
+        },
+        "proxy_unique_action_count": int(proxy_action_count),
+        "legacy_all_exact_bin_state_operations": int(
+            total_action_count
+            * max(sample_count, 0)
+            * particle_count
+            * view_count
+            * energy_bin_count
+        ),
+        "shortlisted_exact_bin_state_operations": int(
+            exact_action_count
+            * max(sample_count, 0)
+            * particle_count
+            * view_count
+            * energy_bin_count
+        ),
+        "proxy_full_spectrum_bin_state_operations": int(
+            proxy_action_count
+            * int(config.proxy_eig_samples)
+            * proxy_particle_count
+            * view_count
+            * energy_bin_count
+            if proxy_action_count
+            else 0
+        ),
+        "shortlist_mc_winner_exceeds_universal_excluded_bound": bool(
+            winner_exceeds_universal_excluded_bound
+        ),
+        "shortlist_best_exact_score": float(best_exact_score),
+        "shortlist_evaluated_objective_lower_bound": (
+            None
+            if not np.isfinite(evaluated_objective_lower)
+            else float(evaluated_objective_lower)
+        ),
+        "shortlist_max_excluded_universal_objective_upper_bound": (
+            None
+            if not np.isfinite(excluded_universal_upper)
+            else float(excluded_universal_upper)
+        ),
+        "shortlist_selected_proxy_rank": int(proxy_rank),
+        "proxy_contract": (
+            "reduced_particle_and_sample_joint_full_spectrum_generative_eig_"
+            "with_identical_background_dead_time_marks_and_likelihood"
+        ),
+        "posterior_entropy_true_eig_upper_bound_nats": float(
+            particle_entropy
+        ),
+        "finite_sample_mc_eig_upper_bound_nats": float(
+            finite_sample_eig_upper
+        ),
+        "universal_eig_upper_bound_nats": float(
+            finite_sample_eig_upper
+        ),
+        "shortlist_formal_recall_certificate_available": bool(
+            shortlist_bound_certified
+        ),
+        "shortlist_certification_note": (
+            "Exact evaluation expands until a zero-EIG evaluated objective "
+            "lower bound exceeds every excluded action's finite-sample "
+            "-log(min_positive_prior_mass) KL upper bound. Prior entropy is "
+            "only a bound on expected mutual information, not on a finite "
+            "Monte Carlo estimate. When auto distance scaling prevents a "
+            "safe objective bound, every action is evaluated exactly."
+        ),
+        "eig_shortlist_wall_s": float(proxy_wall_s + exact_wall_s),
+    }
+    return raw_nodes, diagnostics
 
 
 def select_dss_pp_next_station(
@@ -6212,39 +5332,61 @@ def select_dss_pp_next_station(
     bounds_xyz: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     continuous_height_bounds_m: tuple[float, float] | None = None,
     config: DSSPPConfig | None = None,
-    height_partner_xy_tolerance_m: float = 1.0e-9,
-    height_partner_z_tolerance_m: float = 1.0e-9,
-    height_partner_min_z_separation_m: float = 0.0,
-    allow_height_partner_first_action: bool = True,
+    rng: np.random.Generator | None = None,
 ) -> DSSPPResult:
     """Select the next station and its actually executed shield program.
 
     When ``continuous_height_bounds_m`` is provided, newly augmented xy
     stations receive deterministic low-discrepancy heights within that range;
-    caller-provided candidate heights remain unchanged. Setting
-    ``allow_height_partner_first_action`` to false also removes same-xy height
-    actions introduced by DSS candidate augmentation. This keeps a caller's
-    one-step height-action lock valid across the full planning boundary.
+    caller-provided candidate heights remain unchanged. No height/lateral
+    alternation constraint is imposed; exact EIG and global surface
+    observability decide among all reachable actions.
     """
     cfg = config or DSSPPConfig()
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError(
+            "select_dss_pp_next_station requires a persistent explicit rng; "
+            "reinitializing a fixed seed per planning call is forbidden."
+        )
+    planning_rng = rng
+    pf_max_sources = _validate_mode_capacity(estimator, cfg)
+    _validate_eig_likelihood_contract(estimator, cfg)
     current_pose = np.asarray(current_pose_xyz, dtype=float)
-    if current_pose.shape != (3,):
-        raise ValueError("current_pose_xyz must be shape (3,).")
-    modes = extract_signature_modes(
-        estimator,
+    if current_pose.shape != (3,) or np.any(~np.isfinite(current_pose)):
+        raise ValueError("current_pose_xyz must be a finite shape-(3,) vector.")
+    if current_pair_id is not None:
+        if isinstance(current_pair_id, bool) or not isinstance(
+            current_pair_id,
+            (int, np.integer),
+        ):
+            raise ValueError("current_pair_id must be an integer or None.")
+        current_pair_count = int(estimator.num_orientations) ** 2
+        if not 0 <= int(current_pair_id) < current_pair_count:
+            raise ValueError(
+                "current_pair_id lies outside the estimator shield-pair "
+                f"support [0, {current_pair_count - 1}]."
+            )
+    joint_particles = estimator.planning_joint_particles(
         max_particles=cfg.planning_particles,
         method=cfg.planning_method,
+        rng=planning_rng,
+    )
+    geometry_joint_particles = estimator.planning_joint_particles(
+        max_particles=0,
+        method="top_weight",
+    )
+    modes = extract_signature_modes(
+        estimator,
         mode_cluster_radius_m=float(cfg.mode_cluster_radius_m),
+        max_modes_per_isotope=int(cfg.max_modes_per_isotope),
+        rng=planning_rng,
+        joint_particles=geometry_joint_particles,
+    )
+    _official_modes, official_snapshot_diagnostics = _official_signature_modes(
+        estimator,
         max_modes_per_isotope=int(cfg.max_modes_per_isotope),
     )
     candidates = np.asarray(candidate_poses_xyz, dtype=float)
-    base_candidates = candidates.copy()
-    height_xy_tolerance = max(float(height_partner_xy_tolerance_m), 0.0)
-    height_z_tolerance = max(float(height_partner_z_tolerance_m), 0.0)
-    height_min_z_separation = max(
-        float(height_partner_min_z_separation_m),
-        0.0,
-    )
     if cfg.augment_candidates:
         candidates = augment_candidate_stations(
             candidates,
@@ -6255,55 +5397,24 @@ def select_dss_pp_next_station(
             bounds_xyz=bounds_xyz,
             config=cfg,
             continuous_height_bounds_m=continuous_height_bounds_m,
+            rng=planning_rng,
         )
 
-    def _without_disallowed_height_actions(
-        candidate_rows: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], int]:
-        """Remove first-step height partners when the caller locks them out."""
-        rows = np.asarray(candidate_rows, dtype=float).reshape(-1, 3)
-        if bool(allow_height_partner_first_action) or rows.shape[0] == 0:
-            return rows, 0
-        height_mask = _height_partner_mask_batch(
-            rows,
-            visited_poses_xyz,
-            reference_pose_xyz=current_pose,
-            xy_tolerance_m=height_xy_tolerance,
-            z_tolerance_m=height_z_tolerance,
-            min_z_separation_m=height_min_z_separation,
-        )
-        return rows[~height_mask], int(np.count_nonzero(height_mask))
-
-    candidates, disallowed_height_filtered = _without_disallowed_height_actions(
-        candidates
-    )
     candidates, separation_filtered = _filter_station_separation(
         candidates,
         visited_poses_xyz,
         min_separation_m=float(cfg.min_station_separation_m),
-        reference_pose_xyz=current_pose,
-        height_partner_xy_tolerance_m=height_xy_tolerance,
-        height_partner_z_tolerance_m=height_z_tolerance,
-        height_partner_min_z_separation_m=height_min_z_separation,
     )
     candidates, path_filtered = _filter_path_reachable_stations(
         candidates,
         current_pose_xyz=current_pose,
         map_api=map_api,
     )
-    fallback_used = False
-    if candidates.size == 0 and base_candidates.size != 0:
-        fallback_candidates, fallback_height_filtered = (
-            _without_disallowed_height_actions(base_candidates)
+    if candidates.size == 0:
+        raise ValueError(
+            "DSS-PP received no reachable candidate after the generic 3-D "
+            "station-separation contract."
         )
-        disallowed_height_filtered += int(fallback_height_filtered)
-        candidates, base_path_filtered = _filter_path_reachable_stations(
-            fallback_candidates,
-            current_pose_xyz=current_pose,
-            map_api=map_api,
-        )
-        path_filtered += int(base_path_filtered)
-        fallback_used = candidates.size != 0
     if cfg.forced_program_pair_ids is None:
         programs = build_shield_program_library(
             estimator.normals,
@@ -6311,6 +5422,15 @@ def select_dss_pp_next_station(
             max_programs=int(cfg.max_programs),
         )
     else:
+        pair_count = int(estimator.num_orientations) ** 2
+        if any(
+            int(pair_id) >= pair_count
+            for pair_id in cfg.forced_program_pair_ids
+        ):
+            raise ValueError(
+                "forced_program_pair_ids exceed the estimator shield-pair "
+                f"support [0, {pair_count - 1}]."
+            )
         programs = [
             ShieldProgram(
                 name="forced_baseline_shield_program",
@@ -6318,7 +5438,25 @@ def select_dss_pp_next_station(
                 kind="forced_baseline",
             )
         ]
-    nodes = _build_nodes(
+    candidate_pair_ids = [
+        int(pair_id)
+        for program in programs
+        for pair_id in program.pair_ids
+    ]
+    pair_occurrences = np.bincount(
+        np.asarray(candidate_pair_ids, dtype=np.int64),
+        minlength=int(estimator.num_orientations) ** 2,
+    )
+    positive_occurrences = pair_occurrences[pair_occurrences > 0]
+    companion_sets = {
+        pair_id: set()
+        for pair_id in np.flatnonzero(pair_occurrences)
+    }
+    for program in programs:
+        program_pairs = set(int(pair_id) for pair_id in program.pair_ids)
+        for pair_id in program_pairs:
+            companion_sets[pair_id].update(program_pairs - {pair_id})
+    nodes, shortlist_diagnostics = _build_nodes(
         estimator=estimator,
         candidate_poses_xyz=candidates,
         programs=programs,
@@ -6329,66 +5467,15 @@ def select_dss_pp_next_station(
         map_api=map_api,
         bounds_xyz=bounds_xyz,
         config=cfg,
-        height_partner_xy_tolerance_m=height_xy_tolerance,
-        height_partner_z_tolerance_m=height_z_tolerance,
-        height_partner_min_z_separation_m=height_min_z_separation,
+        rng=planning_rng,
+        joint_particles=joint_particles,
     )
     if not nodes:
         raise ValueError("DSS-PP could not evaluate any station-program node.")
-    sequence = _beam_search_sequence(
-        nodes,
-        current_pose_xyz=current_pose,
-        current_pair_id=current_pair_id,
-        estimator=estimator,
-        map_api=map_api,
-        config=cfg,
-    )
-    if not sequence:
-        sequence = (nodes[0],)
-    first = sequence[0]
-    best_score = float(sum(node.score for node in sequence))
-    diagnostic_kernel = _continuous_kernel_for_estimator(
-        estimator,
-        detector_aperture_samples=max(1, int(cfg.detector_aperture_samples)),
-    )
-    selected_planning_particles = cast(
-        dict[str, tuple[Sequence[object], NDArray[np.float64]]],
-        estimator.planning_particles(
-            max_particles=cfg.planning_particles,
-            method=cfg.planning_method,
-            rng=np.random.default_rng(cfg.rng_seed),
-        ),
-    )
-    selected_signature_future_statistics = _signature_future_statistics_for_poses(
-        estimator,
-        np.asarray(first.pose_xyz, dtype=float).reshape(1, 3),
-        modes,
-        selected_planning_particles,
-        config=cfg,
-    )
-    selected_pairwise_ambiguity = _program_pairwise_ambiguity_diagnostics(
-        estimator=estimator,
-        kernel=diagnostic_kernel,
-        modes_by_isotope=modes,
-        pose_xyz=first.pose_xyz,
-        program=first.program,
-        config=cfg,
-        future_statistics=selected_signature_future_statistics,
-        pose_index=0,
-    )
+    first = nodes[0]
+    sequence = (first,)
+    best_score = float(first.score)
     mode_count = sum(len(mode_list) for mode_list in modes.values())
-    configured_workers = cfg.program_eval_workers
-    program_eval_workers = (
-        min(int(candidates.shape[0]), max(1, os.cpu_count() or 1))
-        if configured_workers is None
-        else min(int(candidates.shape[0]), max(1, int(configured_workers)))
-    )
-    primary_history_weight_diagnostics = _primary_history_weight_diagnostics_at_pose(
-        estimator,
-        first.pose_xyz,
-        config=cfg,
-        particles_by_isotope=selected_planning_particles,
-    )
     ranked_limit = int(cfg.diagnostic_ranked_node_limit)
     ranked_nodes = (
         sorted(nodes, key=lambda node: float(node.score), reverse=True)[:ranked_limit]
@@ -6399,13 +5486,38 @@ def select_dss_pp_next_station(
         "candidate_count": int(candidates.shape[0]),
         "separation_filtered_candidates": int(separation_filtered),
         "path_filtered_candidates": int(path_filtered),
-        "path_fallback_used": int(fallback_used),
         "program_count": int(len(programs)),
-        "height_partner_xy_tolerance_m": float(height_xy_tolerance),
-        "height_partner_z_tolerance_m": float(height_z_tolerance),
-        "height_partner_min_z_separation_m": float(height_min_z_separation),
-        "allow_height_partner_first_action": bool(allow_height_partner_first_action),
-        "disallowed_height_partner_candidates": int(disallowed_height_filtered),
+        "program_library_policy": (
+            "forced_predeclared_baseline"
+            if cfg.forced_program_pair_ids is not None
+            else "balanced_multi_partition_predeclared_action_set"
+        ),
+        "program_library_global_optimality_claimed": False,
+        "program_library_exact_eig_over_every_predeclared_action": bool(
+            int(shortlist_diagnostics.get("exact_action_count", 0))
+            == int(shortlist_diagnostics.get("total_action_count", 0))
+        ),
+        "program_library_unique_pair_count": int(
+            np.count_nonzero(pair_occurrences)
+        ),
+        "program_library_pair_occurrence_min": int(
+            np.min(positive_occurrences)
+        ),
+        "program_library_pair_occurrence_max": int(
+            np.max(positive_occurrences)
+        ),
+        "program_library_companion_diversity_min": int(
+            min(
+                (len(companions) for companions in companion_sets.values()),
+                default=0,
+            )
+        ),
+        "program_library_companion_diversity_max": int(
+            max(
+                (len(companions) for companions in companion_sets.values()),
+                default=0,
+            )
+        ),
         "continuous_height_bounds_m": (
             None
             if continuous_height_bounds_m is None
@@ -6414,108 +5526,70 @@ def select_dss_pp_next_station(
         "evaluated_candidate_count": int(len({int(node.pose_index) for node in nodes})),
         "node_count": int(len(nodes)),
         "mode_count": int(mode_count),
-        "station_condition_min_singular_weight": float(
-            cfg.station_condition_min_singular_weight
-        ),
-        "station_condition_inverse_condition_weight": float(
-            cfg.station_condition_inverse_condition_weight
-        ),
-        "station_condition_coherence_weight": float(
-            cfg.station_condition_coherence_weight
-        ),
+        "max_modes_per_isotope": int(cfg.max_modes_per_isotope),
+        "pf_max_sources": int(pf_max_sources),
         "planner_belief_sources": ["pf_posterior"],
-        "program_eval_workers": int(program_eval_workers),
-        "horizon": int(max(1, cfg.horizon)),
-        "beam_width": int(max(1, cfg.beam_width)),
+        "planner_official_posterior_projection": dict(
+            official_snapshot_diagnostics
+        ),
+        "planner_geometry_mode_projection": {
+            "source": "full_aligned_joint_posterior",
+            "particle_count": int(
+                np.asarray(geometry_joint_particles.weights_n).size
+            ),
+            "mass_semantics": (
+                "unconditional_particle_mass_with_k_zero_preserved"
+            ),
+            "position_representative": "intrinsic_surface_weighted_medoid",
+            "synthetic_xyz_centroids": False,
+        },
+        "planning_policy": "one_step_joint_eig",
         "first_program_kind": first.program.kind,
         "planning_eig_joint_program_views": True,
-        "planning_eig_shared_posterior_subset": True,
-        "planning_eig_batched_detector_pair_response": True,
-        "planning_eig_pose_chunk_size": 8,
-        "planning_eig_likelihood_models": {
-            str(isotope): _count_likelihood_spec_for_isotope(
-                estimator,
-                str(isotope),
-            ).model
-            for isotope in estimator.isotopes
-        },
-        "planning_eig_observation_count_variance_semantics": {
-            str(isotope): str(
-                _count_likelihood_spec_for_isotope(
-                    estimator,
-                    str(isotope),
-                ).observation_count_variance_semantics
-            )
-            for isotope in estimator.isotopes
-        },
-        "planning_primary_history_weight": float(cfg.primary_history_weight),
-        "planning_primary_history_weight_minimum": float(cfg.primary_history_weight),
-        "planning_primary_history_weight_effective_selected_pose": (
-            primary_history_weight_diagnostics
+        "planning_eig_joint_isotope_vector": True,
+        "planning_eig_aligned_joint_posterior_snapshot": True,
+        "planning_eig_raw_spectrum_observations": True,
+        "planning_eig_persistent_named_rng": True,
+        "planning_eig_all_valid_candidates_exact": bool(
+            int(shortlist_diagnostics.get("exact_action_count", 0))
+            == int(shortlist_diagnostics.get("total_action_count", 0))
         ),
-        "planning_primary_sampling_fraction": (1.0 / float(cfg.primary_history_weight)),
-        "planning_primary_sampling_fraction_maximum": (
-            1.0 / float(cfg.primary_history_weight)
+        "planning_eig_batched_source_line_response": True,
+        "planning_eig_action_memory_budget_bytes": 256 * 1024 * 1024,
+        "planning_eig_likelihood_model": "joint_full_spectrum_generative",
+        "planning_eig_contract_hash_sha256": str(
+            estimator.full_spectrum_generative_model.contract_hash_sha256
         ),
-        "planning_target_sampled_primaries": (
-            None
-            if cfg.target_sampled_primaries is None
-            else float(cfg.target_sampled_primaries)
+        "planning_eig_observation_semantics": (
+            "same_full_spectrum_predictive_sampler_and_log_likelihood_as_pf"
         ),
-        "planning_eig_covariance_semantics": (
-            "pf_model_diagonal_predictive_variance_plus_compound_poisson_"
-            "candidate_particle_budget_weighted_history_sumw2"
-            if cfg.target_sampled_primaries is not None
-            else "pf_model_diagonal_predictive_variance_plus_compound_poisson_"
-            "fixed_weighted_history_sumw2"
-        ),
+        "planning_eig_shortlist": dict(shortlist_diagnostics),
         "first_information_gain": float(first.information_gain),
-        "first_signature_score": float(first.signature_score),
-        "first_temporal_separation_score": float(first.temporal_separation_score),
-        "first_elevation_signature_score": float(first.elevation_signature_score),
-        "first_observation_penalty": float(first.observation_penalty),
-        "first_count_balance_penalty": float(first.count_balance_penalty),
-        "first_differential_penalty": float(first.differential_penalty),
-        "first_dose_score": float(first.dose_score),
-        "first_count_utility": float(first.count_utility),
         "first_coverage_gain": float(first.coverage_gain),
+        "coverage_support": str(
+            shortlist_diagnostics.get(
+                "coverage_support",
+                "unavailable",
+            )
+        ),
+        "coverage_quadrature": shortlist_diagnostics.get(
+            "coverage_quadrature"
+        ),
+        "coverage_sample_count": int(
+            (
+                shortlist_diagnostics.get("coverage_quadrature") or {}
+            ).get(
+                "sample_count",
+                cfg.coverage_surface_quadrature_max_points,
+            )
+        ),
         "first_revisit_penalty": float(first.revisit_penalty),
         "first_bearing_diversity_gain": float(first.bearing_diversity_gain),
         "first_frontier_gain": float(first.frontier_gain),
         "first_turn_penalty": float(first.turn_penalty),
         "first_local_orbit_gain": float(first.local_orbit_gain),
-        "first_station_condition_gain": float(first.station_condition_gain),
-        "first_correlation_reduction_gain": float(first.correlation_reduction_gain),
-        "first_isotope_balance_gain": float(first.isotope_balance_gain),
         "first_elevation_condition_gain": float(first.elevation_condition_gain),
-        "first_environment_signature_score": float(first.environment_signature_score),
-        "first_environment_signature_norm": float(
-            _normalized_environment_signature_score(
-                first.environment_signature_score,
-                config=cfg,
-            )
-        ),
-        "first_vertical_environment_signature_score": float(
-            first.vertical_environment_signature_score
-        ),
-        "first_vertical_environment_signature_norm": float(
-            _normalized_environment_signature_score(
-                first.vertical_environment_signature_score,
-                config=cfg,
-            )
-        ),
-        "first_occlusion_boundary_gain": float(first.occlusion_boundary_gain),
-        "remaining_budget_guidance": int(bool(cfg.remaining_budget_guidance)),
-        "remaining_station_estimate": (
-            -1
-            if cfg.remaining_station_estimate is None
-            else int(cfg.remaining_station_estimate)
-        ),
-        "remaining_route_pressure": float(first.remaining_route_pressure),
-        "first_remaining_route_penalty": float(first.remaining_route_penalty),
-        "first_remaining_route_gain": float(first.remaining_route_gain),
         "diagnostic_ranked_node_limit": int(ranked_limit),
-        "selected_pairwise_ambiguity": selected_pairwise_ambiguity,
         "component_leaders": _component_leader_payloads(nodes),
         "ranked_nodes": [
             _node_diagnostic_payload(node, rank)

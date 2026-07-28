@@ -211,6 +211,16 @@ if [[ ${#MAIN_ARGS[@]} -eq 0 ]]; then
     )
 fi
 
+# This launcher is a full-Geant4 contract, not a generic main.py wrapper.
+# Prepending the canonical mode makes Python/analytic mode flags conflict at
+# argparse and makes analytic backend/config overrides fail closed.
+if ! has_arg "--full-simulation" "${MAIN_ARGS[@]}" \
+    && ! has_arg "--standard-geant4-full" "${MAIN_ARGS[@]}" \
+    && ! has_arg "--cui" "${MAIN_ARGS[@]}" \
+    && ! has_arg "--geant4-cui" "${MAIN_ARGS[@]}"; then
+    MAIN_ARGS=(--full-simulation "${MAIN_ARGS[@]}")
+fi
+
 if ! has_arg "--sim-config" "${MAIN_ARGS[@]}"; then
     MAIN_ARGS=(--sim-config "$GUARD_CONFIG" "${MAIN_ARGS[@]}")
 fi

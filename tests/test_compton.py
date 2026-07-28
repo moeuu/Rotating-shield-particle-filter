@@ -1,9 +1,7 @@
-"""コンプトン端と連続成分の基本挙動を検証するテスト。"""
+"""Direct detector-response tests for Compton physics helpers."""
 
 import numpy as np
 
-from measurement.model import EnvironmentConfig, PointSource
-from spectrum.pipeline import SpectralDecomposer
 from spectrum.response_matrix import compton_continuum, compton_edge
 
 
@@ -36,21 +34,3 @@ def test_compton_continuum_properties():
     left_sum = cont[energy_axis < 0.5 * edge].sum()
     right_sum = cont[(energy_axis >= 0.5 * edge) & (energy_axis < edge)].sum()
     assert left_sum > right_sum
-
-
-def test_continuum_dominates_low_energy_mean():
-    """合成スペクトルで低エネルギー平均が高エネルギー平均より大きいことを確認する。"""
-    dec = SpectralDecomposer()
-    env = EnvironmentConfig()
-    sources = [
-        PointSource("Cs-137", position=(5.0, 10.0, 5.0), intensity_cps_1m=20000.0),
-        PointSource("Co-60", position=(5.0, 11.0, 5.0), intensity_cps_1m=20000.0),
-        PointSource("Eu-154", position=(5.0, 9.0, 5.0), intensity_cps_1m=20000.0),
-    ]
-    spectrum, _ = dec.simulate_spectrum(sources, environment=env, acquisition_time=10.0, rng=None, dead_time_s=0.0)
-    energy_axis = dec.energy_axis
-    low_mask = (energy_axis >= 50.0) & (energy_axis < 200.0)
-    high_mask = (energy_axis >= 1000.0) & (energy_axis < 1500.0)
-    low_mean = spectrum[low_mask].mean()
-    high_mean = spectrum[high_mask].mean()
-    assert low_mean > high_mean

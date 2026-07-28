@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "contract_id": "geometry_conditioned_full_spectrum_acceptance_v1",
+  "training_scene_seeds": [
+    2026072701,
+    2026072702,
+    2026072703
+  ],
+  "holdout_scene_seeds": [
+    2026072791,
+    2026072792
+  ],
+  "shield_pair_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63
+  ],
+  "scenario_ids": [
+    "background_only",
+    "single_line_source_resolved",
+    "dominant_plus_absent_isotope",
+    "multi_isotope_superposition",
+    "continuous_surface_perturbation_ranking"
+  ],
+  "metrics": {
+    "native_response_max_abs_error": {
+      "comparison": "le",
+      "threshold": 1e-12
+    },
+    "native_deadtime_mean_abs_z": {
+      "comparison": "le",
+      "threshold": 4.0
+    },
+    "native_deadtime_fano_relative_error": {
+      "comparison": "le",
+      "threshold": 0.05
+    },
+    "cpu_torch_mean_max_abs_error": {
+      "comparison": "le",
+      "threshold": 1e-08
+    },
+    "cpu_torch_log_likelihood_max_abs_error": {
+      "comparison": "le",
+      "threshold": 1e-06
+    },
+    "background_pairwise_95_coverage_fraction": {
+      "comparison": "ge",
+      "threshold": 0.85
+    },
+    "background_k_positive_decision_rate_at_p0p95": {
+      "comparison": "le",
+      "threshold": 0.05
+    },
+    "single_source_pairwise_95_coverage_fraction": {
+      "comparison": "ge",
+      "threshold": 0.8
+    },
+    "dominant_absent_pairwise_95_coverage_fraction": {
+      "comparison": "ge",
+      "threshold": 0.8
+    },
+    "absent_isotope_k_positive_decision_rate_at_p0p95": {
+      "comparison": "le",
+      "threshold": 0.05
+    },
+    "superposition_pairwise_95_coverage_fraction": {
+      "comparison": "ge",
+      "threshold": 0.8
+    },
+    "truth_vs_perturbed_ranking_fraction": {
+      "comparison": "ge",
+      "threshold": 0.8
+    },
+    "pairwise_standardized_total_abs_q95": {
+      "comparison": "le",
+      "threshold": 3.0
+    },
+    "pairwise_mark_tail_ge_0p01_fraction": {
+      "comparison": "ge",
+      "threshold": 0.8
+    },
+    "renewal_total_randomized_pit_ks_pvalue": {
+      "comparison": "ge",
+      "threshold": 0.01
+    },
+    "conditional_mark_randomized_pit_ks_pvalue": {
+      "comparison": "ge",
+      "threshold": 0.01
+    },
+    "line_count_conservation_max_relative_error": {
+      "comparison": "le",
+      "threshold": 1e-12
+    },
+    "validation_label_production_influence_max_abs": {
+      "comparison": "le",
+      "threshold": 0.0
+    }
+  },
+  "training_only_discrepancy_selection": {
+    "rate_scale_family": "station_shared_three_node_symmetric_mean_one",
+    "rate_scale_half_width_grid": [
+      0.0,
+      0.02,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "rate_scale_weights": [
+      0.25,
+      0.5,
+      0.25
+    ],
+    "mark_family": "source_fraction_dirichlet_multinomial",
+    "mark_concentration_source_grid": [
+      100.0,
+      300.0,
+      1000.0,
+      3000.0,
+      10000.0,
+      100000.0
+    ],
+    "objective": "maximum_joint_training_log_predictive_density",
+    "tie_break": "smallest_rate_half_width_then_largest_mark_concentration",
+    "scope": "one_global_parameter_pair_for_all_scenes_pairs_isotopes"
+  },
+  "selection_policy": "thresholds_fixed_before_holdout_no_holdout_tuning"
+}

@@ -7,6 +7,8 @@ import hashlib
 import json
 from typing import Any
 
+import numpy as np
+
 from measurement.detector_geometry import (
     detector_outer_radius_cm as detector_outer_radius_cm_from_model,
 )
@@ -17,6 +19,7 @@ from sim.shield_geometry import (
     SHIELD_SHAPE_SPHERICAL_OCTANT,
     ShieldThicknessConfig,
     nested_shield_inner_radii_cm,
+    require_no_angle_attenuation,
     resolve_shield_thickness_config,
 )
 
@@ -100,17 +103,40 @@ class ExportedGeant4Volume:
 
 @dataclass(frozen=True)
 class ExportedGeant4Source:
-    """Describe a source term exported for Geant4 transport."""
+    """Describe an air-side source term and its exact evaluation anchor."""
 
     isotope: str
     position_xyz: tuple[float, float, float]
     intensity_cps_1m: float
+    anchor_position_xyz: tuple[float, float, float] | None = None
+    surface_chart_id: int | None = None
+    surface_uv: tuple[float, float] | None = None
+    surface_normal_xyz: tuple[float, float, float] | None = None
+    surface_emission_policy_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable source payload."""
         return {
             "isotope": self.isotope,
             "position_xyz": list(self.position_xyz),
+            "position_semantics": "air_side_native_emission_xyz",
+            "anchor_position_xyz": (
+                None
+                if self.anchor_position_xyz is None
+                else list(self.anchor_position_xyz)
+            ),
+            "surface_chart_id": self.surface_chart_id,
+            "surface_uv": (
+                None if self.surface_uv is None else list(self.surface_uv)
+            ),
+            "surface_normal_xyz": (
+                None
+                if self.surface_normal_xyz is None
+                else list(self.surface_normal_xyz)
+            ),
+            "surface_emission_policy_sha256": (
+                self.surface_emission_policy_sha256
+            ),
             "intensity_cps_1m": float(self.intensity_cps_1m),
         }
 
@@ -160,8 +186,37 @@ class ExportedShieldModel:
     material: ExportedGeant4Material
     use_angle_attenuation: bool = False
 
+    def __post_init__(self) -> None:
+        """Reject shield semantics unsupported by the native runtime."""
+        require_no_angle_attenuation(self.use_angle_attenuation)
+        if self.shape != SHIELD_SHAPE_SPHERICAL_OCTANT:
+            raise ValueError(
+                "Exported Geant4 shields must use the shared "
+                f"{SHIELD_SHAPE_SPHERICAL_OCTANT!r} geometry."
+            )
+        inner_radius_m = float(self.inner_radius_m)
+        outer_radius_m = float(self.outer_radius_m)
+        thickness_cm = float(self.thickness_cm)
+        if (
+            not np.isfinite(inner_radius_m)
+            or inner_radius_m < 0.0
+            or not np.isfinite(outer_radius_m)
+            or not np.isfinite(thickness_cm)
+            or thickness_cm < 0.0
+        ):
+            raise ValueError(
+                "Shield radii and thickness must be finite and nonnegative."
+            )
+        expected_outer_radius_m = inner_radius_m + thickness_cm / 100.0
+        if outer_radius_m != expected_outer_radius_m:
+            raise ValueError(
+                "Shield outer_radius_m must equal inner_radius_m + "
+                "thickness_cm / 100 exactly."
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable shield payload."""
+        require_no_angle_attenuation(self.use_angle_attenuation)
         return {
             "path": self.path,
             "shape": self.shape,
@@ -171,7 +226,7 @@ class ExportedShieldModel:
             "thickness_m": float(self.thickness_cm) / 100.0,
             "size_xyz": None if self.size_xyz is None else list(self.size_xyz),
             "material": self.material.to_dict(),
-            "use_angle_attenuation": bool(self.use_angle_attenuation),
+            "use_angle_attenuation": False,
         }
 
 
@@ -185,8 +240,8 @@ class ExportedGeant4Scene:
     static_volumes: tuple[ExportedGeant4Volume, ...]
     sources: tuple[ExportedGeant4Source, ...]
     detector_model: ExportedDetectorModel
-    fe_shield: ExportedShieldModel
-    pb_shield: ExportedShieldModel
+    fe_shield: ExportedShieldModel | None
+    pb_shield: ExportedShieldModel | None
     prim_paths: StagePrimPaths
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,8 +253,12 @@ class ExportedGeant4Scene:
             "static_volumes": [volume.to_dict() for volume in self.static_volumes],
             "sources": [source.to_dict() for source in self.sources],
             "detector_model": self.detector_model.to_dict(),
-            "fe_shield": self.fe_shield.to_dict(),
-            "pb_shield": self.pb_shield.to_dict(),
+            "fe_shield": (
+                None if self.fe_shield is None else self.fe_shield.to_dict()
+            ),
+            "pb_shield": (
+                None if self.pb_shield is None else self.pb_shield.to_dict()
+            ),
             "prim_paths": {
                 "world_root": self.prim_paths.world_root,
                 "generated_root": self.prim_paths.generated_root,
@@ -276,8 +335,24 @@ def export_scene_for_geant4(
     sources = tuple(
         ExportedGeant4Source(
             isotope=source.isotope,
-            position_xyz=tuple(float(v) for v in source.position_xyz),
+            position_xyz=tuple(
+                float(v)
+                for v in (
+                    source.position_xyz
+                    if source.transport_position_xyz is None
+                    else source.transport_position_xyz
+                )
+            ),
             intensity_cps_1m=float(source.intensity_cps_1m),
+            anchor_position_xyz=tuple(
+                float(v) for v in source.position_xyz
+            ),
+            surface_chart_id=source.surface_chart_id,
+            surface_uv=source.surface_uv,
+            surface_normal_xyz=source.surface_normal_xyz,
+            surface_emission_policy_sha256=(
+                source.surface_emission_policy_sha256
+            ),
         )
         for source in scene.sources
     )
@@ -288,23 +363,43 @@ def export_scene_for_geant4(
         thickness_fe_cm=float(shield_thickness.thickness_fe_cm),
         detector_outer_radius_cm=detector_outer_radius_cm,
     )
-    fe_shield = ExportedShieldModel(
-        path=scene.prim_paths.fe_shield_path,
-        shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
-        inner_radius_m=fe_inner_cm / 100.0,
-        outer_radius_m=(fe_inner_cm + float(shield_thickness.thickness_fe_cm)) / 100.0,
-        thickness_cm=float(shield_thickness.thickness_fe_cm),
-        size_xyz=None,
-        material=ExportedGeant4Material(name="fe", preset_name="iron"),
+    fe_thickness_cm = float(shield_thickness.thickness_fe_cm)
+    fe_inner_radius_m = fe_inner_cm / 100.0
+    fe_thickness_m = fe_thickness_cm / 100.0
+    fe_shield = (
+        None
+        if fe_thickness_cm == 0.0
+        else ExportedShieldModel(
+            path=scene.prim_paths.fe_shield_path,
+            shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
+            inner_radius_m=fe_inner_radius_m,
+            outer_radius_m=fe_inner_radius_m + fe_thickness_m,
+            thickness_cm=fe_thickness_cm,
+            size_xyz=None,
+            material=ExportedGeant4Material(
+                name="fe",
+                preset_name="iron",
+            ),
+        )
     )
-    pb_shield = ExportedShieldModel(
-        path=scene.prim_paths.pb_shield_path,
-        shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
-        inner_radius_m=pb_inner_cm / 100.0,
-        outer_radius_m=(pb_inner_cm + float(shield_thickness.thickness_pb_cm)) / 100.0,
-        thickness_cm=float(shield_thickness.thickness_pb_cm),
-        size_xyz=None,
-        material=ExportedGeant4Material(name="pb", preset_name="lead"),
+    pb_thickness_cm = float(shield_thickness.thickness_pb_cm)
+    pb_inner_radius_m = pb_inner_cm / 100.0
+    pb_thickness_m = pb_thickness_cm / 100.0
+    pb_shield = (
+        None
+        if pb_thickness_cm == 0.0
+        else ExportedShieldModel(
+            path=scene.prim_paths.pb_shield_path,
+            shape=SHIELD_SHAPE_SPHERICAL_OCTANT,
+            inner_radius_m=pb_inner_radius_m,
+            outer_radius_m=pb_inner_radius_m + pb_thickness_m,
+            thickness_cm=pb_thickness_cm,
+            size_xyz=None,
+            material=ExportedGeant4Material(
+                name="pb",
+                preset_name="lead",
+            ),
+        )
     )
     scene_payload = ExportedGeant4Scene(
         scene_hash="",

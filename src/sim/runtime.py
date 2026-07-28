@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import json
 import math
+from numbers import Real
 import os
 from pathlib import Path
 import socket
@@ -22,7 +23,94 @@ from sim.protocol import (
     encode_message,
 )
 from sim.approx.python_transport import PythonTransportSpectrumModel
-from spectrum.pipeline import SpectralDecomposer
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    """Reject non-standard non-finite constants in runtime JSON."""
+    raise ValueError(
+        "Runtime configuration must use finite standard-JSON numbers; "
+        f"found {value}."
+    )
+
+
+def _runtime_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    """Build one runtime JSON object while rejecting duplicate keys."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(
+                f"Runtime configuration contains duplicate key {key!r}."
+            )
+        result[key] = value
+    return result
+
+
+def _config_bool(
+    config: dict[str, Any],
+    key: str,
+    default: bool,
+) -> bool:
+    """Return one exact JSON boolean from a runtime configuration."""
+    value = config.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a JSON boolean.")
+    return value
+
+
+def _config_integer(
+    config: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    """Return one exact JSON integer inside inclusive bounds."""
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be a JSON integer.")
+    resolved = int(value)
+    if resolved < minimum:
+        raise ValueError(f"{key} must be at least {minimum}.")
+    if maximum is not None and resolved > maximum:
+        raise ValueError(f"{key} must be at most {maximum}.")
+    return resolved
+
+
+def _config_number(
+    config: dict[str, Any],
+    key: str,
+    default: float,
+    *,
+    minimum: float,
+    strict_minimum: bool = False,
+) -> float:
+    """Return one finite JSON number above a configured lower bound."""
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a JSON number.")
+    resolved = float(value)
+    if not math.isfinite(resolved):
+        raise ValueError(f"{key} must be finite.")
+    below = resolved <= minimum if strict_minimum else resolved < minimum
+    if below:
+        relation = "greater than" if strict_minimum else "at least"
+        raise ValueError(f"{key} must be {relation} {minimum}.")
+    return resolved
+
+
+def _config_string(
+    config: dict[str, Any],
+    key: str,
+    default: str,
+) -> str:
+    """Return one exact nonempty JSON string from runtime configuration."""
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a nonempty JSON string.")
+    return value
 
 
 class SimulationRuntime(ABC):
@@ -48,7 +136,6 @@ class AnalyticSimulationRuntime(SimulationRuntime):
         self,
         *,
         sources: list[PointSource],
-        decomposer: SpectralDecomposer,
         mu_by_isotope: dict[str, object],
         shield_params: Any,
         rng_seed: int = 123,
@@ -56,12 +143,12 @@ class AnalyticSimulationRuntime(SimulationRuntime):
         obstacle_material: str = "concrete",
         scatter_gain: float = 0.03,
         dead_time_s: float = 0.0,
+        background_rate_cps: float = 0.0,
         detector_model: dict[str, Any] | None = None,
     ) -> None:
         """Store simulator inputs for analytic observation generation."""
         self.transport_model = PythonTransportSpectrumModel(
             sources=sources,
-            decomposer=decomposer,
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
             obstacle_height_m=float(obstacle_height_m),
@@ -69,6 +156,7 @@ class AnalyticSimulationRuntime(SimulationRuntime):
             scatter_gain=float(scatter_gain),
             rng_seed=int(rng_seed),
             dead_time_s=float(dead_time_s),
+            background_rate_cps=float(background_rate_cps),
             detector_model=detector_model,
         )
 
@@ -184,6 +272,7 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         expected_source_bias_mode: str | None = None,
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
+        expected_detector_response_sampling: bool = False,
     ) -> None:
         """Store connection parameters and expected sidecar fidelity."""
         from sim.geant4_app.app import require_primary_sampling_fraction
@@ -237,9 +326,21 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             if expected_source_rate_model is None
             else str(expected_source_rate_model)
         )
-        self.expected_thread_count = (
-            None if expected_thread_count is None else int(expected_thread_count)
-        )
+        if expected_thread_count is None:
+            self.expected_thread_count = None
+        else:
+            if isinstance(expected_thread_count, bool) or not isinstance(
+                expected_thread_count,
+                int,
+            ):
+                raise ValueError(
+                    "expected_thread_count must be a positive JSON integer."
+                )
+            if expected_thread_count <= 0:
+                raise ValueError(
+                    "expected_thread_count must be a positive JSON integer."
+                )
+            self.expected_thread_count = expected_thread_count
         self.expected_physics_profile = (
             None if expected_physics_profile is None else str(expected_physics_profile)
         )
@@ -271,10 +372,33 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             or self.expected_dead_time_tau_s < 0.0
         ):
             raise ValueError("expected_dead_time_tau_s must be finite and nonnegative.")
+        if not isinstance(expected_detector_response_sampling, bool):
+            raise ValueError(
+                "expected_detector_response_sampling must be a boolean."
+            )
+        self.expected_detector_response_sampling = bool(
+            expected_detector_response_sampling
+        )
+        self.expected_surface_source_contract_sha256: str | None = None
+        self.expected_scene_hash: str | None = None
 
     def reset(self, payload: dict[str, Any] | None = None) -> None:
         """Reset the sidecar only after validating its fidelity handshake."""
-        response = self._round_trip("reset", payload or {})
+        from measurement.source_boundary import (
+            surface_source_runtime_contract_sha256,
+        )
+
+        reset_payload = payload or {}
+        sources = reset_payload.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise RuntimeError(
+                "Geant4 reset requires a nonempty canonical surface-source "
+                "payload."
+            )
+        self.expected_surface_source_contract_sha256 = (
+            surface_source_runtime_contract_sha256(sources)
+        )
+        response = self._round_trip("reset", reset_payload)
         self._validate_fidelity_handshake(response)
 
     def step(self, command: SimulationCommand) -> SimulationObservation:
@@ -302,6 +426,13 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             expected_source_bias_mode=self.expected_source_bias_mode,
             expected_background_cps=self.expected_background_cps,
             expected_dead_time_tau_s=self.expected_dead_time_tau_s,
+            expected_detector_response_sampling=(
+                self.expected_detector_response_sampling
+            ),
+            expected_surface_source_contract_sha256=(
+                self.expected_surface_source_contract_sha256
+            ),
+            expected_scene_hash=self.expected_scene_hash,
         )
         return observation
 
@@ -318,8 +449,44 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
             )
         return value
 
+    @staticmethod
+    def _required_handshake_integer(
+        fidelity: dict[str, Any],
+        key: str,
+    ) -> int:
+        """Return an exact JSON integer from a reset handshake or fail closed."""
+        value = fidelity.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(
+                f"Geant4 sidecar fidelity handshake is missing valid {key}."
+            )
+        return value
+
+    @staticmethod
+    def _required_handshake_number(
+        fidelity: dict[str, Any],
+        key: str,
+    ) -> float:
+        """Return a finite JSON number from a reset handshake or fail closed."""
+        value = fidelity.get(key)
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise RuntimeError(
+                f"Geant4 sidecar fidelity handshake is missing valid {key}."
+            )
+        resolved = float(value)
+        if not math.isfinite(resolved):
+            raise RuntimeError(
+                f"Geant4 sidecar fidelity handshake is missing valid {key}."
+            )
+        return resolved
+
     def _validate_fidelity_handshake(self, response: dict[str, Any]) -> None:
         """Reject stale or mismatched Geant4 bridge processes."""
+        from measurement.source_boundary import (
+            SURFACE_EMISSION_EPSILON_M,
+            surface_emission_policy_sha256,
+        )
+
         fidelity = response.get("runtime_fidelity")
         if not isinstance(fidelity, dict):
             raise RuntimeError(
@@ -339,13 +506,8 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
         if self.expected_dead_time_tau_s is not None:
             expected_float_fields["dead_time_tau_s"] = self.expected_dead_time_tau_s
         for key, expected_value in expected_float_fields.items():
-            try:
-                value = float(fidelity[key])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    f"Geant4 sidecar fidelity handshake is missing valid {key}."
-                ) from exc
-            if not math.isfinite(value) or not math.isclose(
+            value = self._required_handshake_number(fidelity, key)
+            if not math.isclose(
                 value,
                 expected_value,
                 rel_tol=1.0e-12,
@@ -354,22 +516,73 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 raise RuntimeError(
                     f"Geant4 sidecar requires {key}={expected_value}, got {value}."
                 )
-        try:
-            actual_target_value = fidelity["target_sampled_primaries"]
-        except KeyError as exc:
-            raise RuntimeError(
-                "Geant4 sidecar fidelity handshake is missing valid "
-                "target_sampled_primaries."
-            ) from exc
-        if isinstance(actual_target_value, bool) or not isinstance(
-            actual_target_value,
-            int,
+        if (
+            fidelity.get("source_position_semantics")
+            != "air_side_native_emission_xyz"
+            or fidelity.get("source_anchor_semantics")
+            != "exact_surface_chart_uv_evaluation_truth"
+            or not self._required_handshake_bool(
+                fidelity,
+                "all_sources_surface_bound",
+            )
+            or fidelity.get("surface_emission_policy_sha256")
+            != surface_emission_policy_sha256()
         ):
             raise RuntimeError(
-                "Geant4 sidecar fidelity handshake has invalid "
-                "target_sampled_primaries."
+                "Geant4 sidecar source-boundary fidelity handshake is invalid."
             )
-        actual_target_sampled_primaries = int(actual_target_value)
+        if fidelity.get("intensity_cps_1m_definition") != (
+            "pre_dead_time_detector_pulse_rate_at_1m"
+        ):
+            raise RuntimeError(
+                "Geant4 sidecar source-strength fidelity handshake is invalid."
+            )
+        source_epsilon_m = self._required_handshake_number(
+            fidelity,
+            "surface_emission_epsilon_m",
+        )
+        if not math.isclose(
+            source_epsilon_m,
+            SURFACE_EMISSION_EPSILON_M,
+            rel_tol=0.0,
+            abs_tol=1.0e-15,
+        ):
+            raise RuntimeError(
+                "Geant4 sidecar source epsilon differs from the PF contract."
+            )
+        source_contract_hash = fidelity.get(
+            "surface_source_contract_sha256"
+        )
+        scene_hash = fidelity.get("scene_hash")
+        for key, value in (
+            ("surface_source_contract_sha256", source_contract_hash),
+            ("scene_hash", scene_hash),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value
+                )
+            ):
+                raise RuntimeError(
+                    f"Geant4 sidecar fidelity handshake has invalid {key}."
+                )
+        if (
+            self.expected_surface_source_contract_sha256 is not None
+            and source_contract_hash
+            != self.expected_surface_source_contract_sha256
+        ):
+            raise RuntimeError(
+                "Geant4 sidecar source strength/position contract hash differs "
+                "from the reset payload."
+            )
+        self.expected_scene_hash = str(scene_hash)
+        actual_target_sampled_primaries = self._required_handshake_integer(
+            fidelity,
+            "target_sampled_primaries",
+        )
         expected_target_sampled_primaries = (
             0
             if self.expected_target_sampled_primaries is None
@@ -436,6 +649,72 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                 f"expected {self.accelerated_weighted_transport_enable}, "
                 f"got {actual_accelerated}."
             )
+        actual_response_sampling = self._required_handshake_bool(
+            fidelity,
+            "sample_detector_response",
+        )
+        if actual_response_sampling != self.expected_detector_response_sampling:
+            raise RuntimeError(
+                "Geant4 sidecar detector-response sampling mismatch: expected "
+                f"{self.expected_detector_response_sampling}, got "
+                f"{actual_response_sampling}."
+            )
+        if self.expected_detector_response_sampling:
+            from spectrum.response_matrix import (
+                NATIVE_GEANT4_BACKGROUND_MODEL_ID,
+                NATIVE_GEANT4_BIN_COUNT,
+                NATIVE_GEANT4_BIN_WIDTH_KEV,
+                NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
+                NATIVE_GEANT4_ENERGY_MAX_KEV,
+                NATIVE_GEANT4_ENERGY_MIN_KEV,
+            )
+
+            expected_response_text = {
+                "detector_response_sampling_contract_sha256": (
+                    NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256
+                ),
+                "background_spectrum_model_id": (
+                    NATIVE_GEANT4_BACKGROUND_MODEL_ID
+                ),
+            }
+            for key, expected_value in expected_response_text.items():
+                actual_value = str(fidelity.get(key, ""))
+                if actual_value != expected_value:
+                    raise RuntimeError(
+                        "Geant4 sidecar full-spectrum handshake mismatch for "
+                        f"{key}: expected {expected_value}, got "
+                        f"{actual_value or 'missing'}."
+                    )
+            expected_response_float = {
+                "spectrum_energy_min_keV": NATIVE_GEANT4_ENERGY_MIN_KEV,
+                "spectrum_energy_max_keV": NATIVE_GEANT4_ENERGY_MAX_KEV,
+                "spectrum_bin_width_keV": NATIVE_GEANT4_BIN_WIDTH_KEV,
+            }
+            for key, expected_value in expected_response_float.items():
+                actual_value = self._required_handshake_number(
+                    fidelity,
+                    key,
+                )
+                if not math.isclose(
+                    actual_value,
+                    float(expected_value),
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                ):
+                    raise RuntimeError(
+                        "Geant4 sidecar full-spectrum handshake mismatch for "
+                        f"{key}: expected {expected_value}, got {actual_value}."
+                    )
+            actual_bin_count = self._required_handshake_integer(
+                fidelity,
+                "spectrum_bin_count",
+            )
+            if actual_bin_count != int(NATIVE_GEANT4_BIN_COUNT):
+                raise RuntimeError(
+                    "Geant4 sidecar full-spectrum handshake has the wrong "
+                    f"spectrum_bin_count: expected {NATIVE_GEANT4_BIN_COUNT}, "
+                    f"got {actual_bin_count}."
+                )
         if self.expected_source_rate_model is not None:
             actual_model = str(fidelity.get("source_rate_model", ""))
             if actual_model != self.expected_source_rate_model:
@@ -445,12 +724,10 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                     f"got {actual_model or 'missing'}."
                 )
         if self.expected_thread_count is not None:
-            try:
-                actual_threads = int(fidelity["requested_threads"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "Geant4 sidecar fidelity handshake is missing requested_threads."
-                ) from exc
+            actual_threads = self._required_handshake_integer(
+                fidelity,
+                "requested_threads",
+            )
             if actual_threads != self.expected_thread_count:
                 raise RuntimeError(
                     "Geant4 sidecar thread-count mismatch: "
@@ -472,12 +749,10 @@ class Geant4TCPClientRuntime(TCPSidecarClientRuntime):
                     f"got {actual_value or 'missing'}."
                 )
         if self.expected_background_cps is not None:
-            try:
-                actual_background_cps = float(fidelity["background_cps"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RuntimeError(
-                    "Geant4 sidecar fidelity handshake is missing background_cps."
-                ) from exc
+            actual_background_cps = self._required_handshake_number(
+                fidelity,
+                "background_cps",
+            )
             if actual_background_cps != self.expected_background_cps:
                 raise RuntimeError(
                     "Geant4 sidecar background rate mismatch: "
@@ -607,6 +882,7 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         expected_source_bias_mode: str | None = None,
         expected_background_cps: float | None = None,
         expected_dead_time_tau_s: float | None = None,
+        expected_detector_response_sampling: bool = False,
     ) -> None:
         """Store the client parameters and owned process handles."""
         super().__init__(
@@ -628,6 +904,9 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
             expected_source_bias_mode=expected_source_bias_mode,
             expected_background_cps=expected_background_cps,
             expected_dead_time_tau_s=expected_dead_time_tau_s,
+            expected_detector_response_sampling=(
+                expected_detector_response_sampling
+            ),
         )
         self.process = process
         self.log_handle = log_handle
@@ -664,9 +943,14 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         """Return whether a transport failure can be retried without changing semantics."""
         if message_type == "shutdown":
             return False
-        if not bool(self.restart_config.get("enabled", True)):
+        if not _config_bool(self.restart_config, "enabled", True):
             return False
-        max_restarts = int(self.restart_config.get("max_restarts", 2))
+        max_restarts = _config_integer(
+            self.restart_config,
+            "max_restarts",
+            2,
+            minimum=0,
+        )
         return self._restart_count < max_restarts
 
     def _restart_sidecar(self) -> None:
@@ -676,7 +960,13 @@ class ManagedGeant4TCPClientRuntime(Geant4TCPClientRuntime):
         config = dict(self.restart_config.get("config", {}))
         log_path = Path(str(self.restart_config["log_path"]))
         extra_args = list(self.restart_config.get("extra_args", []))
-        startup_timeout_s = float(self.restart_config.get("startup_timeout_s", 30.0))
+        startup_timeout_s = _config_number(
+            self.restart_config,
+            "startup_timeout_s",
+            30.0,
+            minimum=0.0,
+            strict_minimum=True,
+        )
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -745,13 +1035,21 @@ def _load_runtime_config(
         raise ValueError(f"Cyclic runtime config inheritance at {config_path}")
     seen.add(config_path)
     with config_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+        data = json.load(
+            handle,
+            object_pairs_hook=_runtime_json_object,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
     if not isinstance(data, dict):
         raise ValueError("Simulation config must be a JSON object.")
     parent_ref = data.pop("extends", None)
-    if parent_ref in (None, ""):
+    if parent_ref is None:
         return data
-    parent_path = Path(str(parent_ref)).expanduser()
+    if not isinstance(parent_ref, str) or not parent_ref.strip():
+        raise ValueError(
+            "Runtime config 'extends' must be a nonempty JSON string."
+        )
+    parent_path = Path(parent_ref).expanduser()
     if not parent_path.is_absolute():
         parent_path = (config_path.parent / parent_path).resolve()
     parent = _load_runtime_config(parent_path, seen=seen)
@@ -832,7 +1130,7 @@ def _resolve_local_isaacsim_python() -> str | None:
 
 def _config_requires_isaacsim_python(config: dict[str, Any]) -> bool:
     """Return True when a sidecar must be launched with Isaac Sim's Python."""
-    if bool(config.get("requires_isaacsim_python", False)):
+    if _config_bool(config, "requires_isaacsim_python", False):
         return True
     if str(config.get("mode", "")).strip().lower() == "real":
         return True
@@ -985,7 +1283,18 @@ def _start_geant4_sidecar(
     ).expanduser()
     if not log_path.is_absolute():
         log_path = (root / log_path).resolve()
-    startup_timeout_s = float(config.get("sidecar_startup_timeout_s", 30.0))
+    startup_timeout_s = _config_number(
+        config,
+        "sidecar_startup_timeout_s",
+        30.0,
+        minimum=0.0,
+        strict_minimum=True,
+    )
+    sidecar_mock_stage = _config_bool(
+        config,
+        "sidecar_mock_stage",
+        False,
+    )
     try:
         process, log_handle = _start_sidecar_process(
             script_path=script_path,
@@ -996,9 +1305,7 @@ def _start_geant4_sidecar(
             timeout_s=startup_timeout_s,
             log_path=log_path,
             sidecar_name="Geant4",
-            extra_args=["--mock-stage"]
-            if bool(config.get("sidecar_mock_stage", False))
-            else None,
+            extra_args=["--mock-stage"] if sidecar_mock_stage else None,
         )
     except Exception:
         if temp_config_path is not None:
@@ -1007,7 +1314,13 @@ def _start_geant4_sidecar(
     return ManagedGeant4TCPClientRuntime(
         host=host,
         port=port,
-        timeout_s=float(config.get("timeout_s", 120.0)),
+        timeout_s=_config_number(
+            config,
+            "timeout_s",
+            120.0,
+            minimum=0.0,
+            strict_minimum=True,
+        ),
         process=process,
         log_handle=log_handle,
         temp_config_path=temp_config_path,
@@ -1030,19 +1343,27 @@ def _start_geant4_sidecar(
         expected_source_bias_mode=validated_geant4_config.source_bias_mode,
         expected_background_cps=validated_geant4_config.background_cps,
         expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
+        expected_detector_response_sampling=(
+            validated_geant4_config.sample_detector_response
+        ),
         restart_config={
-            "enabled": bool(config.get("sidecar_restart_on_disconnect", True)),
-            "max_restarts": int(config.get("sidecar_max_restarts", 2)),
+            "enabled": _config_bool(
+                config,
+                "sidecar_restart_on_disconnect",
+                True,
+            ),
+            "max_restarts": _config_integer(
+                config,
+                "sidecar_max_restarts",
+                2,
+                minimum=0,
+            ),
             "script_path": script_path.as_posix(),
             "config_path": config_path.as_posix(),
             "config": dict(config),
             "log_path": log_path.as_posix(),
             "startup_timeout_s": startup_timeout_s,
-            "extra_args": (
-                ["--mock-stage"]
-                if bool(config.get("sidecar_mock_stage", False))
-                else []
-            ),
+            "extra_args": ["--mock-stage"] if sidecar_mock_stage else [],
         },
     )
 
@@ -1103,12 +1424,29 @@ def _start_isaacsim_sidecar(
         runtime_config_path=runtime_config_path,
         direct_config=direct_config,
     )
-    host = str(isaac_config.get("host", "127.0.0.1"))
-    port = int(isaac_config.get("port", 5555))
-    timeout_s = float(isaac_config.get("timeout_s", 10.0))
-    keep_alive = bool(
-        isaac_config.get("keep_sidecar_alive", False)
-        or config.get("isaacsim_keep_sidecar_alive", False)
+    host = _config_string(isaac_config, "host", "127.0.0.1")
+    port = _config_integer(
+        isaac_config,
+        "port",
+        5555,
+        minimum=1,
+        maximum=65535,
+    )
+    timeout_s = _config_number(
+        isaac_config,
+        "timeout_s",
+        10.0,
+        minimum=0.0,
+        strict_minimum=True,
+    )
+    keep_alive = (
+        _config_bool(
+            config,
+            "isaacsim_keep_sidecar_alive",
+            False,
+        )
+        if "isaacsim_keep_sidecar_alive" in config
+        else _config_bool(isaac_config, "keep_sidecar_alive", False)
     )
     if _tcp_server_available(host, port):
         if temp_config_path is not None:
@@ -1127,7 +1465,13 @@ def _start_isaacsim_sidecar(
     ).expanduser()
     if not log_path.is_absolute():
         log_path = (root / log_path).resolve()
-    startup_timeout_s = float(config.get("isaacsim_sidecar_startup_timeout_s", 60.0))
+    startup_timeout_s = _config_number(
+        config,
+        "isaacsim_sidecar_startup_timeout_s",
+        60.0,
+        minimum=0.0,
+        strict_minimum=True,
+    )
     process_config = dict(isaac_config)
     isaac_python = config.get(
         "isaacsim_sidecar_python",
@@ -1152,7 +1496,9 @@ def _start_isaacsim_sidecar(
             log_path=log_path,
             sidecar_name="Isaac Sim",
             extra_args=(
-                ["--mock"] if bool(config.get("isaacsim_sidecar_mock", False)) else None
+                ["--mock"]
+                if _config_bool(config, "isaacsim_sidecar_mock", False)
+                else None
             ),
         )
     except Exception:
@@ -1175,7 +1521,11 @@ def _maybe_pair_geant4_with_isaacsim(
     geant4_runtime: SimulationRuntime,
 ) -> SimulationRuntime:
     """Wrap Geant4 with an Isaac Sim companion runtime when configured."""
-    if not bool(config.get("start_isaacsim_sidecar_with_geant4", True)):
+    if not _config_bool(
+        config,
+        "start_isaacsim_sidecar_with_geant4",
+        True,
+    ):
         return geant4_runtime
     try:
         isaacsim_runtime = _start_isaacsim_sidecar(config)
@@ -1192,7 +1542,6 @@ def create_simulation_runtime(
     backend: str,
     *,
     sources: list[PointSource],
-    decomposer: SpectralDecomposer,
     mu_by_isotope: dict[str, object],
     shield_params: Any,
     runtime_config: dict[str, Any] | None = None,
@@ -1200,20 +1549,49 @@ def create_simulation_runtime(
 ) -> SimulationRuntime:
     """Instantiate the requested simulation runtime."""
     config = {} if runtime_config is None else dict(runtime_config)
+    if not isinstance(backend, str) or not backend.strip():
+        raise ValueError("Simulation backend must be a nonempty string.")
     normalized = backend.strip().lower()
     if normalized == "analytic":
-        rng_seed = int(config.get("rng_seed", 123))
+        rng_seed = _config_integer(
+            config,
+            "rng_seed",
+            123,
+            minimum=0,
+        )
         return AnalyticSimulationRuntime(
             sources=sources,
-            decomposer=decomposer,
             mu_by_isotope=mu_by_isotope,
             shield_params=shield_params,
             rng_seed=rng_seed,
-            obstacle_height_m=float(config.get("obstacle_height_m", 2.0)),
-            obstacle_material=str(config.get("obstacle_material", "concrete")),
-            scatter_gain=float(config.get("scatter_gain", 0.03)),
-            dead_time_s=float(
-                config.get("dead_time_tau_s", config.get("dead_time_s", 0.0))
+            obstacle_height_m=_config_number(
+                config,
+                "obstacle_height_m",
+                2.0,
+                minimum=0.0,
+            ),
+            obstacle_material=_config_string(
+                config,
+                "obstacle_material",
+                "concrete",
+            ),
+            scatter_gain=_config_number(
+                config,
+                "scatter_gain",
+                0.03,
+                minimum=0.0,
+            ),
+            dead_time_s=_config_number(
+                config,
+                "dead_time_tau_s",
+                0.0,
+                minimum=0.0,
+            ),
+            background_rate_cps=_config_number(
+                config,
+                "background_rate_cps",
+                0.0,
+                minimum=0.0,
             ),
             detector_model=(
                 dict(config["detector_model"])
@@ -1222,11 +1600,23 @@ def create_simulation_runtime(
             ),
         )
     if normalized == "isaacsim":
-        host = str(config.get("host", "127.0.0.1"))
-        port = int(config.get("port", 5555))
-        timeout_s = float(config.get("timeout_s", 10.0))
-        keep_alive = bool(config.get("keep_sidecar_alive", False))
-        auto_start = bool(config.get("auto_start_sidecar", True))
+        host = _config_string(config, "host", "127.0.0.1")
+        port = _config_integer(
+            config,
+            "port",
+            5555,
+            minimum=1,
+            maximum=65535,
+        )
+        timeout_s = _config_number(
+            config,
+            "timeout_s",
+            10.0,
+            minimum=0.0,
+            strict_minimum=True,
+        )
+        keep_alive = _config_bool(config, "keep_sidecar_alive", False)
+        auto_start = _config_bool(config, "auto_start_sidecar", True)
         if auto_start and not _tcp_server_available(host, port):
             return _start_isaacsim_sidecar(
                 config,
@@ -1243,10 +1633,22 @@ def create_simulation_runtime(
         from sim.geant4_app.app import Geant4AppConfig
 
         validated_geant4_config = Geant4AppConfig.from_dict(config)
-        host = str(config.get("host", "127.0.0.1"))
-        port = int(config.get("port", 5556))
-        timeout_s = float(config.get("timeout_s", 120.0))
-        auto_start = bool(config.get("auto_start_sidecar", True))
+        host = _config_string(config, "host", "127.0.0.1")
+        port = _config_integer(
+            config,
+            "port",
+            5556,
+            minimum=1,
+            maximum=65535,
+        )
+        timeout_s = _config_number(
+            config,
+            "timeout_s",
+            120.0,
+            minimum=0.0,
+            strict_minimum=True,
+        )
+        auto_start = _config_bool(config, "auto_start_sidecar", True)
         if auto_start and not _tcp_server_available(host, port):
             geant4_runtime = _start_geant4_sidecar(
                 config,
@@ -1280,6 +1682,9 @@ def create_simulation_runtime(
                 expected_source_bias_mode=validated_geant4_config.source_bias_mode,
                 expected_background_cps=validated_geant4_config.background_cps,
                 expected_dead_time_tau_s=validated_geant4_config.dead_time_tau_s,
+                expected_detector_response_sampling=(
+                    validated_geant4_config.sample_detector_response
+                ),
             )
         return _maybe_pair_geant4_with_isaacsim(config, geant4_runtime)
     raise ValueError(f"Unknown simulation backend: {backend}")

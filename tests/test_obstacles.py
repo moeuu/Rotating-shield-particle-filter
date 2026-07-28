@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from measurement.obstacles import (
     ObstacleGrid,
@@ -57,6 +58,192 @@ def test_obstacle_grid_batch_free_space_matches_scalar() -> None:
     scalar = np.asarray([grid.is_free(point) for point in points], dtype=bool)
 
     assert np.array_equal(batch, scalar)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("origin", ("0.0", 0.0)),
+        ("origin", (float("nan"), 0.0)),
+        ("cell_size", "1.0"),
+        ("cell_size", True),
+        ("cell_size", 0.0),
+        ("grid_shape", (2.0, 2)),
+        ("grid_shape", (True, 2)),
+        ("blocked_cells", (("0", 0),)),
+        ("blocked_cells", ((0.0, 0),)),
+        ("blocked_cells", ((True, 0),)),
+        ("blocked_cells", ((0, 0), (0, 0))),
+    ),
+)
+def test_obstacle_grid_rejects_implicit_scalar_coercion_and_duplicates(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    """Grid geometry must not silently reinterpret malformed JSON values."""
+    values: dict[str, object] = {
+        "origin": (0.0, 0.0),
+        "cell_size": 1.0,
+        "grid_shape": (2, 2),
+        "blocked_cells": ((0, 0),),
+    }
+    values[field_name] = invalid_value
+
+    with pytest.raises(ValueError):
+        ObstacleGrid(**values)
+
+
+@pytest.mark.parametrize(
+    "box",
+    (
+        (0.0, 0.0, 0.0, 0.0, 1.0, 1.0),
+        (0.0, 0.0, 0.0, -1.0, 1.0, 1.0),
+        (0.0, 0.0, 0.0, "1.0", 1.0, 1.0),
+        (0.0, 0.0, 0.0, True, 1.0, 1.0),
+        (0.0, 0.0, 0.0, float("nan"), 1.0, 1.0),
+    ),
+)
+def test_obstacle_grid_rejects_invalid_physical_boxes(
+    box: tuple[object, ...],
+) -> None:
+    """Every collision and transport solid must have finite positive volume."""
+    base = {
+        "origin": (0.0, 0.0),
+        "cell_size": 1.0,
+        "grid_shape": (2, 2),
+        "blocked_cells": (),
+    }
+    with pytest.raises(ValueError):
+        ObstacleGrid(**base, collision_boxes_m=(box,))
+    with pytest.raises(ValueError):
+        ObstacleGrid(**base, transport_boxes_m=(box,))
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("collision_boxes_m", "transport_boxes_m"),
+)
+def test_obstacle_grid_rejects_positive_volume_box_overlap(
+    field_name: str,
+) -> None:
+    """Overlapping physical solids must not double-count attenuation or geometry."""
+    boxes = (
+        (0.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+        (0.5, 0.5, 0.5, 1.5, 1.5, 1.5),
+    )
+    values = {
+        "origin": (0.0, 0.0),
+        "cell_size": 1.0,
+        "grid_shape": (2, 2),
+        "blocked_cells": (),
+        field_name: boxes,
+    }
+
+    with pytest.raises(ValueError, match="positive-volume overlap"):
+        ObstacleGrid(**values)
+
+
+@pytest.mark.parametrize(
+    "gap_m",
+    (0.0, -5.0e-13),
+)
+def test_obstacle_grid_allows_face_contact_and_roundoff(
+    gap_m: float,
+) -> None:
+    """Face contact within serialization roundoff is not a volume overlap."""
+    first = (0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+    second = (
+        1.0 + gap_m,
+        0.0,
+        0.0,
+        2.0 + gap_m,
+        1.0,
+        1.0,
+    )
+
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=(),
+        transport_boxes_m=(first, second),
+    )
+
+    assert grid.transport_boxes_m == (first, second)
+
+
+@pytest.mark.parametrize(
+    "invalid_table",
+    (
+        {"Cs-137": ("0.1",)},
+        {"Cs-137": (True,)},
+        {"Cs-137": (float("nan"),)},
+        {"Cs-137": (-0.1,)},
+        {1: (0.1,)},
+        {"": (0.1,)},
+        {"Cs-137": (0.1,), "CS137": (0.1,)},
+    ),
+)
+def test_obstacle_grid_rejects_invalid_attenuation_tables(
+    invalid_table: dict[object, tuple[object, ...]],
+) -> None:
+    """Attenuation metadata must match one unambiguous physical box model."""
+    with pytest.raises(ValueError):
+        ObstacleGrid(
+            origin=(0.0, 0.0),
+            cell_size=1.0,
+            grid_shape=(1, 1),
+            blocked_cells=(),
+            transport_boxes_m=((0.0, 0.0, 0.0, 1.0, 1.0, 1.0),),
+            transport_mu_by_isotope=invalid_table,
+        )
+
+
+def test_obstacle_grid_json_requires_complete_consistent_schema() -> None:
+    """Serialized layouts must not fall back to invented grid geometry."""
+    payload = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(2, 2),
+        blocked_cells=((0, 0),),
+    ).to_dict()
+
+    missing = dict(payload)
+    missing.pop("origin")
+    with pytest.raises(ValueError, match="schema mismatch"):
+        ObstacleGrid.from_dict(missing)
+
+    unknown = dict(payload)
+    unknown["cells"] = []
+    with pytest.raises(ValueError, match="schema mismatch"):
+        ObstacleGrid.from_dict(unknown)
+
+    wrong_fraction = dict(payload)
+    wrong_fraction["blocked_fraction"] = 0.0
+    with pytest.raises(ValueError, match="does not match"):
+        ObstacleGrid.from_dict(wrong_fraction)
+
+    wrong_version = dict(payload)
+    wrong_version["version"] = "1"
+    with pytest.raises(ValueError, match="JSON integer"):
+        ObstacleGrid.from_dict(wrong_version)
+
+
+def test_blocked_boxes_rejects_invalid_vertical_extent() -> None:
+    """Grid extrusion must not swap or create a zero-thickness solid."""
+    grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=((0, 0),),
+    )
+
+    with pytest.raises(ValueError, match="greater"):
+        grid.blocked_boxes(z_min=2.0, z_max=1.0)
+    with pytest.raises(ValueError, match="greater"):
+        grid.blocked_boxes(z_min=1.0, z_max=1.0)
+    with pytest.raises(ValueError, match="real number"):
+        grid.blocked_boxes(z_min="0.0", z_max=1.0)
 
 
 def test_collision_geometry_roundtrips_and_survives_transport_attachment(

@@ -1,4 +1,4 @@
-"""Strict forward-model identity contract for MeasurementLog schema version 1."""
+"""Strict physical identity contract for full-spectrum MeasurementLog v2."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from measurement.shielding import line_resolved_shield_mu_by_isotope
 from pf.provenance import sha256_json
 
 
-FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 1
+FORWARD_MODEL_MANIFEST_SCHEMA_VERSION = 2
 SOURCE_RATE_MODEL = "detector_cps_1m"
 SOURCE_RATE_SEMANTICS = {
-    "quantity": "expected_net_detector_count_rate",
+    "quantity": "expected_pre_dead_time_detector_pulse_rate",
     "unit": "cps",
     "normalization_distance_m": 1.0,
 }
@@ -29,8 +29,15 @@ RESPONSE_SEMANTICS = {
     "detector_geometry": "model_identifier_bound",
     "shield_attenuation": "fe_pb_orientation_pair_8x8",
     "obstacle_attenuation": "line_segment_material_attenuation",
-    "live_time_scaling": "expected_counts_linear_in_live_time_s",
-    "line_resolved_response": "energy_bin_integrated_isotope_line_response",
+    "live_time_scaling": (
+        "incident_rate_linear_then_nonparalyzable_renewal_detection"
+    ),
+    "line_resolved_response": (
+        "source_resolved_geometry_conditioned_full_spectrum"
+    ),
+    "observation_distribution": (
+        "joint_renewal_total_and_conditional_energy_marks"
+    ),
 }
 REQUIRED_MODEL_NAMES = (
     "detector",
@@ -41,41 +48,6 @@ REQUIRED_MODEL_NAMES = (
     "spectrum",
 )
 
-# The only non-native physical model accepted without re-deriving its component
-# hashes from the resolved local runtime configuration.  Every field remains
-# bound to production code below; this is not a permissive identifier alias.
-CONFORMANCE_FORWARD_MODEL_ID = "rotating-shield-analytic-conformance-v1"
-CONFORMANCE_MODEL_IDENTIFIERS = {
-    "detector": {
-        "id": "detector-v1",
-        "sha256": "981049f0f4814240604524186d326e046cf23d9dfeb8b7d71ca3f1480bceaf6e",
-    },
-    "shield": {
-        "id": "shield-fe-pb-8x8-v1",
-        "sha256": "c5e24ded41d8f15b59cbcb08d37c41d281a3867aa39e5fde4bf1bfb6004160f3",
-    },
-    "environment": {
-        "id": "room-6x6x3-v1",
-        "sha256": "d89a96dac3846f84e72daac9559a95812e291824ac023d0f29420e37df798673",
-    },
-    "obstacle": {
-        "id": "obstacle-box-v1",
-        "sha256": "b3fb1cbad6e3fd9c44feb6d3a1a12a733b0ddd93ab87a083e4f9fde631d0c7bc",
-    },
-    "transport": {
-        "id": "analytic-transport-v1",
-        "sha256": "232443b41c8862d6247f4e8c2bd22d96e416107b50475f171be464540c7fa117",
-    },
-    "spectrum": {
-        "id": "spectrum-lines-v1",
-        "sha256": "49cc8ee41dea713ed6dcae459d676ffe78e6b70cacbfea2eba6df2eb732ace73",
-    },
-}
-_CONFORMANCE_SHIELD_PROGRAM = {
-    "fe_orientation_count": 8,
-    "pb_orientation_count": 8,
-    "pair_count": 64,
-}
 _NATIVE_FIELDS = {
     "schema_version",
     "repository_commit",
@@ -87,7 +59,6 @@ _NATIVE_FIELDS = {
     "response_semantics",
     "line_mu_by_isotope",
 }
-_REGISTERED_FIELDS = _NATIVE_FIELDS | {"forward_model_id", "shield_program"}
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -115,11 +86,6 @@ def production_line_mu_by_isotope(
         ]
         for isotope in isotope_order
     }
-
-
-def registered_conformance_line_mu_by_isotope() -> dict[str, list[dict[str, float]]]:
-    """Return the production table bound by the shared conformance registry."""
-    return production_line_mu_by_isotope(("Cs-137", "Co-60", "Eu-154"))
 
 
 def line_energy_weight_by_isotope(
@@ -354,7 +320,21 @@ def forward_model_component_payloads(
                 "buildup",
             )
         },
-        "spectrum": line_energy_weight_by_isotope(line_table),
+        "spectrum": {
+            "line_energy_weight_by_isotope": (
+                line_energy_weight_by_isotope(line_table)
+            ),
+            "full_spectrum_generative_model": deepcopy(
+                runtime.get("full_spectrum_generative_model")
+            ),
+            "full_spectrum_contract_hash_sha256": runtime.get(
+                "full_spectrum_contract_hash_sha256"
+            ),
+            "energy_min_keV": runtime.get("energy_min_keV"),
+            "energy_max_keV": runtime.get("energy_max_keV"),
+            "bin_width_keV": runtime.get("bin_width_keV"),
+            "energy_bin_count": runtime.get("energy_bin_count"),
+        },
     }
     if obstacle_layout_path is not None:
         payloads["obstacle"]["layout_asset"] = _file_asset_identity(
@@ -423,13 +403,13 @@ def build_forward_model_manifest(
         ),
         "transport": _identifier(
             (runtime,),
-            ("transport_model_id", "transport_response_model_id"),
-            "continuous_inverse_square_shield_obstacle_transport.v1",
+            ("transport_model_id",),
+            "continuous_geometry_additive_noncollided_transport.v1",
         ),
         "spectrum": _identifier(
             (runtime,),
             ("spectrum_model_id", "spectrum_response_model_id"),
-            "line_resolved_detector_spectrum_response.v1",
+            "geometry_conditioned_joint_full_spectrum.v1",
         ),
     }
     return {
@@ -508,7 +488,7 @@ def _validate_common(
     resolved_config_sha256: str,
     source_rate_model: str,
 ) -> None:
-    """Validate semantics shared by native and registered manifests."""
+    """Validate semantics shared by production-native manifests."""
     if payload.get("schema_version") != FORWARD_MODEL_MANIFEST_SCHEMA_VERSION:
         raise ValueError("Unsupported forward-model manifest schema_version.")
     if str(source_rate_model).strip().lower() != SOURCE_RATE_MODEL:
@@ -530,54 +510,6 @@ def _validate_common(
         raise ValueError("forward-model response_semantics are incompatible.")
 
 
-def _validate_registered_conformance_manifest(
-    payload: dict[str, object],
-    *,
-    isotopes: tuple[str, ...],
-    repository_commit: str,
-    resolved_config_sha256: str,
-    source_rate_model: str,
-) -> dict[str, object]:
-    """Fail closed while binding the registered fixture to local production code."""
-    if set(payload) != _REGISTERED_FIELDS:
-        raise ValueError(
-            "Registered forward-model fields must be exactly "
-            f"{sorted(_REGISTERED_FIELDS)}."
-        )
-    if payload.get("forward_model_id") != CONFORMANCE_FORWARD_MODEL_ID:
-        raise ValueError("Unknown registered forward_model_id.")
-    _validate_common(
-        payload,
-        repository_commit=repository_commit,
-        resolved_config_sha256=resolved_config_sha256,
-        source_rate_model=source_rate_model,
-    )
-    expected_line_table = registered_conformance_line_mu_by_isotope()
-    if isotopes != tuple(expected_line_table):
-        raise ValueError("Registered forward-model isotope order is incompatible.")
-    if payload.get("shield_program") != _CONFORMANCE_SHIELD_PROGRAM:
-        raise ValueError("Registered forward-model shield_program is incompatible.")
-    if payload.get("line_mu_by_isotope") != expected_line_table:
-        raise ValueError(
-            "Registered forward-model spectral line table is incompatible."
-        )
-    spectrum_table = line_energy_weight_by_isotope(expected_line_table)
-    if (
-        sha256_json(expected_line_table)
-        != CONFORMANCE_MODEL_IDENTIFIERS["shield"]["sha256"]
-        or sha256_json(spectrum_table)
-        != CONFORMANCE_MODEL_IDENTIFIERS["spectrum"]["sha256"]
-    ):
-        raise RuntimeError(
-            "Local production line tables no longer match registered model hashes."
-        )
-    payload["model_identifiers"] = _validate_model_identifiers(
-        payload.get("model_identifiers"),
-        expected=CONFORMANCE_MODEL_IDENTIFIERS,
-    )
-    return payload
-
-
 def validate_forward_model_manifest(
     manifest: Mapping[str, object],
     *,
@@ -591,30 +523,11 @@ def validate_forward_model_manifest(
     run_root: str | Path | None = None,
     repository_root: str | Path = _REPOSITORY_ROOT,
 ) -> dict[str, object]:
-    """Prove that a manifest exactly matches a local or registered model."""
+    """Prove that a manifest exactly matches the local production model."""
     if not isinstance(manifest, Mapping):
         raise TypeError("forward_model_manifest must be a mapping.")
     payload = deepcopy(dict(manifest))
     isotope_order = tuple(str(value) for value in isotopes)
-    registered_id = payload.get("forward_model_id")
-    if registered_id is not None:
-        if registered_id != CONFORMANCE_FORWARD_MODEL_ID:
-            raise ValueError(
-                f"Unknown registered forward_model_id {registered_id!r}; refusing fallback."
-            )
-        if obstacle_layout_path is not None or _runtime_file_asset_references(
-            runtime_config
-        ):
-            raise ValueError(
-                "Registered conformance manifests cannot reference file-backed assets."
-            )
-        return _validate_registered_conformance_manifest(
-            payload,
-            isotopes=isotope_order,
-            repository_commit=repository_commit,
-            resolved_config_sha256=resolved_config_sha256,
-            source_rate_model=source_rate_model,
-        )
     if set(payload) != _NATIVE_FIELDS:
         raise ValueError(
             f"Native forward-model fields must be exactly {sorted(_NATIVE_FIELDS)}."
@@ -649,8 +562,6 @@ def validate_forward_model_manifest(
 
 __all__ = [
     "CANONICAL_UNITS",
-    "CONFORMANCE_FORWARD_MODEL_ID",
-    "CONFORMANCE_MODEL_IDENTIFIERS",
     "FORWARD_MODEL_MANIFEST_SCHEMA_VERSION",
     "REQUIRED_MODEL_NAMES",
     "RESPONSE_SEMANTICS",
@@ -660,7 +571,6 @@ __all__ = [
     "forward_model_component_payloads",
     "line_energy_weight_by_isotope",
     "production_line_mu_by_isotope",
-    "registered_conformance_line_mu_by_isotope",
     "resolve_file_backed_model_asset",
     "validate_forward_model_manifest",
 ]

@@ -2,169 +2,176 @@
 
 ## Estimator boundary
 
-The scientific runtime requires `pure_pf_schema_version: 1`, accepts the single
-estimator profile `pf_strict`, and follows one sequential data flow:
+The scientific runtime accepts one estimator profile, `pf_strict`, under
+`pure_pf_schema_version: 1`. Its sequential data flow is:
 
 ```text
-raw spectrum + detector pose + shield state
-        -> response_poisson count extraction and covariance
-        -> append one MeasurementLog record
-        -> sequential particle-filter update
-        -> PF posterior snapshot
+unit-weight Geant4 detector events
+        -> sampled detector-response marks
+        -> event-time non-paralyzable dead time
+        -> one integer full-spectrum station record
+        -> joint full-spectrum SMC/RJ update
+        -> one aligned multi-isotope PF posterior
              |-> PF-only DSS-PP belief
-             `-> PF posterior point report
+             `-> coherent posterior-particle report
 ```
 
-The log append precedes the update. Ground truth is stored separately and is
-used only for evaluation. Source cardinality, three-dimensional position,
-strength, and background remain particle state throughout runtime, replay,
-planning, and reporting. The versioned schema is the complete compatibility
-boundary; runtime configurations do not depend on a catalog of historical
-options. Unknown or retired estimator keys, likelihood aliases, and incomplete
-replay records fail closed instead of selecting historical behavior.
+The MeasurementLog append precedes the update. Ground truth is stored outside
+the inference log and is used only for evaluation. Source cardinality,
+continuous surface position, and strength remain particle state throughout
+runtime, replay, planning, and reporting.
 
-## Physical source support
+There are no position MLE, batch fit, strength refit, surface-map rescue,
+count-extraction rescue, or report-time optimization paths. Unknown, retired,
+or incomplete runtime settings fail closed.
 
-Standard random ground truth is sampled as a continuous point from the shared
-physical room and transport-obstacle surfaces. Sampling is uniform with respect
-to physical surface area across the floor, ceiling, walls, and every exposed
-transport-component face, including the underside of a raised component. It
-does not condition the draw on height, visibility, ceiling count, source
-separation, or response observability.
+## Joint full-spectrum observation model
 
-The current PF position state is more restrictive than that continuous truth
-support. Python, Geant4, and Isaac Sim entry points construct the source state
-space directly from the physical environment, but the exact structural kernel
-discretizes it into a finite dictionary of surface-patch centers:
+The PF does not estimate isotope counts before inference. One immutable
+source-resolved generative model owns:
 
-- floor and ceiling;
-- room walls;
-- every exposed obstacle-component face.
+- the exact analysis energy axis and positive gamma-line order;
+- detector-response marking and physical background;
+- non-paralyzable renewal total-count statistics;
+- conditional full-spectrum mark statistics;
+- declared, training-only transport-model uncertainty;
+- NumPy and Torch likelihoods;
+- predictive means and samples used by DSS; and
+- posterior-predictive innovation diagnostics.
 
-Each patch carries its physical area. Initial positions and structural
-proposals use the same area-weighted dictionary, prohibit duplicate patch
-indices within one isotope state, and store positions in canonical patch-index
-order. The finite patch spacing is part of the declared model and sets a
-discretization error floor; exactness below refers to this finite-state target,
-not to an undiscretized continuous surface.
+The model contract is identified by a SHA-256 digest covering its physics,
+parameters, energy axis, line order, and validation provenance. Runtime use is
+allowed only after predeclared independent Geant4 holdouts pass production
+gates. PF, exact RJ moves, replay, and DSS call this same model. No additional
+isotope-count, contrast, view-ratio, Poisson, or covariance likelihood is
+added.
 
-All position transitions operate on patch indices and preserve the declared
-area-weighted surface measure. Detector measurement poses remain collision-free
-points in reachable free space; detector support and source support are
-intentionally different physical domains.
+Production observations are nonnegative integer histograms produced from
+unit-weight detector events. Fractional, weighted, truncated, energy-axis
+mismatched, or contract-mismatched spectra are rejected.
 
-The planned continuous-support migration will retain finite patches only as
-surface-atlas charts and store a continuous local coordinate within the chosen
-chart. Birth, death, and position proposals must then include the corresponding
-continuous surface densities and forward/reverse proposal terms. Until that
-migration is implemented, PF positions cannot take arbitrary values on a
-surface and the configured patch spacing remains a localization-error floor.
+## Continuous physical source support
 
-## Sequential likelihood and structural moves
+Random ground truth and the PF use the same exposed physical surface union:
 
-The PF likelihood consumes the logged `response_poisson` isotope counts and
-their covariance. Transport-model, spectrum-model, counting, and correlated
-station-view uncertainty are composed once by the production likelihood.
-Sequential weight updates and structural trials call the same likelihood
-implementation.
+- floor and ceiling portions not hidden by touching transport solids;
+- all exposed room-wall portions;
+- all exposed faces of transport components, including the underside of a
+  raised component.
 
-The PF applies one exact, internal reversible-jump resample-move kernel whose
-invariant target is the current finite-surface posterior:
+Blocked navigation cells do not invent source surfaces. Truth positions are
+independent continuous draws from normalized physical surface area, with no
+height, visibility, ceiling-count, separation, or response-observability
+conditioning.
 
-- the cardinality prior is declared before inference;
-- a distinct set of source patches has probability proportional to the product
-  of its patch areas;
-- each source strength is sampled from the same normalized physical prior used
-  at initialization;
-- birth and death include the forward and reverse move probabilities, proposal
-  densities, cardinality and source priors, and the unit dimension-matching
-  Jacobian in the Metropolis-Hastings ratio;
-- within-cardinality patch moves compose an area-prior independence proposal
-  for global reachability with a local proposal over physically adjacent,
-  unoccupied patches; the local acceptance ratio includes the forward/reverse
-  available-neighbor degree correction;
-- strength moves use a reversible prior-independence
-  Metropolis-Hastings transition; and
-- accepted rejuvenation moves leave the outer particle weights unchanged.
+Rectangular surface charts define atlas topology only. A PF source stores
+`(chart_id, u, v, strength)` with continuous `u,v` in the chart unit square;
+the chart edge limit controls atlas topology and batching, not localization
+resolution. XYZ is derived directly from chart coordinates and passed to the
+continuous physical response kernel. Missing or inconsistent chart
+coordinates fail instead of being reconstructed or projected.
 
-Move probabilities are normalized at the `K=0` and `K=max_sources`
-boundaries. Thus both fixed-cardinality operation and variable-cardinality
-operation have explicit target-preserving semantics within the same PF.
+Birth and global-position proposals include chart mass and continuous UV
+density. Local moves draw a symmetric physical tangent displacement and unfold
+it across valid shared-edge portals; the coordinate-area ratio is included in
+the MH proposal ratio. All target responses are evaluated at continuous XYZ,
+without patch-center interpolation.
 
-There is no second full-spectrum PF likelihood. Spectrum processing produces
-the isotope count vector and propagated covariance once; runtime updates,
-structural moves, planning, and replay all consume that same statistical
-contract.
+## Joint SMC and exact structural moves
 
-## Posterior reporting
+One aligned particle row represents the simultaneous state of every isotope.
+The initial distribution is the independent product of each isotope's
+predeclared cardinality, surface-area, and strength priors. All isotope
+containers share one outer weight and one resampling ancestry.
 
-For each isotope, particle weights are accumulated by source cardinality. The
-MAP cardinality stratum uses deterministic lowest-cardinality tie breaking.
-Source slots are aligned within particles and summarized into posterior
-position, covariance, credible radius, strength interval, and background
-interval.
+The standard cardinality policy is
+`independent_truncated_poisson_surface_source_count_v1`: independently for
+each isotope, a Poisson source-count prior with predeclared mean 2.0 is
+normalized on the exact configured support `K = 0, ..., 5`. This encodes the
+design assumption of sparse surface contamination; it is fixed before any
+observation and was not selected from a failed replay. Every result manifest
+records the policy name, mean, support, and complete normalized probability
+vector. Ground-truth isotope counts and strengths are checked against PF
+support before any external Geant4 process starts. The policy remains subject
+to the designated independent holdout acceptance gate; a failed holdout does
+not authorize retuning it on that holdout.
 
-The public reporting API is:
+Each station is tempered to `beta = 1`. If a partial likelihood would cross the
+target ESS, the PF applies only the admissible increment, resamples all isotope
+states with one ancestor vector, and rejuvenates at the current intermediate
+target before continuing. Reaching a temper-step safety bound before
+`beta = 1`, or finishing below the ESS contract, is an error rather than a
+forced likelihood application.
 
-- `posterior_cardinality_distribution()`;
-- `posterior_point_estimate()`;
-- `posterior_snapshot()`.
+Within each intermediate target, conditional isotope moves evaluate the full
+joint spectrum with all other isotope states held fixed. The reversible-jump
+kernel includes:
 
-Compatibility `estimates()` is a deterministic projection of the current PF
-posterior.
+- full-support data-informed birth and global proposals with explicit
+  forward/reverse densities;
+- exact birth/death cardinality, position, strength, move-direction, and
+  Jacobian terms;
+- continuous local surface moves;
+- bounded-strength MH moves;
+- exact split/merge strength-transfer transforms; and
+- joint death plus strength transfer where admissible.
 
-## Planner and mission control
+Proposal scoring may use observations to improve mixing, but it does not alter
+the target likelihood and every non-prior proposal density appears in the MH/RJ
+ratio. Accepted rejuvenation moves leave outer particle weights unchanged.
 
-DSS-PP receives the current PF posterior. Cardinality pressure is derived from
-the normalized PF posterior cardinality distribution. Expected future response
-discrimination is evaluated from PF modes and hypothetical future observations.
-Every candidate station, including a same-XY height change, is scored with its
-own optimized shield program. The previous station's shield sequence is never
-reused as a height-transition special case.
+Diagnostics report the current ESS after all applied likelihood, the number of
+surviving station-start ancestors, and attempted/accepted posterior weight mass
+for every structural move. Counts of unweighted moved particles are retained
+only as secondary diagnostics.
 
-Standard experiment configs use a fixed measurement/action budget. Continuous
-XYZ detector candidates, collision-aware workspace filtering, height changes,
-collision-free motion, and shared Geant4/PF obstacle attenuation remain
-unchanged.
+## Posterior reporting and stopping
+
+Cardinality probabilities are computed from the aligned joint weights. The
+official point report selects one joint MAP cardinality vector and one existing
+posterior particle as the configuration representative, so reported sources
+coexisted and remain on their original continuous surfaces. It never averages
+positions into a solid or projects a synthetic mean back to a surface.
+
+Uncertainty and stopping diagnostics use intrinsic surface path radius or
+credible area, current ESS, cardinality-boundary mass, and model-native
+posterior-predictive innovation. A rank-deficient three-dimensional covariance
+determinant is not treated as surface convergence.
+
+## Planner
+
+DSS-PP receives aligned PF particles without renormalizing away `P(K=0)`.
+Modes use existing surface representatives, and the planner retains at least
+the PF source-slot limit for every isotope.
+
+Candidate spectra are sampled and scored with the same joint generative model
+used by the PF. The standard planner uses `horizon = 1`; a longer horizon is
+invalid until belief and coverage are conditionally rolled forward. Candidate
+generation covers reachable three-dimensional free space and scores each
+station's own shield program. PF-independent continuous-surface observability
+coverage prevents an absent high-wall or ceiling mode from becoming an
+exploration absorbing state.
 
 ## Execution model
 
-When CUDA is available, expected-count kernels, observation likelihoods,
-spectrum processing, and shield-pair information-gain grids use batched torch
-operations. CPU execution uses the same equations in batched NumPy form.
-
-Geant4 transport uses native worker threads. Candidate-pose and DSS-PP program
-evaluation use worker or batched paths; exact RJ response and likelihood
-evaluation is batched across proposed particle states. Per-isotope update
-ordering remains deterministic.
+Particle, source-slot, line, view, spectrum-bin, candidate, and shield-program
+dimensions use batched NumPy/Torch kernels with explicit chunks and caches.
+CUDA uses float64 for the production likelihood. CPU and GPU paths implement
+the same distribution and have equivalence tests. Geant4 uses native worker
+threads. Scalar implementations are limited to tiny deterministic test or
+debug oracles.
 
 ## MeasurementLog replay
 
-A schema-v1 log bundle contains `run_manifest.json`,
-`runtime_config.resolved.json`, `environment.json`,
-`forward_model_manifest.json`, `observations.npz`,
-`observation_metadata.jsonl`, and `repository_commit.txt`. Truth files are
-rejected below the log root.
+A publishable MeasurementLog schema-v2 bundle binds the resolved runtime configuration,
+environment, forward-model manifest, repository commit, ordered station
+records, and joint-spectrum contract hash. Each record stores the exact raw
+integer analysis spectrum, energy-axis identity, detector pose, Fe/Pb indices,
+live time, station completion marker, and native statistical provenance.
+Isotope-fitted counts and truth are not part of the inference record.
 
-Records contain ordered step, action, and station identifiers; detector XYZ and
-quaternion; Fe/Pb shield indices; raw spectrum and optional spectrum variance;
-energy-bin edges; isotope counts and covariance; and live, travel, and shield
-actuation time. The forward-model manifest binds the production line response,
-shield attenuation table, units, source-rate semantics, and hashes.
-
-Replay consumes rows exactly once and in order. A station is finalized only by
-the writer-owned `station_complete=true` marker. Prefix replay does not inspect
-future rows, the total record count, or truth.
-
-```text
-PYTHONPATH=src uv run python -m pf.replay \
-  --measurement-log LOG_DIR \
-  --config PF_CONFIG \
-  --profile pf_strict \
-  --output-dir OUTPUT_DIR \
-  --seed 0
-```
-
-Replay writes `pf_posterior.json`, `pf_trace.jsonl`, and
-`pf_diagnostics.json`. Configuration and forward-model hashes bind the result
-to the exact physical and statistical runtime settings.
+Replay consumes records once and in order, rejects future-row access and
+contract mismatch, and executes the same joint SMC/RJ path as live runtime.
+Legacy logs with a different energy axis or fitted-count contract may be used
+only by an explicitly labelled read-only diagnostic; they cannot produce an
+accepted production posterior.
