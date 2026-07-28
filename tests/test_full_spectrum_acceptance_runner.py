@@ -28,6 +28,7 @@ from spectrum.full_spectrum_acceptance_runner import (
     line_identity_contract_sha256,
     load_acceptance_pair,
 )
+from spectrum.native_metadata import native_source_line_token
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import (
     FULL_SPECTRUM_ACCEPTANCE_CONTRACT_SHA256,
@@ -113,19 +114,6 @@ def _source() -> dict[str, object]:
     }
 
 
-def _line_token(
-    *,
-    source_index: int,
-    isotope: str,
-    energy_keV: float,
-) -> str:
-    """Return the native validation source-line token."""
-    return (
-        f"src{source_index}_{isotope.replace('-', '_')}_"
-        f"e{energy_keV:.1f}"
-    ).replace(".", "p")
-
-
 def _pair_payload(*, background_only: bool) -> dict[str, object]:
     """Return one exact pair payload for a source or background scenario."""
     model = _base_model()
@@ -180,7 +168,7 @@ def _pair_payload(*, background_only: bool) -> dict[str, object]:
         for line in model.line_identity:
             if line["isotope"] != source["isotope"]:
                 continue
-            token = _line_token(
+            token = native_source_line_token(
                 source_index=source_index,
                 isotope=str(source["isotope"]),
                 energy_keV=float(line["energy_keV"]),

@@ -42,6 +42,7 @@ from spectrum.additive_scatter import (
     AdditiveNoncollidedTransportResponse,
     fit_additive_noncollided_transport_response,
 )
+from spectrum.native_metadata import native_source_line_token
 from spectrum.response_matrix import (
     NATIVE_GEANT4_BIN_COUNT,
     NATIVE_GEANT4_DETECTOR_RESPONSE_CONTRACT_SHA256,
@@ -505,19 +506,6 @@ def _acceptance_line_count() -> int:
     return len(_acceptance_line_identity())
 
 
-def _native_source_line_token(
-    *,
-    source_index: int,
-    isotope: str,
-    energy_keV: float,
-) -> str:
-    """Return the exact C++ validation source-line metadata token."""
-    return (
-        f"src{int(source_index)}_{isotope.replace('-', '_')}_"
-        f"e{float(energy_keV):.1f}"
-    ).replace(".", "p")
-
-
 @dataclass(frozen=True)
 class AcceptancePairRecord:
     """Store one fully authenticated native pair observation."""
@@ -785,7 +773,7 @@ def load_acceptance_pair(
         "entry_spectrum_sha256_by_source_line_class"
     ]
     expected_line_tokens = {
-        _native_source_line_token(
+        native_source_line_token(
             source_index=source_index,
             isotope=str(source["isotope"]),
             energy_keV=float(line["energy_keV"]),
@@ -1352,7 +1340,7 @@ def fit_training_additive_scatter(
             for global_index, line in enumerate(line_rows):
                 if str(line["isotope"]) != isotope:
                     continue
-                token = _native_source_line_token(
+                token = native_source_line_token(
                     source_index=source_index,
                     isotope=isotope,
                     energy_keV=float(line["energy_keV"]),

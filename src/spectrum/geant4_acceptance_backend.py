@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+from numbers import Real
 from pathlib import Path
 import subprocess
 import tempfile
@@ -65,6 +66,10 @@ from spectrum.full_spectrum_acceptance_runner import (
     NATIVE_ACCEPTANCE_FIDELITY,
     acceptance_transport_seed,
     canonical_json_sha256,
+)
+from spectrum.native_metadata import (
+    native_source_line_token,
+    sanitize_native_metadata_token,
 )
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import (
@@ -196,19 +201,6 @@ def _source_payload(source: PointSource) -> dict[str, object]:
     )[0]
 
 
-def _line_token(
-    *,
-    source_index: int,
-    isotope: str,
-    energy_keV: float,
-) -> str:
-    """Return the exact native source-line validation token."""
-    return (
-        f"src{source_index}_{isotope.replace('-', '_')}_"
-        f"e{energy_keV:.1f}"
-    ).replace(".", "p")
-
-
 def _validation_labels(
     metadata: Mapping[str, object],
     *,
@@ -217,7 +209,7 @@ def _validation_labels(
 ) -> dict[str, object]:
     """Extract source-resolved pre-dead-time labels for training only."""
     expected_tokens = {
-        _line_token(
+        native_source_line_token(
             source_index=source_index,
             isotope=source.isotope,
             energy_keV=float(line["energy_keV"]),
@@ -226,6 +218,42 @@ def _validation_labels(
         for line in model.line_identity
         if line["isotope"] == source.isotope
     }
+    count_prefix = "source_equivalent_counts_"
+    expected_line_count_keys = {
+        count_prefix + token for token in expected_tokens
+    }
+    expected_source_count_keys = {
+        (
+            f"{count_prefix}src{source_index}_"
+            f"{sanitize_native_metadata_token(source.isotope)}"
+        )
+        for source_index, source in enumerate(sources)
+    }
+    unexpected_source_count_keys = {
+        key
+        for key in metadata
+        if isinstance(key, str)
+        and key.startswith(count_prefix + "src")
+        and key
+        not in expected_line_count_keys | expected_source_count_keys
+    }
+    if unexpected_source_count_keys:
+        raise RuntimeError(
+            "Native Geant4 emitted unexpected source-resolved count metadata: "
+            f"{sorted(unexpected_source_count_keys)}."
+        )
+    for key in sorted(expected_line_count_keys):
+        value = metadata.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise RuntimeError(
+                "Native Geant4 must emit a finite nonnegative "
+                f"source-equivalent count for every scheduled line: {key}."
+            )
     class_names = (
         "uncollided_primary",
         "interacted_primary",

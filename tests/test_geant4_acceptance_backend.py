@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from measurement.model import PointSource
 from measurement.obstacles import ObstacleGrid
 from measurement.source_boundary import (
     SURFACE_EMISSION_EPSILON_M,
@@ -21,6 +22,11 @@ from spectrum.geant4_acceptance_backend import (
     _geometry_batch,
     _mutated_surface_scene,
     _native_fidelity,
+    _validation_labels,
+)
+from spectrum.native_metadata import (
+    native_source_line_token,
+    sanitize_native_metadata_token,
 )
 from spectrum.response_matrix import NATIVE_GEANT4_BIN_COUNT
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
@@ -228,6 +234,120 @@ def test_native_fidelity_rejects_truthy_integer_boolean() -> None:
 
     with pytest.raises(RuntimeError, match="must be boolean"):
         _native_fidelity(metadata, config=_config(), source_count=1)
+
+
+def test_native_metadata_token_matches_cpp_character_contract() -> None:
+    """Metadata tokens must preserve isotope hyphens and sanitize separators."""
+    assert sanitize_native_metadata_token("Cs-137") == "Cs-137"
+    assert sanitize_native_metadata_token("Co 60,\t=x") == "Co_60___x"
+    assert sanitize_native_metadata_token("") == "unknown"
+    assert (
+        native_source_line_token(
+            source_index=2,
+            isotope="Eu-154",
+            energy_keV=123.4,
+        )
+        == "src2_Eu-154_e123p4"
+    )
+
+
+def _multi_source_validation_metadata(
+    model: GeometryConditionedSpectralModel,
+) -> dict[str, object]:
+    """Return literal C++-style labels for two hyphenated isotopes."""
+    sources = ("Cs-137", "Co-60")
+    spectrum = ",".join(
+        "1" if index == 10 else "0"
+        for index in range(NATIVE_GEANT4_BIN_COUNT)
+    )
+    metadata: dict[str, object] = {
+        "validation_only_background_analysis_spectrum": ",".join(
+            "0" for _ in range(NATIVE_GEANT4_BIN_COUNT)
+        )
+    }
+    for source_index, isotope in enumerate(sources):
+        metadata[
+            f"source_equivalent_counts_src{source_index}_{isotope}"
+        ] = 1.0
+        for line in model.line_identity:
+            if line["isotope"] != isotope:
+                continue
+            token = (
+                f"src{source_index}_{isotope}_"
+                f"e{float(line['energy_keV']):.1f}"
+            ).replace(".", "p")
+            metadata[f"source_equivalent_counts_{token}"] = 1.0
+            metadata[
+                "validation_only_entry_spectrum_"
+                f"{token}_uncollided_primary"
+            ] = spectrum
+    return metadata
+
+
+def test_validation_labels_accept_literal_cpp_multi_source_tokens() -> None:
+    """A real multi-source response must retain native isotope hyphens."""
+    model = GeometryConditionedSpectralModel.standard_native(
+        ACCEPTANCE_ISOTOPES,
+        dead_time_tau_s=0.0,
+        background_rate_cps=0.0,
+    )
+    sources = (
+        PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
+        PointSource("Co-60", (2.0, 2.0, 2.0), 600_000.0),
+    )
+
+    labels = _validation_labels(
+        _multi_source_validation_metadata(model),
+        sources=sources,
+        model=model,
+    )
+
+    totals = labels["entry_class_totals_by_source_line"]
+    assert isinstance(totals, dict)
+    assert "src0_Cs-137_e662p0" in totals
+    assert "src1_Co-60_e1173p0" in totals
+    assert all("Cs_137" not in token for token in totals)
+    assert all(
+        row["uncollided_primary"] == 1
+        for row in totals.values()
+    )
+
+
+def test_validation_labels_require_every_scheduled_line_count_key() -> None:
+    """Zero detector hits must not hide native source-line token drift."""
+    model = GeometryConditionedSpectralModel.standard_native(
+        ACCEPTANCE_ISOTOPES,
+        dead_time_tau_s=0.0,
+        background_rate_cps=0.0,
+    )
+    sources = (
+        PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
+        PointSource("Co-60", (2.0, 2.0, 2.0), 600_000.0),
+    )
+    metadata = _multi_source_validation_metadata(model)
+    missing_key = "source_equivalent_counts_src0_Cs-137_e662p0"
+    del metadata[missing_key]
+
+    with pytest.raises(RuntimeError, match="every scheduled line"):
+        _validation_labels(metadata, sources=sources, model=model)
+
+
+def test_validation_labels_reject_unexpected_line_count_token() -> None:
+    """A Python-only underscore isotope token must fail before checkpointing."""
+    model = GeometryConditionedSpectralModel.standard_native(
+        ACCEPTANCE_ISOTOPES,
+        dead_time_tau_s=0.0,
+        background_rate_cps=0.0,
+    )
+    sources = (
+        PointSource("Cs-137", (1.0, 1.0, 1.0), 800_000.0),
+        PointSource("Co-60", (2.0, 2.0, 2.0), 600_000.0),
+    )
+    metadata = _multi_source_validation_metadata(model)
+    metadata["source_equivalent_counts_src0_Cs_137_e662p0"] = 1.0
+
+    with pytest.raises(RuntimeError, match="unexpected source-resolved"):
+        _validation_labels(metadata, sources=sources, model=model)
 
 
 def test_signed_surface_scene_variants_use_exact_normal_offsets() -> None:
