@@ -90,3 +90,17 @@ def test_online_controller_passes_only_physical_config_to_simulator() -> None:
 
     assert "runtime_config=physical_runtime_config" in call_source
     assert "runtime_config=runtime_config" not in call_source
+
+
+def test_online_controller_initializes_joint_filters_before_atlas_preflight() -> None:
+    """Live startup must resolve lazy PF rows before comparing atlas hashes."""
+    source = inspect.getsource(run_live_pf)
+
+    initialize_offset = source.index(
+        "estimator.initialize_joint_particle_filters()"
+    )
+    atlas_compare_offset = source.index(
+        "if estimator_atlas_sha256 != runtime_atlas_sha256:"
+    )
+
+    assert initialize_offset < atlas_compare_offset

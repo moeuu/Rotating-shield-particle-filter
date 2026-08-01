@@ -7442,7 +7442,7 @@ def run_live_pf(
     runtime_atlas_sha256 = surface_chart_geometry_sha256(
         runtime_surface_chart_geometry
     )
-    estimator_atlas_sha256 = estimator._assert_joint_surface_atlas_alignment()
+    estimator_atlas_sha256 = estimator.initialize_joint_particle_filters()
     if estimator_atlas_sha256 != runtime_atlas_sha256:
         raise RuntimeError(
             "Truth binding and joint PF use different continuous surface atlas "
