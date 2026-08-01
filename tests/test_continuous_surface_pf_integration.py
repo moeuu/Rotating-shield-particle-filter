@@ -771,3 +771,27 @@ def test_multi_merge_group_selection_uses_physical_response_columns(
     assert float(np.sum(probabilities[0])) == pytest.approx(1.0)
     assert int(np.argmax(probabilities[0])) == aligned_column
     assert probabilities[0, aligned_column] > 0.55
+
+
+def test_multi_component_direction_support_respects_cardinality_boundaries(
+) -> None:
+    """Multi-component RJ must not split K=0 or split above the K limit."""
+    empty_filter = _split_merge_filter(cardinality=0, max_sources=5)
+    assert empty_filter._continuous_rj_multi_direction_support(0) == (
+        (),
+        (),
+        0.0,
+        0.0,
+    )
+    assert empty_filter._apply_continuous_rj_multi_component(
+        _one_row_geometry()
+    ) == (0, 0)
+
+    full_filter = _split_merge_filter(cardinality=5, max_sources=5)
+    split_sizes, merge_sizes, split_probability, merge_probability = (
+        full_filter._continuous_rj_multi_direction_support(5)
+    )
+    assert split_sizes == ()
+    assert merge_sizes == (3, 4)
+    assert split_probability == 0.0
+    assert merge_probability == 1.0

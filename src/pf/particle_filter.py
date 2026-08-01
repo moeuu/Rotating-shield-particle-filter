@@ -3651,7 +3651,11 @@ class IsotopeParticleFilter:
         split_sizes = tuple(
             size
             for size in range(3, maximum_group + 1)
-            if int(cardinality) + size - 1 <= int(self.config.max_sources)
+            if (
+                int(cardinality) >= 1
+                and int(cardinality) + size - 1
+                <= int(self.config.max_sources)
+            )
         )
         merge_sizes = tuple(
             size
