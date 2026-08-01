@@ -1744,8 +1744,8 @@ def test_candidate_augmentation_interleaves_every_material_mode() -> None:
     )
 
 
-def test_candidate_augmentation_fails_before_dropping_material_modes() -> None:
-    """An undersized explicit geometry budget must fail rather than truncate."""
+def test_candidate_augmentation_expands_before_dropping_material_modes() -> None:
+    """An undersized ordinary budget must expand to retain every mode."""
     modes = [
         dss_pp.SignatureMode(
             isotope="Cs-137",
@@ -1758,17 +1758,31 @@ def test_candidate_augmentation_fails_before_dropping_material_modes() -> None:
         for index in range(4)
     ]
 
-    with pytest.raises(ValueError, match="increase max_augmented_candidates"):
-        dss_pp.augment_candidate_stations(
-            np.zeros((0, 3), dtype=float),
-            modes_by_isotope={"Cs-137": modes},
-            current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
-            visited_poses_xyz=None,
-            map_api=None,
-            bounds_xyz=None,
-            config=DSSPPConfig(max_augmented_candidates=3),
-            rng=np.random.default_rng(4),
-        )
+    augmented = dss_pp.augment_candidate_stations(
+        np.zeros((0, 3), dtype=float),
+        modes_by_isotope={"Cs-137": modes},
+        current_pose_xyz=np.asarray([0.0, 0.0, 1.0], dtype=float),
+        visited_poses_xyz=None,
+        map_api=None,
+        bounds_xyz=None,
+        config=DSSPPConfig(max_augmented_candidates=3),
+        rng=np.random.default_rng(4),
+    )
+
+    np.testing.assert_allclose(
+        augmented,
+        np.asarray(
+            [
+                [2.0, 0.0, 1.0],
+                [3.0, 0.0, 1.0],
+                [4.0, 0.0, 1.0],
+                [5.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
 
 
 def test_extract_signature_modes_packed_joint_matches_state_oracle() -> None:

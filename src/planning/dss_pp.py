@@ -1985,14 +1985,15 @@ def augment_candidate_stations(
         if mode.weight > 0.0
     ]
     all_modes.sort(key=lambda mode: mode.weight, reverse=True)
-    augmentation_capacity = int(config.max_augmented_candidates)
-    if len(all_modes) > augmentation_capacity:
-        raise ValueError(
-            "Posterior geometry contains more material surface modes than the "
-            "explicit candidate-augmentation capacity "
-            f"({len(all_modes)} > {augmentation_capacity}); increase "
-            "max_augmented_candidates instead of silently dropping modes."
-        )
+    # Every material posterior mode must contribute at least one candidate.
+    # Treat the configured value as the ordinary augmentation budget, but
+    # expand it when the posterior itself contains more distinct modes. This
+    # preserves the full posterior geometry without requiring a run-specific
+    # capacity guess or silently discarding low-mass alternatives.
+    augmentation_capacity = max(
+        int(config.max_augmented_candidates),
+        len(all_modes),
+    )
     angles = np.linspace(
         0.0,
         2.0 * np.pi,
