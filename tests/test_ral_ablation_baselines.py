@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from baselines.ral_ablation import config_factory
 from baselines.ral_ablation.config_factory import (
     DEFAULT_ABLATION_CASES,
     DEFAULT_ABLATION_VARIANTS,
@@ -18,6 +19,8 @@ from baselines.ral_ablation.config_factory import (
     _validate_ral_transport_sampling,
     _variant_config,
     build_ablation_plan,
+    resolve_ablation_seeds,
+    write_ablation_plan,
 )
 from baselines.ral_ablation.path_policies import (
     resolve_rotation_limit_for_active_program,
@@ -66,6 +69,26 @@ def test_ral_source_generation_defaults_are_unconditioned() -> None:
     assert options["structural_rj_surface_chart_max_edge_m"] == pytest.approx(
         1.0
     )
+
+
+def test_fresh_ablation_seed_is_generated_when_seeds_are_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new comparison batch should not silently reuse a historical scene."""
+    monkeypatch.setattr(
+        config_factory,
+        "generate_fresh_ablation_seed",
+        lambda: 987654321,
+    )
+
+    assert resolve_ablation_seeds(None) == (987654321,)
+
+
+def test_explicit_ablation_seed_remains_available_for_exact_replay() -> None:
+    """Explicit seeds should retain deterministic replay semantics."""
+    assert resolve_ablation_seeds((1234, 5678)) == (1234, 5678)
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_ablation_seeds((1234, 1234))
 
 
 @pytest.mark.parametrize(
@@ -361,6 +384,9 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         isotope_counts[source["isotope"]] = isotope_counts.get(source["isotope"], 0) + 1
     assert isotope_counts == {"Cs-137": 4, "Co-60": 3, "Eu-154": 2}
     source_metadata = source_payload["metadata"]
+    assert source_metadata["source_seed"] == 1251
+    assert source_metadata["obstacle_seed"] == 1234
+    assert source_metadata["scene_seed_policy"] == "explicit_replay"
     assert source_metadata["source_surface_sampling_schema_version"] == 3
     assert {
         "sampling": source_metadata["sampling"],
@@ -415,6 +441,11 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
     assert proposed_config["measurement_log_run_id"] == (
         "mix9_multi_isotope_cardinality_proposed_seed_1234"
     )
+    assert proposed_config["metadata"]["ral_environment_seed"] == 1234
+    assert proposed_config["metadata"]["ral_truth_source_seed"] == 1251
+    assert proposed_config["metadata"]["ral_scene_seed_policy"] == (
+        "explicit_replay"
+    )
     measurement_log_targets = {
         json.loads(entry.config_path.read_text())["measurement_log_output_dir"]
         for entry in entries
@@ -438,3 +469,36 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         f"{DEFAULT_NO_ROTATION_OVERHEAD_S:g}"
         in by_variant["baseline_passive_equal_time_no_shield"].command
     )
+
+    manifest_path, _ = write_ablation_plan(entries, output_dir=tmp_path)
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert "source_seed,seed_policy" in manifest_text.splitlines()[0]
+    assert ",1234,1251,explicit_replay," in manifest_text
+
+
+def test_ablation_plan_default_uses_one_fresh_scene_for_all_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All methods should share one new scene within a generated batch."""
+    monkeypatch.setattr(
+        config_factory,
+        "generate_fresh_ablation_seed",
+        lambda: 246813579,
+    )
+
+    entries = build_ablation_plan(
+        output_dir=tmp_path,
+        seeds=None,
+        cases=DEFAULT_ABLATION_CASES[:1],
+        variants=DEFAULT_ABLATION_VARIANTS,
+        intensity_cps_1m=30000.0,
+    )
+
+    assert {entry.seed for entry in entries} == {246813579}
+    assert {entry.source_seed for entry in entries} == {246813596}
+    assert {entry.seed_policy for entry in entries} == {"fresh_per_batch"}
+    assert len({entry.source_path for entry in entries}) == 1
+    for entry in entries:
+        config = json.loads(entry.config_path.read_text(encoding="utf-8"))
+        assert config["metadata"]["ral_scene_seed_policy"] == "fresh_per_batch"

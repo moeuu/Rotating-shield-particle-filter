@@ -5,9 +5,14 @@ Codex sessions should use this plan unless the user explicitly changes it.
 
 ## Decision
 
-Use a single deterministic seed for the paper table:
+Generate one fresh scene seed for each new experiment batch. Record that seed
+in the generated config, source metadata, and manifest so the batch remains
+exactly reproducible after generation.
 
-- `seed = 2026050901`
+- Omit `--seeds` for a new independent batch.
+- Use an explicit `--seeds <recorded-seed>` only for exact replay.
+- All four methods in one comparison batch use the same generated environment
+  and truth layout. A later batch must use a new seed.
 
 Use one main RA-L task. Past Case01/Case02/Case03 paper cases are not part of
 the standard RA-L ablation implementation:
@@ -62,7 +67,7 @@ shield and planning policies above.
 Regenerate the exhaustive manifest and then the compact paper subset:
 
 ```bash
-PYTHONPATH=src uv run python -m baselines.ral_ablation.cli --seeds 2026050901
+PYTHONPATH=src uv run python -m baselines.ral_ablation.cli
 uv run python scripts/build_ral_paper_subset.py
 ```
 

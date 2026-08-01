@@ -15,17 +15,19 @@ assert SPEC is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
-DEFAULT_SEED = MODULE.DEFAULT_SEED
 select_paper_subset = MODULE.select_paper_subset
+TEST_SEED = "246813579"
 
 
-def _manifest_row(case: str, variant: str, seed: str = DEFAULT_SEED) -> dict[str, str]:
+def _manifest_row(case: str, variant: str, seed: str = TEST_SEED) -> dict[str, str]:
     """Return one minimal manifest row for subset tests."""
     tag = f"{case}_{variant}_seed_{seed}"
     return {
         "case": case,
         "variant": variant,
         "seed": seed,
+        "source_seed": str(int(seed) + 17),
+        "seed_policy": "fresh_per_batch",
         "config_path": f"results/ral_ablation/configs/{tag}.json",
         "source_path": f"results/ral_ablation/sources/{case}_seed_{seed}.json",
         "command": (
@@ -74,7 +76,19 @@ def test_select_paper_subset_uses_mix9_four_run_plan() -> None:
         "eig_only_path",
     ) in selected_pairs
     assert all(case == "mix9_multi_isotope_cardinality" for case, _ in selected_pairs)
-    assert all(row["seed"] == DEFAULT_SEED for row in subset)
+    assert all(row["seed"] == TEST_SEED for row in subset)
+
+
+def test_select_paper_subset_requires_seed_for_multi_batch_manifest() -> None:
+    """Implicit selection must not silently choose among independent scenes."""
+    rows = [
+        _manifest_row("mix9_multi_isotope_cardinality", variant, seed)
+        for seed in ("100", "200")
+        for variant in MODULE.CORE_VARIANTS
+    ]
+
+    with pytest.raises(ValueError, match="exactly one scene seed"):
+        select_paper_subset(rows)
 
 
 @pytest.mark.parametrize(

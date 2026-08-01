@@ -80,6 +80,11 @@
   Every variant uses `pure_pf_schema_version: 1`, the `pf_strict` profile, and
   the same exact reversible-jump PF; variants change only shield and planning
   policy.
+- Generate a fresh environment/truth seed for every new RA-L comparison batch
+  by omitting `--seeds` from the ablation-plan CLI. Store the generated seed in
+  the manifest and reuse it only across variants within that same batch.
+  Explicit `--seeds` is reserved for exact replay and must not be used as a new
+  independent acceptance environment.
 - Use `uv run python scripts/build_ral_paper_subset.py` to regenerate
   `results/ral_ablation/ral_paper_subset_manifest.csv` and
   `results/ral_ablation/run_paper_subset.sh` from the exhaustive manifest.

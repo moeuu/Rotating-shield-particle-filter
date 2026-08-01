@@ -9,6 +9,7 @@ import json
 import math
 from numbers import Real
 from pathlib import Path
+import secrets
 from typing import Any
 
 import numpy as np
@@ -50,6 +51,26 @@ DEFAULT_OUTPUT_DIR = ROOT / "results" / "ral_ablation"
 DEFAULT_MEASUREMENT_LOG_ROOT = Path("results") / "ral_ablation" / "measurement_logs"
 DEFAULT_ISOTOPES = ("Cs-137", "Co-60", "Eu-154")
 TRUTH_SURFACE_SOURCE_RNG_DOMAIN = "truth_surface_sources"
+MAX_FRESH_ABLATION_SEED = (1 << 48) - 18
+
+
+def generate_fresh_ablation_seed() -> int:
+    """Return a fresh JSON-safe seed for one independent RA-L scene batch."""
+    return 1 + secrets.randbelow(MAX_FRESH_ABLATION_SEED)
+
+
+def resolve_ablation_seeds(seeds: Sequence[int] | None) -> tuple[int, ...]:
+    """Resolve explicit replay seeds or generate one fresh batch seed."""
+    if seeds is None:
+        return (generate_fresh_ablation_seed(),)
+    resolved = tuple(
+        _json_integer(seed, field_name="seed", minimum=0) for seed in seeds
+    )
+    if not resolved:
+        raise ValueError("seeds must contain at least one seed.")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("seeds must not contain duplicate scene seeds.")
+    return resolved
 
 
 def _json_boolean(value: object, *, field_name: str) -> bool:
@@ -191,6 +212,8 @@ class AblationPlanEntry:
     case: str
     variant: str
     seed: int
+    source_seed: int
+    seed_policy: str
     config_path: Path
     source_path: Path
     command: tuple[str, ...]
@@ -391,6 +414,7 @@ def _case_source_layout(
     *,
     obstacle_seed: int,
     source_seed: int,
+    seed_policy: str,
     intensity_cps_1m: float | Sequence[float],
     source_generation_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -497,6 +521,10 @@ def _case_source_layout(
             "description": case.description,
             "isotope_counts": _case_isotope_count_metadata(case),
             "source_seed": source_seed,
+            "scene_seed_policy": _nonempty_string(
+                seed_policy,
+                field_name="seed_policy",
+            ),
             "source_rng_provenance": named_rng_provenance(
                 source_seed,
                 (TRUTH_SURFACE_SOURCE_RNG_DOMAIN,),
@@ -572,6 +600,8 @@ def _variant_config(
     case: AblationCase,
     variant: AblationVariant,
     seed: int,
+    source_seed: int | None = None,
+    seed_policy: str = "explicit_replay",
     output_tag: str,
 ) -> dict[str, Any]:
     """Return the runtime config for one ablation variant."""
@@ -621,6 +651,14 @@ def _variant_config(
             "thread_count must be greater than one."
         )
     seed = _json_integer(seed, field_name="seed", minimum=0)
+    if source_seed is None:
+        source_seed = seed + 17
+    source_seed = _json_integer(
+        source_seed,
+        field_name="source_seed",
+        minimum=0,
+    )
+    seed_policy = _nonempty_string(seed_policy, field_name="seed_policy")
     output_tag = _nonempty_string(output_tag, field_name="output_tag")
     config["random_seed_base"] = seed
     config["measurement_log_output_dir"] = (
@@ -645,6 +683,9 @@ def _variant_config(
             "ral_ablation_case": case.name,
             "ral_ablation_variant": variant.name,
             "ral_ablation_seed": seed,
+            "ral_environment_seed": seed,
+            "ral_truth_source_seed": source_seed,
+            "ral_scene_seed_policy": seed_policy,
             "ral_transport_history_mode": transport_history_mode,
             "ral_accelerated_transport": False,
             "ral_primary_sampling_fraction": config["primary_sampling_fraction"],
@@ -693,17 +734,19 @@ def build_ablation_plan(
     *,
     base_config_path: Path = DEFAULT_BASE_CONFIG,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
-    seeds: Sequence[int] = (2026050901, 2026050902, 2026050903),
+    seeds: Sequence[int] | None = None,
     cases: Sequence[AblationCase] = DEFAULT_ABLATION_CASES,
     variants: Sequence[AblationVariant] = DEFAULT_ABLATION_VARIANTS,
     intensity_cps_1m: float | Sequence[float] = DEFAULT_SOURCE_INTENSITY_RANGE_CPS_1M,
     output_tag_suffix: str = "",
 ) -> list[AblationPlanEntry]:
-    """Build and write config/source files for RA-L ablation trials."""
+    """Build configs using one fresh scene unless replay seeds are explicit."""
     base_config_path = Path(base_config_path).expanduser().resolve()
     base_config = _load_json(base_config_path)
     source_options = _source_generation_options(base_config)
     entries: list[AblationPlanEntry] = []
+    seed_policy = "fresh_per_batch" if seeds is None else "explicit_replay"
+    resolved_seeds = resolve_ablation_seeds(seeds)
     if not isinstance(output_tag_suffix, str):
         raise ValueError("output_tag_suffix must be a string.")
     normalized_suffix = output_tag_suffix.strip().strip("_")
@@ -717,13 +760,14 @@ def build_ablation_plan(
     config_dir = Path(output_dir) / "configs"
     source_dir = Path(output_dir) / "sources"
     for case in cases:
-        for seed_raw in seeds:
+        for seed_raw in resolved_seeds:
             seed = _json_integer(seed_raw, field_name="seed", minimum=0)
             source_seed = seed + 17
             source_payload = _case_source_layout(
                 case,
                 obstacle_seed=seed,
                 source_seed=source_seed,
+                seed_policy=seed_policy,
                 intensity_cps_1m=intensity_cps_1m,
                 source_generation_options=source_options,
             )
@@ -739,6 +783,8 @@ def build_ablation_plan(
                     case=case,
                     variant=variant,
                     seed=seed,
+                    source_seed=source_seed,
+                    seed_policy=seed_policy,
                     output_tag=tag,
                 )
                 config_path = config_dir / f"{tag}.json"
@@ -755,6 +801,8 @@ def build_ablation_plan(
                         case=case.name,
                         variant=variant.name,
                         seed=seed,
+                        source_seed=source_seed,
+                        seed_policy=seed_policy,
                         config_path=config_path,
                         source_path=source_path,
                         command=command,
@@ -811,6 +859,8 @@ def write_ablation_plan(
                 "case",
                 "variant",
                 "seed",
+                "source_seed",
+                "seed_policy",
                 "config_path",
                 "source_path",
                 "command",
@@ -824,6 +874,8 @@ def write_ablation_plan(
                     "case": entry.case,
                     "variant": entry.variant,
                     "seed": entry.seed,
+                    "source_seed": entry.source_seed,
+                    "seed_policy": entry.seed_policy,
                     "config_path": entry.config_path.as_posix(),
                     "source_path": entry.source_path.as_posix(),
                     "command": " ".join(entry.command),

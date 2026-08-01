@@ -22,7 +22,7 @@ DEFAULT_SUBSET_MANIFEST = (
     ROOT / "results" / "ral_ablation" / "ral_paper_subset_manifest.csv"
 )
 DEFAULT_RUN_SCRIPT = ROOT / "results" / "ral_ablation" / "run_paper_subset.sh"
-DEFAULT_SEED = "2026050901"
+DEFAULT_SEED: str | None = None
 PAPER_CASES = ("mix9_multi_isotope_cardinality",)
 CORE_VARIANTS = (
     "proposed",
@@ -30,7 +30,24 @@ CORE_VARIANTS = (
     "round_robin_shield",
     "eig_only_path",
 )
-MANIFEST_FIELDS = ("case", "variant", "seed", "config_path", "source_path", "command")
+MANIFEST_FIELDS = (
+    "case",
+    "variant",
+    "seed",
+    "source_seed",
+    "seed_policy",
+    "config_path",
+    "source_path",
+    "command",
+)
+LEGACY_MANIFEST_FIELDS = (
+    "case",
+    "variant",
+    "seed",
+    "config_path",
+    "source_path",
+    "command",
+)
 _MODE_FLAGS = frozenset(
     {
         "--mode",
@@ -154,7 +171,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         default=DEFAULT_SEED,
-        help="Single seed to use for the RA-L paper subset.",
+        help=(
+            "Single scene seed to use. When omitted, the manifest must contain "
+            "exactly one seed for the paper case."
+        ),
     )
     return parser.parse_args()
 
@@ -163,11 +183,22 @@ def _read_manifest(path: Path) -> list[dict[str, str]]:
     """Read an ablation manifest CSV."""
     with Path(path).open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
+    normalized: list[dict[str, str]] = []
     for row in rows:
-        missing = [field for field in MANIFEST_FIELDS if field not in row]
+        missing = [field for field in LEGACY_MANIFEST_FIELDS if field not in row]
         if missing:
             raise ValueError(f"Manifest row is missing fields: {missing}")
-    return [{field: str(row[field]) for field in MANIFEST_FIELDS} for row in rows]
+        normalized.append(
+            {
+                **{field: str(row[field]) for field in LEGACY_MANIFEST_FIELDS},
+                "source_seed": str(row.get("source_seed", "")),
+                "seed_policy": str(row.get("seed_policy", "legacy_explicit")),
+            }
+        )
+    return [
+        {field: row[field] for field in MANIFEST_FIELDS}
+        for row in normalized
+    ]
 
 
 def selected_variants_for_case(case: str) -> tuple[str, ...]:
@@ -180,9 +211,23 @@ def selected_variants_for_case(case: str) -> tuple[str, ...]:
 def select_paper_subset(
     rows: Sequence[Mapping[str, str]],
     *,
-    seed: str = DEFAULT_SEED,
+    seed: str | None = DEFAULT_SEED,
 ) -> list[dict[str, str]]:
     """Select the compact paper subset while preserving manifest order."""
+    available_seeds = sorted(
+        {
+            str(row["seed"])
+            for row in rows
+            if str(row["case"]) in PAPER_CASES
+        }
+    )
+    if seed is None:
+        if len(available_seeds) != 1:
+            raise ValueError(
+                "Paper manifest must contain exactly one scene seed when "
+                f"--seed is omitted; found {available_seeds}."
+            )
+        seed = available_seeds[0]
     seed = str(seed)
     cases = tuple(
         case
@@ -200,7 +245,15 @@ def select_paper_subset(
         for variant in selected_variants_for_case(case)
     }
     selected_unsorted = [
-        {field: str(row[field]) for field in MANIFEST_FIELDS}
+        {
+            field: str(
+                row.get(
+                    field,
+                    "legacy_explicit" if field == "seed_policy" else "",
+                )
+            )
+            for field in MANIFEST_FIELDS
+        }
         for row in rows
         if row["seed"] == seed and (row["case"], row["variant"]) in wanted
     ]
@@ -254,7 +307,7 @@ def build_subset(
     subset_manifest_path: Path,
     run_script_path: Path,
     *,
-    seed: str = DEFAULT_SEED,
+    seed: str | None = DEFAULT_SEED,
 ) -> list[dict[str, str]]:
     """Build and write the compact RA-L paper subset."""
     rows = _read_manifest(manifest_path)
@@ -273,7 +326,7 @@ def main() -> None:
         args.manifest,
         args.output_manifest,
         args.output_script,
-        seed=str(args.seed),
+        seed=None if args.seed is None else str(args.seed),
     )
     print(f"Wrote {len(selected)} RA-L paper-subset trials.")
     print(f"Manifest: {args.output_manifest}")

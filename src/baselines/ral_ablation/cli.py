@@ -33,8 +33,11 @@ def main() -> None:
         "--seeds",
         type=int,
         nargs="+",
-        default=[2026050901],
-        help="Obstacle/source seed list.",
+        default=None,
+        help=(
+            "Explicit environment seed list for exact replay. When omitted, "
+            "one fresh scene seed is generated for this comparison batch."
+        ),
     )
     parser.add_argument(
         "--intensity-cps-1m",
@@ -71,7 +74,11 @@ def main() -> None:
     entries = build_ablation_plan(
         base_config_path=args.base_config,
         output_dir=args.output_dir,
-        seeds=tuple(int(seed) for seed in args.seeds),
+        seeds=(
+            None
+            if args.seeds is None
+            else tuple(int(seed) for seed in args.seeds)
+        ),
         intensity_cps_1m=intensity_spec,
         output_tag_suffix=str(args.output_tag_suffix),
     )
@@ -79,6 +86,18 @@ def main() -> None:
         entries, output_dir=args.output_dir
     )
     print(f"Wrote {len(entries)} ablation trials.")
+    print(
+        "Scene seeds: "
+        + ", ".join(
+            str(seed) for seed in sorted({entry.seed for entry in entries})
+        )
+    )
+    print(
+        "Source seeds: "
+        + ", ".join(
+            str(seed) for seed in sorted({entry.source_seed for entry in entries})
+        )
+    )
     print(f"Manifest: {manifest_path}")
     print(f"Run script: {script_path}")
 
