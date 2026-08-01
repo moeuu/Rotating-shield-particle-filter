@@ -1,18 +1,789 @@
-"""Replay a shared MeasurementLog v2 with the particle-filter estimator."""
+"""CLI entry point for the real-time PF demo."""
+# ruff: noqa: E402
 
 from __future__ import annotations
 
+import argparse
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sys
+from typing import Any
+from uuid import uuid4
 
-
+# Ensure src/ is on sys.path for direct script execution.
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pf.replay import main  # noqa: E402
+from realtime_demo import (
+    DEFAULT_PF_CONFIG,
+    DEFAULT_OBSTACLE_CONFIG,
+    DEFAULT_SOURCE_CONFIG,
+    load_sources_from_json,
+    resolve_runtime_variable_cardinality,
+    run_live_pf,
+)
+from piplup_notify import PIPLUP_DEFAULT_BASE_URL, PiplupNotificationConfig
+from runtime_defaults import (
+    DEFAULT_ENVIRONMENT_MODE,
+    DEFAULT_MEASUREMENT_TIME_S,
+    DEFAULT_RANDOM_SOURCE_COUNT,
+    DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
+    DEFAULT_ROBOT_SPEED_M_S,
+    DEFAULT_ROTATION_OVERHEAD_S,
+)
+from sim.runtime import load_runtime_config
+from runtime.assets import simulation_runtime_root, standard_geant4_config_path
+
+SIMULATION_RUNTIME_ROOT = simulation_runtime_root()
+STANDARD_GEANT4_FULL_CONFIG = standard_geant4_config_path()
+STANDARD_GEANT4_GUI_CONFIG = (
+    SIMULATION_RUNTIME_ROOT
+    / "configs"
+    / "geant4"
+    / "variance_reduction_external_gui_32threads.json"
+)
+
+RUN_MODE_ALIASES = {
+    "gui": "geant4-isaacsim-gui",
+    "cui": "geant4-cui",
+    "full-simulation": "geant4-cui",
+    "standard-geant4-full": "geant4-cui",
+}
+RUN_MODE_DEFAULTS = {
+    "python-gui": {
+        "sim_backend": "isaacsim",
+        "sim_config": (
+            SIMULATION_RUNTIME_ROOT / "configs" / "isaacsim" / "demo_room_gui.json"
+        ).as_posix(),
+        "matplotlib_live": False,
+    },
+    "geant4-isaacsim-gui": {
+        "sim_backend": "geant4",
+        "sim_config": STANDARD_GEANT4_GUI_CONFIG.as_posix(),
+        "matplotlib_live": False,
+    },
+    "python-cui": {
+        "sim_backend": "analytic",
+        "sim_config": (
+            SIMULATION_RUNTIME_ROOT / "configs" / "python" / "high_fidelity_no_isaac.json"
+        ).as_posix(),
+        "matplotlib_live": False,
+    },
+    "geant4-cui": {
+        "sim_backend": "geant4",
+        "sim_config": STANDARD_GEANT4_FULL_CONFIG.as_posix(),
+        "matplotlib_live": False,
+    },
+}
+RUN_MODE_CHOICES = tuple(RUN_MODE_DEFAULTS.keys()) + tuple(RUN_MODE_ALIASES.keys())
+RANDOM_SOURCE_CONFIG_TOKENS = {"random", "surface-random", "surface_random"}
+
+
+def _normalize_run_mode(mode: str | None) -> str:
+    """Return the canonical execution mode name."""
+    raw_mode = "geant4-cui" if mode is None else mode.strip().lower()
+    return RUN_MODE_ALIASES.get(raw_mode, raw_mode)
+
+
+def _default_run_mode_for_backend(backend: str | None) -> str:
+    """Return the default run mode for an explicitly requested backend."""
+    if backend is None:
+        return "geant4-cui"
+    backend_name = backend.strip().lower()
+    if backend_name == "analytic":
+        return "python-cui"
+    if backend_name == "isaacsim":
+        return "python-gui"
+    return "geant4-cui"
+
+
+def _resolve_run_settings(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> tuple[str, str, str | None, bool]:
+    """Resolve high-level run mode into backend, config, and live-plot settings."""
+    selected_mode = args.run_mode
+    if selected_mode is None:
+        selected_mode = _default_run_mode_for_backend(args.sim_backend)
+    run_mode = _normalize_run_mode(selected_mode)
+    if run_mode not in RUN_MODE_DEFAULTS:
+        parser.error(f"Unknown run mode: {args.run_mode}")
+    mode_is_sim_gui = run_mode.endswith("-gui")
+    if mode_is_sim_gui and args.headless:
+        parser.error(f"--mode {run_mode} cannot be combined with --headless.")
+    defaults = RUN_MODE_DEFAULTS[run_mode]
+    sim_backend = args.sim_backend or str(defaults["sim_backend"])
+    sim_config = args.sim_config
+    if sim_config is None:
+        default_config = defaults["sim_config"]
+        sim_config = None if default_config is None else str(default_config)
+    matplotlib_live = bool(defaults["matplotlib_live"])
+    if args.matplotlib_live:
+        matplotlib_live = True
+    if args.no_live or args.headless:
+        matplotlib_live = False
+    default_backend = str(defaults["sim_backend"])
+    if args.sim_backend is not None and sim_backend != default_backend:
+        parser.error(
+            f"--mode {run_mode} requires --sim-backend {default_backend}; "
+            f"got {sim_backend}. Select the matching explicit mode instead."
+        )
+    return run_mode, sim_backend, sim_config, matplotlib_live
+
+
+def _source_config_was_explicit(argv: list[str] | None = None) -> bool:
+    """Return whether the CLI explicitly set --source-config."""
+    raw_args = sys.argv[1:] if argv is None else argv
+    return any(arg == "--source-config" or arg.startswith("--source-config=") for arg in raw_args)
+
+
+def _safe_path_component(value: str | None, *, fallback: str) -> str:
+    """Return an ASCII path component without separators or traversal tokens."""
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or "").strip())
+    sanitized = sanitized.strip("_-")
+    return sanitized or fallback
+
+
+def _resolve_measurement_log_output(
+    explicit_output: str | None,
+    runtime_config: Mapping[str, Any],
+    *,
+    output_tag: str | None,
+    repository_root: Path,
+) -> str | None:
+    """Resolve CLI log wiring while preserving configured output targets."""
+    if explicit_output not in (None, ""):
+        return str(explicit_output)
+    if runtime_config.get("measurement_log_output_dir") not in (None, ""):
+        return None
+
+    safe_tag = _safe_path_component(output_tag, fallback="full_simulation")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    relative_parent = Path("results") / "measurement_logs"
+    for _ in range(16):
+        unique_token = uuid4().hex[:12]
+        relative_target = (
+            relative_parent / f"{safe_tag}_{timestamp}_{unique_token}"
+        )
+        if not (repository_root / relative_target).exists():
+            return relative_target.as_posix()
+    raise RuntimeError("Failed to allocate a unique MeasurementLog output path.")
+
+
+def main() -> None:
+    """Parse CLI arguments and run the real-time PF demo."""
+    parser = argparse.ArgumentParser(
+        description="Real-time rotating-shield PF visualization demo."
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--mode",
+        dest="run_mode",
+        type=str,
+        default=None,
+        choices=RUN_MODE_CHOICES,
+        help=(
+            "Execution mode: python-gui, geant4-isaacsim-gui, "
+            "python-cui, or geant4-cui. Default: geant4-cui."
+        ),
+    )
+    mode_group.add_argument(
+        "--gui",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-isaacsim-gui",
+        help="Alias for --mode geant4-isaacsim-gui.",
+    )
+    mode_group.add_argument(
+        "--cui",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-cui",
+        help=(
+            "Alias for the standard no-GUI Geant4 full simulation "
+            "(--mode geant4-cui). Use --python-cui for the analytic Python CUI."
+        ),
+    )
+    mode_group.add_argument(
+        "--full-simulation",
+        "--standard-geant4-full",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-cui",
+        help=(
+            "Run the standard full Geant4/PF simulation: geant4-cui with "
+            "configs/geant4/variance_reduction_external_no_isaac_32threads.json."
+        ),
+    )
+    mode_group.add_argument(
+        "--python-gui",
+        dest="run_mode",
+        action="store_const",
+        const="python-gui",
+        help="Alias for --mode python-gui.",
+    )
+    mode_group.add_argument(
+        "--geant4-isaacsim-gui",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-isaacsim-gui",
+        help="Alias for --mode geant4-isaacsim-gui.",
+    )
+    mode_group.add_argument(
+        "--python-cui",
+        dest="run_mode",
+        action="store_const",
+        const="python-cui",
+        help="Alias for --mode python-cui.",
+    )
+    mode_group.add_argument(
+        "--geant4-cui",
+        dest="run_mode",
+        action="store_const",
+        const="geant4-cui",
+        help="Alias for --mode geant4-cui.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        "--steps",
+        dest="max_steps",
+        type=int,
+        default=None,
+        help="Maximum number of measurement steps (default: runtime budget).",
+    )
+    parser.add_argument(
+        "--max-poses",
+        type=int,
+        default=None,
+        help="Maximum number of measurement poses (default: runtime config or no cap).",
+    )
+    parser.add_argument(
+        "--pose-candidates",
+        type=int,
+        default=64,
+        help="Number of candidate poses to generate per step (default: 64).",
+    )
+    parser.add_argument(
+        "--pose-min-dist",
+        type=float,
+        default=3.0,
+        help="Minimum distance (m) from visited poses for candidates (default: 3.0).",
+    )
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help=(
+            "Disable the Matplotlib live plot (still saves results/result_pf.png and "
+            "results/result_spectrum.png by default)."
+        ),
+    )
+    parser.add_argument(
+        "--matplotlib-live",
+        action="store_true",
+        help="Open the Matplotlib live plot in addition to the selected simulator mode.",
+    )
+    parser.add_argument(
+        "--output-tag",
+        type=str,
+        default=None,
+        help="Optional tag appended to result output filenames (ex: ex5 -> result_pf_ex5.png).",
+    )
+    parser.add_argument(
+        "--measurement-log-output",
+        type=str,
+        default=None,
+        help=(
+            "Truth-free MeasurementLog output directory. When omitted, the "
+            "runtime config target is preserved or a unique target is generated."
+        ),
+    )
+    parser.add_argument(
+        "--resume-measurement-stage",
+        type=str,
+        default=None,
+        help=(
+            "Adopt one hidden MeasurementLog stream directory at its final "
+            "station_complete boundary, replay its pure-PF prefix, and continue."
+        ),
+    )
+    parser.add_argument(
+        "--resume-compatible-code-path",
+        action="append",
+        default=None,
+        help=(
+            "Repository-relative runtime path admitted only after a separate "
+            "state-equivalence gate; may be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--resume-compatibility-basis",
+        type=str,
+        default=None,
+        help=(
+            "Non-empty evidence label required whenever runtime code changed "
+            "between the acquisition and resumed execution."
+        ),
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Force a non-GUI simulator mode and disable the Matplotlib live plot.",
+    )
+    parser.add_argument(
+        "--source-config",
+        type=str,
+        default=DEFAULT_SOURCE_CONFIG.as_posix(),
+        help=(
+            "Path to a JSON file that defines the point sources, or 'random' "
+            "for surface-constrained random sources."
+        ),
+    )
+    parser.add_argument(
+        "--source-seed",
+        type=int,
+        default=None,
+        help="RNG seed for surface-constrained random source generation.",
+    )
+    parser.add_argument(
+        "--random-source-count",
+        type=int,
+        default=DEFAULT_RANDOM_SOURCE_COUNT,
+        help="Number of surface-constrained random sources to generate.",
+    )
+    parser.add_argument(
+        "--random-source-isotopes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated isotope names for surface-constrained random "
+            "source generation. Defaults to all isotopes in the spectrum library."
+        ),
+    )
+    parser.add_argument(
+        "--random-source-intensity-cps-1m",
+        type=float,
+        default=DEFAULT_RANDOM_SOURCE_INTENSITY_CPS_1M,
+        help="Detector cps@1m assigned to each generated random source.",
+    )
+    parser.add_argument(
+        "--random-source-intensity-min-cps-1m",
+        type=float,
+        default=None,
+        help="Minimum detector cps@1m for uniformly sampled random sources.",
+    )
+    parser.add_argument(
+        "--random-source-intensity-max-cps-1m",
+        type=float,
+        default=None,
+        help="Maximum detector cps@1m for uniformly sampled random sources.",
+    )
+    parser.add_argument(
+        "--obstacle-config",
+        type=str,
+        default=DEFAULT_OBSTACLE_CONFIG.as_posix(),
+        help="Path to a JSON file that defines blocked grid cells.",
+    )
+    parser.add_argument(
+        "--environment-mode",
+        type=str,
+        default=DEFAULT_ENVIRONMENT_MODE,
+        choices=("fixed", "random"),
+        help=(
+            "Environment generation mode: fixed loads the obstacle JSON, "
+            "random creates a fresh obstacle layout at startup "
+            f"(default: {DEFAULT_ENVIRONMENT_MODE})."
+        ),
+    )
+    parser.add_argument(
+        "--obstacle-seed",
+        type=int,
+        default=None,
+        help="RNG seed used when creating a fixed missing layout or a random startup layout.",
+    )
+    parser.add_argument(
+        "--no-obstacles",
+        action="store_true",
+        help="Disable obstacles during pose selection and visualization.",
+    )
+    parser.add_argument(
+        "--eval-match-radius",
+        type=float,
+        default=0.5,
+        help="Match radius (m) for evaluation metrics.",
+    )
+    parser.add_argument(
+        "--variable-cardinality",
+        dest="variable_cardinality",
+        action="store_true",
+        default=None,
+        help="Enable exact RJ birth/death moves, overriding the runtime config.",
+    )
+    parser.add_argument(
+        "--fixed-cardinality",
+        dest="variable_cardinality",
+        action="store_false",
+        help="Keep cardinality fixed while retaining exact within-K MH moves.",
+    )
+    parser.add_argument(
+        "--num-particles",
+        type=int,
+        default=2000,
+        help="Particle count per isotope filter (default: 2000).",
+    )
+    parser.add_argument(
+        "--max-sources",
+        type=int,
+        default=None,
+        help=(
+            "Override the runtime-config maximum number of sources per isotope; "
+            "use only for explicit ablation/debug cases."
+        ),
+    )
+    parser.add_argument(
+        "--max-temper-steps",
+        type=int,
+        default=None,
+        help="Override the maximum number of ESS-preserving SMC temperature steps.",
+    )
+    parser.add_argument(
+        "--min-delta-beta",
+        type=float,
+        default=None,
+        help="Override the minimum accepted SMC temperature increment.",
+    )
+    parser.add_argument(
+        "--target-ess-ratio",
+        type=float,
+        default=None,
+        help="Override the ESS fraction maintained through beta=1.",
+    )
+    parser.add_argument(
+        "--sim-backend",
+        type=str,
+        default=None,
+        choices=("analytic", "isaacsim", "geant4"),
+        help="Override the simulation backend selected by --mode.",
+    )
+    parser.add_argument(
+        "--sim-config",
+        type=str,
+        default=None,
+        help="Optional JSON config path for the selected simulation backend.",
+    )
+    parser.add_argument(
+        "--pf-config",
+        type=str,
+        default=DEFAULT_PF_CONFIG.as_posix(),
+        help="PF-owned runtime config overlaid beneath the physical sim config.",
+    )
+    parser.add_argument(
+        "--blender-executable",
+        type=str,
+        default=None,
+        help="Blender executable path used by --environment-mode random.",
+    )
+    parser.add_argument(
+        "--blender-output",
+        type=str,
+        default=None,
+        help="Optional USD output path for the Blender-generated random environment.",
+    )
+    parser.add_argument(
+        "--blender-timeout-s",
+        type=float,
+        default=120.0,
+        help="Timeout for Blender random environment generation.",
+    )
+    parser.add_argument(
+        "--passage-width-m",
+        type=float,
+        default=1.0,
+        help="Minimum robot corridor width reserved in random environments.",
+    )
+    parser.add_argument(
+        "--robot-radius-m",
+        type=float,
+        default=0.35,
+        help="Robot footprint radius used for 2D traversability maps.",
+    )
+    parser.add_argument(
+        "--robot-speed",
+        type=float,
+        default=DEFAULT_ROBOT_SPEED_M_S,
+        help="Nominal robot travel speed in m/s used for mission-time accounting.",
+    )
+    parser.add_argument(
+        "--rotation-overhead-s",
+        type=float,
+        default=DEFAULT_ROTATION_OVERHEAD_S,
+        help="Fixed shield actuation overhead per measurement in seconds.",
+    )
+    parser.add_argument(
+        "--measurement-time-s",
+        type=float,
+        default=DEFAULT_MEASUREMENT_TIME_S,
+        help="Fixed predeclared live time per measurement in seconds.",
+    )
+    parser.add_argument(
+        "--path-planner",
+        choices=("dss_pp",),
+        default=None,
+        help="Next-pose planner. Pure runtime supports joint DSS-PP only.",
+    )
+    parser.add_argument(
+        "--dss-program-length",
+        type=int,
+        default=None,
+        help="Number of shield postures in each DSS-PP measurement program.",
+    )
+    parser.add_argument(
+        "--dss-rotation-weight",
+        type=float,
+        default=None,
+        help="DSS-PP shield-transition penalty weight.",
+    )
+    parser.add_argument(
+        "--rotations-per-pose",
+        "--orientation-k",
+        dest="rotations_per_pose",
+        type=int,
+        default=None,
+        help="Number of shield orientation pairs measured at each robot pose.",
+    )
+    parser.add_argument(
+        "--min-rotations-per-pose",
+        type=int,
+        default=None,
+        help=(
+            "Minimum shield orientation measurements before IG early stopping. "
+            "Defaults to --rotations-per-pose when that option is set."
+        ),
+    )
+    parser.add_argument(
+        "--planning-eig-samples",
+        type=int,
+        default=None,
+        help="Monte Carlo samples used for planning EIG estimates.",
+    )
+    parser.add_argument(
+        "--notify",
+        "--notify-piplup",
+        dest="notify_piplup",
+        action="store_true",
+        default=None,
+        help=(
+            "Send start/final/failure notifications to piplup-notify. "
+            "Requires PIPLUP_NOTIFY_TOKEN or --notify-token."
+        ),
+    )
+    parser.add_argument(
+        "--no-notify",
+        dest="notify_piplup",
+        action="store_false",
+        help="Disable piplup notifications even if PIPLUP_NOTIFY_ENABLED is set.",
+    )
+    parser.add_argument(
+        "--notify-url",
+        type=str,
+        default=None,
+        help=f"piplup-notify base URL (default: {PIPLUP_DEFAULT_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--notify-token",
+        type=str,
+        default=None,
+        help="Bearer token for piplup /api/events. Prefer PIPLUP_NOTIFY_TOKEN.",
+    )
+    parser.add_argument(
+        "--notify-account",
+        type=str,
+        default=None,
+        help="Optional account label stored with piplup events.",
+    )
+    parser.add_argument(
+        "--notify-run-id",
+        type=str,
+        default=None,
+        help="Optional stable run id for piplup event dedupe.",
+    )
+    parser.add_argument(
+        "--notify-timeout-s",
+        type=float,
+        default=None,
+        help="HTTP timeout for piplup notification requests.",
+    )
+    parser.add_argument(
+        "--notify-spectrum",
+        action="store_true",
+        help="Send per-measurement spectrum payloads to piplup/Railway.",
+    )
+    parser.add_argument(
+        "--notify-spectrum-every",
+        type=int,
+        default=1,
+        help="Send one spectrum event every N measurements when --notify-spectrum is set.",
+    )
+    parser.add_argument(
+        "--notify-spectrum-max-bins",
+        type=int,
+        default=800,
+        help="Maximum spectrum bins included in each piplup spectrum event.",
+    )
+    args = parser.parse_args()
+    run_mode, sim_backend, sim_config_path, matplotlib_live = _resolve_run_settings(
+        args,
+        parser,
+    )
+    runtime_config = load_runtime_config(sim_config_path)
+    configured_backend = runtime_config.get("backend")
+    if (
+        not isinstance(configured_backend, str)
+        or configured_backend.strip().lower() != sim_backend
+    ):
+        parser.error(
+            "Simulation config backend must exactly match the selected runtime: "
+            f"selected={sim_backend!r}, configured={configured_backend!r}."
+        )
+    measurement_log_output = _resolve_measurement_log_output(
+        args.measurement_log_output,
+        runtime_config,
+        output_tag=args.output_tag,
+        repository_root=ROOT,
+    )
+    variable_cardinality = resolve_runtime_variable_cardinality(
+        args.variable_cardinality,
+        sim_config_path,
+        args.pf_config,
+    )
+    pf_overrides: dict[str, object] = {}
+    if args.max_temper_steps is not None:
+        if args.max_temper_steps < 1:
+            parser.error("--max-temper-steps must be positive.")
+        pf_overrides["max_temper_steps"] = int(args.max_temper_steps)
+    if args.min_delta_beta is not None:
+        if not 0.0 < args.min_delta_beta <= 1.0:
+            parser.error("--min-delta-beta must lie in (0, 1].")
+        pf_overrides["min_delta_beta"] = float(args.min_delta_beta)
+    if args.target_ess_ratio is not None:
+        if not 0.0 < args.target_ess_ratio < 1.0:
+            parser.error("--target-ess-ratio must lie in (0, 1).")
+        pf_overrides["target_ess_ratio"] = float(args.target_ess_ratio)
+    if args.max_sources is not None:
+        if args.max_sources < 1:
+            parser.error("--max-sources must be positive.")
+        pf_overrides["max_sources"] = int(args.max_sources)
+    if args.rotations_per_pose is not None:
+        if not 1 <= args.rotations_per_pose <= 64:
+            parser.error("--rotations-per-pose must lie in [1, 64].")
+        pf_overrides["orientation_k"] = int(args.rotations_per_pose)
+        pf_overrides["min_rotations_per_pose"] = int(args.rotations_per_pose)
+    if args.min_rotations_per_pose is not None:
+        if not 0 <= args.min_rotations_per_pose <= 64:
+            parser.error("--min-rotations-per-pose must lie in [0, 64].")
+        pf_overrides["min_rotations_per_pose"] = int(
+            args.min_rotations_per_pose
+        )
+    if args.planning_eig_samples is not None:
+        if args.planning_eig_samples < 1:
+            parser.error("--planning-eig-samples must be positive.")
+        pf_overrides["planning_eig_samples"] = int(
+            args.planning_eig_samples
+        )
+    sources = None
+    source_generation_mode = "demo"
+    source_config_provenance: Mapping[str, object] | None = None
+    source_config_token = str(args.source_config).strip().lower() if args.source_config else ""
+    source_config_explicit = _source_config_was_explicit()
+    if source_config_token in RANDOM_SOURCE_CONFIG_TOKENS or (
+        args.environment_mode == "random" and not source_config_explicit
+    ):
+        source_generation_mode = "surface_random"
+        print("Using surface-constrained random source generation.")
+    elif args.source_config:
+        source_path = Path(args.source_config)
+        if not source_path.is_absolute():
+            source_path = (ROOT / source_path).resolve()
+        if not source_path.is_file():
+            parser.error(f"Source config is not a readable file: {source_path}")
+        try:
+            loaded_source_config = load_sources_from_json(
+                source_path,
+                repository_root=ROOT,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"Failed to load source config {source_path}: {exc}")
+        sources = list(loaded_source_config.sources)
+        source_generation_mode = "provided_file"
+        source_config_provenance = dict(loaded_source_config.provenance)
+        print(f"Loaded {len(sources)} sources from {source_path}")
+    print(
+        "Execution mode: "
+        f"{run_mode} (backend={sim_backend}, "
+        f"sim_config={sim_config_path or 'none'}, "
+        f"matplotlib_live={matplotlib_live})"
+    )
+    notify_enabled = args.notify_piplup
+    if notify_enabled is None and args.notify_spectrum:
+        notify_enabled = True
+    notification_config = PiplupNotificationConfig.from_env(
+        enabled=notify_enabled,
+        base_url=args.notify_url,
+        token=args.notify_token,
+        account=args.notify_account,
+        run_id=args.notify_run_id,
+        timeout_s=args.notify_timeout_s,
+    )
+    run_live_pf(
+        live=matplotlib_live,
+        max_steps=args.max_steps,
+        max_poses=args.max_poses,
+        sources=sources,
+        environment_mode=args.environment_mode,
+        obstacle_layout_path=None if args.no_obstacles else args.obstacle_config,
+        obstacle_seed=args.obstacle_seed,
+        eval_match_radius_m=args.eval_match_radius,
+        variable_cardinality=variable_cardinality,
+        num_particles=args.num_particles,
+        pf_config_overrides=pf_overrides,
+        output_tag=args.output_tag,
+        measurement_log_output=measurement_log_output,
+        resume_measurement_stage=args.resume_measurement_stage,
+        resume_compatible_code_paths=args.resume_compatible_code_path,
+        resume_compatibility_basis=args.resume_compatibility_basis,
+        pose_candidates=args.pose_candidates,
+        pose_min_dist=args.pose_min_dist,
+        sim_backend=sim_backend,
+        sim_config_path=sim_config_path,
+        pf_config_path=args.pf_config,
+        blender_executable=args.blender_executable,
+        blender_output_path=args.blender_output,
+        blender_timeout_s=args.blender_timeout_s,
+        passage_width_m=args.passage_width_m,
+        robot_radius_m=args.robot_radius_m,
+        nominal_motion_speed_m_s=args.robot_speed,
+        rotation_overhead_s=args.rotation_overhead_s,
+        measurement_time_s=args.measurement_time_s,
+        path_planner=args.path_planner,
+        dss_program_length=args.dss_program_length,
+        dss_rotation_weight=args.dss_rotation_weight,
+        source_generation_mode=source_generation_mode,
+        source_config_provenance=source_config_provenance,
+        random_source_seed=args.source_seed,
+        random_source_count=args.random_source_count,
+        random_source_isotopes=args.random_source_isotopes,
+        random_source_intensity_cps_1m=args.random_source_intensity_cps_1m,
+        random_source_intensity_min_cps_1m=args.random_source_intensity_min_cps_1m,
+        random_source_intensity_max_cps_1m=args.random_source_intensity_max_cps_1m,
+        notification_config=notification_config,
+        notify_spectrum=args.notify_spectrum,
+        notify_spectrum_every=args.notify_spectrum_every,
+        notify_spectrum_max_bins=args.notify_spectrum_max_bins,
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

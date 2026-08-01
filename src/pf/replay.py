@@ -48,6 +48,29 @@ class PFReplayError(RuntimeError):
 
 _SHA256_PATTERN = frozenset("0123456789abcdef")
 _DEFAULT_SURFACE_DIAGNOSTIC_POINT_COUNT = 1024
+_PF_CONFIG_ALIASES = {
+    "pf_max_sources": "max_sources",
+    "pf_strength_prior_min_cps_1m": "strength_prior_min_cps_1m",
+    "pf_strength_prior_max_cps_1m": "strength_prior_max_cps_1m",
+}
+
+_PF_REPLAY_PHYSICAL_OVERRIDE_KEYS = frozenset(
+    {
+        "pf_buildup",
+        "pf_detector_aperture_radius_m",
+        "pf_detector_aperture_samples",
+        "pf_detector_aperture_sampling",
+        "pf_detector_count_radius_m",
+        "pf_line_resolved_shield_attenuation",
+        "pf_obstacle_attenuation",
+        "pf_obstacle_material",
+        "pf_obstacle_mu_by_isotope",
+        "pf_obstacle_source_extent_radius_m",
+        "pf_obstacle_source_extent_samples",
+        "pf_source_extent_radius_m",
+        "pf_source_extent_samples",
+    }
+)
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -456,6 +479,14 @@ def _external_replay_config(
     upper: NDArray[np.float64],
 ) -> dict[str, Any]:
     """Resolve PF-owned replay inputs without reading estimator state from the log."""
+    forbidden_physics = sorted(
+        key for key in external_config if key in _PF_REPLAY_PHYSICAL_OVERRIDE_KEYS
+    )
+    if forbidden_physics:
+        raise PFReplayError(
+            "External runtime field cannot override MeasurementLog physics: "
+            + ", ".join(forbidden_physics)
+        )
     if external_config:
         try:
             enforce_pure_runtime_settings(external_config)
@@ -463,10 +494,19 @@ def _external_replay_config(
             raise PFReplayError(
                 "External replay configuration violates the pure-PF schema."
             ) from exc
+    normalized = dict(external_config)
+    for alias, canonical in _PF_CONFIG_ALIASES.items():
+        if alias not in normalized:
+            continue
+        if canonical in normalized and normalized[canonical] != normalized[alias]:
+            raise PFReplayError(
+                f"Conflicting PF settings {alias!r} and {canonical!r}."
+            )
+        normalized[canonical] = normalized[alias]
     declared = {field.name for field in fields(RotatingShieldPFConfig)}
     merged = {
         key: value
-        for key, value in external_config.items()
+        for key, value in normalized.items()
         if key in declared or key in {"pure_pf_schema_version", "estimator_profile"}
     }
     merged.setdefault("pure_pf_schema_version", 1)

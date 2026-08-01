@@ -19,12 +19,21 @@ after planners choose different actions.
 uv run rotating-shield-sim run-plan /path/to/private-plan.json
 
 # In this repository
+uv run python main.py --full-simulation
+
+# Or replay one already completed shared log
 uv run rotating-shield-pf \
   --measurement-log /path/to/measurement_log \
   --config configs/pf/pf_strict_3d.json \
   --profile pf_strict \
   --output-dir results/pf-replay
 ```
+
+The online command does not copy or replace acquisition code. Its controller sends
+actions to the sibling runtime, stages each returned raw spectrum through the shared
+MeasurementLog writer, and then calls the PF station update. The simulator receives
+only the physical configuration; PF and planner settings remain local to this
+repository.
 
 The private simulation plan may contain realized source truth. MeasurementLog v2 and
 all estimator inputs must not.

@@ -6,9 +6,11 @@ reporting. It does not own Geant4, environments, detector/shield physics, spectr
 generation, or MeasurementLog serialization.
 
 Physical acquisition is implemented once in the sibling
-`Rotating-shield-simulation-runtime` repository. That runtime publishes a truth-free
-raw full-spectrum MeasurementLog v2. This repository consumes the immutable log and
-an estimator-only PF configuration:
+`Rotating-shield-simulation-runtime` repository. The online PF controller calls that
+shared runtime through `SimulationCommand`, durably stages every truth-free raw
+full-spectrum observation in MeasurementLog v2, and only then updates the PF. The
+same estimator can also consume a completed immutable log with an estimator-only PF
+configuration:
 
 ```text
 Rotating-shield-simulation-runtime
@@ -19,7 +21,7 @@ Rotating-shield-simulation-runtime
                          |
                          v
 Rotating-shield-particle-filter
-  continuous-surface joint full-spectrum PF / exact-RJ
+  online controller + continuous-surface joint full-spectrum PF / exact-RJ
 ```
 
 ## Install and test
@@ -32,6 +34,17 @@ uv run pytest
 The local development checkout uses an editable sibling dependency on the shared
 runtime. A release should pin the corresponding runtime revision in the deployment
 lock file.
+
+## Online full simulation
+
+```bash
+uv run python main.py --full-simulation
+```
+
+The command uses the physical Geant4 configuration from the shared runtime and the
+PF-owned defaults in `configs/pf/pf_strict_3d.json`. Geant4, environment generation,
+shield physics, raw spectra, and MeasurementLog serialization remain implemented in
+the shared repository; only action selection and inference are local.
 
 ## Replay
 
@@ -47,5 +60,6 @@ The replay fails closed if the log schema, source-rate semantics, model identity
 energy axis, environment geometry, or full-spectrum contract is incompatible. Source
 truth is not accepted as estimator input.
 
-To generate a new log, run `rotating-shield-sim` from the shared runtime repository.
-See [the repository boundary](docs/shared_simulation_runtime.md).
+To generate a fixed-plan log without an online estimator, run
+`rotating-shield-sim` from the shared runtime repository. See
+[the repository boundary](docs/shared_simulation_runtime.md).
