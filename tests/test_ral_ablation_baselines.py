@@ -442,7 +442,7 @@ def test_ablation_plan_generates_isolated_baseline_configs(tmp_path) -> None:
         "mix9_multi_isotope_cardinality_proposed_seed_1234"
     )
     assert proposed_config["metadata"]["ral_environment_seed"] == 1234
-    assert proposed_config["metadata"]["ral_truth_source_seed"] == 1251
+    assert "ral_truth_source_seed" not in proposed_config["metadata"]
     assert proposed_config["metadata"]["ral_scene_seed_policy"] == (
         "explicit_replay"
     )

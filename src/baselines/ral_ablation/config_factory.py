@@ -600,7 +600,6 @@ def _variant_config(
     case: AblationCase,
     variant: AblationVariant,
     seed: int,
-    source_seed: int | None = None,
     seed_policy: str = "explicit_replay",
     output_tag: str,
 ) -> dict[str, Any]:
@@ -651,13 +650,6 @@ def _variant_config(
             "thread_count must be greater than one."
         )
     seed = _json_integer(seed, field_name="seed", minimum=0)
-    if source_seed is None:
-        source_seed = seed + 17
-    source_seed = _json_integer(
-        source_seed,
-        field_name="source_seed",
-        minimum=0,
-    )
     seed_policy = _nonempty_string(seed_policy, field_name="seed_policy")
     output_tag = _nonempty_string(output_tag, field_name="output_tag")
     config["random_seed_base"] = seed
@@ -684,7 +676,6 @@ def _variant_config(
             "ral_ablation_variant": variant.name,
             "ral_ablation_seed": seed,
             "ral_environment_seed": seed,
-            "ral_truth_source_seed": source_seed,
             "ral_scene_seed_policy": seed_policy,
             "ral_transport_history_mode": transport_history_mode,
             "ral_accelerated_transport": False,
@@ -783,7 +774,6 @@ def build_ablation_plan(
                     case=case,
                     variant=variant,
                     seed=seed,
-                    source_seed=source_seed,
                     seed_policy=seed_policy,
                     output_tag=tag,
                 )
