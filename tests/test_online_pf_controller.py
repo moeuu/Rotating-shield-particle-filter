@@ -6,11 +6,13 @@ import inspect
 
 from realtime_demo import (
     DEFAULT_PF_CONFIG,
+    _validated_provided_source_provenance,
     load_online_runtime_configs,
     run_live_pf,
 )
 from runtime.assets import simulation_runtime_root, standard_geant4_config_path
 from runtime.session import estimator_neutral_runtime_config
+from sim.protocol import encode_message
 from spectrum.transport_spectral import (
     geometry_conditioned_model_from_runtime_config,
 )
@@ -104,3 +106,30 @@ def test_online_controller_initializes_joint_filters_before_atlas_preflight() ->
     )
 
     assert initialize_offset < atlas_compare_offset
+
+
+def test_source_provenance_preserves_uint64_seed_across_json_protocol() -> None:
+    """Unsigned seed provenance must cross JSON without numeric rounding."""
+    derived_seed = 2**63 + 17
+    provenance = _validated_provided_source_provenance(
+        {
+            "provided_file_path": "sources.json",
+            "provided_file_path_kind": "repository_relative",
+            "provided_file_bytes_sha256": "a" * 64,
+            "provided_file_declared_metadata": {
+                "source_derived_seed": derived_seed,
+                "source_rng_provenance": {
+                    "streams": {
+                        "truth": {"derived_seed_u64": derived_seed}
+                    }
+                },
+            },
+        }
+    )
+
+    declared = provenance["provided_file_declared_metadata"]
+    assert declared["source_derived_seed"] == str(derived_seed)
+    assert declared["source_rng_provenance"]["streams"]["truth"][
+        "derived_seed_u64"
+    ] == str(derived_seed)
+    encode_message("reset", {"source_sampling": provenance})

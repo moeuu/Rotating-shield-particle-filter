@@ -2477,7 +2477,10 @@ def _validated_provided_source_provenance(
     declared_metadata = provenance["provided_file_declared_metadata"]
     if not isinstance(declared_metadata, Mapping):
         raise ValueError("provided_file_declared_metadata must be an object.")
-    sanitized_metadata = _sanitize_json_payload(dict(declared_metadata))
+    sanitized_metadata = _sanitize_json_payload(
+        dict(declared_metadata),
+        _unsafe_integers_as_decimal_strings=True,
+    )
     if not isinstance(sanitized_metadata, dict):
         raise TypeError("provided_file_declared_metadata must sanitize to an object.")
     return {
@@ -3485,6 +3488,7 @@ def _sanitize_json_payload(
     payload: object,
     *,
     _path: str = "$",
+    _unsafe_integers_as_decimal_strings: bool = False,
 ) -> object:
     """Return recursively plain, strict-JSON-compatible data.
 
@@ -3498,7 +3502,10 @@ def _sanitize_json_payload(
     if isinstance(payload, np.bool_):
         return bool(payload)
     if isinstance(payload, (int, np.integer)):
-        return int(payload)
+        value = int(payload)
+        if _unsafe_integers_as_decimal_strings and abs(value) > 2**53:
+            return str(value)
+        return value
     if isinstance(payload, (float, np.floating)):
         value = float(payload)
         if not np.isfinite(value):
@@ -3509,9 +3516,21 @@ def _sanitize_json_payload(
     if isinstance(payload, Path):
         return payload.as_posix()
     if isinstance(payload, np.ndarray):
-        return _sanitize_json_payload(payload.tolist(), _path=_path)
+        return _sanitize_json_payload(
+            payload.tolist(),
+            _path=_path,
+            _unsafe_integers_as_decimal_strings=(
+                _unsafe_integers_as_decimal_strings
+            ),
+        )
     if isinstance(payload, np.generic):
-        return _sanitize_json_payload(payload.item(), _path=_path)
+        return _sanitize_json_payload(
+            payload.item(),
+            _path=_path,
+            _unsafe_integers_as_decimal_strings=(
+                _unsafe_integers_as_decimal_strings
+            ),
+        )
     if isinstance(payload, Mapping):
         result: dict[str, object] = {}
         for key, value in payload.items():
@@ -3524,16 +3543,31 @@ def _sanitize_json_payload(
             result[resolved_key] = _sanitize_json_payload(
                 value,
                 _path=f"{_path}[{resolved_key!r}]",
+                _unsafe_integers_as_decimal_strings=(
+                    _unsafe_integers_as_decimal_strings
+                ),
             )
         return result
     if isinstance(payload, (list, tuple)):
         return [
-            _sanitize_json_payload(value, _path=f"{_path}[{index}]")
+            _sanitize_json_payload(
+                value,
+                _path=f"{_path}[{index}]",
+                _unsafe_integers_as_decimal_strings=(
+                    _unsafe_integers_as_decimal_strings
+                ),
+            )
             for index, value in enumerate(payload)
         ]
     if isinstance(payload, (set, frozenset)):
         return [
-            _sanitize_json_payload(value, _path=f"{_path}[{index}]")
+            _sanitize_json_payload(
+                value,
+                _path=f"{_path}[{index}]",
+                _unsafe_integers_as_decimal_strings=(
+                    _unsafe_integers_as_decimal_strings
+                ),
+            )
             for index, value in enumerate(
                 sorted(payload, key=lambda value: repr(value))
             )
