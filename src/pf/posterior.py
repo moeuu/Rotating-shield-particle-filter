@@ -511,6 +511,7 @@ class PFPosteriorSnapshot:
                 "pure_pf_schema_version"
             ],
             "planner_belief_sources": list(planner_belief_sources),
+            "batch_feedback_applied": False,
             "posterior_semantics": structural["posterior_semantics"],
             "structural_transition_provenance": dict(structural),
             "structural_model_manifest": dict(structural_model),
@@ -524,6 +525,9 @@ class PFPosteriorSnapshot:
             "estimator_variant": estimator_variant,
             "estimator_profile": estimator_variant,
             "final_estimate_source": "pf_posterior",
+            "uses_all_history_batch_fit": False,
+            "uses_surface_map": False,
+            "uses_batch_model_order": False,
             "posterior_semantics": structural["posterior_semantics"],
             "structural_kernel_family": structural["structural_kernel_family"],
             "structural_kernel_target_preserving": structural[

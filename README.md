@@ -4,6 +4,14 @@ Demo simulations assume strong sources (≈20,000 cps at 1 m) for Cs-137,
 Co-60, and Eu-154 to mimic high-dose environments. The scientific estimator
 API is the sequential `pf_strict` particle filter described below.
 
+## Shared simulation runtime
+
+This repository is also the single production owner of Geant4 acquisition and raw
+observation generation for the PF, standalone MLE, and PF+MLE projects. One finalized
+raw full-spectrum MeasurementLog v2 can be replayed by all estimators without copying
+or synchronizing simulator code. See
+[the shared runtime boundary](docs/shared_simulation_runtime.md).
+
 ## Environment setup (uv)
 
 This repository uses `uv` for environment and dependency management.
